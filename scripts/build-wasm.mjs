@@ -58,6 +58,10 @@ Homebrew shell setup so rustup's proxies appear first in PATH.
 const wasmPack = process.platform === 'win32' ? 'wasm-pack.cmd' : 'wasm-pack';
 const staging = await mkdtemp(join(tmpdir(), 'tinygres-wasm-'));
 const distWasm = resolve(root, 'dist/wasm');
+const cargoTargetDir = resolve(
+  root,
+  'node_modules/.cache/tinygres/cargo-target',
+);
 
 try {
   const build = spawnSync(
@@ -74,7 +78,11 @@ try {
       '--release',
       '--no-pack',
     ],
-    {cwd: root, stdio: 'inherit'},
+    {
+      cwd: root,
+      env: {...process.env, CARGO_TARGET_DIR: cargoTargetDir},
+      stdio: 'inherit',
+    },
   );
 
   if (build.error) {

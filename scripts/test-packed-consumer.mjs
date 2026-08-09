@@ -1,28 +1,35 @@
 import {spawn, spawnSync} from 'node:child_process';
+import {rmSync} from 'node:fs';
 import {
   cp,
   mkdir,
+  mkdtemp,
   readFile,
   readdir,
   realpath,
   rm,
   writeFile,
 } from 'node:fs/promises';
-import {dirname, relative, resolve} from 'node:path';
+import {tmpdir} from 'node:os';
+import {dirname, join, relative, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 import {chromium} from '@playwright/test';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const fixture = resolve(root, 'test/consumers/vite');
-const generatedRoot = resolve(root, '.local/packed-consumer/vite');
+const generatedRoot = await mkdtemp(
+  join(tmpdir(), 'tinygres-packed-consumer-'),
+);
 const packageDirectory = resolve(generatedRoot, 'package');
 const appDirectory = resolve(generatedRoot, 'app');
 const port = 43_117;
 const baseUrl = `http://127.0.0.1:${port}`;
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+const cleanupGeneratedRoot = () =>
+  rmSync(generatedRoot, {force: true, recursive: true});
 
-await rm(generatedRoot, {force: true, recursive: true});
+process.once('exit', cleanupGeneratedRoot);
 await mkdir(packageDirectory, {recursive: true});
 
 // Build and pack the same clean dist directory that is published to npm.
@@ -52,7 +59,8 @@ await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 run(npm, ['install', '--no-audit', '--no-fund'], appDirectory);
 const installedPackage = resolve(appDirectory, 'node_modules/tinygres');
 const installedRealPath = await realpath(installedPackage);
-if (!installedRealPath.startsWith(resolve(appDirectory, 'node_modules'))) {
+const nodeModulesRealPath = await realpath(resolve(appDirectory, 'node_modules'));
+if (installedRealPath !== resolve(nodeModulesRealPath, 'tinygres')) {
   throw new Error(
     `Expected a packed install under node_modules, received ${installedRealPath}`,
   );
@@ -138,6 +146,9 @@ console.log(`PACKED_TARBALL ${relative(root, tarball)}`);
 console.log(`PACKED_INSTALL ${relative(root, installedRealPath)}`);
 console.log('SSR_IMPORT_OK');
 console.log(`VITE_BUILD_OK ${builtFiles.length} files`);
+
+await rm(generatedRoot, {force: true, recursive: true});
+process.removeListener('exit', cleanupGeneratedRoot);
 
 function run(command, args, cwd) {
   const result = spawnSync(command, args, {

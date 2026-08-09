@@ -9,6 +9,7 @@
     "build": "node scripts/build.mjs",
     "build:lib": "node scripts/build-lib.mjs",
     "build:wasm": "node scripts/build-wasm.mjs",
+    "cargo": "node scripts/cargo.mjs",
     "check": "npm run typecheck && npm test && npm run build && npm run check:size",
     "check:release": "npm run check && npm run test:browser && npm run test:package",
     "check:size": "node scripts/check-size.mjs",
@@ -18,7 +19,7 @@
     "test:browser": "npm run build && npm run typecheck:browser && playwright test",
     "test:browser:serve": "vite test/browser/app",
     "test:package": "node scripts/test-packed-consumer.mjs",
-    "test:rust": "cargo test --workspace",
+    "test:rust": "node scripts/cargo.mjs test --workspace",
     "test:ts": "vitest run",
     "typecheck": "tsc --noEmit",
     "typecheck:browser": "tsc --noEmit -p test/browser/app/tsconfig.json"

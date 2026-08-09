@@ -42,7 +42,10 @@ from source requires `rustup`. The checked-in toolchain file selects the Rust
 version and `wasm32-unknown-unknown` target, while the npm development dependency
 provides `wasm-pack`. The build stages wasm-bindgen output in a temporary
 directory and copies only the runtime JavaScript and `.wasm` files into
-`dist/wasm`, so generated package metadata never appears under `src/`.
+`dist/wasm`, so generated package metadata never appears under `src/`. Cargo's
+compiler cache lives under `node_modules/.cache/tinygres` when using the project
+scripts rather than creating a top-level `target/` directory. Use
+`npm run cargo -- <arguments>` for other Cargo commands with the same behavior.
 
 If `rustc` comes from Homebrew, install rustup alongside it and activate the
 rustup proxies in the current shell:
