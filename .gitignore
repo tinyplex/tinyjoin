@@ -1,4 +1,11 @@
 node_modules/
-dist
+dist/
+target/
+src/generated/wasm/
+demo-dist/
+playwright-report/
+test-results/
+.local/
+*.tgz
 *.log
 .DS_Store
