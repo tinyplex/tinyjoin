@@ -30,7 +30,7 @@
     "build:demo": "vite build demo --outDir ../demo-dist --emptyOutDir",
     "build:lib": "node scripts/build-lib.mjs",
     "build:types": "tsc -p tsconfig.build.json --emitDeclarationOnly",
-    "build:wasm": "wasm-pack build crates/tinygres-wasm --target web --out-dir ../../src/generated/wasm --out-name tinygres_wasm --release",
+    "build:wasm": "node scripts/build-wasm.mjs",
     "check": "npm run typecheck && npm test && npm run build && npm run check:size",
     "check:size": "node scripts/check-size.mjs",
     "dev": "vite demo",

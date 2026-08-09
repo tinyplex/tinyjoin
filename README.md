@@ -40,6 +40,21 @@ from source requires `rustup`. The checked-in toolchain file selects the Rust
 version and `wasm32-unknown-unknown` target, while the npm development dependency
 provides `wasm-pack`.
 
+If `rustc` comes from Homebrew, install rustup alongside it and activate the
+rustup proxies in the current shell:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+  | sh -s -- --default-toolchain none -y
+. "$HOME/.cargo/env"
+npm run build:wasm
+```
+
+There is no need to uninstall Homebrew Rust. In persistent shell configuration,
+load `$HOME/.cargo/env` after Homebrew's `brew shellenv` so the rustup-managed
+`rustc` and `cargo` take precedence. The build command checks for the WASM target
+and prints this setup guidance before invoking `wasm-pack`.
+
 ## Browser API
 
 ```ts
