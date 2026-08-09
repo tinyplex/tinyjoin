@@ -1,0 +1,19 @@
+{
+  "name": "tinygres",
+  "version": "0.0.0",
+  "author": "jamesgpearce",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tinyplex/tinygres.git"
+  },
+  "license": "MIT",
+  "description": "A tiny PostgreSQL-compatible client for browsers.",
+  "keywords": [
+    "postgresql",
+    "client",
+    "browser",
+    "tiny",
+    "local-first"
+  ],
+  "type": "module"
+}
