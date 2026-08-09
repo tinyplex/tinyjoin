@@ -4,9 +4,9 @@ test('measures warmed worker round-trip latency', async ({page}) => {
   await page.goto('/');
   await expect(page.getByTestId('state')).toHaveText('Ready');
 
-  await page.evaluate(() => window.__tinygresDemo!.benchmark(25));
+  await page.evaluate(() => window.__tinygresTest!.benchmark(25));
   const samples = await page.evaluate(() =>
-    window.__tinygresDemo!.benchmark(200),
+    window.__tinygresTest!.benchmark(200),
   );
   const sorted = [...samples].sort((left, right) => left - right);
   const report = {

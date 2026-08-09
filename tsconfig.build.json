@@ -3,12 +3,12 @@
   "compilerOptions": {
     "allowImportingTsExtensions": false,
     "declaration": true,
-    "declarationMap": true,
+    "declarationMap": false,
     "emitDeclarationOnly": false,
     "noEmit": false,
     "outDir": "dist",
     "rootDir": "src",
-    "sourceMap": true,
+    "sourceMap": false,
     "types": []
   },
   "include": ["src/**/*.ts"]

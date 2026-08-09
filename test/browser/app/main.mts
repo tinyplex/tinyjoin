@@ -1,10 +1,8 @@
-import './style.css';
-
 import {
   createTinygresClient,
   type ChangeBatch,
   type TableSchema,
-} from '../src/index.ts';
+} from '../../../dist/index.js';
 
 type Post = {
   id: number;
@@ -73,10 +71,9 @@ async function boot(): Promise<void> {
   applyButton.addEventListener('click', async () => {
     applyButton.disabled = true;
     simulatedChanges += 1;
-    statusElement.textContent = 'Applying a normalized fake server batch…';
     const batch = {
-      sourceId: 'phase-1-demo',
-      transactionId: `fake-server-change-${simulatedChanges}`,
+      sourceId: 'browser-test',
+      transactionId: `test-change-${simulatedChanges}`,
       committedAt: new Date().toISOString(),
       changes: [
         {
@@ -101,7 +98,7 @@ async function boot(): Promise<void> {
     }
   });
 
-  window.__tinygresDemo = {
+  window.__tinygresTest = {
     async benchmark(iterations) {
       if (!Number.isSafeInteger(iterations) || iterations < 1) {
         throw new TypeError('Benchmark iterations must be a positive integer');
@@ -126,14 +123,13 @@ async function boot(): Promise<void> {
     'pagehide',
     () => {
       unsubscribe();
-      delete window.__tinygresDemo;
+      delete window.__tinygresTest;
       void database.close();
     },
     {once: true},
   );
 
   stateElement.textContent = 'Ready';
-  stateElement.dataset.ready = 'true';
   statusElement.textContent = 'Ready. The initial snapshot is queryable locally.';
   applyButton.disabled = false;
 }
@@ -154,13 +150,7 @@ async function renderQuery(
     ...result.rows.map((post) => {
       const item = document.createElement('li');
       item.dataset.postId = String(post.id);
-
-      const title = document.createElement('strong');
-      title.textContent = post.title;
-      const author = document.createElement('span');
-      author.textContent = post.author;
-
-      item.append(title, author);
+      item.textContent = `${post.title} — ${post.author}`;
       return item;
     }),
   );
@@ -169,8 +159,7 @@ async function renderQuery(
 function showError(error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
   stateElement.textContent = 'Failed';
-  stateElement.dataset.ready = 'false';
-  statusElement.textContent = 'The Phase-1 flow failed.';
+  statusElement.textContent = 'The browser test flow failed.';
   errorElement.hidden = false;
   errorElement.textContent = message;
   applyButton.disabled = true;
@@ -179,7 +168,7 @@ function showError(error: unknown): void {
 function element<ElementType extends Element>(selector: string): ElementType {
   const match = document.querySelector<ElementType>(selector);
   if (!match) {
-    throw new Error(`Demo element not found: ${selector}`);
+    throw new Error(`Test fixture element not found: ${selector}`);
   }
   return match;
 }

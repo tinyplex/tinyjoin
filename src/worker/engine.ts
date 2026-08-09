@@ -19,7 +19,7 @@ export interface WorkerEngine {
 }
 
 export async function createWasmEngine(): Promise<WorkerEngine> {
-  const wasm = await import('../generated/wasm/tinygres_wasm.js');
+  const wasm = await import('../wasm/tinygres_wasm.js');
   await wasm.default();
   const engine = new wasm.WasmEngine();
   return {

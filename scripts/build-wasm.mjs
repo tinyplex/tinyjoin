@@ -1,5 +1,11 @@
 import {existsSync} from 'node:fs';
+import {cp, mkdir, mkdtemp, readdir, rm} from 'node:fs/promises';
 import {spawnSync} from 'node:child_process';
+import {tmpdir} from 'node:os';
+import {dirname, join, resolve} from 'node:path';
+import {fileURLToPath} from 'node:url';
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 const target = 'wasm32-unknown-unknown';
 const targetLibDir = capture('rustc', [
@@ -50,27 +56,63 @@ Homebrew shell setup so rustup's proxies appear first in PATH.
 }
 
 const wasmPack = process.platform === 'win32' ? 'wasm-pack.cmd' : 'wasm-pack';
-const build = spawnSync(
-  wasmPack,
-  [
-    'build',
-    'crates/tinygres-wasm',
-    '--target',
-    'web',
-    '--out-dir',
-    '../../src/generated/wasm',
-    '--out-name',
-    'tinygres_wasm',
-    '--release',
-  ],
-  {stdio: 'inherit'},
-);
+const staging = await mkdtemp(join(tmpdir(), 'tinygres-wasm-'));
+const distWasm = resolve(root, 'dist/wasm');
 
-if (build.error) {
-  console.error(`Could not start wasm-pack: ${build.error.message}`);
-  process.exit(1);
+try {
+  const build = spawnSync(
+    wasmPack,
+    [
+      'build',
+      'crates/tinygres-wasm',
+      '--target',
+      'web',
+      '--out-dir',
+      staging,
+      '--out-name',
+      'tinygres_wasm',
+      '--release',
+      '--no-pack',
+    ],
+    {cwd: root, stdio: 'inherit'},
+  );
+
+  if (build.error) {
+    console.error(`Could not start wasm-pack: ${build.error.message}`);
+    process.exitCode = 1;
+  } else if (build.status !== 0) {
+    process.exitCode = build.status ?? 1;
+  } else {
+    const expected = new Set([
+      '.gitignore',
+      'snippets',
+      'tinygres_wasm.d.ts',
+      'tinygres_wasm.js',
+      'tinygres_wasm_bg.wasm',
+      'tinygres_wasm_bg.wasm.d.ts',
+    ]);
+    const unexpected = (await readdir(staging)).filter(
+      (entry) => !expected.has(entry),
+    );
+    if (unexpected.length > 0) {
+      throw new Error(
+        `wasm-pack emitted unexpected files: ${unexpected.join(', ')}`,
+      );
+    }
+    await rm(distWasm, {force: true, recursive: true});
+    await mkdir(distWasm, {recursive: true});
+    for (const file of ['tinygres_wasm.js', 'tinygres_wasm_bg.wasm']) {
+      await cp(resolve(staging, file), resolve(distWasm, file));
+    }
+    if (existsSync(resolve(staging, 'snippets'))) {
+      await cp(resolve(staging, 'snippets'), resolve(distWasm, 'snippets'), {
+        recursive: true,
+      });
+    }
+  }
+} finally {
+  await rm(staging, {force: true, recursive: true});
 }
-process.exit(build.status ?? 1);
 
 function capture(command, args) {
   const result = spawnSync(command, args, {encoding: 'utf8'});

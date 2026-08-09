@@ -1,8 +1,6 @@
 node_modules/
 dist/
 target/
-src/generated/wasm/
-demo-dist/
 playwright-report/
 test-results/
 .local/

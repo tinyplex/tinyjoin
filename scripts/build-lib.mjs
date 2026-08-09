@@ -1,14 +1,23 @@
-import {cp, mkdir, readdir, rm} from 'node:fs/promises';
+import {
+  access,
+  copyFile,
+  readFile,
+  writeFile,
+} from 'node:fs/promises';
 import {spawnSync} from 'node:child_process';
 import {dirname, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const dist = resolve(root, 'dist');
-const generatedWasm = resolve(root, 'src/generated/wasm');
-const distWasm = resolve(dist, 'generated/wasm');
+const wasm = resolve(dist, 'wasm/tinygres_wasm_bg.wasm');
 
-await rm(dist, {force: true, recursive: true});
+try {
+  await access(wasm);
+} catch {
+  console.error('Missing dist/wasm. Run npm run build:wasm first.');
+  process.exit(1);
+}
 
 const compiler = resolve(root, 'node_modules/typescript/bin/tsc');
 const compile = spawnSync(
@@ -20,14 +29,33 @@ if (compile.status !== 0) {
   process.exit(compile.status ?? 1);
 }
 
-await mkdir(distWasm, {recursive: true});
-for (const entry of await readdir(generatedWasm, {withFileTypes: true})) {
-  if (entry.name === '.gitignore') {
-    continue;
-  }
-  await cp(
-    resolve(generatedWasm, entry.name),
-    resolve(distWasm, entry.name),
-    {recursive: entry.isDirectory()},
-  );
-}
+const manifest = JSON.parse(
+  await readFile(resolve(root, 'package.json'), 'utf8'),
+);
+delete manifest.private;
+delete manifest.scripts;
+delete manifest.devDependencies;
+
+manifest.types = './index.d.ts';
+manifest.exports = {
+  '.': {
+    types: './index.d.ts',
+    import: './index.js',
+  },
+  './worker': {
+    types: './worker/index.d.ts',
+    import: './worker/index.js',
+  },
+  './supabase': {
+    types: './adapters/supabase/index.d.ts',
+    import: './adapters/supabase/index.js',
+  },
+  './package.json': './package.json',
+};
+
+await writeFile(
+  resolve(dist, 'package.json'),
+  `${JSON.stringify(manifest, null, 2)}\n`,
+);
+await copyFile(resolve(root, 'LICENSE'), resolve(dist, 'LICENSE'));
+await copyFile(resolve(root, 'README.md'), resolve(dist, 'README.md'));

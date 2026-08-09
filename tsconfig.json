@@ -16,10 +16,8 @@
     "types": ["node", "vitest/globals"]
   },
   "include": [
-    "demo/**/*.ts",
     "src/**/*.ts",
     "test/**/*.ts",
-    "vite.config.ts",
     "vitest.config.ts"
   ]
 }

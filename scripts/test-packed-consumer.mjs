@@ -25,15 +25,13 @@ const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 await rm(generatedRoot, {force: true, recursive: true});
 await mkdir(packageDirectory, {recursive: true});
 
-// Exercise the package layout around the current release WASM. Rebuilding the
-// Rust artifact is a separate prerequisite because some contributor machines
-// intentionally use a non-rustup toolchain without the wasm target installed.
-run(npm, ['run', 'build:lib'], root);
-run(npm, ['run', 'build:types'], root);
+// Build and pack the same clean dist directory that is published to npm.
+run(npm, ['run', 'build'], root);
 const packOutput = run(
   npm,
   [
     'pack',
+    './dist',
     '--ignore-scripts',
     '--json',
     '--pack-destination',
@@ -42,6 +40,7 @@ const packOutput = run(
   root,
 );
 const packed = parsePackOutput(packOutput);
+assertPackedFiles(packed);
 const tarball = resolve(packageDirectory, packed.filename);
 
 await cp(fixture, appDirectory, {recursive: true});
@@ -64,6 +63,13 @@ const installedManifest = JSON.parse(
 );
 if (installedManifest.name !== 'tinygres') {
   throw new Error('The installed tarball is not the tinygres package');
+}
+for (const developmentField of ['private', 'scripts', 'devDependencies']) {
+  if (developmentField in installedManifest) {
+    throw new Error(
+      `Published Tinygres manifest contains development field ${developmentField}`,
+    );
+  }
 }
 
 const ssrOutput = run(
@@ -161,6 +167,30 @@ function parsePackOutput(output) {
     throw new Error(`npm pack did not report a tarball filename:\n${output}`);
   }
   return entry;
+}
+
+function assertPackedFiles(packed) {
+  const files = Array.isArray(packed.files)
+    ? packed.files.map((file) => file.path)
+    : [];
+  for (const required of [
+    'package.json',
+    'index.js',
+    'index.d.ts',
+    'worker/default-entry.js',
+    'wasm/tinygres_wasm.js',
+    'wasm/tinygres_wasm_bg.wasm',
+  ]) {
+    if (!files.includes(required)) {
+      throw new Error(`Packed Tinygres is missing ${required}`);
+    }
+  }
+  const nestedManifests = files.filter((file) => file.endsWith('/package.json'));
+  if (nestedManifests.length > 0) {
+    throw new Error(
+      `Packed Tinygres contains nested package manifests: ${nestedManifests.join(', ')}`,
+    );
+  }
 }
 
 async function listFiles(directory) {

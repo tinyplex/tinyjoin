@@ -19,26 +19,30 @@ The first proof of concept deliberately does a small number of things:
 - keeps source adapters behind the worker boundary for future Supabase and
   PostgreSQL replication transports.
 
-## Try the demo
+## Building from source
 
-The included demo loads a three-row snapshot, runs a parameterized SQL query in
-the real worker/WASM engine, and lets you simulate an incoming server change.
-The resulting invalidation triggers a fresh local query.
+The repository root is a private development package. A build creates a clean,
+standalone npm package in `dist/`, including its public `package.json`, compiled
+TypeScript, worker entry, and WASM runtime:
 
 ```sh
 npm install
-npm run build:wasm
-npm run dev
+npm run build
 ```
 
-Then open the URL printed by Vite. The demo is intentionally local and uses no
-Supabase credentials or network database.
+Run `npm pack ./dist` to inspect the publishable tarball. Publishing will also
+be done from `dist/`, never from the private repository root. Generated starter
+apps and demos belong in a separate `create-tinygres` package built on
+`tinycreate`; this repository keeps only minimal fixtures used by automated
+browser and package tests.
 
 Application developers consume the prebuilt worker and WASM from the npm
 package; Rust is not required in consuming projects. Building this repository
 from source requires `rustup`. The checked-in toolchain file selects the Rust
 version and `wasm32-unknown-unknown` target, while the npm development dependency
-provides `wasm-pack`.
+provides `wasm-pack`. The build stages wasm-bindgen output in a temporary
+directory and copies only the runtime JavaScript and `.wasm` files into
+`dist/wasm`, so generated package metadata never appears under `src/`.
 
 If `rustc` comes from Homebrew, install rustup alongside it and activate the
 rustup proxies in the current shell:
@@ -232,12 +236,12 @@ does not match, following SQL null semantics.
 ## Development and validation
 
 ```sh
-npm run typecheck       # TypeScript source and demo
+npm run typecheck       # authored TypeScript source and unit tests
 npm run test:ts         # client, RPC, and worker-host unit tests
 npm run test:rust       # native Rust engine tests
-npm run build:demo      # production demo bundle
+npm run build           # assemble the complete publishable dist package
 npm run test:browser    # real browser Worker/WASM flow
-npm run test:package    # install the tarball in a clean Vite app
+npm run test:package    # pack dist and install it in a clean Vite app
 npm run check:size      # hard 700 KiB uncompressed WASM gate
 ```
 

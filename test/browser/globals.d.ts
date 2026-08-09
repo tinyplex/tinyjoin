@@ -1,7 +1,5 @@
-/// <reference types="vite/client" />
-
 interface Window {
-  __tinygresDemo?: {
+  __tinygresTest?: {
     benchmark(iterations: number): Promise<number[]>;
   };
 }

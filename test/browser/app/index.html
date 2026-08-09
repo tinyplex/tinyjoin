@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tinygres browser test fixture</title>
+  </head>
+  <body>
+    <main>
+      <p data-testid="state">Starting…</p>
+      <p data-testid="status">Loading the WebAssembly engine…</p>
+      <p>Revision <span data-testid="revision">–</span></p>
+      <ul data-testid="posts"></ul>
+      <p data-testid="latency">Waiting for the worker…</p>
+      <p><span data-testid="invalidations">0</span> invalidations</p>
+      <button type="button" data-testid="apply-change" disabled>
+        Apply test change
+      </button>
+      <p data-testid="error" hidden></p>
+    </main>
+    <script type="module" src="/main.mts"></script>
+  </body>
+</html>
