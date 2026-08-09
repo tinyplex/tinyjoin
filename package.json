@@ -2,12 +2,52 @@
   "name": "tinygres",
   "version": "0.0.0",
   "author": "jamesgpearce",
+  "type": "module",
+  "sideEffects": false,
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./worker": {
+      "types": "./dist/worker/index.d.ts",
+      "import": "./dist/worker/index.js"
+    },
+    "./supabase": {
+      "types": "./dist/adapters/supabase/index.d.ts",
+      "import": "./dist/adapters/supabase/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "npm run build:wasm && npm run build:lib && npm run build:types",
+    "build:demo": "vite build demo --outDir ../demo-dist --emptyOutDir",
+    "build:lib": "node scripts/build-lib.mjs",
+    "build:types": "tsc -p tsconfig.build.json --emitDeclarationOnly",
+    "build:wasm": "wasm-pack build crates/tinygres-wasm --target web --out-dir ../../src/generated/wasm --out-name tinygres_wasm --release",
+    "check": "npm run typecheck && npm test && npm run build && npm run check:size",
+    "check:size": "node scripts/check-size.mjs",
+    "dev": "vite demo",
+    "prepack": "npm run check",
+    "test": "npm run test:rust && npm run test:ts",
+    "test:browser": "playwright test",
+    "test:package": "node scripts/test-packed-consumer.mjs",
+    "test:rust": "cargo test --workspace",
+    "test:ts": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/tinyplex/tinygres.git"
   },
   "license": "MIT",
-  "description": "A tiny PostgreSQL-compatible client for browsers.",
+  "description": "A tiny, worker-first local query cache for PostgreSQL data.",
   "keywords": [
     "postgresql",
     "client",
@@ -15,5 +55,12 @@
     "tiny",
     "local-first"
   ],
-  "type": "module"
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.1",
+    "vitest": "^4.1.10",
+    "wasm-pack": "^0.15.0"
+  }
 }
