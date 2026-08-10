@@ -16,6 +16,18 @@ impl Default for Engine<InMemoryStorage> {
     }
 }
 
+impl Engine<InMemoryStorage> {
+    /// Encodes the complete engine state into a versioned, self-checking snapshot.
+    pub fn export_snapshot(&self) -> Result<Vec<u8>> {
+        self.storage.export_snapshot()
+    }
+
+    /// Atomically replaces the complete engine state from a validated snapshot.
+    pub fn import_snapshot(&mut self, bytes: &[u8]) -> Result<()> {
+        self.storage.import_snapshot(bytes)
+    }
+}
+
 impl<S: StorageDriver> Engine<S> {
     pub fn new(storage: S) -> Self {
         Self { storage }

@@ -56,6 +56,14 @@ impl WasmEngine {
     pub fn revision(&self) -> u64 {
         self.engine.revision()
     }
+
+    pub fn export_snapshot(&self) -> std::result::Result<Vec<u8>, JsValue> {
+        self.engine.export_snapshot().map_err(error_to_js)
+    }
+
+    pub fn import_snapshot(&mut self, bytes: &[u8]) -> std::result::Result<(), JsValue> {
+        self.engine.import_snapshot(bytes).map_err(error_to_js)
+    }
 }
 
 impl Default for WasmEngine {

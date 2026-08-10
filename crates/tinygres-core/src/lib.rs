@@ -2,6 +2,7 @@ mod engine;
 mod error;
 mod model;
 mod query;
+mod snapshot;
 mod storage;
 
 pub use engine::Engine;

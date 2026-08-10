@@ -53,6 +53,14 @@ impl EngineError {
     pub(crate) fn bind_error(message: impl Into<String>) -> Self {
         Self::new("BIND_ERROR", message)
     }
+
+    pub(crate) fn invalid_snapshot(message: impl Into<String>) -> Self {
+        Self::new("INVALID_SNAPSHOT", message)
+    }
+
+    pub(crate) fn unsupported_snapshot(message: impl Into<String>) -> Self {
+        Self::new("UNSUPPORTED_SNAPSHOT", message)
+    }
 }
 
 impl Display for EngineError {
