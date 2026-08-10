@@ -4,7 +4,7 @@ import {
   isRecord,
   isWorkerRequest,
   type ApplyOutcome,
-  type SerializedTinygresError,
+  type SerializedError,
   type SyncState,
   type WorkerEvent,
   type WorkerRequest,
@@ -25,19 +25,19 @@ export interface WorkerScope {
   close(): void;
 }
 
-export interface TinygresWorkerOptions {
+export interface StartWorkerOptions {
   source?: ReplicaSource;
   scope?: WorkerScope;
   engineFactory?: () => Promise<WorkerEngine>;
 }
 
-export interface TinygresWorkerController {
+export interface WorkerController {
   close(): Promise<void>;
 }
 
-export function startTinygresWorker(
-  options: TinygresWorkerOptions = {},
-): TinygresWorkerController {
+export function startWorker(
+  options: StartWorkerOptions = {},
+): WorkerController {
   const scope = options.scope ?? (globalThis as unknown as WorkerScope);
   const enginePromise = (options.engineFactory ?? createWasmEngine)();
   const sourceAbortController = new AbortController();
@@ -157,7 +157,7 @@ export function startTinygresWorker(
         ok: false,
         error: {
           code: 'PROTOCOL_MISMATCH',
-          message: 'The worker received an invalid Tinygres protocol request',
+          message: 'The worker received an invalid TinyGres protocol request',
         },
       });
       return;
@@ -218,7 +218,7 @@ async function handleRequest(
   }
 }
 
-function serializeError(error: unknown): SerializedTinygresError {
+function serializeError(error: unknown): SerializedError {
   if (
     isRecord(error) &&
     typeof error.code === 'string' &&

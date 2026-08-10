@@ -4,7 +4,7 @@ import {
   QueryBuilder,
   type QueryExecutor,
 } from '../../src/client/query-builder.ts';
-import {TinygresError} from '../../src/client/error.ts';
+import {ClientError} from '../../src/client/error.ts';
 import type {QueryPlan, Row} from '../../src/protocol.ts';
 
 describe('QueryBuilder', () => {
@@ -47,7 +47,7 @@ describe('QueryBuilder', () => {
     const executor: QueryExecutor = {
       executePlan: () =>
         Promise.reject(
-          new TinygresError({
+          new ClientError({
             code: 'TABLE_NOT_FOUND',
             message: 'missing',
           }),

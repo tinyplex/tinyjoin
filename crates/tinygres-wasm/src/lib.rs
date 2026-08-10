@@ -1,5 +1,5 @@
 use serde::Serialize;
-use tinygres_core::{ChangeBatch, Engine, QueryPlan, Row, TinygresError};
+use tinygres_core::{ChangeBatch, Engine, EngineError, QueryPlan, Row};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -65,26 +65,22 @@ impl Default for WasmEngine {
 }
 
 fn from_js<T: serde::de::DeserializeOwned>(value: JsValue) -> std::result::Result<T, JsValue> {
-    serde_wasm_bindgen::from_value(value).map_err(|error| {
-        error_to_js(TinygresError::new(
-            "INVALID_BRIDGE_VALUE",
-            error.to_string(),
-        ))
-    })
+    serde_wasm_bindgen::from_value(value)
+        .map_err(|error| error_to_js(EngineError::new("INVALID_BRIDGE_VALUE", error.to_string())))
 }
 
 fn to_js<T: Serialize>(value: &T) -> std::result::Result<JsValue, JsValue> {
     value
         .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
         .map_err(|error| {
-            error_to_js(TinygresError::new(
+            error_to_js(EngineError::new(
                 "BRIDGE_SERIALIZATION_ERROR",
                 error.to_string(),
             ))
         })
 }
 
-fn error_to_js(error: TinygresError) -> JsValue {
+fn error_to_js(error: EngineError) -> JsValue {
     error
         .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
         .unwrap_or_else(|_| JsValue::from_str(&error.to_string()))

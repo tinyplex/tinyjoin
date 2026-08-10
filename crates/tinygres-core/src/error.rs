@@ -2,16 +2,16 @@ use std::fmt::{self, Display, Formatter};
 
 use serde::{Deserialize, Serialize};
 
-pub type Result<T> = std::result::Result<T, TinygresError>;
+pub type Result<T> = std::result::Result<T, EngineError>;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TinygresError {
+pub struct EngineError {
     pub code: String,
     pub message: String,
 }
 
-impl TinygresError {
+impl EngineError {
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
@@ -55,10 +55,10 @@ impl TinygresError {
     }
 }
 
-impl Display for TinygresError {
+impl Display for EngineError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}: {}", self.code, self.message)
     }
 }
 
-impl std::error::Error for TinygresError {}
+impl std::error::Error for EngineError {}

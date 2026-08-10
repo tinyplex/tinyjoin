@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde_json::Value;
 
-use crate::{ApplyOutcome, Change, ChangeBatch, Result, Row, TableSchema, TinygresError};
+use crate::{ApplyOutcome, Change, ChangeBatch, EngineError, Result, Row, TableSchema};
 
 pub trait StorageDriver {
     fn define_table(&mut self, schema: TableSchema) -> Result<()>;
@@ -32,7 +32,7 @@ impl StorageDriver for InMemoryStorage {
             if existing.schema == schema {
                 return Ok(());
             }
-            return Err(TinygresError::invalid_schema(format!(
+            return Err(EngineError::invalid_schema(format!(
                 "Table `{}` is already defined with a different schema",
                 schema.name
             )));
@@ -52,13 +52,13 @@ impl StorageDriver for InMemoryStorage {
         let current = self
             .tables
             .get(table)
-            .ok_or_else(|| TinygresError::table_not_found(table))?;
+            .ok_or_else(|| EngineError::table_not_found(table))?;
         let mut replacement = BTreeMap::new();
 
         for row in rows {
             let key = row_key(&current.schema, &row)?;
             if replacement.insert(key, row).is_some() {
-                return Err(TinygresError::invalid_change(format!(
+                return Err(EngineError::invalid_change(format!(
                     "Snapshot for `{table}` contains a duplicate primary key"
                 )));
             }
@@ -94,7 +94,7 @@ impl StorageDriver for InMemoryStorage {
                     let target = candidate
                         .tables
                         .get_mut(table)
-                        .ok_or_else(|| TinygresError::table_not_found(table))?;
+                        .ok_or_else(|| EngineError::table_not_found(table))?;
                     let key = row_key(&target.schema, row)?;
                     target.rows.insert(key, row.clone());
                     changed_tables.insert(table.clone());
@@ -103,7 +103,7 @@ impl StorageDriver for InMemoryStorage {
                     let target = candidate
                         .tables
                         .get_mut(table)
-                        .ok_or_else(|| TinygresError::table_not_found(table))?;
+                        .ok_or_else(|| EngineError::table_not_found(table))?;
                     let key = row_key(&target.schema, key)?;
                     target.rows.remove(&key);
                     changed_tables.insert(table.clone());
@@ -124,7 +124,7 @@ impl StorageDriver for InMemoryStorage {
         self.tables
             .get(table)
             .map(|table| table.rows.values().cloned().collect())
-            .ok_or_else(|| TinygresError::table_not_found(table))
+            .ok_or_else(|| EngineError::table_not_found(table))
     }
 
     fn revision(&self) -> u64 {
@@ -134,12 +134,10 @@ impl StorageDriver for InMemoryStorage {
 
 fn validate_schema(schema: &TableSchema) -> Result<()> {
     if schema.name.trim().is_empty() {
-        return Err(TinygresError::invalid_schema(
-            "A table name cannot be empty",
-        ));
+        return Err(EngineError::invalid_schema("A table name cannot be empty"));
     }
     if schema.primary_key.is_empty() {
-        return Err(TinygresError::invalid_schema(format!(
+        return Err(EngineError::invalid_schema(format!(
             "Table `{}` must declare at least one primary-key column",
             schema.name
         )));
@@ -148,13 +146,13 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
     let mut columns = HashSet::new();
     for column in &schema.primary_key {
         if column.trim().is_empty() {
-            return Err(TinygresError::invalid_schema(format!(
+            return Err(EngineError::invalid_schema(format!(
                 "Table `{}` contains an empty primary-key column",
                 schema.name
             )));
         }
         if !columns.insert(column) {
-            return Err(TinygresError::invalid_schema(format!(
+            return Err(EngineError::invalid_schema(format!(
                 "Table `{}` declares primary-key column `{column}` more than once",
                 schema.name
             )));
@@ -167,13 +165,13 @@ fn row_key(schema: &TableSchema, row: &Row) -> Result<String> {
     let mut values = Vec::with_capacity(schema.primary_key.len());
     for column in &schema.primary_key {
         let value = row.get(column).ok_or_else(|| {
-            TinygresError::invalid_change(format!(
+            EngineError::invalid_change(format!(
                 "Row for `{}` is missing primary-key column `{column}`",
                 schema.name
             ))
         })?;
         if value == &Value::Null {
-            return Err(TinygresError::invalid_change(format!(
+            return Err(EngineError::invalid_change(format!(
                 "Primary-key column `{column}` in `{}` cannot be null",
                 schema.name
             )));
@@ -181,14 +179,14 @@ fn row_key(schema: &TableSchema, row: &Row) -> Result<String> {
         values.push(value);
     }
     serde_json::to_string(&values).map_err(|error| {
-        TinygresError::invalid_change(format!("Could not encode primary key: {error}"))
+        EngineError::invalid_change(format!("Could not encode primary key: {error}"))
     })
 }
 
 fn next_revision(revision: u64) -> Result<u64> {
     revision
         .checked_add(1)
-        .ok_or_else(|| TinygresError::new("REVISION_OVERFLOW", "Database revision overflowed"))
+        .ok_or_else(|| EngineError::new("REVISION_OVERFLOW", "Database revision overflowed"))
 }
 
 #[cfg(test)]

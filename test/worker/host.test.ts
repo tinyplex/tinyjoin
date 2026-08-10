@@ -10,7 +10,7 @@ import {
 } from '../../src/protocol.ts';
 import type {WorkerEngine} from '../../src/worker/engine.ts';
 import {
-  startTinygresWorker,
+  startWorker,
   type WorkerScope,
 } from '../../src/worker/host.ts';
 
@@ -71,11 +71,11 @@ async function waitForPosted(scope: FakeScope, count: number): Promise<void> {
   await vi.waitFor(() => expect(scope.posted.length).toBeGreaterThanOrEqual(count));
 }
 
-describe('startTinygresWorker', () => {
+describe('startWorker', () => {
   it('routes requests through the engine and returns versioned responses', async () => {
     const scope = new FakeScope();
     const engine = mockEngine();
-    startTinygresWorker({scope, engineFactory: async () => engine});
+    startWorker({scope, engineFactory: async () => engine});
 
     scope.send({
       v: PROTOCOL_VERSION,
@@ -107,7 +107,7 @@ describe('startTinygresWorker', () => {
   it('microbatches table invalidations from adjacent mutations', async () => {
     const scope = new FakeScope();
     const engine = mockEngine();
-    startTinygresWorker({scope, engineFactory: async () => engine});
+    startWorker({scope, engineFactory: async () => engine});
 
     scope.send({
       v: PROTOCOL_VERSION,
@@ -139,7 +139,7 @@ describe('startTinygresWorker', () => {
   it('rejects malformed messages without invoking the engine', async () => {
     const scope = new FakeScope();
     const engine = mockEngine();
-    startTinygresWorker({scope, engineFactory: async () => engine});
+    startWorker({scope, engineFactory: async () => engine});
 
     scope.send({v: 99, id: 8, method: 'query', params: {}});
     await waitForPosted(scope, 1);
@@ -150,7 +150,7 @@ describe('startTinygresWorker', () => {
       ok: false,
       error: {
         code: 'PROTOCOL_MISMATCH',
-        message: 'The worker received an invalid Tinygres protocol request',
+        message: 'The worker received an invalid TinyGres protocol request',
       },
     });
     expect(engine.query).not.toHaveBeenCalled();
@@ -159,7 +159,7 @@ describe('startTinygresWorker', () => {
   it('rejects well-shaped methods with unsafe parameters', async () => {
     const scope = new FakeScope();
     const engine = mockEngine();
-    startTinygresWorker({scope, engineFactory: async () => engine});
+    startWorker({scope, engineFactory: async () => engine});
 
     scope.send({
       v: PROTOCOL_VERSION,
@@ -200,7 +200,7 @@ describe('startTinygresWorker', () => {
         });
       },
     };
-    startTinygresWorker({scope, source, engineFactory: async () => engine});
+    startWorker({scope, source, engineFactory: async () => engine});
 
     scope.send({
       v: PROTOCOL_VERSION,
@@ -243,7 +243,7 @@ describe('startTinygresWorker', () => {
         });
       },
     };
-    startTinygresWorker({
+    startWorker({
       scope,
       source,
       engineFactory: async () => mockEngine(),

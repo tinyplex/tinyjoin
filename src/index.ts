@@ -1,10 +1,10 @@
-export {createTinygresClient, TinygresClient} from './client/client.js';
+export {createClient, Client} from './client/client.js';
 export type {
   SubscriptionOptions,
   TablesChangedEvent,
-  TinygresClientOptions,
+  ClientOptions,
 } from './client/client.js';
-export {TinygresError} from './client/error.js';
+export {ClientError} from './client/error.js';
 export {QueryBuilder} from './client/query-builder.js';
 export type {QueryResponse} from './client/query-builder.js';
 export type {
@@ -17,7 +17,7 @@ export type {
   QueryPlan,
   QueryResult,
   Row,
-  SerializedTinygresError,
+  SerializedError,
   SourceCursor,
   SyncPhase,
   SyncState,

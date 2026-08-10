@@ -1,5 +1,5 @@
 import {
-  createTinygresClient,
+  createClient,
   type ChangeBatch,
   type TableSchema,
 } from '../../../dist/index.js';
@@ -54,7 +54,7 @@ let invalidations = 0;
 let simulatedChanges = 0;
 
 async function boot(): Promise<void> {
-  const database = createTinygresClient({schemas: [postsSchema]});
+  const database = createClient({schemas: [postsSchema]});
   await database.ready();
   await database.replaceTable(postsSchema, initialPosts);
   await renderQuery(database);
@@ -135,7 +135,7 @@ async function boot(): Promise<void> {
 }
 
 async function renderQuery(
-  database: ReturnType<typeof createTinygresClient>,
+  database: ReturnType<typeof createClient>,
 ): Promise<void> {
   const startedAt = performance.now();
   const result = await database.query<Post>(

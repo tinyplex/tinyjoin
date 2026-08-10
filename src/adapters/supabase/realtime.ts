@@ -93,7 +93,7 @@ export function normalizeSupabaseChange(
 
 /**
  * Wraps the public supabase-js channel API without importing it. Keeping the
- * SDK injected avoids making Tinygres core depend on Supabase or duplicating a
+ * SDK injected avoids making TinyGres core depend on Supabase or duplicating a
  * Supabase client already present in the host application.
  */
 export function createSupabaseJsRealtimeTransport<

@@ -1,13 +1,13 @@
-import type {SerializedTinygresError} from '../protocol.js';
+import type {SerializedError} from '../protocol.js';
 
-export class TinygresError extends Error {
+export class ClientError extends Error {
   readonly code: string;
-  readonly details: SerializedTinygresError['details'];
+  readonly details: SerializedError['details'];
   readonly retryable: boolean;
 
-  constructor(error: SerializedTinygresError) {
+  constructor(error: SerializedError) {
     super(error.message);
-    this.name = 'TinygresError';
+    this.name = 'ClientError';
     this.code = error.code;
     this.details = error.details;
     this.retryable = error.retryable ?? false;
@@ -16,13 +16,13 @@ export class TinygresError extends Error {
   static fromUnknown(
     error: unknown,
     code = 'UNKNOWN_ERROR',
-  ): TinygresError {
-    if (error instanceof TinygresError) {
+  ): ClientError {
+    if (error instanceof ClientError) {
       return error;
     }
     if (error instanceof Error) {
-      return new TinygresError({code, message: error.message});
+      return new ClientError({code, message: error.message});
     }
-    return new TinygresError({code, message: String(error)});
+    return new ClientError({code, message: String(error)});
   }
 }

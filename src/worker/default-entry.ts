@@ -1,3 +1,3 @@
-import {startTinygresWorker} from './host.js';
+import {startWorker} from './host.js';
 
-startTinygresWorker();
+startWorker();

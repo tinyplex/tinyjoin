@@ -1,6 +1,6 @@
 [package]
 name = "tinygres-wasm"
-description = "WebAssembly bindings for the Tinygres engine"
+description = "WebAssembly bindings for the TinyGres engine"
 edition.workspace = true
 license.workspace = true
 publish = false

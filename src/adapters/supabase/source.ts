@@ -3,7 +3,7 @@ import type {
   ReplicaSourceContext,
   SourceCapabilities,
 } from '../types.js';
-import type {Row, SerializedTinygresError, SyncPhase} from '../../protocol.js';
+import type {Row, SerializedError, SyncPhase} from '../../protocol.js';
 import {
   normalizeSupabaseConfig,
   relationKey,
@@ -327,7 +327,7 @@ export function createSupabaseSource(
   return new SupabaseSource(options);
 }
 
-function serializeSourceError(error: unknown): SerializedTinygresError {
+function serializeSourceError(error: unknown): SerializedError {
   if (error instanceof SupabaseSourceError) {
     return {
       code: error.code,

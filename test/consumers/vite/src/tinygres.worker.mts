@@ -1,3 +1,3 @@
-import {startTinygresWorker} from 'tinygres/worker';
+import {startWorker} from 'tinygres/worker';
 
-startTinygresWorker();
+startWorker();

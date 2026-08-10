@@ -3,10 +3,10 @@ export type {
   ReplicaSourceContext,
   SourceCapabilities,
 } from '../adapters/types.js';
-export {startTinygresWorker} from './host.js';
+export {startWorker} from './host.js';
 export type {
-  TinygresWorkerController,
-  TinygresWorkerOptions,
+  WorkerController,
+  StartWorkerOptions,
   WorkerScope,
 } from './host.js';
 export type {WorkerEngine} from './engine.js';

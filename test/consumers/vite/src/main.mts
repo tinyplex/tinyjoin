@@ -1,7 +1,7 @@
 import {
-  createTinygresClient,
+  createClient,
   type ChangeBatch,
-  type TinygresClientOptions,
+  type ClientOptions,
 } from 'tinygres';
 
 type Post = {
@@ -12,7 +12,7 @@ type Post = {
 const body = document.body;
 const resultElement = requiredElement<HTMLOutputElement>('#result');
 const mode = new URLSearchParams(location.search).get('worker');
-const options: TinygresClientOptions =
+const options: ClientOptions =
   mode === 'app-local'
     ? {
         worker: new Worker(new URL('./tinygres.worker.mts', import.meta.url), {
@@ -30,10 +30,10 @@ run(options, mode ?? 'default').catch((error: unknown) => {
 });
 
 async function run(
-  clientOptions: TinygresClientOptions,
+  clientOptions: ClientOptions,
   workerMode: string,
 ): Promise<void> {
-  const database = createTinygresClient({
+  const database = createClient({
     ...clientOptions,
     schemas: [{name: 'posts', primaryKey: ['id']}],
   });

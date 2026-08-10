@@ -3,7 +3,7 @@ use std::str::FromStr;
 use serde_json::{Map, Number, Value};
 
 use crate::{
-    Filter, FilterOperator, QueryPlan, QueryResult, Result, Row, StorageDriver, TinygresError,
+    EngineError, Filter, FilterOperator, QueryPlan, QueryResult, Result, Row, StorageDriver,
 };
 
 const MAX_SQL_BYTES: usize = 64 * 1024;
@@ -15,12 +15,12 @@ const MAX_COMMENT_DEPTH: usize = 32;
 
 pub(crate) fn execute<S: StorageDriver>(storage: &S, plan: &QueryPlan) -> Result<QueryResult> {
     if plan.table.trim().is_empty() {
-        return Err(TinygresError::invalid_query(
+        return Err(EngineError::invalid_query(
             "A query must name exactly one table",
         ));
     }
     if plan.columns.as_ref().is_some_and(Vec::is_empty) {
-        return Err(TinygresError::invalid_query(
+        return Err(EngineError::invalid_query(
             "A projection must contain at least one column",
         ));
     }
@@ -29,12 +29,12 @@ pub(crate) fn execute<S: StorageDriver>(storage: &S, plan: &QueryPlan) -> Result
         .as_ref()
         .is_some_and(|columns| columns.len() > MAX_PROJECTION_COLUMNS)
     {
-        return Err(TinygresError::invalid_query(format!(
+        return Err(EngineError::invalid_query(format!(
             "A projection cannot contain more than {MAX_PROJECTION_COLUMNS} columns"
         )));
     }
     if plan.filters.len() > MAX_FILTERS {
-        return Err(TinygresError::invalid_query(format!(
+        return Err(EngineError::invalid_query(format!(
             "A query cannot contain more than {MAX_FILTERS} filters"
         )));
     }
@@ -66,12 +66,12 @@ pub(crate) fn execute<S: StorageDriver>(storage: &S, plan: &QueryPlan) -> Result
 
 pub(crate) fn parse_sql(sql: &str, params: &[Value]) -> Result<QueryPlan> {
     if sql.len() > MAX_SQL_BYTES {
-        return Err(TinygresError::invalid_query(format!(
+        return Err(EngineError::invalid_query(format!(
             "SQL text exceeds the {MAX_SQL_BYTES}-byte limit"
         )));
     }
     if params.len() > MAX_PARAMETERS {
-        return Err(TinygresError::invalid_query(format!(
+        return Err(EngineError::invalid_query(format!(
             "A SQL query cannot receive more than {MAX_PARAMETERS} parameters"
         )));
     }
@@ -177,14 +177,14 @@ impl<'a> Lexer<'a> {
                 let mut depth = 1;
                 while depth > 0 {
                     if self.position >= self.sql.len() {
-                        return Err(TinygresError::parse_error(
+                        return Err(EngineError::parse_error(
                             "Unterminated block comment in SQL text",
                         ));
                     }
                     if self.remaining().starts_with("/*") {
                         depth += 1;
                         if depth > MAX_COMMENT_DEPTH {
-                            return Err(TinygresError::invalid_query(format!(
+                            return Err(EngineError::invalid_query(format!(
                                 "SQL comments cannot nest more than {MAX_COMMENT_DEPTH} levels"
                             )));
                         }
@@ -207,7 +207,7 @@ impl<'a> Lexer<'a> {
         let mut value = String::new();
         loop {
             let Some(character) = self.peek() else {
-                return Err(TinygresError::parse_error(
+                return Err(EngineError::parse_error(
                     "Unterminated quoted identifier in SQL text",
                 ));
             };
@@ -233,7 +233,7 @@ impl<'a> Lexer<'a> {
         let mut value = String::new();
         loop {
             let Some(character) = self.peek() else {
-                return Err(TinygresError::parse_error(
+                return Err(EngineError::parse_error(
                     "Unterminated string literal in SQL text",
                 ));
             };
@@ -318,7 +318,7 @@ impl<'a> Lexer<'a> {
 
     fn push(&mut self, token: Token) -> Result<()> {
         if self.tokens.len() >= MAX_SQL_TOKENS {
-            return Err(TinygresError::invalid_query(format!(
+            return Err(EngineError::invalid_query(format!(
                 "SQL text exceeds the {MAX_SQL_TOKENS}-token limit"
             )));
         }
@@ -362,7 +362,7 @@ impl<'a> SqlParser<'a> {
 
     fn parse(mut self) -> Result<QueryPlan> {
         if !self.consume_keyword("select") {
-            return Err(TinygresError::unsupported_sql(
+            return Err(EngineError::unsupported_sql(
                 "Only read-only SELECT statements are supported",
             ));
         }
@@ -404,7 +404,7 @@ impl<'a> SqlParser<'a> {
         let mut columns = Vec::new();
         loop {
             if columns.len() >= MAX_PROJECTION_COLUMNS {
-                return Err(TinygresError::invalid_query(format!(
+                return Err(EngineError::invalid_query(format!(
                     "A projection cannot contain more than {MAX_PROJECTION_COLUMNS} columns"
                 )));
             }
@@ -423,7 +423,7 @@ impl<'a> SqlParser<'a> {
         }
         let second = self.parse_identifier()?;
         if self.peek_matches(TokenMatcher::Dot) {
-            return Err(TinygresError::unsupported_sql(
+            return Err(EngineError::unsupported_sql(
                 "Only unqualified or schema-qualified table names are supported",
             ));
         }
@@ -434,7 +434,7 @@ impl<'a> SqlParser<'a> {
         let mut filters = Vec::new();
         loop {
             if filters.len() >= MAX_FILTERS {
-                return Err(TinygresError::invalid_query(format!(
+                return Err(EngineError::invalid_query(format!(
                     "A query cannot contain more than {MAX_FILTERS} filters"
                 )));
             }
@@ -457,24 +457,24 @@ impl<'a> SqlParser<'a> {
     fn parse_limit(&mut self) -> Result<usize> {
         let value = self.parse_value()?;
         let Value::Number(number) = value else {
-            return Err(TinygresError::invalid_query(
+            return Err(EngineError::invalid_query(
                 "LIMIT must be a non-negative integer",
             ));
         };
         number
             .as_u64()
             .and_then(|number| usize::try_from(number).ok())
-            .ok_or_else(|| TinygresError::invalid_query("LIMIT is too large"))
+            .ok_or_else(|| EngineError::invalid_query("LIMIT is too large"))
     }
 
     fn parse_value(&mut self) -> Result<Value> {
         let Some(token) = self.next() else {
-            return Err(TinygresError::parse_error("Expected a SQL value"));
+            return Err(EngineError::parse_error("Expected a SQL value"));
         };
         match token {
             Token::String(value) => Ok(Value::String(value)),
             Token::Number(value) => Number::from_str(&value).map(Value::Number).map_err(|_| {
-                TinygresError::invalid_query(format!("Invalid number literal `{value}`"))
+                EngineError::invalid_query(format!("Invalid number literal `{value}`"))
             }),
             Token::Placeholder(index) => bind_parameter(&index, self.params),
             Token::Identifier {
@@ -495,15 +495,15 @@ impl<'a> SqlParser<'a> {
 
     fn parse_identifier(&mut self) -> Result<String> {
         let Some(Token::Identifier { value, quoted }) = self.next() else {
-            return Err(TinygresError::parse_error("Expected a SQL identifier"));
+            return Err(EngineError::parse_error("Expected a SQL identifier"));
         };
         if value.is_empty() {
-            return Err(TinygresError::parse_error(
+            return Err(EngineError::parse_error(
                 "A quoted SQL identifier cannot be empty",
             ));
         }
         if !quoted && is_reserved_keyword(&value) {
-            return Err(TinygresError::parse_error(format!(
+            return Err(EngineError::parse_error(format!(
                 "Reserved keyword `{value}` cannot be used as an unquoted SQL identifier"
             )));
         }
@@ -592,22 +592,22 @@ fn is_reserved_keyword(identifier: &str) -> bool {
 fn bind_parameter(index: &str, params: &[Value]) -> Result<Value> {
     let placeholder = format!("${index}");
     let index = index.parse::<usize>().map_err(|_| {
-        TinygresError::bind_error(format!("Invalid parameter placeholder `{placeholder}`"))
+        EngineError::bind_error(format!("Invalid parameter placeholder `{placeholder}`"))
     })?;
     if index == 0 {
-        return Err(TinygresError::bind_error(
+        return Err(EngineError::bind_error(
             "PostgreSQL parameter indexes start at $1",
         ));
     }
     params.get(index - 1).cloned().ok_or_else(|| {
-        TinygresError::bind_error(format!("No value was provided for `{placeholder}`"))
+        EngineError::bind_error(format!("No value was provided for `{placeholder}`"))
     })
 }
 
 fn matches_filters(row: &Row, filters: &[Filter], table: &str) -> Result<bool> {
     for filter in filters {
         let Some(actual) = row.get(&filter.column) else {
-            return Err(TinygresError::column_not_found(&filter.column, table));
+            return Err(EngineError::column_not_found(&filter.column, table));
         };
         let matched = match filter.operator {
             FilterOperator::Eq => {
@@ -629,14 +629,14 @@ fn project_row(mut row: Row, columns: Option<&[String]>, table: &str) -> Result<
     for column in columns {
         let value = row
             .remove(column)
-            .ok_or_else(|| TinygresError::column_not_found(column, table))?;
+            .ok_or_else(|| EngineError::column_not_found(column, table))?;
         projected.insert(column.clone(), value);
     }
     Ok(projected)
 }
 
-fn unsupported_shape() -> TinygresError {
-    TinygresError::unsupported_sql(
+fn unsupported_shape() -> EngineError {
+    EngineError::unsupported_sql(
         "The initial SQL subset supports SELECT columns FROM one table, ANDed equality filters, and LIMIT",
     )
 }

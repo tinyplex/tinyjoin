@@ -5,7 +5,7 @@ mod query;
 mod storage;
 
 pub use engine::Engine;
-pub use error::{Result, TinygresError};
+pub use error::{EngineError, Result};
 pub use model::{
     ApplyOutcome, Change, ChangeBatch, Filter, FilterOperator, QueryPlan, QueryResult, Row,
     SourceCursor, TableSchema,

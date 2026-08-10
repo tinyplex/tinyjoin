@@ -20,7 +20,7 @@ test('measures warmed worker round-trip latency', async ({page}) => {
     body: JSON.stringify(report, null, 2),
     contentType: 'application/json',
   });
-  console.log(`Tinygres worker latency: ${JSON.stringify(report)} ms`);
+  console.log(`TinyGres worker latency: ${JSON.stringify(report)} ms`);
 
   expect(samples).toHaveLength(200);
   expect(samples.every((sample) => Number.isFinite(sample) && sample >= 0)).toBe(

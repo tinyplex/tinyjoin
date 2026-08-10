@@ -11,7 +11,7 @@ import type {
 import {QueryBuilder, type QueryExecutor} from './query-builder.js';
 import {WorkerRpc, type WorkerLike} from './rpc.js';
 
-export interface TinygresClientOptions {
+export interface ClientOptions {
   worker?: WorkerLike;
   workerFactory?: () => WorkerLike;
   workerUrl?: string | URL;
@@ -24,7 +24,7 @@ export type SubscriptionOptions = {
   tables?: string[];
 };
 
-export class TinygresClient implements QueryExecutor {
+export class Client implements QueryExecutor {
   readonly #rpc: WorkerRpc;
   readonly #ready: Promise<void>;
   readonly #subscriptions = new Set<{
@@ -35,7 +35,8 @@ export class TinygresClient implements QueryExecutor {
   #revision = 0;
   #closed = false;
 
-  constructor(worker: WorkerLike, schemas: TableSchema[] = []) {
+  constructor(options: ClientOptions = {}) {
+    const worker = createWorker(options);
     this.#rpc = new WorkerRpc(worker);
     this.#rpc.onEvent((event) => {
       if (event.event === 'tablesChanged') {
@@ -54,7 +55,9 @@ export class TinygresClient implements QueryExecutor {
         }
       }
     });
-    this.#ready = this.#rpc.request('init', {schemas}).then(({revision}) => {
+    this.#ready = this.#rpc.request('init', {
+      schemas: options.schemas ?? [],
+    }).then(({revision}) => {
       this.#revision = revision;
     });
   }
@@ -149,23 +152,25 @@ export class TinygresClient implements QueryExecutor {
   }
 }
 
-export function createTinygresClient(
-  options: TinygresClientOptions = {},
-): TinygresClient {
+export function createClient(options: ClientOptions = {}): Client {
+  return new Client(options);
+}
+
+function createWorker(options: ClientOptions): WorkerLike {
   const selected = [options.worker, options.workerFactory, options.workerUrl].filter(
     (value) => value !== undefined,
   );
   if (selected.length > 1) {
     throw new TypeError(
-      'Provide only one of worker, workerFactory, or workerUrl to Tinygres',
+      'Provide only one of worker, workerFactory, or workerUrl to TinyGres',
     );
   }
 
-  const worker =
+  return (
     options.worker ??
     options.workerFactory?.() ??
-    (options.workerUrl ? createUrlWorker(options.workerUrl) : createDefaultWorker());
-  return new TinygresClient(worker, options.schemas);
+    (options.workerUrl ? createUrlWorker(options.workerUrl) : createDefaultWorker())
+  );
 }
 
 function createUrlWorker(url: string | URL): WorkerLike {
@@ -184,7 +189,7 @@ function createDefaultWorker(): WorkerLike {
 function assertWorkerAvailable(): void {
   if (typeof Worker === 'undefined') {
     throw new Error(
-      'Tinygres requires a browser Worker. Importing is SSR-safe, but create the client in the browser or provide a Worker-like implementation.',
+      'TinyGres requires a browser Worker. Importing is SSR-safe, but create the client in the browser or provide a Worker-like implementation.',
     );
   }
 }

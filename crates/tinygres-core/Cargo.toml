@@ -1,6 +1,6 @@
 [package]
 name = "tinygres-core"
-description = "The native-testable storage and query core for Tinygres"
+description = "The native-testable storage and query core for TinyGres"
 edition.workspace = true
 license.workspace = true
 publish = false

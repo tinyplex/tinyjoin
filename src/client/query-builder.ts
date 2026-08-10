@@ -1,9 +1,9 @@
 import type {JsonValue, QueryPlan, Row} from '../protocol.js';
-import {TinygresError} from './error.js';
+import {ClientError} from './error.js';
 
 export type QueryResponse<RowType extends object> =
   | {data: RowType[]; error: null; revision: number}
-  | {data: null; error: TinygresError; revision?: number};
+  | {data: null; error: ClientError; revision?: number};
 
 export interface QueryExecutor {
   executePlan(plan: QueryPlan): Promise<{
@@ -34,7 +34,7 @@ export class QueryBuilder<RowType extends object = Row>
 
   eq(column: string, value: JsonValue): QueryBuilder<RowType> {
     if (!column.trim()) {
-      throw new TinygresError({
+      throw new ClientError({
         code: 'INVALID_QUERY',
         message: 'A filter column cannot be empty',
       });
@@ -49,7 +49,7 @@ export class QueryBuilder<RowType extends object = Row>
 
   limit(limit: number): QueryBuilder<RowType> {
     if (!Number.isSafeInteger(limit) || limit < 0) {
-      throw new TinygresError({
+      throw new ClientError({
         code: 'INVALID_QUERY',
         message: 'A query limit must be a non-negative safe integer',
       });
@@ -66,7 +66,7 @@ export class QueryBuilder<RowType extends object = Row>
         revision: result.revision,
       };
     } catch (error) {
-      return {data: null, error: TinygresError.fromUnknown(error)};
+      return {data: null, error: ClientError.fromUnknown(error)};
     }
   }
 
@@ -90,7 +90,7 @@ function parseProjection(columns: string): string[] | undefined {
   }
   const projection = columns.split(',').map((column) => column.trim());
   if (projection.length === 0 || projection.some((column) => !column)) {
-    throw new TinygresError({
+    throw new ClientError({
       code: 'INVALID_QUERY',
       message: 'A projection must contain one or more column names',
     });

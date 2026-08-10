@@ -29,7 +29,7 @@ describe('WorkerRpc', () => {
     await expect(second).resolves.toEqual({revision: 2, rows: [{id: 2}]});
   });
 
-  it('turns structured worker failures into Tinygres errors', async () => {
+  it('turns structured worker failures into TinyGres errors', async () => {
     const worker = new FakeWorker();
     const rpc = new WorkerRpc(worker);
     const request = rpc.request('querySql', {sql: 'bad', params: []});

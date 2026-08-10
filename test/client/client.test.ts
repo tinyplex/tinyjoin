@@ -1,6 +1,6 @@
 import {describe, expect, it, vi} from 'vitest';
 
-import {TinygresClient} from '../../src/client/client.ts';
+import {Client} from '../../src/client/client.ts';
 import {PROTOCOL_VERSION, type WorkerRequest} from '../../src/protocol.ts';
 import {FakeWorker} from '../helpers/fake-worker.ts';
 
@@ -35,10 +35,10 @@ function respondingWorker(): FakeWorker {
   return worker;
 }
 
-describe('TinygresClient', () => {
+describe('Client', () => {
   it('supports an awaitable Supabase-style query chain', async () => {
     const worker = respondingWorker();
-    const client = new TinygresClient(worker);
+    const client = new Client({worker});
 
     const response = await client
       .from<{id: number; title: string}>('posts')
@@ -62,7 +62,7 @@ describe('TinygresClient', () => {
 
   it('notifies only subscriptions affected by a worker mutation', async () => {
     const worker = respondingWorker();
-    const client = new TinygresClient(worker);
+    const client = new Client({worker});
     await client.ready();
     const posts = vi.fn();
     const users = vi.fn();
@@ -82,7 +82,7 @@ describe('TinygresClient', () => {
 
   it('closes the RPC session and underlying worker', async () => {
     const worker = respondingWorker();
-    const client = new TinygresClient(worker);
+    const client = new Client({worker});
     await client.close();
 
     expect(worker.terminated).toBe(true);

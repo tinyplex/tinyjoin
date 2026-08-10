@@ -21,7 +21,7 @@ if (!targetLibDir.ok || !existsSync(targetLibDir.output)) {
   const detected = sysroot.ok ? `\nDetected Rust sysroot: ${sysroot.output}` : '';
 
   console.error(`
-Tinygres cannot build WebAssembly because the ${target} standard library is
+TinyGres cannot build WebAssembly because the ${target} standard library is
 not installed for the active Rust compiler.${detected}
 
 This repository uses rustup to install its pinned Rust version, Clippy,

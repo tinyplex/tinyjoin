@@ -8,7 +8,7 @@ export interface SupabaseTableConfig {
   /** Columns that uniquely identify a row. Required for Realtime deletes. */
   primaryKey: string[];
   /**
-   * Optional local Tinygres name. Public tables default to their table name;
+   * Optional local TinyGres name. Public tables default to their table name;
    * other schemas default to `schema.table`.
    */
   localName?: string;

@@ -7,7 +7,7 @@ import {
   type WorkerEvent,
   type WorkerRequest,
 } from '../protocol.js';
-import {TinygresError} from './error.js';
+import {ClientError} from './error.js';
 
 export interface WorkerLike {
   postMessage(message: unknown): void;
@@ -57,9 +57,9 @@ export class WorkerRpc {
   ): Promise<RpcMethods[Method]['response']> {
     if (this.#disposed) {
       return Promise.reject(
-        new TinygresError({
+        new ClientError({
           code: 'WORKER_TERMINATED',
-          message: 'The Tinygres worker has been closed',
+          message: 'The TinyGres worker has been closed',
         }),
       );
     }
@@ -78,7 +78,7 @@ export class WorkerRpc {
         this.#worker.postMessage(request);
       } catch (error) {
         this.#pending.delete(id);
-        reject(TinygresError.fromUnknown(error, 'WORKER_POST_FAILED'));
+        reject(ClientError.fromUnknown(error, 'WORKER_POST_FAILED'));
       }
     }) as Promise<RpcMethods[Method]['response']>;
   }
@@ -88,7 +88,7 @@ export class WorkerRpc {
     return () => this.#eventListeners.delete(listener);
   }
 
-  dispose(error?: TinygresError): void {
+  dispose(error?: ClientError): void {
     if (this.#disposed) {
       return;
     }
@@ -99,9 +99,9 @@ export class WorkerRpc {
     this.#worker.terminate?.();
     const reason =
       error ??
-      new TinygresError({
+      new ClientError({
         code: 'WORKER_TERMINATED',
-        message: 'The Tinygres worker has been closed',
+        message: 'The TinyGres worker has been closed',
       });
     for (const pending of this.#pending.values()) {
       pending.reject(reason);
@@ -119,9 +119,9 @@ export class WorkerRpc {
     }
     if (!isWorkerResponse(event.data)) {
       this.dispose(
-        new TinygresError({
+        new ClientError({
           code: 'PROTOCOL_MISMATCH',
-          message: 'The Tinygres worker sent an invalid protocol message',
+          message: 'The TinyGres worker sent an invalid protocol message',
         }),
       );
       return;
@@ -135,24 +135,24 @@ export class WorkerRpc {
     if (event.data.ok) {
       pending.resolve(event.data.result);
     } else {
-      pending.reject(new TinygresError(event.data.error));
+      pending.reject(new ClientError(event.data.error));
     }
   };
 
   readonly #onMessageError = (): void => {
     this.dispose(
-      new TinygresError({
+      new ClientError({
         code: 'WORKER_MESSAGE_ERROR',
-        message: 'The browser could not deserialize a Tinygres worker message',
+        message: 'The browser could not deserialize a TinyGres worker message',
       }),
     );
   };
 
   readonly #onError = (event: ErrorEvent): void => {
     this.dispose(
-      new TinygresError({
+      new ClientError({
         code: 'WORKER_ERROR',
-        message: event.message || 'The Tinygres worker crashed',
+        message: event.message || 'The TinyGres worker crashed',
       }),
     );
   };

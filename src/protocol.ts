@@ -52,7 +52,7 @@ export interface QueryResult<RowType extends object = Row> {
   rows: RowType[];
 }
 
-export interface SerializedTinygresError {
+export interface SerializedError {
   code: string;
   message: string;
   details?: JsonValue;
@@ -74,7 +74,7 @@ export interface SyncState {
   phase: SyncPhase;
   sourceId?: string;
   lastReconciledAt?: string;
-  error?: SerializedTinygresError;
+  error?: SerializedError;
 }
 
 export interface RpcMethods {
@@ -130,7 +130,7 @@ export type WorkerResponse =
       v: typeof PROTOCOL_VERSION;
       id: number;
       ok: false;
-      error: SerializedTinygresError;
+      error: SerializedError;
     };
 
 export type WorkerEvent =
@@ -154,7 +154,7 @@ export function isWorkerResponse(value: unknown): value is WorkerResponse {
   }
   return value.ok
     ? 'result' in value
-    : isSerializedTinygresError(value.error);
+    : isSerializedError(value.error);
 }
 
 export function isWorkerEvent(value: unknown): value is WorkerEvent {
@@ -215,9 +215,9 @@ export function isWorkerRequest(value: unknown): value is WorkerRequest {
   }
 }
 
-export function isSerializedTinygresError(
+export function isSerializedError(
   value: unknown,
-): value is SerializedTinygresError {
+): value is SerializedError {
   return (
     isRecord(value) &&
     typeof value.code === 'string' &&
@@ -329,7 +329,7 @@ function isSyncState(value: unknown): value is SyncState {
     (value.sourceId === undefined || typeof value.sourceId === 'string') &&
     (value.lastReconciledAt === undefined ||
       typeof value.lastReconciledAt === 'string') &&
-    (value.error === undefined || isSerializedTinygresError(value.error))
+    (value.error === undefined || isSerializedError(value.error))
   );
 }
 

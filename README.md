@@ -1,10 +1,10 @@
-# Tinygres
+# TinyGres
 
-Tinygres is an experimental, worker-first local query cache for PostgreSQL data.
+TinyGres is an experimental, worker-first local query cache for PostgreSQL data.
 Its query and storage engine is written in Rust, compiled to WebAssembly, and
 kept off the browser's main thread.
 
-> [!IMPORTANT] Tinygres is an early read-only prototype. It does not persist
+> [!IMPORTANT] TinyGres is an early read-only prototype. It does not persist
 > data, accept application writes, or provide complete PostgreSQL SQL
 > compatibility. Its Supabase adapter is best-effort and reconciles after
 > reconnects; it is not a durable logical-replication stream.
@@ -64,7 +64,7 @@ target and prints this setup guidance before invoking `wasm-pack`.
 ## Browser API
 
 ```ts
-import {createTinygresClient} from 'tinygres';
+import {createClient} from 'tinygres';
 
 type Post = {
   id: number;
@@ -72,7 +72,7 @@ type Post = {
   published: boolean;
 };
 
-const db = createTinygresClient({
+const db = createClient({
   schemas: [{name: 'posts', primaryKey: ['id']}],
 });
 
@@ -111,14 +111,14 @@ unsubscribe();
 await db.close();
 ```
 
-`createTinygresClient` creates a dedicated module worker by default. It is safe
+`createClient` creates a dedicated module worker by default. It is safe
 to import during server rendering; the worker is only constructed when the
 function is called in a browser.
 
 For an application-owned worker, pass `worker`, `workerFactory`, or `workerUrl`:
 
 ```ts
-const db = createTinygresClient({
+const db = createClient({
   workerFactory: () =>
     new Worker(new URL('./tinygres.worker.ts', import.meta.url), {
       name: 'tinygres',
@@ -133,9 +133,9 @@ replication work onto the UI thread:
 
 ```ts
 // tinygres.worker.ts
-import {startTinygresWorker} from 'tinygres/worker';
+import {startWorker} from 'tinygres/worker';
 
-startTinygresWorker({source: myReadOnlyReplicaSource});
+startWorker({source: myReadOnlyReplicaSource});
 ```
 
 Adapter functions live in the worker and normalize their input into table
@@ -154,7 +154,7 @@ import {
   createSupabaseJsRealtimeTransport,
   createSupabaseSource,
 } from 'tinygres/supabase';
-import {startTinygresWorker} from 'tinygres/worker';
+import {startWorker} from 'tinygres/worker';
 
 const url = import.meta.env.VITE_SUPABASE_URL;
 const publishableKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
@@ -166,7 +166,7 @@ const supabase = createClient(url, publishableKey, {
   },
 });
 
-startTinygresWorker({
+startWorker({
   source: createSupabaseSource({
     url,
     publishableKey,
@@ -185,7 +185,7 @@ startTinygresWorker({
 
 ```ts
 // app.ts
-const db = createTinygresClient({
+const db = createClient({
   worker: new Worker(new URL('./tinygres.worker.ts', import.meta.url), {
     name: 'tinygres',
     type: 'module',
@@ -195,14 +195,14 @@ await db.ready();
 ```
 
 Install `@supabase/supabase-js` in the application when using this helper;
-Tinygres deliberately does not bundle it or add it to the core runtime. The
+TinyGres deliberately does not bundle it or add it to the core runtime. The
 example above covers anonymous/public-key access. Passing authenticated sessions
 from the main thread into the worker, including safe token refresh and cache
 namespacing, is a planned integration point rather than a supported contract
 yet. Never put a Supabase secret or service-role key in browser code.
 
 Supabase Realtime does not provide a durable client cursor or transaction
-boundaries. Tinygres therefore reports this source as `live-best-effort`, marks
+boundaries. TinyGres therefore reports this source as `live-best-effort`, marks
 it stale after a disconnect or malformed payload, and replaces affected local
 snapshots before reporting it live again.
 
@@ -223,7 +223,7 @@ Values are represented as JSON-compatible values.
 
 ## Current SQL compatibility
 
-Tinygres currently accepts one read-only `SELECT` statement containing:
+TinyGres currently accepts one read-only `SELECT` statement containing:
 
 - one unqualified or schema-qualified table;
 - `*` or a list of simple column names;
@@ -254,7 +254,7 @@ receive an invalidation, and re-query the new row.
 The packed-package test separately proves SSR-safe import, declarations, a
 production Vite build, and real browser execution through both the packaged
 default worker and an application-owned worker. It installs the tarball rather
-than resolving Tinygres through a workspace link.
+than resolving TinyGres through a workspace link.
 
 The current feasibility target is an uncompressed WASM binary smaller than 700
 KiB. The size check is intentionally independent of gzip size so it cannot hide
@@ -267,4 +267,4 @@ replication gateway without changing the local query API. The next storage phase
 will add OPFS-backed persistence and crash recovery while keeping the current
 in-memory driver for tests and ephemeral use.
 
-Tinygres is MIT licensed.
+TinyGres is MIT licensed.

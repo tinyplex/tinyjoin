@@ -75,7 +75,7 @@ if (installedManifest.name !== 'tinygres') {
 for (const developmentField of ['private', 'scripts', 'devDependencies']) {
   if (developmentField in installedManifest) {
     throw new Error(
-      `Published Tinygres manifest contains development field ${developmentField}`,
+      `Published TinyGres manifest contains development field ${developmentField}`,
     );
   }
 }
@@ -85,7 +85,7 @@ const ssrOutput = run(
   [
     '--input-type=module',
     '--eval',
-    "const pkg = await import('tinygres'); if (typeof pkg.createTinygresClient !== 'function') throw new Error('missing client export'); console.log('SSR_IMPORT_OK');",
+    "const pkg = await import('tinygres'); if (typeof pkg.createClient !== 'function') throw new Error('missing client export'); console.log('SSR_IMPORT_OK');",
   ],
   appDirectory,
 );
@@ -193,13 +193,13 @@ function assertPackedFiles(packed) {
     'wasm/tinygres_wasm_bg.wasm',
   ]) {
     if (!files.includes(required)) {
-      throw new Error(`Packed Tinygres is missing ${required}`);
+      throw new Error(`Packed TinyGres is missing ${required}`);
     }
   }
   const nestedManifests = files.filter((file) => file.endsWith('/package.json'));
   if (nestedManifests.length > 0) {
     throw new Error(
-      `Packed Tinygres contains nested package manifests: ${nestedManifests.join(', ')}`,
+      `Packed TinyGres contains nested package manifests: ${nestedManifests.join(', ')}`,
     );
   }
 }
