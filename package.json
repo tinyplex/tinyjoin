@@ -1,6 +1,6 @@
 {
   "name": "tinygres",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "author": "jamesgpearce",
   "private": true,
   "type": "module",
