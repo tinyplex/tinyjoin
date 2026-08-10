@@ -1,14 +1,13 @@
 # Tinygres
 
-Tinygres is an experimental, worker-first local query cache for PostgreSQL
-data. Its query and storage engine is written in Rust, compiled to WebAssembly,
-and kept off the browser's main thread.
+Tinygres is an experimental, worker-first local query cache for PostgreSQL data.
+Its query and storage engine is written in Rust, compiled to WebAssembly, and
+kept off the browser's main thread.
 
-> [!IMPORTANT]
-> Tinygres is an early read-only prototype. It does not persist data, accept
-> application writes, or provide complete PostgreSQL SQL compatibility. Its
-> Supabase adapter is best-effort and reconciles after reconnects; it is not a
-> durable logical-replication stream.
+> [!IMPORTANT] Tinygres is an early read-only prototype. It does not persist
+> data, accept application writes, or provide complete PostgreSQL SQL
+> compatibility. Its Supabase adapter is best-effort and reconciles after
+> reconnects; it is not a durable logical-replication stream.
 
 The first proof of concept deliberately does a small number of things:
 
@@ -39,13 +38,13 @@ browser and package tests.
 Application developers consume the prebuilt worker and WASM from the npm
 package; Rust is not required in consuming projects. Building this repository
 from source requires `rustup`. The checked-in toolchain file selects the Rust
-version and `wasm32-unknown-unknown` target, while the npm development dependency
-provides `wasm-pack`. The build stages wasm-bindgen output in a temporary
-directory and copies only the runtime JavaScript and `.wasm` files into
-`dist/wasm`, so generated package metadata never appears under `src/`. Cargo's
-compiler cache lives under `node_modules/.cache/tinygres` when using the project
-scripts rather than creating a top-level `target/` directory. Use
-`npm run cargo -- <arguments>` for other Cargo commands with the same behavior.
+version and `wasm32-unknown-unknown` target, while the npm development
+dependency provides `wasm-pack`. The build stages wasm-bindgen output in a
+temporary directory and copies only the runtime JavaScript and `.wasm` files
+into `dist/wasm`, so generated package metadata never appears under `src/`.
+Cargo's compiler cache lives under `node_modules/.cache/tinygres` when using the
+project scripts rather than creating a top-level `target/` directory. Use `npm
+run cargo -- <arguments>` for other Cargo commands with the same behavior.
 
 If `rustc` comes from Homebrew, install rustup alongside it and activate the
 rustup proxies in the current shell:
@@ -59,8 +58,8 @@ npm run build:wasm
 
 There is no need to uninstall Homebrew Rust. In persistent shell configuration,
 load `$HOME/.cargo/env` after Homebrew's `brew shellenv` so the rustup-managed
-`rustc` and `cargo` take precedence. The build command checks for the WASM target
-and prints this setup guidance before invoking `wasm-pack`.
+`rustc` and `cargo` take precedence. The build command checks for the WASM
+target and prints this setup guidance before invoking `wasm-pack`.
 
 ## Browser API
 
@@ -257,9 +256,9 @@ production Vite build, and real browser execution through both the packaged
 default worker and an application-owned worker. It installs the tarball rather
 than resolving Tinygres through a workspace link.
 
-The current feasibility target is an uncompressed WASM binary smaller than
-700 KiB. The size check is intentionally independent of gzip size so it cannot
-hide startup and compilation cost.
+The current feasibility target is an uncompressed WASM binary smaller than 700
+KiB. The size check is intentionally independent of gzip size so it cannot hide
+startup and compilation cost.
 
 ## Direction
 

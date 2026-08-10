@@ -1,0 +1,20 @@
+{
+  "version": "0.2",
+  "ignorePaths": [],
+  "dictionaryDefinitions": [],
+  "dictionaries": [],
+  "words": [
+    "bindgen",
+    "OPFS",
+    "Postg",
+    "rustc",
+    "rustup",
+    "shellenv",
+    "supabase",
+    "tinycreate",
+    "tinygres",
+    "tlsv"
+  ],
+  "ignoreWords": [],
+  "import": []
+}
