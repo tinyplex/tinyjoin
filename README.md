@@ -58,8 +58,9 @@ npm run build:wasm
 
 There is no need to uninstall Homebrew Rust. In persistent shell configuration,
 load `$HOME/.cargo/env` after Homebrew's `brew shellenv` so the rustup-managed
-`rustc` and `cargo` take precedence. The build command checks for the WASM
-target and prints this setup guidance before invoking `wasm-pack`.
+`rustc` and `cargo` take precedence for direct Cargo commands. The WASM build
+resolves the repository toolchain through rustup even when another compiler
+appears first in `PATH`, then checks for the target before invoking `wasm-pack`.
 
 ## Browser API
 
