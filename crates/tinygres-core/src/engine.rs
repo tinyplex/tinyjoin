@@ -37,6 +37,14 @@ impl<S: StorageDriver> Engine<S> {
         self.storage.define_table(schema)
     }
 
+    pub fn replace_table_snapshot(
+        &mut self,
+        schema: TableSchema,
+        rows: Vec<Row>,
+    ) -> Result<ApplyOutcome> {
+        self.storage.replace_table_snapshot(schema, rows)
+    }
+
     pub fn replace_table(&mut self, table: &str, rows: Vec<Row>) -> Result<ApplyOutcome> {
         self.storage.replace_table(table, rows)
     }

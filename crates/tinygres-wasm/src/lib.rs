@@ -1,5 +1,5 @@
 use serde::Serialize;
-use tinygres_core::{ChangeBatch, Engine, EngineError, QueryPlan, Row};
+use tinygres_core::{ChangeBatch, Engine, EngineError, QueryPlan, Row, TableSchema};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -31,6 +31,20 @@ impl WasmEngine {
         let outcome = self
             .engine
             .replace_table(table, rows)
+            .map_err(error_to_js)?;
+        to_js(&outcome)
+    }
+
+    pub fn replace_table_snapshot(
+        &mut self,
+        schema: JsValue,
+        rows: JsValue,
+    ) -> std::result::Result<JsValue, JsValue> {
+        let schema: TableSchema = from_js(schema)?;
+        let rows: Vec<Row> = from_js(rows)?;
+        let outcome = self
+            .engine
+            .replace_table_snapshot(schema, rows)
             .map_err(error_to_js)?;
         to_js(&outcome)
     }

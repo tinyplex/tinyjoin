@@ -7,6 +7,11 @@ use crate::{ApplyOutcome, Change, ChangeBatch, EngineError, Result, Row, TableSc
 
 pub trait StorageDriver {
     fn define_table(&mut self, schema: TableSchema) -> Result<()>;
+    fn replace_table_snapshot(
+        &mut self,
+        schema: TableSchema,
+        rows: Vec<Row>,
+    ) -> Result<ApplyOutcome>;
     fn replace_table(&mut self, table: &str, rows: Vec<Row>) -> Result<ApplyOutcome>;
     fn apply_batch(&mut self, batch: &ChangeBatch) -> Result<ApplyOutcome>;
     fn scan_table(&self, table: &str) -> Result<Vec<Row>>;
@@ -124,6 +129,19 @@ impl StorageDriver for InMemoryStorage {
             },
         );
         Ok(())
+    }
+
+    fn replace_table_snapshot(
+        &mut self,
+        schema: TableSchema,
+        rows: Vec<Row>,
+    ) -> Result<ApplyOutcome> {
+        let table = schema.name.clone();
+        let mut candidate = self.clone();
+        candidate.define_table(schema)?;
+        let outcome = candidate.replace_table(&table, rows)?;
+        *self = candidate;
+        Ok(outcome)
     }
 
     fn replace_table(&mut self, table: &str, rows: Vec<Row>) -> Result<ApplyOutcome> {
@@ -393,6 +411,87 @@ mod tests {
             let error = storage.replace_table("posts", vec![invalid]).unwrap_err();
             assert_eq!(error.code, "INVALID_CHANGE");
         }
+    }
+
+    #[test]
+    fn replace_table_snapshot_atomically_defines_and_populates_a_table() {
+        let mut storage = InMemoryStorage::default();
+        let outcome = storage
+            .replace_table_snapshot(
+                TableSchema {
+                    name: "posts".to_owned(),
+                    primary_key: vec!["id".to_owned()],
+                },
+                vec![row(json!({"id": 1, "title": "first"}))],
+            )
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            ApplyOutcome {
+                revision: 1,
+                tables: vec!["posts".to_owned()],
+            }
+        );
+        assert_eq!(
+            storage.scan_table("posts").unwrap(),
+            vec![row(json!({"id": 1, "title": "first"}))]
+        );
+    }
+
+    #[test]
+    fn failed_table_snapshot_does_not_leave_an_empty_schema() {
+        let mut storage = InMemoryStorage::default();
+        let error = storage
+            .replace_table_snapshot(
+                TableSchema {
+                    name: "posts".to_owned(),
+                    primary_key: vec!["id".to_owned()],
+                },
+                vec![
+                    row(json!({"id": 1, "title": "duplicate"})),
+                    row(json!({"id": 1, "title": "duplicate"})),
+                ],
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "INVALID_CHANGE");
+        assert_eq!(storage.revision(), 0);
+        assert_eq!(
+            storage.scan_table("posts").unwrap_err().code,
+            "TABLE_NOT_FOUND"
+        );
+    }
+
+    #[test]
+    fn conflicting_table_snapshot_preserves_existing_schema_rows_and_revision() {
+        let mut storage = storage();
+        storage
+            .replace_table("posts", vec![row(json!({"id": 1, "title": "kept"}))])
+            .unwrap();
+
+        let error = storage
+            .replace_table_snapshot(
+                TableSchema {
+                    name: "posts".to_owned(),
+                    primary_key: vec!["slug".to_owned()],
+                },
+                vec![row(json!({"slug": "replacement"}))],
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "INVALID_SCHEMA");
+        assert_eq!(storage.revision(), 1);
+        assert_eq!(
+            storage.scan_table("posts").unwrap(),
+            vec![row(json!({"id": 1, "title": "kept"}))]
+        );
+        storage
+            .define_table(TableSchema {
+                name: "posts".to_owned(),
+                primary_key: vec!["id".to_owned()],
+            })
+            .unwrap();
     }
 
     #[test]
