@@ -137,6 +137,25 @@ try {
 
   const packageDefault = await exercise(page, `${baseUrl}/?worker=default`);
   console.log(`PACKAGE_DEFAULT_WORKER_OK ${JSON.stringify(packageDefault)}`);
+
+  for (const workerMode of ['app-local', 'default']) {
+    const databaseName = `packed-${workerMode}-${Date.now()}`;
+    const parameters = new URLSearchParams({
+      worker: workerMode,
+      database: databaseName,
+    });
+    const written = await exercise(
+      page,
+      `${baseUrl}/?${parameters}&persistence=write`,
+    );
+    const restored = await exercisePersisted(
+      page,
+      `${baseUrl}/?${parameters}&persistence=read`,
+    );
+    console.log(
+      `OPFS_${workerMode.toUpperCase().replace('-', '_')}_WORKER_OK ${JSON.stringify({written, restored})}`,
+    );
+  }
 } finally {
   await browser?.close();
   await stopServer(server);
@@ -239,7 +258,9 @@ async function waitForServer(child, url, output) {
 
 async function exercise(page, url) {
   await page.goto(url);
-  await page.locator('body[data-status="passed"]').waitFor({timeout: 30_000});
+  await page
+    .locator('body[data-status="passed"][data-closed="true"]')
+    .waitFor({timeout: 30_000});
   const text = await page.locator('#result').textContent();
   const result = JSON.parse(text ?? 'null');
   if (
@@ -249,6 +270,19 @@ async function exercise(page, url) {
     result.changedTitle !== 'from packed change'
   ) {
     throw new Error(`Unexpected packed-consumer result: ${text}`);
+  }
+  return result;
+}
+
+async function exercisePersisted(page, url) {
+  await page.goto(url);
+  await page
+    .locator('body[data-status="passed"][data-closed="true"]')
+    .waitFor({timeout: 30_000});
+  const text = await page.locator('#result').textContent();
+  const result = JSON.parse(text ?? 'null');
+  if (result.revision !== 2 || result.title !== 'from packed change') {
+    throw new Error(`Unexpected packed OPFS restart result: ${text}`);
   }
   return result;
 }

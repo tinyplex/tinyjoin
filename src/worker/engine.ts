@@ -10,11 +10,14 @@ import type {
 
 export interface WorkerEngine {
   defineTable(schema: TableSchema): void;
-  replaceTable(table: string, rows: Row[]): ApplyOutcome;
+  defineTables(schemas: TableSchema[]): void;
+  replaceTableSnapshot(schema: TableSchema, rows: Row[]): ApplyOutcome;
   applyBatch(batch: ChangeBatch): ApplyOutcome;
   query(plan: QueryPlan): QueryResult;
   querySql(sql: string, params: JsonValue[]): QueryResult;
   revision(): number;
+  exportSnapshot(): Uint8Array;
+  importSnapshot(snapshot: Uint8Array): void;
   close?(): void;
 }
 
@@ -24,11 +27,19 @@ export async function createWasmEngine(): Promise<WorkerEngine> {
   const engine = new wasm.WasmEngine();
   return {
     defineTable: (schema) => engine.define_table(schema),
-    replaceTable: (table, rows) => engine.replace_table(table, rows),
+    defineTables: (schemas) => {
+      for (const schema of schemas) {
+        engine.define_table(schema);
+      }
+    },
+    replaceTableSnapshot: (schema, rows) =>
+      engine.replace_table_snapshot(schema, rows),
     applyBatch: (batch) => engine.apply_batch(batch),
     query: (plan) => engine.query(plan),
     querySql: (sql, params) => engine.query_sql(sql, params),
     revision: () => Number(engine.revision()),
+    exportSnapshot: () => engine.export_snapshot(),
+    importSnapshot: (snapshot) => engine.import_snapshot(snapshot),
     close: () => engine.free(),
   };
 }

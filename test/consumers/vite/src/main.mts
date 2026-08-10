@@ -11,7 +11,10 @@ type Post = {
 
 const body = document.body;
 const resultElement = requiredElement<HTMLOutputElement>('#result');
-const mode = new URLSearchParams(location.search).get('worker');
+const search = new URLSearchParams(location.search);
+const mode = search.get('worker');
+const persistence = search.get('persistence');
+const databaseName = search.get('database');
 const options: ClientOptions =
   mode === 'app-local'
     ? {
@@ -22,7 +25,11 @@ const options: ClientOptions =
       }
     : {};
 
-run(options, mode ?? 'default').catch((error: unknown) => {
+if (persistence && databaseName) {
+  options.storage = {kind: 'opfs', name: databaseName};
+}
+
+run(options, mode ?? 'default', persistence).catch((error: unknown) => {
   body.dataset.status = 'failed';
   body.dataset.worker = mode ?? 'default';
   resultElement.textContent =
@@ -32,14 +39,31 @@ run(options, mode ?? 'default').catch((error: unknown) => {
 async function run(
   clientOptions: ClientOptions,
   workerMode: string,
+  persistence: string | null,
 ): Promise<void> {
   const database = createClient({
     ...clientOptions,
     schemas: [{name: 'posts', primaryKey: ['id']}],
   });
+  let succeeded = false;
 
   try {
     await database.ready();
+    if (persistence === 'read') {
+      const restored = await database.query<Post>(
+        'SELECT id, title FROM posts WHERE id = $1',
+        [1],
+      );
+      resultElement.textContent = JSON.stringify({
+        worker: workerMode,
+        revision: restored.revision,
+        title: restored.rows[0]?.title,
+      });
+      body.dataset.worker = workerMode;
+      succeeded = true;
+      return;
+    }
+
     await database.replaceTable(
       {name: 'posts', primaryKey: ['id']},
       [{id: 1, title: 'from packed snapshot'}],
@@ -98,9 +122,13 @@ async function run(
     };
     resultElement.textContent = JSON.stringify(payload);
     body.dataset.worker = workerMode;
-    body.dataset.status = 'passed';
+    succeeded = true;
   } finally {
     await database.close();
+    if (succeeded) {
+      body.dataset.closed = 'true';
+      body.dataset.status = 'passed';
+    }
   }
 }
 

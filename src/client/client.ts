@@ -5,6 +5,7 @@ import type {
   QueryPlan,
   QueryResult,
   Row,
+  StorageOptions,
   SyncState,
   TableSchema,
 } from '../protocol.js';
@@ -16,6 +17,7 @@ export interface ClientOptions {
   workerFactory?: () => WorkerLike;
   workerUrl?: string | URL;
   schemas?: TableSchema[];
+  storage?: StorageOptions;
 }
 
 export interface TablesChangedEvent extends ApplyOutcome {}
@@ -33,7 +35,7 @@ export class Client implements QueryExecutor {
   }>();
   readonly #syncListeners = new Set<(state: SyncState) => void>();
   #revision = 0;
-  #closed = false;
+  #closePromise: Promise<void> | undefined;
 
   constructor(options: ClientOptions = {}) {
     const worker = createWorker(options);
@@ -57,6 +59,7 @@ export class Client implements QueryExecutor {
     });
     this.#ready = this.#rpc.request('init', {
       schemas: options.schemas ?? [],
+      storage: options.storage ?? {kind: 'memory'},
     }).then(({revision}) => {
       this.#revision = revision;
     });
@@ -102,8 +105,7 @@ export class Client implements QueryExecutor {
     rows: Row[],
   ): Promise<ApplyOutcome> {
     await this.#ready;
-    await this.#rpc.request('defineTable', {schema});
-    return this.#rpc.request('replaceTable', {table: schema.name, rows});
+    return this.#rpc.request('replaceTable', {schema, rows});
   }
 
   /**
@@ -136,11 +138,12 @@ export class Client implements QueryExecutor {
     return this.#revision;
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) {
-      return;
-    }
-    this.#closed = true;
+  close(): Promise<void> {
+    this.#closePromise ??= this.#closeOnce();
+    return this.#closePromise;
+  }
+
+  async #closeOnce(): Promise<void> {
     try {
       await this.#ready;
       await this.#rpc.request('close', undefined);

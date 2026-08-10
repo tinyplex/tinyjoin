@@ -4,14 +4,15 @@ TinyGres is an experimental, worker-first local query cache for PostgreSQL data.
 Its query and storage engine is written in Rust, compiled to WebAssembly, and
 kept off the browser's main thread.
 
-> [!IMPORTANT] TinyGres is an early read-only prototype. It does not persist
-> data, accept application writes, or provide complete PostgreSQL SQL
-> compatibility. Its Supabase adapter is best-effort and reconciles after
-> reconnects; it is not a durable logical-replication stream.
+> [!IMPORTANT] TinyGres is an early read-only prototype. It can optionally
+> persist its replica in OPFS, but it does not accept application writes or
+> provide complete PostgreSQL SQL compatibility. Its Supabase adapter is
+> best-effort and reconciles after reconnects; it is not a durable
+> logical-replication stream.
 
 The first proof of concept deliberately does a small number of things:
 
-- owns an in-memory replica inside a dedicated Web Worker;
+- owns an in-memory or opt-in persistent replica inside a dedicated Web Worker;
 - evaluates a documented subset of PostgreSQL `SELECT` in Rust/WASM;
 - applies normalized snapshot and server-change batches atomically;
 - emits table-level invalidations so an application can re-query; and
@@ -142,6 +143,52 @@ startWorker({source: myReadOnlyReplicaSource});
 Adapter functions live in the worker and normalize their input into table
 snapshots and change batches. They are not serialized through `postMessage`.
 
+## OPFS persistence
+
+Memory remains the default. Opt into persistent browser storage by assigning a
+stable name to the replica:
+
+```ts
+const db = createClient({
+  schemas: [{name: 'posts', primaryKey: ['id']}],
+  storage: {kind: 'opfs', name: 'my-project-public-posts-v1'},
+});
+
+await db.ready();
+```
+
+Names must contain 1–64 ASCII letters, numbers, dots, underscores, or hyphens,
+and start with a letter or number.
+
+`ready()` restores the saved schemas, rows, and revision before a source
+adapter starts. Snapshot replacements and incoming change batches resolve only
+after the new state has been written and flushed. Two alternating,
+checksummed generations ensure an interrupted write cannot overwrite the last
+complete state.
+
+OPFS persistence is deliberately single-writer. A second Worker opening the
+same name fails rather than risking concurrent mutation; closing or terminating
+the owning Worker releases the lock. Different names are independent. Include
+the project, dataset, schema version, and authenticated user or authorization
+scope in the name whenever those affect which rows may be cached. A name is a
+namespace, not an encryption or access-control boundary.
+
+Synchronous OPFS access requires a secure context and a dedicated Worker. It is
+not available in a `SharedWorker`. There is no silent fallback to memory when
+OPFS is requested but unavailable, locked, corrupt, or out of quota.
+
+Browser storage is still reconstructable cache data: users can clear it and a
+browser may evict best-effort storage under pressure. Applications that need
+stronger retention can make an explicit, user-appropriate
+`navigator.storage.persist()` request; TinyGres does not make that policy
+decision during startup.
+
+The current feasibility implementation writes a whole-database snapshot for
+every committed mutation and caps its encoded size at 16 MiB. This is
+intentionally simple and crash-testable, but its write cost grows with the
+database size. An append log, compaction, and paged storage remain later storage
+milestones.
+
 ## Supabase adapter
 
 The first source adapter snapshots explicitly selected tables through the
@@ -248,9 +295,10 @@ npm run test:package    # pack dist and install it in a clean Vite app
 npm run check:size      # hard 700 KiB uncompressed WASM gate
 ```
 
-The browser test covers the complete Phase-1 path: initialize the real module
-worker, load the WASM engine, query its snapshot, apply a fake remote change,
-receive an invalidation, and re-query the new row.
+The browser tests cover the complete Phase-1 path—initialize the real module
+Worker, query, apply a fake remote change, receive an invalidation, and
+re-query—plus the Phase-2 persistence path through a real dedicated Worker and
+OPFS restart.
 
 The packed-package test separately proves SSR-safe import, declarations, a
 production Vite build, and real browser execution through both the packaged
@@ -264,8 +312,8 @@ startup and compilation cost.
 ## Direction
 
 The adapter boundary is intended to support a later cursor-aligned PostgreSQL
-replication gateway without changing the local query API. The next storage phase
-will add OPFS-backed persistence and crash recovery while keeping the current
-in-memory driver for tests and ephemeral use.
+replication gateway without changing the local query API. The current OPFS
+snapshot store proves persistence and crash recovery; a production-scale
+append/page store and durable replication cursor remain separate future phases.
 
 TinyGres is MIT licensed.

@@ -5,12 +5,15 @@ import {
   isWorkerRequest,
   type ApplyOutcome,
   type SerializedError,
+  type StorageOptions,
   type SyncState,
   type WorkerEvent,
   type WorkerRequest,
   type WorkerResponse,
 } from '../protocol.js';
 import {createWasmEngine, type WorkerEngine} from './engine.js';
+import {createPersistentEngine} from './persistent-engine.js';
+import {createOpfsSnapshotStore} from './snapshot-store.js';
 
 export interface WorkerScope {
   postMessage(message: WorkerResponse | WorkerEvent): void;
@@ -39,8 +42,11 @@ export function startWorker(
   options: StartWorkerOptions = {},
 ): WorkerController {
   const scope = options.scope ?? (globalThis as unknown as WorkerScope);
-  const enginePromise = (options.engineFactory ?? createWasmEngine)();
+  const engineFactory = options.engineFactory ?? createWasmEngine;
   const sourceAbortController = new AbortController();
+  let enginePromise: Promise<WorkerEngine> | undefined;
+  let configuredStorage: StorageOptions | undefined;
+  let closingPromise: Promise<void> | undefined;
   let sourceStarted = false;
   let closed = false;
   let pendingRevision = 0;
@@ -88,8 +94,7 @@ export function startWorker(
       engine.defineTable(schema);
     },
     async replaceTable(schema, rows) {
-      engine.defineTable(schema);
-      const outcome = engine.replaceTable(schema.name, rows);
+      const outcome = engine.replaceTableSnapshot(schema, rows);
       emitInvalidation(outcome);
       return outcome;
     },
@@ -121,8 +126,22 @@ export function startWorker(
   };
 
   const respond = async (request: WorkerRequest): Promise<void> => {
+    let engine: WorkerEngine | undefined;
     try {
-      const engine = await enginePromise;
+      if (request.method === 'close') {
+        engine = enginePromise ? await enginePromise : undefined;
+        await releaseResources(engine);
+        scope.postMessage({
+          v: PROTOCOL_VERSION,
+          id: request.id,
+          ok: true,
+          result: undefined,
+        });
+        queueMicrotask(() => scope.close());
+        return;
+      }
+
+      engine = await engineForRequest(request);
       const result = await handleRequest(request, engine, emitInvalidation);
       scope.postMessage({
         v: PROTOCOL_VERSION,
@@ -132,17 +151,63 @@ export function startWorker(
       });
       if (request.method === 'init') {
         void startSource(engine);
-      } else if (request.method === 'close') {
-        queueMicrotask(() => void close());
       }
     } catch (error) {
+      if (request.method === 'init') {
+        if (!engine && enginePromise) {
+          try {
+            engine = await enginePromise;
+          } catch {
+            // Engine construction already closes partially opened resources.
+          }
+        }
+        try {
+          await releaseResources(engine);
+        } catch {
+          // Preserve the initialization error that explains why ready failed.
+        }
+      }
       scope.postMessage({
         v: PROTOCOL_VERSION,
         id: request.id,
         ok: false,
         error: serializeError(error),
       });
+      if (request.method === 'close' || request.method === 'init') {
+        queueMicrotask(() => scope.close());
+      }
     }
+  };
+
+  const engineForRequest = async (
+    request: Exclude<WorkerRequest, {method: 'close'}>,
+  ): Promise<WorkerEngine> => {
+    if (request.method === 'init') {
+      if (
+        configuredStorage !== undefined &&
+        !sameStorage(configuredStorage, request.params.storage)
+      ) {
+        throw Object.assign(
+          new Error('The TinyGres worker is already initialized with different storage'),
+          {code: 'STORAGE_ALREADY_INITIALIZED'},
+        );
+      }
+      if (!enginePromise) {
+        configuredStorage = request.params.storage;
+        enginePromise = createConfiguredEngine(
+          request.params.storage,
+          engineFactory,
+        );
+      }
+      return enginePromise;
+    }
+    if (!enginePromise) {
+      throw Object.assign(
+        new Error('Initialize the TinyGres worker before sending other requests'),
+        {code: 'WORKER_NOT_INITIALIZED'},
+      );
+    }
+    return enginePromise;
   };
 
   const onMessage = (event: MessageEvent<unknown>): void => {
@@ -165,17 +230,38 @@ export function startWorker(
     void respond(event.data);
   };
 
+  const releaseResources = (
+    engine: WorkerEngine | undefined,
+  ): Promise<void> => {
+    closingPromise ??= (async () => {
+      closed = true;
+      scope.removeEventListener('message', onMessage);
+      sourceAbortController.abort();
+      let firstError: unknown;
+      try {
+        await options.source?.close?.();
+      } catch (error) {
+        firstError = error;
+      }
+      try {
+        engine?.close?.();
+      } catch (error) {
+        firstError ??= error;
+      }
+      if (firstError !== undefined) {
+        throw firstError;
+      }
+    })();
+    return closingPromise;
+  };
+
   const close = async (): Promise<void> => {
-    if (closed) {
-      return;
+    try {
+      const engine = enginePromise ? await enginePromise : undefined;
+      await releaseResources(engine);
+    } finally {
+      scope.close();
     }
-    closed = true;
-    scope.removeEventListener('message', onMessage);
-    sourceAbortController.abort();
-    await options.source?.close?.();
-    const engine = await enginePromise;
-    engine.close?.();
-    scope.close();
   };
 
   scope.addEventListener('message', onMessage);
@@ -189,16 +275,14 @@ async function handleRequest(
 ): Promise<unknown> {
   switch (request.method) {
     case 'init':
-      for (const schema of request.params.schemas) {
-        engine.defineTable(schema);
-      }
+      engine.defineTables(request.params.schemas);
       return {revision: engine.revision()};
     case 'defineTable':
       engine.defineTable(request.params.schema);
       return undefined;
     case 'replaceTable': {
-      const outcome = engine.replaceTable(
-        request.params.table,
+      const outcome = engine.replaceTableSnapshot(
+        request.params.schema,
         request.params.rows,
       );
       emitInvalidation(outcome);
@@ -214,8 +298,39 @@ async function handleRequest(
     case 'querySql':
       return engine.querySql(request.params.sql, request.params.params);
     case 'close':
-      return undefined;
+      throw new Error('Close requests are handled before engine dispatch');
   }
+}
+
+async function createConfiguredEngine(
+  storage: StorageOptions,
+  engineFactory: () => Promise<WorkerEngine>,
+): Promise<WorkerEngine> {
+  const engine = await engineFactory();
+  if (storage.kind === 'memory') {
+    return engine;
+  }
+
+  let store: Awaited<ReturnType<typeof createOpfsSnapshotStore>> | undefined;
+  try {
+    store = await createOpfsSnapshotStore(storage.name);
+    return createPersistentEngine(engine, store);
+  } catch (error) {
+    try {
+      store?.close();
+    } finally {
+      engine.close?.();
+    }
+    throw error;
+  }
+}
+
+function sameStorage(left: StorageOptions, right: StorageOptions): boolean {
+  return (
+    left.kind === right.kind &&
+    (left.kind === 'memory' ||
+      (right.kind === 'opfs' && left.name === right.name))
+  );
 }
 
 function serializeError(error: unknown): SerializedError {

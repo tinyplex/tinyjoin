@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 1 as const;
+export const PROTOCOL_VERSION = 2 as const;
 
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue =
@@ -11,6 +11,10 @@ export interface TableSchema {
   name: string;
   primaryKey: string[];
 }
+
+export type StorageOptions =
+  | {kind: 'memory'}
+  | {kind: 'opfs'; name: string};
 
 export interface SourceCursor {
   kind: string;
@@ -79,7 +83,7 @@ export interface SyncState {
 
 export interface RpcMethods {
   init: {
-    request: {schemas: TableSchema[]};
+    request: {schemas: TableSchema[]; storage: StorageOptions};
     response: {revision: number};
   };
   defineTable: {
@@ -87,7 +91,7 @@ export interface RpcMethods {
     response: undefined;
   };
   replaceTable: {
-    request: {table: string; rows: Row[]};
+    request: {schema: TableSchema; rows: Row[]};
     response: ApplyOutcome;
   };
   applyBatch: {
@@ -186,14 +190,15 @@ export function isWorkerRequest(value: unknown): value is WorkerRequest {
       return (
         isRecord(value.params) &&
         Array.isArray(value.params.schemas) &&
-        value.params.schemas.every(isTableSchema)
+        value.params.schemas.every(isTableSchema) &&
+        isStorageOptions(value.params.storage)
       );
     case 'defineTable':
       return isRecord(value.params) && isTableSchema(value.params.schema);
     case 'replaceTable':
       return (
         isRecord(value.params) &&
-        typeof value.params.table === 'string' &&
+        isTableSchema(value.params.schema) &&
         Array.isArray(value.params.rows) &&
         value.params.rows.every(isRow)
       );
@@ -213,6 +218,14 @@ export function isWorkerRequest(value: unknown): value is WorkerRequest {
     default:
       return false;
   }
+}
+
+function isStorageOptions(value: unknown): value is StorageOptions {
+  return (
+    isRecord(value) &&
+    (value.kind === 'memory' ||
+      (value.kind === 'opfs' && typeof value.name === 'string'))
+  );
 }
 
 export function isSerializedError(

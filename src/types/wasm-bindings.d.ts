@@ -7,8 +7,8 @@ declare module '*tinygres_wasm.js' {
     constructor();
     free(): void;
     define_table(schema: unknown): void;
-    replace_table(
-      table: string,
+    replace_table_snapshot(
+      schema: unknown,
       rows: unknown,
     ): import('../protocol.js').ApplyOutcome;
     apply_batch(batch: unknown): import('../protocol.js').ApplyOutcome;
@@ -18,5 +18,7 @@ declare module '*tinygres_wasm.js' {
       params: unknown,
     ): import('../protocol.js').QueryResult;
     revision(): bigint;
+    export_snapshot(): Uint8Array;
+    import_snapshot(snapshot: Uint8Array): void;
   }
 }

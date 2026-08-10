@@ -19,6 +19,7 @@ export type {
   Row,
   SerializedError,
   SourceCursor,
+  StorageOptions,
   SyncPhase,
   SyncState,
   TableSchema,

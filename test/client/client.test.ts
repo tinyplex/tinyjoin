@@ -36,6 +36,30 @@ function respondingWorker(): FakeWorker {
 }
 
 describe('Client', () => {
+  it('selects memory by default and forwards explicit OPFS storage', async () => {
+    const memoryWorker = respondingWorker();
+    const memoryClient = new Client({worker: memoryWorker});
+    await memoryClient.ready();
+    expect(
+      (memoryWorker.posted[0] as Extract<WorkerRequest, {method: 'init'}>)
+        .params.storage,
+    ).toEqual({kind: 'memory'});
+
+    const opfsWorker = respondingWorker();
+    const opfsClient = new Client({
+      worker: opfsWorker,
+      storage: {kind: 'opfs', name: 'application-cache'},
+    });
+    await opfsClient.ready();
+    expect(
+      (opfsWorker.posted[0] as Extract<WorkerRequest, {method: 'init'}>)
+        .params.storage,
+    ).toEqual({kind: 'opfs', name: 'application-cache'});
+
+    await memoryClient.close();
+    await opfsClient.close();
+  });
+
   it('supports an awaitable Supabase-style query chain', async () => {
     const worker = respondingWorker();
     const client = new Client({worker});
@@ -92,5 +116,41 @@ describe('Client', () => {
         (message) => (message as WorkerRequest).method === 'close',
       ),
     ).toHaveLength(1);
+  });
+
+  it('makes concurrent close calls await the same worker cleanup', async () => {
+    const worker = new FakeWorker();
+    let closeRequest: Extract<WorkerRequest, {method: 'close'}> | undefined;
+    worker.onPost = (message) => {
+      if (message.method === 'init') {
+        queueMicrotask(() =>
+          worker.respond({
+            v: PROTOCOL_VERSION,
+            id: message.id,
+            ok: true,
+            result: {revision: 0},
+          }),
+        );
+      } else if (message.method === 'close') {
+        closeRequest = message;
+      }
+    };
+    const client = new Client({worker});
+    await client.ready();
+
+    const first = client.close();
+    const second = client.close();
+    expect(second).toBe(first);
+    await vi.waitFor(() => expect(closeRequest).toBeDefined());
+    expect(worker.terminated).toBe(false);
+
+    worker.respond({
+      v: PROTOCOL_VERSION,
+      id: closeRequest!.id,
+      ok: true,
+      result: undefined,
+    });
+    await second;
+    expect(worker.terminated).toBe(true);
   });
 });

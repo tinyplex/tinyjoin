@@ -13,6 +13,8 @@ import {
   startWorker,
   type WorkerScope,
 } from '../../src/worker/host.ts';
+import {createPersistentEngine} from '../../src/worker/persistent-engine.ts';
+import type {SnapshotStore} from '../../src/worker/snapshot-store.ts';
 
 class FakeScope implements WorkerScope {
   readonly posted: Array<WorkerResponse | WorkerEvent> = [];
@@ -57,11 +59,16 @@ function mockEngine() {
   });
   const engine: WorkerEngine = {
     defineTable: vi.fn(),
-    replaceTable: vi.fn((table) => outcome(table)),
+    defineTables: vi.fn(),
+    replaceTableSnapshot: vi.fn((schema) => outcome(schema.name)),
     applyBatch: vi.fn((batch) => outcome(batch.changes[0]?.table ?? 'none')),
     query: vi.fn(() => ({revision, rows: [{id: 1}]})),
     querySql: vi.fn(() => ({revision, rows: [{id: 1}]})),
     revision: () => revision,
+    exportSnapshot: vi.fn(() => new Uint8Array([revision])),
+    importSnapshot: vi.fn((snapshot) => {
+      revision = snapshot[0] ?? 0;
+    }),
     close: vi.fn(),
   };
   return engine;
@@ -81,7 +88,10 @@ describe('startWorker', () => {
       v: PROTOCOL_VERSION,
       id: 1,
       method: 'init',
-      params: {schemas: [{name: 'posts', primaryKey: ['id']}]},
+      params: {
+        schemas: [{name: 'posts', primaryKey: ['id']}],
+        storage: {kind: 'memory'},
+      },
     } satisfies WorkerRequest);
     scope.send({
       v: PROTOCOL_VERSION,
@@ -91,10 +101,9 @@ describe('startWorker', () => {
     } satisfies WorkerRequest);
     await waitForPosted(scope, 2);
 
-    expect(engine.defineTable).toHaveBeenCalledWith({
-      name: 'posts',
-      primaryKey: ['id'],
-    });
+    expect(engine.defineTables).toHaveBeenCalledWith([
+      {name: 'posts', primaryKey: ['id']},
+    ]);
     expect(engine.querySql).toHaveBeenCalledWith('select * from posts', []);
     expect(scope.posted).toContainEqual({
       v: PROTOCOL_VERSION,
@@ -112,14 +121,29 @@ describe('startWorker', () => {
     scope.send({
       v: PROTOCOL_VERSION,
       id: 1,
-      method: 'replaceTable',
-      params: {table: 'posts', rows: []},
+      method: 'init',
+      params: {schemas: [], storage: {kind: 'memory'}},
     } satisfies WorkerRequest);
+    await waitForPosted(scope, 1);
+    scope.posted.length = 0;
+
     scope.send({
       v: PROTOCOL_VERSION,
       id: 2,
       method: 'replaceTable',
-      params: {table: 'users', rows: []},
+      params: {
+        schema: {name: 'posts', primaryKey: ['id']},
+        rows: [],
+      },
+    } satisfies WorkerRequest);
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 3,
+      method: 'replaceTable',
+      params: {
+        schema: {name: 'users', primaryKey: ['id']},
+        rows: [],
+      },
     } satisfies WorkerRequest);
     await waitForPosted(scope, 3);
 
@@ -174,7 +198,150 @@ describe('startWorker', () => {
       ok: false,
       error: {code: 'PROTOCOL_MISMATCH'},
     });
-    expect(engine.replaceTable).not.toHaveBeenCalled();
+    expect(engine.replaceTableSnapshot).not.toHaveBeenCalled();
+  });
+
+  it('fails explicit OPFS initialization instead of falling back to memory', async () => {
+    const scope = new FakeScope();
+    const engine = mockEngine();
+    startWorker({scope, engineFactory: async () => engine});
+
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 10,
+      method: 'init',
+      params: {
+        schemas: [{name: 'posts', primaryKey: ['id']}],
+        storage: {kind: 'opfs', name: 'unit-test'},
+      },
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 1);
+
+    expect(scope.posted[0]).toMatchObject({
+      id: 10,
+      ok: false,
+      error: {code: 'OPFS_UNAVAILABLE'},
+    });
+    expect(engine.defineTables).not.toHaveBeenCalled();
+    expect(engine.close).toHaveBeenCalledOnce();
+  });
+
+  it('makes a failed initialization terminal and releases its engine', async () => {
+    const scope = new FakeScope();
+    const engine = mockEngine();
+    vi.mocked(engine.defineTables).mockImplementation(() => {
+      throw Object.assign(new Error('schema conflict'), {
+        code: 'INVALID_SCHEMA',
+      });
+    });
+    startWorker({scope, engineFactory: async () => engine});
+
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 11,
+      method: 'init',
+      params: {
+        schemas: [{name: 'posts', primaryKey: ['slug']}],
+        storage: {kind: 'memory'},
+      },
+    } satisfies WorkerRequest);
+    await vi.waitFor(() => expect(scope.closed).toBe(true));
+
+    expect(scope.posted).toContainEqual({
+      v: PROTOCOL_VERSION,
+      id: 11,
+      ok: false,
+      error: {code: 'INVALID_SCHEMA', message: 'schema conflict'},
+    });
+    expect(engine.close).toHaveBeenCalledOnce();
+  });
+
+  it('releases the existing engine when a second init changes storage', async () => {
+    const scope = new FakeScope();
+    const engine = mockEngine();
+    startWorker({scope, engineFactory: async () => engine});
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 1,
+      method: 'init',
+      params: {schemas: [], storage: {kind: 'memory'}},
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 1);
+
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 2,
+      method: 'init',
+      params: {
+        schemas: [],
+        storage: {kind: 'opfs', name: 'different-storage'},
+      },
+    } satisfies WorkerRequest);
+    await vi.waitFor(() => expect(scope.closed).toBe(true));
+
+    expect(scope.posted).toContainEqual({
+      v: PROTOCOL_VERSION,
+      id: 2,
+      ok: false,
+      error: {
+        code: 'STORAGE_ALREADY_INITIALIZED',
+        message: 'The TinyGres worker is already initialized with different storage',
+      },
+    });
+    expect(engine.close).toHaveBeenCalledOnce();
+  });
+
+  it('does not acknowledge or invalidate a mutation that fails to flush', async () => {
+    const scope = new FakeScope();
+    const baseEngine = mockEngine();
+    const store: SnapshotStore = {
+      hadData: false,
+      candidates: () => [],
+      select: vi.fn(),
+      commit: () => {
+        throw Object.assign(new Error('quota exhausted'), {
+          code: 'STORAGE_QUOTA_EXCEEDED',
+          retryable: true,
+        });
+      },
+      close: vi.fn(),
+    };
+    const engine = createPersistentEngine(baseEngine, store);
+    startWorker({scope, engineFactory: async () => engine});
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 1,
+      method: 'init',
+      params: {schemas: [], storage: {kind: 'memory'}},
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 1);
+    scope.posted.length = 0;
+
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 2,
+      method: 'replaceTable',
+      params: {
+        schema: {name: 'posts', primaryKey: ['id']},
+        rows: [{id: 1}],
+      },
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 1);
+    await new Promise<void>((resolve) => queueMicrotask(() => resolve()));
+
+    expect(scope.posted).toEqual([
+      {
+        v: PROTOCOL_VERSION,
+        id: 2,
+        ok: false,
+        error: {
+          code: 'STORAGE_QUOTA_EXCEEDED',
+          message: 'quota exhausted',
+          retryable: true,
+        },
+      },
+    ]);
+    expect(baseEngine.revision()).toBe(0);
   });
 
   it('starts a future source adapter behind the worker boundary', async () => {
@@ -206,13 +373,14 @@ describe('startWorker', () => {
       v: PROTOCOL_VERSION,
       id: 1,
       method: 'init',
-      params: {schemas: []},
+      params: {schemas: [], storage: {kind: 'memory'}},
     } satisfies WorkerRequest);
     await waitForPosted(scope, 4);
 
-    expect(engine.replaceTable).toHaveBeenCalledWith('posts', [
-      {id: 1, title: 'from source'},
-    ]);
+    expect(engine.replaceTableSnapshot).toHaveBeenCalledWith(
+      {name: 'posts', primaryKey: ['id']},
+      [{id: 1, title: 'from source'}],
+    );
     expect(scope.posted).toContainEqual({
       v: PROTOCOL_VERSION,
       event: 'syncStateChanged',
@@ -253,7 +421,7 @@ describe('startWorker', () => {
       v: PROTOCOL_VERSION,
       id: 1,
       method: 'init',
-      params: {schemas: []},
+      params: {schemas: [], storage: {kind: 'memory'}},
     } satisfies WorkerRequest);
     await waitForPosted(scope, 3);
 
@@ -270,5 +438,40 @@ describe('startWorker', () => {
         },
       },
     });
+  });
+
+  it('releases engine resources before acknowledging close', async () => {
+    const scope = new FakeScope();
+    const engine = mockEngine();
+    const order: string[] = [];
+    vi.mocked(engine.close!).mockImplementation(() => order.push('engine'));
+    vi.spyOn(scope, 'postMessage').mockImplementation((message) => {
+      if ('id' in message && message.id === 2) {
+        order.push('response');
+      }
+      scope.posted.push(message);
+    });
+    vi.spyOn(scope, 'close').mockImplementation(() => {
+      order.push('scope');
+      scope.closed = true;
+    });
+    startWorker({scope, engineFactory: async () => engine});
+
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 1,
+      method: 'init',
+      params: {schemas: [], storage: {kind: 'memory'}},
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 1);
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 2,
+      method: 'close',
+      params: undefined,
+    } satisfies WorkerRequest);
+    await vi.waitFor(() => expect(scope.closed).toBe(true));
+
+    expect(order).toEqual(['engine', 'response', 'scope']);
   });
 });
