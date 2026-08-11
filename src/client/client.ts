@@ -21,6 +21,7 @@ export interface ClientOptions {
   workerUrl?: string | URL;
   schemas?: TableSchema[];
   storage?: StorageOptions;
+  /** Serializable source configuration run inside the Worker. */
   source?: SourceOptions;
 }
 
@@ -105,6 +106,7 @@ export class Client implements QueryExecutor {
       });
   }
 
+  /** Resolves after local memory or OPFS state is ready, without waiting for a source. */
   ready(): Promise<void> {
     return this.#ready;
   }
@@ -166,16 +168,19 @@ export class Client implements QueryExecutor {
     return () => this.#subscriptions.delete(subscription);
   }
 
+  /** Subscribes to sync state and immediately emits its current snapshot. */
   subscribeToSyncState(listener: (state: SyncState) => void): () => void {
     this.#syncListeners.add(listener);
     listener(copySyncState(this.#syncState));
     return () => this.#syncListeners.delete(listener);
   }
 
+  /** Returns a detached snapshot of the latest source synchronization state. */
   getSyncState(): SyncState {
     return copySyncState(this.#syncState);
   }
 
+  /** Waits until the configured source has established a complete live baseline. */
   async whenSynced(options: WhenSyncedOptions = {}): Promise<SyncState> {
     const timeoutMs = validateSyncTimeout(options.timeoutMs);
     if (options.signal?.aborted) {

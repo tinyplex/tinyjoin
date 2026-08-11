@@ -15,6 +15,8 @@ const search = new URLSearchParams(location.search);
 const mode = search.get('worker');
 const persistence = search.get('persistence');
 const databaseName = search.get('database');
+const source = search.get('source');
+const supabaseUrl = search.get('supabaseUrl');
 const options: ClientOptions =
   mode === 'app-local'
     ? {
@@ -28,8 +30,22 @@ const options: ClientOptions =
 if (persistence && databaseName) {
   options.storage = {kind: 'opfs', name: databaseName};
 }
+if (source === 'supabase') {
+  options.source = {
+    kind: 'supabase',
+    url: supabaseUrl ?? 'https://tinygres-packed.supabase.co',
+    publishableKey: 'sb_publishable_packed_test',
+    tables: [
+      {
+        table: 'posts',
+        primaryKey: ['id'],
+        columns: ['id', 'title'],
+      },
+    ],
+  };
+}
 
-run(options, mode ?? 'default', persistence).catch((error: unknown) => {
+run(options, mode ?? 'default', persistence, source).catch((error: unknown) => {
   body.dataset.status = 'failed';
   body.dataset.worker = mode ?? 'default';
   resultElement.textContent =
@@ -40,15 +56,34 @@ async function run(
   clientOptions: ClientOptions,
   workerMode: string,
   persistence: string | null,
+  source: string | null,
 ): Promise<void> {
   const database = createClient({
     ...clientOptions,
-    schemas: [{name: 'posts', primaryKey: ['id']}],
+    ...(source === 'supabase'
+      ? {}
+      : {schemas: [{name: 'posts', primaryKey: ['id']}]}),
   });
   let succeeded = false;
 
   try {
     await database.ready();
+    if (source === 'supabase') {
+      const syncState = await database.whenSynced({timeoutMs: 15_000});
+      const snapshot = await database.query<Post>(
+        'SELECT id, title FROM posts WHERE id = $1',
+        [1],
+      );
+      resultElement.textContent = JSON.stringify({
+        worker: workerMode,
+        phase: syncState.phase,
+        revision: snapshot.revision,
+        title: snapshot.rows[0]?.title,
+      });
+      body.dataset.worker = workerMode;
+      succeeded = true;
+      return;
+    }
     if (persistence === 'read') {
       const restored = await database.query<Post>(
         'SELECT id, title FROM posts WHERE id = $1',

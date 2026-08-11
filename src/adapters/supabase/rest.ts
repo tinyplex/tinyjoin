@@ -22,7 +22,8 @@ export class SupabaseRestSnapshotReader {
     );
     this.#publishableKey = options.publishableKey;
     this.#pageSize = options.pageSize ?? 500;
-    this.#fetch = options.fetch ?? globalThis.fetch;
+    this.#fetch =
+      options.fetch ?? globalThis.fetch?.bind(globalThis);
     this.#getAccessToken = options.getAccessToken ?? (() => null);
     if (typeof this.#fetch !== 'function') {
       throw new SupabaseSourceError(
@@ -37,16 +38,24 @@ export class SupabaseRestSnapshotReader {
     signal: AbortSignal,
   ): AsyncGenerator<SupabaseSnapshotPage> {
     let page = 0;
+    let from = 0;
     while (true) {
       throwIfAborted(signal);
-      const from = page * this.#pageSize;
       const to = from + this.#pageSize - 1;
       const rows = await this.#fetchPage(table, from, to, signal);
-      const done = rows.length < this.#pageSize;
+      const done = rows.length === 0;
       yield {page, rows, done};
       if (done) {
         return;
       }
+      const nextFrom = from + rows.length;
+      if (!Number.isSafeInteger(nextFrom) || nextFrom <= from) {
+        throw new SupabaseSourceError(
+          'SUPABASE_INVALID_SNAPSHOT',
+          `Supabase snapshot for \`${table.schema}.${table.table}\` could not advance its pagination range`,
+        );
+      }
+      from = nextFrom;
       page += 1;
     }
   }

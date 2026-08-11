@@ -1,6 +1,7 @@
 import {
   createClient,
   type ChangeBatch,
+  type SyncState,
   type TableSchema,
 } from '../../../dist/index.js';
 
@@ -52,6 +53,13 @@ const applyButton = element<HTMLButtonElement>(
 
 let invalidations = 0;
 let simulatedChanges = 0;
+let supabaseProbe:
+  | {
+      database: ReturnType<typeof createClient>;
+      states: SyncState[];
+      unsubscribe(): void;
+    }
+  | undefined;
 
 async function boot(): Promise<void> {
   const database = createClient({schemas: [postsSchema]});
@@ -117,8 +125,12 @@ async function boot(): Promise<void> {
       }
       return samples;
     },
+    closeSupabaseProbe,
+    openSupabaseProbe,
     persistenceProbe,
+    readSupabaseProbe,
     readBrowserRestartFixture,
+    waitForSupabaseProbe,
     writeBrowserRestartFixture,
   };
 
@@ -127,6 +139,7 @@ async function boot(): Promise<void> {
     () => {
       unsubscribe();
       delete window.__tinygresTest;
+      void closeSupabaseProbe();
       void database.close();
     },
     {once: true},
@@ -135,6 +148,89 @@ async function boot(): Promise<void> {
   stateElement.textContent = 'Ready';
   statusElement.textContent = 'Ready. The initial snapshot is queryable locally.';
   applyButton.disabled = false;
+}
+
+async function openSupabaseProbe(options: {
+  databaseName?: string;
+  publishableKey: string;
+  url: string;
+}): Promise<{
+  revision: number;
+  rows: Array<{id: number; title: string}>;
+  state: SyncState;
+  states: SyncState[];
+}> {
+  await closeSupabaseProbe();
+  const database = createClient({
+    ...(options.databaseName
+      ? {storage: {kind: 'opfs' as const, name: options.databaseName}}
+      : {}),
+    source: {
+      kind: 'supabase',
+      url: options.url,
+      publishableKey: options.publishableKey,
+      tables: [
+        {
+          table: 'posts',
+          primaryKey: ['id'],
+          columns: ['id', 'title'],
+        },
+      ],
+    },
+  });
+  const states: SyncState[] = [];
+  const unsubscribe = database.subscribeToSyncState((state) => {
+    states.push(state);
+  });
+  supabaseProbe = {database, states, unsubscribe};
+  await database.ready();
+  return readSupabaseProbe();
+}
+
+async function waitForSupabaseProbe(): Promise<{
+  revision: number;
+  rows: Array<{id: number; title: string}>;
+  state: SyncState;
+  states: SyncState[];
+}> {
+  const probe = requireSupabaseProbe();
+  await probe.database.whenSynced({timeoutMs: 15_000});
+  return readSupabaseProbe();
+}
+
+async function readSupabaseProbe(): Promise<{
+  revision: number;
+  rows: Array<{id: number; title: string}>;
+  state: SyncState;
+  states: SyncState[];
+}> {
+  const probe = requireSupabaseProbe();
+  const result = await probe.database.query<{id: number; title: string}>(
+    'SELECT id, title FROM posts',
+  );
+  return {
+    revision: result.revision,
+    rows: result.rows,
+    state: probe.database.getSyncState(),
+    states: probe.states.map((state) => structuredClone(state)),
+  };
+}
+
+async function closeSupabaseProbe(): Promise<void> {
+  const probe = supabaseProbe;
+  supabaseProbe = undefined;
+  if (!probe) {
+    return;
+  }
+  probe.unsubscribe();
+  await probe.database.close();
+}
+
+function requireSupabaseProbe(): NonNullable<typeof supabaseProbe> {
+  if (!supabaseProbe) {
+    throw new Error('The Supabase browser probe is not open');
+  }
+  return supabaseProbe;
 }
 
 async function renderQuery(

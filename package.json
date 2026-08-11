@@ -1,6 +1,6 @@
 {
   "name": "tinygres",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "author": "jamesgpearce",
   "private": true,
   "type": "module",
@@ -40,9 +40,11 @@
   "devDependencies": {
     "@playwright/test": "^1.62.1",
     "@types/node": "^26.2.0",
+    "@types/ws": "^8.18.1",
     "typescript": "^7.0.2",
     "vite": "^8.2.1",
     "vitest": "^4.1.10",
-    "wasm-pack": "^0.15.0"
+    "wasm-pack": "^0.15.0",
+    "ws": "^8.21.3"
   }
 }

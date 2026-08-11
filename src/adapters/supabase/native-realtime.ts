@@ -97,6 +97,10 @@ class NativeRealtimeSession {
   #subscriptionIds = new Set<number>();
   #reference = 0;
   #reconnectAttempt = 0;
+  #joinAccepted = false;
+  #postgresSubscribed = false;
+  #replicationReady = false;
+  #currentSubscriptionReady = false;
   #established = false;
   #readySettled = false;
   #closed = false;
@@ -216,7 +220,7 @@ class NativeRealtimeSession {
       event: 'phx_join',
       payload: {
         config: {
-          broadcast: {ack: false, self: false},
+          broadcast: {ack: false, self: false, replication_ready: true},
           presence: {enabled: false},
           postgres_changes: postgresChanges,
           private: false,
@@ -284,9 +288,32 @@ class NativeRealtimeSession {
     }
     if (
       value.event === 'system' &&
-      isRecord(value.payload) &&
-      (value.payload.status === 'error' || value.payload.status === 'timeout')
+      isRecord(value.payload)
     ) {
+      if (
+        value.payload.status === 'ok' &&
+        value.payload.extension === 'postgres_changes' &&
+        value.payload.message === 'Subscribed to PostgreSQL'
+      ) {
+        this.#postgresSubscribed = true;
+        this.#completeSubscriptionIfReady();
+        return;
+      }
+      if (
+        value.payload.status === 'ok' &&
+        value.payload.extension === 'system' &&
+        value.payload.message === 'Replication connection established'
+      ) {
+        this.#replicationReady = true;
+        this.#completeSubscriptionIfReady();
+        return;
+      }
+      if (
+        value.payload.status !== 'error' &&
+        value.payload.status !== 'timeout'
+      ) {
+        return;
+      }
       this.#failAttempt(
         new SupabaseSourceError(
           'SUPABASE_REALTIME_SYSTEM_ERROR',
@@ -303,12 +330,7 @@ class NativeRealtimeSession {
       return;
     }
     if (payload.status !== 'ok') {
-      this.#failAttempt(
-        new SupabaseSourceError(
-          'SUPABASE_REALTIME_JOIN_REJECTED',
-          'Supabase Realtime rejected the channel join',
-        ),
-      );
+      this.#failAttempt(joinRejectedError(payload.response));
       return;
     }
     try {
@@ -321,12 +343,26 @@ class NativeRealtimeSession {
       return;
     }
 
-    this.#clearJoinTimeout();
+    this.#joinAccepted = true;
     this.#heartbeatRef = undefined;
+    this.#scheduleHeartbeat();
+    this.#completeSubscriptionIfReady();
+  }
+
+  #completeSubscriptionIfReady(): void {
+    if (
+      this.#currentSubscriptionReady ||
+      !this.#joinAccepted ||
+      !this.#postgresSubscribed ||
+      !this.#replicationReady
+    ) {
+      return;
+    }
+    this.#currentSubscriptionReady = true;
+    this.#clearJoinTimeout();
     this.#reconnectAttempt = 0;
     const firstJoin = !this.#established;
     this.#established = true;
-    this.#scheduleHeartbeat();
     this.#options.observer.status('SUBSCRIBED');
     if (firstJoin && !this.#readySettled) {
       this.#readySettled = true;
@@ -443,6 +479,10 @@ class NativeRealtimeSession {
     this.#heartbeatRef = undefined;
     this.#joinRef = undefined;
     this.#subscriptionIds.clear();
+    this.#joinAccepted = false;
+    this.#postgresSubscribed = false;
+    this.#replicationReady = false;
+    this.#currentSubscriptionReady = false;
     const socket = this.#socket;
     const listeners = this.#listeners;
     this.#socket = undefined;
@@ -612,6 +652,19 @@ function protocolError(detail: string, retryable = false): SupabaseSourceError {
   );
 }
 
+function joinRejectedError(response: unknown): SupabaseSourceError {
+  const reason =
+    isRecord(response) && typeof response.reason === 'string'
+      ? response.reason
+      : undefined;
+  const code = reason?.match(/^([A-Za-z][A-Za-z0-9]*):(?:\s|$)/)?.[1];
+  return new SupabaseSourceError(
+    'SUPABASE_REALTIME_JOIN_REJECTED',
+    'Supabase Realtime rejected the channel join',
+    code !== undefined && TRANSIENT_JOIN_REJECTION_CODES.has(code),
+  );
+}
+
 function disconnectedError(detail: string): SupabaseSourceError {
   return new SupabaseSourceError(
     'SUPABASE_REALTIME_DISCONNECTED',
@@ -638,6 +691,17 @@ const defaultTimer: SupabaseRealtimeTimer = {
   clearTimeout: (handle) =>
     globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>),
 };
+
+const TRANSIENT_JOIN_REJECTION_CODES = new Set([
+  'ChannelRateLimitReached',
+  'ClientJoinRateLimitReached',
+  'ConnectionRateLimitReached',
+  'DatabaseLackOfConnections',
+  'IncreaseConnectionPool',
+  'InitializingProjectConnection',
+  'RealtimeRestarting',
+  'UnableToConnectToProject',
+]);
 
 function defaultWebSocketFactory(url: string): SupabaseRealtimeWebSocket {
   if (typeof globalThis.WebSocket !== 'function') {

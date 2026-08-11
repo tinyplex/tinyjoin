@@ -1,5 +1,6 @@
 import {spawn, spawnSync} from 'node:child_process';
 import {rmSync} from 'node:fs';
+import {createServer} from 'node:http';
 import {
   cp,
   mkdir,
@@ -15,6 +16,7 @@ import {dirname, join, relative, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 import {chromium} from '@playwright/test';
+import {WebSocketServer} from 'ws';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const fixture = resolve(root, 'test/consumers/vite');
@@ -79,6 +81,14 @@ for (const developmentField of ['private', 'scripts', 'devDependencies']) {
     );
   }
 }
+if (
+  installedManifest.dependencies &&
+  Object.keys(installedManifest.dependencies).length > 0
+) {
+  throw new Error(
+    `Published TinyGres unexpectedly has runtime dependencies: ${Object.keys(installedManifest.dependencies).join(', ')}`,
+  );
+}
 
 const ssrOutput = run(
   process.execPath,
@@ -100,34 +110,37 @@ if (!builtFiles.some((file) => file.endsWith('.wasm'))) {
   throw new Error(`The consumer build emitted no WASM asset:\n${builtFiles.join('\n')}`);
 }
 
-const server = spawn(
-  npm,
-  [
-    'run',
-    'preview',
-    '--',
-    '--host',
-    '127.0.0.1',
-    '--port',
-    String(port),
-    '--strictPort',
-  ],
-  {
-    cwd: appDirectory,
-    env: process.env,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  },
-);
+let server;
 let serverOutput = '';
-server.stdout.on('data', (chunk) => {
-  serverOutput += String(chunk);
-});
-server.stderr.on('data', (chunk) => {
-  serverOutput += String(chunk);
-});
-
 let browser;
+let supabaseMock;
+let completed = false;
 try {
+  server = spawn(
+    npm,
+    [
+      'run',
+      'preview',
+      '--',
+      '--host',
+      '127.0.0.1',
+      '--port',
+      String(port),
+      '--strictPort',
+    ],
+    {
+      cwd: appDirectory,
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  );
+  server.stdout.on('data', (chunk) => {
+    serverOutput += String(chunk);
+  });
+  server.stderr.on('data', (chunk) => {
+    serverOutput += String(chunk);
+  });
+  supabaseMock = await startSupabaseMock();
   await waitForServer(server, baseUrl, () => serverOutput);
   browser = await chromium.launch({headless: true});
   const page = await browser.newPage();
@@ -137,6 +150,27 @@ try {
 
   const packageDefault = await exercise(page, `${baseUrl}/?worker=default`);
   console.log(`PACKAGE_DEFAULT_WORKER_OK ${JSON.stringify(packageDefault)}`);
+
+  for (const workerMode of ['app-local', 'default']) {
+    const parameters = new URLSearchParams({
+      worker: workerMode,
+      source: 'supabase',
+      supabaseUrl: supabaseMock.url,
+    });
+    const result = await exerciseSupabase(
+      page,
+      `${baseUrl}/?${parameters}`,
+    );
+    console.log(
+      `SUPABASE_${workerMode.toUpperCase().replace('-', '_')}_WORKER_OK ${JSON.stringify(result)}`,
+    );
+  }
+  if (supabaseMock.restRequests !== 4 || supabaseMock.joins !== 2) {
+    throw new Error(
+      `Expected two complete packed Supabase snapshots and joins, received ${JSON.stringify(supabaseMock)}`,
+    );
+  }
+  supabaseMock.throwIfFailed();
 
   for (const workerMode of ['app-local', 'default']) {
     const databaseName = `packed-${workerMode}-${Date.now()}`;
@@ -156,9 +190,19 @@ try {
       `OPFS_${workerMode.toUpperCase().replace('-', '_')}_WORKER_OK ${JSON.stringify({written, restored})}`,
     );
   }
+  completed = true;
 } finally {
-  await browser?.close();
-  await stopServer(server);
+  const cleanup = await Promise.allSettled([
+    browser?.close(),
+    supabaseMock?.close(),
+    server ? stopServer(server) : undefined,
+  ]);
+  if (completed) {
+    const failure = cleanup.find((result) => result.status === 'rejected');
+    if (failure?.status === 'rejected') {
+      throw failure.reason;
+    }
+  }
 }
 
 console.log(`PACKED_TARBALL ${relative(root, tarball)}`);
@@ -207,6 +251,10 @@ function assertPackedFiles(packed) {
     'package.json',
     'index.js',
     'index.d.ts',
+    'adapters/supabase/builtin.js',
+    'adapters/supabase/native-realtime.js',
+    'source-options.js',
+    'worker/builtin-source.js',
     'worker/default-entry.js',
     'wasm/tinygres_wasm.js',
     'wasm/tinygres_wasm_bg.wasm',
@@ -285,6 +333,211 @@ async function exercisePersisted(page, url) {
     throw new Error(`Unexpected packed OPFS restart result: ${text}`);
   }
   return result;
+}
+
+async function exerciseSupabase(page, url) {
+  await page.goto(url);
+  await page
+    .locator('body[data-status="passed"][data-closed="true"]')
+    .waitFor({timeout: 30_000});
+  const text = await page.locator('#result').textContent();
+  const result = JSON.parse(text ?? 'null');
+  if (
+    result.phase !== 'live-best-effort' ||
+    result.revision !== 1 ||
+    result.title !== 'from packed Supabase snapshot'
+  ) {
+    throw new Error(`Unexpected packed Supabase result: ${text}`);
+  }
+  return result;
+}
+
+async function startSupabaseMock() {
+  const state = {errors: [], joins: 0, restRequests: 0};
+  const server = createServer((request, response) => {
+    const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+    if (request.method === 'OPTIONS') {
+      respondCors(response, 204);
+      return;
+    }
+    try {
+      if (request.method !== 'GET' || url.pathname !== '/rest/v1/posts') {
+        throw new Error(`Unexpected packed Supabase HTTP request: ${request.method} ${url}`);
+      }
+      state.restRequests += 1;
+      const headers = request.headers;
+      const firstPage = headers.range === '0-499';
+      const terminatingPage = headers.range === '1-500';
+      if (
+        headers.apikey !== 'sb_publishable_packed_test' ||
+        headers.authorization !== undefined ||
+        headers['accept-profile'] !== 'public' ||
+        (!firstPage && !terminatingPage) ||
+        url.searchParams.get('select') !== 'id,title' ||
+        url.searchParams.get('order') !== 'id.asc'
+      ) {
+        throw new Error(
+          `Unexpected packed Supabase snapshot request: ${url} ${JSON.stringify(headers)}`,
+        );
+      }
+      respondCors(
+        response,
+        200,
+        JSON.stringify(
+          firstPage
+            ? [{id: 1, title: 'from packed Supabase snapshot'}]
+            : [],
+        ),
+      );
+    } catch (error) {
+      state.errors.push(error);
+      respondCors(response, 500, JSON.stringify({message: String(error)}));
+    }
+  });
+  const webSockets = new WebSocketServer({noServer: true});
+  server.on('upgrade', (request, socket, head) => {
+    const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+    if (url.pathname !== '/realtime/v1/websocket') {
+      socket.destroy();
+      return;
+    }
+    webSockets.handleUpgrade(request, socket, head, (webSocket) => {
+      webSockets.emit('connection', webSocket, request);
+    });
+  });
+  webSockets.on('connection', (socket, request) => {
+    try {
+      const endpoint = new URL(request.url ?? '/', 'http://127.0.0.1');
+      if (
+        endpoint.searchParams.get('apikey') !==
+          'sb_publishable_packed_test' ||
+        endpoint.searchParams.get('vsn') !== '1.0.0'
+      ) {
+        throw new Error(`Unexpected packed Supabase Realtime URL: ${endpoint}`);
+      }
+    } catch (error) {
+      state.errors.push(error);
+      socket.close(1008, 'Invalid test connection');
+      return;
+    }
+    socket.on('message', (message) => {
+      try {
+        const frame = JSON.parse(String(message));
+        if (frame.event === 'heartbeat') {
+          socket.send(
+            JSON.stringify({
+              topic: 'phoenix',
+              event: 'phx_reply',
+              payload: {status: 'ok', response: {}},
+              ref: frame.ref,
+            }),
+          );
+          return;
+        }
+        if (frame.event !== 'phx_join') {
+          return;
+        }
+        state.joins += 1;
+        const subscriptions = frame.payload?.config?.postgres_changes;
+        if (
+          !Array.isArray(subscriptions) ||
+          subscriptions.length !== 1 ||
+          frame.payload?.config?.broadcast?.replication_ready !== true ||
+          subscriptions[0]?.schema !== 'public' ||
+          subscriptions[0]?.table !== 'posts' ||
+          JSON.stringify(subscriptions[0]?.select) !==
+            JSON.stringify(['id', 'title'])
+        ) {
+          throw new Error(
+            `Unexpected packed Supabase join: ${JSON.stringify(frame)}`,
+          );
+        }
+        socket.send(
+          JSON.stringify({
+            topic: frame.topic,
+            event: 'phx_reply',
+            payload: {
+              status: 'ok',
+              response: {
+                postgres_changes: [
+                  {id: 101, event: '*', schema: 'public', table: 'posts'},
+                ],
+              },
+            },
+            ref: frame.ref,
+            join_ref: frame.ref,
+          }),
+        );
+        for (const payload of [
+          {
+            status: 'ok',
+            extension: 'postgres_changes',
+            message: 'Subscribed to PostgreSQL',
+          },
+          {
+            status: 'ok',
+            extension: 'system',
+            message: 'Replication connection established',
+          },
+        ]) {
+          socket.send(
+            JSON.stringify({
+              topic: frame.topic,
+              event: 'system',
+              payload,
+              ref: null,
+              join_ref: frame.ref,
+            }),
+          );
+        }
+      } catch (error) {
+        state.errors.push(error);
+        socket.close(1011, 'Invalid test frame');
+      }
+    });
+  });
+  await new Promise((resolvePromise, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolvePromise);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string') {
+    throw new Error('Packed Supabase server did not bind an IPv4 port');
+  }
+  return {
+    get joins() {
+      return state.joins;
+    },
+    get restRequests() {
+      return state.restRequests;
+    },
+    url: `http://127.0.0.1:${address.port}`,
+    throwIfFailed() {
+      if (state.errors.length > 0) {
+        throw state.errors[0];
+      }
+    },
+    async close() {
+      for (const socket of webSockets.clients) {
+        socket.terminate();
+      }
+      await new Promise((resolvePromise) => webSockets.close(resolvePromise));
+      await new Promise((resolvePromise, reject) =>
+        server.close((error) => (error ? reject(error) : resolvePromise())),
+      );
+    },
+  };
+}
+
+function respondCors(response, status, body = '') {
+  response.writeHead(status, {
+    'Access-Control-Allow-Headers':
+      'accept-profile, apikey, authorization, range, range-unit',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Origin': '*',
+    'Content-Type': 'application/json',
+  });
+  response.end(body);
 }
 
 async function stopServer(child) {

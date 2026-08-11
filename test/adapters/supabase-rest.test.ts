@@ -25,7 +25,9 @@ describe('SupabaseRestSnapshotReader', () => {
               {team_id: 1, user_id: 1, role: 'owner'},
               {team_id: 1, user_id: 2, role: 'member'},
             ]
-          : [{team_id: 2, user_id: 1, role: 'owner'}];
+          : range === '2-3'
+            ? [{team_id: 2, user_id: 1, role: 'owner'}]
+            : [];
       return new Response(JSON.stringify(rows));
     });
     const reader = new SupabaseRestSnapshotReader({
@@ -56,12 +58,18 @@ describe('SupabaseRestSnapshotReader', () => {
       {
         page: 1,
         rows: [{team_id: 2, user_id: 1, role: 'owner'}],
+        done: false,
+      },
+      {
+        page: 2,
+        rows: [],
         done: true,
       },
     ]);
     expect(calls.map(({init}) => new Headers(init.headers).get('Range'))).toEqual([
       '0-1',
       '2-3',
+      '3-4',
     ]);
     expect(calls[0]!.url.pathname).toBe('/rest/v1/memberships');
     expect(calls[0]!.url.searchParams.get('select')).toBe(
@@ -75,6 +83,40 @@ describe('SupabaseRestSnapshotReader', () => {
     expect(headers.get('Authorization')).toBe('Bearer user-jwt');
     expect(headers.get('apikey')).toBe('sb_publishable_test');
     expect(getAccessToken).toHaveBeenCalledOnce();
+  });
+
+  it('continues after pages capped below the requested range size', async () => {
+    const ranges: string[] = [];
+    const rows = Array.from({length: 250}, (_, index) => ({
+      team_id: Math.floor(index / 10),
+      user_id: index,
+      role: 'member',
+    }));
+    const fetch = vi.fn(async (_input: URL | RequestInfo, init?: RequestInit) => {
+      const range = new Headers(init?.headers).get('Range')!;
+      ranges.push(range);
+      const from = Number(range.split('-', 1)[0]);
+      return new Response(JSON.stringify(rows.slice(from, from + 100)));
+    });
+    const reader = new SupabaseRestSnapshotReader({
+      url: 'https://project.supabase.co',
+      publishableKey: 'sb_publishable_test',
+      pageSize: 500,
+      fetch,
+    });
+
+    const pages = await collect(
+      reader.snapshot(memberships, new AbortController().signal),
+    );
+
+    expect(pages.flatMap(({rows}) => rows)).toEqual(rows);
+    expect(pages.map(({rows, done}) => [rows.length, done])).toEqual([
+      [100, false],
+      [100, false],
+      [50, false],
+      [0, true],
+    ]);
+    expect(ranges).toEqual(['0-499', '100-599', '200-699', '250-749']);
   });
 
   it('rejects HTTP failures and malformed or keyless rows', async () => {

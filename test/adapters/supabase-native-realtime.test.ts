@@ -65,7 +65,7 @@ describe('createSupabaseRealtimeTransport', () => {
       payload: {
         access_token: 'user-jwt',
         config: {
-          broadcast: {ack: false, self: false},
+          broadcast: {ack: false, self: false, replication_ready: true},
           presence: {enabled: false},
           private: false,
           postgres_changes: [
@@ -80,7 +80,7 @@ describe('createSupabaseRealtimeTransport', () => {
         },
       },
     });
-    socket.joinReply(join, [
+    socket.ready(join, [
       {id: 7, event: '*', schema: 'private', table: 'memberships'},
       {id: 4, event: '*', schema: 'public', table: 'posts'},
     ]);
@@ -103,6 +103,83 @@ describe('createSupabaseRealtimeTransport', () => {
     expect(observer.payload).toHaveBeenCalledWith(data);
 
     await connection.close();
+    expect(socket.closeCalls).toBe(1);
+    expect(harness.timer.pending()).toBe(0);
+  });
+
+  it('waits for both Postgres subscription and replication readiness', async () => {
+    const postgresHarness = createHarness();
+    const postgres = postgresHarness.connect();
+    const postgresSocket = postgresHarness.sockets[0]!;
+    postgresSocket.open();
+    const postgresJoin = postgresSocket.lastSent();
+    postgresSocket.joinReply(postgresJoin, expectedSubscriptions());
+    postgresSocket.system(
+      postgresJoin,
+      'postgres_changes',
+      'Subscribed to PostgreSQL',
+    );
+    const postgresSettled = vi.fn();
+    void postgres.promise.then(postgresSettled, postgresSettled);
+    await Promise.resolve();
+    expect(postgresSettled).not.toHaveBeenCalled();
+    expect(postgres.observer.status).not.toHaveBeenCalledWith('SUBSCRIBED');
+
+    const replicationHarness = createHarness();
+    const replication = replicationHarness.connect();
+    const replicationSocket = replicationHarness.sockets[0]!;
+    replicationSocket.open();
+    const replicationJoin = replicationSocket.lastSent();
+    replicationSocket.joinReply(replicationJoin, expectedSubscriptions());
+    replicationSocket.system(
+      replicationJoin,
+      'system',
+      'Replication connection established',
+    );
+    const replicationSettled = vi.fn();
+    void replication.promise.then(replicationSettled, replicationSettled);
+    await Promise.resolve();
+    expect(replicationSettled).not.toHaveBeenCalled();
+    expect(replication.observer.status).not.toHaveBeenCalledWith('SUBSCRIBED');
+
+    postgresSocket.system(
+      postgresJoin,
+      'system',
+      'Replication connection established',
+    );
+    replicationSocket.system(
+      replicationJoin,
+      'postgres_changes',
+      'Subscribed to PostgreSQL',
+    );
+    const [postgresConnection, replicationConnection] = await Promise.all([
+      postgres.promise,
+      replication.promise,
+    ]);
+    expect(postgres.observer.status).toHaveBeenCalledWith('SUBSCRIBED');
+    expect(replication.observer.status).toHaveBeenCalledWith('SUBSCRIBED');
+
+    await Promise.all([
+      postgresConnection.close(),
+      replicationConnection.close(),
+    ]);
+  });
+
+  it('bounds the complete readiness handshake with the join timeout', async () => {
+    const harness = createHarness({joinTimeoutMs: 5});
+    const {promise} = harness.connect();
+    const socket = harness.sockets[0]!;
+    socket.open();
+    const join = socket.lastSent();
+    socket.joinReply(join, expectedSubscriptions());
+    socket.system(join, 'postgres_changes', 'Subscribed to PostgreSQL');
+
+    harness.timer.advance(5);
+
+    await expect(promise).rejects.toMatchObject({
+      code: 'SUPABASE_REALTIME_CONNECT_FAILED',
+      retryable: true,
+    });
     expect(socket.closeCalls).toBe(1);
     expect(harness.timer.pending()).toBe(0);
   });
@@ -142,6 +219,61 @@ describe('createSupabaseRealtimeTransport', () => {
     });
   });
 
+  it.each([
+    'Unauthorized: invalid token sb_secret_never_log_this',
+    'RealtimeDisabledForConfiguration: Postgres Changes are disabled',
+  ])('keeps permanent join rejection `%s` terminal and sanitized', async (reason) => {
+    const harness = createHarness();
+    const {promise} = harness.connect();
+    const socket = harness.sockets[0]!;
+    socket.open();
+    socket.joinRejected(socket.lastSent(), reason);
+
+    await expect(promise).rejects.toMatchObject({
+      code: 'SUPABASE_REALTIME_JOIN_REJECTED',
+      message: 'Supabase Realtime rejected the channel join',
+      retryable: false,
+    });
+    await expect(promise).rejects.not.toMatchObject({
+      message: expect.stringContaining(reason),
+    });
+    expect(harness.timer.pending()).toBe(0);
+  });
+
+  it('backs off and reconnects after a transient join rejection', async () => {
+    const harness = createHarness({reconnectDelaysMs: [3, 7]});
+    const connected = harness.connect();
+    const first = harness.sockets[0]!;
+    first.open();
+    first.ready(first.lastSent(), expectedSubscriptions());
+    const connection = await connected.promise;
+
+    first.serverClose();
+    expect(harness.timer.nextDelay()).toBe(3);
+    harness.timer.advance(3);
+    const second = harness.sockets[1]!;
+    second.open();
+    second.joinRejected(
+      second.lastSent(),
+      'RealtimeRestarting: Realtime is restarting',
+    );
+
+    expect(connected.observer.status).toHaveBeenLastCalledWith(
+      'CHANNEL_ERROR',
+      expect.objectContaining({
+        code: 'SUPABASE_REALTIME_JOIN_REJECTED',
+        message: 'Supabase Realtime rejected the channel join',
+        retryable: true,
+      }),
+    );
+    expect(harness.timer.nextDelay()).toBe(7);
+    harness.timer.advance(7);
+    expect(harness.sockets).toHaveLength(3);
+
+    await connection.close();
+    expect(harness.timer.pending()).toBe(0);
+  });
+
   it('detects a missing heartbeat acknowledgement and reconnects with backoff', async () => {
     const harness = createHarness({
       heartbeatIntervalMs: 20,
@@ -151,7 +283,7 @@ describe('createSupabaseRealtimeTransport', () => {
     const first = harness.sockets[0]!;
     first.open();
     const firstJoin = first.lastSent();
-    first.joinReply(firstJoin, expectedSubscriptions());
+    first.ready(firstJoin, expectedSubscriptions());
     const connection = await promise;
 
     harness.timer.advance(20);
@@ -176,6 +308,18 @@ describe('createSupabaseRealtimeTransport', () => {
     second.open();
     const secondJoin = second.lastSent();
     second.joinReply(secondJoin, expectedSubscriptions());
+    second.system(
+      secondJoin,
+      'postgres_changes',
+      'Subscribed to PostgreSQL',
+    );
+    expect(observer.status.mock.calls.filter(([status]) => status === 'SUBSCRIBED'))
+      .toHaveLength(1);
+    second.system(
+      secondJoin,
+      'system',
+      'Replication connection established',
+    );
     expect(observer.status.mock.calls.filter(([status]) => status === 'SUBSCRIBED'))
       .toHaveLength(2);
 
@@ -189,7 +333,7 @@ describe('createSupabaseRealtimeTransport', () => {
     const first = harness.sockets[0]!;
     first.open();
     const join = first.lastSent();
-    first.joinReply(join, expectedSubscriptions());
+    first.ready(join, expectedSubscriptions());
     const connection = await connected.promise;
 
     first.serverClose();
@@ -216,7 +360,7 @@ describe('createSupabaseRealtimeTransport', () => {
     const first = harness.sockets[0]!;
     first.open();
     const join = first.lastSent();
-    first.joinReply(join, expectedSubscriptions());
+    first.ready(join, expectedSubscriptions());
     const connection = await promise;
 
     harness.timer.advance(20);
@@ -249,7 +393,7 @@ describe('createSupabaseRealtimeTransport', () => {
     const second = harness.sockets[1]!;
     second.open();
     const secondJoin = second.lastSent();
-    second.joinReply(secondJoin, expectedSubscriptions());
+    second.ready(secondJoin, expectedSubscriptions());
     second.message({
       topic: secondJoin.topic,
       event: 'system',
@@ -281,7 +425,7 @@ describe('createSupabaseRealtimeTransport', () => {
     const socket = secondHarness.sockets[0]!;
     socket.open();
     const join = socket.lastSent();
-    socket.joinReply(join, expectedSubscriptions());
+    socket.ready(join, expectedSubscriptions());
     const connection = await connected.promise;
     socket.serverClose();
     await connection.close();
@@ -447,6 +591,40 @@ class FakeSocket implements SupabaseRealtimeWebSocket {
       ref: join.ref,
       join_ref: join.ref,
     });
+  }
+
+  joinRejected(join: Record<string, any>, reason: string): void {
+    this.message({
+      topic: join.topic,
+      event: 'phx_reply',
+      payload: {status: 'error', response: {reason}},
+      ref: join.ref,
+      join_ref: join.ref,
+    });
+  }
+
+  system(
+    join: Record<string, any>,
+    extension: 'postgres_changes' | 'system',
+    message: string,
+    status = 'ok',
+  ): void {
+    this.message({
+      topic: join.topic,
+      event: 'system',
+      payload: {status, extension, message, channel: join.topic},
+      ref: null,
+      join_ref: join.ref,
+    });
+  }
+
+  ready(
+    join: Record<string, any>,
+    subscriptions: Array<Record<string, unknown>>,
+  ): void {
+    this.joinReply(join, subscriptions);
+    this.system(join, 'postgres_changes', 'Subscribed to PostgreSQL');
+    this.system(join, 'system', 'Replication connection established');
   }
 
   #emit(

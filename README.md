@@ -16,8 +16,8 @@ The first proof of concept deliberately does a small number of things:
 - evaluates a documented subset of PostgreSQL `SELECT` in Rust/WASM;
 - applies normalized snapshot and server-change batches atomically;
 - emits table-level invalidations so an application can re-query; and
-- keeps source adapters behind the worker boundary for future Supabase and
-  PostgreSQL replication transports.
+- runs an optional built-in Supabase snapshot/Realtime source behind the worker
+  boundary, while retaining an adapter seam for future transports.
 
 ## Building from source
 
@@ -97,7 +97,7 @@ const unsubscribe = db.subscribe({tables: ['posts']}, async (event) => {
   render(refreshed.rows);
 });
 
-// Later, a read-only source adapter will call this for a server change.
+// A read-only source adapter normally owns this integration API.
 await db.applyBatch({
   sourceId: 'example-source',
   changes: [
@@ -130,7 +130,7 @@ const db = createClient({
 });
 ```
 
-The worker entry can install a future source adapter without moving network or
+The worker entry can install a custom source adapter without moving network or
 replication work onto the UI thread:
 
 ```ts
@@ -142,6 +142,9 @@ startWorker({source: myReadOnlyReplicaSource});
 
 Adapter functions live in the worker and normalize their input into table
 snapshots and change batches. They are not serialized through `postMessage`.
+When a custom source and OPFS are combined, the application must include the
+source identity and authorization scope in its storage name. TinyGres can bind
+storage automatically only for serializable built-in source configurations.
 
 ## OPFS persistence
 
@@ -173,6 +176,14 @@ the project, dataset, schema version, and authenticated user or authorization
 scope in the name whenever those affect which rows may be cached. A name is a
 namespace, not an encryption or access-control boundary.
 
+For the built-in Supabase source, TinyGres derives the physical OPFS namespace
+from the logical name plus the normalized project URL, publishable key, table
+mapping, primary keys, and selected columns. Changing that visibility contract
+opens a separate cache instead of exposing rows from the previous one. Database
+policy definitions are not part of that client-side fingerprint: change the
+logical storage name (or clear the old cache) whenever an anonymous policy or
+publication changes.
+
 Synchronous OPFS access requires a secure context and a dedicated Worker. It is
 not available in a `SharedWorker`. There is no silent fallback to memory when
 OPFS is requested but unavailable, locked, corrupt, or out of quota.
@@ -192,8 +203,70 @@ milestones.
 ## Supabase adapter
 
 The first source adapter snapshots explicitly selected tables through the
-Supabase Data API, then uses Supabase Realtime to accelerate changes. Put the
-adapter and its Supabase client inside an application-owned worker:
+Supabase Data API, then uses Supabase Realtime to accelerate changes. The
+default worker needs only a serializable configuration; it includes the narrow
+REST and Phoenix WebSocket behavior required for this flow and has no Supabase
+SDK dependency:
+
+```ts
+import {createClient} from 'tinygres';
+
+const db = createClient({
+  storage: {kind: 'opfs', name: 'my-app-cache'},
+  source: {
+    kind: 'supabase',
+    url: import.meta.env.VITE_SUPABASE_URL,
+    publishableKey: import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
+    tables: [
+      {
+        // `schema` defaults to `public`.
+        table: 'posts',
+        primaryKey: ['id'],
+        columns: ['id', 'title', 'published'],
+      },
+    ],
+  },
+});
+
+// Local readiness never waits for the network. An OPFS cache is queryable here;
+// a new cache has the configured schemas and no rows yet.
+await db.ready();
+const cached = await db.query('SELECT * FROM posts');
+
+const unsubscribe = db.subscribeToSyncState((state) => {
+  console.log('TinyGres sync state', state.phase);
+});
+
+// Wait through transient reconnects until a complete remote baseline is live.
+await db.whenSynced({timeoutMs: 30_000});
+const reconciled = await db.query('SELECT * FROM posts');
+
+unsubscribe();
+await db.close();
+```
+
+`getSyncState()` returns the latest state, and `subscribeToSyncState()`
+immediately emits that same snapshot before reporting later transitions.
+`whenSynced()` resolves only for `live-best-effort` or a future durable-live
+state; it rejects terminal configuration/permission errors, cancellation,
+timeout, client closure, and calls made without a source.
+
+The built-in configuration deliberately supports one invariant anonymous
+visibility scope through a browser-safe Supabase publishable key. Each selected
+table must be entirely readable by the anonymous role through the Data API—for
+example, with a table-wide `USING (true)` policy—and included in Supabase's
+Realtime publication. Row-dependent anonymous RLS, policy changes, and
+visibility based on JWT claims are not supported: a browser cache cannot infer
+that a previously visible row has become hidden. Enable `REPLICA IDENTITY FULL`
+for synchronized tables so UPDATE and DELETE events contain enough old row
+identity to repair primary-key changes safely. Never put a secret or
+service-role key in browser code; TinyGres rejects those recognizable key
+forms.
+
+Authenticated sessions, token refresh, and changing per-user RLS visibility
+need an explicit auth-generation and cache-transition contract and are not yet
+supported by the built-in source. For advanced experiments, an
+application-owned worker can still inject the official Supabase client:
 
 ```ts
 // tinygres.worker.ts
@@ -244,15 +317,21 @@ await db.ready();
 
 Install `@supabase/supabase-js` in the application when using this helper;
 TinyGres deliberately does not bundle it or add it to the core runtime. The
-example above covers anonymous/public-key access. Passing authenticated sessions
-from the main thread into the worker, including safe token refresh and cache
-namespacing, is a planned integration point rather than a supported contract
-yet. Never put a Supabase secret or service-role key in browser code.
+example above also covers anonymous/public-key access. Adapter functions remain
+inside the worker and are never passed through `postMessage`.
 
 Supabase Realtime does not provide a durable client cursor or transaction
 boundaries. TinyGres therefore reports this source as `live-best-effort`, marks
-it stale after a disconnect or malformed payload, and replaces affected local
-snapshots before reporting it live again.
+it stale after a disconnect or untrusted payload, quarantines incremental
+changes until integrity is restored, and replaces complete table snapshots
+before reporting it live again. The REST snapshot is not transactionally
+aligned with the Realtime stream, so repeated changes during a snapshot trigger
+another bounded pass. This is an offline-readable cache with reconciliation,
+not logical replication or an upstream write path.
+
+See Supabase's documentation for [Postgres Changes setup](https://supabase.com/docs/guides/realtime/postgres-changes),
+the [Realtime wire protocol](https://supabase.com/docs/guides/realtime/protocol),
+and [browser-safe API keys](https://supabase.com/docs/guides/getting-started/api-keys).
 
 ## Supabase-style builder
 
@@ -298,12 +377,15 @@ npm run check:size      # hard 700 KiB uncompressed WASM gate
 The browser tests cover the complete Phase-1 path—initialize the real module
 Worker, query, apply a fake remote change, receive an invalidation, and
 re-query—plus the Phase-2 persistence path through a real dedicated Worker and
-OPFS restart.
+OPFS restart. Phase 3 adds a credential-free protocol server that exercises the
+actual default Worker, PostgREST snapshot, Phoenix join/change/reconnect flow,
+and source-bound OPFS recovery.
 
 The packed-package test separately proves SSR-safe import, declarations, a
 production Vite build, and real browser execution through both the packaged
-default worker and an application-owned worker. It installs the tarball rather
-than resolving TinyGres through a workspace link.
+default worker and an application-owned worker. It also starts the built-in
+Supabase source through both worker modes without installing a Supabase SDK. It
+installs the tarball rather than resolving TinyGres through a workspace link.
 
 The current feasibility target is an uncompressed WASM binary smaller than 700
 KiB. The size check is intentionally independent of gzip size so it cannot hide

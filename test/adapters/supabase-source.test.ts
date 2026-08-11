@@ -36,8 +36,8 @@ describe('SupabaseSource', () => {
         },
       ],
       realtime,
-      fetch: async () =>
-        new Response(JSON.stringify([{id: 1, title: 'snapshot'}])),
+      fetch: async (_input, init) =>
+        snapshotPage(init, [{id: 1, title: 'snapshot'}]),
       now: () => '2026-08-09T00:00:00.000Z',
     });
 
@@ -96,7 +96,10 @@ describe('SupabaseSource', () => {
         {schema: 'public', table: 'posts', primaryKey: ['id']},
       ],
       realtime,
-      fetch: async () => {
+      fetch: async (_input, init) => {
+        if (!isFirstSnapshotPage(init)) {
+          return new Response('[]');
+        }
         fetches += 1;
         if (fetches === 1) {
           realtime.observer!.payload({
@@ -138,8 +141,12 @@ describe('SupabaseSource', () => {
         {schema: 'public', table: 'posts', primaryKey: ['id']},
       ],
       realtime,
-      fetch: async () =>
-        new Response(JSON.stringify([{id: ++snapshotVersion}])),
+      fetch: async (_input, init) => {
+        if (!isFirstSnapshotPage(init)) {
+          return new Response('[]');
+        }
+        return new Response(JSON.stringify([{id: ++snapshotVersion}]));
+      },
       now: () => `reconciled-${snapshotVersion}`,
     });
     await source.start(context.value);
@@ -195,7 +202,10 @@ describe('SupabaseSource', () => {
         },
       ],
       realtime,
-      fetch: async () => {
+      fetch: async (_input, init) => {
+        if (!isFirstSnapshotPage(init)) {
+          return new Response('[]');
+        }
         snapshots += 1;
         return new Response(JSON.stringify([{id: 1, title: 'complete'}]));
       },
@@ -241,7 +251,10 @@ describe('SupabaseSource', () => {
       realtime,
       retryDelaysMs: [0],
       sleep: async () => undefined,
-      fetch: async () => {
+      fetch: async (_input, init) => {
+        if (!isFirstSnapshotPage(init)) {
+          return new Response('[]');
+        }
         snapshots += 1;
         if (snapshots === 1) {
           realtime.observer!.status(
@@ -292,8 +305,12 @@ describe('SupabaseSource', () => {
       realtime,
       retryDelaysMs: [0],
       sleep: async () => undefined,
-      fetch: async () =>
-        new Response(JSON.stringify([{id: 1, snapshot: ++snapshot}])),
+      fetch: async (_input, init) => {
+        if (!isFirstSnapshotPage(init)) {
+          return new Response('[]');
+        }
+        return new Response(JSON.stringify([{id: 1, snapshot: ++snapshot}]));
+      },
     });
     await source.start(context.value);
 
@@ -344,7 +361,10 @@ describe('SupabaseSource', () => {
       realtime,
       retryDelaysMs: [0],
       sleep: async () => undefined,
-      fetch: async () => {
+      fetch: async (_input, init) => {
+        if (!isFirstSnapshotPage(init)) {
+          return new Response('[]');
+        }
         snapshots += 1;
         return new Response(JSON.stringify([{id: 1, title: 'complete'}]));
       },
@@ -393,7 +413,10 @@ describe('SupabaseSource', () => {
       sleep: async (delay) => {
         delays.push(delay);
       },
-      fetch: async () => {
+      fetch: async (_input, init) => {
+        if (!isFirstSnapshotPage(init)) {
+          return new Response('[]');
+        }
         fetches += 1;
         if (fetches === 1) {
           return new Response('{}', {status: 503});
@@ -556,6 +579,14 @@ class FakeRealtime implements SupabaseRealtimeTransport {
 
 function encodeBase64Url(value: unknown): string {
   return Buffer.from(JSON.stringify(value)).toString('base64url');
+}
+
+function isFirstSnapshotPage(init?: RequestInit): boolean {
+  return new Headers(init?.headers).get('Range')?.startsWith('0-') ?? false;
+}
+
+function snapshotPage(init: RequestInit | undefined, rows: Row[]): Response {
+  return new Response(JSON.stringify(isFirstSnapshotPage(init) ? rows : []));
 }
 
 function fakeContext(): {
