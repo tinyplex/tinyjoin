@@ -55,18 +55,16 @@ export function normalizeSupabaseChange(
       break;
     }
     case 'UPDATE': {
+      const previous = requireUpdateKey(oldRow, table);
       const row = projectRow(
         requireRow(newRow, table, options.expectedColumns),
         table.columns,
       );
-      const previous = optionalRow(oldRow);
       changes = [];
-      if (previous && hasCompletePrimaryKey(table, previous)) {
-        const oldKey = keyRow(table, previous);
-        const newKey = keyRow(table, row);
-        if (!keysEqual(table, oldKey, newKey)) {
-          changes.push({type: 'delete', table: table.localName, key: oldKey});
-        }
+      const oldKey = keyRow(table, previous);
+      const newKey = keyRow(table, row);
+      if (!keysEqual(table, oldKey, newKey)) {
+        changes.push({type: 'delete', table: table.localName, key: oldKey});
       }
       changes.push({type: 'upsert', table: table.localName, row});
       break;
@@ -114,7 +112,12 @@ export function createSupabaseJsRealtimeTransport<
       for (const table of options.tables) {
         channel.on(
           'postgres_changes',
-          {event: '*', schema: table.schema, table: table.table},
+          {
+            event: '*',
+            schema: table.schema,
+            table: table.table,
+            ...(table.columns ? {select: [...table.columns]} : {}),
+          },
           (payload) => observer.payload(payload),
         );
       }
@@ -126,7 +129,12 @@ export function createSupabaseJsRealtimeTransport<
 interface ChannelLike {
   on(
     type: 'postgres_changes',
-    filter: {event: '*'; schema: string; table: string},
+    filter: {
+      event: '*';
+      schema: string;
+      table: string;
+      select?: string[];
+    },
     callback: (payload: unknown) => void,
   ): unknown;
   subscribe(callback: (status: string, error?: unknown) => void): unknown;
@@ -233,14 +241,22 @@ function requireRow(
   return value;
 }
 
-function optionalRow(value: unknown): Row | undefined {
-  return isRow(value) ? value : undefined;
-}
-
 function projectRow(row: Row, columns?: readonly string[]): Row {
   return columns
     ? Object.fromEntries(columns.map((column) => [column, row[column]!]))
     : row;
+}
+
+function requireUpdateKey(
+  value: unknown,
+  table: NormalizedSupabaseTable,
+): Row {
+  if (!isRow(value) || !hasCompletePrimaryKey(table, value)) {
+    throw invalidPayload(
+      `Realtime UPDATE for \`${table.schema}.${table.table}\` does not contain the previous primary key; enable REPLICA IDENTITY FULL so TinyGres can reconcile key changes`,
+    );
+  }
+  return value;
 }
 
 function hasCompletePrimaryKey(

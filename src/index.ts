@@ -3,6 +3,7 @@ export type {
   SubscriptionOptions,
   TablesChangedEvent,
   ClientOptions,
+  WhenSyncedOptions,
 } from './client/client.js';
 export {ClientError} from './client/error.js';
 export {QueryBuilder} from './client/query-builder.js';
@@ -24,3 +25,8 @@ export type {
   SyncState,
   TableSchema,
 } from './protocol.js';
+export type {
+  SourceOptions,
+  SupabaseSourceOptions,
+  SupabaseTableOptions,
+} from './source-options.js';

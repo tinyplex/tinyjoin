@@ -1,28 +1,13 @@
 import type {Row} from '../../protocol.js';
+import type {
+  NormalizedSupabaseTableOptions,
+  SupabaseTableOptions,
+} from '../../source-options.js';
 
-export interface SupabaseTableConfig {
-  /** Postgres schema exposed through the Supabase Data API. */
-  schema: string;
-  /** Remote Postgres table name. */
-  table: string;
-  /** Columns that uniquely identify a row. Required for Realtime deletes. */
-  primaryKey: string[];
-  /**
-   * Optional local TinyGres name. Public tables default to their table name;
-   * other schemas default to `schema.table`.
-   */
-  localName?: string;
-  /** Optional flat column projection. Primary-key columns must be included. */
-  columns?: string[];
-}
+/** Table configuration shared by built-in and application-owned sources. */
+export type SupabaseTableConfig = SupabaseTableOptions;
 
-export interface NormalizedSupabaseTable {
-  readonly schema: string;
-  readonly table: string;
-  readonly primaryKey: string[];
-  readonly localName: string;
-  readonly columns?: string[];
-}
+export type NormalizedSupabaseTable = NormalizedSupabaseTableOptions;
 
 export type MaybePromise<Value> = Value | PromiseLike<Value>;
 
@@ -30,7 +15,7 @@ export interface SupabaseRealtimeConnectOptions {
   readonly sourceId: string;
   readonly tables: readonly Pick<
     NormalizedSupabaseTable,
-    'schema' | 'table'
+    'schema' | 'table' | 'columns'
   >[];
   readonly accessToken: string | null;
   readonly signal: AbortSignal;
@@ -56,11 +41,45 @@ export interface SupabaseRealtimeTransport {
   ): Promise<SupabaseRealtimeConnection>;
 }
 
+export interface SupabaseRealtimeWebSocket {
+  readonly readyState: number;
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+  addEventListener(
+    type: 'open' | 'error' | 'close' | 'message',
+    listener: (event: Event | CloseEvent | MessageEvent<unknown>) => void,
+  ): void;
+  removeEventListener(
+    type: 'open' | 'error' | 'close' | 'message',
+    listener: (event: Event | CloseEvent | MessageEvent<unknown>) => void,
+  ): void;
+}
+
+export interface SupabaseRealtimeTimer {
+  setTimeout(callback: () => void, delayMs: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
+
+export interface CreateSupabaseRealtimeTransportOptions {
+  readonly url: string;
+  readonly publishableKey: string;
+  /** Injectable WebSocket factory for non-browser runtimes and tests. */
+  readonly createWebSocket?: (url: string) => SupabaseRealtimeWebSocket;
+  /** Injectable timer for deterministic reconnect and heartbeat tests. */
+  readonly timer?: SupabaseRealtimeTimer;
+  /** Must remain below Supabase's 25-second heartbeat deadline. */
+  readonly heartbeatIntervalMs?: number;
+  readonly joinTimeoutMs?: number;
+  /** Retry schedule; the final delay is reused for subsequent attempts. */
+  readonly reconnectDelaysMs?: readonly number[];
+}
+
 export interface SupabaseRestSnapshotOptions {
   readonly url: string;
   readonly publishableKey: string;
   readonly pageSize?: number;
   readonly fetch?: typeof globalThis.fetch;
+  /** Invoked at most once; one reader never changes authorization principal. */
   readonly getAccessToken?: () => MaybePromise<string | null>;
 }
 
@@ -77,6 +96,15 @@ export interface CreateSupabaseSourceOptions
   readonly id?: string;
   /** Number of snapshot attempts if changes arrive during a snapshot. */
   readonly maxSnapshotPasses?: number;
+  /**
+   * Invoked exactly once when synchronization starts. The sampled token is
+   * shared by Realtime and every REST page for the lifetime of this source.
+   */
+  readonly getAccessToken?: () => MaybePromise<string | null>;
+  /** Retry schedule; the final delay is reused for subsequent attempts. */
+  readonly retryDelaysMs?: readonly number[];
+  /** Injectable abort-aware delay used by deterministic tests. */
+  readonly sleep?: (delayMs: number, signal: AbortSignal) => Promise<void>;
   /** Injectable clock for deterministic tests. */
   readonly now?: () => string;
 }

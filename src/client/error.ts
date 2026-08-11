@@ -9,7 +9,8 @@ export class ClientError extends Error {
     super(error.message);
     this.name = 'ClientError';
     this.code = error.code;
-    this.details = error.details;
+    this.details =
+      error.details === undefined ? undefined : structuredClone(error.details);
     this.retryable = error.retryable ?? false;
   }
 

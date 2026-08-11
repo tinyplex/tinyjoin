@@ -1,10 +1,10 @@
-export const PROTOCOL_VERSION = 2 as const;
+import {isSourceOptions, type SourceOptions} from './source-options.js';
+
+export const PROTOCOL_VERSION = 3 as const;
 
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue =
-  | JsonPrimitive
-  | JsonValue[]
-  | {[key: string]: JsonValue};
+  JsonPrimitive | JsonValue[] | {[key: string]: JsonValue};
 export type Row = Record<string, JsonValue>;
 
 export interface TableSchema {
@@ -12,9 +12,7 @@ export interface TableSchema {
   primaryKey: string[];
 }
 
-export type StorageOptions =
-  | {kind: 'memory'}
-  | {kind: 'opfs'; name: string};
+export type StorageOptions = {kind: 'memory'} | {kind: 'opfs'; name: string};
 
 export interface SourceCursor {
   kind: string;
@@ -83,8 +81,12 @@ export interface SyncState {
 
 export interface RpcMethods {
   init: {
-    request: {schemas: TableSchema[]; storage: StorageOptions};
-    response: {revision: number};
+    request: {
+      schemas: TableSchema[];
+      storage: StorageOptions;
+      source?: SourceOptions;
+    };
+    response: {revision: number; sourceConfigured: boolean};
   };
   defineTable: {
     request: {schema: TableSchema};
@@ -156,9 +158,7 @@ export function isWorkerResponse(value: unknown): value is WorkerResponse {
   if (!Number.isSafeInteger(value.id) || typeof value.ok !== 'boolean') {
     return false;
   }
-  return value.ok
-    ? 'result' in value
-    : isSerializedError(value.error);
+  return value.ok ? 'result' in value : isSerializedError(value.error);
 }
 
 export function isWorkerEvent(value: unknown): value is WorkerEvent {
@@ -189,9 +189,12 @@ export function isWorkerRequest(value: unknown): value is WorkerRequest {
     case 'init':
       return (
         isRecord(value.params) &&
+        hasOnlyKeys(value.params, ['schemas', 'storage', 'source']) &&
         Array.isArray(value.params.schemas) &&
         value.params.schemas.every(isTableSchema) &&
-        isStorageOptions(value.params.storage)
+        isStorageOptions(value.params.storage) &&
+        (!Object.hasOwn(value.params, 'source') ||
+          isSourceOptions(value.params.source))
       );
     case 'defineTable':
       return isRecord(value.params) && isTableSchema(value.params.schema);
@@ -228,9 +231,14 @@ function isStorageOptions(value: unknown): value is StorageOptions {
   );
 }
 
-export function isSerializedError(
-  value: unknown,
-): value is SerializedError {
+function hasOnlyKeys(
+  value: Record<string, unknown>,
+  allowedKeys: readonly string[],
+): boolean {
+  return Object.keys(value).every((key) => allowedKeys.includes(key));
+}
+
+export function isSerializedError(value: unknown): value is SerializedError {
   return (
     isRecord(value) &&
     typeof value.code === 'string' &&
@@ -268,8 +276,7 @@ function isTableSchema(value: unknown): value is TableSchema {
 
 function isRow(value: unknown): value is Row {
   return (
-    isRecord(value) &&
-    Object.values(value).every((cell) => isJsonValue(cell))
+    isRecord(value) && Object.values(value).every((cell) => isJsonValue(cell))
   );
 }
 
@@ -281,7 +288,8 @@ function isChangeBatch(value: unknown): value is ChangeBatch {
     (value.sourceId !== undefined && typeof value.sourceId !== 'string') ||
     (value.transactionId !== undefined &&
       typeof value.transactionId !== 'string') ||
-    (value.committedAt !== undefined && typeof value.committedAt !== 'string') ||
+    (value.committedAt !== undefined &&
+      typeof value.committedAt !== 'string') ||
     (value.cursor !== undefined && !isSourceCursor(value.cursor))
   ) {
     return false;

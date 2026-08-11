@@ -22,6 +22,9 @@ import type {
 } from './types.js';
 import {SupabaseSourceError} from './types.js';
 
+const DEFAULT_RETRY_DELAYS_MS = [250, 500, 1_000, 2_000, 5_000, 10_000] as const;
+const MAX_RETRY_DELAY_MS = 60_000;
+
 export const SUPABASE_SOURCE_CAPABILITIES = Object.freeze({
   snapshotConsistency: 'eventual',
   changes: 'best-effort',
@@ -35,19 +38,25 @@ export class SupabaseSource implements ReplicaSource {
   readonly capabilities = SUPABASE_SOURCE_CAPABILITIES;
   readonly #options: CreateSupabaseSourceOptions;
   readonly #config: NormalizedSupabaseSourceConfig;
-  readonly #snapshotReader: SupabaseRestSnapshotReader;
   readonly #tablesByRelation = new Map<string, NormalizedSupabaseTable>();
   readonly #expectedColumns = new Map<string, readonly string[]>();
   readonly #snapshotting = new Set<string>();
   readonly #dirty = new Set<string>();
   readonly #abortController = new AbortController();
+  readonly #retryDelaysMs: readonly number[];
+  readonly #sleep: (delayMs: number, signal: AbortSignal) => Promise<void>;
+  #snapshotReader: SupabaseRestSnapshotReader | undefined;
   #context: ReplicaSourceContext | undefined;
   #connection: SupabaseRealtimeConnection | undefined;
+  #snapshotAbortController: AbortController | undefined;
   #externalAbortListener: (() => void) | undefined;
   #eventQueue: Promise<void> = Promise.resolve();
   #reconcilePromise: Promise<void> | undefined;
   #reconcileAgain = false;
+  #generation = 0;
   #subscribed = false;
+  #live = false;
+  #connecting = false;
   #closed = false;
   #started = false;
 
@@ -55,6 +64,10 @@ export class SupabaseSource implements ReplicaSource {
     this.#options = options;
     this.#config = normalizeSupabaseConfig(options);
     this.id = this.#config.id;
+    this.#retryDelaysMs = normalizeRetryDelays(
+      options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS,
+    );
+    this.#sleep = options.sleep ?? abortableSleep;
     for (const table of this.#config.tables) {
       this.#tablesByRelation.set(relationKey(table.schema, table.table), table);
       if (table.columns) {
@@ -64,15 +77,6 @@ export class SupabaseSource implements ReplicaSource {
         );
       }
     }
-    this.#snapshotReader = new SupabaseRestSnapshotReader({
-      url: this.#config.url,
-      publishableKey: this.#config.publishableKey,
-      pageSize: this.#config.pageSize,
-      ...(options.fetch ? {fetch: options.fetch} : {}),
-      ...(options.getAccessToken
-        ? {getAccessToken: options.getAccessToken}
-        : {}),
-    });
   }
 
   async start(context: ReplicaSourceContext): Promise<void> {
@@ -97,21 +101,65 @@ export class SupabaseSource implements ReplicaSource {
       await context.defineTable(toLocalSchema(table));
     }
 
-    const accessToken = await this.#options.getAccessToken?.();
-    this.#connection = await this.#options.realtime.connect(
-      {
-        sourceId: this.id,
-        tables: this.#config.tables,
-        accessToken: accessToken ?? null,
-        signal: this.#abortController.signal,
-      },
-      {
-        payload: (payload) => this.#receivePayload(payload),
-        status: (status, error) => this.#receiveStatus(status, error),
-      },
-    );
+    const accessToken = await this.#sampleAccessToken();
+    this.#snapshotReader = new SupabaseRestSnapshotReader({
+      url: this.#config.url,
+      publishableKey: this.#config.publishableKey,
+      pageSize: this.#config.pageSize,
+      ...(this.#options.fetch ? {fetch: this.#options.fetch} : {}),
+      getAccessToken: () => accessToken,
+    });
 
-    await this.#reconcile('snapshotting');
+    let attempt = 0;
+    while (!this.#closed && !this.#abortController.signal.aborted) {
+      try {
+        this.#connecting = true;
+        this.#subscribed = false;
+        this.#live = false;
+        this.#generation += 1;
+        this.#connection = await this.#options.realtime.connect(
+          {
+            sourceId: this.id,
+            tables: this.#config.tables,
+            accessToken,
+            signal: this.#abortController.signal,
+          },
+          {
+            payload: (payload) => this.#receivePayload(payload),
+            status: (status, error) => this.#receiveStatus(status, error),
+          },
+        );
+        this.#connecting = false;
+        if (!this.#subscribed) {
+          throw new SupabaseSourceError(
+            'SUPABASE_REALTIME_CONNECT_FAILED',
+            'Supabase Realtime connected without confirming its subscriptions',
+            true,
+          );
+        }
+        await this.#reconcile('snapshotting');
+        return;
+      } catch (error) {
+        this.#connecting = false;
+        if (this.#closed || this.#abortController.signal.aborted) {
+          throw abortedError();
+        }
+        await this.#discardConnection();
+        this.#invalidateGeneration();
+        if (!isRetryable(error)) {
+          throw error;
+        }
+        this.#setFailureState(error, 'stale');
+        await this.#sleep(
+          retryDelay(this.#retryDelaysMs, attempt++),
+          this.#abortController.signal,
+        );
+        if (!this.#closed && !this.#abortController.signal.aborted) {
+          context.setSyncState({phase: 'connecting', sourceId: this.id});
+        }
+      }
+    }
+    throw abortedError();
   }
 
   async reconcile(): Promise<void> {
@@ -129,6 +177,9 @@ export class SupabaseSource implements ReplicaSource {
       return;
     }
     this.#closed = true;
+    this.#live = false;
+    this.#subscribed = false;
+    this.#snapshotAbortController?.abort();
     this.#abortController.abort();
     if (this.#context && this.#externalAbortListener) {
       this.#context.signal.removeEventListener(
@@ -136,12 +187,13 @@ export class SupabaseSource implements ReplicaSource {
         this.#externalAbortListener,
       );
     }
-    await this.#connection?.close();
+    await this.#discardConnection();
     await this.#eventQueue.catch(() => undefined);
+    await this.#reconcilePromise?.catch(() => undefined);
   }
 
   #receivePayload(payload: unknown): void {
-    if (this.#closed || !this.#context) {
+    if (this.#closed || !this.#context || !this.#subscribed) {
       return;
     }
     const relation = payloadRelation(payload);
@@ -162,15 +214,27 @@ export class SupabaseSource implements ReplicaSource {
         sourceId: this.id,
         ...(expectedColumns ? {expectedColumns} : {}),
       });
-      if (this.#snapshotting.has(relation!)) {
+      if (!this.#live || this.#snapshotting.has(relation!)) {
         this.#dirty.add(relation!);
+        if (!this.#snapshotting.has(relation!)) {
+          this.#reconcileAgain = true;
+        }
         return;
       }
+
+      const generation = this.#generation;
       this.#eventQueue = this.#eventQueue
         .then(async () => {
-          if (!this.#closed) {
-            await this.#context!.applyBatch(batch);
+          if (
+            this.#closed ||
+            !this.#live ||
+            !this.#subscribed ||
+            generation !== this.#generation
+          ) {
+            this.#dirty.add(relation!);
+            return;
           }
+          await this.#context!.applyBatch(batch);
         })
         .catch((error: unknown) => this.#handleIntegrityError(error));
     } catch (error) {
@@ -184,9 +248,12 @@ export class SupabaseSource implements ReplicaSource {
     }
     if (status === 'SUBSCRIBED') {
       if (this.#subscribed) {
+        return;
+      }
+      this.#subscribed = true;
+      this.#generation += 1;
+      if (!this.#connecting) {
         this.#requestReconcile();
-      } else {
-        this.#subscribed = true;
       }
       return;
     }
@@ -195,18 +262,16 @@ export class SupabaseSource implements ReplicaSource {
       status === 'TIMED_OUT' ||
       status === 'CLOSED'
     ) {
-      this.#context.setSyncState({
-        phase: 'stale',
-        sourceId: this.id,
-        error: serializeSourceError(
-          error ??
-            new SupabaseSourceError(
-              'SUPABASE_REALTIME_DISCONNECTED',
-              `Supabase Realtime entered ${status}`,
-              true,
-            ),
-        ),
-      });
+      this.#invalidateGeneration();
+      this.#setFailureState(
+        error ??
+          new SupabaseSourceError(
+            'SUPABASE_REALTIME_DISCONNECTED',
+            `Supabase Realtime entered ${status}`,
+            true,
+          ),
+        isExplicitPermanent(error) ? 'error' : 'stale',
+      );
     }
   }
 
@@ -214,12 +279,17 @@ export class SupabaseSource implements ReplicaSource {
     if (this.#closed || !this.#context) {
       return;
     }
-    this.#context.setSyncState({
-      phase: 'stale',
-      sourceId: this.id,
-      error: serializeSourceError(error),
-    });
-    this.#requestReconcile();
+    const remainedSubscribed = this.#subscribed;
+    this.#live = false;
+    this.#generation += 1;
+    this.#snapshotAbortController?.abort();
+    this.#markAllDirty();
+    // An untrusted delta is repairable by a complete REST baseline even when
+    // the malformed payload itself is not retryable as an incremental event.
+    this.#setFailureState(error, 'stale');
+    if (remainedSubscribed) {
+      this.#requestReconcile();
+    }
   }
 
   #requestReconcile(): void {
@@ -233,24 +303,9 @@ export class SupabaseSource implements ReplicaSource {
       this.#reconcileAgain = true;
       return this.#reconcilePromise;
     }
-    this.#reconcilePromise = this.#runReconcileLoop(phase)
-      .catch((error: unknown) => {
-        if (
-          !this.#closed &&
-          !this.#abortController.signal.aborted &&
-          this.#context
-        ) {
-          this.#context.setSyncState({
-            phase: 'stale',
-            sourceId: this.id,
-            error: serializeSourceError(error),
-          });
-        }
-        throw error;
-      })
-      .finally(() => {
-        this.#reconcilePromise = undefined;
-      });
+    this.#reconcilePromise = this.#runReconcileLoop(phase).finally(() => {
+      this.#reconcilePromise = undefined;
+    });
     return this.#reconcilePromise;
   }
 
@@ -258,53 +313,127 @@ export class SupabaseSource implements ReplicaSource {
     initialPhase: Extract<SyncPhase, 'snapshotting' | 'resyncing'>,
   ): Promise<void> {
     let phase = initialPhase;
-    do {
+    let attempt = 0;
+    while (!this.#closed && !this.#abortController.signal.aborted) {
+      if (!this.#subscribed) {
+        throw realtimeGapError();
+      }
       this.#reconcileAgain = false;
-      await this.#performReconcile(phase);
-      phase = 'resyncing';
-    } while (this.#reconcileAgain && !this.#abortController.signal.aborted);
+      try {
+        await this.#performReconcile(phase);
+        if (!this.#reconcileAgain) {
+          return;
+        }
+        phase = 'resyncing';
+        attempt = 0;
+      } catch (error) {
+        if (this.#closed || this.#abortController.signal.aborted) {
+          throw abortedError();
+        }
+        this.#live = false;
+        const retryable = isRetryable(error);
+        this.#setFailureState(error, retryable ? 'stale' : 'error');
+        if (!retryable || !this.#subscribed) {
+          throw error;
+        }
+        await this.#sleep(
+          retryDelay(this.#retryDelaysMs, attempt++),
+          this.#abortController.signal,
+        );
+        phase = 'resyncing';
+      }
+    }
+    throw abortedError();
   }
 
   async #performReconcile(
     phase: Extract<SyncPhase, 'snapshotting' | 'resyncing'>,
   ): Promise<void> {
     const context = this.#context;
-    if (!context || this.#closed || this.#abortController.signal.aborted) {
-      throw abortedError();
+    if (!context || !this.#snapshotReader) {
+      throw new SupabaseSourceError(
+        'SUPABASE_SOURCE_NOT_STARTED',
+        'The Supabase source is not ready to snapshot',
+      );
     }
+    const generation = this.#generation;
+    this.#assertCurrentGeneration(generation);
+    this.#live = false;
     context.setSyncState({phase, sourceId: this.id});
 
-    for (const table of this.#config.tables) {
-      await this.#snapshotTable(table);
-    }
-
-    context.setSyncState({
-      phase: 'live-best-effort',
-      sourceId: this.id,
-      lastReconciledAt: this.#options.now?.() ?? new Date().toISOString(),
+    const snapshotAbortController = new AbortController();
+    this.#snapshotAbortController = snapshotAbortController;
+    const abortSnapshot = () => snapshotAbortController.abort();
+    this.#abortController.signal.addEventListener('abort', abortSnapshot, {
+      once: true,
     });
+    try {
+      for (const table of this.#config.tables) {
+        this.#assertCurrentGeneration(generation);
+        await this.#snapshotTable(
+          table,
+          generation,
+          snapshotAbortController.signal,
+        );
+      }
+      this.#assertCurrentGeneration(generation);
+      if (this.#dirty.size > 0 || this.#reconcileAgain) {
+        throw new SupabaseSourceError(
+          'SUPABASE_SNAPSHOT_DIRTY',
+          'Supabase changed while the replica baseline was being rebuilt',
+          true,
+        );
+      }
+      this.#live = true;
+      context.setSyncState({
+        phase: 'live-best-effort',
+        sourceId: this.id,
+        lastReconciledAt: this.#options.now?.() ?? new Date().toISOString(),
+      });
+    } catch (error) {
+      if (
+        snapshotAbortController.signal.aborted &&
+        !this.#abortController.signal.aborted
+      ) {
+        throw realtimeGapError();
+      }
+      throw error;
+    } finally {
+      this.#abortController.signal.removeEventListener(
+        'abort',
+        abortSnapshot,
+      );
+      if (this.#snapshotAbortController === snapshotAbortController) {
+        this.#snapshotAbortController = undefined;
+      }
+    }
   }
 
-  async #snapshotTable(table: NormalizedSupabaseTable): Promise<void> {
+  async #snapshotTable(
+    table: NormalizedSupabaseTable,
+    generation: number,
+    signal: AbortSignal,
+  ): Promise<void> {
     const relation = relationKey(table.schema, table.table);
     for (let pass = 1; pass <= this.#config.maxSnapshotPasses; pass += 1) {
+      this.#assertCurrentGeneration(generation);
       this.#dirty.delete(relation);
       this.#snapshotting.add(relation);
       try {
         const rows: Row[] = [];
-        for await (const page of this.#snapshotReader.snapshot(
-          table,
-          this.#abortController.signal,
-        )) {
+        for await (const page of this.#snapshotReader!.snapshot(table, signal)) {
+          this.#assertCurrentGeneration(generation);
           rows.push(...page.rows);
           if (!this.#expectedColumns.has(relation) && page.rows[0]) {
             this.#expectedColumns.set(relation, Object.keys(page.rows[0]));
           }
         }
+        this.#assertCurrentGeneration(generation);
         if (this.#dirty.has(relation)) {
           continue;
         }
         await this.#context!.replaceTable(toLocalSchema(table), rows);
+        this.#assertCurrentGeneration(generation);
         if (!this.#dirty.has(relation)) {
           return;
         }
@@ -318,6 +447,59 @@ export class SupabaseSource implements ReplicaSource {
       `Supabase relation \`${relation}\` changed during every snapshot attempt`,
       true,
     );
+  }
+
+  #assertCurrentGeneration(generation: number): void {
+    if (!this.#subscribed || generation !== this.#generation) {
+      throw realtimeGapError();
+    }
+  }
+
+  #invalidateGeneration(): void {
+    this.#subscribed = false;
+    this.#live = false;
+    this.#generation += 1;
+    this.#snapshotAbortController?.abort();
+    this.#markAllDirty();
+  }
+
+  #markAllDirty(): void {
+    for (const relation of this.#tablesByRelation.keys()) {
+      this.#dirty.add(relation);
+    }
+    this.#reconcileAgain = true;
+  }
+
+  #setFailureState(
+    error: unknown,
+    phase: Extract<SyncPhase, 'stale' | 'error'>,
+  ): void {
+    this.#context?.setSyncState({
+      phase,
+      sourceId: this.id,
+      error: serializeSourceError(error),
+    });
+  }
+
+  async #sampleAccessToken(): Promise<string | null> {
+    try {
+      return (await this.#options.getAccessToken?.()) ?? null;
+    } catch {
+      throw new SupabaseSourceError(
+        'SUPABASE_ACCESS_TOKEN_FAILED',
+        'Could not obtain the Supabase access token',
+      );
+    }
+  }
+
+  async #discardConnection(): Promise<void> {
+    const connection = this.#connection;
+    this.#connection = undefined;
+    if (connection) {
+      await Promise.resolve()
+        .then(() => connection.close())
+        .catch(() => undefined);
+    }
   }
 }
 
@@ -339,6 +521,74 @@ function serializeSourceError(error: unknown): SerializedError {
     return {code: 'SUPABASE_SOURCE_FAILED', message: error.message};
   }
   return {code: 'SUPABASE_SOURCE_FAILED', message: String(error)};
+}
+
+function isRetryable(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'retryable' in error &&
+    error.retryable === true
+  );
+}
+
+function isExplicitPermanent(error: unknown): boolean {
+  return error instanceof SupabaseSourceError && !error.retryable;
+}
+
+function normalizeRetryDelays(delays: readonly number[]): readonly number[] {
+  if (delays.length === 0) {
+    throw new SupabaseSourceError(
+      'SUPABASE_INVALID_CONFIG',
+      'retryDelaysMs must contain at least one delay',
+    );
+  }
+  return delays.map((delay) => {
+    if (
+      !Number.isSafeInteger(delay) ||
+      delay < 0 ||
+      delay > MAX_RETRY_DELAY_MS
+    ) {
+      throw new SupabaseSourceError(
+        'SUPABASE_INVALID_CONFIG',
+        `Source retry delays must be integers from 0 to ${MAX_RETRY_DELAY_MS}`,
+      );
+    }
+    return delay;
+  });
+}
+
+function retryDelay(delays: readonly number[], attempt: number): number {
+  return delays[Math.min(attempt, delays.length - 1)]!;
+}
+
+function abortableSleep(delayMs: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(abortedError());
+      return;
+    }
+    const timeout = globalThis.setTimeout(finish, delayMs);
+    signal.addEventListener('abort', abort, {once: true});
+
+    function finish(): void {
+      signal.removeEventListener('abort', abort);
+      resolve();
+    }
+
+    function abort(): void {
+      globalThis.clearTimeout(timeout);
+      reject(abortedError());
+    }
+  });
+}
+
+function realtimeGapError(): SupabaseSourceError {
+  return new SupabaseSourceError(
+    'SUPABASE_REALTIME_GAP',
+    'Supabase Realtime disconnected while rebuilding the replica baseline',
+    true,
+  );
 }
 
 function abortedError(): SupabaseSourceError {

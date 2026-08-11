@@ -12,6 +12,16 @@ import {
   type WorkerResponse,
 } from '../protocol.js';
 import {createWasmEngine, type WorkerEngine} from './engine.js';
+import {
+  bindOpfsStorageName,
+  builtinSourceConfigurationKey,
+  loadBuiltinSource,
+  mergeSourceSchemas,
+  prepareBuiltinSource,
+  type BuiltinSourceFactory,
+  type PreparedBuiltinSource,
+  type SourceIdentityHasher,
+} from './builtin-source.js';
 import {createPersistentEngine} from './persistent-engine.js';
 import {createOpfsSnapshotStore} from './snapshot-store.js';
 
@@ -32,6 +42,8 @@ export interface StartWorkerOptions {
   source?: ReplicaSource;
   scope?: WorkerScope;
   engineFactory?: () => Promise<WorkerEngine>;
+  builtinSourceFactory?: BuiltinSourceFactory;
+  sourceIdentityHasher?: SourceIdentityHasher;
 }
 
 export interface WorkerController {
@@ -43,10 +55,18 @@ export function startWorker(
 ): WorkerController {
   const scope = options.scope ?? (globalThis as unknown as WorkerScope);
   const engineFactory = options.engineFactory ?? createWasmEngine;
+  const builtinSourceFactory =
+    options.builtinSourceFactory ?? loadBuiltinSource;
+  const sourceIdentityHasher = options.sourceIdentityHasher;
   const sourceAbortController = new AbortController();
   let enginePromise: Promise<WorkerEngine> | undefined;
   let configuredStorage: StorageOptions | undefined;
+  let configuredSource: PreparedBuiltinSource | undefined;
   let closingPromise: Promise<void> | undefined;
+  let sourceCreationPromise: Promise<ReplicaSource> | undefined = options.source
+    ? Promise.resolve(options.source)
+    : undefined;
+  let sourceRunPromise: Promise<void> | undefined;
   let sourceStarted = false;
   let closed = false;
   let pendingRevision = 0;
@@ -81,6 +101,9 @@ export function startWorker(
   };
 
   const setSyncState = (state: SyncState): void => {
+    if (closed) {
+      return;
+    }
     scope.postMessage({
       v: PROTOCOL_VERSION,
       event: 'syncStateChanged',
@@ -107,22 +130,36 @@ export function startWorker(
   });
 
   const startSource = async (engine: WorkerEngine): Promise<void> => {
-    if (!options.source || sourceStarted) {
+    const sourceConfigured =
+      options.source !== undefined || configuredSource !== undefined;
+    if (!sourceConfigured || sourceStarted) {
       return;
     }
+    const sourceId =
+      options.source?.id || configuredSource?.options.id || 'custom-source';
     sourceStarted = true;
-    setSyncState({phase: 'connecting', sourceId: options.source.id});
-    try {
-      await options.source.start(sourceContext(engine));
-    } catch (error) {
-      if (!sourceAbortController.signal.aborted) {
-        setSyncState({
-          phase: 'error',
-          sourceId: options.source.id,
-          error: serializeError(error),
-        });
+    setSyncState({phase: 'connecting', sourceId});
+    sourceCreationPromise ??= Promise.resolve().then(() =>
+      builtinSourceFactory(configuredSource!.options),
+    );
+    sourceRunPromise = (async () => {
+      try {
+        const source = await sourceCreationPromise;
+        if (sourceAbortController.signal.aborted) {
+          return;
+        }
+        await source.start(sourceContext(engine));
+      } catch (error) {
+        if (!sourceAbortController.signal.aborted) {
+          setSyncState({
+            phase: 'error',
+            sourceId,
+            error: serializeError(error),
+          });
+        }
       }
-    }
+    })();
+    await sourceRunPromise;
   };
 
   const respond = async (request: WorkerRequest): Promise<void> => {
@@ -142,7 +179,13 @@ export function startWorker(
       }
 
       engine = await engineForRequest(request);
-      const result = await handleRequest(request, engine, emitInvalidation);
+      const result = await handleRequest(
+        request,
+        engine,
+        emitInvalidation,
+        configuredSource,
+        options.source !== undefined || configuredSource !== undefined,
+      );
       scope.postMessage({
         v: PROTOCOL_VERSION,
         id: request.id,
@@ -183,27 +226,57 @@ export function startWorker(
     request: Exclude<WorkerRequest, {method: 'close'}>,
   ): Promise<WorkerEngine> => {
     if (request.method === 'init') {
+      const requestedSource = request.params.source
+        ? prepareBuiltinSource(request.params.source)
+        : undefined;
+      if (options.source && requestedSource) {
+        throw Object.assign(
+          new Error(
+            'The TinyGres worker cannot combine a fixed custom source with a built-in source configuration',
+          ),
+          {code: 'SOURCE_CONFLICT'},
+        );
+      }
       if (
         configuredStorage !== undefined &&
         !sameStorage(configuredStorage, request.params.storage)
       ) {
         throw Object.assign(
-          new Error('The TinyGres worker is already initialized with different storage'),
+          new Error(
+            'The TinyGres worker is already initialized with different storage',
+          ),
           {code: 'STORAGE_ALREADY_INITIALIZED'},
+        );
+      }
+      if (
+        configuredStorage !== undefined &&
+        builtinSourceConfigurationKey(configuredSource) !==
+          builtinSourceConfigurationKey(requestedSource)
+      ) {
+        throw Object.assign(
+          new Error(
+            'The TinyGres worker is already initialized with a different built-in source',
+          ),
+          {code: 'SOURCE_ALREADY_INITIALIZED'},
         );
       }
       if (!enginePromise) {
         configuredStorage = request.params.storage;
-        enginePromise = createConfiguredEngine(
+        configuredSource = requestedSource;
+        enginePromise = createSourceBoundEngine(
           request.params.storage,
+          requestedSource,
           engineFactory,
+          sourceIdentityHasher,
         );
       }
       return enginePromise;
     }
     if (!enginePromise) {
       throw Object.assign(
-        new Error('Initialize the TinyGres worker before sending other requests'),
+        new Error(
+          'Initialize the TinyGres worker before sending other requests',
+        ),
         {code: 'WORKER_NOT_INITIALIZED'},
       );
     }
@@ -238,11 +311,18 @@ export function startWorker(
       scope.removeEventListener('message', onMessage);
       sourceAbortController.abort();
       let firstError: unknown;
+      let source: ReplicaSource | undefined;
       try {
-        await options.source?.close?.();
+        source = await sourceCreationPromise;
+      } catch {
+        // Source construction failures are already exposed as sync errors.
+      }
+      try {
+        await source?.close?.();
       } catch (error) {
         firstError = error;
       }
+      await sourceRunPromise?.catch(() => undefined);
       try {
         engine?.close?.();
       } catch (error) {
@@ -272,11 +352,15 @@ async function handleRequest(
   request: WorkerRequest,
   engine: WorkerEngine,
   emitInvalidation: (outcome: ApplyOutcome) => void,
+  source: PreparedBuiltinSource | undefined,
+  sourceConfigured: boolean,
 ): Promise<unknown> {
   switch (request.method) {
     case 'init':
-      engine.defineTables(request.params.schemas);
-      return {revision: engine.revision()};
+      engine.defineTables(
+        mergeSourceSchemas(request.params.schemas, source?.schemas ?? []),
+      );
+      return {revision: engine.revision(), sourceConfigured};
     case 'defineTable':
       engine.defineTable(request.params.schema);
       return undefined;
@@ -300,6 +384,23 @@ async function handleRequest(
     case 'close':
       throw new Error('Close requests are handled before engine dispatch');
   }
+}
+
+async function createSourceBoundEngine(
+  storage: StorageOptions,
+  source: PreparedBuiltinSource | undefined,
+  engineFactory: () => Promise<WorkerEngine>,
+  sourceIdentityHasher: SourceIdentityHasher | undefined,
+): Promise<WorkerEngine> {
+  if (storage.kind !== 'opfs' || !source) {
+    return createConfiguredEngine(storage, engineFactory);
+  }
+  const name = await bindOpfsStorageName(
+    storage.name,
+    source,
+    sourceIdentityHasher,
+  );
+  return createConfiguredEngine({kind: 'opfs', name}, engineFactory);
 }
 
 async function createConfiguredEngine(

@@ -13,6 +13,7 @@ export class SupabaseRestSnapshotReader {
   readonly #pageSize: number;
   readonly #fetch: typeof globalThis.fetch;
   readonly #getAccessToken: () => MaybePromise<string | null>;
+  #accessTokenPromise: Promise<string | null> | undefined;
 
   constructor(options: SupabaseRestSnapshotOptions) {
     this.#apiRoot = new URL(
@@ -63,30 +64,54 @@ export class SupabaseRestSnapshotReader {
       table.primaryKey.map((column) => `${column}.asc`).join(','),
     );
 
-    const accessToken = await this.#getAccessToken();
+    const accessToken = await this.#accessToken();
     throwIfAborted(signal);
-    const response = await this.#fetch(url, {
-      cache: 'no-store',
-      headers: {
-        Accept: 'application/json',
-        'Accept-Profile': table.schema,
-        Authorization: `Bearer ${accessToken ?? this.#publishableKey}`,
-        Range: `${from}-${to}`,
-        'Range-Unit': 'items',
-        apikey: this.#publishableKey,
-      },
-      signal,
-    });
+    let response: Response;
+    try {
+      response = await this.#fetch(url, {
+        cache: 'no-store',
+        headers: {
+          Accept: 'application/json',
+          'Accept-Profile': table.schema,
+          Range: `${from}-${to}`,
+          'Range-Unit': 'items',
+          apikey: this.#publishableKey,
+          ...(accessToken ? {Authorization: `Bearer ${accessToken}`} : {}),
+        },
+        signal,
+      });
+    } catch {
+      throwIfAborted(signal);
+      throw new SupabaseSourceError(
+        'SUPABASE_SNAPSHOT_FAILED',
+        `Supabase snapshot for \`${table.schema}.${table.table}\` could not reach the Data API`,
+        true,
+      );
+    }
+    throwIfAborted(signal);
 
     if (!response.ok) {
       throw new SupabaseSourceError(
         'SUPABASE_SNAPSHOT_FAILED',
         `Supabase snapshot for \`${table.schema}.${table.table}\` failed with HTTP ${response.status}`,
-        response.status >= 500 || response.status === 429,
+        response.status >= 500 ||
+          response.status === 408 ||
+          response.status === 425 ||
+          response.status === 429,
       );
     }
 
-    const value: unknown = await response.json();
+    let value: unknown;
+    try {
+      value = await response.json();
+    } catch {
+      throwIfAborted(signal);
+      throw new SupabaseSourceError(
+        'SUPABASE_INVALID_SNAPSHOT',
+        `Supabase snapshot for \`${table.schema}.${table.table}\` returned invalid JSON`,
+      );
+    }
+    throwIfAborted(signal);
     if (!Array.isArray(value) || !value.every(isRow)) {
       throw new SupabaseSourceError(
         'SUPABASE_INVALID_SNAPSHOT',
@@ -97,6 +122,14 @@ export class SupabaseRestSnapshotReader {
       assertPrimaryKey(table, row);
     }
     return value;
+  }
+
+  #accessToken(): Promise<string | null> {
+    this.#accessTokenPromise ??= Promise.resolve().then(async () => {
+      const token = await this.#getAccessToken();
+      return token ?? null;
+    });
+    return this.#accessTokenPromise;
   }
 }
 

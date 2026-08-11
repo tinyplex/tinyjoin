@@ -14,6 +14,7 @@ const memberships: NormalizedSupabaseTable = {
 describe('SupabaseRestSnapshotReader', () => {
   it('paginates with inclusive ranges and stable primary-key ordering', async () => {
     const calls: Array<{url: URL; init: RequestInit}> = [];
+    const getAccessToken = vi.fn(() => 'user-jwt');
     const fetch = vi.fn(async (input: URL | RequestInfo, init?: RequestInit) => {
       const url = new URL(String(input));
       calls.push({url, init: init ?? {}});
@@ -32,7 +33,7 @@ describe('SupabaseRestSnapshotReader', () => {
       publishableKey: 'sb_publishable_test',
       pageSize: 2,
       fetch,
-      getAccessToken: () => 'user-jwt',
+      getAccessToken,
     });
 
     const pages = [];
@@ -73,6 +74,7 @@ describe('SupabaseRestSnapshotReader', () => {
     expect(headers.get('Accept-Profile')).toBe('private');
     expect(headers.get('Authorization')).toBe('Bearer user-jwt');
     expect(headers.get('apikey')).toBe('sb_publishable_test');
+    expect(getAccessToken).toHaveBeenCalledOnce();
   });
 
   it('rejects HTTP failures and malformed or keyless rows', async () => {
@@ -97,6 +99,23 @@ describe('SupabaseRestSnapshotReader', () => {
     await expect(
       collect(malformed.snapshot(table, new AbortController().signal)),
     ).rejects.toMatchObject({code: 'SUPABASE_INVALID_ROW'});
+  });
+
+  it('sends an anonymous publishable key only as an API key', async () => {
+    let headers: Headers | undefined;
+    const reader = new SupabaseRestSnapshotReader({
+      url: 'https://project.supabase.co',
+      publishableKey: 'sb_publishable_test',
+      fetch: async (_input, init) => {
+        headers = new Headers(init?.headers);
+        return new Response('[]');
+      },
+    });
+
+    await collect(reader.snapshot(memberships, new AbortController().signal));
+
+    expect(headers?.get('apikey')).toBe('sb_publishable_test');
+    expect(headers?.has('Authorization')).toBe(false);
   });
 
   it('stops before issuing a request when aborted', async () => {

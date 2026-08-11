@@ -125,6 +125,17 @@ describe('normalizeSupabaseChange', () => {
     ).toThrow(/missing columns: role/);
     expect(() =>
       normalizeSupabaseChange(
+        {
+          ...base,
+          new: {team_id: 1, user_id: 2, role: 'x'},
+          old: {},
+        },
+        memberships,
+        {sourceId: 'source'},
+      ),
+    ).toThrow(/REPLICA IDENTITY FULL/);
+    expect(() =>
+      normalizeSupabaseChange(
         {...base, new: {team_id: 1, user_id: 2, role: 'x'}, errors: 'too big'},
         memberships,
         {sourceId: 'source'},
@@ -158,7 +169,7 @@ describe('createSupabaseJsRealtimeTransport', () => {
       {
         sourceId: 'supabase:test',
         tables: [
-          {schema: 'public', table: 'posts'},
+          {schema: 'public', table: 'posts', columns: ['id', 'title']},
           {schema: 'public', table: 'users'},
         ],
         accessToken: 'jwt',
@@ -172,7 +183,12 @@ describe('createSupabaseJsRealtimeTransport', () => {
 
     expect(setAuth).toHaveBeenCalledWith('jwt');
     expect(channel.filters).toEqual([
-      {event: '*', schema: 'public', table: 'posts'},
+      {
+        event: '*',
+        schema: 'public',
+        table: 'posts',
+        select: ['id', 'title'],
+      },
       {event: '*', schema: 'public', table: 'users'},
     ]);
     channel.callbacks[0]!({eventType: 'INSERT'});
@@ -189,14 +205,24 @@ describe('createSupabaseJsRealtimeTransport', () => {
 });
 
 class FakeChannel {
-  readonly filters: Array<{event: '*'; schema: string; table: string}> = [];
+  readonly filters: Array<{
+    event: '*';
+    schema: string;
+    table: string;
+    select?: string[];
+  }> = [];
   readonly callbacks: Array<(payload: unknown) => void> = [];
   subscribeCallback: ((status: string, error?: unknown) => void) | undefined;
   readonly unsubscribe = vi.fn();
 
   on(
     _type: 'postgres_changes',
-    filter: {event: '*'; schema: string; table: string},
+    filter: {
+      event: '*';
+      schema: string;
+      table: string;
+      select?: string[];
+    },
     callback: (payload: unknown) => void,
   ): this {
     this.filters.push(filter);
