@@ -39,6 +39,30 @@ pub(crate) fn execute<S: StorageDriver>(storage: &S, plan: &QueryPlan) -> Result
         )));
     }
 
+    let schema = storage.table_schema(&plan.table)?;
+    if !schema.columns.is_empty() {
+        if let Some(columns) = &plan.columns {
+            for column in columns {
+                if !schema
+                    .columns
+                    .iter()
+                    .any(|definition| definition.name == *column)
+                {
+                    return Err(EngineError::column_not_found(column, &plan.table));
+                }
+            }
+        }
+        for filter in &plan.filters {
+            if !schema
+                .columns
+                .iter()
+                .any(|definition| definition.name == filter.column)
+            {
+                return Err(EngineError::column_not_found(&filter.column, &plan.table));
+            }
+        }
+    }
+
     let table_rows = storage.scan_table(&plan.table)?;
     if plan.limit == Some(0) {
         return Ok(QueryResult {
@@ -65,6 +89,11 @@ pub(crate) fn execute<S: StorageDriver>(storage: &S, plan: &QueryPlan) -> Result
 }
 
 pub(crate) fn parse_sql(sql: &str, params: &[Value]) -> Result<QueryPlan> {
+    validate_sql_input(sql, params)?;
+    SqlParser::new(tokenize(sql)?, params).parse()
+}
+
+pub(crate) fn validate_sql_input(sql: &str, params: &[Value]) -> Result<()> {
     if sql.len() > MAX_SQL_BYTES {
         return Err(EngineError::invalid_query(format!(
             "SQL text exceeds the {MAX_SQL_BYTES}-byte limit"
@@ -75,12 +104,11 @@ pub(crate) fn parse_sql(sql: &str, params: &[Value]) -> Result<QueryPlan> {
             "A SQL query cannot receive more than {MAX_PARAMETERS} parameters"
         )));
     }
-
-    SqlParser::new(tokenize(sql)?, params).parse()
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum Token {
+pub(crate) enum Token {
     Identifier { value: String, quoted: bool },
     String(String),
     Number(String),
@@ -89,6 +117,8 @@ enum Token {
     Comma,
     Dot,
     Eq,
+    LParen,
+    RParen,
     Semicolon,
     Other,
 }
@@ -130,6 +160,14 @@ impl<'a> Lexer<'a> {
                 '=' => {
                     self.advance();
                     Token::Eq
+                }
+                '(' => {
+                    self.advance();
+                    Token::LParen
+                }
+                ')' => {
+                    self.advance();
+                    Token::RParen
                 }
                 ';' => {
                     self.advance();
@@ -569,7 +607,7 @@ enum TokenMatcher {
     Semicolon,
 }
 
-fn tokenize(sql: &str) -> Result<Vec<Token>> {
+pub(crate) fn tokenize(sql: &str) -> Result<Vec<Token>> {
     Lexer::new(sql).tokenize()
 }
 
@@ -581,15 +619,37 @@ fn is_identifier_continue(character: char) -> bool {
     is_identifier_start(character) || character.is_ascii_digit() || character == '$'
 }
 
-fn is_reserved_keyword(identifier: &str) -> bool {
+pub(crate) fn is_reserved_keyword(identifier: &str) -> bool {
     [
-        "select", "from", "where", "and", "limit", "null", "true", "false",
+        "select",
+        "from",
+        "where",
+        "and",
+        "limit",
+        "null",
+        "true",
+        "false",
+        "create",
+        "table",
+        "if",
+        "not",
+        "exists",
+        "primary",
+        "key",
+        "default",
+        "insert",
+        "into",
+        "values",
+        "update",
+        "set",
+        "delete",
+        "returning",
     ]
     .iter()
     .any(|keyword| identifier.eq_ignore_ascii_case(keyword))
 }
 
-fn bind_parameter(index: &str, params: &[Value]) -> Result<Value> {
+pub(crate) fn bind_parameter(index: &str, params: &[Value]) -> Result<Value> {
     let placeholder = format!("${index}");
     let index = index.parse::<usize>().map_err(|_| {
         EngineError::bind_error(format!("Invalid parameter placeholder `{placeholder}`"))
@@ -604,7 +664,7 @@ fn bind_parameter(index: &str, params: &[Value]) -> Result<Value> {
     })
 }
 
-fn matches_filters(row: &Row, filters: &[Filter], table: &str) -> Result<bool> {
+pub(crate) fn matches_filters(row: &Row, filters: &[Filter], table: &str) -> Result<bool> {
     for filter in filters {
         let Some(actual) = row.get(&filter.column) else {
             return Err(EngineError::column_not_found(&filter.column, table));
@@ -621,7 +681,7 @@ fn matches_filters(row: &Row, filters: &[Filter], table: &str) -> Result<bool> {
     Ok(true)
 }
 
-fn project_row(mut row: Row, columns: Option<&[String]>, table: &str) -> Result<Row> {
+pub(crate) fn project_row(mut row: Row, columns: Option<&[String]>, table: &str) -> Result<Row> {
     let Some(columns) = columns else {
         return Ok(row);
     };
@@ -661,6 +721,7 @@ mod tests {
             .define_table(TableSchema {
                 name: "posts".to_owned(),
                 primary_key: vec!["id".to_owned()],
+                columns: vec![],
             })
             .unwrap();
         engine

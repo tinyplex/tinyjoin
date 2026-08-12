@@ -3,6 +3,7 @@ export type {
   SubscriptionOptions,
   TablesChangedEvent,
   ClientOptions,
+  Transaction,
   WhenSyncedOptions,
 } from './client/client.js';
 export {ClientError} from './client/error.js';
@@ -19,6 +20,7 @@ export type {
   QueryResult,
   Row,
   SerializedError,
+  SqlResult,
   SourceCursor,
   StorageOptions,
   SyncPhase,

@@ -5,6 +5,7 @@ import type {
   QueryPlan,
   QueryResult,
   Row,
+  SqlResult,
   TableSchema,
 } from '../protocol.js';
 
@@ -15,6 +16,11 @@ export interface WorkerEngine {
   applyBatch(batch: ChangeBatch): ApplyOutcome;
   query(plan: QueryPlan): QueryResult;
   querySql(sql: string, params: JsonValue[]): QueryResult;
+  executeSql(sql: string, params: JsonValue[]): SqlResult;
+  beginTransaction(): void;
+  commitTransaction(): ApplyOutcome;
+  rollbackTransaction(): void;
+  inTransaction(): boolean;
   revision(): number;
   exportSnapshot(): Uint8Array;
   importSnapshot(snapshot: Uint8Array): void;
@@ -37,6 +43,11 @@ export async function createWasmEngine(): Promise<WorkerEngine> {
     applyBatch: (batch) => engine.apply_batch(batch),
     query: (plan) => engine.query(plan),
     querySql: (sql, params) => engine.query_sql(sql, params),
+    executeSql: (sql, params) => engine.execute_sql(sql, params),
+    beginTransaction: () => engine.begin_transaction(),
+    commitTransaction: () => engine.commit_transaction(),
+    rollbackTransaction: () => engine.rollback_transaction(),
+    inTransaction: () => engine.in_transaction(),
     revision: () => Number(engine.revision()),
     exportSnapshot: () => engine.export_snapshot(),
     importSnapshot: (snapshot) => engine.import_snapshot(snapshot),

@@ -67,6 +67,33 @@ impl WasmEngine {
         to_js(&result)
     }
 
+    pub fn execute_sql(
+        &mut self,
+        sql: &str,
+        params: JsValue,
+    ) -> std::result::Result<JsValue, JsValue> {
+        let params: Vec<serde_json::Value> = from_js(params)?;
+        let result = self.engine.execute_sql(sql, &params).map_err(error_to_js)?;
+        to_js(&result)
+    }
+
+    pub fn begin_transaction(&mut self) -> std::result::Result<(), JsValue> {
+        self.engine.begin_transaction().map_err(error_to_js)
+    }
+
+    pub fn commit_transaction(&mut self) -> std::result::Result<JsValue, JsValue> {
+        let outcome = self.engine.commit_transaction().map_err(error_to_js)?;
+        to_js(&outcome)
+    }
+
+    pub fn rollback_transaction(&mut self) -> std::result::Result<(), JsValue> {
+        self.engine.rollback_transaction().map_err(error_to_js)
+    }
+
+    pub fn in_transaction(&self) -> bool {
+        self.engine.in_transaction()
+    }
+
     pub fn revision(&self) -> u64 {
         self.engine.revision()
     }

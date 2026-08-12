@@ -80,10 +80,104 @@ describe('built-in source protocol', () => {
     ).toBe(false);
     expect(
       isWorkerRequest({
-        v: 2,
+        v: 3,
         id: 1,
         method: 'init',
         params: {schemas: [], storage: {kind: 'memory'}, source},
+      }),
+    ).toBe(false);
+  });
+
+  it('accepts the writable SQL and transaction protocol surface', () => {
+    expect(
+      isWorkerRequest({
+        v: PROTOCOL_VERSION,
+        id: 2,
+        method: 'executeSql',
+        params: {
+          sql: 'INSERT INTO posts (id, title) VALUES ($1, $2) RETURNING *',
+          params: [1, 'hello'],
+        },
+      }),
+    ).toBe(true);
+    expect(
+      isWorkerRequest({
+        v: PROTOCOL_VERSION,
+        id: 3,
+        method: 'beginTransaction',
+        params: undefined,
+      }),
+    ).toBe(true);
+    for (const method of ['querySql', 'executeSql'] as const) {
+      expect(
+        isWorkerRequest({
+          v: PROTOCOL_VERSION,
+          id: 4,
+          method,
+          params: {
+            sql: 'SELECT * FROM posts',
+            params: [],
+            transactionId: 'tx-1',
+          },
+        }),
+      ).toBe(true);
+    }
+    expect(
+      isWorkerRequest({
+        v: PROTOCOL_VERSION,
+        id: 5,
+        method: 'query',
+        params: {
+          plan: {table: 'posts', filters: []},
+          transactionId: 'tx-1',
+        },
+      }),
+    ).toBe(true);
+    for (const method of [
+      'commitTransaction',
+      'rollbackTransaction',
+    ] as const) {
+      expect(
+        isWorkerRequest({
+          v: PROTOCOL_VERSION,
+          id: 6,
+          method,
+          params: {transactionId: 'tx-1'},
+        }),
+      ).toBe(true);
+    }
+  });
+
+  it.each([
+    {
+      method: 'executeSql',
+      params: {
+        sql: 'INSERT INTO posts (id) VALUES (1)',
+        params: [],
+        extra: true,
+      },
+    },
+    {
+      method: 'executeSql',
+      params: {sql: 'INSERT INTO posts (id) VALUES ($1)', params: [1n]},
+    },
+    {method: 'beginTransaction', params: {}},
+    {method: 'commitTransaction', params: {transactionId: ''}},
+    {
+      method: 'rollbackTransaction',
+      params: {transactionId: 'x'.repeat(129)},
+    },
+    {
+      method: 'querySql',
+      params: {sql: 'SELECT * FROM posts', params: [], transactionId: 1},
+    },
+  ])('rejects an invalid writable protocol request', ({method, params}) => {
+    expect(
+      isWorkerRequest({
+        v: PROTOCOL_VERSION,
+        id: 7,
+        method,
+        params,
       }),
     ).toBe(false);
   });

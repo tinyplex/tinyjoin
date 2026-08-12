@@ -72,6 +72,9 @@ export function startWorker(
   let pendingRevision = 0;
   const pendingTables = new Set<string>();
   let invalidationScheduled = false;
+  let activeTransactionId: string | undefined;
+  let nextTransactionId = 1;
+  let requestTail: Promise<void> = Promise.resolve();
 
   const emitInvalidation = (outcome: ApplyOutcome): void => {
     pendingRevision = Math.max(pendingRevision, outcome.revision);
@@ -82,7 +85,9 @@ export function startWorker(
       return;
     }
     invalidationScheduled = true;
-    queueMicrotask(() => {
+    // A task boundary lets adjacent serialized mutations share one event and
+    // ensures callers receive their RPC acknowledgement before invalidation.
+    setTimeout(() => {
       invalidationScheduled = false;
       if (closed || pendingTables.size === 0) {
         return;
@@ -97,7 +102,7 @@ export function startWorker(
       };
       pendingTables.clear();
       scope.postMessage(event);
-    });
+    }, 0);
   };
 
   const setSyncState = (state: SyncState): void => {
@@ -185,6 +190,26 @@ export function startWorker(
         emitInvalidation,
         configuredSource,
         options.source !== undefined || configuredSource !== undefined,
+        {
+          get activeId() {
+            return activeTransactionId;
+          },
+          begin() {
+            if (activeTransactionId !== undefined) {
+              throw workerError(
+                'TRANSACTION_ACTIVE',
+                'A TinyGres transaction is already active',
+              );
+            }
+            const id = `tx-${nextTransactionId++}`;
+            activeTransactionId = id;
+            return id;
+          },
+          clear(id) {
+            assertTransactionId(activeTransactionId, id);
+            activeTransactionId = undefined;
+          },
+        },
       );
       scope.postMessage({
         v: PROTOCOL_VERSION,
@@ -300,7 +325,8 @@ export function startWorker(
       });
       return;
     }
-    void respond(event.data);
+    const request = event.data;
+    requestTail = requestTail.then(() => respond(request));
   };
 
   const releaseResources = (
@@ -354,17 +380,21 @@ async function handleRequest(
   emitInvalidation: (outcome: ApplyOutcome) => void,
   source: PreparedBuiltinSource | undefined,
   sourceConfigured: boolean,
+  transaction: HostTransactionState,
 ): Promise<unknown> {
   switch (request.method) {
     case 'init':
+      assertNoTransaction(transaction.activeId);
       engine.defineTables(
         mergeSourceSchemas(request.params.schemas, source?.schemas ?? []),
       );
       return {revision: engine.revision(), sourceConfigured};
     case 'defineTable':
+      assertNoTransaction(transaction.activeId);
       engine.defineTable(request.params.schema);
       return undefined;
     case 'replaceTable': {
+      assertNoTransaction(transaction.activeId);
       const outcome = engine.replaceTableSnapshot(
         request.params.schema,
         request.params.rows,
@@ -373,17 +403,130 @@ async function handleRequest(
       return outcome;
     }
     case 'applyBatch': {
+      assertNoTransaction(transaction.activeId);
       const outcome = engine.applyBatch(request.params.batch);
       emitInvalidation(outcome);
       return outcome;
     }
     case 'query':
+      assertTransactionId(
+        transaction.activeId,
+        request.params.transactionId,
+      );
       return engine.query(request.params.plan);
     case 'querySql':
+      assertTransactionId(
+        transaction.activeId,
+        request.params.transactionId,
+      );
       return engine.querySql(request.params.sql, request.params.params);
+    case 'executeSql': {
+      assertLocalWritesAllowed(sourceConfigured);
+      assertTransactionId(
+        transaction.activeId,
+        request.params.transactionId,
+      );
+      const result = engine.executeSql(
+        request.params.sql,
+        request.params.params,
+      );
+      if (transaction.activeId === undefined && result.tables.length > 0) {
+        emitInvalidation({revision: result.revision, tables: result.tables});
+      }
+      return result;
+    }
+    case 'beginTransaction': {
+      assertLocalWritesAllowed(sourceConfigured);
+      assertNoTransaction(transaction.activeId);
+      engine.beginTransaction();
+      try {
+        return {transactionId: transaction.begin()};
+      } catch (error) {
+        engine.rollbackTransaction();
+        throw error;
+      }
+    }
+    case 'commitTransaction': {
+      assertTransactionId(
+        transaction.activeId,
+        request.params.transactionId,
+      );
+      try {
+        const outcome = engine.commitTransaction();
+        emitInvalidation(outcome);
+        return outcome;
+      } catch (error) {
+        if (engine.inTransaction()) {
+          engine.rollbackTransaction();
+        }
+        throw error;
+      } finally {
+        transaction.clear(request.params.transactionId);
+      }
+    }
+    case 'rollbackTransaction':
+      assertTransactionId(
+        transaction.activeId,
+        request.params.transactionId,
+      );
+      try {
+        engine.rollbackTransaction();
+        return undefined;
+      } finally {
+        transaction.clear(request.params.transactionId);
+      }
     case 'close':
       throw new Error('Close requests are handled before engine dispatch');
   }
+}
+
+interface HostTransactionState {
+  readonly activeId: string | undefined;
+  begin(): string;
+  clear(id: string): void;
+}
+
+function assertLocalWritesAllowed(sourceConfigured: boolean): void {
+  if (sourceConfigured) {
+    throw workerError(
+      'SOURCE_DATABASE_READ_ONLY',
+      'Local SQL writes are disabled while a TinyGres replication source is configured',
+    );
+  }
+}
+
+function assertNoTransaction(activeId: string | undefined): void {
+  if (activeId !== undefined) {
+    throw workerError(
+      'TRANSACTION_ACTIVE',
+      'A TinyGres transaction is already active',
+    );
+  }
+}
+
+function assertTransactionId(
+  activeId: string | undefined,
+  requestedId: string | undefined,
+): void {
+  if (activeId === undefined && requestedId === undefined) {
+    return;
+  }
+  if (activeId === undefined) {
+    throw workerError(
+      'TRANSACTION_NOT_ACTIVE',
+      'The TinyGres transaction is no longer active',
+    );
+  }
+  if (requestedId !== activeId) {
+    throw workerError(
+      'TRANSACTION_ACTIVE',
+      'Use the active TinyGres transaction for this operation',
+    );
+  }
+}
+
+function workerError(code: string, message: string): Error {
+  return Object.assign(new Error(message), {code});
 }
 
 async function createSourceBoundEngine(

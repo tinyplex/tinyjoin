@@ -50,6 +50,8 @@ class FakeScope implements WorkerScope {
 
 function mockEngine() {
   let revision = 0;
+  let transactionActive = false;
+  const transactionTables = new Set<string>();
   const outcome = (table: string): ApplyOutcome => ({
     revision: ++revision,
     tables: [table],
@@ -61,6 +63,40 @@ function mockEngine() {
     applyBatch: vi.fn((batch) => outcome(batch.changes[0]?.table ?? 'none')),
     query: vi.fn(() => ({revision, rows: [{id: 1}]})),
     querySql: vi.fn(() => ({revision, rows: [{id: 1}]})),
+    executeSql: vi.fn((sql) => {
+      const command = sql.trim().split(/\s+/, 1)[0]!.toUpperCase();
+      const table = 'posts';
+      if (transactionActive) {
+        transactionTables.add(table);
+      } else {
+        revision += 1;
+      }
+      return {
+        command,
+        revision,
+        rowCount: 1,
+        rows: [],
+        tables: [table],
+      };
+    }),
+    beginTransaction: vi.fn(() => {
+      transactionActive = true;
+      transactionTables.clear();
+    }),
+    commitTransaction: vi.fn(() => {
+      const tables = [...transactionTables].sort();
+      if (tables.length > 0) {
+        revision += 1;
+      }
+      transactionActive = false;
+      transactionTables.clear();
+      return {revision, tables};
+    }),
+    rollbackTransaction: vi.fn(() => {
+      transactionActive = false;
+      transactionTables.clear();
+    }),
+    inTransaction: vi.fn(() => transactionActive),
     revision: () => revision,
     exportSnapshot: vi.fn(() => new Uint8Array([revision])),
     importSnapshot: vi.fn((snapshot) => {
@@ -176,6 +212,205 @@ describe('startWorker', () => {
         payload: {revision: 2, tables: ['posts', 'users']},
       },
     ]);
+  });
+
+  it('invalidates writable SQL immediately but a transaction only when it commits', async () => {
+    const scope = new FakeScope();
+    const engine = mockEngine();
+    startWorker({scope, engineFactory: async () => engine});
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 1,
+      method: 'init',
+      params: {schemas: [], storage: {kind: 'memory'}},
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 1);
+    scope.posted.length = 0;
+
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 2,
+      method: 'executeSql',
+      params: {sql: 'INSERT INTO posts (id) VALUES (1)', params: []},
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 2);
+    expect(scope.posted).toContainEqual({
+      v: PROTOCOL_VERSION,
+      id: 2,
+      ok: true,
+      result: {
+        command: 'INSERT',
+        revision: 1,
+        rowCount: 1,
+        rows: [],
+        tables: ['posts'],
+      },
+    });
+    expect(scope.posted).toContainEqual({
+      v: PROTOCOL_VERSION,
+      event: 'tablesChanged',
+      payload: {revision: 1, tables: ['posts']},
+    });
+    scope.posted.length = 0;
+
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 3,
+      method: 'beginTransaction',
+      params: undefined,
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 1);
+    expect(scope.posted[0]).toMatchObject({
+      id: 3,
+      ok: true,
+      result: {transactionId: 'tx-1'},
+    });
+    scope.posted.length = 0;
+
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 4,
+      method: 'executeSql',
+      params: {
+        sql: 'UPDATE posts SET title = $1 WHERE id = $2',
+        params: ['changed', 1],
+        transactionId: 'tx-1',
+      },
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 1);
+    await new Promise<void>((resolve) => queueMicrotask(resolve));
+    expect(scope.posted).toEqual([
+      {
+        v: PROTOCOL_VERSION,
+        id: 4,
+        ok: true,
+        result: {
+          command: 'UPDATE',
+          revision: 1,
+          rowCount: 1,
+          rows: [],
+          tables: ['posts'],
+        },
+      },
+    ]);
+
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 5,
+      method: 'commitTransaction',
+      params: {transactionId: 'tx-1'},
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 3);
+    expect(scope.posted).toContainEqual({
+      v: PROTOCOL_VERSION,
+      id: 5,
+      ok: true,
+      result: {revision: 2, tables: ['posts']},
+    });
+    expect(scope.posted).toContainEqual({
+      v: PROTOCOL_VERSION,
+      event: 'tablesChanged',
+      payload: {revision: 2, tables: ['posts']},
+    });
+  });
+
+  it('requires the active transaction token and rollback emits no invalidation', async () => {
+    const scope = new FakeScope();
+    const engine = mockEngine();
+    startWorker({scope, engineFactory: async () => engine});
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 1,
+      method: 'init',
+      params: {schemas: [], storage: {kind: 'memory'}},
+    } satisfies WorkerRequest);
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 2,
+      method: 'beginTransaction',
+      params: undefined,
+    } satisfies WorkerRequest);
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 3,
+      method: 'executeSql',
+      params: {sql: 'DELETE FROM posts', params: []},
+    } satisfies WorkerRequest);
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 4,
+      method: 'rollbackTransaction',
+      params: {transactionId: 'tx-1'},
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 4);
+    await new Promise<void>((resolve) => queueMicrotask(resolve));
+
+    expect(scope.posted).toContainEqual({
+      v: PROTOCOL_VERSION,
+      id: 3,
+      ok: false,
+      error: {
+        code: 'TRANSACTION_ACTIVE',
+        message: 'Use the active TinyGres transaction for this operation',
+      },
+    });
+    expect(engine.executeSql).not.toHaveBeenCalled();
+    expect(engine.rollbackTransaction).toHaveBeenCalledOnce();
+    expect(scope.posted.some((message) => 'event' in message)).toBe(false);
+  });
+
+  it('rejects local writes while a replication source is configured', async () => {
+    const scope = new FakeScope();
+    const engine = mockEngine();
+    const source: ReplicaSource = {
+      id: 'read-only-source',
+      capabilities: {
+        snapshotConsistency: 'eventual',
+        changes: 'best-effort',
+        resume: 'none',
+        atomicity: 'row',
+        writes: false,
+      },
+      start: vi.fn(async () => undefined),
+    };
+    startWorker({scope, source, engineFactory: async () => engine});
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 1,
+      method: 'init',
+      params: {schemas: [], storage: {kind: 'memory'}},
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 2);
+    scope.posted.length = 0;
+
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 2,
+      method: 'executeSql',
+      params: {sql: 'INSERT INTO posts (id) VALUES (1)', params: []},
+    } satisfies WorkerRequest);
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 3,
+      method: 'beginTransaction',
+      params: undefined,
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 2);
+
+    for (const id of [2, 3]) {
+      expect(scope.posted).toContainEqual({
+        v: PROTOCOL_VERSION,
+        id,
+        ok: false,
+        error: {
+          code: 'SOURCE_DATABASE_READ_ONLY',
+          message:
+            'Local SQL writes are disabled while a TinyGres replication source is configured',
+        },
+      });
+    }
+    expect(engine.executeSql).not.toHaveBeenCalled();
+    expect(engine.beginTransaction).not.toHaveBeenCalled();
   });
 
   it('rejects malformed messages without invoking the engine', async () => {

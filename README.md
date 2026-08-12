@@ -1,19 +1,19 @@
 # TinyGres
 
-TinyGres is an experimental, worker-first local query cache for PostgreSQL data.
-Its query and storage engine is written in Rust, compiled to WebAssembly, and
-kept off the browser's main thread.
+TinyGres is an experimental, worker-first relational database for browser apps.
+It provides a deliberately bounded PostgreSQL-shaped SQL surface in a small
+Rust/WebAssembly engine kept off the browser's main thread.
 
-> [!IMPORTANT] TinyGres is an early read-only prototype. It can optionally
-> persist its replica in OPFS, but it does not accept application writes or
-> provide complete PostgreSQL SQL compatibility. Its Supabase adapter is
-> best-effort and reconciles after reconnects; it is not a durable
-> logical-replication stream.
+> [!IMPORTANT] TinyGres is an early database prototype, not PostgreSQL compiled
+> to WebAssembly. It intentionally implements only the documented SQL and type
+> subset. Its optional Supabase adapter remains read-only, best-effort, and
+> reconciles after reconnects; it is not a durable logical-replication stream.
 
 The first proof of concept deliberately does a small number of things:
 
-- owns an in-memory or opt-in persistent replica inside a dedicated Web Worker;
-- evaluates a documented subset of PostgreSQL `SELECT` in Rust/WASM;
+- owns an in-memory or opt-in persistent database inside a dedicated Web Worker;
+- evaluates a documented subset of PostgreSQL-shaped SQL in Rust/WASM;
+- supports typed tables, atomic DDL/DML, and staged transactions;
 - applies normalized snapshot and server-change batches atomically;
 - emits table-level invalidations so an application can re-query; and
 - runs an optional built-in Supabase snapshot/Realtime source behind the worker
@@ -113,6 +113,50 @@ unsubscribe();
 await db.close();
 ```
 
+For a standalone writable database, define the catalog and mutate it with SQL:
+
+```ts
+const db = createClient({
+  storage: {kind: 'opfs', name: 'my-app-v1'},
+});
+await db.ready();
+
+await db.exec(`
+  CREATE TABLE tasks (
+    id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    done BOOLEAN NOT NULL DEFAULT false,
+    metadata JSONB
+  )
+`);
+
+const inserted = await db.exec<Task>(
+  `INSERT INTO tasks (id, title, metadata)
+   VALUES ($1, $2, $3)
+   RETURNING *`,
+  [1, 'Ship TinyGres', {priority: 'high'}],
+);
+
+await db.transaction(async (tx) => {
+  await tx.exec('UPDATE tasks SET done = true WHERE id = $1', [1]);
+  await tx.exec(
+    'INSERT INTO tasks (id, title) VALUES ($1, $2)',
+    [2, 'Survives the same atomic commit'],
+  );
+  // Queries inside the callback see staged rows. Other state is published only
+  // after the callback and its outstanding operations complete successfully.
+  console.log((await tx.query<Task>('SELECT * FROM tasks')).rows);
+});
+```
+
+Every standalone SQL statement is atomic. `transaction()` stages all statements
+against an isolated candidate database, rolls them back when the callback or a
+statement fails, persists one complete commit to OPFS, and then emits one
+table-level invalidation. The transaction object must not escape its callback.
+While a replication source is configured, local SQL writes and transactions are
+rejected: the current source contract is read-only and a reconciliation snapshot
+must never silently overwrite application state.
+
 `createClient` creates a dedicated module worker by default. It is safe
 to import during server rendering; the worker is only constructed when the
 function is called in a browser.
@@ -149,7 +193,7 @@ storage automatically only for serializable built-in source configurations.
 ## OPFS persistence
 
 Memory remains the default. Opt into persistent browser storage by assigning a
-stable name to the replica:
+stable name to the database:
 
 ```ts
 const db = createClient({
@@ -350,7 +394,7 @@ Values are represented as JSON-compatible values.
 
 ## Current SQL compatibility
 
-TinyGres currently accepts one read-only `SELECT` statement containing:
+TinyGres currently accepts one statement at a time. `SELECT` supports:
 
 - one unqualified or schema-qualified table;
 - `*` or a list of simple column names;
@@ -358,9 +402,29 @@ TinyGres currently accepts one read-only `SELECT` statement containing:
 - string, number, boolean, `NULL`, or PostgreSQL-style `$1` parameters; and
 - an optional non-negative `LIMIT`.
 
-Joins, aliases, ordering, grouping, aggregates, subqueries, expressions, and
-write statements are rejected with an `UNSUPPORTED_SQL` error. `NULL = NULL`
-does not match, following SQL null semantics.
+Standalone writable databases additionally support:
+
+- `CREATE TABLE` and `CREATE TABLE IF NOT EXISTS` with a required inline or
+  table-level primary key;
+- column types `BOOLEAN`, `SMALLINT`/`INTEGER`/`BIGINT`, `REAL`/`DOUBLE
+  PRECISION`, `TEXT`/`VARCHAR`, and `JSON`/`JSONB`;
+- literal defaults, `NULL`/`NOT NULL`, and composite primary keys;
+- multi-row `INSERT ... VALUES`, filtered `UPDATE`, and filtered `DELETE`;
+- `$1` parameters, `DEFAULT`, and simple `RETURNING *`/column lists; and
+- callback transactions through `db.transaction()`.
+
+Integers are restricted to JavaScript's exactly representable safe-integer
+range. Type names are compatibility spellings over this smaller runtime type
+set: for example, `BIGINT` does not provide 64-bit values and `JSONB` currently
+uses JSON-compatible structured values. `NULL = NULL` does not match, following
+SQL null semantics.
+
+Joins, aliases, ordering, grouping, aggregates, subqueries, general
+expressions, unique constraints beyond the primary key, foreign keys,
+`ON CONFLICT`, sequences/generated IDs, type modifiers, `ALTER`/`DROP`, and SQL
+`BEGIN` tokens are rejected with an `UNSUPPORTED_SQL` or schema error. This is
+an explicit compatibility boundary, not an accidental promise of full
+PostgreSQL behavior.
 
 ## Development and validation
 
@@ -376,8 +440,11 @@ npm run check:size      # hard 700 KiB uncompressed WASM gate
 
 The browser tests cover the complete Phase-1 path—initialize the real module
 Worker, query, apply a fake remote change, receive an invalidation, and
-re-query—plus the Phase-2 persistence path through a real dedicated Worker and
-OPFS restart. Phase 3 adds a credential-free protocol server that exercises the
+re-query—plus the persistence path through a real dedicated Worker and OPFS
+restart. The writable proof creates a typed table, inserts and updates inside a
+transaction, verifies rollback after a constraint failure, closes the Worker,
+and reopens the committed state. The Supabase suite adds a credential-free
+protocol server that exercises the
 actual default Worker, PostgREST snapshot, Phoenix join/change/reconnect flow,
 and source-bound OPFS recovery.
 
@@ -393,9 +460,11 @@ startup and compilation cost.
 
 ## Direction
 
-The adapter boundary is intended to support a later cursor-aligned PostgreSQL
-replication gateway without changing the local query API. The current OPFS
-snapshot store proves persistence and crash recovery; a production-scale
-append/page store and durable replication cursor remain separate future phases.
+The immediate direction is a useful small local database: richer predicates,
+ordering, indexes, bounded joins and aggregates, followed by incremental
+journal/page persistence. Full PostgreSQL catalogs, extensions, server
+concurrency, and arbitrary wire compatibility are not goals. The existing
+adapter boundary remains available for optional remote read sources and a later
+cursor-aligned gateway without defining the core product around sync.
 
 TinyGres is MIT licensed.

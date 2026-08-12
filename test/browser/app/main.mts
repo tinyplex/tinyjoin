@@ -128,6 +128,7 @@ async function boot(): Promise<void> {
     closeSupabaseProbe,
     openSupabaseProbe,
     persistenceProbe,
+    writableDatabaseProbe,
     readSupabaseProbe,
     readBrowserRestartFixture,
     waitForSupabaseProbe,
@@ -148,6 +149,104 @@ async function boot(): Promise<void> {
   stateElement.textContent = 'Ready';
   statusElement.textContent = 'Ready. The initial snapshot is queryable locally.';
   applyButton.disabled = false;
+}
+
+async function writableDatabaseProbe(databaseName: string): Promise<{
+  committedRevision: number;
+  insertRows: Array<{done: boolean; id: number; title: string}>;
+  invalidations: Array<{revision: number; tables: string[]}>;
+  reopenedRevision: number;
+  reopenedRows: Array<{done: boolean; id: number; title: string}>;
+  rollbackCode: string;
+  stagedRows: Array<{done: boolean; id: number; title: string}>;
+}> {
+  const connection = openOpfsClient(databaseName, []);
+  const events: Array<{revision: number; tables: string[]}> = [];
+  const unsubscribe = connection.client.subscribe({}, (event) => {
+    events.push(structuredClone(event));
+  });
+  try {
+    await connection.client.ready();
+    await connection.client.exec(`
+      CREATE TABLE tasks (
+        id INTEGER PRIMARY KEY,
+        title TEXT NOT NULL,
+        done BOOLEAN DEFAULT false,
+        metadata JSON
+      )
+    `);
+    const inserted = await connection.client.exec<{
+      done: boolean;
+      id: number;
+      title: string;
+    }>(
+      'INSERT INTO tasks (id, title, metadata) VALUES ($1, $2, $3), ($4, $5, $6) RETURNING id, title, done',
+      [1, 'Ship writable SQL', {owner: 'worker'}, 2, 'Persist it', null],
+    );
+
+    const stagedRows = await connection.client.transaction(
+      async (transaction) => {
+        await transaction.exec(
+          'UPDATE tasks SET done = true WHERE id = $1 RETURNING id',
+          [1],
+        );
+        await transaction.exec(
+          'INSERT INTO tasks (id, title) VALUES ($1, $2)',
+          [3, 'Rollback safely'],
+        );
+        const result = await transaction.query<{
+          done: boolean;
+          id: number;
+          title: string;
+        }>('SELECT id, title, done FROM tasks');
+        return result.rows.sort((left, right) => left.id - right.id);
+      },
+    );
+
+    let rollbackCode = '';
+    try {
+      await connection.client.transaction(async (transaction) => {
+        await transaction.exec(
+          'UPDATE tasks SET title = $1 WHERE id = $2',
+          ['must not persist', 1],
+        );
+        await transaction.exec(
+          'INSERT INTO tasks (id, title) VALUES ($1, $2)',
+          [1, 'duplicate'],
+        );
+      });
+    } catch (error) {
+      rollbackCode = errorCode(error);
+    }
+
+    const committedRevision = connection.client.getRevision();
+    unsubscribe();
+    await connection.client.close();
+
+    const reopened = openOpfsClient(databaseName, []);
+    try {
+      await reopened.client.ready();
+      const result = await reopened.client.query<{
+        done: boolean;
+        id: number;
+        title: string;
+      }>('SELECT id, title, done FROM tasks');
+      return {
+        committedRevision,
+        insertRows: inserted.rows,
+        invalidations: events,
+        reopenedRevision: result.revision,
+        reopenedRows: result.rows.sort((left, right) => left.id - right.id),
+        rollbackCode,
+        stagedRows,
+      };
+    } finally {
+      await reopened.client.close();
+    }
+  } finally {
+    unsubscribe();
+    connection.worker.terminate();
+  }
 }
 
 async function openSupabaseProbe(options: {

@@ -1,6 +1,6 @@
 import {isSourceOptions, type SourceOptions} from './source-options.js';
 
-export const PROTOCOL_VERSION = 3 as const;
+export const PROTOCOL_VERSION = 4 as const;
 
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue =
@@ -54,6 +54,14 @@ export interface QueryResult<RowType extends object = Row> {
   rows: RowType[];
 }
 
+export interface SqlResult<RowType extends object = Row> {
+  command: string;
+  revision: number;
+  rowCount: number;
+  rows: RowType[];
+  tables: string[];
+}
+
 export interface SerializedError {
   code: string;
   message: string;
@@ -101,12 +109,28 @@ export interface RpcMethods {
     response: ApplyOutcome;
   };
   query: {
-    request: {plan: QueryPlan};
+    request: {plan: QueryPlan; transactionId?: string};
     response: QueryResult;
   };
   querySql: {
-    request: {sql: string; params: JsonValue[]};
+    request: {sql: string; params: JsonValue[]; transactionId?: string};
     response: QueryResult;
+  };
+  executeSql: {
+    request: {sql: string; params: JsonValue[]; transactionId?: string};
+    response: SqlResult;
+  };
+  beginTransaction: {
+    request: undefined;
+    response: {transactionId: string};
+  };
+  commitTransaction: {
+    request: {transactionId: string};
+    response: ApplyOutcome;
+  };
+  rollbackTransaction: {
+    request: {transactionId: string};
+    response: undefined;
   };
   close: {
     request: undefined;
@@ -208,19 +232,44 @@ export function isWorkerRequest(value: unknown): value is WorkerRequest {
     case 'applyBatch':
       return isRecord(value.params) && isChangeBatch(value.params.batch);
     case 'query':
-      return isRecord(value.params) && isQueryPlan(value.params.plan);
-    case 'querySql':
       return (
         isRecord(value.params) &&
+        hasOnlyKeys(value.params, ['plan', 'transactionId']) &&
+        isQueryPlan(value.params.plan) &&
+        isOptionalTransactionId(value.params.transactionId)
+      );
+    case 'querySql':
+    case 'executeSql':
+      return (
+        isRecord(value.params) &&
+        hasOnlyKeys(value.params, ['sql', 'params', 'transactionId']) &&
         typeof value.params.sql === 'string' &&
         Array.isArray(value.params.params) &&
-        value.params.params.every((param) => isJsonValue(param))
+        value.params.params.every((param) => isJsonValue(param)) &&
+        isOptionalTransactionId(value.params.transactionId)
+      );
+    case 'beginTransaction':
+      return value.params === undefined;
+    case 'commitTransaction':
+    case 'rollbackTransaction':
+      return (
+        isRecord(value.params) &&
+        hasOnlyKeys(value.params, ['transactionId']) &&
+        isTransactionId(value.params.transactionId)
       );
     case 'close':
       return value.params === undefined;
     default:
       return false;
   }
+}
+
+function isOptionalTransactionId(value: unknown): boolean {
+  return value === undefined || isTransactionId(value);
+}
+
+function isTransactionId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= 128;
 }
 
 function isStorageOptions(value: unknown): value is StorageOptions {

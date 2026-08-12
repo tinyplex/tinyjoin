@@ -29,13 +29,14 @@
     "url": "git+https://github.com/tinyplex/tinygres.git"
   },
   "license": "MIT",
-  "description": "A tiny, worker-first local query cache for PostgreSQL data.",
+  "description": "A tiny, worker-first relational database for browser apps.",
   "keywords": [
     "postgresql",
-    "client",
+    "database",
     "browser",
     "tiny",
-    "local-first"
+    "opfs",
+    "webassembly"
   ],
   "devDependencies": {
     "@playwright/test": "^1.62.1",

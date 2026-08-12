@@ -5,6 +5,7 @@ import type {
   QueryPlan,
   QueryResult,
   Row,
+  SqlResult,
   TableSchema,
 } from '../protocol.js';
 import type {WorkerEngine} from './engine.js';
@@ -20,6 +21,7 @@ export function createPersistentEngine(
   restoreNewestValidSnapshot(engine, store);
   let closed = false;
   let poisoned = false;
+  let transactionSnapshot: Uint8Array | undefined;
 
   const closeResources = (): void => {
     if (closed) {
@@ -117,6 +119,64 @@ export function createPersistentEngine(
       assertUsable();
       return engine.querySql(sql, params);
     },
+    executeSql(sql: string, params: JsonValue[]): SqlResult {
+      assertUsable();
+      return engine.inTransaction()
+        ? engine.executeSql(sql, params)
+        : mutate(() => engine.executeSql(sql, params));
+    },
+    beginTransaction(): void {
+      assertUsable();
+      const previous = engine.exportSnapshot();
+      engine.beginTransaction();
+      transactionSnapshot = previous;
+    },
+    commitTransaction(): ApplyOutcome {
+      assertUsable();
+      if (!transactionSnapshot) {
+        return engine.commitTransaction();
+      }
+      const previous = transactionSnapshot;
+      try {
+        const result = engine.commitTransaction();
+        const next = engine.exportSnapshot();
+        if (!bytesEqual(previous, next)) {
+          store.commit(next);
+        }
+        transactionSnapshot = undefined;
+        return result;
+      } catch (error) {
+        transactionSnapshot = undefined;
+        try {
+          if (engine.inTransaction()) {
+            engine.rollbackTransaction();
+          }
+          engine.importSnapshot(previous);
+        } catch (rollbackError) {
+          poison();
+          throw new StorageError(
+            'STORAGE_ROLLBACK_FAILED',
+            `TinyGres could not restore memory after a failed durable transaction: ${errorMessage(rollbackError)}`,
+          );
+        }
+        if (errorCode(error) === 'STORAGE_COMMIT_OUTCOME_UNKNOWN') {
+          poison();
+        }
+        throw error;
+      }
+    },
+    rollbackTransaction(): void {
+      assertUsable();
+      try {
+        engine.rollbackTransaction();
+      } finally {
+        transactionSnapshot = undefined;
+      }
+    },
+    inTransaction(): boolean {
+      assertUsable();
+      return engine.inTransaction();
+    },
     revision(): number {
       assertUsable();
       return engine.revision();
@@ -129,7 +189,23 @@ export function createPersistentEngine(
       mutate(() => engine.importSnapshot(snapshot));
     },
     close(): void {
-      closeResources();
+      let rollbackError: unknown;
+      try {
+        if (!closed && !poisoned && engine.inTransaction()) {
+          engine.rollbackTransaction();
+          transactionSnapshot = undefined;
+        }
+      } catch (error) {
+        rollbackError = error;
+      }
+      try {
+        closeResources();
+      } catch (error) {
+        rollbackError ??= error;
+      }
+      if (rollbackError !== undefined) {
+        throw rollbackError;
+      }
     },
   };
 }

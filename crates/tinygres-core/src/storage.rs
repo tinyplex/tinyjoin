@@ -3,7 +3,10 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{ApplyOutcome, Change, ChangeBatch, EngineError, Result, Row, TableSchema};
+use crate::{
+    ApplyOutcome, Change, ChangeBatch, ColumnDefinition, ColumnType, EngineError, Result, Row,
+    TableSchema,
+};
 
 pub trait StorageDriver {
     fn define_table(&mut self, schema: TableSchema) -> Result<()>;
@@ -15,6 +18,11 @@ pub trait StorageDriver {
     fn replace_table(&mut self, table: &str, rows: Vec<Row>) -> Result<ApplyOutcome>;
     fn apply_batch(&mut self, batch: &ChangeBatch) -> Result<ApplyOutcome>;
     fn scan_table(&self, table: &str) -> Result<Vec<Row>>;
+    fn table_schema(&self, table: &str) -> Result<TableSchema>;
+    #[doc(hidden)]
+    fn replace_table_unrevisioned(&mut self, table: &str, rows: Vec<Row>) -> Result<()>;
+    #[doc(hidden)]
+    fn advance_revision(&mut self) -> Result<u64>;
     fn revision(&self) -> u64;
 }
 
@@ -76,6 +84,7 @@ impl InMemoryStorage {
             let mut rows = BTreeMap::new();
 
             for row in table.rows {
+                let row = normalize_row(&table.schema, row).map_err(snapshot_validation_error)?;
                 let key = row_key(&table.schema, &row).map_err(snapshot_validation_error)?;
                 if rows.insert(key, row).is_some() {
                     return Err(EngineError::invalid_snapshot(format!(
@@ -145,26 +154,8 @@ impl StorageDriver for InMemoryStorage {
     }
 
     fn replace_table(&mut self, table: &str, rows: Vec<Row>) -> Result<ApplyOutcome> {
-        let current = self
-            .tables
-            .get(table)
-            .ok_or_else(|| EngineError::table_not_found(table))?;
-        let mut replacement = BTreeMap::new();
-
-        for row in rows {
-            let key = row_key(&current.schema, &row)?;
-            if replacement.insert(key, row).is_some() {
-                return Err(EngineError::invalid_change(format!(
-                    "Snapshot for `{table}` contains a duplicate primary key"
-                )));
-            }
-        }
-
-        self.tables
-            .get_mut(table)
-            .expect("table was checked above")
-            .rows = replacement;
-        self.revision = next_revision(self.revision)?;
+        self.replace_table_unrevisioned(table, rows)?;
+        self.advance_revision()?;
 
         Ok(ApplyOutcome {
             revision: self.revision,
@@ -191,8 +182,9 @@ impl StorageDriver for InMemoryStorage {
                         .tables
                         .get_mut(table)
                         .ok_or_else(|| EngineError::table_not_found(table))?;
-                    let key = row_key(&target.schema, row)?;
-                    target.rows.insert(key, row.clone());
+                    let row = normalize_row(&target.schema, row.clone())?;
+                    let key = row_key(&target.schema, &row)?;
+                    target.rows.insert(key, row);
                     changed_tables.insert(table.clone());
                 }
                 Change::Delete { table, key } => {
@@ -221,6 +213,42 @@ impl StorageDriver for InMemoryStorage {
             .get(table)
             .map(|table| table.rows.values().cloned().collect())
             .ok_or_else(|| EngineError::table_not_found(table))
+    }
+
+    fn table_schema(&self, table: &str) -> Result<TableSchema> {
+        self.tables
+            .get(table)
+            .map(|table| table.schema.clone())
+            .ok_or_else(|| EngineError::table_not_found(table))
+    }
+
+    fn replace_table_unrevisioned(&mut self, table: &str, rows: Vec<Row>) -> Result<()> {
+        let current = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::table_not_found(table))?;
+        let mut replacement = BTreeMap::new();
+
+        for row in rows {
+            let row = normalize_row(&current.schema, row)?;
+            let key = row_key(&current.schema, &row)?;
+            if replacement.insert(key, row).is_some() {
+                return Err(EngineError::invalid_change(format!(
+                    "Snapshot for `{table}` contains a duplicate primary key"
+                )));
+            }
+        }
+
+        self.tables
+            .get_mut(table)
+            .expect("table was checked above")
+            .rows = replacement;
+        Ok(())
+    }
+
+    fn advance_revision(&mut self) -> Result<u64> {
+        self.revision = next_revision(self.revision)?;
+        Ok(self.revision)
     }
 
     fn revision(&self) -> u64 {
@@ -254,10 +282,128 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
             )));
         }
     }
+
+    if schema.columns.is_empty() {
+        return Ok(());
+    }
+
+    let mut catalog_columns = HashSet::new();
+    for column in &schema.columns {
+        if column.name.trim().is_empty() {
+            return Err(EngineError::invalid_schema(format!(
+                "Table `{}` contains an empty column name",
+                schema.name
+            )));
+        }
+        if !catalog_columns.insert(column.name.as_str()) {
+            return Err(EngineError::invalid_schema(format!(
+                "Table `{}` declares column `{}` more than once",
+                schema.name, column.name
+            )));
+        }
+        if schema.primary_key.contains(&column.name) && column.nullable {
+            return Err(EngineError::invalid_schema(format!(
+                "Primary-key column `{}` in `{}` cannot be nullable",
+                column.name, schema.name
+            )));
+        }
+        if let Some(default) = &column.default {
+            validate_value(column, default, &schema.name).map_err(|error| {
+                EngineError::invalid_schema(format!(
+                    "Default for column `{}` is invalid: {}",
+                    column.name, error.message
+                ))
+            })?;
+        }
+    }
+
+    for column in &schema.primary_key {
+        if !catalog_columns.contains(column.as_str()) {
+            return Err(EngineError::invalid_schema(format!(
+                "Primary-key column `{column}` is not declared in table `{}`",
+                schema.name
+            )));
+        }
+    }
     Ok(())
 }
 
-fn row_key(schema: &TableSchema, row: &Row) -> Result<String> {
+pub(crate) fn normalize_row(schema: &TableSchema, mut row: Row) -> Result<Row> {
+    if schema.columns.is_empty() {
+        return Ok(row);
+    }
+
+    for name in row.keys() {
+        if !schema.columns.iter().any(|column| column.name == *name) {
+            return Err(EngineError::column_not_found(name, &schema.name));
+        }
+    }
+
+    for column in &schema.columns {
+        if !row.contains_key(&column.name) {
+            let value = column.default.clone().unwrap_or(Value::Null);
+            row.insert(column.name.clone(), value);
+        }
+        validate_value(
+            column,
+            row.get(&column.name)
+                .expect("the catalog column was populated above"),
+            &schema.name,
+        )?;
+    }
+    Ok(row)
+}
+
+fn validate_value(column: &ColumnDefinition, value: &Value, table: &str) -> Result<()> {
+    if value == &Value::Null {
+        if column.nullable {
+            return Ok(());
+        }
+        return Err(EngineError::constraint_violation(format!(
+            "Column `{}` in `{table}` cannot be null",
+            column.name
+        )));
+    }
+
+    let valid = match column.data_type {
+        ColumnType::Boolean => value.is_boolean(),
+        ColumnType::Integer => is_javascript_safe_integer(value),
+        ColumnType::Float => value.is_number(),
+        ColumnType::Text => value.is_string(),
+        ColumnType::Json => true,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(EngineError::type_mismatch(format!(
+            "Column `{}` in `{table}` expects {}",
+            column.name,
+            column_type_name(column.data_type)
+        )))
+    }
+}
+
+fn is_javascript_safe_integer(value: &Value) -> bool {
+    const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+    value
+        .as_u64()
+        .is_some_and(|number| number <= MAX_SAFE_INTEGER)
+        || value.as_i64().is_some_and(|number| {
+            number >= -(MAX_SAFE_INTEGER as i64) && number <= MAX_SAFE_INTEGER as i64
+        })
+}
+
+fn column_type_name(data_type: ColumnType) -> &'static str {
+    match data_type {
+        ColumnType::Boolean => "boolean",
+        ColumnType::Integer => "integer",
+        ColumnType::Float => "float",
+        ColumnType::Text => "text",
+        ColumnType::Json => "json",
+    }
+}
+
+pub(crate) fn row_key(schema: &TableSchema, row: &Row) -> Result<String> {
     let mut values = Vec::with_capacity(schema.primary_key.len());
     for column in &schema.primary_key {
         let value = row.get(column).ok_or_else(|| {
@@ -308,6 +454,7 @@ mod tests {
             .define_table(TableSchema {
                 name: "posts".to_owned(),
                 primary_key: vec!["id".to_owned()],
+                columns: vec![],
             })
             .unwrap();
         storage
@@ -376,6 +523,7 @@ mod tests {
             .define_table(TableSchema {
                 name: "memberships".to_owned(),
                 primary_key: vec!["team_id".to_owned(), "user_id".to_owned()],
+                columns: vec![],
             })
             .unwrap();
         storage
@@ -421,6 +569,7 @@ mod tests {
                 TableSchema {
                     name: "posts".to_owned(),
                     primary_key: vec!["id".to_owned()],
+                    columns: vec![],
                 },
                 vec![row(json!({"id": 1, "title": "first"}))],
             )
@@ -447,6 +596,7 @@ mod tests {
                 TableSchema {
                     name: "posts".to_owned(),
                     primary_key: vec!["id".to_owned()],
+                    columns: vec![],
                 },
                 vec![
                     row(json!({"id": 1, "title": "duplicate"})),
@@ -475,6 +625,7 @@ mod tests {
                 TableSchema {
                     name: "posts".to_owned(),
                     primary_key: vec!["slug".to_owned()],
+                    columns: vec![],
                 },
                 vec![row(json!({"slug": "replacement"}))],
             )
@@ -490,6 +641,7 @@ mod tests {
             .define_table(TableSchema {
                 name: "posts".to_owned(),
                 primary_key: vec!["id".to_owned()],
+                columns: vec![],
             })
             .unwrap();
     }
@@ -501,12 +653,14 @@ mod tests {
             .define_table(TableSchema {
                 name: "empty".to_owned(),
                 primary_key: vec!["id".to_owned()],
+                columns: vec![],
             })
             .unwrap();
         storage
             .define_table(TableSchema {
                 name: "memberships".to_owned(),
                 primary_key: vec!["team_id".to_owned(), "user_id".to_owned()],
+                columns: vec![],
             })
             .unwrap();
         storage
@@ -550,6 +704,7 @@ mod tests {
             .define_table(TableSchema {
                 name: "memberships".to_owned(),
                 primary_key: vec!["team_id".to_owned(), "user_id".to_owned()],
+                columns: vec![],
             })
             .unwrap();
     }
@@ -567,6 +722,7 @@ mod tests {
                 schema: TableSchema {
                     name: "posts".to_owned(),
                     primary_key: vec!["id".to_owned()],
+                    columns: vec![],
                 },
                 rows: vec![
                     row(json!({"id": 2, "title": "duplicate"})),
@@ -591,6 +747,7 @@ mod tests {
         let schema = TableSchema {
             name: "posts".to_owned(),
             primary_key: vec!["id".to_owned()],
+            columns: vec![],
         };
         let invalid_snapshots = [
             StorageSnapshot {

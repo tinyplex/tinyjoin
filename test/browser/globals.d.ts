@@ -23,6 +23,15 @@ interface Window {
       rowCount: number;
       updatedTitle: string;
     }>;
+    writableDatabaseProbe(databaseName: string): Promise<{
+      committedRevision: number;
+      insertRows: Array<{done: boolean; id: number; title: string}>;
+      invalidations: Array<{revision: number; tables: string[]}>;
+      reopenedRevision: number;
+      reopenedRows: Array<{done: boolean; id: number; title: string}>;
+      rollbackCode: string;
+      stagedRows: Array<{done: boolean; id: number; title: string}>;
+    }>;
     readBrowserRestartFixture(databaseName: string): Promise<{
       emptyTableRows: number;
       revision: number;

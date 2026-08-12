@@ -3,7 +3,10 @@ use serde::{Serialize, de::DeserializeOwned};
 use crate::{EngineError, Result};
 
 const MAGIC: &[u8; 8] = b"TGRSNAP\0";
-const FORMAT_VERSION: u16 = 1;
+// Version 2 adds typed catalog columns. Version 1 remains readable so existing
+// read-only caches upgrade in place, while older engines fail safely on v2.
+const FORMAT_VERSION: u16 = 2;
+const MIN_READABLE_VERSION: u16 = 1;
 const FLAGS: u16 = 0;
 const HEADER_LENGTH: usize = 20;
 
@@ -50,7 +53,7 @@ pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     }
 
     let version = read_u16(bytes, 8);
-    if version != FORMAT_VERSION {
+    if !(MIN_READABLE_VERSION..=FORMAT_VERSION).contains(&version) {
         return Err(EngineError::unsupported_snapshot(format!(
             "Snapshot format version {version} is not supported"
         )));
@@ -140,10 +143,17 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_previous_snapshot_envelope_version() {
+        let mut bytes = encoded();
+        bytes[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        assert_eq!(decode::<Payload>(&bytes).unwrap().value, "kept");
+    }
+
+    #[test]
     fn envelope_rejects_invalid_header_fields() {
         let cases: [(usize, u8, &str); 4] = [
             (0, b'X', "INVALID_SNAPSHOT"),
-            (8, 2, "UNSUPPORTED_SNAPSHOT"),
+            (8, 3, "UNSUPPORTED_SNAPSHOT"),
             (10, 1, "UNSUPPORTED_SNAPSHOT"),
             (12, 0, "INVALID_SNAPSHOT"),
         ];

@@ -43,6 +43,13 @@ impl EngineError {
         Self::new("TABLE_NOT_FOUND", format!("Table `{table}` is not defined"))
     }
 
+    pub(crate) fn table_already_exists(table: &str) -> Self {
+        Self::new(
+            "TABLE_ALREADY_EXISTS",
+            format!("Table `{table}` is already defined"),
+        )
+    }
+
     pub(crate) fn column_not_found(column: &str, table: &str) -> Self {
         Self::new(
             "COLUMN_NOT_FOUND",
@@ -52,6 +59,28 @@ impl EngineError {
 
     pub(crate) fn bind_error(message: impl Into<String>) -> Self {
         Self::new("BIND_ERROR", message)
+    }
+
+    pub(crate) fn constraint_violation(message: impl Into<String>) -> Self {
+        Self::new("CONSTRAINT_VIOLATION", message)
+    }
+
+    pub(crate) fn type_mismatch(message: impl Into<String>) -> Self {
+        Self::new("TYPE_MISMATCH", message)
+    }
+
+    pub(crate) fn transaction_active() -> Self {
+        Self::new(
+            "TRANSACTION_ACTIVE",
+            "A transaction is already active on this engine",
+        )
+    }
+
+    pub(crate) fn no_active_transaction() -> Self {
+        Self::new(
+            "NO_ACTIVE_TRANSACTION",
+            "No transaction is active on this engine",
+        )
     }
 
     pub(crate) fn invalid_snapshot(message: impl Into<String>) -> Self {

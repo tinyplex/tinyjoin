@@ -7,6 +7,7 @@ import type {
   QueryPlan,
   QueryResult,
   Row,
+  SqlResult,
   TableSchema,
 } from '../../src/protocol.ts';
 import type {WorkerEngine} from '../../src/worker/engine.ts';
@@ -28,6 +29,8 @@ class StateEngine implements WorkerEngine {
   state: EngineState = {revision: 0, tables: {}};
   closed = false;
   failImport = false;
+  transactionState: EngineState | undefined;
+  readonly transactionTables = new Set<string>();
 
   defineTable(schema: TableSchema): void {
     const existing = this.state.tables[schema.name];
@@ -95,6 +98,77 @@ class StateEngine implements WorkerEngine {
     return this.query({table: 'posts', filters: []});
   }
 
+  executeSql(sql: string, params: JsonValue[]): SqlResult {
+    const table = this.state.tables.posts;
+    if (!table) {
+      throw Object.assign(new Error('missing table'), {
+        code: 'TABLE_NOT_FOUND',
+      });
+    }
+    const command = sql.trim().split(/\s+/, 1)[0]!.toUpperCase();
+    if (command === 'INSERT') {
+      table.rows.push({id: params[0] ?? table.rows.length + 1});
+    } else if (command === 'DELETE') {
+      table.rows = [];
+    } else {
+      throw Object.assign(new Error('unsupported statement'), {
+        code: 'UNSUPPORTED_SQL',
+      });
+    }
+    if (this.inTransaction()) {
+      this.transactionTables.add('posts');
+    } else {
+      this.state.revision += 1;
+    }
+    return {
+      command,
+      revision: this.state.revision,
+      rowCount: 1,
+      rows: [],
+      tables: ['posts'],
+    };
+  }
+
+  beginTransaction(): void {
+    if (this.transactionState) {
+      throw Object.assign(new Error('transaction active'), {
+        code: 'TRANSACTION_ACTIVE',
+      });
+    }
+    this.transactionState = structuredClone(this.state);
+    this.transactionTables.clear();
+  }
+
+  commitTransaction(): ApplyOutcome {
+    if (!this.transactionState) {
+      throw Object.assign(new Error('no active transaction'), {
+        code: 'NO_ACTIVE_TRANSACTION',
+      });
+    }
+    const tables = [...this.transactionTables].sort();
+    if (tables.length > 0) {
+      this.state.revision += 1;
+    }
+    this.transactionState = undefined;
+    this.transactionTables.clear();
+    return {revision: this.state.revision, tables};
+  }
+
+  rollbackTransaction(): void {
+    if (!this.transactionState) {
+      throw Object.assign(new Error('no active transaction'), {
+        code: 'NO_ACTIVE_TRANSACTION',
+      });
+    }
+    this.state = this.transactionState;
+    this.transactionState = undefined;
+    this.transactionTables.clear();
+  }
+
+  inTransaction(): boolean {
+    return this.transactionState !== undefined;
+  }
+
   revision(): number {
     return this.state.revision;
   }
@@ -111,9 +185,13 @@ class StateEngine implements WorkerEngine {
       throw Object.assign(new Error('invalid'), {code: 'INVALID_SNAPSHOT'});
     }
     if (snapshot[0] === 0xfe) {
-      throw Object.assign(new Error('future'), {code: 'UNSUPPORTED_SNAPSHOT'});
+      throw Object.assign(new Error('future'), {
+        code: 'UNSUPPORTED_SNAPSHOT',
+      });
     }
     this.state = JSON.parse(decoder.decode(snapshot)) as EngineState;
+    this.transactionState = undefined;
+    this.transactionTables.clear();
   }
 
   close(): void {
@@ -200,6 +278,62 @@ describe('persistent worker engine', () => {
     expect(engine.query({table: 'posts', filters: []}).rows).toEqual([
       {id: 1, title: 'before'},
     ]);
+  });
+
+  it('persists all transaction writes in one snapshot when committing', () => {
+    const store = new MemorySnapshotStore();
+    const engine = createPersistentEngine(new StateEngine(), store);
+    engine.defineTables([postsSchema]);
+    store.commits.length = 0;
+
+    engine.beginTransaction();
+    expect(
+      engine.executeSql('INSERT INTO posts (id) VALUES ($1)', [1]),
+    ).toMatchObject({
+      command: 'INSERT',
+      revision: 0,
+      tables: ['posts'],
+    });
+    engine.executeSql('INSERT INTO posts (id) VALUES ($1)', [2]);
+    expect(engine.query({table: 'posts', filters: []}).rows).toEqual([
+      {id: 1},
+      {id: 2},
+    ]);
+    expect(store.commits).toHaveLength(0);
+
+    expect(engine.commitTransaction()).toEqual({
+      revision: 1,
+      tables: ['posts'],
+    });
+    expect(store.commits).toHaveLength(1);
+
+    const restored = createPersistentEngine(
+      new StateEngine(),
+      new MemorySnapshotStore([
+        {slot: 0, generation: 1n, snapshot: store.commits[0]!},
+      ]),
+    );
+    expect(restored.revision()).toBe(1);
+    expect(restored.query({table: 'posts', filters: []}).rows).toEqual([
+      {id: 1},
+      {id: 2},
+    ]);
+  });
+
+  it('rolls staged transaction writes back without persisting a snapshot', () => {
+    const store = new MemorySnapshotStore();
+    const engine = createPersistentEngine(new StateEngine(), store);
+    engine.replaceTableSnapshot(postsSchema, [{id: 1}]);
+    store.commits.length = 0;
+
+    engine.beginTransaction();
+    engine.executeSql('DELETE FROM posts', []);
+    expect(engine.query({table: 'posts', filters: []}).rows).toEqual([]);
+    engine.rollbackTransaction();
+
+    expect(store.commits).toHaveLength(0);
+    expect(engine.revision()).toBe(1);
+    expect(engine.query({table: 'posts', filters: []}).rows).toEqual([{id: 1}]);
   });
 
   it('poisons the engine when rollback cannot restore memory', () => {
