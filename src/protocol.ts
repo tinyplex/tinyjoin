@@ -33,7 +33,7 @@ export interface ChangeBatch {
 
 export type Filter = {
   column: string;
-  operator: 'eq';
+  operator: 'eq' | 'neq' | 'lt' | 'lte' | 'gt' | 'gte';
   value: JsonValue;
 };
 
@@ -41,7 +41,15 @@ export interface QueryPlan {
   table: string;
   columns?: string[];
   filters: Filter[];
+  orderBy?: OrderBy[];
   limit?: number;
+  offset?: number;
+}
+
+export interface OrderBy {
+  column: string;
+  direction: 'asc' | 'desc';
+  nulls: 'default' | 'first' | 'last';
 }
 
 export interface ApplyOutcome {
@@ -208,7 +216,6 @@ export function isWorkerRequest(value: unknown): value is WorkerRequest {
   ) {
     return false;
   }
-
   switch (value.method) {
     case 'init':
       return (
@@ -262,6 +269,19 @@ export function isWorkerRequest(value: unknown): value is WorkerRequest {
     default:
       return false;
   }
+}
+
+function isOrderBy(value: unknown): value is OrderBy {
+  return (
+    isRecord(value) &&
+    hasOnlyKeys(value, ['column', 'direction', 'nulls']) &&
+    typeof value.column === 'string' &&
+    value.column.length > 0 &&
+    (value.direction === 'asc' || value.direction === 'desc') &&
+    (value.nulls === 'default' ||
+      value.nulls === 'first' ||
+      value.nulls === 'last')
+  );
 }
 
 function isOptionalTransactionId(value: unknown): boolean {
@@ -364,6 +384,14 @@ function isSourceCursor(value: unknown): value is SourceCursor {
 function isQueryPlan(value: unknown): value is QueryPlan {
   if (
     !isRecord(value) ||
+    !hasOnlyKeys(value, [
+      'table',
+      'columns',
+      'filters',
+      'orderBy',
+      'limit',
+      'offset',
+    ]) ||
     typeof value.table !== 'string' ||
     !Array.isArray(value.filters)
   ) {
@@ -382,14 +410,37 @@ function isQueryPlan(value: unknown): value is QueryPlan {
   ) {
     return false;
   }
+  if (
+    value.offset !== undefined &&
+    (!Number.isSafeInteger(value.offset) || Number(value.offset) < 0)
+  ) {
+    return false;
+  }
+  if (
+    value.orderBy !== undefined &&
+    (!Array.isArray(value.orderBy) ||
+      value.orderBy.length > 32 ||
+      !value.orderBy.every(isOrderBy))
+  ) {
+    return false;
+  }
   return value.filters.every(
     (filter) =>
       isRecord(filter) &&
       typeof filter.column === 'string' &&
-      filter.operator === 'eq' &&
+      FILTER_OPERATORS.has(filter.operator) &&
       isJsonValue(filter.value),
   );
 }
+
+const FILTER_OPERATORS = new Set<unknown>([
+  'eq',
+  'neq',
+  'lt',
+  'lte',
+  'gt',
+  'gte',
+]);
 
 function isSyncState(value: unknown): value is SyncState {
   if (!isRecord(value) || !SYNC_PHASES.has(value.phase)) {

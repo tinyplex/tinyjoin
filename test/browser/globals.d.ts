@@ -27,6 +27,7 @@ interface Window {
       committedRevision: number;
       insertRows: Array<{done: boolean; id: number; title: string}>;
       invalidations: Array<{revision: number; tables: string[]}>;
+      orderedRows: Array<{done: boolean; id: number; title: string}>;
       reopenedRevision: number;
       reopenedRows: Array<{done: boolean; id: number; title: string}>;
       rollbackCode: string;

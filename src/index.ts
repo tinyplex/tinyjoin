@@ -8,7 +8,7 @@ export type {
 } from './client/client.js';
 export {ClientError} from './client/error.js';
 export {QueryBuilder} from './client/query-builder.js';
-export type {QueryResponse} from './client/query-builder.js';
+export type {OrderOptions, QueryResponse} from './client/query-builder.js';
 export type {
   ApplyOutcome,
   Change,
@@ -18,6 +18,7 @@ export type {
   JsonValue,
   QueryPlan,
   QueryResult,
+  OrderBy,
   Row,
   SerializedError,
   SqlResult,

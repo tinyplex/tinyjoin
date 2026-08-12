@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde::{Deserialize, Serialize};
@@ -18,6 +20,7 @@ pub trait StorageDriver {
     fn replace_table(&mut self, table: &str, rows: Vec<Row>) -> Result<ApplyOutcome>;
     fn apply_batch(&mut self, batch: &ChangeBatch) -> Result<ApplyOutcome>;
     fn scan_table(&self, table: &str) -> Result<Vec<Row>>;
+    fn lookup_primary_key(&self, table: &str, key: &Row) -> Result<Option<Row>>;
     fn table_schema(&self, table: &str) -> Result<TableSchema>;
     #[doc(hidden)]
     fn replace_table_unrevisioned(&mut self, table: &str, rows: Vec<Row>) -> Result<()>;
@@ -30,6 +33,10 @@ pub trait StorageDriver {
 pub struct InMemoryStorage {
     revision: u64,
     tables: BTreeMap<String, TableData>,
+    #[cfg(test)]
+    scan_count: Cell<usize>,
+    #[cfg(test)]
+    lookup_count: Cell<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -112,7 +119,16 @@ impl InMemoryStorage {
         Ok(Self {
             revision: snapshot.revision,
             tables,
+            #[cfg(test)]
+            scan_count: Cell::new(0),
+            #[cfg(test)]
+            lookup_count: Cell::new(0),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn access_counts(&self) -> (usize, usize) {
+        (self.scan_count.get(), self.lookup_count.get())
     }
 }
 
@@ -209,10 +225,23 @@ impl StorageDriver for InMemoryStorage {
     }
 
     fn scan_table(&self, table: &str) -> Result<Vec<Row>> {
+        #[cfg(test)]
+        self.scan_count.set(self.scan_count.get() + 1);
         self.tables
             .get(table)
             .map(|table| table.rows.values().cloned().collect())
             .ok_or_else(|| EngineError::table_not_found(table))
+    }
+
+    fn lookup_primary_key(&self, table: &str, key: &Row) -> Result<Option<Row>> {
+        #[cfg(test)]
+        self.lookup_count.set(self.lookup_count.get() + 1);
+        let table = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::table_not_found(table))?;
+        let key = row_key(&table.schema, key)?;
+        Ok(table.rows.get(&key).cloned())
     }
 
     fn table_schema(&self, table: &str) -> Result<TableSchema> {

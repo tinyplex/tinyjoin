@@ -12,6 +12,11 @@ export interface QueryExecutor {
   }>;
 }
 
+export interface OrderOptions {
+  ascending?: boolean;
+  nullsFirst?: boolean;
+}
+
 export class QueryBuilder<RowType extends object = Row>
   implements PromiseLike<QueryResponse<RowType>>
 {
@@ -33,6 +38,34 @@ export class QueryBuilder<RowType extends object = Row>
   }
 
   eq(column: string, value: JsonValue): QueryBuilder<RowType> {
+    return this.#filter(column, 'eq', value);
+  }
+
+  neq(column: string, value: JsonValue): QueryBuilder<RowType> {
+    return this.#filter(column, 'neq', value);
+  }
+
+  lt(column: string, value: JsonValue): QueryBuilder<RowType> {
+    return this.#filter(column, 'lt', value);
+  }
+
+  lte(column: string, value: JsonValue): QueryBuilder<RowType> {
+    return this.#filter(column, 'lte', value);
+  }
+
+  gt(column: string, value: JsonValue): QueryBuilder<RowType> {
+    return this.#filter(column, 'gt', value);
+  }
+
+  gte(column: string, value: JsonValue): QueryBuilder<RowType> {
+    return this.#filter(column, 'gte', value);
+  }
+
+  #filter(
+    column: string,
+    operator: import('../protocol.js').Filter['operator'],
+    value: JsonValue,
+  ): QueryBuilder<RowType> {
     if (!column.trim()) {
       throw new ClientError({
         code: 'INVALID_QUERY',
@@ -42,7 +75,7 @@ export class QueryBuilder<RowType extends object = Row>
     return this.#with({
       filters: [
         ...this.#plan.filters,
-        {column, operator: 'eq', value},
+        {column, operator, value},
       ],
     });
   }
@@ -55,6 +88,49 @@ export class QueryBuilder<RowType extends object = Row>
       });
     }
     return this.#with({limit});
+  }
+
+  offset(offset: number): QueryBuilder<RowType> {
+    assertNonNegativeInteger(offset, 'offset');
+    return this.#with({offset});
+  }
+
+  /** Uses the same option names as Supabase's query builder. */
+  order(column: string, options: OrderOptions = {}): QueryBuilder<RowType> {
+    if (!column.trim()) {
+      throw new ClientError({
+        code: 'INVALID_QUERY',
+        message: 'An order column cannot be empty',
+      });
+    }
+    return this.#with({
+      orderBy: [
+        ...(this.#plan.orderBy ?? []),
+        {
+          column,
+          direction: options.ascending === false ? 'desc' : 'asc',
+          nulls:
+            options.nullsFirst === undefined
+              ? 'default'
+              : options.nullsFirst
+                ? 'first'
+                : 'last',
+        },
+      ],
+    });
+  }
+
+  /** Selects the inclusive zero-based row range after filtering and ordering. */
+  range(from: number, to: number): QueryBuilder<RowType> {
+    assertNonNegativeInteger(from, 'range start');
+    assertNonNegativeInteger(to, 'range end');
+    if (to < from) {
+      throw new ClientError({
+        code: 'INVALID_QUERY',
+        message: 'A query range end cannot be smaller than its start',
+      });
+    }
+    return this.#with({offset: from, limit: to - from + 1});
   }
 
   async execute(): Promise<QueryResponse<RowType>> {
@@ -81,6 +157,15 @@ export class QueryBuilder<RowType extends object = Row>
 
   #with(patch: Partial<QueryPlan>): QueryBuilder<RowType> {
     return new QueryBuilder(this.#executor, {...this.#plan, ...patch});
+  }
+}
+
+function assertNonNegativeInteger(value: number, description: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new ClientError({
+      code: 'INVALID_QUERY',
+      message: `A query ${description} must be a non-negative safe integer`,
+    });
   }
 }
 

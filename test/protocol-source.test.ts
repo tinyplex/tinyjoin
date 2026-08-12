@@ -148,6 +148,48 @@ describe('built-in source protocol', () => {
     }
   });
 
+  it('validates structured comparisons, ordering, and offsets', () => {
+    expect(
+      isWorkerRequest({
+        v: PROTOCOL_VERSION,
+        id: 8,
+        method: 'query',
+        params: {
+          plan: {
+            table: 'tasks',
+            filters: [{column: 'priority', operator: 'gte', value: 2}],
+            orderBy: [
+              {column: 'priority', direction: 'desc', nulls: 'last'},
+            ],
+            offset: 10,
+            limit: 5,
+          },
+        },
+      }),
+    ).toBe(true);
+    for (const plan of [
+      {table: 'tasks', filters: [], offset: -1},
+      {
+        table: 'tasks',
+        filters: [{column: 'id', operator: 'contains', value: 1}],
+      },
+      {
+        table: 'tasks',
+        filters: [],
+        orderBy: [{column: 'id', direction: 'sideways', nulls: 'default'}],
+      },
+    ]) {
+      expect(
+        isWorkerRequest({
+          v: PROTOCOL_VERSION,
+          id: 9,
+          method: 'query',
+          params: {plan},
+        }),
+      ).toBe(false);
+    }
+  });
+
   it.each([
     {
       method: 'executeSql',

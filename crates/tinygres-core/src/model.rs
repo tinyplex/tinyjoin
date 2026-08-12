@@ -67,10 +67,15 @@ pub enum Change {
     Delete { table: String, key: Row },
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FilterOperator {
     Eq,
+    Neq,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -82,6 +87,56 @@ pub struct Filter {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum Predicate {
+    Comparison {
+        column: String,
+        operator: FilterOperator,
+        value: Value,
+    },
+    IsNull {
+        column: String,
+        negated: bool,
+    },
+    In {
+        column: String,
+        values: Vec<Value>,
+    },
+    And {
+        predicates: Vec<Predicate>,
+    },
+    Or {
+        predicates: Vec<Predicate>,
+    },
+    Not {
+        predicate: Box<Predicate>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OrderDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NullOrder {
+    Default,
+    First,
+    Last,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderBy {
+    pub column: String,
+    pub direction: OrderDirection,
+    pub nulls: NullOrder,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryPlan {
     pub table: String,
@@ -90,7 +145,17 @@ pub struct QueryPlan {
     #[serde(default)]
     pub filters: Vec<Filter>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<Predicate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order_by: Vec<OrderBy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub offset: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

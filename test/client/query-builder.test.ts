@@ -63,6 +63,65 @@ describe('QueryBuilder', () => {
     expect(response.error).toMatchObject({code: 'TABLE_NOT_FOUND'});
   });
 
+  it('builds typed comparison filters without mutating its base', async () => {
+    const executePlan = vi.fn(async () => ({revision: 1, rows: []}));
+    const executor: QueryExecutor = {executePlan};
+    const base = new QueryBuilder(executor, {table: 'tasks', filters: []});
+
+    await base
+      .neq('state', 'archived')
+      .gt('priority', 1)
+      .gte('score', 2)
+      .lt('age', 10)
+      .lte('attempts', 3);
+
+    expect(executePlan).toHaveBeenCalledWith({
+      table: 'tasks',
+      filters: [
+        {column: 'state', operator: 'neq', value: 'archived'},
+        {column: 'priority', operator: 'gt', value: 1},
+        {column: 'score', operator: 'gte', value: 2},
+        {column: 'age', operator: 'lt', value: 10},
+        {column: 'attempts', operator: 'lte', value: 3},
+      ],
+    });
+    await base;
+    expect(executePlan).toHaveBeenLastCalledWith({
+      table: 'tasks',
+      filters: [],
+    });
+  });
+
+  it('builds stable ordering, offsets, and inclusive ranges', async () => {
+    const executePlan = vi.fn(async () => ({revision: 1, rows: []}));
+    const builder = new QueryBuilder({executePlan}, {
+      table: 'tasks',
+      filters: [],
+    });
+
+    await builder
+      .order('done', {ascending: false, nullsFirst: false})
+      .order('id')
+      .range(10, 19);
+    expect(executePlan).toHaveBeenCalledWith({
+      table: 'tasks',
+      filters: [],
+      orderBy: [
+        {column: 'done', direction: 'desc', nulls: 'last'},
+        {column: 'id', direction: 'asc', nulls: 'default'},
+      ],
+      offset: 10,
+      limit: 10,
+    });
+
+    await builder.offset(3);
+    expect(executePlan).toHaveBeenLastCalledWith({
+      table: 'tasks',
+      filters: [],
+      offset: 3,
+    });
+  });
+
   it('validates limits and projections before crossing the worker boundary', () => {
     const executor: QueryExecutor = {
       executePlan: () => Promise.resolve({revision: 0, rows: []}),
@@ -70,6 +129,9 @@ describe('QueryBuilder', () => {
     const builder = new QueryBuilder(executor, {table: 'posts', filters: []});
 
     expect(() => builder.limit(-1)).toThrow('non-negative safe integer');
+    expect(() => builder.offset(-1)).toThrow('non-negative safe integer');
+    expect(() => builder.range(3, 2)).toThrow('cannot be smaller');
+    expect(() => builder.order('')).toThrow('cannot be empty');
     expect(() => builder.select('id, ')).toThrow('one or more column names');
   });
 });

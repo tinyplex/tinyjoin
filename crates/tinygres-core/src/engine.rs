@@ -410,6 +410,46 @@ mod tests {
     }
 
     #[test]
+    fn writable_predicates_share_select_null_and_boolean_semantics() {
+        let mut engine = Engine::default();
+        create_posts(&mut engine);
+        engine
+            .execute_sql(
+                "INSERT INTO posts (id, title, rating) VALUES \
+                 (1, 'one', NULL), (2, 'two', 2), (3, 'three', 3)",
+                &[],
+            )
+            .unwrap();
+
+        let updated = engine
+            .execute_sql(
+                "UPDATE posts SET published = true \
+                 WHERE id >= 2 AND (rating < 3 OR title = 'three') RETURNING id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            updated.rows,
+            vec![row(json!({"id": 2})), row(json!({"id": 3}))]
+        );
+
+        let deleted = engine
+            .execute_sql(
+                "DELETE FROM posts WHERE rating IS NULL OR id IN (3) RETURNING id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            deleted.rows,
+            vec![row(json!({"id": 1})), row(json!({"id": 3}))]
+        );
+        assert_eq!(
+            engine.query_sql("SELECT id FROM posts", &[]).unwrap().rows,
+            vec![row(json!({"id": 2}))]
+        );
+    }
+
+    #[test]
     fn explicit_transactions_publish_once_and_snapshots_stay_committed() {
         let mut engine = Engine::default();
         create_posts(&mut engine);

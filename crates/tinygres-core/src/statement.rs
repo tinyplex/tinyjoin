@@ -4,13 +4,13 @@ use std::str::FromStr;
 use serde_json::{Map, Number, Value};
 
 use crate::query::{
-    Token, bind_parameter, is_reserved_keyword, matches_filters, project_row, tokenize,
-    validate_sql_input,
+    Token, bind_parameter, is_reserved_keyword, matches_predicate, parse_predicate_at, project_row,
+    tokenize, validate_predicate_columns, validate_sql_input,
 };
 use crate::storage::{normalize_row, row_key};
 use crate::{
-    ColumnDefinition, ColumnType, EngineError, Filter, FilterOperator, QueryPlan, Result, Row,
-    StorageDriver, TableSchema,
+    ColumnDefinition, ColumnType, EngineError, Predicate, QueryPlan, Result, Row, StorageDriver,
+    TableSchema,
 };
 
 const MAX_COLUMNS: usize = 256;
@@ -35,12 +35,12 @@ pub(crate) enum WriteStatement {
     Update {
         table: String,
         assignments: Vec<(String, SqlValue)>,
-        filters: Vec<Filter>,
+        predicate: Option<Predicate>,
         returning: Option<Vec<String>>,
     },
     Delete {
         table: String,
-        filters: Vec<Filter>,
+        predicate: Option<Predicate>,
         returning: Option<Vec<String>>,
     },
 }
@@ -100,14 +100,20 @@ pub(crate) fn execute<S: StorageDriver>(
         WriteStatement::Update {
             table,
             assignments,
-            filters,
+            predicate,
             returning,
-        } => update(storage, table, assignments, filters, returning.as_deref()),
+        } => update(
+            storage,
+            table,
+            assignments,
+            predicate.as_ref(),
+            returning.as_deref(),
+        ),
         WriteStatement::Delete {
             table,
-            filters,
+            predicate,
             returning,
-        } => delete(storage, table, filters, returning.as_deref()),
+        } => delete(storage, table, predicate.as_ref(), returning.as_deref()),
     }
 }
 
@@ -215,7 +221,7 @@ fn update<S: StorageDriver>(
     storage: &mut S,
     table: &str,
     assignments: &[(String, SqlValue)],
-    filters: &[Filter],
+    predicate: Option<&Predicate>,
     returning: Option<&[String]>,
 ) -> Result<WriteOutcome> {
     let schema = storage.table_schema(table)?;
@@ -226,13 +232,15 @@ fn update<S: StorageDriver>(
             .map(|(column, _)| column.clone())
             .collect::<Vec<_>>(),
     )?;
-    validate_filter_columns(&schema, filters)?;
+    if let Some(predicate) = predicate.filter(|_| !schema.columns.is_empty()) {
+        validate_predicate_columns(predicate, &schema, table)?;
+    }
     validate_projection(&schema, returning)?;
 
     let mut rows = storage.scan_table(table)?;
     let mut updated = Vec::new();
     for row in &mut rows {
-        if !matches_filters(row, filters, table)? {
+        if !matches_predicate(row, predicate, table)? {
             continue;
         }
         for (column, value) in assignments {
@@ -275,17 +283,19 @@ fn update<S: StorageDriver>(
 fn delete<S: StorageDriver>(
     storage: &mut S,
     table: &str,
-    filters: &[Filter],
+    predicate: Option<&Predicate>,
     returning: Option<&[String]>,
 ) -> Result<WriteOutcome> {
     let schema = storage.table_schema(table)?;
-    validate_filter_columns(&schema, filters)?;
+    if let Some(predicate) = predicate.filter(|_| !schema.columns.is_empty()) {
+        validate_predicate_columns(predicate, &schema, table)?;
+    }
     validate_projection(&schema, returning)?;
 
     let mut kept = Vec::new();
     let mut deleted = Vec::new();
     for row in storage.scan_table(table)? {
-        if matches_filters(&row, filters, table)? {
+        if matches_predicate(&row, predicate, table)? {
             deleted.push(row);
         } else {
             kept.push(row);
@@ -323,22 +333,6 @@ fn validate_named_columns(schema: &TableSchema, columns: &[String]) -> Result<()
                 .any(|definition| definition.name == *column)
         {
             return Err(EngineError::column_not_found(column, &schema.name));
-        }
-    }
-    Ok(())
-}
-
-fn validate_filter_columns(schema: &TableSchema, filters: &[Filter]) -> Result<()> {
-    if schema.columns.is_empty() {
-        return Ok(());
-    }
-    for filter in filters {
-        if !schema
-            .columns
-            .iter()
-            .any(|column| column.name == filter.column)
-        {
-            return Err(EngineError::column_not_found(&filter.column, &schema.name));
         }
     }
     Ok(())
@@ -652,16 +646,20 @@ impl<'a> MutationParser<'a> {
                 break;
             }
         }
-        let filters = if self.consume_keyword("where") {
-            self.parse_filters()?
+        let predicate = if self.consume_keyword("where") {
+            Some(parse_predicate_at(
+                &self.tokens,
+                &mut self.position,
+                self.params,
+            )?)
         } else {
-            vec![]
+            None
         };
         let returning = self.parse_returning()?;
         Ok(WriteStatement::Update {
             table,
             assignments,
-            filters,
+            predicate,
             returning,
         })
     }
@@ -669,42 +667,21 @@ impl<'a> MutationParser<'a> {
     fn parse_delete(&mut self) -> Result<WriteStatement> {
         self.expect_keyword("from")?;
         let table = self.parse_table_name()?;
-        let filters = if self.consume_keyword("where") {
-            self.parse_filters()?
+        let predicate = if self.consume_keyword("where") {
+            Some(parse_predicate_at(
+                &self.tokens,
+                &mut self.position,
+                self.params,
+            )?)
         } else {
-            vec![]
+            None
         };
         let returning = self.parse_returning()?;
         Ok(WriteStatement::Delete {
             table,
-            filters,
+            predicate,
             returning,
         })
-    }
-
-    fn parse_filters(&mut self) -> Result<Vec<Filter>> {
-        let mut filters = Vec::new();
-        loop {
-            if filters.len() >= MAX_COLUMNS {
-                return Err(EngineError::invalid_query(format!(
-                    "A statement cannot contain more than {MAX_COLUMNS} filters"
-                )));
-            }
-            let column = self.parse_identifier()?;
-            self.expect(TokenMatcher::Eq, "Expected `=` in WHERE filter")?;
-            let SqlValue::Value(value) = self.parse_sql_value(false)? else {
-                unreachable!("DEFAULT was disabled for WHERE values")
-            };
-            filters.push(Filter {
-                column,
-                operator: FilterOperator::Eq,
-                value,
-            });
-            if !self.consume_keyword("and") {
-                break;
-            }
-        }
-        Ok(filters)
     }
 
     /// `None` means no RETURNING clause. An empty vector means RETURNING `*`.

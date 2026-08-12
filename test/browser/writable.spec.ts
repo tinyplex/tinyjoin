@@ -21,6 +21,10 @@ test('writes, transacts, rolls back, and reopens through Worker/WASM/OPFS', asyn
     {id: 3, title: 'Rollback safely', done: false},
   ]);
   expect(report.rollbackCode).toBe('CONSTRAINT_VIOLATION');
+  expect(report.orderedRows).toEqual([
+    {id: 3, title: 'Rollback safely', done: false},
+    {id: 2, title: 'Persist it', done: false},
+  ]);
   expect(report.committedRevision).toBe(3);
   expect(report.reopenedRevision).toBe(3);
   expect(report.reopenedRows).toEqual(report.stagedRows);

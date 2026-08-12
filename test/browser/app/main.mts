@@ -155,6 +155,7 @@ async function writableDatabaseProbe(databaseName: string): Promise<{
   committedRevision: number;
   insertRows: Array<{done: boolean; id: number; title: string}>;
   invalidations: Array<{revision: number; tables: string[]}>;
+  orderedRows: Array<{done: boolean; id: number; title: string}>;
   reopenedRevision: number;
   reopenedRows: Array<{done: boolean; id: number; title: string}>;
   rollbackCode: string;
@@ -219,6 +220,27 @@ async function writableDatabaseProbe(databaseName: string): Promise<{
       rollbackCode = errorCode(error);
     }
 
+    const ordered = await connection.client.query<{
+      done: boolean;
+      id: number;
+      title: string;
+    }>(
+      `SELECT id, title, done FROM tasks
+       WHERE done IS NOT NULL AND (id >= $1 OR title = $2)
+       ORDER BY done DESC, id DESC LIMIT 2 OFFSET 1`,
+      [1, 'missing'],
+    );
+    const built = await connection.client
+      .from<{done: boolean; id: number; title: string}>('tasks')
+      .select('id, title, done')
+      .gte('id', 1)
+      .order('done', {ascending: false})
+      .order('id', {ascending: false})
+      .range(1, 2);
+    if (built.error || JSON.stringify(built.data) !== JSON.stringify(ordered.rows)) {
+      throw built.error ?? new Error('Structured query did not match SQL query');
+    }
+
     const committedRevision = connection.client.getRevision();
     unsubscribe();
     await connection.client.close();
@@ -235,6 +257,7 @@ async function writableDatabaseProbe(databaseName: string): Promise<{
         committedRevision,
         insertRows: inserted.rows,
         invalidations: events,
+        orderedRows: ordered.rows,
         reopenedRevision: result.revision,
         reopenedRows: result.rows.sort((left, right) => left.id - right.id),
         rollbackCode,

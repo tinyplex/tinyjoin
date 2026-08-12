@@ -386,7 +386,9 @@ const {data, error} = await db
   .from<Post>('posts')
   .select('id, title, published')
   .eq('published', true)
-  .limit(20);
+  .gte('priority', 2)
+  .order('id', {ascending: false})
+  .range(0, 19);
 ```
 
 This syntax queries the local replica. It does not make a PostgREST request.
@@ -398,9 +400,13 @@ TinyGres currently accepts one statement at a time. `SELECT` supports:
 
 - one unqualified or schema-qualified table;
 - `*` or a list of simple column names;
-- equality filters joined with `AND`;
+- `=`, `<>`/`!=`, `<`, `<=`, `>`, and `>=` comparisons;
+- `AND`, `OR`, `NOT`, parentheses, `IN`/`NOT IN`, and `IS [NOT] NULL`
+  with SQL three-valued null logic;
 - string, number, boolean, `NULL`, or PostgreSQL-style `$1` parameters; and
-- an optional non-negative `LIMIT`.
+- simple multi-column `ORDER BY` with `ASC`/`DESC` and
+  `NULLS FIRST`/`NULLS LAST`;
+- optional non-negative `LIMIT` and `OFFSET`.
 
 Standalone writable databases additionally support:
 
@@ -413,13 +419,17 @@ Standalone writable databases additionally support:
 - `$1` parameters, `DEFAULT`, and simple `RETURNING *`/column lists; and
 - callback transactions through `db.transaction()`.
 
+Complete primary-key equality uses direct indexed row lookup; other predicates
+currently scan the table. Text comparison and ordering use deterministic Unicode
+code-point ordering rather than PostgreSQL database collations.
+
 Integers are restricted to JavaScript's exactly representable safe-integer
 range. Type names are compatibility spellings over this smaller runtime type
 set: for example, `BIGINT` does not provide 64-bit values and `JSONB` currently
 uses JSON-compatible structured values. `NULL = NULL` does not match, following
 SQL null semantics.
 
-Joins, aliases, ordering, grouping, aggregates, subqueries, general
+Joins, aliases, grouping, aggregates, subqueries, general
 expressions, unique constraints beyond the primary key, foreign keys,
 `ON CONFLICT`, sequences/generated IDs, type modifiers, `ALTER`/`DROP`, and SQL
 `BEGIN` tokens are rejected with an `UNSUPPORTED_SQL` or schema error. This is
@@ -460,9 +470,9 @@ startup and compilation cost.
 
 ## Direction
 
-The immediate direction is a useful small local database: richer predicates,
-ordering, indexes, bounded joins and aggregates, followed by incremental
-journal/page persistence. Full PostgreSQL catalogs, extensions, server
+The immediate direction is a useful small local database: secondary indexes,
+bounded joins and aggregates, followed by incremental journal/page persistence.
+Full PostgreSQL catalogs, extensions, server
 concurrency, and arbitrary wire compatibility are not goals. The existing
 adapter boundary remains available for optional remote read sources and a later
 cursor-aligned gateway without defining the core product around sync.
