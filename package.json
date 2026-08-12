@@ -1,6 +1,6 @@
 {
   "name": "tinygres",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "author": "jamesgpearce",
   "private": true,
   "type": "module",
@@ -13,7 +13,7 @@
     "check": "npm run typecheck && npm test && npm run build && npm run check:size",
     "check:release": "npm run check && npm run test:browser && npm run test:package",
     "check:size": "node scripts/check-size.mjs",
-    "prePublishPackage": "npm run check:release",
+    "prePublishPackage": "npm i && npm run check:release",
     "publishPackage": "npm run prePublishPackage && npm publish ./dist",
     "test": "npm run test:rust && npm run test:ts",
     "test:browser": "npm run build && npm run typecheck:browser && playwright test",
