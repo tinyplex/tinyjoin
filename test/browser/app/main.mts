@@ -152,6 +152,7 @@ async function boot(): Promise<void> {
 }
 
 async function writableDatabaseProbe(databaseName: string): Promise<{
+  aggregateRows: Array<{done: boolean; task_count: number}>;
   committedRevision: number;
   insertRows: Array<{done: boolean; id: number; title: string}>;
   invalidations: Array<{revision: number; tables: string[]}>;
@@ -247,6 +248,13 @@ async function writableDatabaseProbe(databaseName: string): Promise<{
     if (built.error || JSON.stringify(built.data) !== JSON.stringify(ordered.rows)) {
       throw built.error ?? new Error('Structured query did not match SQL query');
     }
+    const aggregateRows = await connection.client.query<{
+      done: boolean;
+      task_count: number;
+    }>(
+      `SELECT done, COUNT(*) AS task_count FROM tasks
+       GROUP BY done ORDER BY task_count DESC`,
+    );
 
     const committedRevision = connection.client.getRevision();
     unsubscribe();
@@ -265,6 +273,7 @@ async function writableDatabaseProbe(databaseName: string): Promise<{
         priority: number;
       }>('SELECT id, priority FROM tasks ORDER BY id');
       return {
+        aggregateRows: aggregateRows.rows,
         committedRevision,
         insertRows: inserted.rows,
         invalidations: events,

@@ -75,8 +75,15 @@ impl<S: StorageDriver> Engine<S> {
     }
 
     pub fn query_sql(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
-        let plan = crate::query::parse_sql(sql, params)?;
-        self.query(&plan)
+        match crate::statement::parse(sql, params)? {
+            crate::statement::Statement::Select(plan) => self.query(&plan),
+            crate::statement::Statement::Aggregate(plan) => {
+                crate::aggregate::execute(self.read_storage(), &plan)
+            }
+            crate::statement::Statement::Write(_) => Err(EngineError::unsupported_sql(
+                "query_sql accepts only SELECT statements",
+            )),
+        }
     }
 
     pub fn revision(&self) -> u64 {
@@ -152,6 +159,16 @@ impl<S: StorageDriver + Clone> Engine<S> {
         match crate::statement::parse(sql, params)? {
             crate::statement::Statement::Select(plan) => {
                 let result = self.query(&plan)?;
+                Ok(ExecuteResult {
+                    command: "SELECT".to_owned(),
+                    revision: result.revision,
+                    row_count: result.rows.len(),
+                    rows: result.rows,
+                    tables: vec![],
+                })
+            }
+            crate::statement::Statement::Aggregate(plan) => {
+                let result = crate::aggregate::execute(self.read_storage(), &plan)?;
                 Ok(ExecuteResult {
                     command: "SELECT".to_owned(),
                     revision: result.revision,

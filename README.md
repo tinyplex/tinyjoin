@@ -153,6 +153,16 @@ await db.transaction(async (tx) => {
   // after the callback and its outstanding operations complete successfully.
   console.log((await tx.query<Task>('SELECT * FROM tasks')).rows);
 });
+
+const summary = await db.query<{
+  done: boolean;
+  task_count: number;
+}>(`
+  SELECT done, COUNT(*) AS task_count
+  FROM tasks
+  GROUP BY done
+  ORDER BY task_count DESC
+`);
 ```
 
 Every standalone SQL statement is atomic. `transaction()` stages all statements
@@ -417,6 +427,24 @@ TinyGres currently accepts one statement at a time. `SELECT` supports:
   `NULLS FIRST`/`NULLS LAST`;
 - optional non-negative `LIMIT` and `OFFSET`.
 
+Raw SQL also supports a bounded single-table aggregate form:
+
+- `COUNT(*)`, `COUNT(column)`, `SUM`, `AVG`, `MIN`, and `MAX`;
+- simple group columns through `GROUP BY`, with explicit `AS` aliases;
+- the existing `WHERE` predicates before grouping; and
+- `ORDER BY` projected output names or aliases, followed by `LIMIT`/`OFFSET`.
+
+Aggregate queries require a typed catalog, so this first slice applies to
+SQL-created local tables rather than legacy/source schemas that expose only
+column names.
+
+`COUNT(column)`, `SUM`, `AVG`, `MIN`, and `MAX` skip `NULL`. A global
+aggregate over no matching rows produces one row (`COUNT` is zero and the
+others are `NULL`), while a grouped empty input produces no rows. `SUM` and
+`AVG` accept integer/float columns; `MIN` and `MAX` accept integer, float, or
+text columns. Integer sums fail rather than silently crossing JavaScript's
+safe-integer boundary.
+
 Standalone writable databases additionally support:
 
 - `CREATE TABLE` and `CREATE TABLE IF NOT EXISTS` with a required inline or
@@ -445,9 +473,10 @@ set: for example, `BIGINT` does not provide 64-bit values and `JSONB` currently
 uses JSON-compatible structured values. `NULL = NULL` does not match, following
 SQL null semantics.
 
-Joins, aliases, grouping, aggregates, subqueries, general expressions, foreign
-keys, `ON CONFLICT`, sequences/generated IDs, type modifiers, and SQL `BEGIN`
-tokens are rejected with an `UNSUPPORTED_SQL` or schema error. `ALTER` is
+Joins, aliases on ordinary non-aggregate projections, `HAVING`, aggregate
+`DISTINCT`/`FILTER`/window forms, subqueries, general expressions, foreign keys,
+`ON CONFLICT`, sequences/generated IDs, type modifiers, and SQL `BEGIN` tokens
+are rejected with an `UNSUPPORTED_SQL` or schema error. `ALTER` is
 currently limited to adding a column; renaming or removing columns is not
 implemented. This is an explicit compatibility boundary, not an accidental
 promise of full PostgreSQL behavior.
@@ -486,10 +515,10 @@ startup and compilation cost.
 
 ## Direction
 
-The immediate direction is a useful small local database: bounded aggregates,
-followed by prepared commits and paged persistence. Joins
-will follow only after qualified column references can be added without making
-ambiguous row semantics part of the public contract.
+The immediate direction is prepared commits and paged persistence, removing the
+remaining whole-database in-memory rollback snapshot and the transitional
+16 MiB ceiling. Joins will follow only after qualified column references can be
+added without making ambiguous row semantics part of the public contract.
 Full PostgreSQL catalogs, extensions, server
 concurrency, and arbitrary wire compatibility are not goals. The existing
 adapter boundary remains available for optional remote read sources and a later

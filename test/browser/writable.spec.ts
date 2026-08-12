@@ -11,6 +11,10 @@ test('writes, transacts, rolls back, and reopens through Worker/WASM/OPFS', asyn
     window.__tinygresTest!.writableDatabaseProbe(name), databaseName,
   );
 
+  expect(report.aggregateRows).toEqual([
+    {done: false, task_count: 2},
+    {done: true, task_count: 1},
+  ]);
   expect(report.insertRows).toEqual([
     {id: 1, title: 'Ship writable SQL', done: false},
     {id: 2, title: 'Persist it', done: false},

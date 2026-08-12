@@ -25,6 +25,7 @@ interface Window {
       updatedTitle: string;
     }>;
     writableDatabaseProbe(databaseName: string): Promise<{
+      aggregateRows: Array<{done: boolean; task_count: number}>;
       committedRevision: number;
       insertRows: Array<{done: boolean; id: number; title: string}>;
       invalidations: Array<{revision: number; tables: string[]}>;

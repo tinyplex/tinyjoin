@@ -1397,7 +1397,7 @@ fn column_definition<'a>(
         .ok_or_else(|| EngineError::column_not_found(column, table))
 }
 
-fn validate_predicate_types(
+pub(crate) fn validate_predicate_types(
     predicate: &Predicate,
     schema: &crate::TableSchema,
     table: &str,
@@ -2083,10 +2083,8 @@ mod tests {
     #[test]
     fn rejects_every_unimplemented_query_shape() {
         for sql in [
-            "SELECT count(*) FROM posts",
             "SELECT * FROM posts JOIN users ON posts.user_id = users.id",
             "SELECT id + 1 FROM posts",
-            "SELECT * FROM posts GROUP BY user_id",
             "SELECT * FROM posts AS p",
             "SELECT DISTINCT * FROM posts",
             "SELECT * FROM posts; SELECT * FROM posts",
