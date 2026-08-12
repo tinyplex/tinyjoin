@@ -10,8 +10,12 @@ use crate::{
     Result, Row, TableSchema,
 };
 
+const MAX_COLUMNS: usize = 256;
+
 pub trait StorageDriver {
     fn define_table(&mut self, schema: TableSchema) -> Result<()>;
+    fn drop_table(&mut self, table: &str) -> Result<()>;
+    fn add_column(&mut self, table: &str, column: ColumnDefinition) -> Result<()>;
     fn replace_table_snapshot(
         &mut self,
         schema: TableSchema,
@@ -22,6 +26,7 @@ pub trait StorageDriver {
     fn scan_table(&self, table: &str) -> Result<Vec<Row>>;
     fn lookup_primary_key(&self, table: &str, key: &Row) -> Result<Option<Row>>;
     fn define_index(&mut self, definition: IndexDefinition) -> Result<()>;
+    fn drop_index(&mut self, name: &str) -> Result<()>;
     fn index_definition(&self, name: &str) -> Option<IndexDefinition>;
     fn indexes_for_table(&self, table: &str) -> Result<Vec<IndexDefinition>>;
     fn lookup_index(&self, table: &str, columns: &[String], key: &Row) -> Result<Option<Vec<Row>>>;
@@ -195,6 +200,60 @@ impl StorageDriver for InMemoryStorage {
         Ok(())
     }
 
+    fn drop_table(&mut self, table: &str) -> Result<()> {
+        if self.tables.remove(table).is_none() {
+            return Err(EngineError::table_not_found(table));
+        }
+        self.indexes
+            .retain(|_, index| index.definition.table != table);
+        Ok(())
+    }
+
+    fn add_column(&mut self, table: &str, column: ColumnDefinition) -> Result<()> {
+        let current = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::table_not_found(table))?;
+        if current.schema.columns.is_empty() {
+            return Err(EngineError::unsupported_sql(format!(
+                "ALTER TABLE ADD COLUMN requires a typed table catalog for `{table}`"
+            )));
+        }
+        if current.schema.columns.len() >= MAX_COLUMNS {
+            return Err(EngineError::invalid_schema(format!(
+                "Table `{table}` cannot contain more than {MAX_COLUMNS} columns"
+            )));
+        }
+        if current
+            .schema
+            .columns
+            .iter()
+            .any(|existing| existing.name == column.name)
+        {
+            return Err(EngineError::column_already_exists(&column.name, table));
+        }
+
+        let mut schema = current.schema.clone();
+        schema.columns.push(column.clone());
+        validate_schema(&schema)?;
+        let value = column.default.clone().unwrap_or(Value::Null);
+        let mut rows = BTreeMap::new();
+        for (key, row) in &current.rows {
+            let mut row = row.clone();
+            row.insert(column.name.clone(), value.clone());
+            let row = normalize_row(&schema, row)?;
+            rows.insert(key.clone(), row);
+        }
+
+        let target = self
+            .tables
+            .get_mut(table)
+            .expect("the altered table was resolved above");
+        target.schema = schema;
+        target.rows = rows;
+        Ok(())
+    }
+
     fn replace_table_snapshot(
         &mut self,
         schema: TableSchema,
@@ -310,6 +369,16 @@ impl StorageDriver for InMemoryStorage {
                 postings,
             },
         );
+        Ok(())
+    }
+
+    fn drop_index(&mut self, name: &str) -> Result<()> {
+        if self.indexes.remove(name).is_none() {
+            return Err(EngineError::new(
+                "INDEX_NOT_FOUND",
+                format!("Index `{name}` is not defined"),
+            ));
+        }
         Ok(())
     }
 

@@ -64,6 +64,13 @@ impl EngineError {
         )
     }
 
+    pub(crate) fn column_already_exists(column: &str, table: &str) -> Self {
+        Self::new(
+            "COLUMN_ALREADY_EXISTS",
+            format!("Column `{column}` is already defined in table `{table}`"),
+        )
+    }
+
     pub(crate) fn bind_error(message: impl Into<String>) -> Self {
         Self::new("BIND_ERROR", message)
     }

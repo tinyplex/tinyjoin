@@ -30,6 +30,19 @@ pub(crate) enum WriteStatement {
         definition: crate::IndexDefinition,
         if_not_exists: bool,
     },
+    DropTable {
+        table: String,
+        if_exists: bool,
+    },
+    DropIndex {
+        name: String,
+        if_exists: bool,
+    },
+    AddColumn {
+        table: String,
+        column: ColumnDefinition,
+        if_not_exists: bool,
+    },
     Insert {
         table: String,
         columns: Option<Vec<String>>,
@@ -93,6 +106,13 @@ pub(crate) fn execute<S: StorageDriver>(
             definition,
             if_not_exists,
         } => create_index(storage, definition, *if_not_exists),
+        WriteStatement::DropTable { table, if_exists } => drop_table(storage, table, *if_exists),
+        WriteStatement::DropIndex { name, if_exists } => drop_index(storage, name, *if_exists),
+        WriteStatement::AddColumn {
+            table,
+            column,
+            if_not_exists,
+        } => add_column(storage, table, column, *if_not_exists),
         WriteStatement::Insert {
             table,
             columns,
@@ -123,6 +143,96 @@ pub(crate) fn execute<S: StorageDriver>(
             returning,
         } => delete(storage, table, predicate.as_ref(), returning.as_deref()),
     }
+}
+
+fn drop_table<S: StorageDriver>(
+    storage: &mut S,
+    table: &str,
+    if_exists: bool,
+) -> Result<WriteOutcome> {
+    if storage.table_schema(table).is_err() {
+        if if_exists {
+            return Ok(WriteOutcome {
+                command: "DROP TABLE",
+                row_count: 0,
+                rows: vec![],
+                tables: vec![],
+                mutated: false,
+            });
+        }
+        return Err(EngineError::table_not_found(table));
+    }
+    storage.drop_table(table)?;
+    Ok(WriteOutcome {
+        command: "DROP TABLE",
+        row_count: 0,
+        rows: vec![],
+        tables: vec![table.to_owned()],
+        mutated: true,
+    })
+}
+
+fn drop_index<S: StorageDriver>(
+    storage: &mut S,
+    name: &str,
+    if_exists: bool,
+) -> Result<WriteOutcome> {
+    let Some(definition) = storage.index_definition(name) else {
+        if if_exists {
+            return Ok(WriteOutcome {
+                command: "DROP INDEX",
+                row_count: 0,
+                rows: vec![],
+                tables: vec![],
+                mutated: false,
+            });
+        }
+        return Err(EngineError::new(
+            "INDEX_NOT_FOUND",
+            format!("Index `{name}` is not defined"),
+        ));
+    };
+    storage.drop_index(name)?;
+    Ok(WriteOutcome {
+        command: "DROP INDEX",
+        row_count: 0,
+        rows: vec![],
+        tables: vec![definition.table],
+        mutated: true,
+    })
+}
+
+fn add_column<S: StorageDriver>(
+    storage: &mut S,
+    table: &str,
+    column: &ColumnDefinition,
+    if_not_exists: bool,
+) -> Result<WriteOutcome> {
+    let schema = storage.table_schema(table)?;
+    if schema
+        .columns
+        .iter()
+        .any(|existing| existing.name == column.name)
+    {
+        if if_not_exists {
+            return Ok(WriteOutcome {
+                command: "ALTER TABLE",
+                row_count: 0,
+                rows: vec![],
+                tables: vec![],
+                mutated: false,
+            });
+        }
+        return Err(EngineError::column_already_exists(&column.name, table));
+    }
+    storage.add_column(table, column.clone())?;
+    Ok(WriteOutcome {
+        command: "ALTER TABLE",
+        row_count: 0,
+        rows: vec![],
+        tables: vec![table.to_owned()],
+        mutated: true,
+    })
 }
 
 fn create_index<S: StorageDriver>(
@@ -443,6 +553,10 @@ impl<'a> MutationParser<'a> {
             self.parse_update()?
         } else if self.consume_keyword("delete") {
             self.parse_delete()?
+        } else if self.consume_keyword("drop") {
+            self.parse_drop()?
+        } else if self.consume_keyword("alter") {
+            self.parse_alter_table()?
         } else {
             return Err(unsupported_statement());
         };
@@ -560,6 +674,57 @@ impl<'a> MutationParser<'a> {
                 columns,
                 unique,
             },
+            if_not_exists,
+        })
+    }
+
+    fn parse_drop(&mut self) -> Result<WriteStatement> {
+        let table = if self.consume_keyword("table") {
+            true
+        } else {
+            self.expect_keyword("index")?;
+            false
+        };
+        let if_exists = if self.consume_keyword("if") {
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        if table {
+            Ok(WriteStatement::DropTable {
+                table: self.parse_table_name()?,
+                if_exists,
+            })
+        } else {
+            Ok(WriteStatement::DropIndex {
+                name: self.parse_identifier()?,
+                if_exists,
+            })
+        }
+    }
+
+    fn parse_alter_table(&mut self) -> Result<WriteStatement> {
+        self.expect_keyword("table")?;
+        let table = self.parse_table_name()?;
+        self.expect_keyword("add")?;
+        self.consume_keyword("column");
+        let if_not_exists = if self.consume_keyword("if") {
+            self.expect_keyword("not")?;
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        let (column, primary_key) = self.parse_column_definition()?;
+        if primary_key {
+            return Err(EngineError::unsupported_sql(
+                "ALTER TABLE ADD COLUMN cannot add a primary key",
+            ));
+        }
+        Ok(WriteStatement::AddColumn {
+            table,
+            column,
             if_not_exists,
         })
     }
@@ -936,7 +1101,7 @@ enum TokenMatcher {
 
 fn unsupported_statement() -> EngineError {
     EngineError::unsupported_sql(
-        "Supported statements are SELECT, CREATE TABLE, CREATE INDEX, INSERT, UPDATE, and DELETE",
+        "Supported statements are SELECT, CREATE TABLE, CREATE INDEX, ALTER TABLE ADD COLUMN, DROP TABLE, DROP INDEX, INSERT, UPDATE, and DELETE",
     )
 }
 

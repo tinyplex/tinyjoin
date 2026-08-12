@@ -672,6 +672,223 @@ mod tests {
     }
 
     #[test]
+    fn schema_migrations_backfill_rows_and_preserve_indexes() {
+        let mut engine = Engine::default();
+        create_posts(&mut engine);
+        engine
+            .execute_sql(
+                "INSERT INTO posts (id, title) VALUES (1, 'one'), (2, 'two')",
+                &[],
+            )
+            .unwrap();
+        engine
+            .execute_sql("CREATE UNIQUE INDEX posts_title ON posts (title)", &[])
+            .unwrap();
+
+        let altered = engine
+            .execute_sql(
+                "ALTER TABLE posts ADD COLUMN priority INTEGER NOT NULL DEFAULT 3",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(altered.command, "ALTER TABLE");
+        assert_eq!(altered.tables, vec!["posts"]);
+        assert_eq!(
+            engine
+                .query_sql("SELECT id, priority FROM posts ORDER BY id", &[])
+                .unwrap()
+                .rows,
+            vec![
+                row(json!({"id": 1, "priority": 3})),
+                row(json!({"id": 2, "priority": 3})),
+            ]
+        );
+        engine
+            .execute_sql("ALTER TABLE posts ADD COLUMN note TEXT", &[])
+            .unwrap();
+        assert_eq!(
+            engine
+                .query_sql("SELECT note FROM posts WHERE id = 1", &[])
+                .unwrap()
+                .rows,
+            vec![row(json!({"note": null}))]
+        );
+        engine
+            .execute_sql("INSERT INTO posts (id, title) VALUES (3, 'three')", &[])
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute_sql("INSERT INTO posts (id, title) VALUES (4, 'one')", &[])
+                .unwrap_err()
+                .code,
+            "CONSTRAINT_VIOLATION"
+        );
+
+        let bytes = engine.export_snapshot().unwrap();
+        let mut restored = Engine::default();
+        restored.import_snapshot(&bytes).unwrap();
+        assert_eq!(
+            restored
+                .query_sql("SELECT priority FROM posts WHERE title = 'three'", &[])
+                .unwrap()
+                .rows,
+            vec![row(json!({"priority": 3}))]
+        );
+    }
+
+    #[test]
+    fn failed_and_redundant_column_migrations_are_atomic() {
+        let mut engine = Engine::default();
+        create_posts(&mut engine);
+        engine
+            .execute_sql("INSERT INTO posts (id, title) VALUES (1, 'one')", &[])
+            .unwrap();
+        let revision = engine.revision();
+
+        assert_eq!(
+            engine
+                .execute_sql("ALTER TABLE posts ADD COLUMN required TEXT NOT NULL", &[],)
+                .unwrap_err()
+                .code,
+            "CONSTRAINT_VIOLATION"
+        );
+        assert_eq!(engine.revision(), revision);
+        assert_eq!(
+            engine
+                .query_sql("SELECT required FROM posts", &[])
+                .unwrap_err()
+                .code,
+            "COLUMN_NOT_FOUND"
+        );
+
+        let unchanged = engine
+            .execute_sql(
+                "ALTER TABLE posts ADD COLUMN IF NOT EXISTS title BOOLEAN",
+                &[],
+            )
+            .unwrap();
+        assert!(unchanged.tables.is_empty());
+        assert_eq!(unchanged.revision, revision);
+        assert_eq!(
+            engine
+                .execute_sql("ALTER TABLE posts ADD COLUMN title BOOLEAN", &[])
+                .unwrap_err()
+                .code,
+            "COLUMN_ALREADY_EXISTS"
+        );
+        assert_eq!(
+            engine
+                .execute_sql(
+                    "ALTER TABLE posts ADD COLUMN second_id INTEGER PRIMARY KEY",
+                    &[],
+                )
+                .unwrap_err()
+                .code,
+            "UNSUPPORTED_SQL"
+        );
+        assert_eq!(engine.revision(), revision);
+
+        let mut legacy = Engine::default();
+        legacy
+            .define_table(TableSchema {
+                name: "legacy".to_owned(),
+                primary_key: vec!["id".to_owned()],
+                columns: vec![],
+            })
+            .unwrap();
+        assert_eq!(
+            legacy
+                .execute_sql("ALTER TABLE legacy ADD COLUMN value TEXT", &[])
+                .unwrap_err()
+                .code,
+            "UNSUPPORTED_SQL"
+        );
+
+        let mut empty = Engine::default();
+        empty
+            .execute_sql("CREATE TABLE empty_table (id INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        empty
+            .execute_sql(
+                "ALTER TABLE empty_table ADD COLUMN required TEXT NOT NULL",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            empty
+                .execute_sql("INSERT INTO empty_table (id) VALUES (1)", &[])
+                .unwrap_err()
+                .code,
+            "CONSTRAINT_VIOLATION"
+        );
+    }
+
+    #[test]
+    fn tables_and_indexes_drop_atomically_and_transactionally() {
+        let mut engine = Engine::default();
+        create_posts(&mut engine);
+        engine
+            .execute_sql("CREATE UNIQUE INDEX posts_title ON posts (title)", &[])
+            .unwrap();
+        engine
+            .execute_sql("INSERT INTO posts (id, title) VALUES (1, 'one')", &[])
+            .unwrap();
+
+        engine.begin_transaction().unwrap();
+        engine.execute_sql("DROP TABLE posts", &[]).unwrap();
+        assert_eq!(
+            engine
+                .query_sql("SELECT * FROM posts", &[])
+                .unwrap_err()
+                .code,
+            "TABLE_NOT_FOUND"
+        );
+        engine.rollback_transaction().unwrap();
+        assert_eq!(
+            engine
+                .query_sql("SELECT * FROM posts", &[])
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+
+        let dropped = engine.execute_sql("DROP INDEX posts_title", &[]).unwrap();
+        assert_eq!(dropped.command, "DROP INDEX");
+        engine
+            .execute_sql("INSERT INTO posts (id, title) VALUES (2, 'one')", &[])
+            .unwrap();
+        assert!(
+            engine
+                .execute_sql("DROP INDEX IF EXISTS posts_title", &[])
+                .unwrap()
+                .tables
+                .is_empty()
+        );
+
+        engine
+            .execute_sql("CREATE INDEX posts_title ON posts (title)", &[])
+            .unwrap();
+        engine.execute_sql("DROP TABLE posts", &[]).unwrap();
+        assert!(
+            engine
+                .execute_sql("DROP TABLE IF EXISTS posts", &[])
+                .unwrap()
+                .tables
+                .is_empty()
+        );
+        engine
+            .execute_sql(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, title TEXT)",
+                &[],
+            )
+            .unwrap();
+        engine
+            .execute_sql("CREATE INDEX posts_title ON notes (title)", &[])
+            .unwrap();
+    }
+
+    #[test]
     fn index_ddl_validates_catalog_and_if_not_exists_is_a_noop() {
         let mut engine = Engine::default();
         create_posts(&mut engine);
@@ -883,8 +1100,6 @@ mod tests {
             "CREATE TABLE sized (id INTEGER PRIMARY KEY, name VARCHAR(100))",
             "INSERT INTO missing SELECT * FROM elsewhere",
             "UPDATE missing SET value = value + 1",
-            "DROP TABLE missing",
-            "ALTER TABLE missing ADD COLUMN value TEXT",
         ] {
             assert_eq!(
                 engine.execute_sql(sql, &[]).unwrap_err().code,

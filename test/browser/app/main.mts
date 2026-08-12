@@ -156,6 +156,7 @@ async function writableDatabaseProbe(databaseName: string): Promise<{
   insertRows: Array<{done: boolean; id: number; title: string}>;
   invalidations: Array<{revision: number; tables: string[]}>;
   orderedRows: Array<{done: boolean; id: number; title: string}>;
+  reopenedPriorities: Array<{id: number; priority: number}>;
   reopenedRevision: number;
   reopenedRows: Array<{done: boolean; id: number; title: string}>;
   rollbackCode: string;
@@ -176,6 +177,12 @@ async function writableDatabaseProbe(databaseName: string): Promise<{
         metadata JSON
       )
     `);
+    await connection.client.exec(
+      'CREATE UNIQUE INDEX tasks_title ON tasks (title)',
+    );
+    await connection.client.exec(
+      'ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0',
+    );
     const inserted = await connection.client.exec<{
       done: boolean;
       id: number;
@@ -213,7 +220,7 @@ async function writableDatabaseProbe(databaseName: string): Promise<{
         );
         await transaction.exec(
           'INSERT INTO tasks (id, title) VALUES ($1, $2)',
-          [1, 'duplicate'],
+          [4, 'Persist it'],
         );
       });
     } catch (error) {
@@ -253,12 +260,17 @@ async function writableDatabaseProbe(databaseName: string): Promise<{
         id: number;
         title: string;
       }>('SELECT id, title, done FROM tasks');
+      const priorities = await reopened.client.query<{
+        id: number;
+        priority: number;
+      }>('SELECT id, priority FROM tasks ORDER BY id');
       return {
         committedRevision,
         insertRows: inserted.rows,
         invalidations: events,
         orderedRows: ordered.rows,
         reopenedRevision: result.revision,
+        reopenedPriorities: priorities.rows,
         reopenedRows: result.rows.sort((left, right) => left.id - right.id),
         rollbackCode,
         stagedRows,

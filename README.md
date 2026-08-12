@@ -132,6 +132,9 @@ await db.exec(`
 
 await db.exec('CREATE INDEX tasks_done ON tasks (done)');
 await db.exec('CREATE UNIQUE INDEX tasks_title ON tasks (title)');
+await db.exec(
+  'ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0',
+);
 
 const inserted = await db.exec<Task>(
   `INSERT INTO tasks (id, title, metadata)
@@ -423,6 +426,8 @@ Standalone writable databases additionally support:
 - literal defaults, `NULL`/`NOT NULL`, and composite primary keys;
 - `CREATE [UNIQUE] INDEX [IF NOT EXISTS]` over boolean, integer, and text
   columns, including composite indexes;
+- `ALTER TABLE ... ADD [COLUMN] [IF NOT EXISTS]` with literal/default
+  backfilling, plus `DROP TABLE [IF EXISTS]` and `DROP INDEX [IF EXISTS]`;
 - multi-row `INSERT ... VALUES`, filtered `UPDATE`, and filtered `DELETE`;
 - `$1` parameters, `DEFAULT`, and simple `RETURNING *`/column lists; and
 - callback transactions through `db.transaction()`.
@@ -440,12 +445,12 @@ set: for example, `BIGINT` does not provide 64-bit values and `JSONB` currently
 uses JSON-compatible structured values. `NULL = NULL` does not match, following
 SQL null semantics.
 
-Joins, aliases, grouping, aggregates, subqueries, general
-expressions, foreign keys,
-`ON CONFLICT`, sequences/generated IDs, type modifiers, `ALTER`/`DROP`, and SQL
-`BEGIN` tokens are rejected with an `UNSUPPORTED_SQL` or schema error. This is
-an explicit compatibility boundary, not an accidental promise of full
-PostgreSQL behavior.
+Joins, aliases, grouping, aggregates, subqueries, general expressions, foreign
+keys, `ON CONFLICT`, sequences/generated IDs, type modifiers, and SQL `BEGIN`
+tokens are rejected with an `UNSUPPORTED_SQL` or schema error. `ALTER` is
+currently limited to adding a column; renaming or removing columns is not
+implemented. This is an explicit compatibility boundary, not an accidental
+promise of full PostgreSQL behavior.
 
 ## Development and validation
 
@@ -481,8 +486,8 @@ startup and compilation cost.
 
 ## Direction
 
-The immediate direction is a useful small local database: schema migrations and
-bounded aggregates, followed by prepared commits and paged persistence. Joins
+The immediate direction is a useful small local database: bounded aggregates,
+followed by prepared commits and paged persistence. Joins
 will follow only after qualified column references can be added without making
 ambiguous row semantics part of the public contract.
 Full PostgreSQL catalogs, extensions, server
