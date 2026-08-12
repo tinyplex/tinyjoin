@@ -1,6 +1,7 @@
 mod aggregate;
 mod engine;
 mod error;
+mod join;
 mod model;
 mod query;
 mod snapshot;

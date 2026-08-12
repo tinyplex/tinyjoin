@@ -875,11 +875,35 @@ impl PredicateParser<'_> {
                 "Reserved keyword `{value}` cannot be used as an unquoted SQL identifier"
             )));
         }
-        Ok(if quoted {
+        let first = if quoted {
             value
         } else {
             value.to_ascii_lowercase()
-        })
+        };
+        if !self.consume_token(TokenMatcher::Dot) {
+            return Ok(first);
+        }
+        let Some(Token::Identifier { value, quoted }) = self.next() else {
+            return Err(EngineError::parse_error(
+                "Expected a column name after qualifier",
+            ));
+        };
+        if value.is_empty() || (!quoted && is_reserved_keyword(&value)) {
+            return Err(EngineError::parse_error(
+                "Expected a valid column name after qualifier",
+            ));
+        }
+        let second = if quoted {
+            value
+        } else {
+            value.to_ascii_lowercase()
+        };
+        if self.consume_token(TokenMatcher::Dot) {
+            return Err(EngineError::unsupported_sql(
+                "WHERE columns can contain at most one table qualifier",
+            ));
+        }
+        Ok(format!("{first}.{second}"))
     }
 
     fn parse_value(&mut self) -> Result<Value> {
@@ -1037,6 +1061,14 @@ pub(crate) fn is_reserved_keyword(identifier: &str) -> bool {
         "set",
         "delete",
         "returning",
+        "as",
+        "join",
+        "inner",
+        "left",
+        "outer",
+        "on",
+        "group",
+        "having",
     ]
     .iter()
     .any(|keyword| identifier.eq_ignore_ascii_case(keyword))

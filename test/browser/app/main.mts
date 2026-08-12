@@ -126,6 +126,7 @@ async function boot(): Promise<void> {
       return samples;
     },
     closeSupabaseProbe,
+    joinDatabaseProbe,
     openSupabaseProbe,
     persistenceProbe,
     writableDatabaseProbe,
@@ -290,6 +291,79 @@ async function writableDatabaseProbe(databaseName: string): Promise<{
   } finally {
     unsubscribe();
     connection.worker.terminate();
+  }
+}
+
+async function joinDatabaseProbe(): Promise<{
+  innerRows: Array<{
+    author_id: number;
+    author_name: string;
+    article_id: number;
+    article_title: string;
+  }>;
+  leftRows: Array<{
+    author_id: number;
+    author_name: string;
+    article_id: number | null;
+  }>;
+}> {
+  const database = createClient();
+  try {
+    await database.ready();
+    await database.exec(`
+      CREATE TABLE authors (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL
+      )
+    `);
+    await database.exec(`
+      CREATE TABLE articles (
+        id INTEGER PRIMARY KEY,
+        author_id INTEGER,
+        title TEXT NOT NULL,
+        published BOOLEAN NOT NULL
+      )
+    `);
+    await database.exec(
+      `INSERT INTO authors (id, name) VALUES
+       (1, 'Ada'), (2, 'Linus'), (3, 'Grace')`,
+    );
+    await database.exec(
+      `INSERT INTO articles (id, author_id, title, published) VALUES
+       (10, 1, 'Worker databases', true),
+       (11, 1, 'A second article', false),
+       (12, 2, 'Local queries', true),
+       (13, NULL, 'Unassigned draft', true)`,
+    );
+
+    const inner = await database.query<{
+      author_id: number;
+      author_name: string;
+      article_id: number;
+      article_title: string;
+    }>(
+      `SELECT a.id AS author_id, a.name AS author_name,
+              article.id AS article_id, article.title AS article_title
+       FROM authors AS a INNER JOIN articles AS article
+         ON a.id = article.author_id
+       WHERE article.published = $1 AND a.id >= $2
+       ORDER BY article.id`,
+      [true, 1],
+    );
+    const left = await database.query<{
+      author_id: number;
+      author_name: string;
+      article_id: number | null;
+    }>(
+      `SELECT author.id AS author_id, author.name AS author_name,
+              article.id AS article_id
+       FROM authors author LEFT OUTER JOIN articles article
+         ON author.id = article.author_id
+       ORDER BY author_id, article_id NULLS LAST`,
+    );
+    return {innerRows: inner.rows, leftRows: left.rows};
+  } finally {
+    await database.close();
   }
 }
 

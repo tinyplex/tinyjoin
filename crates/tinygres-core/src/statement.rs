@@ -19,6 +19,7 @@ const MAX_VALUE_ROWS: usize = 4096;
 pub(crate) enum Statement {
     Select(QueryPlan),
     Aggregate(crate::aggregate::AggregatePlan),
+    Join(crate::join::JoinPlan),
     Write(WriteStatement),
 }
 
@@ -87,6 +88,9 @@ pub(crate) fn parse(sql: &str, params: &[Value]) -> Result<Statement> {
             quoted: false,
         }) if value.eq_ignore_ascii_case("select")
     ) {
+        if crate::join::is_join_select(&tokens) {
+            return crate::join::parse_sql(sql, params).map(Statement::Join);
+        }
         if crate::aggregate::is_aggregate_select(&tokens) {
             return crate::aggregate::parse_sql(sql, params).map(Statement::Aggregate);
         }

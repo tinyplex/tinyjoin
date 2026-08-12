@@ -2,6 +2,19 @@ interface Window {
   __tinygresTest?: {
     benchmark(iterations: number): Promise<number[]>;
     closeSupabaseProbe(): Promise<void>;
+    joinDatabaseProbe(): Promise<{
+      innerRows: Array<{
+        author_id: number;
+        author_name: string;
+        article_id: number;
+        article_title: string;
+      }>;
+      leftRows: Array<{
+        author_id: number;
+        author_name: string;
+        article_id: number | null;
+      }>;
+    }>;
     openSupabaseProbe(options: {
       databaseName?: string;
       publishableKey: string;

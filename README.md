@@ -445,6 +445,37 @@ others are `NULL`), while a grouped empty input produces no rows. `SUM` and
 text columns. Integer sums fail rather than silently crossing JavaScript's
 safe-integer boundary.
 
+Typed local tables can be joined with a deliberately bounded relational form:
+
+```sql
+SELECT author.id AS author_id, article.title AS article_title
+FROM authors AS author
+LEFT JOIN articles AS article ON author.id = article.author_id
+WHERE author.active = true
+ORDER BY author_id, article.id NULLS LAST
+```
+
+- exactly two tables with `JOIN`/`INNER JOIN` or `LEFT [OUTER] JOIN`;
+- optional bare or `AS` table aliases and qualified column references;
+- one or more cross-table column equalities in `ON`, combined with `AND`;
+- the existing predicates in `WHERE`, plus `ORDER BY`, `LIMIT`, and `OFFSET`;
+  and
+- explicit column projections with distinct output names, using `AS` where
+  the two tables contain the same column name.
+
+Both sides require typed catalogs. Unqualified references are accepted only
+when exactly one table contains the column; ambiguous references are rejected.
+`NULL` join keys do not match, and a left join represents columns from an
+unmatched right row as `NULL`. Integer and float keys can be compared, while
+JSON join keys are rejected. Without `ORDER BY`, joined row order is not part
+of the contract. Quoted table aliases and source column names remain
+case-sensitive, but this first join slice rejects literal dots inside them.
+
+This first implementation uses a bounded nested-loop execution path. It rejects
+more than one join, `OR` or non-equality expressions in `ON`, `SELECT *`, more
+than 1,000,000 candidate row pairs, and more than 100,000 materialized rows.
+Aggregates over joins remain outside this slice.
+
 Standalone writable databases additionally support:
 
 - `CREATE TABLE` and `CREATE TABLE IF NOT EXISTS` with a required inline or
@@ -473,10 +504,11 @@ set: for example, `BIGINT` does not provide 64-bit values and `JSONB` currently
 uses JSON-compatible structured values. `NULL = NULL` does not match, following
 SQL null semantics.
 
-Joins, aliases on ordinary non-aggregate projections, `HAVING`, aggregate
-`DISTINCT`/`FILTER`/window forms, subqueries, general expressions, foreign keys,
-`ON CONFLICT`, sequences/generated IDs, type modifiers, and SQL `BEGIN` tokens
-are rejected with an `UNSUPPORTED_SQL` or schema error. `ALTER` is
+Aliases on ordinary non-aggregate, non-join projections, `HAVING`, aggregate
+`DISTINCT`/`FILTER`/window forms, subqueries, general expressions, multiple or
+non-equijoins, foreign keys, `ON CONFLICT`, sequences/generated IDs, type
+modifiers, and SQL `BEGIN` tokens are rejected with an `UNSUPPORTED_SQL` or
+schema error. `ALTER` is
 currently limited to adding a column; renaming or removing columns is not
 implemented. This is an explicit compatibility boundary, not an accidental
 promise of full PostgreSQL behavior.
@@ -517,8 +549,8 @@ startup and compilation cost.
 
 The immediate direction is prepared commits and paged persistence, removing the
 remaining whole-database in-memory rollback snapshot and the transitional
-16 MiB ceiling. Joins will follow only after qualified column references can be
-added without making ambiguous row semantics part of the public contract.
+16 MiB ceiling. The initial bounded join slice establishes qualified column
+references without making ambiguous row semantics part of the public contract.
 Full PostgreSQL catalogs, extensions, server
 concurrency, and arbitrary wire compatibility are not goals. The existing
 adapter boundary remains available for optional remote read sources and a later
