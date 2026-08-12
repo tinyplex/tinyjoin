@@ -130,6 +130,9 @@ await db.exec(`
   )
 `);
 
+await db.exec('CREATE INDEX tasks_done ON tasks (done)');
+await db.exec('CREATE UNIQUE INDEX tasks_title ON tasks (title)');
+
 const inserted = await db.exec<Task>(
   `INSERT INTO tasks (id, title, metadata)
    VALUES ($1, $2, $3)
@@ -418,13 +421,18 @@ Standalone writable databases additionally support:
 - column types `BOOLEAN`, `SMALLINT`/`INTEGER`/`BIGINT`, `REAL`/`DOUBLE
   PRECISION`, `TEXT`/`VARCHAR`, and `JSON`/`JSONB`;
 - literal defaults, `NULL`/`NOT NULL`, and composite primary keys;
+- `CREATE [UNIQUE] INDEX [IF NOT EXISTS]` over boolean, integer, and text
+  columns, including composite indexes;
 - multi-row `INSERT ... VALUES`, filtered `UPDATE`, and filtered `DELETE`;
 - `$1` parameters, `DEFAULT`, and simple `RETURNING *`/column lists; and
 - callback transactions through `db.transaction()`.
 
-Complete primary-key equality uses direct indexed row lookup; other predicates
-currently scan the table. Text comparison and ordering use deterministic Unicode
-code-point ordering rather than PostgreSQL database collations.
+Complete primary-key equality uses direct row lookup. A complete equality match
+for every column of a secondary index uses its maintained postings; partial
+composite matches, ranges, `OR`, and `NOT` currently scan the table. Unique
+indexes follow PostgreSQL's default behavior of allowing multiple keys that
+contain `NULL`. Text comparison and ordering use deterministic Unicode code-point
+ordering rather than PostgreSQL database collations.
 
 Integers are restricted to JavaScript's exactly representable safe-integer
 range. Type names are compatibility spellings over this smaller runtime type
@@ -433,7 +441,7 @@ uses JSON-compatible structured values. `NULL = NULL` does not match, following
 SQL null semantics.
 
 Joins, aliases, grouping, aggregates, subqueries, general
-expressions, unique constraints beyond the primary key, foreign keys,
+expressions, foreign keys,
 `ON CONFLICT`, sequences/generated IDs, type modifiers, `ALTER`/`DROP`, and SQL
 `BEGIN` tokens are rejected with an `UNSUPPORTED_SQL` or schema error. This is
 an explicit compatibility boundary, not an accidental promise of full
@@ -473,8 +481,10 @@ startup and compilation cost.
 
 ## Direction
 
-The immediate direction is a useful small local database: secondary indexes,
-bounded joins and aggregates, followed by prepared commits and paged persistence.
+The immediate direction is a useful small local database: schema migrations and
+bounded aggregates, followed by prepared commits and paged persistence. Joins
+will follow only after qualified column references can be added without making
+ambiguous row semantics part of the public contract.
 Full PostgreSQL catalogs, extensions, server
 concurrency, and arbitrary wire compatibility are not goals. The existing
 adapter boundary remains available for optional remote read sources and a later

@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    ApplyOutcome, Change, ChangeBatch, ColumnDefinition, ColumnType, EngineError, Result, Row,
-    TableSchema,
+    ApplyOutcome, Change, ChangeBatch, ColumnDefinition, ColumnType, EngineError, IndexDefinition,
+    Result, Row, TableSchema,
 };
 
 pub trait StorageDriver {
@@ -21,6 +21,10 @@ pub trait StorageDriver {
     fn apply_batch(&mut self, batch: &ChangeBatch) -> Result<ApplyOutcome>;
     fn scan_table(&self, table: &str) -> Result<Vec<Row>>;
     fn lookup_primary_key(&self, table: &str, key: &Row) -> Result<Option<Row>>;
+    fn define_index(&mut self, definition: IndexDefinition) -> Result<()>;
+    fn index_definition(&self, name: &str) -> Option<IndexDefinition>;
+    fn indexes_for_table(&self, table: &str) -> Result<Vec<IndexDefinition>>;
+    fn lookup_index(&self, table: &str, columns: &[String], key: &Row) -> Result<Option<Vec<Row>>>;
     fn table_schema(&self, table: &str) -> Result<TableSchema>;
     #[doc(hidden)]
     fn replace_table_unrevisioned(&mut self, table: &str, rows: Vec<Row>) -> Result<()>;
@@ -33,6 +37,7 @@ pub trait StorageDriver {
 pub struct InMemoryStorage {
     revision: u64,
     tables: BTreeMap<String, TableData>,
+    indexes: BTreeMap<String, IndexData>,
     #[cfg(test)]
     scan_count: Cell<usize>,
     #[cfg(test)]
@@ -45,11 +50,19 @@ struct TableData {
     rows: BTreeMap<String, Row>,
 }
 
+#[derive(Clone, Debug)]
+struct IndexData {
+    definition: IndexDefinition,
+    postings: BTreeMap<String, BTreeSet<String>>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StorageSnapshot {
     revision: u64,
     tables: Vec<TableSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    indexes: Vec<IndexDefinition>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -70,6 +83,11 @@ impl InMemoryStorage {
                     schema: table.schema.clone(),
                     rows: table.rows.values().cloned().collect(),
                 })
+                .collect(),
+            indexes: self
+                .indexes
+                .values()
+                .map(|index| index.definition.clone())
                 .collect(),
         };
         crate::snapshot::encode(&snapshot)
@@ -116,19 +134,40 @@ impl InMemoryStorage {
             }
         }
 
-        Ok(Self {
+        let mut storage = Self {
             revision: snapshot.revision,
             tables,
+            indexes: BTreeMap::new(),
             #[cfg(test)]
             scan_count: Cell::new(0),
             #[cfg(test)]
             lookup_count: Cell::new(0),
-        })
+        };
+        for definition in snapshot.indexes {
+            storage
+                .define_index(definition)
+                .map_err(snapshot_validation_error)?;
+        }
+        Ok(storage)
     }
 
     #[cfg(test)]
     pub(crate) fn access_counts(&self) -> (usize, usize) {
         (self.scan_count.get(), self.lookup_count.get())
+    }
+
+    fn rebuilt_indexes_for_table(
+        &self,
+        table: &str,
+        rows: &BTreeMap<String, Row>,
+    ) -> Result<BTreeMap<String, IndexData>> {
+        let mut indexes = self.indexes.clone();
+        for index in indexes.values_mut() {
+            if index.definition.table == table {
+                index.postings = build_postings(&index.definition, rows)?;
+            }
+        }
+        Ok(indexes)
     }
 }
 
@@ -215,6 +254,15 @@ impl StorageDriver for InMemoryStorage {
             }
         }
 
+        for table in &changed_tables {
+            let rows = &candidate
+                .tables
+                .get(table)
+                .expect("a changed table was resolved above")
+                .rows;
+            candidate.indexes = candidate.rebuilt_indexes_for_table(table, rows)?;
+        }
+
         candidate.revision = next_revision(self.revision)?;
         let outcome = ApplyOutcome {
             revision: candidate.revision,
@@ -244,6 +292,70 @@ impl StorageDriver for InMemoryStorage {
         Ok(table.rows.get(&key).cloned())
     }
 
+    fn define_index(&mut self, definition: IndexDefinition) -> Result<()> {
+        validate_index_definition(&definition, &self.tables)?;
+        if self.indexes.contains_key(&definition.name) {
+            return Err(EngineError::index_already_exists(&definition.name));
+        }
+        let rows = &self
+            .tables
+            .get(&definition.table)
+            .expect("index validation resolved the table")
+            .rows;
+        let postings = build_postings(&definition, rows)?;
+        self.indexes.insert(
+            definition.name.clone(),
+            IndexData {
+                definition,
+                postings,
+            },
+        );
+        Ok(())
+    }
+
+    fn index_definition(&self, name: &str) -> Option<IndexDefinition> {
+        self.indexes.get(name).map(|index| index.definition.clone())
+    }
+
+    fn indexes_for_table(&self, table: &str) -> Result<Vec<IndexDefinition>> {
+        if !self.tables.contains_key(table) {
+            return Err(EngineError::table_not_found(table));
+        }
+        Ok(self
+            .indexes
+            .values()
+            .filter(|index| index.definition.table == table)
+            .map(|index| index.definition.clone())
+            .collect())
+    }
+
+    fn lookup_index(&self, table: &str, columns: &[String], key: &Row) -> Result<Option<Vec<Row>>> {
+        #[cfg(test)]
+        self.lookup_count.set(self.lookup_count.get() + 1);
+        let table_data = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::table_not_found(table))?;
+        let Some(index) = self
+            .indexes
+            .values()
+            .find(|index| index.definition.table == table && index.definition.columns == columns)
+        else {
+            return Ok(None);
+        };
+        let Some(index_key) = index_key(&index.definition, key)? else {
+            return Ok(Some(vec![]));
+        };
+        let rows = index
+            .postings
+            .get(&index_key)
+            .into_iter()
+            .flatten()
+            .filter_map(|primary_key| table_data.rows.get(primary_key).cloned())
+            .collect();
+        Ok(Some(rows))
+    }
+
     fn table_schema(&self, table: &str) -> Result<TableSchema> {
         self.tables
             .get(table)
@@ -268,10 +380,12 @@ impl StorageDriver for InMemoryStorage {
             }
         }
 
+        let indexes = self.rebuilt_indexes_for_table(table, &replacement)?;
         self.tables
             .get_mut(table)
             .expect("table was checked above")
             .rows = replacement;
+        self.indexes = indexes;
         Ok(())
     }
 
@@ -283,6 +397,95 @@ impl StorageDriver for InMemoryStorage {
     fn revision(&self) -> u64 {
         self.revision
     }
+}
+
+fn validate_index_definition(
+    definition: &IndexDefinition,
+    tables: &BTreeMap<String, TableData>,
+) -> Result<()> {
+    if definition.name.trim().is_empty() {
+        return Err(EngineError::invalid_schema("An index name cannot be empty"));
+    }
+    if definition.columns.is_empty() {
+        return Err(EngineError::invalid_schema(format!(
+            "Index `{}` must contain at least one column",
+            definition.name
+        )));
+    }
+    let table = tables
+        .get(&definition.table)
+        .ok_or_else(|| EngineError::table_not_found(&definition.table))?;
+    if table.schema.columns.is_empty() {
+        return Err(EngineError::unsupported_sql(format!(
+            "Index `{}` requires a typed table catalog",
+            definition.name
+        )));
+    }
+    let mut seen = HashSet::new();
+    for name in &definition.columns {
+        if !seen.insert(name) {
+            return Err(EngineError::invalid_schema(format!(
+                "Index `{}` names column `{name}` more than once",
+                definition.name
+            )));
+        }
+        let column = table
+            .schema
+            .columns
+            .iter()
+            .find(|column| column.name == *name)
+            .ok_or_else(|| EngineError::column_not_found(name, &definition.table))?;
+        if matches!(column.data_type, ColumnType::Float | ColumnType::Json) {
+            return Err(EngineError::unsupported_sql(format!(
+                "Index `{}` cannot use {} column `{name}`; only boolean, integer, and text columns are supported",
+                definition.name,
+                column_type_name(column.data_type)
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn build_postings(
+    definition: &IndexDefinition,
+    rows: &BTreeMap<String, Row>,
+) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    let mut postings: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (primary_key, row) in rows {
+        // PostgreSQL's default UNIQUE semantics treat every key containing NULL
+        // as distinct. NULL comparisons cannot use an equality lookup either.
+        let Some(key) = index_key(definition, row)? else {
+            continue;
+        };
+        let entries = postings.entry(key).or_default();
+        if definition.unique && !entries.is_empty() {
+            return Err(EngineError::constraint_violation(format!(
+                "Index `{}` would contain duplicate values",
+                definition.name
+            )));
+        }
+        entries.insert(primary_key.clone());
+    }
+    Ok(postings)
+}
+
+fn index_key(definition: &IndexDefinition, row: &Row) -> Result<Option<String>> {
+    let mut values = Vec::with_capacity(definition.columns.len());
+    for column in &definition.columns {
+        let value = row.get(column).ok_or_else(|| {
+            EngineError::invalid_change(format!(
+                "Row for `{}` is missing indexed column `{column}`",
+                definition.table
+            ))
+        })?;
+        if value == &Value::Null {
+            return Ok(None);
+        }
+        values.push(value);
+    }
+    serde_json::to_string(&values).map(Some).map_err(|error| {
+        EngineError::invalid_change(format!("Could not encode index key: {error}"))
+    })
 }
 
 fn validate_schema(schema: &TableSchema) -> Result<()> {
@@ -484,6 +687,31 @@ mod tests {
                 name: "posts".to_owned(),
                 primary_key: vec!["id".to_owned()],
                 columns: vec![],
+            })
+            .unwrap();
+        storage
+    }
+
+    fn typed_storage() -> InMemoryStorage {
+        let mut storage = InMemoryStorage::default();
+        storage
+            .define_table(TableSchema {
+                name: "users".to_owned(),
+                primary_key: vec!["id".to_owned()],
+                columns: vec![
+                    ColumnDefinition {
+                        name: "id".to_owned(),
+                        data_type: ColumnType::Integer,
+                        nullable: false,
+                        default: None,
+                    },
+                    ColumnDefinition {
+                        name: "email".to_owned(),
+                        data_type: ColumnType::Text,
+                        nullable: true,
+                        default: None,
+                    },
+                ],
             })
             .unwrap();
         storage
@@ -747,6 +975,7 @@ mod tests {
 
         let invalid = StorageSnapshot {
             revision: 99,
+            indexes: vec![],
             tables: vec![TableSnapshot {
                 schema: TableSchema {
                     name: "posts".to_owned(),
@@ -781,6 +1010,7 @@ mod tests {
         let invalid_snapshots = [
             StorageSnapshot {
                 revision: 0,
+                indexes: vec![],
                 tables: vec![
                     TableSnapshot {
                         schema: schema.clone(),
@@ -794,6 +1024,7 @@ mod tests {
             },
             StorageSnapshot {
                 revision: 0,
+                indexes: vec![],
                 tables: vec![TableSnapshot {
                     schema,
                     rows: vec![row(json!({"title": "missing id"}))],
@@ -807,5 +1038,94 @@ mod tests {
                     .unwrap_err();
             assert_eq!(error.code, "INVALID_SNAPSHOT");
         }
+    }
+
+    #[test]
+    fn snapshot_persists_definitions_and_rebuilds_index_postings() {
+        let mut storage = typed_storage();
+        storage
+            .replace_table(
+                "users",
+                vec![
+                    row(json!({"id": 1, "email": "one@example.com"})),
+                    row(json!({"id": 2, "email": "two@example.com"})),
+                ],
+            )
+            .unwrap();
+        storage
+            .define_index(IndexDefinition {
+                name: "users_email".to_owned(),
+                table: "users".to_owned(),
+                columns: vec!["email".to_owned()],
+                unique: true,
+            })
+            .unwrap();
+
+        let bytes = storage.export_snapshot().unwrap();
+        let restored = InMemoryStorage::from_snapshot(&bytes).unwrap();
+        assert_eq!(restored.export_snapshot().unwrap(), bytes);
+        assert_eq!(
+            restored
+                .lookup_index(
+                    "users",
+                    &["email".to_owned()],
+                    &row(json!({"email": "two@example.com"})),
+                )
+                .unwrap()
+                .unwrap(),
+            vec![row(json!({"id": 2, "email": "two@example.com"}))]
+        );
+    }
+
+    #[test]
+    fn previous_snapshot_versions_restore_without_indexes() {
+        let storage = typed_storage();
+        for version in [1_u16, 2_u16] {
+            let mut bytes = storage.export_snapshot().unwrap();
+            bytes[8..10].copy_from_slice(&version.to_le_bytes());
+            let restored = InMemoryStorage::from_snapshot(&bytes).unwrap();
+            assert!(restored.indexes_for_table("users").unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn snapshot_rejects_invalid_or_non_unique_index_definitions() {
+        let schema = typed_storage().table_schema("users").unwrap();
+        let invalid = StorageSnapshot {
+            revision: 8,
+            tables: vec![TableSnapshot {
+                schema,
+                rows: vec![
+                    row(json!({"id": 1, "email": "same@example.com"})),
+                    row(json!({"id": 2, "email": "same@example.com"})),
+                ],
+            }],
+            indexes: vec![IndexDefinition {
+                name: "users_email".to_owned(),
+                table: "users".to_owned(),
+                columns: vec!["email".to_owned()],
+                unique: true,
+            }],
+        };
+        assert_eq!(
+            InMemoryStorage::from_snapshot(&crate::snapshot::encode(&invalid).unwrap())
+                .unwrap_err()
+                .code,
+            "INVALID_SNAPSHOT"
+        );
+
+        let mut duplicate_definitions = invalid;
+        duplicate_definitions.tables[0].rows.pop();
+        duplicate_definitions
+            .indexes
+            .push(duplicate_definitions.indexes[0].clone());
+        assert_eq!(
+            InMemoryStorage::from_snapshot(
+                &crate::snapshot::encode(&duplicate_definitions).unwrap()
+            )
+            .unwrap_err()
+            .code,
+            "INVALID_SNAPSHOT"
+        );
     }
 }

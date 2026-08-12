@@ -202,6 +202,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::Change;
 
     fn row(value: Value) -> Row {
         value
@@ -591,6 +592,228 @@ mod tests {
                 .unwrap_err()
                 .code,
             "TYPE_MISMATCH"
+        );
+    }
+
+    #[test]
+    fn unique_indexes_are_atomic_and_treat_nulls_as_distinct() {
+        let mut engine = Engine::default();
+        engine
+            .execute_sql(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, tenant TEXT, email TEXT, active BOOLEAN)",
+                &[],
+            )
+            .unwrap();
+        engine
+            .execute_sql(
+                "INSERT INTO users (id, tenant, email, active) VALUES \
+                 (1, 'one', 'a@example.com', true), \
+                 (2, NULL, 'a@example.com', false), \
+                 (3, NULL, 'a@example.com', true), \
+                 (4, NULL, NULL, true), (5, NULL, NULL, false)",
+                &[],
+            )
+            .unwrap();
+        let created = engine
+            .execute_sql(
+                "CREATE UNIQUE INDEX users_tenant_email ON users (tenant, email)",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(created.command, "CREATE INDEX");
+        assert_eq!(created.revision, 3);
+
+        let revision = engine.revision();
+        assert_eq!(
+            engine
+                .execute_sql(
+                    "INSERT INTO users (id, tenant, email) VALUES (6, 'one', 'a@example.com')",
+                    &[],
+                )
+                .unwrap_err()
+                .code,
+            "CONSTRAINT_VIOLATION"
+        );
+        assert_eq!(
+            engine
+                .execute_sql("UPDATE users SET tenant = 'one' WHERE id = 2", &[])
+                .unwrap_err()
+                .code,
+            "CONSTRAINT_VIOLATION"
+        );
+        assert_eq!(engine.revision(), revision);
+
+        engine
+            .execute_sql("DELETE FROM users WHERE id = 1", &[])
+            .unwrap();
+        engine
+            .execute_sql("UPDATE users SET tenant = 'one' WHERE id = 2", &[])
+            .unwrap();
+        assert_eq!(
+            engine
+                .query_sql(
+                    "SELECT id FROM users WHERE tenant = 'one' AND email = 'a@example.com'",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![row(json!({"id": 2}))]
+        );
+
+        let before_failed_ddl = engine.revision();
+        assert_eq!(
+            engine
+                .execute_sql("CREATE UNIQUE INDEX users_active ON users (active)", &[])
+                .unwrap_err()
+                .code,
+            "CONSTRAINT_VIOLATION"
+        );
+        assert_eq!(engine.revision(), before_failed_ddl);
+    }
+
+    #[test]
+    fn index_ddl_validates_catalog_and_if_not_exists_is_a_noop() {
+        let mut engine = Engine::default();
+        create_posts(&mut engine);
+        for sql in [
+            "CREATE INDEX bad_float ON posts (rating)",
+            "CREATE INDEX bad_json ON posts (metadata)",
+            "CREATE INDEX bad_missing ON posts (missing)",
+            "CREATE INDEX bad_duplicate ON posts (title, title)",
+        ] {
+            assert!(
+                matches!(
+                    engine.execute_sql(sql, &[]).unwrap_err().code.as_str(),
+                    "UNSUPPORTED_SQL" | "COLUMN_NOT_FOUND" | "INVALID_SCHEMA"
+                ),
+                "statement was `{sql}`"
+            );
+        }
+        assert_eq!(engine.revision(), 1);
+        engine
+            .execute_sql("CREATE INDEX posts_title ON posts (title)", &[])
+            .unwrap();
+        let unchanged = engine
+            .execute_sql(
+                "CREATE INDEX IF NOT EXISTS posts_title ON posts (published)",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(unchanged.revision, 2);
+        assert!(unchanged.tables.is_empty());
+        assert_eq!(
+            engine
+                .execute_sql("CREATE INDEX posts_title ON posts (published)", &[])
+                .unwrap_err()
+                .code,
+            "INDEX_ALREADY_EXISTS"
+        );
+    }
+
+    #[test]
+    fn indexes_survive_snapshots_and_transaction_rollback() {
+        let mut engine = Engine::default();
+        create_posts(&mut engine);
+        engine
+            .execute_sql("CREATE UNIQUE INDEX posts_title ON posts (title)", &[])
+            .unwrap();
+        engine
+            .execute_sql("INSERT INTO posts (id, title) VALUES (1, 'one')", &[])
+            .unwrap();
+
+        engine.begin_transaction().unwrap();
+        engine
+            .execute_sql("CREATE INDEX posts_published ON posts (published)", &[])
+            .unwrap();
+        engine.rollback_transaction().unwrap();
+        engine
+            .execute_sql("CREATE INDEX posts_published ON posts (published)", &[])
+            .unwrap();
+
+        let bytes = engine.export_snapshot().unwrap();
+        let mut restored = Engine::default();
+        restored.import_snapshot(&bytes).unwrap();
+        assert_eq!(restored.export_snapshot().unwrap(), bytes);
+        assert_eq!(
+            restored
+                .execute_sql("INSERT INTO posts (id, title) VALUES (2, 'one')", &[])
+                .unwrap_err()
+                .code,
+            "CONSTRAINT_VIOLATION"
+        );
+    }
+
+    #[test]
+    fn source_changes_rebuild_indexes_atomically() {
+        let mut engine = Engine::default();
+        create_posts(&mut engine);
+        engine
+            .execute_sql("CREATE UNIQUE INDEX posts_title ON posts (title)", &[])
+            .unwrap();
+        engine
+            .apply_batch(&ChangeBatch {
+                changes: vec![Change::Upsert {
+                    table: "posts".to_owned(),
+                    row: row(json!({
+                        "id": 1, "title": "kept", "published": false,
+                        "rating": null, "metadata": null
+                    })),
+                }],
+                ..ChangeBatch::default()
+            })
+            .unwrap();
+        let revision = engine.revision();
+        let error = engine
+            .apply_batch(&ChangeBatch {
+                changes: vec![
+                    Change::Upsert {
+                        table: "posts".to_owned(),
+                        row: row(json!({
+                            "id": 2, "title": "other", "published": false,
+                            "rating": null, "metadata": null
+                        })),
+                    },
+                    Change::Upsert {
+                        table: "posts".to_owned(),
+                        row: row(json!({
+                            "id": 3, "title": "kept", "published": false,
+                            "rating": null, "metadata": null
+                        })),
+                    },
+                ],
+                ..ChangeBatch::default()
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "CONSTRAINT_VIOLATION");
+        assert_eq!(engine.revision(), revision);
+        assert_eq!(
+            engine.query_sql("SELECT id FROM posts", &[]).unwrap().rows,
+            vec![row(json!({"id": 1}))]
+        );
+
+        assert_eq!(
+            engine
+                .replace_table(
+                    "posts",
+                    vec![
+                        row(json!({
+                            "id": 2, "title": "same", "published": false,
+                            "rating": null, "metadata": null
+                        })),
+                        row(json!({
+                            "id": 3, "title": "same", "published": false,
+                            "rating": null, "metadata": null
+                        })),
+                    ],
+                )
+                .unwrap_err()
+                .code,
+            "CONSTRAINT_VIOLATION"
+        );
+        assert_eq!(engine.revision(), revision);
+        assert_eq!(
+            engine.query_sql("SELECT id FROM posts", &[]).unwrap().rows,
+            vec![row(json!({"id": 1}))]
         );
     }
 

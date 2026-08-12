@@ -26,6 +26,10 @@ pub(crate) enum WriteStatement {
         schema: TableSchema,
         if_not_exists: bool,
     },
+    CreateIndex {
+        definition: crate::IndexDefinition,
+        if_not_exists: bool,
+    },
     Insert {
         table: String,
         columns: Option<Vec<String>>,
@@ -85,6 +89,10 @@ pub(crate) fn execute<S: StorageDriver>(
             schema,
             if_not_exists,
         } => create_table(storage, schema, *if_not_exists),
+        WriteStatement::CreateIndex {
+            definition,
+            if_not_exists,
+        } => create_index(storage, definition, *if_not_exists),
         WriteStatement::Insert {
             table,
             columns,
@@ -115,6 +123,33 @@ pub(crate) fn execute<S: StorageDriver>(
             returning,
         } => delete(storage, table, predicate.as_ref(), returning.as_deref()),
     }
+}
+
+fn create_index<S: StorageDriver>(
+    storage: &mut S,
+    definition: &crate::IndexDefinition,
+    if_not_exists: bool,
+) -> Result<WriteOutcome> {
+    if storage.index_definition(&definition.name).is_some() {
+        if if_not_exists {
+            return Ok(WriteOutcome {
+                command: "CREATE INDEX",
+                row_count: 0,
+                rows: vec![],
+                tables: vec![],
+                mutated: false,
+            });
+        }
+        return Err(EngineError::index_already_exists(&definition.name));
+    }
+    storage.define_index(definition.clone())?;
+    Ok(WriteOutcome {
+        command: "CREATE INDEX",
+        row_count: 0,
+        rows: vec![],
+        tables: vec![definition.table.clone()],
+        mutated: true,
+    })
 }
 
 fn create_table<S: StorageDriver>(
@@ -401,7 +436,7 @@ impl<'a> MutationParser<'a> {
 
     fn parse(mut self) -> Result<WriteStatement> {
         let statement = if self.consume_keyword("create") {
-            self.parse_create_table()?
+            self.parse_create()?
         } else if self.consume_keyword("insert") {
             self.parse_insert()?
         } else if self.consume_keyword("update") {
@@ -418,8 +453,16 @@ impl<'a> MutationParser<'a> {
         Ok(statement)
     }
 
+    fn parse_create(&mut self) -> Result<WriteStatement> {
+        if self.consume_keyword("table") {
+            return self.parse_create_table();
+        }
+        let unique = self.consume_keyword("unique");
+        self.expect_keyword("index")?;
+        self.parse_create_index(unique)
+    }
+
     fn parse_create_table(&mut self) -> Result<WriteStatement> {
-        self.expect_keyword("table")?;
         let if_not_exists = if self.consume_keyword("if") {
             self.expect_keyword("not")?;
             self.expect_keyword("exists")?;
@@ -491,6 +534,31 @@ impl<'a> MutationParser<'a> {
                 name,
                 primary_key,
                 columns,
+            },
+            if_not_exists,
+        })
+    }
+
+    fn parse_create_index(&mut self, unique: bool) -> Result<WriteStatement> {
+        let if_not_exists = if self.consume_keyword("if") {
+            self.expect_keyword("not")?;
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_identifier()?;
+        self.expect_keyword("on")?;
+        let table = self.parse_table_name()?;
+        self.expect(TokenMatcher::LParen, "Expected `(` after indexed table")?;
+        let columns = self.parse_identifier_list(TokenMatcher::RParen)?;
+        self.expect(TokenMatcher::RParen, "Expected `)` after indexed columns")?;
+        Ok(WriteStatement::CreateIndex {
+            definition: crate::IndexDefinition {
+                name,
+                table,
+                columns,
+                unique,
             },
             if_not_exists,
         })
@@ -868,7 +936,7 @@ enum TokenMatcher {
 
 fn unsupported_statement() -> EngineError {
     EngineError::unsupported_sql(
-        "Supported statements are SELECT, CREATE TABLE, INSERT, UPDATE, and DELETE",
+        "Supported statements are SELECT, CREATE TABLE, CREATE INDEX, INSERT, UPDATE, and DELETE",
     )
 }
 

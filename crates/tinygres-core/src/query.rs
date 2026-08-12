@@ -94,6 +94,8 @@ pub(crate) fn execute<S: StorageDriver>(storage: &S, plan: &QueryPlan) -> Result
             .lookup_primary_key(&plan.table, &key)?
             .into_iter()
             .collect()
+    } else if let Some(rows) = secondary_index_lookup(storage, plan, &schema)? {
+        rows
     } else {
         storage.scan_table(&plan.table)?
     };
@@ -120,6 +122,35 @@ pub(crate) fn execute<S: StorageDriver>(storage: &S, plan: &QueryPlan) -> Result
         revision: storage.revision(),
         rows,
     })
+}
+
+fn secondary_index_lookup<S: StorageDriver>(
+    storage: &S,
+    plan: &QueryPlan,
+    schema: &crate::TableSchema,
+) -> Result<Option<Vec<Row>>> {
+    let mut equalities = Map::new();
+    for filter in &plan.filters {
+        if filter.operator == FilterOperator::Eq && filter.value != Value::Null {
+            equalities.insert(filter.column.clone(), filter.value.clone());
+        }
+    }
+    collect_guaranteed_equalities(plan.predicate.as_ref(), &mut equalities);
+    for definition in storage.indexes_for_table(&plan.table)? {
+        if definition.columns.iter().all(|column| {
+            equalities
+                .get(column)
+                .is_some_and(|value| exact_primary_key_value(schema, column, value))
+        }) {
+            let key = definition
+                .columns
+                .iter()
+                .map(|column| (column.clone(), equalities[column].clone()))
+                .collect();
+            return storage.lookup_index(&plan.table, &definition.columns, &key);
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn parse_sql(sql: &str, params: &[Value]) -> Result<QueryPlan> {
@@ -1736,6 +1767,46 @@ mod tests {
         let database = engine();
         database
             .query_sql("SELECT * FROM posts WHERE id = 1 OR id = 2", &[])
+            .unwrap();
+        assert_eq!(database.into_storage().access_counts(), (1, 0));
+    }
+
+    #[test]
+    fn complete_secondary_index_equality_uses_postings_and_residual_filters() {
+        let mut database = engine();
+        database
+            .execute_sql("CREATE INDEX posts_user ON posts (user_id)", &[])
+            .unwrap();
+        assert_eq!(
+            database
+                .query_sql(
+                    "SELECT title FROM posts WHERE user_id = 7 AND deleted = true",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![row(json!({"title": "three"}))]
+        );
+        assert_eq!(database.into_storage().access_counts(), (0, 1));
+
+        let mut database = engine();
+        database
+            .execute_sql(
+                "CREATE INDEX posts_user_deleted ON posts (user_id, deleted)",
+                &[],
+            )
+            .unwrap();
+        database
+            .query_sql("SELECT * FROM posts WHERE user_id = 7", &[])
+            .unwrap();
+        assert_eq!(database.into_storage().access_counts(), (1, 0));
+
+        let mut database = engine();
+        database
+            .execute_sql("CREATE INDEX posts_user ON posts (user_id)", &[])
+            .unwrap();
+        database
+            .query_sql("SELECT * FROM posts WHERE user_id = 7 OR user_id = 8", &[])
             .unwrap();
         assert_eq!(database.into_storage().access_counts(), (1, 0));
     }

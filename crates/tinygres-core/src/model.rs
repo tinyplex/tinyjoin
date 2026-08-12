@@ -35,6 +35,16 @@ pub struct TableSchema {
     pub columns: Vec<ColumnDefinition>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexDefinition {
+    pub name: String,
+    pub table: String,
+    pub columns: Vec<String>,
+    #[serde(default)]
+    pub unique: bool,
+}
+
 fn default_nullable() -> bool {
     true
 }

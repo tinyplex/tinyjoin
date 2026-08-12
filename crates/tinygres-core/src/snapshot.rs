@@ -3,9 +3,9 @@ use serde::{Serialize, de::DeserializeOwned};
 use crate::{EngineError, Result};
 
 const MAGIC: &[u8; 8] = b"TGRSNAP\0";
-// Version 2 adds typed catalog columns. Version 1 remains readable so existing
-// read-only caches upgrade in place, while older engines fail safely on v2.
-const FORMAT_VERSION: u16 = 2;
+// Version 3 adds secondary-index definitions. Older payloads deserialize with
+// an empty index catalog and rebuild all derived state on import.
+const FORMAT_VERSION: u16 = 3;
 const MIN_READABLE_VERSION: u16 = 1;
 const FLAGS: u16 = 0;
 const HEADER_LENGTH: usize = 20;
@@ -153,7 +153,7 @@ mod tests {
     fn envelope_rejects_invalid_header_fields() {
         let cases: [(usize, u8, &str); 4] = [
             (0, b'X', "INVALID_SNAPSHOT"),
-            (8, 3, "UNSUPPORTED_SNAPSHOT"),
+            (8, 4, "UNSUPPORTED_SNAPSHOT"),
             (10, 1, "UNSUPPORTED_SNAPSHOT"),
             (12, 0, "INVALID_SNAPSHOT"),
         ];

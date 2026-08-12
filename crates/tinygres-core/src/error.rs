@@ -50,6 +50,13 @@ impl EngineError {
         )
     }
 
+    pub(crate) fn index_already_exists(index: &str) -> Self {
+        Self::new(
+            "INDEX_ALREADY_EXISTS",
+            format!("Index `{index}` is already defined"),
+        )
+    }
+
     pub(crate) fn column_not_found(column: &str, table: &str) -> Self {
         Self::new(
             "COLUMN_NOT_FOUND",
