@@ -336,6 +336,25 @@ describe('persistent worker engine', () => {
     expect(engine.query({table: 'posts', filters: []}).rows).toEqual([{id: 1}]);
   });
 
+  it('restores committed memory when a transaction snapshot cannot flush', () => {
+    const store = new MemorySnapshotStore();
+    const engine = createPersistentEngine(new StateEngine(), store);
+    engine.replaceTableSnapshot(postsSchema, [{id: 1}]);
+    store.failure = Object.assign(new Error('quota'), {
+      code: 'STORAGE_QUOTA_EXCEEDED',
+    });
+
+    engine.beginTransaction();
+    engine.executeSql('INSERT INTO posts (id) VALUES ($1)', [2]);
+    expect(() => engine.commitTransaction()).toThrowError(
+      expect.objectContaining({code: 'STORAGE_QUOTA_EXCEEDED'}),
+    );
+
+    expect(engine.inTransaction()).toBe(false);
+    expect(engine.revision()).toBe(1);
+    expect(engine.query({table: 'posts', filters: []}).rows).toEqual([{id: 1}]);
+  });
+
   it('poisons the engine when rollback cannot restore memory', () => {
     const store = new MemorySnapshotStore();
     const base = new StateEngine();

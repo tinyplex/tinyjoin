@@ -456,8 +456,12 @@ async function handleRequest(
         emitInvalidation(outcome);
         return outcome;
       } catch (error) {
-        if (engine.inTransaction()) {
-          engine.rollbackTransaction();
+        try {
+          if (engine.inTransaction()) {
+            engine.rollbackTransaction();
+          }
+        } catch {
+          // Preserve a storage failure from a poisoned persistent engine.
         }
         throw error;
       } finally {
