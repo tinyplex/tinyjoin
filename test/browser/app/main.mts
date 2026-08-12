@@ -408,6 +408,7 @@ async function persistenceProbe(
   initialCommitMs: number;
   lockErrorCode: string;
   mutationCommitMs: number;
+  journalWriteBytes: number;
   revision: number;
   rowCount: number;
   updatedTitle: string;
@@ -479,6 +480,7 @@ async function persistenceProbe(
     }>('SELECT id, title FROM posts');
     const empty = await reopened.client.query('SELECT * FROM empty_table');
 
+    const journalBytesBefore = await opfsJournalBytes(databaseName);
     const mutationStartedAt = performance.now();
     await reopened.client.applyBatch({
       changes: [
@@ -490,6 +492,8 @@ async function persistenceProbe(
       ],
     });
     const mutationCommitMs = performance.now() - mutationStartedAt;
+    const journalWriteBytes =
+      (await opfsJournalBytes(databaseName)) - journalBytesBefore;
     reopened.worker.terminate();
     reopened = undefined;
 
@@ -510,6 +514,7 @@ async function persistenceProbe(
       initialCommitMs,
       lockErrorCode,
       mutationCommitMs,
+      journalWriteBytes,
       revision: afterCrashResult.revision,
       rowCount: restored.rows.length,
       updatedTitle: afterCrashResult.rows[0]?.title ?? '',
@@ -524,6 +529,21 @@ async function persistenceProbe(
       }
     }
   }
+}
+
+async function opfsFileSize(databaseName: string, fileName: string): Promise<number> {
+  const root = await navigator.storage.getDirectory();
+  const tinygres = await root.getDirectoryHandle('tinygres-v1');
+  const database = await tinygres.getDirectoryHandle(`db-${databaseName}`);
+  const file = await database.getFileHandle(fileName);
+  return (await file.getFile()).size;
+}
+
+async function opfsJournalBytes(databaseName: string): Promise<number> {
+  return (
+    (await opfsFileSize(databaseName, 'journal-a.bin')) +
+    (await opfsFileSize(databaseName, 'journal-b.bin'))
+  );
 }
 
 function openOpfsClient(databaseName: string, schemas: TableSchema[]) {

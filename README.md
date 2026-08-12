@@ -208,10 +208,11 @@ Names must contain 1–64 ASCII letters, numbers, dots, underscores, or hyphens,
 and start with a letter or number.
 
 `ready()` restores the saved schemas, rows, and revision before a source
-adapter starts. Snapshot replacements and incoming change batches resolve only
-after the new state has been written and flushed. Two alternating,
-checksummed generations ensure an interrupted write cannot overwrite the last
-complete state.
+adapter starts. Mutations resolve only after a checksummed append record and
+its independent commit marker have been flushed. Recovery replays complete
+records over the latest checkpoint, truncates only an incomplete final record,
+and fails closed on framed corruption. Two alternating checkpoint/journal pairs
+ensure compaction cannot overwrite the last complete state.
 
 OPFS persistence is deliberately single-writer. A second Worker opening the
 same name fails rather than risking concurrent mutation; closing or terminating
@@ -238,11 +239,13 @@ stronger retention can make an explicit, user-appropriate
 `navigator.storage.persist()` request; TinyGres does not make that policy
 decision during startup.
 
-The current feasibility implementation writes a whole-database snapshot for
-every committed mutation and caps its encoded size at 16 MiB. This is
-intentionally simple and crash-testable, but its write cost grows with the
-database size. An append log, compaction, and paged storage remain later storage
-milestones.
+The journal checkpoints after 128 records or 1 MiB. A small update to the
+10,000-row browser fixture currently appends hundreds of bytes rather than
+rewriting its multi-megabyte checkpoint. This transitional engine still exports
+one in-memory pre-mutation snapshot so it can roll back a failed OPFS flush, and
+caps snapshots and individual journal transactions at 16 MiB. A prepared Rust
+commit seam and paged storage are later milestones for removing that remaining
+whole-database memory cost and raising the data-size ceiling.
 
 ## Supabase adapter
 
@@ -471,7 +474,7 @@ startup and compilation cost.
 ## Direction
 
 The immediate direction is a useful small local database: secondary indexes,
-bounded joins and aggregates, followed by incremental journal/page persistence.
+bounded joins and aggregates, followed by prepared commits and paged persistence.
 Full PostgreSQL catalogs, extensions, server
 concurrency, and arbitrary wire compatibility are not goals. The existing
 adapter boundary remains available for optional remote read sources and a later

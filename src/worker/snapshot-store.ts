@@ -1,18 +1,30 @@
+import {
+  encodeJournalHeader,
+  encodeJournalRecord,
+  type JournalScan,
+  scanJournal,
+} from './journal-codec.js';
+
 const RECORD_MAGIC = new Uint8Array([
   0x54, 0x47, 0x52, 0x53, 0x4f, 0x50, 0x46, 0x31,
 ]);
-const RECORD_VERSION = 1;
-const RECORD_HEADER_BYTES = 28;
+const RECORD_VERSION = 2;
+const RECORD_HEADER_BYTES_V1 = 28;
+const RECORD_HEADER_BYTES = 36;
 const MAX_GENERATION = 0xffff_ffff_ffff_ffffn;
 
 export const MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024;
+const MAX_JOURNAL_BYTES = 32 * 1024 * 1024;
 
 export type SnapshotSlot = 0 | 1;
 
 export interface SnapshotCandidate {
   slot: SnapshotSlot;
   generation: bigint;
+  checkpointSequence?: bigint;
   snapshot: Uint8Array;
+  journal?: JournalScan;
+  journalError?: StorageError;
 }
 
 export interface SnapshotStore {
@@ -20,6 +32,10 @@ export interface SnapshotStore {
   candidates(): readonly SnapshotCandidate[];
   select(candidate: SnapshotCandidate): void;
   commit(snapshot: Uint8Array): void;
+  append?(payload: Uint8Array): bigint;
+  checkpoint?(snapshot: Uint8Array): void;
+  journalRecordCount?(): number;
+  journalByteLength?(): number;
   close(): void;
 }
 
@@ -94,7 +110,12 @@ export async function createOpfsSnapshotStore(
       {create: true},
     );
     const fileHandles = await Promise.all(
-      ['snapshot-a.bin', 'snapshot-b.bin'].map((name) =>
+      [
+        'snapshot-a.bin',
+        'snapshot-b.bin',
+        'journal-a.bin',
+        'journal-b.bin',
+      ].map((name) =>
         databaseDirectory.getFileHandle(name, {create: true}),
       ),
     );
@@ -125,10 +146,10 @@ export async function createOpfsSnapshotStore(
     }
 
     try {
-      return new OpfsSnapshotStore([
-        accessHandles[0]!,
-        accessHandles[1]!,
-      ]);
+      return new OpfsSnapshotStore(
+        [accessHandles[0]!, accessHandles[1]!],
+        [accessHandles[2]!, accessHandles[3]!],
+      );
     } catch (error) {
       closeAll(accessHandles);
       throw error;
@@ -154,17 +175,27 @@ export function assertDatabaseName(databaseName: string): void {
 class OpfsSnapshotStore implements SnapshotStore {
   readonly hadData: boolean;
   readonly #handles: readonly [SyncAccessHandleLike, SyncAccessHandleLike];
+  readonly #journalHandles: readonly [
+    SyncAccessHandleLike,
+    SyncAccessHandleLike,
+  ];
   readonly #candidates: SnapshotCandidate[];
   #activeSlot: SnapshotSlot | undefined;
   #latestGeneration = 0n;
+  #latestSequence = 0n;
+  #journalRecords = 0;
+  #journalBytes = 0;
   #closed = false;
 
   constructor(
     handles: readonly [SyncAccessHandleLike, SyncAccessHandleLike],
+    journalHandles: readonly [SyncAccessHandleLike, SyncAccessHandleLike],
   ) {
     this.#handles = handles;
+    this.#journalHandles = journalHandles;
     const sizes = handles.map((handle) => readSize(handle));
-    this.hadData = sizes.some((size) => size > 0);
+    const journalSizes = journalHandles.map((handle) => readSize(handle));
+    this.hadData = [...sizes, ...journalSizes].some((size) => size > 0);
     this.#candidates = handles
       .map((handle, slot) =>
         decodeRecord(handle, sizes[slot]!, slot as SnapshotSlot),
@@ -180,6 +211,51 @@ class OpfsSnapshotStore implements SnapshotStore {
             ? -1
             : 1,
       );
+    for (const candidate of this.#candidates) {
+      const size = journalSizes[candidate.slot]!;
+      if (size === 0) {
+        if ((candidate.checkpointSequence ?? 0n) !== 0n) {
+          candidate.journalError = new StorageError(
+            'STORAGE_JOURNAL_CORRUPT',
+            'A TinyGres checkpoint is missing its paired OPFS journal',
+          );
+        }
+        continue;
+      }
+      if (size > MAX_JOURNAL_BYTES) {
+        candidate.journalError = new StorageError(
+          'STORAGE_JOURNAL_CORRUPT',
+          'The TinyGres OPFS journal exceeds its maximum size',
+        );
+        continue;
+      }
+      try {
+        const bytes = readAll(
+          journalHandles[candidate.slot],
+          size,
+          'journal',
+        );
+        const journal = scanJournal(bytes);
+        if (journal.baseSequence !== (candidate.checkpointSequence ?? 0n)) {
+          throw new StorageError(
+            'STORAGE_JOURNAL_CORRUPT',
+            'A TinyGres checkpoint does not match its paired OPFS journal',
+          );
+        }
+        if (journal.tail === 'torn') {
+          const handle = journalHandles[candidate.slot];
+          handle.truncate(journal.validBytes);
+          handle.flush();
+        }
+        candidate.journal = journal;
+      } catch (error) {
+        candidate.journalError = storageError(
+          error,
+          'STORAGE_JOURNAL_CORRUPT',
+          'TinyGres could not validate its OPFS journal',
+        );
+      }
+    }
     this.#latestGeneration = this.#candidates.reduce(
       (latest, candidate) =>
         candidate.generation > latest ? candidate.generation : latest,
@@ -200,13 +276,34 @@ class OpfsSnapshotStore implements SnapshotStore {
         'TinyGres could not select an unknown OPFS snapshot candidate',
       );
     }
+    if (candidate.journalError) {
+      throw candidate.journalError;
+    }
     this.#activeSlot = candidate.slot;
+    if (candidate.journal) {
+      this.#latestSequence =
+        candidate.journal.records.at(-1)?.sequence ??
+        candidate.journal.baseSequence;
+      this.#journalRecords = candidate.journal.records.length;
+      this.#journalBytes = candidate.journal.validBytes;
+    } else {
+      this.#latestSequence = 0n;
+      this.#journalRecords = 0;
+      this.#journalBytes = encodeJournalHeader(0n).byteLength;
+      // Migrate an old snapshot by publishing a complete paired slot while
+      // leaving the legacy slot untouched as the crash fallback.
+      this.checkpoint(candidate.snapshot);
+    }
     // Import copies the selected state into WASM. Do not retain both complete
     // startup snapshots for the rest of the Worker lifetime.
     this.#candidates.length = 0;
   }
 
   commit(snapshot: Uint8Array): void {
+    this.checkpoint(snapshot);
+  }
+
+  checkpoint(snapshot: Uint8Array): void {
     this.#assertOpen();
     if (snapshot.byteLength > MAX_SNAPSHOT_BYTES) {
       throw new StorageError(
@@ -224,13 +321,18 @@ class OpfsSnapshotStore implements SnapshotStore {
     const generation = this.#latestGeneration + 1n;
     const targetSlot: SnapshotSlot =
       this.#activeSlot === undefined || this.#activeSlot === 1 ? 0 : 1;
-    const record = encodeRecord(generation, snapshot);
+    const record = encodeRecord(generation, this.#latestSequence, snapshot);
     record.fill(0, 0, RECORD_MAGIC.byteLength);
     const handle = this.#handles[targetSlot];
+    const journalHandle = this.#journalHandles[targetSlot];
     let markerWritten = false;
 
     try {
-      handle.truncate(0);
+      // Invalidate the old target snapshot before replacing its paired
+      // journal. A crash can therefore select either the untouched active
+      // pair or the fully published new pair, never a mismatched pair.
+      invalidateRecordOrThrow(handle);
+      replaceFile(journalHandle, encodeJournalHeader(this.#latestSequence));
       writeAll(handle, record, 0);
       handle.truncate(record.byteLength);
       if (handle.getSize() !== record.byteLength) {
@@ -265,6 +367,78 @@ class OpfsSnapshotStore implements SnapshotStore {
 
     this.#activeSlot = targetSlot;
     this.#latestGeneration = generation;
+    this.#journalRecords = 0;
+    this.#journalBytes = encodeJournalHeader(0n).byteLength;
+  }
+
+  append(payload: Uint8Array): bigint {
+    this.#assertOpen();
+    if (this.#activeSlot === undefined) {
+      throw new StorageError(
+        'STORAGE_NOT_INITIALIZED',
+        'TinyGres must checkpoint an initial state before appending its journal',
+      );
+    }
+    if (this.#latestSequence === MAX_GENERATION) {
+      throw new StorageError(
+        'STORAGE_SEQUENCE_OVERFLOW',
+        'The TinyGres OPFS journal sequence overflowed',
+      );
+    }
+    const sequence = this.#latestSequence + 1n;
+    const record = encodeJournalRecord(sequence, payload);
+    const handle = this.#journalHandles[this.#activeSlot];
+    const originalSize = readSize(handle);
+    const withoutMarker = record.subarray(0, record.byteLength - 4);
+    let markerWritten = false;
+    try {
+      writeAll(handle, withoutMarker, originalSize);
+      handle.truncate(originalSize + withoutMarker.byteLength);
+      handle.flush();
+      writeAll(
+        handle,
+        record.subarray(record.byteLength - 4),
+        originalSize + withoutMarker.byteLength,
+      );
+      markerWritten = true;
+      handle.truncate(originalSize + record.byteLength);
+      handle.flush();
+    } catch (error) {
+      const rolledBack = truncateAndFlush(handle, originalSize);
+      if (!rolledBack) {
+        this.#poison();
+        if (markerWritten) {
+          throw new StorageError(
+            'STORAGE_COMMIT_OUTCOME_UNKNOWN',
+            'TinyGres could not determine whether the final journal commit marker was durable',
+          );
+        }
+        throw new StorageError(
+          'STORAGE_WRITE_FAILED',
+          'TinyGres could not remove a torn journal append',
+          true,
+        );
+      }
+      throw storageError(
+        error,
+        'STORAGE_WRITE_FAILED',
+        'TinyGres could not durably append its OPFS journal',
+      );
+    }
+    this.#latestSequence = sequence;
+    this.#journalRecords += 1;
+    this.#journalBytes = originalSize + record.byteLength;
+    return sequence;
+  }
+
+  journalRecordCount(): number {
+    this.#assertOpen();
+    return this.#journalRecords;
+  }
+
+  journalByteLength(): number {
+    this.#assertOpen();
+    return this.#journalBytes;
   }
 
   close(): void {
@@ -272,7 +446,7 @@ class OpfsSnapshotStore implements SnapshotStore {
       return;
     }
     this.#closed = true;
-    closeAll(this.#handles);
+    closeAll([...this.#handles, ...this.#journalHandles]);
   }
 
   #assertOpen(): void {
@@ -287,7 +461,7 @@ class OpfsSnapshotStore implements SnapshotStore {
   #poison(): void {
     this.#closed = true;
     try {
-      closeAll(this.#handles);
+      closeAll([...this.#handles, ...this.#journalHandles]);
     } catch {
       // The outcome is already unknown; still attempt to release both locks.
     }
@@ -333,6 +507,34 @@ function readSize(handle: SyncAccessHandleLike): number {
   return size;
 }
 
+function readAll(
+  handle: SyncAccessHandleLike,
+  size: number,
+  description: string,
+): Uint8Array {
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  try {
+    while (offset < size) {
+      const read = handle.read(bytes.subarray(offset), {at: offset});
+      if (!Number.isSafeInteger(read) || read <= 0 || read > size - offset) {
+        throw new StorageError(
+          'STORAGE_READ_FAILED',
+          `TinyGres encountered a short OPFS ${description} read`,
+        );
+      }
+      offset += read;
+    }
+  } catch (error) {
+    throw storageError(
+      error,
+      'STORAGE_READ_FAILED',
+      `TinyGres could not read its OPFS ${description}`,
+    );
+  }
+  return bytes;
+}
+
 function decodeRecord(
   handle: SyncAccessHandleLike,
   size: number,
@@ -342,7 +544,7 @@ function decodeRecord(
     return undefined;
   }
   if (
-    size < RECORD_HEADER_BYTES ||
+    size < RECORD_HEADER_BYTES_V1 ||
     size > RECORD_HEADER_BYTES + MAX_SNAPSHOT_BYTES
   ) {
     return undefined;
@@ -374,37 +576,61 @@ function decodeRecord(
     return undefined;
   }
   const view = new DataView(record.buffer, record.byteOffset, record.byteLength);
+  const version = view.getUint32(8, true);
+  const headerBytes =
+    version === 1
+      ? RECORD_HEADER_BYTES_V1
+      : version === RECORD_VERSION
+        ? RECORD_HEADER_BYTES
+        : undefined;
+  if (headerBytes === undefined) {
+    const recognizedEnvelope = [RECORD_HEADER_BYTES, RECORD_HEADER_BYTES_V1].some(
+      (candidateHeaderBytes) =>
+        size >= candidateHeaderBytes &&
+        view.getUint32(candidateHeaderBytes - 4, true) ===
+          crc32([
+            record.subarray(8, candidateHeaderBytes - 4),
+            record.subarray(candidateHeaderBytes),
+          ]),
+    );
+    if (recognizedEnvelope) {
+      throw new StorageError(
+        'STORAGE_VERSION_UNSUPPORTED',
+        'The TinyGres OPFS snapshot uses an unsupported storage format',
+      );
+    }
+    return undefined;
+  }
   const generation = view.getBigUint64(12, true);
   const snapshotLength = view.getUint32(20, true);
   if (
     generation === 0n ||
     snapshotLength > MAX_SNAPSHOT_BYTES ||
-    snapshotLength !== size - RECORD_HEADER_BYTES
+    snapshotLength !== size - headerBytes
   ) {
     return undefined;
   }
-  const expectedChecksum = view.getUint32(24, true);
+  const checksumOffset = version === 1 ? 24 : 32;
   if (
-    expectedChecksum !==
-    crc32([record.subarray(8, 24), record.subarray(RECORD_HEADER_BYTES)])
+    view.getUint32(checksumOffset, true) !==
+    crc32([
+      record.subarray(8, checksumOffset),
+      record.subarray(headerBytes),
+    ])
   ) {
     return undefined;
-  }
-  if (view.getUint32(8, true) !== RECORD_VERSION) {
-    throw new StorageError(
-      'STORAGE_VERSION_UNSUPPORTED',
-      'The TinyGres OPFS snapshot uses an unsupported storage format',
-    );
   }
   return {
     slot,
     generation,
-    snapshot: record.slice(RECORD_HEADER_BYTES),
+    checkpointSequence: version === 1 ? 0n : view.getBigUint64(24, true),
+    snapshot: record.slice(headerBytes),
   };
 }
 
 function encodeRecord(
   generation: bigint,
+  checkpointSequence: bigint,
   snapshot: Uint8Array,
 ): Uint8Array {
   const record = new Uint8Array(RECORD_HEADER_BYTES + snapshot.byteLength);
@@ -413,10 +639,11 @@ function encodeRecord(
   view.setUint32(8, RECORD_VERSION, true);
   view.setBigUint64(12, generation, true);
   view.setUint32(20, snapshot.byteLength, true);
+  view.setBigUint64(24, checkpointSequence, true);
   record.set(snapshot, RECORD_HEADER_BYTES);
   view.setUint32(
-    24,
-    crc32([record.subarray(8, 24), record.subarray(RECORD_HEADER_BYTES)]),
+    32,
+    crc32([record.subarray(8, 32), record.subarray(RECORD_HEADER_BYTES)]),
     true,
   );
   return record;
@@ -442,6 +669,38 @@ function writeAll(
       );
     }
     offset += written;
+  }
+}
+
+function replaceFile(handle: SyncAccessHandleLike, bytes: Uint8Array): void {
+  handle.truncate(0);
+  writeAll(handle, bytes, 0);
+  handle.truncate(bytes.byteLength);
+  if (handle.getSize() !== bytes.byteLength) {
+    throw new StorageError(
+      'STORAGE_WRITE_FAILED',
+      'TinyGres could not write a complete OPFS file',
+      true,
+    );
+  }
+  handle.flush();
+}
+
+function invalidateRecordOrThrow(handle: SyncAccessHandleLike): void {
+  handle.truncate(0);
+  handle.flush();
+}
+
+function truncateAndFlush(
+  handle: SyncAccessHandleLike,
+  size: number,
+): boolean {
+  try {
+    handle.truncate(size);
+    handle.flush();
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -494,6 +753,16 @@ function storageError(
 ): StorageError {
   if (error instanceof StorageError) {
     return error;
+  }
+  if (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    typeof error.code === 'string' &&
+    'message' in error &&
+    typeof error.message === 'string'
+  ) {
+    return new StorageError(error.code, error.message);
   }
   const name =
     typeof error === 'object' && error !== null && 'name' in error

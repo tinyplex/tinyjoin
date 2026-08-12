@@ -12,9 +12,15 @@ import type {
 } from '../../src/protocol.ts';
 import type {WorkerEngine} from '../../src/worker/engine.ts';
 import {createPersistentEngine} from '../../src/worker/persistent-engine.ts';
-import type {
-  SnapshotCandidate,
-  SnapshotStore,
+import {
+  decodeJournalTransaction,
+  encodeJournalTransaction,
+  JOURNAL_TRANSACTION_VERSION,
+} from '../../src/worker/journal-payload.ts';
+import {
+  StorageError,
+  type SnapshotCandidate,
+  type SnapshotStore,
 } from '../../src/worker/snapshot-store.ts';
 
 const encoder = new TextEncoder();
@@ -232,9 +238,181 @@ class MemorySnapshotStore implements SnapshotStore {
   }
 }
 
+class MemoryJournalSnapshotStore extends MemorySnapshotStore {
+  readonly checkpoints: Uint8Array[] = [];
+  readonly payloads: {sequence: bigint; payload: Uint8Array}[] = [];
+  sequence = 0n;
+  appendFailure: unknown;
+
+  append(payload: Uint8Array): bigint {
+    if (this.appendFailure !== undefined) {
+      throw this.appendFailure;
+    }
+    this.sequence += 1n;
+    this.payloads.push({sequence: this.sequence, payload: payload.slice()});
+    return this.sequence;
+  }
+
+  checkpoint(snapshot: Uint8Array): void {
+    if (this.failure !== undefined) {
+      throw this.failure;
+    }
+    this.checkpoints.push(snapshot.slice());
+    this.payloads.length = 0;
+  }
+
+  override commit(snapshot: Uint8Array): void {
+    this.checkpoint(snapshot);
+  }
+
+  journalRecordCount(): number {
+    return this.payloads.length;
+  }
+
+  journalByteLength(): number {
+    return this.payloads.reduce(
+      (bytes, record) => bytes + record.payload.byteLength,
+      28,
+    );
+  }
+}
+
 const postsSchema = {name: 'posts', primaryKey: ['id']} satisfies TableSchema;
 
 describe('persistent worker engine', () => {
+  it('journals deterministic mutations and replays them from one checkpoint', () => {
+    const store = new MemoryJournalSnapshotStore();
+    const engine = createPersistentEngine(new StateEngine(), store);
+    expect(store.checkpoints).toHaveLength(1);
+
+    engine.defineTables([postsSchema]);
+    engine.replaceTableSnapshot(postsSchema, [{id: 1, title: 'one'}]);
+    engine.applyBatch({
+      changes: [
+        {type: 'upsert', table: 'posts', row: {id: 2, title: 'two'}},
+      ],
+    });
+    expect(store.checkpoints).toHaveLength(1);
+    expect(store.payloads).toHaveLength(3);
+    expect(
+      store.payloads.map(({payload}) =>
+        decodeJournalTransaction(payload).mutations[0]?.type,
+      ),
+    ).toEqual(['defineTables', 'replaceTableSnapshot', 'applyBatch']);
+
+    const restoredStore = new MemorySnapshotStore([
+      {
+        slot: 0,
+        generation: 1n,
+        snapshot: store.checkpoints[0]!,
+        journal: {
+          baseSequence: 0n,
+          records: store.payloads,
+          validBytes: store.journalByteLength(),
+          tail: 'clean',
+        },
+      },
+    ]);
+    const restored = createPersistentEngine(new StateEngine(), restoredStore);
+    expect(restored.revision()).toBe(2);
+    expect(restored.query({table: 'posts', filters: []}).rows).toEqual([
+      {id: 1, title: 'one'},
+      {id: 2, title: 'two'},
+    ]);
+  });
+
+  it('journals an explicit SQL transaction as one replayable record', () => {
+    const store = new MemoryJournalSnapshotStore();
+    const engine = createPersistentEngine(new StateEngine(), store);
+    engine.defineTables([postsSchema]);
+    store.checkpoint(engine.exportSnapshot());
+    store.payloads.length = 0;
+
+    engine.beginTransaction();
+    engine.executeSql('INSERT INTO posts (id) VALUES ($1)', [1]);
+    engine.executeSql('INSERT INTO posts (id) VALUES ($1)', [2]);
+    engine.commitTransaction();
+
+    expect(store.payloads).toHaveLength(1);
+    expect(decodeJournalTransaction(store.payloads[0]!.payload)).toMatchObject({
+      revisionBefore: 0,
+      revisionAfter: 1,
+      mutations: [
+        {
+          type: 'executeSql',
+          statements: [
+            {sql: 'INSERT INTO posts (id) VALUES ($1)', params: [1]},
+            {sql: 'INSERT INTO posts (id) VALUES ($1)', params: [2]},
+          ],
+        },
+      ],
+    });
+  });
+
+  it('restores memory when a journal append fails', () => {
+    const store = new MemoryJournalSnapshotStore();
+    const engine = createPersistentEngine(new StateEngine(), store);
+    engine.defineTables([postsSchema]);
+    engine.replaceTableSnapshot(postsSchema, [{id: 1}]);
+    store.appendFailure = Object.assign(new Error('quota'), {
+      code: 'STORAGE_QUOTA_EXCEEDED',
+    });
+
+    expect(() =>
+      engine.applyBatch({
+        changes: [{type: 'upsert', table: 'posts', row: {id: 2}}],
+      }),
+    ).toThrowError(expect.objectContaining({code: 'STORAGE_QUOTA_EXCEEDED'}));
+    expect(engine.revision()).toBe(1);
+    expect(engine.query({table: 'posts', filters: []}).rows).toEqual([{id: 1}]);
+  });
+
+  it('fails closed when a journal revision or payload is corrupt', () => {
+    const base = new StateEngine().exportSnapshot();
+    const payload = encodeJournalTransaction({
+      version: JOURNAL_TRANSACTION_VERSION,
+      revisionBefore: 8,
+      revisionAfter: 9,
+      mutations: [{type: 'defineTables', schemas: [postsSchema]}],
+    });
+    const store = new MemorySnapshotStore([
+      {
+        slot: 0,
+        generation: 1n,
+        snapshot: base,
+        journal: {
+          baseSequence: 0n,
+          records: [{sequence: 1n, payload}],
+          validBytes: payload.byteLength,
+          tail: 'clean',
+        },
+      },
+    ]);
+    expect(() => createPersistentEngine(new StateEngine(), store)).toThrowError(
+      expect.objectContaining({code: 'STORAGE_JOURNAL_CORRUPT'}),
+    );
+  });
+
+  it('does not silently lose newer records by falling back across journal corruption', () => {
+    const valid = new StateEngine().exportSnapshot();
+    const store = new MemorySnapshotStore([
+      {
+        slot: 1,
+        generation: 2n,
+        snapshot: valid,
+        journalError: new StorageError(
+          'STORAGE_JOURNAL_CORRUPT',
+          'framed journal corruption',
+        ),
+      },
+      {slot: 0, generation: 1n, snapshot: valid},
+    ]);
+    expect(() => createPersistentEngine(new StateEngine(), store)).toThrowError(
+      expect.objectContaining({code: 'STORAGE_JOURNAL_CORRUPT'}),
+    );
+    expect(store.selected).toBeUndefined();
+  });
+
   it('persists schema-only changes without changing the engine revision', () => {
     const store = new MemorySnapshotStore();
     const engine = createPersistentEngine(new StateEngine(), store);

@@ -236,7 +236,7 @@ describe('OPFS snapshot store', () => {
     const secondSlot = await database.getFileHandle('snapshot-b.bin', {
       create: true,
     });
-    secondSlot.failFlushCalls.add(2);
+    secondSlot.failFlushCalls.add(3);
 
     expect(() => store.commit(new Uint8Array([2]))).toThrowError(
       expect.objectContaining({code: 'STORAGE_QUOTA_EXCEEDED'}),
@@ -265,8 +265,8 @@ describe('OPFS snapshot store', () => {
     const secondSlot = await database.getFileHandle('snapshot-b.bin', {
       create: true,
     });
-    secondSlot.failFlushCalls.add(2);
     secondSlot.failFlushCalls.add(3);
+    secondSlot.failFlushCalls.add(4);
 
     expect(() => store.commit(new Uint8Array([2]))).toThrowError(
       expect.objectContaining({code: 'STORAGE_COMMIT_OUTCOME_UNKNOWN'}),
@@ -346,7 +346,7 @@ describe('OPFS snapshot store', () => {
     const firstSlot = await database.getFileHandle('snapshot-a.bin', {
       create: true,
     });
-    rewriteRecordVersion(firstSlot, 2);
+    rewriteRecordVersion(firstSlot, 99);
 
     await expect(
       createOpfsSnapshotStore('future-format', opfs.provider),
@@ -378,6 +378,38 @@ describe('OPFS snapshot store', () => {
     reopened.close();
   });
 
+  it('migrates a legacy snapshot into a paired journal checkpoint', async () => {
+    const opfs = memoryOpfs();
+    const store = await createOpfsSnapshotStore('legacy-pair', opfs.provider);
+    store.commit(new Uint8Array([1, 2, 3]));
+    store.close();
+    const database = await opfs.database('legacy-pair');
+    const firstSlot = await database.getFileHandle('snapshot-a.bin', {
+      create: true,
+    });
+    firstSlot.bytes = new Uint8Array(
+      encodeLegacySnapshot(1n, new Uint8Array([1, 2, 3])),
+    );
+    const firstJournal = await database.getFileHandle('journal-a.bin', {
+      create: true,
+    });
+    firstJournal.bytes = new Uint8Array();
+
+    const reopened = await createOpfsSnapshotStore('legacy-pair', opfs.provider);
+    const legacy = reopened.candidates()[0]!;
+    expect(legacy.checkpointSequence).toBe(0n);
+    reopened.select(legacy);
+    reopened.close();
+
+    const migrated = await createOpfsSnapshotStore('legacy-pair', opfs.provider);
+    expect(migrated.candidates()[0]).toMatchObject({
+      checkpointSequence: 0n,
+      snapshot: new Uint8Array([1, 2, 3]),
+    });
+    expect(migrated.candidates()[0]!.journal?.baseSequence).toBe(0n);
+    migrated.close();
+  });
+
   it('locks one database name while allowing independent names', async () => {
     const opfs = memoryOpfs();
     const first = await createOpfsSnapshotStore('locked', opfs.provider);
@@ -404,6 +436,164 @@ describe('OPFS snapshot store', () => {
       ).rejects.toBeInstanceOf(StorageError);
     }
   });
+
+  it('appends committed journal records and resumes their sequence', async () => {
+    const opfs = memoryOpfs();
+    const store = await createOpfsSnapshotStore('journal-restart', opfs.provider);
+    store.checkpoint!(new Uint8Array([0]));
+    expect(store.append!(new Uint8Array([10]))).toBe(1n);
+    expect(store.append!(new Uint8Array([20]))).toBe(2n);
+    store.close();
+
+    const reopened = await createOpfsSnapshotStore(
+      'journal-restart',
+      opfs.provider,
+    );
+    const candidate = reopened.candidates()[0]!;
+    expect(candidate.journal?.baseSequence).toBe(0n);
+    expect(
+      candidate.journal?.records.map(({sequence, payload}) => ({
+        sequence,
+        payload: [...payload],
+      })),
+    ).toEqual([
+      {sequence: 1n, payload: [10]},
+      {sequence: 2n, payload: [20]},
+    ]);
+    reopened.select(candidate);
+    expect(reopened.append!(new Uint8Array([30]))).toBe(3n);
+    reopened.close();
+  });
+
+  it('compacts into an independently committed checkpoint and journal pair', async () => {
+    const opfs = memoryOpfs();
+    const store = await createOpfsSnapshotStore('journal-compact', opfs.provider);
+    store.checkpoint!(new Uint8Array([0]));
+    store.append!(new Uint8Array([10]));
+    store.checkpoint!(new Uint8Array([1]));
+    store.close();
+
+    const reopened = await createOpfsSnapshotStore(
+      'journal-compact',
+      opfs.provider,
+    );
+    expect(
+      reopened.candidates().map((candidate) => ({
+        snapshot: [...candidate.snapshot],
+        base: candidate.journal?.baseSequence,
+        records: candidate.journal?.records.length,
+      })),
+    ).toEqual([
+      {snapshot: [1], base: 1n, records: 0},
+      {snapshot: [0], base: 0n, records: 1},
+    ]);
+    reopened.close();
+  });
+
+  it('rejects a journal paired with the wrong checkpoint sequence', async () => {
+    const opfs = memoryOpfs();
+    const store = await createOpfsSnapshotStore('journal-mismatch', opfs.provider);
+    store.checkpoint!(new Uint8Array([0]));
+    store.append!(new Uint8Array([1]));
+    store.checkpoint!(new Uint8Array([1]));
+    store.close();
+    const database = await opfs.database('journal-mismatch');
+    const oldJournal = await database.getFileHandle('journal-a.bin', {
+      create: true,
+    });
+    const newJournal = await database.getFileHandle('journal-b.bin', {
+      create: true,
+    });
+    newJournal.bytes = oldJournal.bytes.slice();
+
+    const reopened = await createOpfsSnapshotStore(
+      'journal-mismatch',
+      opfs.provider,
+    );
+    expect(() => reopened.select(reopened.candidates()[0]!)).toThrowError(
+      expect.objectContaining({code: 'STORAGE_JOURNAL_CORRUPT'}),
+    );
+    reopened.close();
+  });
+
+  it('repairs an incomplete final journal record without losing its checkpoint', async () => {
+    const opfs = memoryOpfs();
+    const store = await createOpfsSnapshotStore('journal-torn', opfs.provider);
+    store.checkpoint!(new Uint8Array([1]));
+    store.append!(new Uint8Array([2, 3, 4]));
+    store.close();
+    const database = await opfs.database('journal-torn');
+    const journal = await database.getFileHandle('journal-a.bin', {create: true});
+    journal.bytes = journal.bytes.slice(0, journal.bytes.length - 2);
+
+    const reopened = await createOpfsSnapshotStore(
+      'journal-torn',
+      opfs.provider,
+    );
+    const candidate = reopened.candidates()[0]!;
+    expect([...candidate.snapshot]).toEqual([1]);
+    expect(candidate.journal?.records).toEqual([]);
+    expect(journal.bytes).toHaveLength(candidate.journal?.validBytes ?? -1);
+    reopened.close();
+  });
+
+  it('leaves the legacy snapshot intact when migration cannot flush', async () => {
+    const opfs = memoryOpfs();
+    const store = await createOpfsSnapshotStore('legacy-failure', opfs.provider);
+    store.commit(new Uint8Array([7]));
+    store.close();
+    const database = await opfs.database('legacy-failure');
+    const legacy = await database.getFileHandle('snapshot-a.bin', {create: true});
+    legacy.bytes = new Uint8Array(encodeLegacySnapshot(1n, new Uint8Array([7])));
+    const oldJournal = await database.getFileHandle('journal-a.bin', {
+      create: true,
+    });
+    oldJournal.bytes = new Uint8Array();
+    const newJournal = await database.getFileHandle('journal-b.bin', {
+      create: true,
+    });
+    newJournal.flushFailures = 1;
+
+    const reopening = await createOpfsSnapshotStore(
+      'legacy-failure',
+      opfs.provider,
+    );
+    expect(() => reopening.select(reopening.candidates()[0]!)).toThrowError(
+      expect.objectContaining({code: 'STORAGE_QUOTA_EXCEEDED'}),
+    );
+    reopening.close();
+
+    const recovered = await createOpfsSnapshotStore(
+      'legacy-failure',
+      opfs.provider,
+    );
+    expect([...recovered.candidates()[0]!.snapshot]).toEqual([7]);
+    recovered.close();
+  });
+
+  it('rolls back a journal whose final marker cannot flush', async () => {
+    const opfs = memoryOpfs();
+    const store = await createOpfsSnapshotStore(
+      'journal-marker-failure',
+      opfs.provider,
+    );
+    store.checkpoint!(new Uint8Array([1]));
+    const database = await opfs.database('journal-marker-failure');
+    const journal = await database.getFileHandle('journal-a.bin', {create: true});
+    journal.failFlushCalls.add(3);
+
+    expect(() => store.append!(new Uint8Array([2]))).toThrowError(
+      expect.objectContaining({code: 'STORAGE_QUOTA_EXCEEDED'}),
+    );
+    store.close();
+
+    const reopened = await createOpfsSnapshotStore(
+      'journal-marker-failure',
+      opfs.provider,
+    );
+    expect(reopened.candidates()[0]!.journal?.records).toEqual([]);
+    reopened.close();
+  });
 });
 
 function rewriteRecordVersion(file: MemoryFile, version: number): void {
@@ -414,10 +604,29 @@ function rewriteRecordVersion(file: MemoryFile, version: number): void {
   );
   view.setUint32(8, version, true);
   view.setUint32(
-    24,
-    testCrc32([file.bytes.subarray(8, 24), file.bytes.subarray(28)]),
+    32,
+    testCrc32([file.bytes.subarray(8, 32), file.bytes.subarray(36)]),
     true,
   );
+}
+
+function encodeLegacySnapshot(
+  generation: bigint,
+  snapshot: Uint8Array,
+): Uint8Array {
+  const bytes = new Uint8Array(28 + snapshot.byteLength);
+  bytes.set([0x54, 0x47, 0x52, 0x53, 0x4f, 0x50, 0x46, 0x31]);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(8, 1, true);
+  view.setBigUint64(12, generation, true);
+  view.setUint32(20, snapshot.byteLength, true);
+  bytes.set(snapshot, 28);
+  view.setUint32(
+    24,
+    testCrc32([bytes.subarray(8, 24), bytes.subarray(28)]),
+    true,
+  );
+  return bytes;
 }
 
 function testCrc32(parts: readonly Uint8Array[]): number {

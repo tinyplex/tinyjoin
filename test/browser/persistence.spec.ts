@@ -28,6 +28,7 @@ test('persists complete state across dedicated Worker restarts', async ({
   expect(report.emptyTableRows).toBe(0);
   expect(report.revision).toBe(2);
   expect(report.updatedTitle).toBe('Persisted after forced termination');
+  expect(report.journalWriteBytes).toBeLessThan(16_384);
   for (const timing of [
     report.initialCommitMs,
     report.gracefulReopenMs,

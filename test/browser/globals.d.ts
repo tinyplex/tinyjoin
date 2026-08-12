@@ -19,6 +19,7 @@ interface Window {
       initialCommitMs: number;
       lockErrorCode: string;
       mutationCommitMs: number;
+      journalWriteBytes: number;
       revision: number;
       rowCount: number;
       updatedTitle: string;
