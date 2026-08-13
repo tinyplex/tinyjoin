@@ -57,6 +57,16 @@ impl<D: PageDevice> PagedEngine<D> {
         self.storage.define_tables(schemas)
     }
 
+    /// Defines initialization schemas and reports whether one pager generation was published.
+    ///
+    /// The binary worker bridge uses this to distinguish catalog durability from a true no-op;
+    /// schema initialization itself intentionally does not advance the database revision.
+    #[doc(hidden)]
+    pub fn define_tables_with_publication(&mut self, schemas: Vec<TableSchema>) -> Result<bool> {
+        self.ensure_no_transaction()?;
+        self.storage.define_tables_with_publication(schemas)
+    }
+
     /// Atomically defines or replaces one complete table snapshot.
     ///
     /// The current browser bridge supplies `rows` as one buffered JavaScript array. The paged
@@ -635,7 +645,11 @@ mod tests {
                 columns: vec![],
             },
         ];
-        engine.define_tables(schemas).unwrap();
+        assert!(
+            engine
+                .define_tables_with_publication(schemas.clone())
+                .unwrap()
+        );
         assert_eq!(engine.revision(), 0);
         assert!(
             engine
@@ -647,6 +661,7 @@ mod tests {
 
         let mut reopened = PagedEngine::open(engine.into_device()).unwrap();
         assert_eq!(reopened.revision(), 0);
+        assert!(!reopened.define_tables_with_publication(schemas).unwrap());
         let inserted = reopened
             .execute_sql("INSERT INTO accounts (id) VALUES (1) RETURNING id", &[])
             .unwrap();

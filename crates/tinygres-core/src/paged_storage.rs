@@ -412,7 +412,19 @@ impl<D: PageDevice> PagedStorage<D> {
     /// catalog header required by later page-native mutations. A failed definition batch publishes
     /// none of its schemas.
     pub fn define_tables(&mut self, schemas: Vec<TableSchema>) -> Result<()> {
-        self.publish_table_definitions(schemas, false).map(|_| ())
+        self.define_tables_with_publication(schemas).map(|_| ())
+    }
+
+    /// Defines initialization schemas and reports whether one pager generation was published.
+    ///
+    /// This is the page-native bridge seam for distinguishing a durable catalog publication from
+    /// an identical-schema no-op even though initialization deliberately leaves the logical
+    /// database revision unchanged.
+    pub(crate) fn define_tables_with_publication(
+        &mut self,
+        schemas: Vec<TableSchema>,
+    ) -> Result<bool> {
+        self.publish_table_definitions(schemas, false)
     }
 
     /// Defines a SQL-created table and advances the database revision in the same pager generation.
@@ -3814,13 +3826,14 @@ mod tests {
         assert_eq!(paged.revision(), 0);
 
         // Even an empty initializer publishes the canonical catalog root at the same revision.
-        paged.define_tables(vec![]).unwrap();
+        assert!(paged.define_tables_with_publication(vec![]).unwrap());
         let device = paged.into_device();
         let pager = Pager::open_or_create(device).unwrap();
         assert_eq!(pager.database_revision(), 0);
         assert!(pager.catalog_root_page_id().is_some());
 
         let mut paged = PagedStorage::open(pager.into_device()).unwrap();
+        assert!(!paged.define_tables_with_publication(vec![]).unwrap());
         let accounts = schema(
             "accounts",
             &[
