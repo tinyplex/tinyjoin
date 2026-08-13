@@ -3,7 +3,9 @@ use std::str::FromStr;
 
 use serde_json::{Map, Number, Value};
 
-use crate::storage::{StorageReader, validate_json_value};
+use crate::storage::{
+    StorageReader, estimated_row_bytes, estimated_value_bytes, validate_json_value,
+};
 use crate::{
     ColumnDefinition, ColumnType, EngineError, Filter, FilterOperator, NullOrder, OrderBy,
     OrderDirection, Predicate, QueryPlan, QueryResult, Result, Row, VisitControl, VisitOutcome,
@@ -19,6 +21,7 @@ const MAX_ORDER_COLUMNS: usize = 32;
 const MAX_PARAMETERS: usize = 1024;
 const MAX_COMMENT_DEPTH: usize = 32;
 const MAX_RESULT_ROWS: usize = 100_000;
+const MAX_QUERY_RESULT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SCAN_ROWS: usize = 1_000_000;
 const MAX_ORDERED_ROWS: usize = 100_000;
 
@@ -121,6 +124,7 @@ fn execute_unordered<S: StorageReader>(
 ) -> Result<Vec<Row>> {
     let mut scanned = 0_usize;
     let mut skipped_matches = 0_usize;
+    let mut result_bytes = 0_usize;
     let mut rows = Vec::new();
     visit_candidate_rows(storage, plan, schema, &mut |row| {
         count_scanned_row(&mut scanned)?;
@@ -136,11 +140,17 @@ fn execute_unordered<S: StorageReader>(
         if rows.len() == MAX_RESULT_ROWS {
             return Err(result_limit_exceeded());
         }
+        let projected_bytes = projected_row_bytes(row, plan.columns.as_deref(), &plan.table)?;
+        let next_result_bytes = checked_result_add(result_bytes, projected_bytes)?;
+        ensure_result_budget(next_result_bytes)?;
+        let clone_peak = checked_result_add(result_bytes, owned_row_bytes(row)?)?;
+        ensure_result_budget(clone_peak)?;
         rows.push(project_row(
             row.clone(),
             plan.columns.as_deref(),
             &plan.table,
         )?);
+        result_bytes = next_result_bytes;
         if plan.limit.is_some_and(|limit| rows.len() == limit) {
             Ok(VisitControl::Stop)
         } else {
@@ -156,6 +166,7 @@ fn execute_ordered<S: StorageReader>(
     schema: &crate::TableSchema,
 ) -> Result<Vec<Row>> {
     let mut scanned = 0_usize;
+    let mut ordered_bytes = 0_usize;
     let mut rows = Vec::new();
     visit_candidate_rows(storage, plan, schema, &mut |row| {
         count_scanned_row(&mut scanned)?;
@@ -170,22 +181,43 @@ fn execute_ordered<S: StorageReader>(
                     ),
                 ));
             }
+            let next_ordered_bytes = checked_result_add(ordered_bytes, owned_row_bytes(row)?)?;
+            ensure_result_budget(next_ordered_bytes)?;
             rows.push(row.clone());
+            ordered_bytes = next_ordered_bytes;
         }
         Ok(VisitControl::Continue)
     })?;
     sort_rows(&mut rows, &plan.order_by, &plan.table)?;
     let take = plan.limit.unwrap_or(MAX_RESULT_ROWS + 1);
-    let rows = rows
-        .into_iter()
-        .skip(plan.offset)
-        .take(take)
-        .map(|row| project_row(row, plan.columns.as_deref(), &plan.table))
-        .collect::<Result<Vec<_>>>()?;
-    if rows.len() > MAX_RESULT_ROWS {
-        return Err(result_limit_exceeded());
+    let mut remaining_ordered_bytes = ordered_bytes;
+    let mut result_bytes = 0_usize;
+    let mut projected_rows = Vec::new();
+    for (index, row) in rows.into_iter().enumerate() {
+        if index >= plan.offset && projected_rows.len() == take {
+            break;
+        }
+        let row_bytes = owned_row_bytes(&row)?;
+        remaining_ordered_bytes = remaining_ordered_bytes
+            .checked_sub(row_bytes)
+            .ok_or_else(result_bytes_limit_exceeded)?;
+        if index < plan.offset {
+            continue;
+        }
+        if projected_rows.len() == MAX_RESULT_ROWS {
+            return Err(result_limit_exceeded());
+        }
+        let projected_bytes = projected_row_bytes(&row, plan.columns.as_deref(), &plan.table)?;
+        let next_result_bytes = checked_result_add(result_bytes, projected_bytes)?;
+        ensure_result_budget(next_result_bytes)?;
+        ensure_result_budget(checked_result_add(
+            remaining_ordered_bytes,
+            next_result_bytes,
+        )?)?;
+        projected_rows.push(project_row(row, plan.columns.as_deref(), &plan.table)?);
+        result_bytes = next_result_bytes;
     }
-    Ok(rows)
+    Ok(projected_rows)
 }
 
 fn visit_candidate_rows<S: StorageReader>(
@@ -253,6 +285,58 @@ fn result_limit_exceeded() -> EngineError {
     EngineError::new(
         "RESULT_LIMIT_EXCEEDED",
         format!("A query cannot return more than {MAX_RESULT_ROWS} rows"),
+    )
+}
+
+fn projected_row_bytes(row: &Row, columns: Option<&[String]>, table: &str) -> Result<usize> {
+    let Some(columns) = columns else {
+        return owned_row_bytes(row);
+    };
+    let mut bytes = 32_usize;
+    for (index, column) in columns.iter().enumerate() {
+        let value = row
+            .get(column)
+            .ok_or_else(|| EngineError::column_not_found(column, table))?;
+        if columns[..index].contains(column) {
+            return Err(EngineError::column_not_found(column, table));
+        }
+        bytes = checked_result_add(bytes, 64)?;
+        bytes = checked_result_add(bytes, checked_result_mul(column.len(), 2)?)?;
+        bytes = checked_result_add(bytes, checked_result_mul(owned_value_bytes(value)?, 2)?)?;
+    }
+    Ok(bytes)
+}
+
+fn owned_row_bytes(row: &Row) -> Result<usize> {
+    estimated_row_bytes(row).map_err(|_| result_bytes_limit_exceeded())
+}
+
+fn owned_value_bytes(value: &Value) -> Result<usize> {
+    estimated_value_bytes(value).map_err(|_| result_bytes_limit_exceeded())
+}
+
+fn ensure_result_budget(bytes: usize) -> Result<()> {
+    if bytes > MAX_QUERY_RESULT_BYTES {
+        Err(result_bytes_limit_exceeded())
+    } else {
+        Ok(())
+    }
+}
+
+fn checked_result_add(left: usize, right: usize) -> Result<usize> {
+    left.checked_add(right)
+        .ok_or_else(result_bytes_limit_exceeded)
+}
+
+fn checked_result_mul(left: usize, right: usize) -> Result<usize> {
+    left.checked_mul(right)
+        .ok_or_else(result_bytes_limit_exceeded)
+}
+
+fn result_bytes_limit_exceeded() -> EngineError {
+    EngineError::new(
+        "QUERY_WORK_LIMIT_EXCEEDED",
+        format!("A query cannot materialize more than {MAX_QUERY_RESULT_BYTES} bytes of results"),
     )
 }
 
@@ -1791,6 +1875,15 @@ mod tests {
                 index_visits: Cell::new(0),
             }
         }
+
+        fn add_payload_column(&mut self) {
+            self.schema.columns.push(ColumnDefinition {
+                name: "payload".to_owned(),
+                data_type: ColumnType::Text,
+                nullable: false,
+                default: None,
+            });
+        }
     }
 
     impl StorageReader for VisitorOnlyStorage {
@@ -2249,10 +2342,8 @@ mod tests {
         assert_eq!(error.code, "QUERY_WORK_LIMIT_EXCEEDED");
         assert_eq!(storage.table_visits.get(), MAX_SCAN_ROWS + 1);
 
-        let storage = VisitorOnlyStorage::new(
-            row(json!({"id": 1, "user_id": 1, "selected": true})),
-            MAX_RESULT_ROWS + 1,
-        );
+        let mut storage = VisitorOnlyStorage::new(Map::new(), MAX_RESULT_ROWS + 1);
+        storage.schema.columns.clear();
         assert_eq!(
             execute(&storage, &parse_sql("SELECT * FROM items", &[]).unwrap())
                 .unwrap_err()
@@ -2261,10 +2352,8 @@ mod tests {
         );
         assert_eq!(storage.table_visits.get(), MAX_RESULT_ROWS + 1);
 
-        let storage = VisitorOnlyStorage::new(
-            row(json!({"id": 1, "user_id": 1, "selected": true})),
-            MAX_ORDERED_ROWS + 1,
-        );
+        let mut storage = VisitorOnlyStorage::new(row(json!({"id": 1})), MAX_ORDERED_ROWS + 1);
+        storage.schema.columns.truncate(1);
         assert_eq!(
             execute(
                 &storage,
@@ -2287,6 +2376,120 @@ mod tests {
         plan.offset = usize::MAX;
         assert_eq!(execute(&storage, &plan).unwrap_err().code, "INVALID_QUERY");
         assert_eq!(storage.table_visits.get(), 0);
+    }
+
+    #[test]
+    fn oversized_borrowed_rows_fail_before_unordered_or_ordered_clones() {
+        let mut storage = VisitorOnlyStorage::new(
+            row(json!({
+                "id": 1,
+                "user_id": 1,
+                "selected": true,
+                "payload": "x".repeat(MAX_QUERY_RESULT_BYTES / 2),
+            })),
+            1,
+        );
+        storage.add_payload_column();
+
+        assert_eq!(
+            execute(
+                &storage,
+                &parse_sql("SELECT payload FROM items", &[]).unwrap(),
+            )
+            .unwrap_err()
+            .code,
+            "QUERY_WORK_LIMIT_EXCEEDED"
+        );
+        assert_eq!(storage.table_visits.get(), 1);
+
+        storage.table_visits.set(0);
+        assert_eq!(
+            execute(
+                &storage,
+                &parse_sql("SELECT id FROM items ORDER BY id LIMIT 1", &[]).unwrap(),
+            )
+            .unwrap_err()
+            .code,
+            "QUERY_WORK_LIMIT_EXCEEDED"
+        );
+        assert_eq!(storage.table_visits.get(), 1);
+    }
+
+    #[test]
+    fn cumulative_borrowed_results_reject_the_first_row_over_the_byte_budget() {
+        let repeated_row = row(json!({
+            "id": 1,
+            "user_id": 1,
+            "selected": true,
+            "payload": "x".repeat(128 * 1024),
+        }));
+        let plan = parse_sql("SELECT payload FROM items", &[]).unwrap();
+        let projected_bytes =
+            projected_row_bytes(&repeated_row, plan.columns.as_deref(), "items").unwrap();
+        let clone_bytes = owned_row_bytes(&repeated_row).unwrap();
+        let accepted_rows = (MAX_QUERY_RESULT_BYTES - clone_bytes) / projected_bytes + 1;
+        assert!((accepted_rows - 1) * projected_bytes + clone_bytes <= MAX_QUERY_RESULT_BYTES);
+        assert!(accepted_rows * projected_bytes + clone_bytes > MAX_QUERY_RESULT_BYTES);
+
+        let mut accepted = VisitorOnlyStorage::new(repeated_row.clone(), accepted_rows);
+        accepted.add_payload_column();
+        assert_eq!(execute(&accepted, &plan).unwrap().rows.len(), accepted_rows);
+        assert_eq!(accepted.table_visits.get(), accepted_rows);
+
+        let mut rejected = VisitorOnlyStorage::new(repeated_row, accepted_rows + 1);
+        rejected.add_payload_column();
+        assert_eq!(
+            execute(&rejected, &plan).unwrap_err().code,
+            "QUERY_WORK_LIMIT_EXCEEDED"
+        );
+        assert_eq!(rejected.table_visits.get(), accepted_rows + 1);
+    }
+
+    #[test]
+    fn ordered_candidates_reject_the_first_borrowed_clone_over_the_byte_budget() {
+        let repeated_row = row(json!({
+            "id": 1,
+            "user_id": 1,
+            "selected": true,
+            "payload": "x".repeat(128 * 1024),
+        }));
+        let row_bytes = owned_row_bytes(&repeated_row).unwrap();
+        let accepted_rows = MAX_QUERY_RESULT_BYTES / row_bytes;
+        assert!(accepted_rows * row_bytes <= MAX_QUERY_RESULT_BYTES);
+        assert!((accepted_rows + 1) * row_bytes > MAX_QUERY_RESULT_BYTES);
+        let plan = parse_sql("SELECT id FROM items ORDER BY id LIMIT 1", &[]).unwrap();
+
+        let mut accepted = VisitorOnlyStorage::new(repeated_row.clone(), accepted_rows);
+        accepted.add_payload_column();
+        assert_eq!(execute(&accepted, &plan).unwrap().rows.len(), 1);
+        assert_eq!(accepted.table_visits.get(), accepted_rows);
+
+        let mut rejected = VisitorOnlyStorage::new(repeated_row, accepted_rows + 1);
+        rejected.add_payload_column();
+        assert_eq!(
+            execute(&rejected, &plan).unwrap_err().code,
+            "QUERY_WORK_LIMIT_EXCEEDED"
+        );
+        assert_eq!(rejected.table_visits.get(), accepted_rows + 1);
+    }
+
+    #[test]
+    fn result_byte_budget_arithmetic_has_an_exact_checked_boundary() {
+        ensure_result_budget(MAX_QUERY_RESULT_BYTES).unwrap();
+        assert_eq!(
+            ensure_result_budget(MAX_QUERY_RESULT_BYTES + 1)
+                .unwrap_err()
+                .code,
+            "QUERY_WORK_LIMIT_EXCEEDED"
+        );
+        assert_eq!(
+            checked_result_add(usize::MAX, 1).unwrap_err().code,
+            "QUERY_WORK_LIMIT_EXCEEDED"
+        );
+        assert_eq!(
+            checked_result_mul(usize::MAX, 2).unwrap_err().code,
+            "QUERY_WORK_LIMIT_EXCEEDED"
+        );
     }
 
     #[test]
