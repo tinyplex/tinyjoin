@@ -226,6 +226,11 @@ impl<D: PageDevice> PagedEngine<D> {
         self.storage.applied_journal_sequence()
     }
 
+    #[doc(hidden)]
+    pub fn ensure_readiness(&self) -> Result<()> {
+        self.storage.ensure_readiness()
+    }
+
     pub fn begin_transaction(&mut self) -> Result<()> {
         self.storage.ensure_readiness()?;
         if self.in_transaction() {

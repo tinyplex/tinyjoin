@@ -4,6 +4,25 @@ use crate::{
     AllocationBitmap, EngineError, FIRST_DATA_PAGE_ID, PAGE_SIZE, PageDevice, PageId, Result,
 };
 
+// Keep browser cache diagnostics static and let PAGE_CACHE_ERROR carry the
+// failure class. Native builds retain page and reservation details.
+#[cfg(all(target_arch = "wasm32", feature = "compact-storage-diagnostics"))]
+macro_rules! storage_diagnostic {
+    ($($argument:tt)*) => {{
+        if false {
+            let _ = ::std::format!($($argument)*);
+        }
+        String::from("Page cache operation failed")
+    }};
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "compact-storage-diagnostics")))]
+macro_rules! storage_diagnostic {
+    ($($argument:tt)*) => {
+        ::std::format!($($argument)*)
+    };
+}
+
 pub type CandidateId = u64;
 
 pub const DEFAULT_PAGE_CACHE_BYTES: usize = 16 * 1024 * 1024;
@@ -106,7 +125,7 @@ impl<D: PageDevice> PageCache<D> {
             .expect("the candidate reservation was checked")
             .written
         {
-            return Err(cache_error(format!(
+            return Err(cache_error(storage_diagnostic!(
                 "Candidate {candidate} must initialize reserved page {id} before reading it"
             )));
         }
@@ -126,17 +145,17 @@ impl<D: PageDevice> PageCache<D> {
         active_bitmap: &AllocationBitmap,
     ) -> Result<()> {
         if id < FIRST_DATA_PAGE_ID {
-            return Err(cache_error(format!(
+            return Err(cache_error(storage_diagnostic!(
                 "Candidate pages must not use metadata page ID {id}"
             )));
         }
         if active_bitmap.is_allocated(id)? {
-            return Err(cache_error(format!(
+            return Err(cache_error(storage_diagnostic!(
                 "Candidate {candidate} cannot reserve allocated page {id}"
             )));
         }
         if self.lookup.contains_key(&(Owner::Committed, id)) {
-            return Err(cache_error(format!(
+            return Err(cache_error(storage_diagnostic!(
                 "Candidate {candidate} cannot reserve page {id} while it is present in the committed cache view"
             )));
         }
@@ -145,14 +164,14 @@ impl<D: PageDevice> PageCache<D> {
             .values()
             .find(|reservation| reservation.candidate != candidate)
         {
-            return Err(cache_error(format!(
+            return Err(cache_error(storage_diagnostic!(
                 "Candidate {candidate} cannot reserve page {id}; candidate {} is already active",
                 reservation.candidate
             )));
         }
         match self.reservations.get(&id) {
             Some(reservation) if reservation.candidate == candidate => Ok(()),
-            Some(reservation) => Err(cache_error(format!(
+            Some(reservation) => Err(cache_error(storage_diagnostic!(
                 "Candidate {candidate} cannot reserve page {id}; candidate {} already reserved it",
                 reservation.candidate
             ))),
@@ -219,7 +238,7 @@ impl<D: PageDevice> PageCache<D> {
             .any(|entry| entry.owner == owner && entry.dirty)
             || self.unflushed_owners.contains(&owner)
         {
-            return Err(cache_error(format!(
+            return Err(cache_error(storage_diagnostic!(
                 "Candidate {candidate} must be flushed before it is installed"
             )));
         }
@@ -234,18 +253,18 @@ impl<D: PageDevice> PageCache<D> {
             .iter()
             .any(|(id, _)| self.lookup.contains_key(&(Owner::Committed, *id)))
         {
-            return Err(cache_error(format!(
+            return Err(cache_error(storage_diagnostic!(
                 "Candidate {candidate} overlaps a page in the committed cache view"
             )));
         }
         if let Some((id, _)) = candidate_ids.iter().find(|(_, written)| !written) {
-            return Err(cache_error(format!(
+            return Err(cache_error(storage_diagnostic!(
                 "Candidate {candidate} reserved page {id} but never wrote it"
             )));
         }
         for (id, _) in &candidate_ids {
             if !next_bitmap.is_allocated(*id)? {
-                return Err(cache_error(format!(
+                return Err(cache_error(storage_diagnostic!(
                     "Candidate {candidate} page {id} is missing from the next allocation bitmap"
                 )));
             }
@@ -288,7 +307,7 @@ impl<D: PageDevice> PageCache<D> {
 
     fn ensure_not_reserved(&self, id: PageId) -> Result<()> {
         if let Some(reservation) = self.reservations.get(&id) {
-            return Err(cache_error(format!(
+            return Err(cache_error(storage_diagnostic!(
                 "Page {id} is exclusively reserved by candidate {}",
                 reservation.candidate
             )));
@@ -299,11 +318,11 @@ impl<D: PageDevice> PageCache<D> {
     fn ensure_reserved_by(&self, candidate: CandidateId, id: PageId) -> Result<()> {
         match self.reservations.get(&id) {
             Some(reservation) if reservation.candidate == candidate => Ok(()),
-            Some(reservation) => Err(cache_error(format!(
+            Some(reservation) => Err(cache_error(storage_diagnostic!(
                 "Page {id} is reserved by candidate {}, not candidate {candidate}",
                 reservation.candidate
             ))),
-            None => Err(cache_error(format!(
+            None => Err(cache_error(storage_diagnostic!(
                 "Candidate {candidate} must reserve page {id} before accessing it"
             ))),
         }
@@ -328,7 +347,7 @@ impl<D: PageDevice> PageCache<D> {
 
     fn write_owned(&mut self, owner: Owner, id: PageId, bytes: &[u8]) -> Result<()> {
         if bytes.len() != PAGE_SIZE {
-            return Err(cache_error(format!(
+            return Err(cache_error(storage_diagnostic!(
                 "Cached pages must be exactly {PAGE_SIZE} bytes, not {}",
                 bytes.len()
             )));

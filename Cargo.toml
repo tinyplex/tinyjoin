@@ -1,5 +1,9 @@
 [workspace]
-members = ["crates/tinygres-core", "crates/tinygres-wasm"]
+members = [
+  "crates/tinygres-core",
+  "crates/tinygres-wasm",
+  "crates/tinygres-wasm-paged",
+]
 resolver = "2"
 
 [workspace.package]

@@ -1,5 +1,24 @@
 use crate::{EngineError, Result, snapshot::crc32};
 
+// Keep browser corruption diagnostics static and let the stable error code
+// carry the precise class. Native builds retain the detailed values.
+#[cfg(all(target_arch = "wasm32", feature = "compact-storage-diagnostics"))]
+macro_rules! storage_diagnostic {
+    ($($argument:tt)*) => {{
+        if false {
+            let _ = ::std::format!($($argument)*);
+        }
+        String::from("Page validation failed")
+    }};
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "compact-storage-diagnostics")))]
+macro_rules! storage_diagnostic {
+    ($($argument:tt)*) => {
+        ::std::format!($($argument)*)
+    };
+}
+
 pub type PageId = u64;
 
 pub const PAGE_SIZE: usize = 4_096;
@@ -48,7 +67,9 @@ impl TryFrom<u8> for PageType {
             3 => Ok(Self::BtreeInternal),
             4 => Ok(Self::BtreeLeaf),
             5 => Ok(Self::Overflow),
-            _ => Err(invalid_page(format!("Unknown page type {value}"))),
+            _ => Err(invalid_page(storage_diagnostic!(
+                "Unknown page type {value}"
+            ))),
         }
     }
 }
@@ -103,7 +124,7 @@ impl Page {
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != PAGE_SIZE {
-            return Err(invalid_page(format!(
+            return Err(invalid_page(storage_diagnostic!(
                 "A physical page must be exactly {PAGE_SIZE} bytes, not {}",
                 bytes.len()
             )));
@@ -142,7 +163,7 @@ impl Page {
         }
         let payload_length = read_u32(bytes, 24) as usize;
         if payload_length > MAX_PAGE_PAYLOAD_SIZE {
-            return Err(invalid_page(format!(
+            return Err(invalid_page(storage_diagnostic!(
                 "Page payload length {payload_length} exceeds the {MAX_PAGE_PAYLOAD_SIZE}-byte limit"
             )));
         }
@@ -193,7 +214,9 @@ impl TryFrom<u8> for SuperblockSlot {
         match value {
             0 => Ok(Self::A),
             1 => Ok(Self::B),
-            _ => Err(invalid_page(format!("Unknown superblock slot {value}"))),
+            _ => Err(invalid_page(storage_diagnostic!(
+                "Unknown superblock slot {value}"
+            ))),
         }
     }
 }
@@ -225,7 +248,7 @@ impl TryFrom<u8> for BitmapSlot {
         match value {
             0 => Ok(Self::A),
             1 => Ok(Self::B),
-            _ => Err(invalid_page(format!(
+            _ => Err(invalid_page(storage_diagnostic!(
                 "Unknown allocation bitmap slot {value}"
             ))),
         }
@@ -288,7 +311,7 @@ impl Superblock {
     pub fn decode_page(bytes: &[u8]) -> Result<Self> {
         let page = Page::decode(bytes)?;
         if page.id >= SUPERBLOCK_PAGE_COUNT as PageId {
-            return Err(invalid_page(format!(
+            return Err(invalid_page(storage_diagnostic!(
                 "Superblock must occupy page 0 or 1, not page {}",
                 page.id
             )));
@@ -297,7 +320,7 @@ impl Superblock {
             return Err(invalid_page("Superblock page has the wrong page type"));
         }
         if page.payload.len() != SUPERBLOCK_PAYLOAD_SIZE {
-            return Err(invalid_page(format!(
+            return Err(invalid_page(storage_diagnostic!(
                 "Superblock payload must be {SUPERBLOCK_PAYLOAD_SIZE} bytes"
             )));
         }
@@ -338,7 +361,7 @@ impl Superblock {
         }
         let slot = SuperblockSlot::try_from(payload[70])?;
         if page.id != slot.page_id() {
-            return Err(invalid_page(format!(
+            return Err(invalid_page(storage_diagnostic!(
                 "Superblock slot {slot:?} must occupy page {}, not page {}",
                 slot.page_id(),
                 page.id
@@ -404,7 +427,7 @@ impl Superblock {
         }
         let maximum_live_pages = (MAX_PAGE_COUNT - FIRST_DATA_PAGE_ID) as u32;
         if self.live_data_page_count > maximum_live_pages {
-            return Err(invalid_page(format!(
+            return Err(invalid_page(storage_diagnostic!(
                 "Live data page count {} exceeds the supported maximum {maximum_live_pages}",
                 self.live_data_page_count
             )));
@@ -540,7 +563,7 @@ impl AllocationBitmap {
 
     fn decode_page_slices(slot: BitmapSlot, pages: &[&[u8]]) -> Result<Self> {
         if pages.len() != BITMAP_CHUNK_COUNT {
-            return Err(invalid_page(format!(
+            return Err(invalid_page(storage_diagnostic!(
                 "Allocation bitmap slot must contain {BITMAP_CHUNK_COUNT} chunks, not {}",
                 pages.len()
             )));
@@ -550,19 +573,19 @@ impl AllocationBitmap {
         for (chunk, bytes) in pages.iter().enumerate() {
             let page = Page::decode(bytes)?;
             if page.id != slot.page_id(chunk) {
-                return Err(invalid_page(format!(
+                return Err(invalid_page(storage_diagnostic!(
                     "Allocation bitmap chunk {chunk} has page ID {}, expected {}",
                     page.id,
                     slot.page_id(chunk)
                 )));
             }
             if page.page_type != PageType::AllocationBitmap {
-                return Err(invalid_page(format!(
+                return Err(invalid_page(storage_diagnostic!(
                     "Allocation bitmap chunk {chunk} has the wrong page type"
                 )));
             }
             if page.payload.len() < BITMAP_CHUNK_HEADER_SIZE {
-                return Err(invalid_page(format!(
+                return Err(invalid_page(storage_diagnostic!(
                     "Allocation bitmap chunk {chunk} header is truncated"
                 )));
             }
@@ -582,13 +605,13 @@ impl AllocationBitmap {
                 generation = Some(chunk_generation);
             }
             if BitmapSlot::try_from(page.payload[8])? != slot {
-                return Err(invalid_page(format!(
+                return Err(invalid_page(storage_diagnostic!(
                     "Allocation bitmap chunk {chunk} belongs to a different slot"
                 )));
             }
             if page.payload[9] as usize != chunk || page.payload[10] as usize != BITMAP_CHUNK_COUNT
             {
-                return Err(invalid_page(format!(
+                return Err(invalid_page(storage_diagnostic!(
                     "Allocation bitmap chunk {chunk} has inconsistent chunk metadata"
                 )));
             }
@@ -602,7 +625,7 @@ impl AllocationBitmap {
             if length != expected_length
                 || page.payload.len() != BITMAP_CHUNK_HEADER_SIZE + expected_length
             {
-                return Err(invalid_page(format!(
+                return Err(invalid_page(storage_diagnostic!(
                     "Allocation bitmap chunk {chunk} has an invalid payload length"
                 )));
             }
@@ -858,11 +881,13 @@ fn decode_metadata_candidate(
     raw: RawMetadataSlot<'_>,
 ) -> Result<RecoveredMetadata> {
     let superblock_bytes = raw.superblock.ok_or_else(|| {
-        invalid_page(format!("Metadata slot {expected_slot:?} has no superblock"))
+        invalid_page(storage_diagnostic!(
+            "Metadata slot {expected_slot:?} has no superblock"
+        ))
     })?;
     let superblock = Superblock::decode_page(superblock_bytes)?;
     if superblock.slot != expected_slot {
-        return Err(invalid_page(format!(
+        return Err(invalid_page(storage_diagnostic!(
             "Metadata candidate {expected_slot:?} contains superblock {:?}",
             superblock.slot
         )));
@@ -873,7 +898,7 @@ fn decode_metadata_candidate(
         .enumerate()
         .map(|(chunk, bytes)| {
             bytes.ok_or_else(|| {
-                invalid_page(format!(
+                invalid_page(storage_diagnostic!(
                     "Metadata slot {expected_slot:?} has no bitmap chunk {chunk}"
                 ))
             })
@@ -894,7 +919,7 @@ fn bitmap_chunk_length(chunk: usize) -> usize {
 
 fn validate_page_id(id: PageId) -> Result<()> {
     if id >= MAX_PAGE_COUNT {
-        return Err(invalid_page(format!(
+        return Err(invalid_page(storage_diagnostic!(
             "Page ID {id} exceeds the maximum page ID {}",
             MAX_PAGE_COUNT - 1
         )));

@@ -3,5 +3,9 @@
   "compilerOptions": {
     "types": ["vite/client"]
   },
-  "include": ["main.mts", "../globals.d.ts"]
+  "include": [
+    "*.mts",
+    "../globals.d.ts",
+    "../../../src/types/wasm-bindings.d.ts"
+  ]
 }

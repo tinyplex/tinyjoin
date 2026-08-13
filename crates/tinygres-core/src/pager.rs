@@ -11,6 +11,25 @@ use crate::{
     build_next_metadata, recover_metadata,
 };
 
+// Keep browser pager diagnostics static and let the stable error code carry
+// the precise class. Native builds retain page IDs and candidate details.
+#[cfg(all(target_arch = "wasm32", feature = "compact-storage-diagnostics"))]
+macro_rules! storage_diagnostic {
+    ($($argument:tt)*) => {{
+        if false {
+            let _ = ::std::format!($($argument)*);
+        }
+        String::from("Pager operation failed")
+    }};
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "compact-storage-diagnostics")))]
+macro_rules! storage_diagnostic {
+    ($($argument:tt)*) => {
+        ::std::format!($($argument)*)
+    };
+}
+
 /// A bounded, copy-on-write page store with crash-safe paired metadata roots.
 ///
 /// `Pager` deliberately permits only one [`PagerWriteTransaction`] at a time. Data pages are
@@ -264,7 +283,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
 
         let page_count = self.pager.device.page_count();
         if id > page_count {
-            return Err(pager_error(format!(
+            return Err(pager_error(storage_diagnostic!(
                 "Allocator selected non-dense page {id} after a {page_count}-page physical file"
             )));
         }
@@ -284,7 +303,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
     pub fn write_new_page(&mut self, page: &Page) -> Result<()> {
         self.ensure_open()?;
         if !self.new_pages.contains(&page.id) {
-            return Err(pager_error(format!(
+            return Err(pager_error(storage_diagnostic!(
                 "Page {} was not allocated by this write transaction",
                 page.id
             )));
@@ -308,7 +327,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
         } else if self.pager.active.allocation_bitmap.is_allocated(id)? {
             self.pager.cache.read_page(id)?
         } else {
-            return Err(pager_error(format!(
+            return Err(pager_error(storage_diagnostic!(
                 "Page {id} is allocated in the candidate bitmap without candidate ownership"
             )));
         };
@@ -322,7 +341,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
         self.ensure_open()?;
         ensure_data_page(id)?;
         if self.new_pages.contains(&id) {
-            return Err(pager_error(format!(
+            return Err(pager_error(storage_diagnostic!(
                 "New candidate page {id} cannot be freed before publication"
             )));
         }
@@ -340,7 +359,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
         self.ensure_open()?;
         ensure_data_page(id)?;
         if !self.new_pages.contains(&id) {
-            return Err(pager_error(format!(
+            return Err(pager_error(storage_diagnostic!(
                 "Page {id} was not allocated by this write transaction"
             )));
         }
@@ -381,7 +400,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
                 .difference(&self.written_pages)
                 .copied()
                 .collect::<Vec<_>>();
-            return self.fail_before_superblock(pager_error(format!(
+            return self.fail_before_superblock(pager_error(storage_diagnostic!(
                 "Every allocated page must be initialized before commit; unwritten pages: {unwritten:?}"
             )));
         }
@@ -664,7 +683,7 @@ fn validate_physical_coverage<D: PageDevice>(
     let page_count = device.page_count();
     for id in FIRST_DATA_PAGE_ID..MAX_PAGE_COUNT {
         if allocation_bitmap.is_allocated(id)? && id >= page_count {
-            return Err(pager_error(format!(
+            return Err(pager_error(storage_diagnostic!(
                 "Allocation bitmap references page {id}, but the physical device contains only {page_count} pages"
             )));
         }
@@ -674,7 +693,7 @@ fn validate_physical_coverage<D: PageDevice>(
 
 fn ensure_data_page(id: PageId) -> Result<()> {
     if !(FIRST_DATA_PAGE_ID..MAX_PAGE_COUNT).contains(&id) {
-        return Err(pager_error(format!(
+        return Err(pager_error(storage_diagnostic!(
             "Data page ID {id} must be between {FIRST_DATA_PAGE_ID} and {}",
             MAX_PAGE_COUNT - 1
         )));

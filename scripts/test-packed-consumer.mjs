@@ -263,6 +263,14 @@ function assertPackedFiles(packed) {
       throw new Error(`Packed TinyGres is missing ${required}`);
     }
   }
+  const pagedWasmFiles = files.filter((file) =>
+    file.includes('tinygres_paged_wasm'),
+  );
+  if (pagedWasmFiles.length > 0) {
+    throw new Error(
+      `The internal page-native WASM artifact must not be published: ${pagedWasmFiles.join(', ')}`,
+    );
+  }
   const nestedManifests = files.filter((file) => file.endsWith('/package.json'));
   if (nestedManifests.length > 0) {
     throw new Error(

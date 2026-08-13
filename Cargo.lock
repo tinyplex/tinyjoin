@@ -200,6 +200,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinygres-wasm-paged"
+version = "0.0.0"
+dependencies = [
+ "js-sys",
+ "serde_json",
+ "tinygres-core",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"

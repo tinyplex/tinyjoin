@@ -5,6 +5,27 @@ use crate::{
     PageDevice, PageId, PageType, Pager, PagerWriteTransaction, Result, snapshot::crc32,
 };
 
+// Page diagnostics are intentionally compact in the browser build. The stable
+// error code still distinguishes invalid, unsupported, overflow, and limit
+// failures; native builds retain the detailed page IDs and offsets used while
+// debugging storage internals.
+#[cfg(all(target_arch = "wasm32", feature = "compact-storage-diagnostics"))]
+macro_rules! storage_diagnostic {
+    ($($argument:tt)*) => {{
+        if false {
+            let _ = ::std::format!($($argument)*);
+        }
+        String::from("B-tree validation failed")
+    }};
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "compact-storage-diagnostics")))]
+macro_rules! storage_diagnostic {
+    ($($argument:tt)*) => {
+        ::std::format!($($argument)*)
+    };
+}
+
 pub type TreeId = u64;
 
 pub const MAX_BTREE_KEY_BYTES: usize = 1_024;
@@ -80,7 +101,7 @@ impl Btree {
 
         for _ in 0..MAX_TREE_DEPTH {
             if !visited.insert(page_id) {
-                return Err(invalid_btree(format!(
+                return Err(invalid_btree(storage_diagnostic!(
                     "Tree {tree_id} contains a cycle through page {page_id}"
                 )));
             }
@@ -110,7 +131,7 @@ impl Btree {
                 }
             }
         }
-        Err(invalid_btree(format!(
+        Err(invalid_btree(storage_diagnostic!(
             "Tree {tree_id} exceeds the maximum depth of {MAX_TREE_DEPTH}"
         )))
     }
@@ -451,7 +472,7 @@ impl BtreeCursor {
         let mut parent_generation = None;
         for _ in 0..MAX_TREE_DEPTH {
             if !self.visited_pages.insert(page_id) {
-                return Err(invalid_btree(format!(
+                return Err(invalid_btree(storage_diagnostic!(
                     "Tree {} contains a cycle through page {page_id}",
                     self.tree_id
                 )));
@@ -488,7 +509,7 @@ impl BtreeCursor {
                 }
             }
         }
-        Err(invalid_btree(format!(
+        Err(invalid_btree(storage_diagnostic!(
             "Tree {} exceeds the maximum depth of {MAX_TREE_DEPTH}",
             self.tree_id
         )))
@@ -503,16 +524,18 @@ impl BtreeCursor {
                 reader.requires_view_generation(frame.page_id),
             )?;
             let NodeKind::Internal(internal) = node.kind else {
-                return Err(invalid_btree(format!(
+                return Err(invalid_btree(storage_diagnostic!(
                     "Cursor path page {} is a leaf",
                     frame.page_id
                 )));
             };
             validate_expected_level(frame.page_id, node.level, Some(frame.level))?;
             if node.generation != frame.generation {
-                return Err(invalid_btree(format!(
+                return Err(invalid_btree(storage_diagnostic!(
                     "Cursor path page {} changed generation from {} to {}",
-                    frame.page_id, frame.generation, node.generation
+                    frame.page_id,
+                    frame.generation,
+                    node.generation
                 )));
             }
             if frame.child_index < internal.entries.len() {
@@ -541,7 +564,7 @@ impl BtreeCursor {
     ) -> Result<bool> {
         for _ in self.path.len()..MAX_TREE_DEPTH {
             if !self.visited_pages.insert(page_id) {
-                return Err(invalid_btree(format!(
+                return Err(invalid_btree(storage_diagnostic!(
                     "Tree {} contains a cycle through page {page_id}",
                     self.tree_id
                 )));
@@ -576,7 +599,7 @@ impl BtreeCursor {
                 }
             }
         }
-        Err(invalid_btree(format!(
+        Err(invalid_btree(storage_diagnostic!(
             "Tree {} exceeds the maximum depth of {MAX_TREE_DEPTH}",
             self.tree_id
         )))
@@ -690,22 +713,24 @@ impl OverflowPage {
             || self.chunk_count as usize > MAX_OVERFLOW_PAGE_COUNT
             || self.chunk_index >= self.chunk_count
         {
-            return Err(invalid_overflow(format!(
+            return Err(invalid_overflow(storage_diagnostic!(
                 "Overflow chunk index {} is outside chunk count {}",
-                self.chunk_index, self.chunk_count
+                self.chunk_index,
+                self.chunk_count
             )));
         }
         if self.total_length == 0 || self.total_length as usize > MAX_BTREE_VALUE_BYTES {
-            return Err(invalid_overflow(format!(
+            return Err(invalid_overflow(storage_diagnostic!(
                 "Overflow total length {} is outside 1..={MAX_BTREE_VALUE_BYTES}",
                 self.total_length
             )));
         }
         let expected_chunk_count = (self.total_length as usize).div_ceil(MAX_OVERFLOW_CHUNK_BYTES);
         if self.chunk_count as usize != expected_chunk_count {
-            return Err(invalid_overflow(format!(
+            return Err(invalid_overflow(storage_diagnostic!(
                 "Overflow chunk count {} does not match total length {}",
-                self.chunk_count, self.total_length
+                self.chunk_count,
+                self.total_length
             )));
         }
         let expected_chunk_length = overflow_chunk_length(
@@ -714,7 +739,7 @@ impl OverflowPage {
             self.chunk_count as usize,
         )?;
         if self.chunk.len() != expected_chunk_length {
-            return Err(invalid_overflow(format!(
+            return Err(invalid_overflow(storage_diagnostic!(
                 "Overflow chunk {} is {} bytes, not {expected_chunk_length}",
                 self.chunk_index,
                 self.chunk.len()
@@ -734,7 +759,7 @@ impl OverflowPage {
         if let Some(next_page_id) = self.next_page_id {
             validate_overflow_page_id(next_page_id)?;
             if next_page_id == page_id {
-                return Err(invalid_overflow(format!(
+                return Err(invalid_overflow(storage_diagnostic!(
                     "Overflow page {page_id} references itself"
                 )));
             }
@@ -765,13 +790,14 @@ impl OverflowPage {
     ) -> Result<Self> {
         validate_overflow_page_id(page.id)?;
         if page.page_type != PageType::Overflow {
-            return Err(invalid_overflow(format!(
+            return Err(invalid_overflow(storage_diagnostic!(
                 "Overflow chain page {} has type {:?}",
-                page.id, page.page_type
+                page.id,
+                page.page_type
             )));
         }
         if page.payload.len() < OVERFLOW_HEADER_SIZE {
-            return Err(invalid_overflow(format!(
+            return Err(invalid_overflow(storage_diagnostic!(
                 "Overflow page {} payload is truncated to {} bytes",
                 page.id,
                 page.payload.len()
@@ -779,7 +805,7 @@ impl OverflowPage {
         }
         let bytes = &page.payload;
         if &bytes[..4] != OVERFLOW_MAGIC {
-            return Err(invalid_overflow(format!(
+            return Err(invalid_overflow(storage_diagnostic!(
                 "Overflow page {} magic does not match",
                 page.id
             )));
@@ -807,7 +833,7 @@ impl OverflowPage {
         let checksum = read_u32(bytes, 44);
         let chunk_length = read_u32(bytes, 48) as usize;
         if bytes[52..56].iter().any(|byte| *byte != 0) {
-            return Err(invalid_overflow(format!(
+            return Err(invalid_overflow(storage_diagnostic!(
                 "Overflow page {} reserved bytes must be zero",
                 page.id
             )));
@@ -819,7 +845,7 @@ impl OverflowPage {
             || total_length != descriptor.total_length
             || checksum != descriptor.checksum
         {
-            return Err(invalid_overflow(format!(
+            return Err(invalid_overflow(storage_diagnostic!(
                 "Overflow page {} does not match its descriptor or chain position",
                 page.id
             )));
@@ -832,7 +858,7 @@ impl OverflowPage {
         if chunk_length != expected_chunk_length
             || OVERFLOW_HEADER_SIZE + chunk_length != bytes.len()
         {
-            return Err(invalid_overflow(format!(
+            return Err(invalid_overflow(storage_diagnostic!(
                 "Overflow page {} chunk length {chunk_length} does not match expected {expected_chunk_length}",
                 page.id
             )));
@@ -846,7 +872,7 @@ impl OverflowPage {
         match (chunk_index + 1 == chunk_count, next_page_id) {
             (true, None) | (false, Some(_)) => {}
             _ => {
-                return Err(invalid_overflow(format!(
+                return Err(invalid_overflow(storage_diagnostic!(
                     "Overflow page {} has an invalid chain terminator",
                     page.id
                 )));
@@ -896,7 +922,9 @@ impl InternalNode {
                 .get(index - 1)
                 .map(|entry| entry.right_child)
                 .ok_or_else(|| {
-                    invalid_btree(format!("Internal child index {index} is out of range"))
+                    invalid_btree(storage_diagnostic!(
+                        "Internal child index {index} is out of range"
+                    ))
                 })
         }
     }
@@ -909,7 +937,7 @@ impl InternalNode {
             entry.right_child = page_id;
             Ok(())
         } else {
-            Err(invalid_btree(format!(
+            Err(invalid_btree(storage_diagnostic!(
                 "Internal child index {index} is out of range"
             )))
         }
@@ -1024,7 +1052,7 @@ impl Node {
         require_view_generation: bool,
     ) -> Result<Self> {
         if page.payload.len() != MAX_PAGE_PAYLOAD_SIZE {
-            return Err(invalid_btree(format!(
+            return Err(invalid_btree(storage_diagnostic!(
                 "B-tree page {} payload is {} bytes, not {MAX_PAGE_PAYLOAD_SIZE}",
                 page.id,
                 page.payload.len()
@@ -1032,7 +1060,7 @@ impl Node {
         }
         let bytes = &page.payload;
         if &bytes[..4] != NODE_MAGIC {
-            return Err(invalid_btree(format!(
+            return Err(invalid_btree(storage_diagnostic!(
                 "B-tree page {} magic does not match",
                 page.id
             )));
@@ -1053,20 +1081,20 @@ impl Node {
         }
         let tree_id = read_u64(bytes, 8);
         if tree_id != expected_tree_id {
-            return Err(invalid_btree(format!(
+            return Err(invalid_btree(storage_diagnostic!(
                 "B-tree page {} belongs to tree {tree_id}, not tree {expected_tree_id}",
                 page.id
             )));
         }
         let generation = read_u64(bytes, 16);
         if generation == 0 || generation > view_generation {
-            return Err(invalid_btree(format!(
+            return Err(invalid_btree(storage_diagnostic!(
                 "B-tree page {} generation {generation} is outside view generation {view_generation}",
                 page.id
             )));
         }
         if require_view_generation && generation != view_generation {
-            return Err(invalid_btree(format!(
+            return Err(invalid_btree(storage_diagnostic!(
                 "Candidate B-tree page {} has generation {generation}, not {view_generation}",
                 page.id
             )));
@@ -1081,19 +1109,19 @@ impl Node {
             || free_start > free_end
             || free_end > MAX_PAGE_PAYLOAD_SIZE
         {
-            return Err(invalid_btree(format!(
+            return Err(invalid_btree(storage_diagnostic!(
                 "B-tree page {} has invalid free-space bounds {free_start}..{free_end}",
                 page.id
             )));
         }
         if bytes[30..32].iter().any(|byte| *byte != 0) {
-            return Err(invalid_btree(format!(
+            return Err(invalid_btree(storage_diagnostic!(
                 "B-tree page {} reserved header bytes must be zero",
                 page.id
             )));
         }
         if bytes[free_start..free_end].iter().any(|byte| *byte != 0) {
-            return Err(invalid_btree(format!(
+            return Err(invalid_btree(storage_diagnostic!(
                 "B-tree page {} free space must be zero-filled",
                 page.id
             )));
@@ -1104,7 +1132,7 @@ impl Node {
         let kind = match page.page_type {
             PageType::BtreeLeaf => {
                 if level != 0 || leftmost_child != NO_PAGE_ID {
-                    return Err(invalid_btree(format!(
+                    return Err(invalid_btree(storage_diagnostic!(
                         "B-tree leaf page {} has internal-node header fields",
                         page.id
                     )));
@@ -1130,7 +1158,7 @@ impl Node {
             }
             PageType::BtreeInternal => {
                 if level == 0 {
-                    return Err(invalid_btree(format!(
+                    return Err(invalid_btree(storage_diagnostic!(
                         "B-tree internal page {} has no level",
                         page.id
                     )));
@@ -1161,7 +1189,7 @@ impl Node {
                 })
             }
             other => {
-                return Err(invalid_btree(format!(
+                return Err(invalid_btree(storage_diagnostic!(
                     "Page {} has type {other:?}, not a B-tree page",
                     page.id
                 )));
@@ -1235,12 +1263,12 @@ fn delete_recursive<D: PageDevice>(
     parent_generation: Option<u64>,
 ) -> Result<DeletedPage> {
     if depth >= MAX_TREE_DEPTH {
-        return Err(invalid_btree(format!(
+        return Err(invalid_btree(storage_diagnostic!(
             "Tree {tree_id} exceeds the maximum depth of {MAX_TREE_DEPTH}"
         )));
     }
     if !visited.insert(page_id) {
-        return Err(invalid_btree(format!(
+        return Err(invalid_btree(storage_diagnostic!(
             "Tree {tree_id} contains a cycle through page {page_id}"
         )));
     }
@@ -1385,12 +1413,12 @@ fn insert_recursive<D: PageDevice>(
     parent_generation: Option<u64>,
 ) -> Result<InsertedPage> {
     if depth >= MAX_TREE_DEPTH {
-        return Err(invalid_btree(format!(
+        return Err(invalid_btree(storage_diagnostic!(
             "Tree {tree_id} exceeds the maximum depth of {MAX_TREE_DEPTH}"
         )));
     }
     if !visited.insert(page_id) {
-        return Err(invalid_btree(format!(
+        return Err(invalid_btree(storage_diagnostic!(
             "Tree {tree_id} contains a cycle through page {page_id}"
         )));
     }
@@ -1443,9 +1471,10 @@ fn insert_recursive<D: PageDevice>(
             internal.replace_child(child_index, child.page_id)?;
             if let Some(split) = child.split {
                 if split.left_level + 1 != node_level {
-                    return Err(invalid_btree(format!(
+                    return Err(invalid_btree(storage_diagnostic!(
                         "Child split level {} does not match parent level {}",
-                        split.left_level, node_level
+                        split.left_level,
+                        node_level
                     )));
                 }
                 internal.entries.insert(
@@ -1720,12 +1749,12 @@ fn reclaim_tree<D: PageDevice>(
 
     while let Some(current) = pending.pop() {
         if current.depth >= MAX_TREE_DEPTH {
-            return Err(invalid_btree(format!(
+            return Err(invalid_btree(storage_diagnostic!(
                 "Tree {tree_id} exceeds the maximum depth of {MAX_TREE_DEPTH}"
             )));
         }
         if !reachable.insert(current.page_id) {
-            return Err(invalid_btree(format!(
+            return Err(invalid_btree(storage_diagnostic!(
                 "Tree {tree_id} references page {} more than once",
                 current.page_id
             )));
@@ -1759,7 +1788,7 @@ fn reclaim_tree<D: PageDevice>(
                     )?;
                     for page_id in overflow_pages {
                         if !reachable.insert(page_id) {
-                            return Err(invalid_btree(format!(
+                            return Err(invalid_btree(storage_diagnostic!(
                                 "Tree {tree_id} references page {page_id} more than once"
                             )));
                         }
@@ -1769,7 +1798,7 @@ fn reclaim_tree<D: PageDevice>(
             }
             NodeKind::Internal(internal) => {
                 let expected_level = node.level.checked_sub(1).ok_or_else(|| {
-                    invalid_btree(format!(
+                    invalid_btree(storage_diagnostic!(
                         "Internal B-tree page {} has no child level",
                         current.page_id
                     ))
@@ -1834,7 +1863,7 @@ fn read_overflow_chain(
 ) -> Result<(Vec<u8>, Vec<PageId>)> {
     validate_overflow_descriptor(descriptor, leaf_generation)?;
     if descriptor.generation > view_generation {
-        return Err(invalid_overflow(format!(
+        return Err(invalid_overflow(storage_diagnostic!(
             "Overflow generation {} exceeds view generation {view_generation}",
             descriptor.generation
         )));
@@ -1846,7 +1875,7 @@ fn read_overflow_chain(
     let mut page_id = descriptor.first_page_id;
     for index in 0..chunk_count {
         if !visited.insert(page_id) {
-            return Err(invalid_overflow(format!(
+            return Err(invalid_overflow(storage_diagnostic!(
                 "Overflow chain contains a cycle through page {page_id}"
             )));
         }
@@ -1861,12 +1890,14 @@ fn read_overflow_chain(
         pages.push(page_id);
         if index + 1 < chunk_count {
             page_id = overflow.next_page_id.ok_or_else(|| {
-                invalid_overflow(format!("Overflow chain ended after page {page_id}"))
+                invalid_overflow(storage_diagnostic!(
+                    "Overflow chain ended after page {page_id}"
+                ))
             })?;
         }
     }
     if value.len() != descriptor.total_length as usize {
-        return Err(invalid_overflow(format!(
+        return Err(invalid_overflow(storage_diagnostic!(
             "Overflow chain materialized {} bytes, not {}",
             value.len(),
             descriptor.total_length
@@ -1920,7 +1951,7 @@ fn decode_leaf_cell(
         }
         OVERFLOW_CELL_FLAGS => {
             if value_length != OVERFLOW_DESCRIPTOR_SIZE {
-                return Err(invalid_btree(format!(
+                return Err(invalid_btree(storage_diagnostic!(
                     "Overflow descriptor is {value_length} bytes, not {OVERFLOW_DESCRIPTOR_SIZE}"
                 )));
             }
@@ -1958,7 +1989,7 @@ fn decode_internal_cell(bytes: &[u8], offset: usize) -> Result<(InternalEntry, u
         )));
     }
     if key_length > MAX_BTREE_KEY_BYTES {
-        return Err(invalid_btree(format!(
+        return Err(invalid_btree(storage_diagnostic!(
             "Internal key length {key_length} exceeds {MAX_BTREE_KEY_BYTES}"
         )));
     }
@@ -1975,7 +2006,7 @@ fn decode_internal_cell(bytes: &[u8], offset: usize) -> Result<(InternalEntry, u
 fn read_slot(bytes: &[u8], index: usize, free_start: usize) -> Result<usize> {
     let offset = NODE_HEADER_SIZE + index * SLOT_SIZE;
     if offset + SLOT_SIZE > free_start || offset + SLOT_SIZE > bytes.len() {
-        return Err(invalid_btree(format!(
+        return Err(invalid_btree(storage_diagnostic!(
             "B-tree slot {index} lies outside the slot array"
         )));
     }
@@ -1991,7 +2022,7 @@ fn validate_packed_cell(
     free_end: usize,
 ) -> Result<()> {
     if offset < free_end || cell_end != expected_cell_end {
-        return Err(invalid_btree(format!(
+        return Err(invalid_btree(storage_diagnostic!(
             "B-tree page {page_id} cell {index} is overlapping, out of order, or not tightly packed"
         )));
     }
@@ -2000,7 +2031,7 @@ fn validate_packed_cell(
 
 fn validate_cell_floor(page_id: PageId, actual: usize, expected: usize) -> Result<()> {
     if actual != expected {
-        return Err(invalid_btree(format!(
+        return Err(invalid_btree(storage_diagnostic!(
             "B-tree page {page_id} cell area starts at {actual}, not {expected}"
         )));
     }
@@ -2012,7 +2043,7 @@ fn checked_end(offset: usize, length: usize, bound: usize) -> Result<usize> {
         .checked_add(length)
         .ok_or_else(|| invalid_btree("B-tree cell offset overflowed"))?;
     if end > bound {
-        return Err(invalid_btree(format!(
+        return Err(invalid_btree(storage_diagnostic!(
             "B-tree cell range {offset}..{end} exceeds page payload {bound}"
         )));
     }
@@ -2037,7 +2068,7 @@ fn validate_sorted_internal_entries(
         validate_key(&entry.key)?;
         validate_child_page(page_id, entry.right_child)?;
         if !children.insert(entry.right_child) {
-            return Err(invalid_btree(format!(
+            return Err(invalid_btree(storage_diagnostic!(
                 "Internal page {page_id} references child {} more than once",
                 entry.right_child
             )));
@@ -2097,20 +2128,20 @@ fn validate_overflow_descriptor(
 ) -> Result<()> {
     validate_overflow_page_id(descriptor.first_page_id)?;
     if descriptor.generation == 0 || descriptor.generation > leaf_generation {
-        return Err(invalid_overflow(format!(
+        return Err(invalid_overflow(storage_diagnostic!(
             "Overflow generation {} is outside leaf generation {leaf_generation}",
             descriptor.generation
         )));
     }
     let total_length = descriptor.total_length as usize;
     if total_length == 0 || total_length > MAX_BTREE_VALUE_BYTES {
-        return Err(invalid_overflow(format!(
+        return Err(invalid_overflow(storage_diagnostic!(
             "Overflow total length {total_length} is outside 1..={MAX_BTREE_VALUE_BYTES}"
         )));
     }
     let chunk_count = total_length.div_ceil(MAX_OVERFLOW_CHUNK_BYTES);
     if chunk_count == 0 || chunk_count > MAX_OVERFLOW_PAGE_COUNT {
-        return Err(invalid_overflow(format!(
+        return Err(invalid_overflow(storage_diagnostic!(
             "Overflow descriptor requires invalid chunk count {chunk_count}"
         )));
     }
@@ -2119,7 +2150,7 @@ fn validate_overflow_descriptor(
 
 fn validate_overflow_page_id(page_id: PageId) -> Result<()> {
     if !(FIRST_DATA_PAGE_ID..MAX_PAGE_COUNT).contains(&page_id) {
-        return Err(invalid_overflow(format!(
+        return Err(invalid_overflow(storage_diagnostic!(
             "Overflow page ID {page_id} is outside the data-page range"
         )));
     }
@@ -2132,13 +2163,13 @@ fn overflow_chunk_length(
     chunk_count: usize,
 ) -> Result<usize> {
     if chunk_count == 0 || chunk_index >= chunk_count {
-        return Err(invalid_overflow(format!(
+        return Err(invalid_overflow(storage_diagnostic!(
             "Overflow chunk index {chunk_index} is outside count {chunk_count}"
         )));
     }
     let expected_count = total_length.div_ceil(MAX_OVERFLOW_CHUNK_BYTES);
     if expected_count != chunk_count {
-        return Err(invalid_overflow(format!(
+        return Err(invalid_overflow(storage_diagnostic!(
             "Overflow total length {total_length} needs {expected_count} chunks, not {chunk_count}"
         )));
     }
@@ -2174,7 +2205,7 @@ fn validate_decoded_inline_entry(key_length: usize, value_length: usize) -> Resu
         || value_length > MAX_BTREE_INLINE_VALUE_BYTES
         || key_length.saturating_add(value_length) > MAX_BTREE_INLINE_ENTRY_BYTES
     {
-        return Err(invalid_btree(format!(
+        return Err(invalid_btree(storage_diagnostic!(
             "Decoded inline entry lengths {key_length}+{value_length} exceed the supported bounds"
         )));
     }
@@ -2183,12 +2214,12 @@ fn validate_decoded_inline_entry(key_length: usize, value_length: usize) -> Resu
 
 fn validate_child_page(parent_page_id: PageId, child_page_id: PageId) -> Result<()> {
     if !(FIRST_DATA_PAGE_ID..MAX_PAGE_COUNT).contains(&child_page_id) {
-        return Err(invalid_btree(format!(
+        return Err(invalid_btree(storage_diagnostic!(
             "Internal page {parent_page_id} references invalid child page {child_page_id}"
         )));
     }
     if child_page_id == parent_page_id {
-        return Err(invalid_btree(format!(
+        return Err(invalid_btree(storage_diagnostic!(
             "Internal page {parent_page_id} references itself"
         )));
     }
@@ -2203,7 +2234,7 @@ fn validate_expected_level(
     if let Some(expected_level) = expected_level
         && actual_level != expected_level
     {
-        return Err(invalid_btree(format!(
+        return Err(invalid_btree(storage_diagnostic!(
             "B-tree page {page_id} has level {actual_level}, not its expected level {expected_level}"
         )));
     }
@@ -2218,7 +2249,7 @@ fn validate_child_generation(
     if let Some(parent_generation) = parent_generation
         && generation > parent_generation
     {
-        return Err(invalid_btree(format!(
+        return Err(invalid_btree(storage_diagnostic!(
             "B-tree page {page_id} generation {generation} is newer than its parent generation {parent_generation}"
         )));
     }
