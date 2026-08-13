@@ -1,8 +1,8 @@
 use serde_json::Value;
 
 use crate::{
-    ApplyOutcome, EngineError, ExecuteResult, InMemoryStorage, PageDevice, PagedStorage, QueryPlan,
-    QueryResult, Result, StorageReader, TableSchema,
+    ApplyOutcome, ChangeBatch, EngineError, ExecuteResult, InMemoryStorage, PageDevice,
+    PagedStorage, QueryPlan, QueryResult, Result, StorageReader, TableSchema,
     paged_transaction::{PagedReadView, PagedTransaction},
     statement::{PlannedDml, Statement, WriteStatement},
 };
@@ -59,6 +59,12 @@ impl<D: PageDevice> PagedEngine<D> {
     ) -> Result<ApplyOutcome> {
         self.ensure_no_transaction()?;
         self.storage.replace_table_snapshot(schema, rows)
+    }
+
+    /// Atomically applies page-native row upserts and deletes outside an explicit transaction.
+    pub fn apply_batch(&mut self, batch: &ChangeBatch) -> Result<ApplyOutcome> {
+        self.ensure_no_transaction()?;
+        self.storage.apply_batch(batch)
     }
 
     pub fn query(&self, plan: &QueryPlan) -> Result<QueryResult> {
@@ -608,6 +614,82 @@ mod tests {
             .unwrap();
         assert_eq!(inserted.revision, 1);
         assert_eq!(inserted.rows, vec![row(json!({"id": 1}))]);
+    }
+
+    #[test]
+    fn page_native_apply_batch_rejects_active_transactions_before_delegating() {
+        let source = source();
+        let mut engine =
+            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let revision = engine.revision();
+        let batch = ChangeBatch {
+            changes: vec![Change::Upsert {
+                table: "accounts".to_owned(),
+                row: row(json!({
+                    "id": 3,
+                    "email": "grace@example.com",
+                    "active": true,
+                })),
+            }],
+            ..ChangeBatch::default()
+        };
+
+        engine.begin_transaction().unwrap();
+        for blocked in [&ChangeBatch::default(), &batch] {
+            assert_eq!(
+                engine.apply_batch(blocked).unwrap_err().code,
+                "TRANSACTION_ACTIVE"
+            );
+        }
+        assert!(engine.in_transaction());
+        assert_eq!(engine.revision(), revision);
+        assert!(
+            engine
+                .query_sql("SELECT id FROM accounts WHERE id = 3", &[])
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+
+        engine.rollback_transaction().unwrap();
+        let outcome = engine.apply_batch(&batch).unwrap();
+        assert_eq!(outcome.revision, revision + 1);
+        assert_eq!(outcome.tables, vec!["accounts"]);
+        let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        assert_eq!(
+            reopened
+                .query_sql("SELECT email FROM accounts WHERE id = 3", &[])
+                .unwrap()
+                .rows,
+            vec![row(json!({"email": "grace@example.com"}))]
+        );
+    }
+
+    #[test]
+    fn empty_apply_batch_observes_ambiguous_publication_poison() {
+        let source = source();
+        let device = DurableDevice::default();
+        let control = device.clone();
+        let mut engine = PagedEngine::from_in_memory(device, &source).unwrap();
+        let batch = ChangeBatch {
+            changes: vec![Change::Upsert {
+                table: "accounts".to_owned(),
+                row: row(json!({
+                    "id": 3,
+                    "email": "grace@example.com",
+                    "active": false,
+                })),
+            }],
+            ..ChangeBatch::default()
+        };
+
+        control.arm_after_flush(3);
+        let publication = engine.apply_batch(&batch).unwrap_err();
+        assert_eq!(publication.code, "RECOVERY_REQUIRED");
+        assert_eq!(publication.retryable, None);
+        let empty = engine.apply_batch(&ChangeBatch::default()).unwrap_err();
+        assert_eq!(empty.code, "RECOVERY_REQUIRED");
+        assert_eq!(empty.retryable, None);
     }
 
     #[test]

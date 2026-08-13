@@ -9,6 +9,8 @@ pub type Result<T> = std::result::Result<T, EngineError>;
 pub struct EngineError {
     pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
 }
 
 impl EngineError {
@@ -16,7 +18,15 @@ impl EngineError {
         Self {
             code: code.into(),
             message: message.into(),
+            retryable: None,
         }
+    }
+
+    /// Annotates an error with transport retryability while keeping ordinary engine errors
+    /// unclassified.
+    pub fn with_retryable(mut self, retryable: bool) -> Self {
+        self.retryable = Some(retryable);
+        self
     }
 
     pub(crate) fn invalid_schema(message: impl Into<String>) -> Self {
@@ -113,3 +123,51 @@ impl Display for EngineError {
 }
 
 impl std::error::Error for EngineError {}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn retryability_is_optional_and_serializes_for_bridges() {
+        let ordinary = EngineError::new("ORDINARY", "ordinary failure");
+        assert_eq!(ordinary.retryable, None);
+        assert_eq!(
+            serde_json::to_value(&ordinary).unwrap(),
+            json!({"code": "ORDINARY", "message": "ordinary failure"})
+        );
+
+        for retryable in [false, true] {
+            let classified = EngineError::new("DEVICE", "device failure").with_retryable(retryable);
+            assert_eq!(classified.retryable, Some(retryable));
+            assert_eq!(
+                serde_json::to_value(&classified).unwrap(),
+                json!({
+                    "code": "DEVICE",
+                    "message": "device failure",
+                    "retryable": retryable,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn retryability_deserializes_from_new_and_legacy_bridge_shapes() {
+        let legacy: EngineError = serde_json::from_value(json!({
+            "code": "LEGACY",
+            "message": "legacy failure",
+        }))
+        .unwrap();
+        assert_eq!(legacy.retryable, None);
+
+        let classified: EngineError = serde_json::from_value(json!({
+            "code": "DEVICE",
+            "message": "device failure",
+            "retryable": true,
+        }))
+        .unwrap();
+        assert_eq!(classified.retryable, Some(true));
+    }
+}

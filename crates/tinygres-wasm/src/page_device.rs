@@ -226,7 +226,10 @@ fn js_device_error(error: JsValue, fallback_message: &str) -> EngineError {
     let message = string_property(&error, "message")
         .or_else(|| error.as_string())
         .unwrap_or_else(|| fallback_message.into());
-    EngineError::new(code, message)
+    with_retryability(
+        EngineError::new(code, message),
+        boolean_property(&error, "retryable"),
+    )
 }
 
 fn string_property(value: &JsValue, property: &str) -> Option<String> {
@@ -234,6 +237,19 @@ fn string_property(value: &JsValue, property: &str) -> Option<String> {
         .ok()
         .and_then(|value| value.as_string())
         .filter(|value| !value.is_empty())
+}
+
+fn boolean_property(value: &JsValue, property: &str) -> Option<bool> {
+    Reflect::get(value, &JsValue::from_str(property))
+        .ok()
+        .and_then(|value| value.as_bool())
+}
+
+fn with_retryability(error: EngineError, retryable: Option<bool>) -> EngineError {
+    match retryable {
+        Some(retryable) => error.with_retryable(retryable),
+        None => error,
+    }
 }
 
 #[cfg(test)]
@@ -274,5 +290,16 @@ mod tests {
             validate_buffer(PAGE_SIZE - 1).unwrap_err().code,
             "PAGE_DEVICE_ERROR",
         );
+    }
+
+    #[test]
+    fn native_bridge_helper_preserves_only_explicit_retryability() {
+        for retryable in [None, Some(false), Some(true)] {
+            let error = with_retryability(
+                EngineError::new("STORAGE_READ_FAILED", "read failed"),
+                retryable,
+            );
+            assert_eq!(error.retryable, retryable);
+        }
     }
 }
