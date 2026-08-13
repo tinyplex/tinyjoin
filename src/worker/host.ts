@@ -11,7 +11,11 @@ import {
   type WorkerRequest,
   type WorkerResponse,
 } from '../protocol.js';
-import {createWasmEngine, type WorkerEngine} from './engine.js';
+import {
+  createWasmEngine,
+  type WorkerEngine,
+  type WorkerEngineFactory,
+} from './engine.js';
 import {
   bindOpfsStorageName,
   builtinSourceConfigurationKey,
@@ -41,7 +45,7 @@ export interface WorkerScope {
 export interface StartWorkerOptions {
   source?: ReplicaSource;
   scope?: WorkerScope;
-  engineFactory?: () => Promise<WorkerEngine>;
+  engineFactory?: WorkerEngineFactory;
   builtinSourceFactory?: BuiltinSourceFactory;
   sourceIdentityHasher?: SourceIdentityHasher;
 }
@@ -536,7 +540,7 @@ function workerError(code: string, message: string): Error {
 async function createSourceBoundEngine(
   storage: StorageOptions,
   source: PreparedBuiltinSource | undefined,
-  engineFactory: () => Promise<WorkerEngine>,
+  engineFactory: WorkerEngineFactory,
   sourceIdentityHasher: SourceIdentityHasher | undefined,
 ): Promise<WorkerEngine> {
   if (storage.kind !== 'opfs' || !source) {
@@ -552,9 +556,9 @@ async function createSourceBoundEngine(
 
 async function createConfiguredEngine(
   storage: StorageOptions,
-  engineFactory: () => Promise<WorkerEngine>,
+  engineFactory: WorkerEngineFactory,
 ): Promise<WorkerEngine> {
-  const engine = await engineFactory();
+  const engine = await engineFactory(storage);
   if (storage.kind === 'memory') {
     return engine;
   }

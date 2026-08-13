@@ -9,4 +9,4 @@ export type {
   StartWorkerOptions,
   WorkerScope,
 } from './host.js';
-export type {WorkerEngine} from './engine.js';
+export type {WorkerEngine, WorkerEngineFactory} from './engine.js';

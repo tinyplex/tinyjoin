@@ -6,6 +6,7 @@ import type {
   QueryResult,
   Row,
   SqlResult,
+  StorageOptions,
   TableSchema,
 } from '../protocol.js';
 
@@ -47,7 +48,13 @@ export interface WorkerEngine {
   close?(): void;
 }
 
-export async function createWasmEngine(): Promise<WorkerEngine> {
+export type WorkerEngineFactory = (
+  resolvedStorage: StorageOptions,
+) => Promise<WorkerEngine>;
+
+export async function createWasmEngine(
+  _resolvedStorage: StorageOptions,
+): Promise<WorkerEngine> {
   const wasm = await import('../wasm/tinygres_wasm.js');
   await wasm.default();
   const engine = new wasm.WasmEngine();

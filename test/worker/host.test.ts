@@ -976,6 +976,33 @@ describe('startWorker', () => {
     expect(engine.close).toHaveBeenCalledOnce();
   });
 
+  it('passes the resolved source-bound storage name to the engine factory', async () => {
+    const scope = new FakeScope();
+    const engineFactory = vi.fn(async () => mockEngine());
+    startWorker({
+      scope,
+      engineFactory,
+      sourceIdentityHasher: async () => 'a'.repeat(64),
+    });
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 1,
+      method: 'init',
+      params: {
+        schemas: [],
+        storage: {kind: 'opfs', name: 'logical-name'},
+        source: builtInSource(),
+      },
+    } satisfies WorkerRequest);
+    await vi.waitFor(() => expect(scope.closed).toBe(true));
+
+    expect(engineFactory).toHaveBeenCalledOnce();
+    expect(engineFactory).toHaveBeenCalledWith({
+      kind: 'opfs',
+      name: 'a'.repeat(64),
+    });
+  });
+
   it('starts an app-owned custom source even when its id is empty', async () => {
     const scope = new FakeScope();
     const source: ReplicaSource = {
