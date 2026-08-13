@@ -10,6 +10,7 @@ mod page;
 mod paged_codec;
 mod paged_engine;
 mod paged_storage;
+mod paged_transaction;
 mod pager;
 mod prepared;
 mod query;

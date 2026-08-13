@@ -820,6 +820,14 @@ fn validate_index_definition(
     definition: &IndexDefinition,
     tables: &BTreeMap<String, TableData>,
 ) -> Result<()> {
+    validate_index_definition_shape(definition)?;
+    let table = tables
+        .get(&definition.table)
+        .ok_or_else(|| EngineError::table_not_found(&definition.table))?;
+    validate_index_columns_for_schema(definition, &table.schema)
+}
+
+pub(crate) fn validate_index_definition_shape(definition: &IndexDefinition) -> Result<()> {
     validate_catalog_name_bound(&definition.name)
         .map_err(|error| EngineError::invalid_schema(error.message))?;
     validate_catalog_name_bound(&definition.table)
@@ -833,10 +841,15 @@ fn validate_index_definition(
             definition.name
         )));
     }
-    let table = tables
-        .get(&definition.table)
-        .ok_or_else(|| EngineError::table_not_found(&definition.table))?;
-    if table.schema.columns.is_empty() {
+    Ok(())
+}
+
+pub(crate) fn validate_index_columns_for_schema(
+    definition: &IndexDefinition,
+    schema: &TableSchema,
+) -> Result<()> {
+    debug_assert_eq!(definition.table, schema.name);
+    if schema.columns.is_empty() {
         return Err(EngineError::unsupported_sql(format!(
             "Index `{}` requires a typed table catalog",
             definition.name
@@ -852,8 +865,7 @@ fn validate_index_definition(
                 definition.name
             )));
         }
-        let column = table
-            .schema
+        let column = schema
             .columns
             .iter()
             .find(|column| column.name == *name)

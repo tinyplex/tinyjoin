@@ -7,7 +7,10 @@ use crate::query::{
     Token, bind_parameter, is_reserved_keyword, matches_predicate, parse_predicate_at, tokenize,
     validate_predicate_columns, validate_sql_input,
 };
-use crate::storage::{estimated_row_bytes, estimated_value_bytes, normalize_row, row_key};
+use crate::storage::{
+    estimated_row_bytes, estimated_value_bytes, normalize_row, row_key,
+    validate_index_columns_for_schema, validate_index_definition_shape,
+};
 use crate::{
     Change, ColumnDefinition, ColumnType, EngineError, Predicate, QueryPlan, Result, Row,
     StorageDriver, StorageReader, TableSchema, VisitControl, VisitOutcome,
@@ -285,7 +288,23 @@ fn create_index<S: StorageDriver>(
     definition: &crate::IndexDefinition,
     if_not_exists: bool,
 ) -> Result<WriteOutcome> {
-    if storage.index_definition(&definition.name).is_some() {
+    let outcome = plan_create_index(storage, definition, if_not_exists)?;
+    if outcome.mutated {
+        storage.define_index(definition.clone())?;
+    }
+    Ok(outcome)
+}
+
+pub(crate) fn plan_create_index<S: StorageReader>(
+    storage: &S,
+    definition: &crate::IndexDefinition,
+    if_not_exists: bool,
+) -> Result<WriteOutcome> {
+    if let Some(existing) = storage.index_definition(&definition.name) {
+        // The metadata probe is infallible so page storage can report its last confirmed
+        // catalog after an ambiguous commit. Force a fallible read before accepting the duplicate
+        // name, while still checking that name before the requested table or columns.
+        storage.table_schema(&existing.table)?;
         if if_not_exists {
             return Ok(WriteOutcome {
                 command: "CREATE INDEX",
@@ -297,7 +316,9 @@ fn create_index<S: StorageDriver>(
         }
         return Err(EngineError::index_already_exists(&definition.name));
     }
-    storage.define_index(definition.clone())?;
+    validate_index_definition_shape(definition)?;
+    let schema = storage.table_schema(&definition.table)?;
+    validate_index_columns_for_schema(definition, &schema)?;
     Ok(WriteOutcome {
         command: "CREATE INDEX",
         row_count: 0,
@@ -580,13 +601,16 @@ fn plan_update<S: StorageReader>(
         }
         if update.new_key != update.old_key
             && !old_keys.contains(update.new_key.as_str())
-            && storage
-                .lookup_primary_key(table, &update.new_row)?
-                .is_some()
+            && let Some(existing) = storage.lookup_primary_key(table, &update.new_row)?
         {
-            return Err(EngineError::constraint_violation(format!(
-                "UPDATE of `{table}` would duplicate a primary key"
-            )));
+            // Page storage canonicalizes typed physical keys. A spelling-only FLOAT update such
+            // as `0` to `-0.0` therefore finds its own source row at the destination key; only a
+            // hit on a different logical source row is a collision.
+            if row_key(&schema, &existing)? != update.old_key {
+                return Err(EngineError::constraint_violation(format!(
+                    "UPDATE of `{table}` would duplicate a primary key"
+                )));
+            }
         }
     }
 
