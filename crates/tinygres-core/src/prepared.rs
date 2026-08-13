@@ -191,14 +191,14 @@ pub(crate) fn apply_payload(
             CommitOperation::DropIndex { name, .. } => candidate.drop_index(name)?,
         }
     }
-    candidate.set_revision(payload.revision_after);
+    candidate.set_revision(payload.revision_after)?;
     Ok(candidate)
 }
 
 fn apply_changes_unrevisioned(candidate: &mut InMemoryStorage, batch: ChangeBatch) -> Result<()> {
     let revision = candidate.revision();
     candidate.apply_batch(&batch)?;
-    candidate.set_revision(revision);
+    candidate.set_revision(revision)?;
     Ok(())
 }
 
@@ -391,6 +391,10 @@ fn decode_payload(bytes: &[u8]) -> Result<CommitPayload> {
 }
 
 fn validate_payload(payload: &CommitPayload) -> Result<()> {
+    crate::revision::validate_database_revision(payload.revision_before)
+        .map_err(|error| invalid_commit(error.message))?;
+    crate::revision::validate_database_revision(payload.revision_after)
+        .map_err(|error| invalid_commit(error.message))?;
     if payload.operations.is_empty() && payload.revision_after == payload.revision_before {
         return Err(invalid_commit(
             "A prepared commit must change database state",
@@ -479,4 +483,46 @@ fn validate_payload(payload: &CommitPayload) -> Result<()> {
 
 fn invalid_commit(message: impl Into<String>) -> EngineError {
     EngineError::new("INVALID_PREPARED_COMMIT", message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{StorageReader, revision::MAX_DATABASE_REVISION};
+
+    fn create_table_payload(revision: u64) -> CommitPayload {
+        CommitPayload {
+            revision_before: revision,
+            revision_after: revision,
+            tables: vec!["items".to_owned()],
+            operations: vec![CommitOperation::CreateTable {
+                schema: TableSchema {
+                    name: "items".to_owned(),
+                    primary_key: vec!["id".to_owned()],
+                    columns: vec![],
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn prepared_commit_revision_bound_is_validated_before_replay() {
+        let maximum_bytes = encode_payload(&create_table_payload(MAX_DATABASE_REVISION)).unwrap();
+        let (_, maximum) = PreparedCommit::decode(&maximum_bytes).unwrap();
+        let mut storage = InMemoryStorage::default();
+        storage.set_revision(MAX_DATABASE_REVISION).unwrap();
+        let replayed = apply_payload(&storage, &maximum).unwrap();
+        assert_eq!(replayed.revision(), MAX_DATABASE_REVISION);
+        assert_eq!(replayed.table_schema("items").unwrap().name, "items");
+
+        let unsupported = create_table_payload(MAX_DATABASE_REVISION + 1);
+        let bytes = encode_payload(&unsupported).unwrap();
+        let error = PreparedCommit::decode(&bytes).unwrap_err();
+        assert_eq!(error.code, "INVALID_PREPARED_COMMIT");
+        assert_eq!(storage.revision(), MAX_DATABASE_REVISION);
+        assert_eq!(
+            storage.table_schema("items").unwrap_err().code,
+            "TABLE_NOT_FOUND"
+        );
+    }
 }

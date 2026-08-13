@@ -372,6 +372,9 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
         catalog_root_page_id: Option<PageId>,
     ) -> Result<()> {
         self.ensure_open()?;
+        if let Err(error) = crate::revision::validate_database_revision(database_revision) {
+            return self.fail_before_superblock(error);
+        }
         if self.new_pages != self.written_pages {
             let unwritten = self
                 .new_pages
@@ -740,6 +743,43 @@ mod tests {
         let mut reopened = Pager::open_or_create(device).unwrap();
         assert_eq!(reopened.catalog_root_page_id(), Some(root));
         assert_eq!(reopened.read_page(root).unwrap().payload, vec![7]);
+    }
+
+    #[test]
+    fn revision_exhaustion_rejects_publication_before_device_io() {
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let root;
+        {
+            let mut transaction = pager.begin_write().unwrap();
+            root = transaction.allocate_page().unwrap();
+            transaction.write_new_page(&leaf(root, 7)).unwrap();
+            transaction
+                .commit(crate::revision::MAX_DATABASE_REVISION, 0, Some(root))
+                .unwrap();
+        }
+        let flushes = pager.device.0.borrow().flush_count();
+        let transaction = pager.begin_write().unwrap();
+        assert_eq!(
+            transaction
+                .commit(crate::revision::MAX_DATABASE_REVISION + 1, 0, Some(root),)
+                .unwrap_err()
+                .code,
+            "REVISION_OVERFLOW"
+        );
+        assert_eq!(pager.device.0.borrow().flush_count(), flushes);
+        assert!(!pager.is_recovery_required());
+        assert_eq!(
+            pager.database_revision(),
+            crate::revision::MAX_DATABASE_REVISION
+        );
+
+        let device = pager.into_device();
+        let reopened = Pager::open_or_create(device).unwrap();
+        assert_eq!(
+            reopened.database_revision(),
+            crate::revision::MAX_DATABASE_REVISION
+        );
+        assert_eq!(reopened.catalog_root_page_id(), Some(root));
     }
 
     #[test]

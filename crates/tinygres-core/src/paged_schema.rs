@@ -52,7 +52,7 @@ pub(crate) struct PublishedTableReplacement {
 }
 
 pub(crate) struct AddColumnPlan {
-    pub base_revision: u64,
+    pub revision: u64,
     pub header: (Vec<u8>, Vec<u8>),
     pub old_schema: TableSchema,
     pub new_schema: TableSchema,
@@ -78,6 +78,7 @@ pub(crate) fn publish_schema_drop<D: PageDevice>(
     pager: &mut Pager<D>,
     plan: SchemaDropPlan,
 ) -> Result<()> {
+    crate::revision::validate_database_revision(plan.revision)?;
     let applied_journal_sequence = pager.applied_journal_sequence();
     let catalog_root = pager.catalog_root_page_id().ok_or_else(|| {
         EngineError::new(
@@ -137,6 +138,7 @@ pub(crate) fn publish_table_replacement<D: PageDevice>(
     pager: &mut Pager<D>,
     plan: TableReplacementPlan,
 ) -> Result<PublishedTableReplacement> {
+    crate::revision::validate_database_revision(plan.revision)?;
     let applied_journal_sequence = pager.applied_journal_sequence();
     let existing_catalog_root = pager.catalog_root_page_id();
     let mut transaction = pager.begin_write()?;
@@ -314,6 +316,7 @@ pub(crate) fn publish_added_column<D: PageDevice>(
     pager: &mut Pager<D>,
     plan: AddColumnPlan,
 ) -> Result<PublishedColumnAddition> {
+    crate::revision::validate_database_revision(plan.revision)?;
     let applied_journal_sequence = pager.applied_journal_sequence();
     let catalog_root = pager
         .catalog_root_page_id()
@@ -416,10 +419,6 @@ pub(crate) fn publish_added_column<D: PageDevice>(
             )));
         }
 
-        let revision = plan
-            .base_revision
-            .checked_add(1)
-            .ok_or_else(|| EngineError::new("REVISION_OVERFLOW", "Database revision overflowed"))?;
         let (table_key, table_value) = encode_catalog_table_record(&CatalogTableRecord {
             schema: plan.new_schema.clone(),
             tree_id: plan.new_tree_id,
@@ -440,18 +439,18 @@ pub(crate) fn publish_added_column<D: PageDevice>(
             &table_key,
             &table_value,
         )?;
-        Ok((revision, catalog_root, new_root_page_id))
+        Ok((catalog_root, new_root_page_id))
     })();
-    let (revision, catalog_root, root_page_id) = match result {
+    let (catalog_root, root_page_id) = match result {
         Ok(result) => result,
         Err(error) => {
             transaction.abort();
             return Err(error);
         }
     };
-    transaction.commit(revision, applied_journal_sequence, Some(catalog_root))?;
+    transaction.commit(plan.revision, applied_journal_sequence, Some(catalog_root))?;
     Ok(PublishedColumnAddition {
-        revision,
+        revision: plan.revision,
         schema: plan.new_schema,
         tree_id: plan.new_tree_id,
         root_page_id,

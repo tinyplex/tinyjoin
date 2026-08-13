@@ -145,6 +145,11 @@ struct PreparedIndexChange {
     new_key: Option<String>,
 }
 
+struct PreparedTableReplacement {
+    rows: BTreeMap<String, Row>,
+    indexes: BTreeMap<String, IndexData>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StorageSnapshot {
@@ -163,6 +168,7 @@ struct TableSnapshot {
 
 impl InMemoryStorage {
     pub fn export_snapshot(&self) -> Result<Vec<u8>> {
+        crate::revision::validate_database_revision(self.revision)?;
         let snapshot = StorageSnapshot {
             revision: self.revision,
             tables: self
@@ -190,6 +196,8 @@ impl InMemoryStorage {
 
     fn from_snapshot(bytes: &[u8]) -> Result<Self> {
         let snapshot: StorageSnapshot = crate::snapshot::decode(bytes)?;
+        crate::revision::validate_database_revision(snapshot.revision)
+            .map_err(snapshot_validation_error)?;
         let mut tables = BTreeMap::new();
 
         for table in snapshot.tables {
@@ -273,6 +281,42 @@ impl InMemoryStorage {
         Ok(indexes)
     }
 
+    fn prepare_table_replacement(
+        &self,
+        table: &str,
+        rows: Vec<Row>,
+    ) -> Result<PreparedTableReplacement> {
+        let current = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::table_not_found(table))?;
+        let mut replacement = BTreeMap::new();
+
+        for row in rows {
+            let row = normalize_row(&current.schema, row)?;
+            let key = row_key(&current.schema, &row)?;
+            if replacement.insert(key, row).is_some() {
+                return Err(EngineError::invalid_change(format!(
+                    "Snapshot for `{table}` contains a duplicate primary key"
+                )));
+            }
+        }
+
+        let indexes = self.rebuilt_indexes_for_table(table, &replacement)?;
+        Ok(PreparedTableReplacement {
+            rows: replacement,
+            indexes,
+        })
+    }
+
+    fn install_table_replacement(&mut self, table: &str, replacement: PreparedTableReplacement) {
+        self.tables
+            .get_mut(table)
+            .expect("the prepared replacement table still exists")
+            .rows = replacement.rows;
+        self.indexes = replacement.indexes;
+    }
+
     pub(crate) fn table_names(&self) -> impl Iterator<Item = &str> {
         self.tables.keys().map(String::as_str)
     }
@@ -301,7 +345,14 @@ impl InMemoryStorage {
         self.indexes.get(name).map(|index| &index.definition)
     }
 
-    pub(crate) fn set_revision(&mut self, revision: u64) {
+    pub(crate) fn set_revision(&mut self, revision: u64) -> Result<()> {
+        crate::revision::validate_database_revision(revision)?;
+        self.revision = revision;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_revision_unchecked_for_test(&mut self, revision: u64) {
         self.revision = revision;
     }
 }
@@ -371,19 +422,27 @@ impl StorageDriver for InMemoryStorage {
         let table = schema.name.clone();
         let mut candidate = self.clone();
         candidate.define_table(schema)?;
-        let outcome = candidate.replace_table(&table, rows)?;
+        let replacement = candidate.prepare_table_replacement(&table, rows)?;
+        candidate.revision = next_revision(self.revision)?;
+        candidate.install_table_replacement(&table, replacement);
+        let outcome = ApplyOutcome {
+            revision: candidate.revision,
+            tables: vec![table],
+        };
         *self = candidate;
         Ok(outcome)
     }
 
     fn replace_table(&mut self, table: &str, rows: Vec<Row>) -> Result<ApplyOutcome> {
-        self.replace_table_unrevisioned(table, rows)?;
-        self.advance_revision()?;
-
-        Ok(ApplyOutcome {
-            revision: self.revision,
+        let replacement = self.prepare_table_replacement(table, rows)?;
+        let revision = next_revision(self.revision)?;
+        self.install_table_replacement(table, replacement);
+        self.revision = revision;
+        let outcome = ApplyOutcome {
+            revision,
             tables: vec![table.to_owned()],
-        })
+        };
+        Ok(outcome)
     }
 
     fn apply_batch(&mut self, batch: &ChangeBatch) -> Result<ApplyOutcome> {
@@ -657,28 +716,8 @@ impl StorageDriver for InMemoryStorage {
     }
 
     fn replace_table_unrevisioned(&mut self, table: &str, rows: Vec<Row>) -> Result<()> {
-        let current = self
-            .tables
-            .get(table)
-            .ok_or_else(|| EngineError::table_not_found(table))?;
-        let mut replacement = BTreeMap::new();
-
-        for row in rows {
-            let row = normalize_row(&current.schema, row)?;
-            let key = row_key(&current.schema, &row)?;
-            if replacement.insert(key, row).is_some() {
-                return Err(EngineError::invalid_change(format!(
-                    "Snapshot for `{table}` contains a duplicate primary key"
-                )));
-            }
-        }
-
-        let indexes = self.rebuilt_indexes_for_table(table, &replacement)?;
-        self.tables
-            .get_mut(table)
-            .expect("table was checked above")
-            .rows = replacement;
-        self.indexes = indexes;
+        let replacement = self.prepare_table_replacement(table, rows)?;
+        self.install_table_replacement(table, replacement);
         Ok(())
     }
 
@@ -1773,9 +1812,7 @@ fn unique_index_violation(index: &str) -> EngineError {
 }
 
 fn next_revision(revision: u64) -> Result<u64> {
-    revision
-        .checked_add(1)
-        .ok_or_else(|| EngineError::new("REVISION_OVERFLOW", "Database revision overflowed"))
+    crate::revision::next_database_revision(revision)
 }
 
 fn snapshot_validation_error(error: EngineError) -> EngineError {
@@ -2379,6 +2416,64 @@ mod tests {
             storage.scan_table("posts").unwrap(),
             vec![row(json!({"id": 1, "title": "kept"}))]
         );
+    }
+
+    #[test]
+    fn snapshot_revision_bound_is_exact_and_exhaustion_is_atomic() {
+        let maximum = StorageSnapshot {
+            revision: crate::revision::MAX_DATABASE_REVISION,
+            indexes: vec![],
+            tables: vec![TableSnapshot {
+                schema: TableSchema {
+                    name: "posts".to_owned(),
+                    primary_key: vec!["id".to_owned()],
+                    columns: vec![],
+                },
+                rows: vec![row(json!({"id": 1, "title": "kept"}))],
+            }],
+        };
+        let mut storage =
+            InMemoryStorage::from_snapshot(&crate::snapshot::encode(&maximum).unwrap()).unwrap();
+        assert_eq!(storage.revision(), crate::revision::MAX_DATABASE_REVISION);
+
+        let error = storage
+            .replace_table("posts", vec![row(json!({"id": 2, "title": "new"}))])
+            .unwrap_err();
+        assert_eq!(error.code, "REVISION_OVERFLOW");
+        assert_eq!(
+            storage.scan_table("posts").unwrap(),
+            vec![row(json!({"id": 1, "title": "kept"}))]
+        );
+        assert_eq!(storage.revision(), crate::revision::MAX_DATABASE_REVISION);
+
+        let error = storage
+            .apply_batch(&ChangeBatch {
+                changes: vec![Change::Upsert {
+                    table: "posts".to_owned(),
+                    row: row(json!({"id": 2, "title": "batch"})),
+                }],
+                ..ChangeBatch::default()
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "REVISION_OVERFLOW");
+        assert_eq!(
+            storage.scan_table("posts").unwrap(),
+            vec![row(json!({"id": 1, "title": "kept"}))]
+        );
+
+        let unsupported = StorageSnapshot {
+            revision: crate::revision::MAX_DATABASE_REVISION + 1,
+            ..maximum
+        };
+        let error = storage
+            .import_snapshot(&crate::snapshot::encode(&unsupported).unwrap())
+            .unwrap_err();
+        assert_eq!(error.code, "INVALID_SNAPSHOT");
+        assert_eq!(
+            storage.scan_table("posts").unwrap(),
+            vec![row(json!({"id": 1, "title": "kept"}))]
+        );
+        assert_eq!(storage.revision(), crate::revision::MAX_DATABASE_REVISION);
     }
 
     #[test]

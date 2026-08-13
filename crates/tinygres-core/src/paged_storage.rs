@@ -92,6 +92,8 @@ impl<D: PageDevice> PagedStorage<D> {
     pub fn open(device: D) -> Result<Self> {
         let mut pager = Pager::open_or_create(device)?;
         let revision = pager.database_revision();
+        crate::revision::validate_database_revision(revision)
+            .map_err(|error| storage_corrupt(error.message))?;
         let Some(catalog_root_page_id) = pager.catalog_root_page_id() else {
             if revision != 0
                 || pager.applied_journal_sequence() != 0
@@ -152,6 +154,7 @@ impl<D: PageDevice> PagedStorage<D> {
                 "Paged import requires a device without a published database",
             ));
         }
+        let revision = crate::revision::validate_database_revision(source.revision())?;
 
         // Reject catalog-wide bounds before cloning schemas or retaining any source rows. Table
         // rows remain borrowed and are streamed into the one pager candidate below.
@@ -223,7 +226,6 @@ impl<D: PageDevice> PagedStorage<D> {
         preflight_import_operations(&table_inputs, index_inputs.len())?;
         preflight_import_rows(metadata_bytes, &table_inputs, &index_inputs)?;
 
-        let revision = source.revision();
         let mut transaction = pager.begin_write()?;
         let mut table_records = Vec::with_capacity(table_inputs.len());
         for input in &table_inputs {
@@ -513,9 +515,7 @@ impl<D: PageDevice> PagedStorage<D> {
         // Encode every application-level value before allocating candidate pages.
         let header = encode_catalog_header_record(&header)?;
         let revision = if advance_revision {
-            self.revision.checked_add(1).ok_or_else(|| {
-                EngineError::new("REVISION_OVERFLOW", "Database revision overflowed")
-            })?
+            crate::revision::next_database_revision(self.revision)?
         } else {
             self.revision
         };
@@ -590,10 +590,7 @@ impl<D: PageDevice> PagedStorage<D> {
         let next_tree_id = tree_id
             .checked_add(1)
             .ok_or_else(|| limit_error("The catalog tree ID range is exhausted"))?;
-        let revision = self
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| EngineError::new("REVISION_OVERFLOW", "Database revision overflowed"))?;
+        let revision = crate::revision::next_database_revision(self.revision)?;
         let index_count = u32::try_from(self.indexes.len() + 1)
             .map_err(|_| limit_error("The catalog contains too many indexes"))?;
         let header = encode_catalog_header_record(&CatalogHeader {
@@ -789,10 +786,7 @@ impl<D: PageDevice> PagedStorage<D> {
             .len()
             .checked_sub(1)
             .ok_or_else(|| storage_corrupt("The catalog index count underflowed"))?;
-        let revision = self
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| EngineError::new("REVISION_OVERFLOW", "Database revision overflowed"))?;
+        let revision = crate::revision::next_database_revision(self.revision)?;
         let header = encode_catalog_header_record(&CatalogHeader {
             next_tree_id: self.next_tree_id,
             table_count: u32::try_from(self.tables.len())
@@ -873,10 +867,7 @@ impl<D: PageDevice> PagedStorage<D> {
             .len()
             .checked_sub(dropped_index_count)
             .ok_or_else(|| storage_corrupt("The catalog index count underflowed"))?;
-        let revision = self
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| EngineError::new("REVISION_OVERFLOW", "Database revision overflowed"))?;
+        let revision = crate::revision::next_database_revision(self.revision)?;
         let header = encode_catalog_header_record(&CatalogHeader {
             next_tree_id: self.next_tree_id,
             table_count: u32::try_from(table_count)
@@ -931,6 +922,9 @@ impl<D: PageDevice> PagedStorage<D> {
                 column.name
             )));
         }
+        // The revision is a public JavaScript number. Reject exhaustion after logical statement
+        // validation, but before any catalog clone, row scan, or pager candidate can be created.
+        let revision = crate::revision::next_database_revision(self.revision)?;
 
         // Bound borrowed metadata before constructing the owned prospective schema and plan.
         let current_schema_work = estimated_schema_work_bytes(&table.schema)?;
@@ -987,7 +981,7 @@ impl<D: PageDevice> PagedStorage<D> {
         drop(provisional_table);
 
         let plan = AddColumnPlan {
-            base_revision: self.revision,
+            revision,
             header,
             old_schema: table.schema.clone(),
             new_schema,
@@ -1220,10 +1214,7 @@ impl<D: PageDevice> PagedStorage<D> {
                 "A catalog cannot contain more than {MAX_CATALOG_TABLES} tables"
             )));
         }
-        let revision = self
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| EngineError::new("REVISION_OVERFLOW", "Database revision overflowed"))?;
+        let revision = crate::revision::next_database_revision(self.revision)?;
         let header = encode_catalog_header_record(&CatalogHeader {
             next_tree_id,
             table_count: u32::try_from(table_count)
@@ -1554,10 +1545,7 @@ impl<D: PageDevice> PagedStorage<D> {
             tables: changes,
         } = write_set;
 
-        let revision = self
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| EngineError::new("REVISION_OVERFLOW", "Database revision overflowed"))?;
+        let revision = crate::revision::next_database_revision(self.revision)?;
         let mut next_tables = self.tables.clone();
         let mut next_indexes = self.indexes.clone();
         let mut pager = self.pager.borrow_mut();
@@ -3030,7 +3018,7 @@ mod tests {
     use super::*;
     use crate::{
         ColumnDefinition, ColumnType, Engine, MAX_BTREE_KEY_BYTES, MemoryPageDevice, PAGE_SIZE,
-        PageDevice, QueryResult, StorageDriver,
+        Page, PageDevice, QueryResult, StorageDriver, SuperblockSlot,
     };
 
     #[derive(Clone)]
@@ -3287,6 +3275,118 @@ mod tests {
         let ordinary =
             PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
         assert_eq!(ordinary.applied_journal_sequence(), 0);
+    }
+
+    #[test]
+    fn paged_revision_boundary_publishes_max_and_rejects_the_next_candidate_before_page_work() {
+        let mut source = source();
+        source
+            .set_revision(crate::revision::MAX_DATABASE_REVISION - 1)
+            .unwrap();
+        let device = CountingDevice::new();
+        let control = device.clone();
+        let mut paged = PagedStorage::from_in_memory(device, &source).unwrap();
+        let outcome = paged
+            .apply_batch(&ChangeBatch {
+                changes: vec![Change::Upsert {
+                    table: "posts".to_owned(),
+                    row: row(json!({
+                        "id": 10,
+                        "author_id": 1,
+                        "state": "published",
+                        "rank": 2,
+                    })),
+                }],
+                ..ChangeBatch::default()
+            })
+            .unwrap();
+        assert_eq!(outcome.revision, crate::revision::MAX_DATABASE_REVISION);
+        let page_count = control.page_count();
+        let flush_count = control.inner.borrow().flush_count();
+        let error = paged
+            .apply_batch(&ChangeBatch {
+                changes: vec![Change::Upsert {
+                    table: "posts".to_owned(),
+                    row: row(json!({
+                        "id": 10,
+                        "author_id": 1,
+                        "state": "archived",
+                        "rank": 2,
+                    })),
+                }],
+                ..ChangeBatch::default()
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "REVISION_OVERFLOW");
+        assert_eq!(control.page_count(), page_count);
+        assert_eq!(control.inner.borrow().flush_count(), flush_count);
+        assert!(!paged.pager.borrow().is_recovery_required());
+
+        let reopened = PagedStorage::open(paged.into_device()).unwrap();
+        assert_eq!(reopened.revision(), crate::revision::MAX_DATABASE_REVISION);
+        assert_eq!(
+            reopened
+                .lookup_primary_key("posts", &row(json!({"id": 10})))
+                .unwrap(),
+            Some(row(json!({
+                "id": 10,
+                "author_id": 1,
+                "state": "published",
+                "rank": 2,
+            })))
+        );
+    }
+
+    #[test]
+    fn paged_import_and_reopen_reject_revisions_above_the_safe_bound() {
+        let mut unsupported = InMemoryStorage::default();
+        unsupported.set_revision_unchecked_for_test(crate::revision::MAX_DATABASE_REVISION + 1);
+        let device = CountingDevice::new();
+        let control = device.clone();
+        let error = match PagedStorage::from_in_memory(device, &unsupported) {
+            Ok(_) => panic!("an unsupported source revision must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "REVISION_OVERFLOW");
+        assert_eq!(control.page_count(), crate::FIRST_DATA_PAGE_ID);
+        assert!(PagedStorage::open(control).unwrap().tables.is_empty());
+
+        let target =
+            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source()).unwrap();
+        let target_device = target.into_device();
+        let error = match PagedStorage::from_in_memory(target_device.clone(), &unsupported) {
+            Ok(_) => panic!("a nonempty target must win before source revision validation"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "DATABASE_NOT_EMPTY");
+        assert_eq!(PagedStorage::open(target_device).unwrap().revision(), 2);
+
+        let mut maximum = InMemoryStorage::default();
+        maximum
+            .set_revision(crate::revision::MAX_DATABASE_REVISION)
+            .unwrap();
+        let paged =
+            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &maximum).unwrap();
+        let slot = paged.pager.borrow().active_metadata().superblock.slot;
+        let mut device = paged.into_device();
+        let superblock_page_id = match slot {
+            SuperblockSlot::A => 0,
+            SuperblockSlot::B => 1,
+        };
+        let mut bytes = [0; PAGE_SIZE];
+        device.read_page(superblock_page_id, &mut bytes).unwrap();
+        let mut page = Page::decode(&bytes).unwrap();
+        page.payload[32..40]
+            .copy_from_slice(&(crate::revision::MAX_DATABASE_REVISION + 1).to_le_bytes());
+        device
+            .write_page(superblock_page_id, &page.encode().unwrap())
+            .unwrap();
+        device.flush().unwrap();
+        let error = match PagedStorage::open(device) {
+            Ok(_) => panic!("an unsupported persisted revision must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "UNSUPPORTED_PAGE");
     }
 
     #[test]
@@ -5151,7 +5251,7 @@ mod tests {
     }
 
     #[test]
-    fn add_column_row_growth_error_precedes_revision_overflow() {
+    fn add_column_revision_exhaustion_precedes_row_rewrite_and_page_work() {
         let schema = schema(
             "large",
             &[
@@ -5175,18 +5275,27 @@ mod tests {
         let mut expected = source.clone();
         let expected_error = expected.add_column("large", column.clone()).unwrap_err();
         assert_eq!(expected_error.code, "INVALID_CHANGE");
+        source
+            .set_revision(crate::revision::MAX_DATABASE_REVISION)
+            .unwrap();
 
-        let mut paged =
-            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let device = CountingDevice::new();
+        let control = device.clone();
+        let mut paged = PagedStorage::from_in_memory(device, &source).unwrap();
         let old_tree = paged.tables["large"].clone();
         let old_next_tree_id = paged.next_tree_id;
-        paged.revision = u64::MAX;
+        let page_count = control.page_count();
+        let flush_count = control.inner.borrow().flush_count();
         let actual = paged.add_column_and_advance("large", &column).unwrap_err();
-        assert_eq!(actual, expected_error);
-        assert_eq!(paged.revision(), u64::MAX);
+        assert_eq!(actual.code, "REVISION_OVERFLOW");
+        assert_eq!(paged.revision(), crate::revision::MAX_DATABASE_REVISION);
         assert_eq!(paged.next_tree_id, old_next_tree_id);
         assert_eq!(paged.tables["large"].tree_id, old_tree.tree_id);
         assert_eq!(paged.tables["large"].root_page_id, old_tree.root_page_id);
+        assert_eq!(control.page_count(), page_count);
+        assert_eq!(control.inner.borrow().flush_count(), flush_count);
+        let reopened = PagedStorage::open(paged.into_device()).unwrap();
+        assert_eq!(reopened.revision(), crate::revision::MAX_DATABASE_REVISION);
     }
 
     #[test]

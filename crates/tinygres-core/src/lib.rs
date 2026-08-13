@@ -15,6 +15,7 @@ mod paged_transaction;
 mod pager;
 mod prepared;
 mod query;
+mod revision;
 mod snapshot;
 mod statement;
 mod storage;

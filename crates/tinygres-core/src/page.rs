@@ -364,6 +364,12 @@ impl Superblock {
     }
 
     fn validate(&self) -> Result<()> {
+        crate::revision::validate_database_revision(self.database_revision).map_err(|error| {
+            unsupported_page(format!(
+                "Superblock database revision is unsupported: {}",
+                error.message
+            ))
+        })?;
         if self.generation == 0 || self.bitmap_generation == 0 {
             return Err(invalid_page(
                 "Superblock and allocation bitmap generations must be non-zero",
@@ -800,6 +806,7 @@ pub fn build_next_metadata(
     catalog_root_page_id: Option<PageId>,
     allocation_bitmap: &AllocationBitmap,
 ) -> Result<PendingMetadata> {
+    crate::revision::validate_database_revision(database_revision)?;
     active
         .superblock
         .validate_bitmap(&active.allocation_bitmap)?;
@@ -1116,6 +1123,16 @@ mod tests {
             Superblock::decode_page(&wrong_type).unwrap_err().code,
             "INVALID_PAGE"
         );
+
+        let mut maximum = Superblock::new(SuperblockSlot::A);
+        maximum.database_revision = crate::revision::MAX_DATABASE_REVISION;
+        let page = maximum.encode_page().unwrap();
+        assert_eq!(
+            Superblock::decode_page(&page).unwrap().database_revision,
+            crate::revision::MAX_DATABASE_REVISION
+        );
+        maximum.database_revision = crate::revision::MAX_DATABASE_REVISION + 1;
+        assert_eq!(maximum.encode_page().unwrap_err().code, "UNSUPPORTED_PAGE");
 
         let mut short_payload = page;
         short_payload[24..28].copy_from_slice(&95_u32.to_le_bytes());
@@ -1441,6 +1458,37 @@ mod tests {
         mutate_payload(&mut unsupported_superblock_payload, 8, 2);
         let unsupported = RawMetadataSlot::new(
             &unsupported_superblock_payload,
+            [
+                &newer.bitmap_chunks[0],
+                &newer.bitmap_chunks[1],
+                &newer.bitmap_chunks[2],
+            ],
+        );
+        assert_eq!(
+            recover_metadata(older.raw(), unsupported).unwrap_err().code,
+            "UNSUPPORTED_PAGE"
+        );
+
+        let older = encoded_metadata(
+            SuperblockSlot::A,
+            8,
+            crate::revision::MAX_DATABASE_REVISION,
+            19,
+            false,
+        );
+        let newer = encoded_metadata(
+            SuperblockSlot::B,
+            9,
+            crate::revision::MAX_DATABASE_REVISION,
+            20,
+            false,
+        );
+        let mut unsupported_revision = newer.superblock;
+        unsupported_revision[PAGE_HEADER_SIZE + 32..PAGE_HEADER_SIZE + 40]
+            .copy_from_slice(&(crate::revision::MAX_DATABASE_REVISION + 1).to_le_bytes());
+        rewrite_crc(&mut unsupported_revision);
+        let unsupported = RawMetadataSlot::new(
+            &unsupported_revision,
             [
                 &newer.bitmap_chunks[0],
                 &newer.bitmap_chunks[1],
