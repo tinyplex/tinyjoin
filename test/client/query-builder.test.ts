@@ -5,7 +5,11 @@ import {
   type QueryExecutor,
 } from '../../src/client/query-builder.ts';
 import {ClientError} from '../../src/client/error.ts';
-import type {QueryPlan, Row} from '../../src/protocol.ts';
+import {
+  MAX_QUERY_POSITION,
+  type QueryPlan,
+  type Row,
+} from '../../src/protocol.ts';
 
 describe('QueryBuilder', () => {
   it('builds immutable structured plans without interpolating values', async () => {
@@ -128,8 +132,25 @@ describe('QueryBuilder', () => {
     };
     const builder = new QueryBuilder(executor, {table: 'posts', filters: []});
 
-    expect(() => builder.limit(-1)).toThrow('non-negative safe integer');
-    expect(() => builder.offset(-1)).toThrow('non-negative safe integer');
+    expect(() => builder.limit(MAX_QUERY_POSITION)).not.toThrow();
+    expect(() => builder.offset(MAX_QUERY_POSITION)).not.toThrow();
+    expect(() =>
+      builder.range(MAX_QUERY_POSITION - 1, MAX_QUERY_POSITION - 1),
+    ).not.toThrow();
+    expect(() => builder.limit(-1)).toThrow('between 0');
+    expect(() => builder.offset(-1)).toThrow('between 0');
+    expect(() => builder.limit(MAX_QUERY_POSITION + 1)).toThrow('between 0');
+    expect(() => builder.offset(MAX_QUERY_POSITION + 1)).toThrow('between 0');
+    expect(() => builder.range(0, MAX_QUERY_POSITION)).toThrow('range length');
+    expect(() =>
+      builder.range(MAX_QUERY_POSITION, MAX_QUERY_POSITION),
+    ).toThrow('offset plus limit');
+    expect(() => builder.offset(MAX_QUERY_POSITION).limit(1)).toThrow(
+      'offset plus limit',
+    );
+    expect(() => builder.limit(1).offset(MAX_QUERY_POSITION)).toThrow(
+      'offset plus limit',
+    );
     expect(() => builder.range(3, 2)).toThrow('cannot be smaller');
     expect(() => builder.order('')).toThrow('cannot be empty');
     expect(() => builder.select('id, ')).toThrow('one or more column names');

@@ -1,6 +1,11 @@
 import {describe, expect, it} from 'vitest';
 
-import {PROTOCOL_VERSION, isWorkerRequest} from '../src/protocol.ts';
+import {
+  MAX_QUERY_POSITION,
+  PROTOCOL_VERSION,
+  isWorkerEvent,
+  isWorkerRequest,
+} from '../src/protocol.ts';
 
 const source = {
   kind: 'supabase',
@@ -167,8 +172,31 @@ describe('built-in source protocol', () => {
         },
       }),
     ).toBe(true);
+    expect(
+      isWorkerRequest({
+        v: PROTOCOL_VERSION,
+        id: 8,
+        method: 'query',
+        params: {
+          plan: {
+            table: 'tasks',
+            filters: [],
+            offset: MAX_QUERY_POSITION,
+            limit: 0,
+          },
+        },
+      }),
+    ).toBe(true);
     for (const plan of [
       {table: 'tasks', filters: [], offset: -1},
+      {table: 'tasks', filters: [], limit: MAX_QUERY_POSITION + 1},
+      {table: 'tasks', filters: [], offset: MAX_QUERY_POSITION + 1},
+      {
+        table: 'tasks',
+        filters: [],
+        offset: MAX_QUERY_POSITION,
+        limit: 1,
+      },
       {
         table: 'tasks',
         filters: [{column: 'id', operator: 'contains', value: 1}],
@@ -238,6 +266,89 @@ describe('built-in source protocol', () => {
         },
       }),
     ).toBe(false);
+
+    const sparse = <T>(value: T): T[] => {
+      const values = new Array<T>(2);
+      values[1] = value;
+      return values;
+    };
+    const schema = {name: 'posts', primaryKey: ['id']};
+    const requests = [
+      {
+        method: 'init',
+        params: {
+          schemas: sparse(schema),
+          storage: {kind: 'memory'},
+        },
+      },
+      {
+        method: 'defineTable',
+        params: {schema: {...schema, primaryKey: sparse('id')}},
+      },
+      {
+        method: 'replaceTable',
+        params: {schema, rows: sparse({id: 1})},
+      },
+      {
+        method: 'replaceTable',
+        params: {schema, rows: [{id: sparse(1)}]},
+      },
+      {
+        method: 'applyBatch',
+        params: {
+          batch: {
+            changes: sparse({type: 'upsert', table: 'posts', row: {id: 1}}),
+          },
+        },
+      },
+      {
+        method: 'query',
+        params: {
+          plan: {
+            table: 'posts',
+            columns: sparse('id'),
+            filters: [],
+          },
+        },
+      },
+      {
+        method: 'query',
+        params: {
+          plan: {
+            table: 'posts',
+            filters: sparse({column: 'id', operator: 'eq', value: 1}),
+          },
+        },
+      },
+      {
+        method: 'query',
+        params: {
+          plan: {
+            table: 'posts',
+            filters: [],
+            orderBy: sparse({
+              column: 'id',
+              direction: 'asc',
+              nulls: 'default',
+            }),
+          },
+        },
+      },
+      {
+        method: 'querySql',
+        params: {sql: 'SELECT $1', params: sparse(1)},
+      },
+    ];
+    for (const [index, request] of requests.entries()) {
+      expect(
+        isWorkerRequest({
+          v: PROTOCOL_VERSION,
+          id: index + 10,
+          ...request,
+        }),
+      ).toBe(false);
+    }
+
     expect(
       isWorkerRequest({
         v: PROTOCOL_VERSION,
@@ -248,6 +359,18 @@ describe('built-in source protocol', () => {
           storage: {kind: 'memory'},
           source: undefined,
         },
+      }),
+    ).toBe(false);
+  });
+
+  it('rejects sparse arrays in worker events', () => {
+    const tables = new Array<string>(2);
+    tables[1] = 'posts';
+    expect(
+      isWorkerEvent({
+        v: PROTOCOL_VERSION,
+        event: 'tablesChanged',
+        payload: {revision: 1, tables},
       }),
     ).toBe(false);
   });

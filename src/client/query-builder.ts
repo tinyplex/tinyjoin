@@ -1,4 +1,9 @@
-import type {JsonValue, QueryPlan, Row} from '../protocol.js';
+import {
+  MAX_QUERY_POSITION,
+  type JsonValue,
+  type QueryPlan,
+  type Row,
+} from '../protocol.js';
 import {ClientError} from './error.js';
 
 export type QueryResponse<RowType extends object> =
@@ -81,17 +86,14 @@ export class QueryBuilder<RowType extends object = Row>
   }
 
   limit(limit: number): QueryBuilder<RowType> {
-    if (!Number.isSafeInteger(limit) || limit < 0) {
-      throw new ClientError({
-        code: 'INVALID_QUERY',
-        message: 'A query limit must be a non-negative safe integer',
-      });
-    }
+    assertNonNegativeInteger(limit, 'limit');
+    assertQueryWindow(this.#plan.offset, limit);
     return this.#with({limit});
   }
 
   offset(offset: number): QueryBuilder<RowType> {
     assertNonNegativeInteger(offset, 'offset');
+    assertQueryWindow(offset, this.#plan.limit);
     return this.#with({offset});
   }
 
@@ -130,7 +132,10 @@ export class QueryBuilder<RowType extends object = Row>
         message: 'A query range end cannot be smaller than its start',
       });
     }
-    return this.#with({offset: from, limit: to - from + 1});
+    const limit = to - from + 1;
+    assertNonNegativeInteger(limit, 'range length');
+    assertQueryWindow(from, limit);
+    return this.#with({offset: from, limit});
   }
 
   async execute(): Promise<QueryResponse<RowType>> {
@@ -161,10 +166,30 @@ export class QueryBuilder<RowType extends object = Row>
 }
 
 function assertNonNegativeInteger(value: number, description: string): void {
-  if (!Number.isSafeInteger(value) || value < 0) {
+  if (
+    !Number.isSafeInteger(value) ||
+    value < 0 ||
+    value > MAX_QUERY_POSITION
+  ) {
     throw new ClientError({
       code: 'INVALID_QUERY',
-      message: `A query ${description} must be a non-negative safe integer`,
+      message: `A query ${description} must be an integer between 0 and ${MAX_QUERY_POSITION}`,
+    });
+  }
+}
+
+function assertQueryWindow(
+  offset: number | undefined,
+  limit: number | undefined,
+): void {
+  if (
+    offset !== undefined &&
+    limit !== undefined &&
+    offset + limit > MAX_QUERY_POSITION
+  ) {
+    throw new ClientError({
+      code: 'INVALID_QUERY',
+      message: `A query offset plus limit cannot exceed ${MAX_QUERY_POSITION}`,
     });
   }
 }

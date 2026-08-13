@@ -1,6 +1,7 @@
 import {isSourceOptions, type SourceOptions} from './source-options.js';
 
 export const PROTOCOL_VERSION = 4 as const;
+export const MAX_QUERY_POSITION = 0xffff_ffff;
 
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue =
@@ -221,8 +222,7 @@ export function isWorkerRequest(value: unknown): value is WorkerRequest {
       return (
         isRecord(value.params) &&
         hasOnlyKeys(value.params, ['schemas', 'storage', 'source']) &&
-        Array.isArray(value.params.schemas) &&
-        value.params.schemas.every(isTableSchema) &&
+        isDenseArray(value.params.schemas, isTableSchema) &&
         isStorageOptions(value.params.storage) &&
         (!Object.hasOwn(value.params, 'source') ||
           isSourceOptions(value.params.source))
@@ -233,8 +233,7 @@ export function isWorkerRequest(value: unknown): value is WorkerRequest {
       return (
         isRecord(value.params) &&
         isTableSchema(value.params.schema) &&
-        Array.isArray(value.params.rows) &&
-        value.params.rows.every(isRow)
+        isDenseArray(value.params.rows, isRow)
       );
     case 'applyBatch':
       return isRecord(value.params) && isChangeBatch(value.params.batch);
@@ -251,8 +250,7 @@ export function isWorkerRequest(value: unknown): value is WorkerRequest {
         isRecord(value.params) &&
         hasOnlyKeys(value.params, ['sql', 'params', 'transactionId']) &&
         typeof value.params.sql === 'string' &&
-        Array.isArray(value.params.params) &&
-        value.params.params.every((param) => isJsonValue(param)) &&
+        isDenseArray(value.params.params, (param) => isJsonValue(param)) &&
         isOptionalTransactionId(value.params.transactionId)
       );
     case 'beginTransaction':
@@ -307,6 +305,23 @@ function hasOnlyKeys(
   return Object.keys(value).every((key) => allowedKeys.includes(key));
 }
 
+function isDenseArray<T>(
+  value: unknown,
+  isItem: (item: unknown) => item is T,
+): value is T[] {
+  if (!Array.isArray(value) || value.length > MAX_PROTOCOL_ARRAY_ITEMS) {
+    return false;
+  }
+  for (let index = 0; index < value.length; index++) {
+    if (!Object.hasOwn(value, index) || !isItem(value[index])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+const MAX_PROTOCOL_ARRAY_ITEMS = 1_000_000;
+
 export function isSerializedError(value: unknown): value is SerializedError {
   return (
     isRecord(value) &&
@@ -325,8 +340,9 @@ function isApplyOutcome(value: unknown): value is ApplyOutcome {
   return (
     isRecord(value) &&
     Number.isSafeInteger(value.revision) &&
-    Array.isArray(value.tables) &&
-    value.tables.every((table) => typeof table === 'string')
+    isDenseArray(value.tables, (table): table is string =>
+      typeof table === 'string'
+    )
   );
 }
 
@@ -335,11 +351,12 @@ function isTableSchema(value: unknown): value is TableSchema {
     isRecord(value) &&
     typeof value.name === 'string' &&
     value.name.length > 0 &&
-    Array.isArray(value.primaryKey) &&
-    value.primaryKey.length > 0 &&
-    value.primaryKey.every(
-      (column) => typeof column === 'string' && column.length > 0,
-    )
+    isDenseArray(
+      value.primaryKey,
+      (column): column is string =>
+        typeof column === 'string' && column.length > 0,
+    ) &&
+    value.primaryKey.length > 0
   );
 }
 
@@ -350,7 +367,7 @@ function isRow(value: unknown): value is Row {
 }
 
 function isChangeBatch(value: unknown): value is ChangeBatch {
-  if (!isRecord(value) || !Array.isArray(value.changes)) {
+  if (!isRecord(value)) {
     return false;
   }
   if (
@@ -363,14 +380,16 @@ function isChangeBatch(value: unknown): value is ChangeBatch {
   ) {
     return false;
   }
-  return value.changes.every((change) => {
-    if (!isRecord(change) || typeof change.table !== 'string') {
-      return false;
-    }
-    return change.type === 'upsert'
-      ? isRow(change.row)
-      : change.type === 'delete' && isRow(change.key);
-  });
+  return isDenseArray(value.changes, isChange);
+}
+
+function isChange(value: unknown): value is Change {
+  if (!isRecord(value) || typeof value.table !== 'string') {
+    return false;
+  }
+  return value.type === 'upsert'
+    ? isRow(value.row)
+    : value.type === 'delete' && isRow(value.key);
 }
 
 function isSourceCursor(value: unknown): value is SourceCursor {
@@ -399,20 +418,33 @@ function isQueryPlan(value: unknown): value is QueryPlan {
   }
   if (
     value.columns !== undefined &&
-    (!Array.isArray(value.columns) ||
-      !value.columns.every((column) => typeof column === 'string'))
+    !isDenseArray(
+      value.columns,
+      (column): column is string => typeof column === 'string',
+    )
   ) {
     return false;
   }
   if (
     value.limit !== undefined &&
-    (!Number.isSafeInteger(value.limit) || Number(value.limit) < 0)
+    (!Number.isSafeInteger(value.limit) ||
+      Number(value.limit) < 0 ||
+      Number(value.limit) > MAX_QUERY_POSITION)
   ) {
     return false;
   }
   if (
     value.offset !== undefined &&
-    (!Number.isSafeInteger(value.offset) || Number(value.offset) < 0)
+    (!Number.isSafeInteger(value.offset) ||
+      Number(value.offset) < 0 ||
+      Number(value.offset) > MAX_QUERY_POSITION)
+  ) {
+    return false;
+  }
+  if (
+    value.offset !== undefined &&
+    value.limit !== undefined &&
+    Number(value.offset) + Number(value.limit) > MAX_QUERY_POSITION
   ) {
     return false;
   }
@@ -420,12 +452,13 @@ function isQueryPlan(value: unknown): value is QueryPlan {
     value.orderBy !== undefined &&
     (!Array.isArray(value.orderBy) ||
       value.orderBy.length > 32 ||
-      !value.orderBy.every(isOrderBy))
+      !isDenseArray(value.orderBy, isOrderBy))
   ) {
     return false;
   }
-  return value.filters.every(
-    (filter) =>
+  return isDenseArray(
+    value.filters,
+    (filter): filter is Filter =>
       isRecord(filter) &&
       typeof filter.column === 'string' &&
       FILTER_OPERATORS.has(filter.operator) &&
@@ -489,7 +522,9 @@ function isJsonValue(
   }
   seen.add(value);
   const valid = Array.isArray(value)
-    ? value.every((item) => isJsonValue(item, seen, depth + 1))
+    ? isDenseArray(value, (item): item is JsonValue =>
+        isJsonValue(item, seen, depth + 1),
+      )
     : isRecord(value) &&
       Object.values(value).every((item) => isJsonValue(item, seen, depth + 1));
   seen.delete(value);
