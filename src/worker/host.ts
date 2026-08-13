@@ -12,11 +12,11 @@ import {
   type WorkerResponse,
 } from '../protocol.js';
 import {
-  createWasmEngine,
-  type LegacyRecoveryEngine,
+  createMemoryWasmEngine,
   type WorkerEngine,
   type WorkerEngineFactory,
 } from './engine.js';
+import {createOpfsMigrationEngine} from './migration-loader.js';
 import {
   bindOpfsStorageName,
   builtinSourceConfigurationKey,
@@ -59,7 +59,7 @@ export function startWorker(
 ): WorkerController {
   const scope = options.scope ?? (globalThis as unknown as WorkerScope);
   const engineFactory =
-    options.durableEngineFactory ?? createLegacyConfiguredEngine;
+    options.durableEngineFactory ?? createDefaultConfiguredEngine;
   const builtinSourceFactory =
     options.builtinSourceFactory ?? loadBuiltinSource;
   const sourceIdentityHasher = options.sourceIdentityHasher;
@@ -558,31 +558,13 @@ async function createSourceBoundEngine(
   return engineFactory(resolvedStorage);
 }
 
-async function createLegacyConfiguredEngine(
+async function createDefaultConfiguredEngine(
   storage: StorageOptions,
 ): Promise<WorkerEngine> {
-  const engine: LegacyRecoveryEngine = await createWasmEngine(storage);
   if (storage.kind === 'memory') {
-    return engine;
+    return createMemoryWasmEngine();
   }
-
-  let store: import('./snapshot-store.js').SnapshotStore | undefined;
-  try {
-    const [{createPersistentEngine}, {createOpfsSnapshotStore}] =
-      await Promise.all([
-        import('./persistent-engine.js'),
-        import('./snapshot-store.js'),
-      ]);
-    store = await createOpfsSnapshotStore(storage.name);
-    return createPersistentEngine(engine, store);
-  } catch (error) {
-    try {
-      store?.close();
-    } finally {
-      engine.close();
-    }
-    throw error;
-  }
+  return createOpfsMigrationEngine(storage.name);
 }
 
 function sameStorage(left: StorageOptions, right: StorageOptions): boolean {

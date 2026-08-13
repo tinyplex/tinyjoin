@@ -18,6 +18,11 @@ import {fileURLToPath} from 'node:url';
 import {chromium} from '@playwright/test';
 import {WebSocketServer} from 'ws';
 
+import {
+  requireWasmArtifacts,
+  wasmArtifacts,
+} from './wasm-artifacts.mjs';
+
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const fixture = resolve(root, 'test/consumers/vite');
 const generatedRoot = await mkdtemp(
@@ -36,6 +41,7 @@ await mkdir(packageDirectory, {recursive: true});
 
 // Build and pack the same clean dist directory that is published to npm.
 run(npm, ['run', 'build'], root);
+await assertBuildLibRejectsMissingMigrationArtifact();
 const packOutput = run(
   npm,
   [
@@ -106,6 +112,7 @@ if (!ssrOutput.includes('SSR_IMPORT_OK')) {
 run(npm, ['run', 'typecheck'], appDirectory);
 run(npm, ['run', 'build'], appDirectory);
 const builtFiles = await listFiles(resolve(appDirectory, 'dist'));
+await assertConsumerMigrationBoundary(builtFiles);
 if (!builtFiles.some((file) => file.endsWith('.wasm'))) {
   throw new Error(`The consumer build emitted no WASM asset:\n${builtFiles.join('\n')}`);
 }
@@ -144,11 +151,21 @@ try {
   await waitForServer(server, baseUrl, () => serverOutput);
   browser = await chromium.launch({headless: true});
   const page = await browser.newPage();
+  const runtimeRequests = [];
+  page.on('request', (request) => runtimeRequests.push(request.url()));
 
-  const appLocal = await exercise(page, `${baseUrl}/?worker=app-local`);
+  const appLocal = await exerciseWithoutMigration(
+    page,
+    `${baseUrl}/?worker=app-local`,
+    runtimeRequests,
+  );
   console.log(`APP_LOCAL_WORKER_OK ${JSON.stringify(appLocal)}`);
 
-  const packageDefault = await exercise(page, `${baseUrl}/?worker=default`);
+  const packageDefault = await exerciseWithoutMigration(
+    page,
+    `${baseUrl}/?worker=default`,
+    runtimeRequests,
+  );
   console.log(`PACKAGE_DEFAULT_WORKER_OK ${JSON.stringify(packageDefault)}`);
 
   for (const workerMode of ['app-local', 'default']) {
@@ -157,9 +174,10 @@ try {
       source: 'supabase',
       supabaseUrl: supabaseMock.url,
     });
-    const result = await exerciseSupabase(
+    const result = await exerciseSupabaseWithoutMigration(
       page,
       `${baseUrl}/?${parameters}`,
+      runtimeRequests,
     );
     console.log(
       `SUPABASE_${workerMode.toUpperCase().replace('-', '_')}_WORKER_OK ${JSON.stringify(result)}`,
@@ -178,13 +196,15 @@ try {
       worker: workerMode,
       database: databaseName,
     });
-    const written = await exercise(
+    const written = await exerciseWithMigration(
       page,
       `${baseUrl}/?${parameters}&persistence=write`,
+      runtimeRequests,
     );
-    const restored = await exercisePersisted(
+    const restored = await exercisePersistedWithMigration(
       page,
       `${baseUrl}/?${parameters}&persistence=read`,
+      runtimeRequests,
     );
     console.log(
       `OPFS_${workerMode.toUpperCase().replace('-', '_')}_WORKER_OK ${JSON.stringify({written, restored})}`,
@@ -229,6 +249,35 @@ function run(command, args, cwd) {
   return output;
 }
 
+async function assertBuildLibRejectsMissingMigrationArtifact() {
+  const fixture = resolve(
+    generatedRoot,
+    'missing-migration-artifact',
+  );
+  const missing = 'wasm-migration/tinygres_migration_wasm_bg.wasm';
+  await Promise.all(
+    wasmArtifacts
+      .filter((artifact) => artifact !== missing)
+      .map(async (artifact) => {
+        const path = resolve(fixture, artifact);
+        await mkdir(dirname(path), {recursive: true});
+        await writeFile(path, 'fixture');
+      }),
+  );
+  try {
+    await requireWasmArtifacts(fixture);
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message.includes('Missing default or migration WASM artifacts')
+    ) {
+      return;
+    }
+    throw error;
+  }
+  throw new Error('Build precondition accepted a missing migration artifact');
+}
+
 function parsePackOutput(output) {
   let parsed;
   try {
@@ -258,24 +307,77 @@ function assertPackedFiles(packed) {
     'worker/default-entry.js',
     'wasm/tinygres_wasm.js',
     'wasm/tinygres_wasm_bg.wasm',
+    'wasm-migration/tinygres_migration_wasm.js',
+    'wasm-migration/tinygres_migration_wasm_bg.wasm',
+    'worker-migration/tinygres_migration_runtime.js',
   ]) {
     if (!files.includes(required)) {
       throw new Error(`Packed TinyGres is missing ${required}`);
     }
-  }
-  const pagedWasmFiles = files.filter((file) =>
-    file.includes('tinygres_paged_wasm'),
-  );
-  if (pagedWasmFiles.length > 0) {
-    throw new Error(
-      `The internal page-native WASM artifact must not be published: ${pagedWasmFiles.join(', ')}`,
-    );
   }
   const nestedManifests = files.filter((file) => file.endsWith('/package.json'));
   if (nestedManifests.length > 0) {
     throw new Error(
       `Packed TinyGres contains nested package manifests: ${nestedManifests.join(', ')}`,
     );
+  }
+  for (const privateModule of [
+    'worker/journal-codec.js',
+    'worker/journal-payload.js',
+    'worker/migration-engine.js',
+    'worker/persistent-engine.js',
+    'worker/snapshot-store.js',
+  ]) {
+    if (files.includes(privateModule)) {
+      throw new Error(
+        `Packed TinyGres exposes migration implementation module ${privateModule}`,
+      );
+    }
+  }
+}
+
+async function assertConsumerMigrationBoundary(files) {
+  const javascript = files.filter((file) => file.endsWith('.js'));
+  const runtime = javascript.filter((file) =>
+    /tinygres_migration_runtime(?:-[^/]*)?\.js$/.test(file),
+  );
+  const glue = javascript.filter((file) =>
+    /tinygres_migration_wasm(?:-[^/]*)?\.js$/.test(file),
+  );
+  if (runtime.length !== 1 || glue.length !== 1) {
+    throw new Error(
+      `Consumer build did not emit one migration runtime and glue asset:\n${javascript.join('\n')}`,
+    );
+  }
+
+  const implementationMarkers = [
+    'A journal transaction payload cannot be empty',
+    'The TinyGres persistent engine is closed',
+    'TinyGres could not determine whether the final OPFS commit marker was durable',
+    'Another TinyGres worker already has this OPFS database open',
+  ];
+  const runtimeSource = await readFile(runtime[0], 'utf8');
+  for (const marker of implementationMarkers) {
+    if (!runtimeSource.includes(marker)) {
+      throw new Error(
+        `Migration runtime is missing expected implementation marker: ${marker}`,
+      );
+    }
+  }
+
+  for (const file of javascript) {
+    if (runtime.includes(file) || glue.includes(file)) {
+      continue;
+    }
+    const source = await readFile(file, 'utf8');
+    const leaked = implementationMarkers.find((marker) =>
+      source.includes(marker),
+    );
+    if (leaked) {
+      throw new Error(
+        `Consumer JavaScript eagerly contains migration implementation code (${leaked}): ${file}`,
+      );
+    }
   }
 }
 
@@ -330,6 +432,14 @@ async function exercise(page, url) {
   return result;
 }
 
+async function exerciseWithoutMigration(page, url, requests) {
+  return captureMigrationRequests(requests, false, () => exercise(page, url));
+}
+
+async function exerciseWithMigration(page, url, requests) {
+  return captureMigrationRequests(requests, true, () => exercise(page, url));
+}
+
 async function exercisePersisted(page, url) {
   await page.goto(url);
   await page
@@ -341,6 +451,12 @@ async function exercisePersisted(page, url) {
     throw new Error(`Unexpected packed OPFS restart result: ${text}`);
   }
   return result;
+}
+
+async function exercisePersistedWithMigration(page, url, requests) {
+  return captureMigrationRequests(requests, true, () =>
+    exercisePersisted(page, url),
+  );
 }
 
 async function exerciseSupabase(page, url) {
@@ -358,6 +474,52 @@ async function exerciseSupabase(page, url) {
     throw new Error(`Unexpected packed Supabase result: ${text}`);
   }
   return result;
+}
+
+async function exerciseSupabaseWithoutMigration(page, url, requests) {
+  return captureMigrationRequests(requests, false, () =>
+    exerciseSupabase(page, url),
+  );
+}
+
+async function captureMigrationRequests(requests, expected, exerciseRuntime) {
+  const firstRequest = requests.length;
+  const result = await exerciseRuntime();
+  const capturedRequests = requests.slice(firstRequest);
+  const migrationRequests = capturedRequests.filter((url) =>
+    isMigrationRequest(url),
+  );
+  const requestedRuntime = migrationRequests.some((url) =>
+    /tinygres_migration_runtime(?:-[^/]*)?\.js(?:\?|$)/.test(url),
+  );
+  const requestedGlue = migrationRequests.some((url) =>
+    /tinygres_migration_wasm(?:-[^/]*)?\.js(?:\?|$)/.test(url),
+  );
+  const requestedWasm = migrationRequests.some((url) =>
+    /tinygres_migration_wasm_bg(?:-[^/]+)?\.wasm(?:\?|$)/.test(url),
+  );
+  if (expected && (!requestedRuntime || !requestedGlue || !requestedWasm)) {
+    throw new Error(
+      `Persistent packed runtime did not lazily load migration runtime, glue, and WASM: ${capturedRequests.join(', ')}`,
+    );
+  }
+  if (!expected && migrationRequests.length > 0) {
+    throw new Error(
+      `Memory packed runtime unexpectedly loaded migration artifacts: ${migrationRequests.join(', ')}`,
+    );
+  }
+  return result;
+}
+
+function isMigrationRequest(url) {
+  return (
+    url.includes('tinygres_migration_runtime') ||
+    url.includes('/worker-migration/') ||
+    url.includes('tinygres_migration_wasm') ||
+    url.includes('migration-engine') ||
+    url.includes('persistent-engine') ||
+    url.includes('snapshot-store')
+  );
 }
 
 async function startSupabaseMock() {

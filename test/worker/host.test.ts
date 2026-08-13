@@ -8,7 +8,7 @@ import {
   type WorkerRequest,
   type WorkerResponse,
 } from '../../src/protocol.ts';
-import type {LegacyRecoveryEngine} from '../../src/worker/engine.ts';
+import type {LegacyRecoveryEngine} from '../../src/worker/migration-engine.ts';
 import {startWorker, type WorkerScope} from '../../src/worker/host.ts';
 import {createPersistentEngine} from '../../src/worker/persistent-engine.ts';
 import type {SnapshotStore} from '../../src/worker/snapshot-store.ts';

@@ -8,7 +8,7 @@ import {
 
 const PAGE_SIZE = 4096;
 const pagedWasmModule = new URL(
-  '../../../node_modules/.cache/tinygres/wasm-paged/tinygres_paged_wasm.js',
+  '../../../dist/wasm/tinygres_wasm.js',
   import.meta.url,
 ).href;
 

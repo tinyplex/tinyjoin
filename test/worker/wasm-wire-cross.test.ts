@@ -13,10 +13,9 @@ import {
 } from '../../src/worker/wasm-wire.js';
 
 const binaryDirectory =
-  process.env.TINYGRES_PAGED_WASM_DIR ??
-  resolve('node_modules/.cache/tinygres/wasm-paged');
-const binaryModule = `${binaryDirectory}/tinygres_paged_wasm.js`;
-const binaryWasm = `${binaryDirectory}/tinygres_paged_wasm_bg.wasm`;
+  process.env.TINYGRES_PAGED_WASM_DIR ?? resolve('dist/wasm');
+const binaryModule = `${binaryDirectory}/tinygres_wasm.js`;
+const binaryWasm = `${binaryDirectory}/tinygres_wasm_bg.wasm`;
 
 interface BinaryModule {
   default(options: {module_or_path: Uint8Array}): Promise<unknown>;

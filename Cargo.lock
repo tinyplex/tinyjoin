@@ -192,18 +192,18 @@ name = "tinygres-wasm"
 version = "0.0.0"
 dependencies = [
  "js-sys",
- "serde",
- "serde-wasm-bindgen",
  "serde_json",
  "tinygres-core",
  "wasm-bindgen",
 ]
 
 [[package]]
-name = "tinygres-wasm-paged"
+name = "tinygres-wasm-migration"
 version = "0.0.0"
 dependencies = [
  "js-sys",
+ "serde",
+ "serde-wasm-bindgen",
  "serde_json",
  "tinygres-core",
  "wasm-bindgen",

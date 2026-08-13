@@ -20,6 +20,18 @@ interface Window {
       publishableKey: string;
       url: string;
     }): Promise<SupabaseProbeReport>;
+    legacyTransactionDdlProbe(databaseName: string): Promise<{
+      reopenedRevision: number;
+      reopenedRows: number;
+      stagedRows: number;
+    }>;
+    pageTransactionDdlProbe(): Promise<{
+      committedRows: number;
+      ddlCodes: string[];
+      revisionAfter: number;
+      revisionBefore: number;
+      stagedRows: number;
+    }>;
     persistenceProbe(
       databaseName: string,
       rowCount: number,

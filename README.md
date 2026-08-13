@@ -165,10 +165,12 @@ const summary = await db.query<{
 `);
 ```
 
-Every standalone SQL statement is atomic. `transaction()` stages all statements
-against an isolated candidate database, rolls them back when the callback or a
-statement fails, persists one complete commit to OPFS, and then emits one
-table-level invalidation. The transaction object must not escape its callback.
+Every standalone SQL statement is atomic. `transaction()` stages `INSERT`,
+`UPDATE`, and `DELETE` statements against an isolated candidate database,
+rolls them back when the callback or a statement fails, persists one complete
+commit to OPFS, and then emits one table-level invalidation. Run DDL such as
+`CREATE`, `ALTER`, and `DROP` as standalone atomic statements. The transaction
+object must not escape its callback.
 While a replication source is configured, local SQL writes and transactions are
 rejected: the current source contract is read-only and a reconciliation snapshot
 must never silently overwrite application state.

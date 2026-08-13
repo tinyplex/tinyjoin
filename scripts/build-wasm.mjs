@@ -89,6 +89,12 @@ const cargoTargetDir = resolve(
   root,
   'node_modules/.cache/tinygres/cargo-target',
 );
+const wasmRustFlags = [
+  '-Ctarget-feature=+bulk-memory,+nontrapping-fptoint,+sign-ext,+mutable-globals,+simd128',
+  process.env.RUSTFLAGS,
+]
+  .filter(Boolean)
+  .join(' ');
 
 try {
   const build = spawnSync(
@@ -107,7 +113,11 @@ try {
     ],
     {
       cwd: root,
-      env: {...rustEnvironment, CARGO_TARGET_DIR: cargoTargetDir},
+      env: {
+        ...rustEnvironment,
+        CARGO_TARGET_DIR: cargoTargetDir,
+        RUSTFLAGS: wasmRustFlags,
+      },
       stdio: 'inherit',
     },
   );

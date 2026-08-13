@@ -127,7 +127,9 @@ async function boot(): Promise<void> {
     },
     closeSupabaseProbe,
     joinDatabaseProbe,
+    legacyTransactionDdlProbe,
     openSupabaseProbe,
+    pageTransactionDdlProbe: () => pageTransactionDdlProbe(database),
     persistenceProbe,
     writableDatabaseProbe,
     readSupabaseProbe,
@@ -150,6 +152,119 @@ async function boot(): Promise<void> {
   stateElement.textContent = 'Ready';
   statusElement.textContent = 'Ready. The initial snapshot is queryable locally.';
   applyButton.disabled = false;
+}
+
+async function legacyTransactionDdlProbe(databaseName: string): Promise<{
+  reopenedRevision: number;
+  reopenedRows: number;
+  stagedRows: number;
+}> {
+  let connection: ReturnType<typeof openOpfsClient> | undefined =
+    openOpfsClient(databaseName, []);
+  try {
+    await connection.client.ready();
+    const stagedRows = await connection.client.transaction(
+      async (transaction) => {
+        await transaction.exec(`
+          CREATE TABLE legacy_tx_probe (
+            id INTEGER PRIMARY KEY,
+            note TEXT NOT NULL
+          )
+        `);
+        await transaction.exec(
+          'INSERT INTO legacy_tx_probe (id, note) VALUES ($1, $2)',
+          [1, 'DDL and DML committed together'],
+        );
+        return (
+          await transaction.query('SELECT id FROM legacy_tx_probe')
+        ).rows.length;
+      },
+    );
+    await connection.client.close();
+    connection = openOpfsClient(databaseName, []);
+    await connection.client.ready();
+    const reopened = await connection.client.query(
+      'SELECT id FROM legacy_tx_probe',
+    );
+    return {
+      reopenedRevision: reopened.revision,
+      reopenedRows: reopened.rows.length,
+      stagedRows,
+    };
+  } finally {
+    connection?.worker.terminate();
+  }
+}
+
+async function pageTransactionDdlProbe(
+  database: ReturnType<typeof createClient>,
+): Promise<{
+  committedRows: number;
+  ddlCodes: string[];
+  revisionAfter: number;
+  revisionBefore: number;
+  stagedRows: number;
+}> {
+  await database.exec(`
+    CREATE TABLE page_tx_probe (
+      id INTEGER PRIMARY KEY,
+      note TEXT NOT NULL
+    )
+  `);
+  const before = await database.query(
+    'SELECT id FROM page_tx_probe WHERE id = $1',
+    [99],
+  );
+  const ddlCodes: string[] = [];
+  let stagedRows = 0;
+  try {
+    await database.transaction(async (transaction) => {
+      await transaction.exec(
+        'INSERT INTO page_tx_probe (id, note) VALUES ($1, $2)',
+        [99, 'Staged before rejected DDL'],
+      );
+      for (const sql of [
+        `CREATE TABLE IF NOT EXISTS page_tx_probe (
+           id INTEGER PRIMARY KEY,
+           note TEXT NOT NULL
+         )`,
+        'DROP TABLE IF EXISTS absent_page_tx_probe',
+        'CREATE INDEX IF NOT EXISTS page_tx_note ON page_tx_probe (note)',
+        'DROP INDEX IF EXISTS absent_page_tx_index',
+        'ALTER TABLE page_tx_probe ADD COLUMN extra TEXT',
+      ]) {
+        try {
+          await transaction.exec(sql);
+        } catch (error) {
+          ddlCodes.push(errorCode(error));
+        }
+      }
+      stagedRows = (
+        await transaction.query(
+          'SELECT id FROM page_tx_probe WHERE id = $1',
+          [99],
+        )
+      ).rows.length;
+      throw Object.assign(new Error('Roll back the browser DDL probe'), {
+        code: 'EXPECTED_TEST_ROLLBACK',
+      });
+    });
+  } catch (error) {
+    if (errorCode(error) !== 'EXPECTED_TEST_ROLLBACK') {
+      throw error;
+    }
+  }
+  const after = await database.query(
+    'SELECT id FROM page_tx_probe WHERE id = $1',
+    [99],
+  );
+  return {
+    committedRows: after.rows.length,
+    ddlCodes,
+    revisionAfter: after.revision,
+    revisionBefore: before.revision,
+    stagedRows,
+  };
 }
 
 async function writableDatabaseProbe(databaseName: string): Promise<{

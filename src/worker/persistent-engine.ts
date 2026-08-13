@@ -8,7 +8,10 @@ import type {
   SqlResult,
   TableSchema,
 } from '../protocol.js';
-import type {LegacyRecoveryEngine, PreparedMutation} from './engine.js';
+import type {
+  LegacyRecoveryEngine,
+  PreparedMutation,
+} from './migration-engine.js';
 import {
   decodeJournalTransaction,
   type JournalMutation,

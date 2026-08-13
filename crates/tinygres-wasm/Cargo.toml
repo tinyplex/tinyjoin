@@ -13,11 +13,15 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 js-sys = "0.3"
-serde = "1"
 serde_json = {version = "1", default-features = false, features = ["alloc"]}
-serde-wasm-bindgen = "0.6"
-tinygres-core = {path = "../tinygres-core"}
+tinygres-core = {path = "../tinygres-core", features = ["compact-storage-diagnostics"]}
 wasm-bindgen = "0.2"
 
 [package.metadata.wasm-pack.profile.release]
-wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
+wasm-opt = [
+  "-Oz",
+  "--enable-bulk-memory",
+  "--enable-nontrapping-float-to-int",
+  "--enable-sign-ext",
+  "--enable-simd",
+]

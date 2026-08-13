@@ -190,12 +190,17 @@ fn validate_write_transfer_count(value: JsValue) -> Result<()> {
     if value.as_f64() == Some(PAGE_SIZE as f64) {
         return Ok(());
     }
-    Err(EngineError::new(
+    Err(invalid_write_transfer_count())
+}
+
+fn invalid_write_transfer_count() -> EngineError {
+    EngineError::new(
         "STORAGE_COMMIT_OUTCOME_UNKNOWN",
         format!(
             "JavaScript PageDevice.writePage() returned an invalid byte count; expected exactly {PAGE_SIZE}",
         ),
-    ))
+    )
+    .with_retryable(false)
 }
 
 fn validate_buffer(length: usize) -> Result<()> {
@@ -301,5 +306,12 @@ mod tests {
             );
             assert_eq!(error.retryable, retryable);
         }
+    }
+
+    #[test]
+    fn invalid_write_counts_are_explicitly_fatal() {
+        let error = invalid_write_transfer_count();
+        assert_eq!(error.code, "STORAGE_COMMIT_OUTCOME_UNKNOWN");
+        assert_eq!(error.retryable, Some(false));
     }
 }
