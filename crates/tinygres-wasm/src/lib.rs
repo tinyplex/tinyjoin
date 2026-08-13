@@ -1,6 +1,10 @@
+mod page_device;
+
 use serde::Serialize;
 use tinygres_core::{ChangeBatch, Engine, EngineError, Prepared, QueryPlan, Row, TableSchema};
 use wasm_bindgen::prelude::*;
+
+pub use page_device::WasmPageDevice;
 
 #[wasm_bindgen]
 pub struct WasmEngine {
