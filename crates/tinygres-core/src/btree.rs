@@ -177,6 +177,42 @@ impl Btree {
         result
     }
 
+    /// Removes one exact key and returns the candidate root and whether an entry existed.
+    ///
+    /// Deletion is copy-on-write and deliberately does not rebalance under-full pages. Empty
+    /// descendants are pruned; an internal page may retain one child and no separator, and an
+    /// empty tree is represented by `None`. Separator keys are advanced when the first key in a
+    /// right subtree changes. On error, the pager transaction is marked failed and must be aborted.
+    pub fn delete<D: PageDevice>(
+        transaction: &mut PagerWriteTransaction<'_, D>,
+        root_page_id: PageId,
+        tree_id: TreeId,
+        key: &[u8],
+    ) -> Result<(Option<PageId>, bool)> {
+        validate_tree_id(tree_id)?;
+        validate_key(key)?;
+        let result = (|| {
+            let generation = transaction.generation()?;
+            let mut visited = HashSet::new();
+            let deleted = delete_recursive(
+                transaction,
+                root_page_id,
+                tree_id,
+                generation,
+                key,
+                &mut visited,
+                0,
+                None,
+                None,
+            )?;
+            Ok((deleted.page_id, deleted.removed))
+        })();
+        if result.is_err() {
+            transaction.mark_failed();
+        }
+        result
+    }
+
     /// Opens a detached cursor at the first key in a committed tree.
     pub fn cursor<D: PageDevice>(
         pager: &mut Pager<D>,
@@ -792,9 +828,6 @@ impl Node {
                 if self.level == 0 {
                     return Err(invalid_btree("An internal node must have a positive level"));
                 }
-                if internal.entries.is_empty() {
-                    return Err(invalid_btree("An internal node must contain a separator"));
-                }
                 validate_child_page(page_id, internal.leftmost_child)?;
                 validate_sorted_internal_entries(
                     page_id,
@@ -959,9 +992,9 @@ impl Node {
                 NodeKind::Leaf(entries)
             }
             PageType::BtreeInternal => {
-                if level == 0 || item_count == 0 {
+                if level == 0 {
                     return Err(invalid_btree(format!(
-                        "B-tree internal page {} has no level or separators",
+                        "B-tree internal page {} has no level",
                         page.id
                     )));
                 }
@@ -1043,6 +1076,162 @@ struct PageSplit {
     separator: Vec<u8>,
     right_page_id: PageId,
     left_level: u8,
+}
+
+struct DeletedPage {
+    page_id: Option<PageId>,
+    removed: bool,
+    first_key_changed: bool,
+    first_key: Option<Vec<u8>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn delete_recursive<D: PageDevice>(
+    transaction: &mut PagerWriteTransaction<'_, D>,
+    page_id: PageId,
+    tree_id: TreeId,
+    generation: u64,
+    key: &[u8],
+    visited: &mut HashSet<PageId>,
+    depth: usize,
+    expected_level: Option<u8>,
+    parent_generation: Option<u64>,
+) -> Result<DeletedPage> {
+    if depth >= MAX_TREE_DEPTH {
+        return Err(invalid_btree(format!(
+            "Tree {tree_id} exceeds the maximum depth of {MAX_TREE_DEPTH}"
+        )));
+    }
+    if !visited.insert(page_id) {
+        return Err(invalid_btree(format!(
+            "Tree {tree_id} contains a cycle through page {page_id}"
+        )));
+    }
+    let owned = transaction.owns_page(page_id);
+    let mut node = Node::decode(transaction.read_page(page_id)?, tree_id, generation, owned)?;
+    validate_expected_level(page_id, node.level, expected_level)?;
+    validate_child_generation(page_id, node.generation, parent_generation)?;
+    let node_level = node.level;
+    let node_generation = node.generation;
+
+    let (removed, first_key_changed, first_key, empty) = match &mut node.kind {
+        NodeKind::Leaf(entries) => {
+            let Ok(index) = entries.binary_search_by(|entry| entry.key.as_slice().cmp(key)) else {
+                return Ok(DeletedPage {
+                    page_id: Some(page_id),
+                    removed: false,
+                    first_key_changed: false,
+                    first_key: None,
+                });
+            };
+            let removed_first = index == 0;
+            let entry = entries.remove(index);
+            release_leaf_value(
+                transaction,
+                tree_id,
+                generation,
+                node_generation,
+                &entry.value,
+            )?;
+            (
+                true,
+                removed_first,
+                removed_first
+                    .then(|| entries.first().map(|entry| entry.key.clone()))
+                    .flatten(),
+                entries.is_empty(),
+            )
+        }
+        NodeKind::Internal(internal) => {
+            let child_index = internal.child_index_for(key);
+            let child_page_id = internal.child(child_index)?;
+            let child = delete_recursive(
+                transaction,
+                child_page_id,
+                tree_id,
+                generation,
+                key,
+                visited,
+                depth + 1,
+                Some(node_level - 1),
+                Some(node_generation),
+            )?;
+            if !child.removed {
+                return Ok(DeletedPage {
+                    page_id: Some(page_id),
+                    removed: false,
+                    first_key_changed: false,
+                    first_key: None,
+                });
+            }
+            match child.page_id {
+                Some(child_page_id) => {
+                    internal.replace_child(child_index, child_page_id)?;
+                    if child_index > 0 && child.first_key_changed {
+                        internal.entries[child_index - 1].key =
+                            child.first_key.clone().ok_or_else(|| {
+                                invalid_btree("A non-empty changed child has no first key")
+                            })?;
+                    }
+                    (
+                        true,
+                        child_index == 0 && child.first_key_changed,
+                        if child_index == 0 && child.first_key_changed {
+                            child.first_key
+                        } else {
+                            None
+                        },
+                        false,
+                    )
+                }
+                None if internal.entries.is_empty() => (true, true, None, true),
+                None if child_index == 0 => {
+                    let replacement = internal.entries.remove(0);
+                    internal.leftmost_child = replacement.right_child;
+                    (true, true, Some(replacement.key), false)
+                }
+                None => {
+                    internal.entries.remove(child_index - 1);
+                    (true, false, None, false)
+                }
+            }
+        }
+    };
+
+    if empty {
+        release_node_page(transaction, page_id, owned)?;
+        return Ok(DeletedPage {
+            page_id: None,
+            removed,
+            first_key_changed,
+            first_key,
+        });
+    }
+
+    node.generation = generation;
+    let materialized = materialize_node(transaction, page_id, owned, node)?;
+    debug_assert!(
+        materialized.split.is_none(),
+        "deletion cannot split a B-tree page"
+    );
+    Ok(DeletedPage {
+        page_id: Some(materialized.page_id),
+        removed,
+        first_key_changed,
+        first_key,
+    })
+}
+
+fn release_node_page<D: PageDevice>(
+    transaction: &mut PagerWriteTransaction<'_, D>,
+    page_id: PageId,
+    owned: bool,
+) -> Result<()> {
+    if owned {
+        transaction.release_new_page(page_id)
+    } else {
+        transaction.free_shared_page(page_id)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1888,6 +2077,35 @@ mod tests {
         descriptor.clone()
     }
 
+    fn assert_exact_separators(
+        pager: &mut Pager<MemoryPageDevice>,
+        page_id: PageId,
+    ) -> Option<Vec<u8>> {
+        let node = Node::decode(
+            pager.read_page(page_id).unwrap(),
+            TREE,
+            pager.generation(),
+            false,
+        )
+        .unwrap();
+        match node.kind {
+            NodeKind::Leaf(entries) => entries.first().map(|entry| entry.key.clone()),
+            NodeKind::Internal(internal) => {
+                let mut first = assert_exact_separators(pager, internal.leftmost_child);
+                for entry in internal.entries {
+                    let right_first = assert_exact_separators(pager, entry.right_child);
+                    if let Some(right_first) = right_first {
+                        assert_eq!(entry.key, right_first);
+                        if first.is_none() {
+                            first = Some(entry.key);
+                        }
+                    }
+                }
+                first
+            }
+        }
+    }
+
     #[derive(Debug)]
     struct SparseDevice {
         pages: HashMap<PageId, [u8; crate::PAGE_SIZE]>,
@@ -2036,6 +2254,174 @@ mod tests {
         assert_eq!(
             Btree::get(&mut reopened, root, TREE, &key(79)).unwrap(),
             Some(value(79))
+        );
+    }
+
+    #[test]
+    fn deletes_copy_on_write_across_levels_and_advances_separators() {
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let mut root = create_tree(&mut pager);
+        {
+            let mut transaction = pager.begin_write().unwrap();
+            for number in 0..80 {
+                root = Btree::upsert(&mut transaction, root, TREE, &key(number), &value(number))
+                    .unwrap();
+            }
+            transaction.commit(2, 2, Some(root)).unwrap();
+        }
+        assert!(
+            Node::decode(
+                pager.read_page(root).unwrap(),
+                TREE,
+                pager.generation(),
+                false,
+            )
+            .unwrap()
+            .level
+                >= 2
+        );
+        assert!(assert_exact_separators(&mut pager, root).is_some());
+        let boundary_key = {
+            let node = Node::decode(
+                pager.read_page(root).unwrap(),
+                TREE,
+                pager.generation(),
+                false,
+            )
+            .unwrap();
+            let NodeKind::Internal(internal) = node.kind else {
+                panic!("test expected an internal root");
+            };
+            internal.entries[0].key.clone()
+        };
+        let boundary_number = u32::from_be_bytes(boundary_key[..4].try_into().unwrap());
+        {
+            let mut transaction = pager.begin_write().unwrap();
+            let (next, removed) =
+                Btree::delete(&mut transaction, root, TREE, &boundary_key).unwrap();
+            assert!(removed);
+            root = next.unwrap();
+            transaction.commit(3, 3, Some(root)).unwrap();
+        }
+        assert!(assert_exact_separators(&mut pager, root).is_some());
+
+        let committed_root = root;
+        {
+            let mut transaction = pager.begin_write().unwrap();
+            let (unchanged, removed) =
+                Btree::delete(&mut transaction, root, TREE, &key(100)).unwrap();
+            assert!(!removed);
+            assert_eq!(unchanged, Some(root));
+            for number in 0..70 {
+                if number == boundary_number {
+                    continue;
+                }
+                let (next, removed) =
+                    Btree::delete(&mut transaction, root, TREE, &key(number)).unwrap();
+                assert!(removed);
+                root = next.unwrap();
+            }
+            transaction.commit(4, 4, Some(root)).unwrap();
+        }
+        assert_ne!(root, committed_root);
+        assert_eq!(Btree::get(&mut pager, root, TREE, &key(69)).unwrap(), None);
+        assert_eq!(
+            Btree::get(&mut pager, root, TREE, &key(70)).unwrap(),
+            Some(value(70))
+        );
+        let mut cursor = Btree::cursor(&mut pager, root, TREE).unwrap();
+        let mut remaining = Vec::new();
+        while let Some((entry_key, _)) = cursor.next(&mut pager).unwrap() {
+            remaining.push(u32::from_be_bytes(entry_key[..4].try_into().unwrap()));
+        }
+        assert_eq!(remaining, (70..80).collect::<Vec<_>>());
+
+        {
+            let mut transaction = pager.begin_write().unwrap();
+            root = Btree::upsert(&mut transaction, root, TREE, &key(65), &value(65)).unwrap();
+            transaction.commit(5, 5, Some(root)).unwrap();
+        }
+        let mut cursor = Btree::cursor(&mut pager, root, TREE).unwrap();
+        let mut reinserted = Vec::new();
+        while let Some((entry_key, _)) = cursor.next(&mut pager).unwrap() {
+            reinserted.push(u32::from_be_bytes(entry_key[..4].try_into().unwrap()));
+        }
+        assert_eq!(
+            reinserted,
+            std::iter::once(65).chain(70..80).collect::<Vec<_>>()
+        );
+
+        let reopened_root = root;
+        let mut reopened = Pager::open_or_create(pager.into_device()).unwrap();
+        assert_eq!(
+            Btree::get(&mut reopened, reopened_root, TREE, &key(70)).unwrap(),
+            Some(value(70))
+        );
+    }
+
+    #[test]
+    fn deleting_single_leaf_root_reclaims_overflow_and_absent_delete_is_unchanged() {
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let mut root = create_tree(&mut pager);
+        let large = vec![9; MAX_OVERFLOW_CHUNK_BYTES * 2 + 17];
+        root = upsert_and_commit(&mut pager, root, 2, b"large", &large);
+        let overflow = overflow_descriptor_from_root(&mut pager, root, b"large");
+        let live_before = pager.active_metadata().superblock.live_data_page_count;
+
+        {
+            let mut transaction = pager.begin_write().unwrap();
+            let (same_root, removed) =
+                Btree::delete(&mut transaction, root, TREE, b"absent").unwrap();
+            assert!(!removed);
+            assert_eq!(same_root, Some(root));
+            let (empty_root, removed) =
+                Btree::delete(&mut transaction, root, TREE, b"large").unwrap();
+            assert!(removed);
+            assert_eq!(empty_root, None);
+            transaction.commit(3, 3, None).unwrap();
+        }
+        assert!(pager.active_metadata().superblock.live_data_page_count < live_before);
+        assert_eq!(
+            pager.read_page(overflow.first_page_id).unwrap_err().code,
+            "PAGE_NOT_ALLOCATED"
+        );
+    }
+
+    #[test]
+    fn deleting_every_entry_prunes_empty_descendants_and_root_then_reuses_pages() {
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let mut root = create_tree(&mut pager);
+        {
+            let mut transaction = pager.begin_write().unwrap();
+            for number in 0..80 {
+                root = Btree::upsert(&mut transaction, root, TREE, &key(number), &value(number))
+                    .unwrap();
+            }
+            transaction.commit(2, 2, Some(root)).unwrap();
+        }
+        let live_before = pager.active_metadata().superblock.live_data_page_count;
+        let mut next_root = Some(root);
+        {
+            let mut transaction = pager.begin_write().unwrap();
+            for number in (0..80).rev() {
+                let (next, removed) =
+                    Btree::delete(&mut transaction, next_root.unwrap(), TREE, &key(number))
+                        .unwrap();
+                assert!(removed);
+                next_root = next;
+            }
+            assert_eq!(next_root, None);
+            transaction.commit(3, 3, None).unwrap();
+        }
+        assert!(pager.active_metadata().superblock.live_data_page_count < live_before);
+
+        let mut transaction = pager.begin_write().unwrap();
+        let reused = Btree::create(&mut transaction, TREE).unwrap();
+        let reused = Btree::upsert(&mut transaction, reused, TREE, b"again", b"works").unwrap();
+        transaction.commit(4, 4, Some(reused)).unwrap();
+        assert_eq!(
+            Btree::get(&mut pager, reused, TREE, b"again").unwrap(),
+            Some(b"works".to_vec())
         );
     }
 

@@ -4,8 +4,9 @@ use std::{
 };
 
 use crate::{
-    Btree, EngineError, InMemoryStorage, IndexDefinition, PageDevice, PageId, Pager, Result, Row,
-    StorageReader, TableSchema, TreeId, VisitControl, VisitOutcome,
+    ApplyOutcome, Btree, Change, ChangeBatch, EngineError, InMemoryStorage, IndexDefinition,
+    PageDevice, PageId, Pager, Result, Row, StorageReader, TableSchema, TreeId, VisitControl,
+    VisitOutcome,
     paged_codec::{
         CATALOG_TREE_ID, CatalogHeader, CatalogIndexRecord, CatalogKey, CatalogTableRecord,
         FIRST_USER_TREE_ID, decode_catalog_header_record, decode_catalog_index_record,
@@ -18,16 +19,17 @@ use crate::{
     storage::normalize_row,
 };
 
-/// A read-only relational view over the crash-safe paged B-tree store.
+/// A relational view over the crash-safe paged B-tree store.
 ///
-/// This first slice deliberately exposes no mutation contract. [`Self::from_in_memory`] is a
-/// deterministic one-shot importer used to prove the on-disk layout and query path; normal SQL
-/// writes continue to use [`InMemoryStorage`] until page-native row deltas are implemented.
+/// [`Self::apply_batch`] is the first page-native mutation contract. The broader SQL/DDL storage
+/// driver remains deliberately unavailable until every operation can share the same atomic
+/// publication path. [`Self::from_in_memory`] is a deterministic one-shot importer.
 pub struct PagedStorage<D: PageDevice> {
     pager: RefCell<Pager<D>>,
     revision: u64,
     tables: BTreeMap<String, PagedTable>,
     indexes: BTreeMap<String, PagedIndex>,
+    recovery_required: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -43,7 +45,26 @@ struct PagedIndex {
     definition: IndexDefinition,
     tree_id: TreeId,
     root_page_id: Option<PageId>,
+    entry_count: usize,
 }
+
+/// A semantically validated row write-set based on one committed paged revision.
+///
+/// The future SQL transaction overlay can retain statement deltas and prepare this object only at
+/// commit time, then share the exact publication path used by replication batches.
+pub(crate) struct PagedRowWriteSet {
+    base_revision: u64,
+    tables: BTreeMap<String, BTreeMap<Vec<u8>, PagedRowChange>>,
+}
+
+struct PagedRowChange {
+    old: Option<Row>,
+    next: Option<Row>,
+}
+
+const MAX_PAGED_BATCH_CHANGES: usize = 100_000;
+const MAX_PAGED_BATCH_OPERATIONS: usize = 1_000_000;
+const MAX_PAGED_BATCH_BYTES: usize = 16 * 1024 * 1024;
 
 impl<D: PageDevice> PagedStorage<D> {
     /// Opens and validates a previously published paged database.
@@ -61,6 +82,7 @@ impl<D: PageDevice> PagedStorage<D> {
                 revision,
                 tables: BTreeMap::new(),
                 indexes: BTreeMap::new(),
+                recovery_required: false,
             });
         };
 
@@ -70,6 +92,7 @@ impl<D: PageDevice> PagedStorage<D> {
             revision,
             tables,
             indexes,
+            recovery_required: false,
         })
     }
 
@@ -268,12 +291,563 @@ impl<D: PageDevice> PagedStorage<D> {
             revision,
             tables,
             indexes,
+            recovery_required: false,
         })
     }
 
     pub fn into_device(self) -> D {
         self.pager.into_inner().into_device()
     }
+
+    /// Atomically applies page-native row upserts and deletes in one durable generation.
+    ///
+    /// This narrow mutation surface deliberately remains an inherent method until the remaining
+    /// DDL, snapshot-replacement, and explicit transaction operations can satisfy the complete
+    /// [`crate::StorageDriver`] contract. Sequential changes to one primary key use last-write
+    /// semantics. A non-empty batch advances the revision exactly once even when its final rows
+    /// equal the committed rows, matching [`InMemoryStorage`].
+    pub fn apply_batch(&mut self, batch: &ChangeBatch) -> Result<ApplyOutcome> {
+        if batch.changes.is_empty() {
+            return Ok(ApplyOutcome {
+                revision: self.revision,
+                tables: vec![],
+            });
+        }
+
+        let write_set = self.prepare_row_write_set(&batch.changes)?;
+        self.commit_row_write_set(write_set)
+    }
+
+    pub(crate) fn prepare_row_write_set(
+        &self,
+        input_changes: &[Change],
+    ) -> Result<PagedRowWriteSet> {
+        self.ensure_ready()?;
+        preflight_batch(input_changes, &self.tables, &self.indexes)?;
+        let mut retained_bytes = 0usize;
+        let mut tables = BTreeMap::<String, BTreeMap<Vec<u8>, PagedRowChange>>::new();
+        for change in input_changes {
+            let (table_name, input, is_delete) = match change {
+                Change::Upsert { table, row } => (table, row, false),
+                Change::Delete { table, key } => (table, key, true),
+            };
+            let table = self
+                .tables
+                .get(table_name)
+                .expect("preflight resolved every changed table");
+            let row = if is_delete {
+                input.clone()
+            } else {
+                normalize_row(&table.schema, input.clone())?
+            };
+            let key = encode_primary_key(&table.schema, &row)?;
+            let table_changes = tables.entry(table_name.clone()).or_default();
+            if let Some(existing) = table_changes.get_mut(&key) {
+                let previous_bytes = existing.next.as_ref().map_or(Ok(0), estimated_row_bytes)?;
+                let next = (!is_delete).then_some(row);
+                let next_bytes = next.as_ref().map_or(Ok(0), estimated_row_bytes)?;
+                retained_bytes = retained_bytes
+                    .checked_sub(previous_bytes)
+                    .and_then(|bytes| bytes.checked_add(next_bytes))
+                    .ok_or_else(batch_too_large)?;
+                ensure_batch_bytes(retained_bytes)?;
+                existing.next = next;
+                continue;
+            }
+
+            let old = lookup_encoded_primary_key(&mut self.pager.borrow_mut(), table, &key)?;
+            let next = (!is_delete).then_some(row);
+            let old_bytes = old.as_ref().map_or(Ok(0), estimated_row_bytes)?;
+            let next_bytes = next.as_ref().map_or(Ok(0), estimated_row_bytes)?;
+            let change_bytes = key
+                .len()
+                .checked_add(old_bytes)
+                .and_then(|bytes| bytes.checked_add(next_bytes))
+                .and_then(|bytes| bytes.checked_add(96))
+                .ok_or_else(batch_too_large)?;
+            retained_bytes = retained_bytes
+                .checked_add(change_bytes)
+                .ok_or_else(batch_too_large)?;
+            ensure_batch_bytes(retained_bytes)?;
+            table_changes.insert(key, PagedRowChange { old, next });
+        }
+
+        self.validate_changed_unique_indexes(&tables, retained_bytes)?;
+
+        Ok(PagedRowWriteSet {
+            base_revision: self.revision,
+            tables,
+        })
+    }
+
+    fn validate_changed_unique_indexes(
+        &self,
+        tables: &BTreeMap<String, BTreeMap<Vec<u8>, PagedRowChange>>,
+        mut retained_bytes: usize,
+    ) -> Result<()> {
+        for (table_name, changes) in tables {
+            let table = &self.tables[table_name];
+            for index in self
+                .indexes
+                .values()
+                .filter(|index| index.definition.table == *table_name && index.definition.unique)
+            {
+                let mut changed_prefixes = BTreeMap::<Vec<u8>, &[u8]>::new();
+                for (primary_key, change) in changes {
+                    let Some(row) = &change.next else {
+                        continue;
+                    };
+                    let Some(prefix) =
+                        encode_secondary_index_prefix(&table.schema, &index.definition, row)?
+                    else {
+                        continue;
+                    };
+                    retained_bytes = retained_bytes
+                        .checked_add(prefix.len() + primary_key.len() + 64)
+                        .ok_or_else(batch_too_large)?;
+                    ensure_batch_bytes(retained_bytes)?;
+                    if changed_prefixes
+                        .insert(prefix.clone(), primary_key)
+                        .is_some()
+                    {
+                        return Err(unique_violation(&index.definition.name));
+                    }
+
+                    let existing_primary_keys =
+                        committed_index_primary_keys(&mut self.pager.borrow_mut(), index, &prefix)?;
+                    for existing_primary_key in existing_primary_keys {
+                        retained_bytes = retained_bytes
+                            .checked_add(existing_primary_key.len())
+                            .ok_or_else(batch_too_large)?;
+                        ensure_batch_bytes(retained_bytes)?;
+                        if existing_primary_key == *primary_key {
+                            continue;
+                        }
+                        let existing_moves =
+                            if let Some(existing) = changes.get(&existing_primary_key) {
+                                match &existing.next {
+                                    None => true,
+                                    Some(row) => {
+                                        encode_secondary_index_prefix(
+                                            &table.schema,
+                                            &index.definition,
+                                            row,
+                                        )?
+                                        .as_deref()
+                                            != Some(prefix.as_slice())
+                                    }
+                                }
+                            } else {
+                                false
+                            };
+                        if !existing_moves {
+                            return Err(unique_violation(&index.definition.name));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit_row_write_set(
+        &mut self,
+        write_set: PagedRowWriteSet,
+    ) -> Result<ApplyOutcome> {
+        self.ensure_ready()?;
+        if write_set.base_revision != self.revision {
+            return Err(EngineError::new(
+                "WRITE_CONFLICT",
+                format!(
+                    "Paged write-set revision {} does not match current revision {}",
+                    write_set.base_revision, self.revision
+                ),
+            ));
+        }
+        if write_set.tables.is_empty() {
+            return Ok(ApplyOutcome {
+                revision: self.revision,
+                tables: vec![],
+            });
+        }
+        let PagedRowWriteSet {
+            base_revision: _,
+            tables: changes,
+        } = write_set;
+
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| EngineError::new("REVISION_OVERFLOW", "Database revision overflowed"))?;
+        let mut next_tables = self.tables.clone();
+        let mut next_indexes = self.indexes.clone();
+        let mut pager = self.pager.borrow_mut();
+        let applied_journal_sequence = pager.applied_journal_sequence();
+        let catalog_root = pager.catalog_root_page_id().ok_or_else(|| {
+            storage_corrupt("A non-empty paged catalog must have a published root")
+        })?;
+        let mut transaction = pager.begin_write()?;
+        let result = (|| {
+            for (table_name, table_changes) in &changes {
+                let table = next_tables
+                    .get_mut(table_name)
+                    .expect("every changed table was resolved above");
+                for (key, change) in table_changes {
+                    match &change.next {
+                        Some(row) => {
+                            let current = match table.root_page_id {
+                                Some(root) => root,
+                                None => Btree::create(&mut transaction, table.tree_id)?,
+                            };
+                            table.root_page_id = Some(Btree::upsert(
+                                &mut transaction,
+                                current,
+                                table.tree_id,
+                                key,
+                                &encode_row(row)?,
+                            )?);
+                        }
+                        None => {
+                            if let Some(root) = table.root_page_id {
+                                table.root_page_id =
+                                    Btree::delete(&mut transaction, root, table.tree_id, key)?.0;
+                            }
+                        }
+                    }
+                }
+                table.row_count = adjusted_count(
+                    table.row_count,
+                    table_changes
+                        .values()
+                        .filter(|change| change.old.is_none() && change.next.is_some())
+                        .count(),
+                    table_changes
+                        .values()
+                        .filter(|change| change.old.is_some() && change.next.is_none())
+                        .count(),
+                    "table row",
+                )?;
+
+                for index in next_indexes
+                    .values_mut()
+                    .filter(|index| index.definition.table == *table_name)
+                {
+                    let mut inserted = 0usize;
+                    let mut deleted = 0usize;
+                    for change in table_changes.values() {
+                        let old_key = if let Some(old_row) = &change.old
+                            && let Some(index_key) = encode_secondary_index_entry_key(
+                                &table.schema,
+                                &index.definition,
+                                old_row,
+                            )? {
+                            Some(index_key)
+                        } else {
+                            None
+                        };
+                        let next_key = if let Some(row) = &change.next
+                            && let Some(index_key) = encode_secondary_index_entry_key(
+                                &table.schema,
+                                &index.definition,
+                                row,
+                            )? {
+                            Some(index_key)
+                        } else {
+                            None
+                        };
+                        if old_key == next_key {
+                            continue;
+                        }
+                        if let Some(index_key) = old_key
+                            && let Some(root) = index.root_page_id
+                        {
+                            let (next_root, removed) =
+                                Btree::delete(&mut transaction, root, index.tree_id, &index_key)?;
+                            if !removed {
+                                return Err(storage_corrupt(format!(
+                                    "Index `{}` is missing an entry for a committed row",
+                                    index.definition.name
+                                )));
+                            }
+                            index.root_page_id = next_root;
+                            deleted += 1;
+                        }
+                        if let Some(index_key) = next_key {
+                            let current = match index.root_page_id {
+                                Some(root) => root,
+                                None => Btree::create(&mut transaction, index.tree_id)?,
+                            };
+                            index.root_page_id = Some(Btree::upsert(
+                                &mut transaction,
+                                current,
+                                index.tree_id,
+                                &index_key,
+                                &[],
+                            )?);
+                            inserted += 1;
+                        }
+                    }
+                    index.entry_count =
+                        adjusted_count(index.entry_count, inserted, deleted, "index entry")?;
+                }
+            }
+
+            let mut catalog_root = catalog_root;
+            for table_name in changes.keys() {
+                let table = &next_tables[table_name];
+                let (key, value) = encode_catalog_table_record(&CatalogTableRecord {
+                    schema: table.schema.clone(),
+                    tree_id: table.tree_id,
+                    root_page_id: table.root_page_id,
+                    row_count: table.row_count as u64,
+                })?;
+                catalog_root = Btree::upsert(
+                    &mut transaction,
+                    catalog_root,
+                    CATALOG_TREE_ID,
+                    &key,
+                    &value,
+                )?;
+            }
+            for index in next_indexes
+                .values()
+                .filter(|index| changes.contains_key(index.definition.table.as_str()))
+            {
+                let (key, value) = encode_catalog_index_record(&CatalogIndexRecord {
+                    definition: index.definition.clone(),
+                    tree_id: index.tree_id,
+                    root_page_id: index.root_page_id,
+                    entry_count: index.entry_count as u64,
+                })?;
+                catalog_root = Btree::upsert(
+                    &mut transaction,
+                    catalog_root,
+                    CATALOG_TREE_ID,
+                    &key,
+                    &value,
+                )?;
+            }
+            Ok(catalog_root)
+        })();
+
+        let catalog_root = match result {
+            Ok(catalog_root) => catalog_root,
+            Err(error) => {
+                transaction.abort();
+                return Err(error);
+            }
+        };
+        if let Err(error) =
+            transaction.commit(revision, applied_journal_sequence, Some(catalog_root))
+        {
+            if error.code == "RECOVERY_REQUIRED" || pager.is_recovery_required() {
+                self.recovery_required = true;
+            }
+            return Err(error);
+        }
+        drop(pager);
+
+        self.tables = next_tables;
+        self.indexes = next_indexes;
+        self.revision = revision;
+        Ok(ApplyOutcome {
+            revision,
+            tables: changes.into_keys().collect(),
+        })
+    }
+
+    fn ensure_ready(&self) -> Result<()> {
+        if self.recovery_required || self.pager.borrow().is_recovery_required() {
+            Err(EngineError::new(
+                "RECOVERY_REQUIRED",
+                "The paged database has an unknown commit outcome; reopen its page device before continuing",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn preflight_batch(
+    changes: &[Change],
+    tables: &BTreeMap<String, PagedTable>,
+    indexes: &BTreeMap<String, PagedIndex>,
+) -> Result<()> {
+    if changes.len() > MAX_PAGED_BATCH_CHANGES {
+        return Err(EngineError::new(
+            "TRANSACTION_TOO_LARGE",
+            format!("A paged batch cannot contain more than {MAX_PAGED_BATCH_CHANGES} changes"),
+        ));
+    }
+    let mut bytes = 0usize;
+    let mut operations = 0usize;
+    let mut changed_tables = BTreeSet::new();
+    let mut index_counts = BTreeMap::<&str, usize>::new();
+    for index in indexes.values() {
+        *index_counts
+            .entry(index.definition.table.as_str())
+            .or_default() += 1;
+    }
+    for change in changes {
+        let (table, row) = match change {
+            Change::Upsert { table, row } | Change::Delete { table, key: row } => (table, row),
+        };
+        if !tables.contains_key(table) {
+            return Err(EngineError::table_not_found(table));
+        }
+        let index_count = index_counts.get(table.as_str()).copied().unwrap_or(0);
+        operations = operations
+            .checked_add(1 + 2 * index_count)
+            .ok_or_else(batch_too_large)?;
+        if operations > MAX_PAGED_BATCH_OPERATIONS {
+            return Err(operation_limit());
+        }
+        let row_bytes = estimated_row_bytes(row)?;
+        bytes = bytes
+            .checked_add(table.len())
+            .and_then(|bytes| bytes.checked_add(row_bytes))
+            .and_then(|bytes| bytes.checked_add(64))
+            .ok_or_else(batch_too_large)?;
+        ensure_batch_bytes(bytes)?;
+        changed_tables.insert(table.as_str());
+    }
+    let affected_index_count = changed_tables.iter().try_fold(0usize, |count, table| {
+        count
+            .checked_add(index_counts.get(table).copied().unwrap_or(0))
+            .ok_or_else(batch_too_large)
+    })?;
+    operations = operations
+        .checked_add(changed_tables.len())
+        .and_then(|operations| operations.checked_add(affected_index_count))
+        .ok_or_else(batch_too_large)?;
+    if operations > MAX_PAGED_BATCH_OPERATIONS {
+        return Err(operation_limit());
+    }
+    Ok(())
+}
+
+fn operation_limit() -> EngineError {
+    EngineError::new(
+        "TRANSACTION_TOO_LARGE",
+        format!(
+            "A paged batch cannot require more than {MAX_PAGED_BATCH_OPERATIONS} row, index, and catalog operations"
+        ),
+    )
+}
+
+fn lookup_encoded_primary_key<D: PageDevice>(
+    pager: &mut Pager<D>,
+    table: &PagedTable,
+    key: &[u8],
+) -> Result<Option<Row>> {
+    let Some(root) = table.root_page_id else {
+        return Ok(None);
+    };
+    Btree::get(pager, root, table.tree_id, key)?
+        .map(|value| validated_row(&table.schema, key, &value))
+        .transpose()
+}
+
+fn committed_index_primary_keys<D: PageDevice>(
+    pager: &mut Pager<D>,
+    index: &PagedIndex,
+    prefix: &[u8],
+) -> Result<Vec<Vec<u8>>> {
+    let Some(root) = index.root_page_id else {
+        return Ok(Vec::new());
+    };
+    let mut cursor = Btree::cursor_from(pager, root, index.tree_id, prefix)?;
+    let mut primary_keys = Vec::new();
+    while let Some((entry_key, value)) = cursor.next(pager)? {
+        if !secondary_index_entry_matches_prefix(&entry_key, prefix) {
+            break;
+        }
+        if !value.is_empty() {
+            return Err(storage_corrupt(format!(
+                "Secondary index `{}` contains a non-empty value",
+                index.definition.name
+            )));
+        }
+        primary_keys.push(secondary_index_primary_key(&entry_key, prefix)?.to_vec());
+        if index.definition.unique && primary_keys.len() > 1 {
+            return Err(storage_corrupt(format!(
+                "Unique index `{}` contains duplicate values",
+                index.definition.name
+            )));
+        }
+    }
+    Ok(primary_keys)
+}
+
+fn adjusted_count(current: usize, inserted: usize, deleted: usize, kind: &str) -> Result<usize> {
+    current
+        .checked_sub(deleted)
+        .and_then(|count| count.checked_add(inserted))
+        .ok_or_else(|| storage_corrupt(format!("A {kind} count overflowed or underflowed")))
+}
+
+fn estimated_row_bytes(row: &Row) -> Result<usize> {
+    estimated_object_bytes(row, 0)
+}
+
+fn estimated_json_bytes(value: &serde_json::Value, depth: usize) -> Result<usize> {
+    if depth > 64 {
+        return Err(EngineError::invalid_change(
+            "A paged batch value cannot exceed 64 levels",
+        ));
+    }
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) => Ok(8),
+        serde_json::Value::Number(_) => Ok(32),
+        serde_json::Value::String(value) => value
+            .len()
+            .checked_mul(6)
+            .and_then(|bytes| bytes.checked_add(32))
+            .ok_or_else(batch_too_large),
+        serde_json::Value::Array(values) => values.iter().try_fold(64usize, |bytes, value| {
+            bytes
+                .checked_add(estimated_json_bytes(value, depth + 1)?)
+                .and_then(|bytes| bytes.checked_add(16))
+                .ok_or_else(batch_too_large)
+        }),
+        serde_json::Value::Object(values) => estimated_object_bytes(values, depth),
+    }
+}
+
+fn estimated_object_bytes(values: &Row, depth: usize) -> Result<usize> {
+    if depth > 64 {
+        return Err(EngineError::invalid_change(
+            "A paged batch value cannot exceed 64 levels",
+        ));
+    }
+    values.iter().try_fold(64usize, |bytes, (key, value)| {
+        let key_bytes = key.len().checked_mul(6).ok_or_else(batch_too_large)?;
+        let value_bytes = estimated_json_bytes(value, depth + 1)?;
+        bytes
+            .checked_add(key_bytes)
+            .and_then(|bytes| bytes.checked_add(value_bytes))
+            .and_then(|bytes| bytes.checked_add(64))
+            .ok_or_else(batch_too_large)
+    })
+}
+
+fn ensure_batch_bytes(bytes: usize) -> Result<()> {
+    if bytes > MAX_PAGED_BATCH_BYTES {
+        Err(batch_too_large())
+    } else {
+        Ok(())
+    }
+}
+
+fn batch_too_large() -> EngineError {
+    EngineError::new(
+        "TRANSACTION_TOO_LARGE",
+        format!("A paged batch cannot retain more than {MAX_PAGED_BATCH_BYTES} bytes"),
+    )
+}
+
+fn unique_violation(index: &str) -> EngineError {
+    EngineError::constraint_violation(format!("Index `{index}` would contain duplicate values"))
 }
 
 struct TableInput {
@@ -287,6 +861,7 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
         table: &str,
         visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
+        self.ensure_ready()?;
         let table = self
             .tables
             .get(table)
@@ -309,6 +884,7 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
     }
 
     fn table_row_count(&self, table: &str) -> Result<usize> {
+        self.ensure_ready()?;
         self.tables
             .get(table)
             .map(|table| table.row_count)
@@ -316,6 +892,7 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
     }
 
     fn lookup_primary_key(&self, table: &str, key: &Row) -> Result<Option<Row>> {
+        self.ensure_ready()?;
         let table = self
             .tables
             .get(table)
@@ -335,10 +912,14 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
     }
 
     fn index_definition(&self, name: &str) -> Option<IndexDefinition> {
+        // StorageReader cannot express failure on this metadata probe. After an ambiguous commit
+        // this may report the last confirmed definition, but every operation which can consume it
+        // is fallible and rejects through `ensure_ready` until the device is reopened.
         self.indexes.get(name).map(|index| index.definition.clone())
     }
 
     fn indexes_for_table(&self, table: &str) -> Result<Vec<IndexDefinition>> {
+        self.ensure_ready()?;
         if !self.tables.contains_key(table) {
             return Err(EngineError::table_not_found(table));
         }
@@ -357,6 +938,7 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
         key: &Row,
         visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
     ) -> Result<Option<VisitOutcome>> {
+        self.ensure_ready()?;
         let table_data = self
             .tables
             .get(table)
@@ -444,6 +1026,7 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
     }
 
     fn table_schema(&self, table: &str) -> Result<TableSchema> {
+        self.ensure_ready()?;
         self.tables
             .get(table)
             .map(|table| table.schema.clone())
@@ -451,6 +1034,8 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
     }
 
     fn revision(&self) -> u64 {
+        // The trait is infallible: return the last confirmed revision, not a claim about an
+        // ambiguously published commit. Callers must reopen after `RECOVERY_REQUIRED`.
         self.revision
     }
 }
@@ -558,6 +1143,9 @@ fn load_and_validate_catalog<D: PageDevice>(
                     definition: record.definition,
                     tree_id: record.tree_id,
                     root_page_id: record.root_page_id,
+                    entry_count: usize::try_from(record.entry_count).map_err(|_| {
+                        storage_corrupt("An index entry count cannot fit in memory")
+                    })?,
                 },
             ))
         })
@@ -798,12 +1386,129 @@ fn as_storage_corruption(error: EngineError) -> EngineError {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
     use serde_json::{Value, json};
 
     use super::*;
     use crate::{
-        ColumnDefinition, ColumnType, Engine, MemoryPageDevice, QueryResult, StorageDriver,
+        ColumnDefinition, ColumnType, Engine, MemoryPageDevice, PAGE_SIZE, PageDevice, QueryResult,
+        StorageDriver,
     };
+
+    #[derive(Clone)]
+    struct CountingDevice {
+        inner: Rc<RefCell<MemoryPageDevice>>,
+        reads: Rc<Cell<usize>>,
+    }
+
+    impl CountingDevice {
+        fn new() -> Self {
+            Self {
+                inner: Rc::new(RefCell::new(MemoryPageDevice::new(0).unwrap())),
+                reads: Rc::new(Cell::new(0)),
+            }
+        }
+
+        fn reset_reads(&self) {
+            self.reads.set(0);
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.get()
+        }
+    }
+
+    impl PageDevice for CountingDevice {
+        fn page_count(&self) -> PageId {
+            self.inner.borrow().page_count()
+        }
+
+        fn read_page(&mut self, id: PageId, destination: &mut [u8]) -> Result<()> {
+            self.reads.set(self.reads.get() + 1);
+            self.inner.borrow_mut().read_page(id, destination)
+        }
+
+        fn write_page(&mut self, id: PageId, source: &[u8]) -> Result<()> {
+            self.inner.borrow_mut().write_page(id, source)
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            self.inner.borrow_mut().flush()
+        }
+    }
+
+    #[derive(Default)]
+    struct DurableState {
+        working: Vec<[u8; PAGE_SIZE]>,
+        durable: Vec<[u8; PAGE_SIZE]>,
+        flushes: usize,
+        fail_after_flush: Option<usize>,
+    }
+
+    #[derive(Clone, Default)]
+    struct DurableDevice(Rc<RefCell<DurableState>>);
+
+    impl DurableDevice {
+        fn arm_after_flush(&self, flush: usize) {
+            let mut state = self.0.borrow_mut();
+            state.flushes = 0;
+            state.fail_after_flush = Some(flush);
+        }
+
+        fn crash(&self) {
+            let mut state = self.0.borrow_mut();
+            state.working = state.durable.clone();
+            state.flushes = 0;
+            state.fail_after_flush = None;
+        }
+    }
+
+    impl PageDevice for DurableDevice {
+        fn page_count(&self) -> PageId {
+            self.0.borrow().working.len() as PageId
+        }
+
+        fn read_page(&mut self, id: PageId, destination: &mut [u8]) -> Result<()> {
+            let state = self.0.borrow();
+            if destination.len() != PAGE_SIZE || id >= state.working.len() as PageId {
+                return Err(EngineError::new("DURABLE_DEVICE", "invalid read"));
+            }
+            destination.copy_from_slice(&state.working[id as usize]);
+            Ok(())
+        }
+
+        fn write_page(&mut self, id: PageId, source: &[u8]) -> Result<()> {
+            let mut state = self.0.borrow_mut();
+            if source.len() != PAGE_SIZE {
+                return Err(EngineError::new("DURABLE_DEVICE", "invalid write"));
+            }
+            if id == state.working.len() as PageId {
+                state.working.push([0; PAGE_SIZE]);
+            } else if id > state.working.len() as PageId {
+                return Err(EngineError::new("DURABLE_DEVICE", "non-dense write"));
+            }
+            state.working[id as usize].copy_from_slice(source);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            let mut state = self.0.borrow_mut();
+            state.durable = state.working.clone();
+            state.flushes += 1;
+            if state.fail_after_flush == Some(state.flushes) {
+                state.fail_after_flush = None;
+                return Err(EngineError::new(
+                    "INJECTED_IO",
+                    "failure after durability barrier",
+                ));
+            }
+            Ok(())
+        }
+    }
 
     fn row(value: Value) -> Row {
         value.as_object().unwrap().clone()
@@ -1032,6 +1737,453 @@ mod tests {
             Some(VisitOutcome::Stopped)
         );
         assert_eq!(index_visits, 1);
+    }
+
+    #[test]
+    fn page_native_batch_is_atomic_indexed_revisioned_and_reopenable() {
+        let source = source();
+        let mut paged =
+            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let before_revision = paged.revision();
+        let outcome = paged
+            .apply_batch(&ChangeBatch {
+                changes: vec![
+                    Change::Upsert {
+                        table: "posts".to_owned(),
+                        row: row(json!({"id": 11, "author_id": 2, "state": "archived", "rank": 7})),
+                    },
+                    Change::Delete {
+                        table: "posts".to_owned(),
+                        key: row(json!({"id": 10})),
+                    },
+                    Change::Upsert {
+                        table: "posts".to_owned(),
+                        row: row(json!({"id": 13, "author_id": 1, "state": "live", "rank": 4})),
+                    },
+                    Change::Upsert {
+                        table: "authors".to_owned(),
+                        row: row(json!({"id": 1, "name": "Ada Lovelace"})),
+                    },
+                    Change::Upsert {
+                        table: "posts".to_owned(),
+                        row: row(json!({"id": 14, "author_id": 1, "state": "draft", "rank": 8})),
+                    },
+                    Change::Delete {
+                        table: "posts".to_owned(),
+                        key: row(json!({"id": 14})),
+                    },
+                ],
+                ..ChangeBatch::default()
+            })
+            .unwrap();
+        assert_eq!(outcome.revision, before_revision + 1);
+        assert_eq!(outcome.tables, vec!["authors", "posts"]);
+        assert_eq!(paged.table_row_count("posts").unwrap(), 3);
+        assert_eq!(
+            paged.scan_table("posts").unwrap(),
+            vec![
+                row(json!({"id": 11, "author_id": 2, "state": "archived", "rank": 7})),
+                row(json!({"id": 12, "author_id": 2, "state": null, "rank": 3})),
+                row(json!({"id": 13, "author_id": 1, "state": "live", "rank": 4})),
+            ]
+        );
+        let mut ids = Vec::new();
+        paged
+            .visit_index(
+                "posts",
+                &["author_id".to_owned()],
+                &row(json!({"author_id": 2})),
+                &mut |row| {
+                    ids.push(row["id"].as_i64().unwrap());
+                    Ok(VisitControl::Continue)
+                },
+            )
+            .unwrap();
+        assert_eq!(ids, vec![11, 12]);
+
+        let mut reopened = PagedStorage::open(paged.into_device()).unwrap();
+        assert_eq!(reopened.revision(), before_revision + 1);
+        assert_eq!(
+            reopened
+                .lookup_primary_key("authors", &row(json!({"id": 1})))
+                .unwrap()
+                .unwrap()["name"],
+            "Ada Lovelace"
+        );
+        let no_op = reopened
+            .apply_batch(&ChangeBatch {
+                changes: vec![],
+                ..ChangeBatch::default()
+            })
+            .unwrap();
+        assert_eq!(no_op.revision, before_revision + 1);
+        assert!(no_op.tables.is_empty());
+        let syntactic_change = reopened
+            .apply_batch(&ChangeBatch {
+                changes: vec![Change::Delete {
+                    table: "posts".to_owned(),
+                    key: row(json!({"id": 999})),
+                }],
+                ..ChangeBatch::default()
+            })
+            .unwrap();
+        assert_eq!(syntactic_change.revision, before_revision + 2);
+        assert_eq!(syntactic_change.tables, vec!["posts"]);
+    }
+
+    #[test]
+    fn unique_indexes_validate_complete_final_composite_state_and_allow_nulls_and_swaps() {
+        let mut source = InMemoryStorage::default();
+        source
+            .define_table(schema(
+                "accounts",
+                &[
+                    ("id", ColumnType::Integer, false),
+                    ("tenant", ColumnType::Integer, false),
+                    ("email", ColumnType::Text, true),
+                ],
+            ))
+            .unwrap();
+        source
+            .replace_table(
+                "accounts",
+                vec![
+                    row(json!({"id": 1, "tenant": 7, "email": "a@example.com"})),
+                    row(json!({"id": 2, "tenant": 7, "email": "b@example.com"})),
+                    row(json!({"id": 3, "tenant": 7, "email": null})),
+                    row(json!({"id": 4, "tenant": 7, "email": null})),
+                ],
+            )
+            .unwrap();
+        source
+            .define_index(IndexDefinition {
+                name: "accounts_tenant_email".to_owned(),
+                table: "accounts".to_owned(),
+                columns: vec!["tenant".to_owned(), "email".to_owned()],
+                unique: true,
+            })
+            .unwrap();
+        let mut paged =
+            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        paged
+            .apply_batch(&ChangeBatch {
+                changes: vec![
+                    Change::Upsert {
+                        table: "accounts".to_owned(),
+                        row: row(json!({"id": 1, "tenant": 7, "email": "b@example.com"})),
+                    },
+                    Change::Upsert {
+                        table: "accounts".to_owned(),
+                        row: row(json!({"id": 2, "tenant": 7, "email": "a@example.com"})),
+                    },
+                ],
+                ..ChangeBatch::default()
+            })
+            .unwrap();
+        let revision = paged.revision();
+        let error = paged
+            .apply_batch(&ChangeBatch {
+                changes: vec![
+                    Change::Upsert {
+                        table: "accounts".to_owned(),
+                        row: row(json!({"id": 3, "tenant": 7, "email": "same@example.com"})),
+                    },
+                    Change::Upsert {
+                        table: "accounts".to_owned(),
+                        row: row(json!({"id": 4, "tenant": 7, "email": "same@example.com"})),
+                    },
+                ],
+                ..ChangeBatch::default()
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "CONSTRAINT_VIOLATION");
+        assert_eq!(paged.revision(), revision);
+        assert_eq!(
+            paged
+                .lookup_primary_key("accounts", &row(json!({"id": 3})))
+                .unwrap()
+                .unwrap()["email"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn invalid_late_table_keeps_every_table_and_revision_unchanged() {
+        let mut paged =
+            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source()).unwrap();
+        let revision = paged.revision();
+        let before = paged
+            .lookup_primary_key("authors", &row(json!({"id": 1})))
+            .unwrap();
+        let error = paged
+            .apply_batch(&ChangeBatch {
+                changes: vec![
+                    Change::Upsert {
+                        table: "authors".to_owned(),
+                        row: row(json!({"id": 1, "name": "Changed"})),
+                    },
+                    Change::Delete {
+                        table: "missing".to_owned(),
+                        key: row(json!({"id": 1})),
+                    },
+                ],
+                ..ChangeBatch::default()
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "TABLE_NOT_FOUND");
+        assert_eq!(paged.revision(), revision);
+        assert_eq!(
+            paged
+                .lookup_primary_key("authors", &row(json!({"id": 1})))
+                .unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn one_row_batch_uses_exact_lookup_instead_of_scanning_the_table() {
+        let mut source = InMemoryStorage::default();
+        source
+            .define_table(schema(
+                "large",
+                &[
+                    ("id", ColumnType::Integer, false),
+                    ("payload", ColumnType::Text, false),
+                ],
+            ))
+            .unwrap();
+        source
+            .replace_table(
+                "large",
+                (0..2_000)
+                    .map(|id| row(json!({"id": id, "payload": "x".repeat(700)})))
+                    .collect(),
+            )
+            .unwrap();
+
+        let device = CountingDevice::new();
+        let control = device.clone();
+        let imported = PagedStorage::from_in_memory(device, &source).unwrap();
+        let device = imported.into_device();
+        let mut pager = Pager::with_cache_capacity(device, PAGE_SIZE).unwrap();
+        let revision = pager.database_revision();
+        let catalog_root = pager.catalog_root_page_id().unwrap();
+        let (tables, indexes) = load_and_validate_catalog(&mut pager, catalog_root).unwrap();
+        let mut paged = PagedStorage {
+            pager: RefCell::new(pager),
+            revision,
+            tables,
+            indexes,
+            recovery_required: false,
+        };
+        control.reset_reads();
+
+        paged
+            .apply_batch(&ChangeBatch {
+                changes: vec![Change::Upsert {
+                    table: "large".to_owned(),
+                    row: row(json!({"id": 1_000, "payload": "updated"})),
+                }],
+                ..ChangeBatch::default()
+            })
+            .unwrap();
+        assert!(
+            control.reads() < 30,
+            "one exact mutation read {} pages from a multi-hundred-page table",
+            control.reads()
+        );
+    }
+
+    #[test]
+    fn interrupted_publication_reopens_at_exactly_the_old_or_new_generation() {
+        for (failing_flush, expected_new) in [(1, false), (3, true)] {
+            let device = DurableDevice::default();
+            let control = device.clone();
+            let mut paged = PagedStorage::from_in_memory(device, &source()).unwrap();
+            let revision = paged.revision();
+            control.arm_after_flush(failing_flush);
+            let error = paged
+                .apply_batch(&ChangeBatch {
+                    changes: vec![Change::Upsert {
+                        table: "authors".to_owned(),
+                        row: row(json!({"id": 1, "name": "Grace"})),
+                    }],
+                    ..ChangeBatch::default()
+                })
+                .unwrap_err();
+            if expected_new {
+                assert_eq!(error.code, "RECOVERY_REQUIRED");
+                for result in [
+                    paged.table_row_count("authors").map(|_| ()),
+                    paged.table_schema("authors").map(|_| ()),
+                    paged
+                        .lookup_primary_key("authors", &row(json!({"id": 1})))
+                        .map(|_| ()),
+                    paged.indexes_for_table("posts").map(|_| ()),
+                    paged
+                        .visit_table("authors", &mut |_| Ok(VisitControl::Continue))
+                        .map(|_| ()),
+                    paged
+                        .visit_index(
+                            "posts",
+                            &["author_id".to_owned()],
+                            &row(json!({"author_id": 1})),
+                            &mut |_| Ok(VisitControl::Continue),
+                        )
+                        .map(|_| ()),
+                ] {
+                    assert_eq!(result.unwrap_err().code, "RECOVERY_REQUIRED");
+                }
+                assert_eq!(
+                    paged
+                        .apply_batch(&ChangeBatch {
+                            changes: vec![Change::Delete {
+                                table: "authors".to_owned(),
+                                key: row(json!({"id": 2})),
+                            }],
+                            ..ChangeBatch::default()
+                        })
+                        .unwrap_err()
+                        .code,
+                    "RECOVERY_REQUIRED"
+                );
+            } else {
+                assert_eq!(error.code, "INJECTED_IO");
+                assert_eq!(paged.revision(), revision);
+                assert_eq!(
+                    paged
+                        .lookup_primary_key("authors", &row(json!({"id": 1})))
+                        .unwrap()
+                        .unwrap()["name"],
+                    "Ada"
+                );
+            }
+
+            let device = paged.into_device();
+            control.crash();
+            let reopened = PagedStorage::open(device).unwrap();
+            assert_eq!(
+                reopened
+                    .lookup_primary_key("authors", &row(json!({"id": 1})))
+                    .unwrap()
+                    .unwrap()["name"],
+                if expected_new { "Grace" } else { "Ada" }
+            );
+            assert_eq!(reopened.revision(), revision + u64::from(expected_new));
+        }
+    }
+
+    #[test]
+    fn page_native_batch_enforces_operation_and_memory_limits_before_mutation() {
+        let mut paged =
+            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source()).unwrap();
+        let revision = paged.revision();
+        let operation_error = paged
+            .apply_batch(&ChangeBatch {
+                changes: (0..=MAX_PAGED_BATCH_CHANGES)
+                    .map(|id| Change::Delete {
+                        table: "posts".to_owned(),
+                        key: row(json!({"id": id})),
+                    })
+                    .collect(),
+                ..ChangeBatch::default()
+            })
+            .unwrap_err();
+        assert_eq!(operation_error.code, "TRANSACTION_TOO_LARGE");
+        assert_eq!(paged.revision(), revision);
+
+        let memory_error = paged
+            .apply_batch(&ChangeBatch {
+                changes: vec![Change::Upsert {
+                    table: "posts".to_owned(),
+                    row: row(json!({
+                        "id": 99,
+                        "author_id": 1,
+                        "state": "z".repeat(MAX_PAGED_BATCH_BYTES / 5),
+                        "rank": 1,
+                    })),
+                }],
+                ..ChangeBatch::default()
+            })
+            .unwrap_err();
+        assert_eq!(memory_error.code, "TRANSACTION_TOO_LARGE");
+        assert_eq!(paged.revision(), revision);
+    }
+
+    #[test]
+    fn operation_budget_counts_index_delete_and_upsert_plus_catalog_publication() {
+        let table = PagedTable {
+            schema: schema(
+                "indexed",
+                &[
+                    ("id", ColumnType::Integer, false),
+                    ("value", ColumnType::Text, false),
+                ],
+            ),
+            tree_id: FIRST_USER_TREE_ID,
+            root_page_id: None,
+            row_count: 0,
+        };
+        let tables = BTreeMap::from([("indexed".to_owned(), table)]);
+        let indexes = (0..9)
+            .map(|number| {
+                let name = format!("index_{number}");
+                (
+                    name.clone(),
+                    PagedIndex {
+                        definition: IndexDefinition {
+                            name,
+                            table: "indexed".to_owned(),
+                            columns: vec!["value".to_owned()],
+                            unique: false,
+                        },
+                        tree_id: FIRST_USER_TREE_ID + 1 + number,
+                        root_page_id: None,
+                        entry_count: 0,
+                    },
+                )
+            })
+            .collect();
+        let at_limit = (MAX_PAGED_BATCH_OPERATIONS - 10) / 19;
+        assert_eq!(at_limit, 52_631);
+        let changes = (0..=at_limit)
+            .map(|id| Change::Delete {
+                table: "indexed".to_owned(),
+                key: row(json!({"id": id})),
+            })
+            .collect::<Vec<_>>();
+        preflight_batch(&changes[..at_limit], &tables, &indexes).unwrap();
+        let error = preflight_batch(&changes, &tables, &indexes).unwrap_err();
+        assert_eq!(error.code, "TRANSACTION_TOO_LARGE");
+    }
+
+    #[test]
+    fn typed_delete_keys_fail_before_publication_on_type_or_shape_errors() {
+        let mut paged =
+            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source()).unwrap();
+        let revision = paged.revision();
+        let wrong_type = paged
+            .apply_batch(&ChangeBatch {
+                changes: vec![Change::Delete {
+                    table: "posts".to_owned(),
+                    key: row(json!({"id": "11"})),
+                }],
+                ..ChangeBatch::default()
+            })
+            .unwrap_err();
+        assert_eq!(wrong_type.code, "TYPE_MISMATCH");
+        assert_eq!(paged.revision(), revision);
+        let missing = paged
+            .apply_batch(&ChangeBatch {
+                changes: vec![Change::Delete {
+                    table: "posts".to_owned(),
+                    key: Row::new(),
+                }],
+                ..ChangeBatch::default()
+            })
+            .unwrap_err();
+        assert_eq!(missing.code, "INVALID_CHANGE");
+        assert_eq!(paged.revision(), revision);
     }
 
     #[test]
