@@ -7,6 +7,7 @@ mod error;
 mod join;
 mod model;
 mod page;
+mod paged_codec;
 mod pager;
 mod prepared;
 mod query;
