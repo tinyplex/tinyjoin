@@ -4,6 +4,7 @@ import {
   StorageError,
   createOpfsSnapshotStore,
 } from '../../src/worker/snapshot-store.ts';
+import {encodePageAuthorityMarker} from '../../src/worker/page-authority.ts';
 
 class MemoryFile {
   bytes = new Uint8Array();
@@ -139,6 +140,25 @@ function memoryOpfs() {
 }
 
 describe('OPFS snapshot store', () => {
+  it('makes released legacy recovery reject a committed page authority marker', async () => {
+    const opfs = memoryOpfs();
+    const database = await opfs.database('page-authority');
+    const firstSlot = await database.getFileHandle('snapshot-a.bin', {
+      create: true,
+    });
+    firstSlot.bytes = new Uint8Array(
+      encodePageAuthorityMarker({
+        appliedJournalSequence: 42n,
+        databaseRevision: 7n,
+      }),
+    );
+
+    await expect(
+      createOpfsSnapshotStore('page-authority', opfs.provider),
+    ).rejects.toMatchObject({code: 'STORAGE_VERSION_UNSUPPORTED'});
+    expect(firstSlot.locked).toBe(false);
+  });
+
   it('orders complete A/B snapshots by an independent generation', async () => {
     const opfs = memoryOpfs();
     const store = await createOpfsSnapshotStore('restart-test', opfs.provider);
