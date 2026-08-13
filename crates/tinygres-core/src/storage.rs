@@ -284,8 +284,21 @@ impl InMemoryStorage {
             .ok_or_else(|| EngineError::table_not_found(table))
     }
 
+    /// Borrows a schema so the paged importer can enforce aggregate metadata bounds before clone.
+    pub(crate) fn table_schema_ref(&self, table: &str) -> Result<&TableSchema> {
+        self.tables
+            .get(table)
+            .map(|table| &table.schema)
+            .ok_or_else(|| EngineError::table_not_found(table))
+    }
+
     pub(crate) fn index_names(&self) -> impl Iterator<Item = &str> {
         self.indexes.keys().map(String::as_str)
+    }
+
+    /// Borrows an index definition for bounded paged-import planning.
+    pub(crate) fn index_definition_ref(&self, name: &str) -> Option<&IndexDefinition> {
+        self.indexes.get(name).map(|index| &index.definition)
     }
 
     pub(crate) fn set_revision(&mut self, revision: u64) {

@@ -35,6 +35,16 @@ impl<D: PageDevice> PagedEngine<D> {
         PagedStorage::from_in_memory(device, source).map(Self::new)
     }
 
+    /// Imports an in-memory catalog and its recovered journal watermark as one generation.
+    pub fn from_in_memory_with_journal_sequence(
+        device: D,
+        source: &InMemoryStorage,
+        applied_journal_sequence: u64,
+    ) -> Result<Self> {
+        PagedStorage::from_in_memory_with_journal_sequence(device, source, applied_journal_sequence)
+            .map(Self::new)
+    }
+
     /// Atomically defines one initialization schema without advancing the database revision.
     pub fn define_table(&mut self, schema: TableSchema) -> Result<()> {
         self.ensure_no_transaction()?;
@@ -172,8 +182,10 @@ impl<D: PageDevice> PagedEngine<D> {
                         (outcome, revision)
                     }
                     _ => {
-                        let PlannedDml { outcome, changes } =
-                            crate::statement::plan_dml(&self.storage, &statement)?;
+                        let PlannedDml { outcome, changes } = {
+                            let view = self.read_view();
+                            crate::statement::plan_dml(&view, &statement)?
+                        };
                         debug_assert_eq!(outcome.mutated, !changes.is_empty());
                         let revision = if outcome.mutated {
                             let write_set = self.storage.prepare_row_write_set(&changes)?;
@@ -197,6 +209,11 @@ impl<D: PageDevice> PagedEngine<D> {
 
     pub fn revision(&self) -> u64 {
         self.storage.revision()
+    }
+
+    /// Returns the legacy journal sequence incorporated into the active paged generation.
+    pub fn applied_journal_sequence(&self) -> u64 {
+        self.storage.applied_journal_sequence()
     }
 
     pub fn begin_transaction(&mut self) -> Result<()> {
@@ -428,6 +445,27 @@ mod tests {
             )
             .unwrap();
         engine.into_storage()
+    }
+
+    #[test]
+    fn sequence_aware_import_exposes_and_reopens_the_recovery_watermark() {
+        let source = source();
+        let engine = PagedEngine::from_in_memory_with_journal_sequence(
+            MemoryPageDevice::new(0).unwrap(),
+            &source,
+            47,
+        )
+        .unwrap();
+        assert_eq!(engine.revision(), source.revision());
+        assert_eq!(engine.applied_journal_sequence(), 47);
+
+        let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        assert_eq!(reopened.revision(), source.revision());
+        assert_eq!(reopened.applied_journal_sequence(), 47);
+
+        let ordinary =
+            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        assert_eq!(ordinary.applied_journal_sequence(), 0);
     }
 
     #[test]
@@ -1585,6 +1623,16 @@ mod tests {
             engine
                 .execute_sql(
                     "INSERT INTO accounts (id, email) VALUES (3, 'grace@example.com')",
+                    &[],
+                )
+                .unwrap_err()
+                .code,
+            "RECOVERY_REQUIRED"
+        );
+        assert_eq!(
+            engine
+                .execute_sql(
+                    "INSERT INTO accounts (id, email) VALUES (4, 'lin@example.com')",
                     &[],
                 )
                 .unwrap_err()
