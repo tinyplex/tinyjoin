@@ -16,7 +16,7 @@ use crate::{
         secondary_index_entry_matches_prefix, secondary_index_primary_key,
         secondary_index_primary_key_for_definition,
     },
-    storage::normalize_row,
+    storage::{normalize_row, preflight_change_batch},
 };
 
 /// A relational view over the crash-safe paged B-tree store.
@@ -62,7 +62,6 @@ struct PagedRowChange {
     next: Option<Row>,
 }
 
-const MAX_PAGED_BATCH_CHANGES: usize = 100_000;
 const MAX_PAGED_BATCH_OPERATIONS: usize = 1_000_000;
 const MAX_PAGED_BATCH_BYTES: usize = 16 * 1024 * 1024;
 
@@ -673,12 +672,15 @@ fn preflight_batch(
     tables: &BTreeMap<String, PagedTable>,
     indexes: &BTreeMap<String, PagedIndex>,
 ) -> Result<()> {
-    if changes.len() > MAX_PAGED_BATCH_CHANGES {
-        return Err(EngineError::new(
-            "TRANSACTION_TOO_LARGE",
-            format!("A paged batch cannot contain more than {MAX_PAGED_BATCH_CHANGES} changes"),
-        ));
-    }
+    let schemas = tables
+        .iter()
+        .map(|(name, table)| (name.as_str(), &table.schema))
+        .collect();
+    let definitions = indexes
+        .values()
+        .map(|index| &index.definition)
+        .collect::<Vec<_>>();
+    preflight_change_batch(changes, &schemas, &definitions)?;
     let mut bytes = 0usize;
     let mut operations = 0usize;
     let mut changed_tables = BTreeSet::new();
@@ -2080,7 +2082,7 @@ mod tests {
         let revision = paged.revision();
         let operation_error = paged
             .apply_batch(&ChangeBatch {
-                changes: (0..=MAX_PAGED_BATCH_CHANGES)
+                changes: (0..=crate::storage::MAX_BATCH_CHANGES)
                     .map(|id| Change::Delete {
                         table: "posts".to_owned(),
                         key: row(json!({"id": id})),
@@ -2094,15 +2096,17 @@ mod tests {
 
         let memory_error = paged
             .apply_batch(&ChangeBatch {
-                changes: vec![Change::Upsert {
-                    table: "posts".to_owned(),
-                    row: row(json!({
-                        "id": 99,
-                        "author_id": 1,
-                        "state": "z".repeat(MAX_PAGED_BATCH_BYTES / 5),
-                        "rank": 1,
-                    })),
-                }],
+                changes: (0..20_000)
+                    .map(|id| Change::Upsert {
+                        table: "posts".to_owned(),
+                        row: row(json!({
+                            "id": 99 + id,
+                            "author_id": 1,
+                            "state": "z".repeat(800),
+                            "rank": 1,
+                        })),
+                    })
+                    .collect(),
                 ..ChangeBatch::default()
             })
             .unwrap_err();

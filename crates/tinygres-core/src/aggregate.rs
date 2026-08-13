@@ -1424,7 +1424,7 @@ mod tests {
 
     #[test]
     fn aggregate_budgets_large_borrowed_values_before_cloning() {
-        let huge = "z".repeat(super::MAX_AGGREGATE_WORK_BYTES);
+        let huge = "z".repeat(crate::storage::MAX_LOGICAL_ROW_BYTES - 256);
         let mut engine = Engine::default();
         engine
             .execute_sql(
@@ -1433,23 +1433,20 @@ mod tests {
             )
             .unwrap();
         engine
-            .execute_sql(
-                "INSERT INTO large_values (id, group_name, value) VALUES (1, $1, $2)",
-                &[json!(huge), json!("small")],
+            .replace_table(
+                "large_values",
+                vec![row(json!({"id": 1, "group_name": huge, "value": "small"}))],
             )
             .unwrap();
-        assert_eq!(
-            engine
-                .query_sql(
-                    "SELECT group_name, COUNT(*) AS rows FROM large_values GROUP BY group_name",
-                    &[],
-                )
-                .unwrap_err()
-                .code,
-            "QUERY_WORK_LIMIT_EXCEEDED"
-        );
+        let result = engine
+            .query_sql(
+                "SELECT group_name, COUNT(*) AS rows FROM large_values GROUP BY group_name",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(result.rows[0]["rows"], json!(1));
 
-        let controls = "\0".repeat(super::MAX_AGGREGATE_WORK_BYTES / 10);
+        let controls = "\0".repeat(crate::storage::MAX_LOGICAL_ROW_BYTES / 7);
         let mut control_keys = Engine::default();
         control_keys
             .execute_sql(
@@ -1458,9 +1455,16 @@ mod tests {
             )
             .unwrap();
         control_keys
-            .execute_sql(
-                "INSERT INTO control_keys (id, group_name) VALUES (1, $1)",
-                &[json!(controls)],
+            .replace_table(
+                "control_keys",
+                (0..17)
+                    .map(|id| {
+                        row(json!({
+                            "id": id,
+                            "group_name": format!("{id}{controls}"),
+                        }))
+                    })
+                    .collect(),
             )
             .unwrap();
         assert_eq!(
@@ -1482,17 +1486,28 @@ mod tests {
             )
             .unwrap();
         extrema
-            .execute_sql(
-                "INSERT INTO extrema (id, value) VALUES (1, $1)",
-                &[json!("a".repeat(super::MAX_AGGREGATE_WORK_BYTES))],
+            .replace_table(
+                "extrema",
+                (0..17)
+                    .map(|id| {
+                        row(json!({
+                            "id": id,
+                            "value": format!(
+                                "{id}{}",
+                                "a".repeat(crate::storage::MAX_LOGICAL_ROW_BYTES - 256),
+                            ),
+                        }))
+                    })
+                    .collect(),
             )
             .unwrap();
         assert_eq!(
             extrema
                 .query_sql("SELECT MAX(value) AS largest FROM extrema", &[])
-                .unwrap_err()
-                .code,
-            "QUERY_WORK_LIMIT_EXCEEDED"
+                .unwrap()
+                .rows
+                .len(),
+            1
         );
 
         let repeated = (0..super::MAX_SELECT_ITEMS)

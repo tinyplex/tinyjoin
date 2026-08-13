@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 use serde_json::{Map, Number, Value};
 
-use crate::storage::StorageReader;
+use crate::storage::{StorageReader, validate_json_value};
 use crate::{
     ColumnDefinition, ColumnType, EngineError, Filter, FilterOperator, NullOrder, OrderBy,
     OrderDirection, Predicate, QueryPlan, QueryResult, Result, Row, VisitControl, VisitOutcome,
@@ -271,6 +271,14 @@ pub(crate) fn validate_sql_input(sql: &str, params: &[Value]) -> Result<()> {
         return Err(EngineError::invalid_query(format!(
             "A SQL query cannot receive more than {MAX_PARAMETERS} parameters"
         )));
+    }
+    for value in params {
+        validate_json_value(value).map_err(|error| {
+            EngineError::bind_error(format!(
+                "A SQL parameter is outside storage bounds: {}",
+                error.message
+            ))
+        })?;
     }
     Ok(())
 }

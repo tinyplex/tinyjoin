@@ -1,20 +1,25 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use serde_json::{Map, Number, Value};
 
 use crate::query::{
-    Token, bind_parameter, is_reserved_keyword, matches_predicate, parse_predicate_at, project_row,
-    tokenize, validate_predicate_columns, validate_sql_input,
+    Token, bind_parameter, is_reserved_keyword, matches_predicate, parse_predicate_at, tokenize,
+    validate_predicate_columns, validate_sql_input,
 };
-use crate::storage::{normalize_row, row_key};
+use crate::storage::{estimated_row_bytes, estimated_value_bytes, normalize_row, row_key};
 use crate::{
-    ColumnDefinition, ColumnType, EngineError, Predicate, QueryPlan, Result, Row, StorageDriver,
-    TableSchema,
+    Change, ColumnDefinition, ColumnType, EngineError, Predicate, QueryPlan, Result, Row,
+    StorageDriver, TableSchema, VisitControl, VisitOutcome,
 };
 
 const MAX_COLUMNS: usize = 256;
 const MAX_VALUE_ROWS: usize = 4096;
+const MAX_DML_SCAN_ROWS: usize = 1_000_000;
+const MAX_DML_CHANGED_ROWS: usize = 100_000;
+const MAX_DML_WORK_BYTES: usize = 16 * 1024 * 1024;
+const MAX_DML_RESULT_BYTES: usize = 16 * 1024 * 1024;
+const DML_CHANGE_RETAINED_BYTES: usize = 96;
 
 pub(crate) enum Statement {
     Select(QueryPlan),
@@ -70,6 +75,7 @@ pub(crate) enum SqlValue {
     Default,
 }
 
+#[derive(Debug)]
 pub(crate) struct WriteOutcome {
     pub command: &'static str,
     pub row_count: usize,
@@ -324,13 +330,11 @@ fn insert<S: StorageDriver>(
     validate_named_columns(&schema, &columns)?;
     validate_projection(&schema, returning)?;
 
-    let mut rows = storage.scan_table(table)?;
-    let mut keys = HashSet::with_capacity(rows.len() + value_rows.len());
-    for row in &rows {
-        keys.insert(row_key(&schema, row)?);
-    }
-
-    let mut inserted = Vec::with_capacity(value_rows.len());
+    let mut keys = HashSet::with_capacity(value_rows.len());
+    let mut changes = Vec::with_capacity(value_rows.len());
+    let mut returned = Vec::with_capacity(returning.map_or(0, |_| value_rows.len()));
+    let mut work_bytes = 0usize;
+    let mut result_bytes = 0usize;
     for values in value_rows {
         if !default_values && values.len() != columns.len() {
             return Err(EngineError::invalid_query(format!(
@@ -339,6 +343,13 @@ fn insert<S: StorageDriver>(
                 values.len()
             )));
         }
+        let prospective_bytes =
+            prospective_insert_row_bytes(&schema, &columns, values, default_values)?;
+        let prospective_charge = checked_dml_add(
+            checked_dml_mul(prospective_bytes, 2)?,
+            checked_dml_add(table.len(), DML_CHANGE_RETAINED_BYTES + 160)?,
+        )?;
+        ensure_dml_work_bytes(checked_dml_add(work_bytes, prospective_charge)?)?;
         let mut row = Map::new();
         if !default_values {
             for (column, value) in columns.iter().zip(values) {
@@ -349,18 +360,33 @@ fn insert<S: StorageDriver>(
         }
         let row = normalize_row(&schema, row)?;
         let key = row_key(&schema, &row)?;
+        let key_charge = checked_dml_add(checked_dml_mul(key.len(), 2)?, 64)?;
+        work_bytes = checked_dml_add(work_bytes, key_charge)?;
+        ensure_dml_work_bytes(work_bytes)?;
         if !keys.insert(key) {
             return Err(EngineError::constraint_violation(format!(
                 "INSERT into `{table}` would duplicate a primary key"
             )));
         }
-        inserted.push(row.clone());
-        rows.push(row);
+        if storage.lookup_primary_key(table, &row)?.is_some() {
+            return Err(EngineError::constraint_violation(format!(
+                "INSERT into `{table}` would duplicate a primary key"
+            )));
+        }
+        work_bytes = retain_dml_row(work_bytes, &row)?;
+        work_bytes = retain_dml_change(work_bytes, table)?;
+        if let Some(columns) = returning {
+            result_bytes = retain_returned_row(result_bytes, &row, columns)?;
+            returned.push(project_returning_row(&row, columns, table)?);
+        }
+        changes.push(Change::Upsert {
+            table: table.to_owned(),
+            row,
+        });
     }
 
-    let row_count = inserted.len();
-    let returned = project_rows(inserted, returning, table)?;
-    storage.replace_table_unrevisioned(table, rows)?;
+    let row_count = changes.len();
+    storage.apply_row_changes_unrevisioned(changes)?;
     Ok(WriteOutcome {
         command: "INSERT",
         row_count,
@@ -390,36 +416,153 @@ fn update<S: StorageDriver>(
     }
     validate_projection(&schema, returning)?;
 
-    let mut rows = storage.scan_table(table)?;
-    let mut updated = Vec::new();
-    for row in &mut rows {
-        if !matches_predicate(row, predicate, table)? {
-            continue;
-        }
-        for (column, value) in assignments {
+    let assignment_bytes = assignments
+        .iter()
+        .try_fold(0usize, |bytes, (column, value)| {
             let value = match value {
-                SqlValue::Value(value) => value.clone(),
-                SqlValue::Default => column_default(&schema, column)?,
+                SqlValue::Value(value) => value,
+                SqlValue::Default => schema
+                    .columns
+                    .iter()
+                    .find(|definition| definition.name == *column)
+                    .and_then(|definition| definition.default.as_ref())
+                    .unwrap_or(&Value::Null),
             };
-            row.insert(column.clone(), value);
-        }
-        *row = normalize_row(&schema, std::mem::take(row))?;
-        updated.push(row.clone());
+            let value_bytes = estimated_value_bytes(value)?;
+            checked_dml_add(
+                bytes,
+                checked_dml_add(
+                    checked_dml_mul(column.len(), 2)?,
+                    checked_dml_add(checked_dml_mul(value_bytes, 2)?, 64)?,
+                )?,
+            )
+        })?;
+    ensure_dml_work_bytes(assignment_bytes)?;
+    let resolved_assignments = assignments
+        .iter()
+        .map(|(column, value)| {
+            Ok((
+                column.clone(),
+                match value {
+                    SqlValue::Value(value) => value.clone(),
+                    SqlValue::Default => column_default(&schema, column)?,
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    struct PlannedUpdate {
+        old_key: String,
+        old_primary_key: Row,
+        new_key: String,
+        new_row: Row,
     }
 
-    let mut keys = HashSet::with_capacity(rows.len());
-    for row in &rows {
-        if !keys.insert(row_key(&schema, row)?) {
+    let mut updates = Vec::new();
+    let mut returned = Vec::new();
+    let mut scanned = 0usize;
+    let mut work_bytes = 0usize;
+    let mut result_bytes = 0usize;
+    let visit_outcome = storage.visit_table(table, &mut |row| {
+        scanned = scanned.saturating_add(1);
+        if scanned > MAX_DML_SCAN_ROWS {
+            return Err(dml_limit_error(format!(
+                "A data-modification statement cannot scan more than {MAX_DML_SCAN_ROWS} rows"
+            )));
+        }
+        if !matches_predicate(row, predicate, table)? {
+            return Ok(VisitControl::Continue);
+        }
+        if updates.len() == MAX_DML_CHANGED_ROWS {
+            return Err(dml_limit_error(format!(
+                "A data-modification statement cannot change more than {MAX_DML_CHANGED_ROWS} rows"
+            )));
+        }
+
+        // Check the retained candidate budget before cloning the visited row or assignment values.
+        let conservative_row_bytes = checked_dml_add(
+            checked_dml_mul(estimated_row_bytes(row)?, 3)?,
+            checked_dml_add(assignment_bytes, 256)?,
+        )?;
+        ensure_dml_work_bytes(checked_dml_add(work_bytes, conservative_row_bytes)?)?;
+
+        let old_key = row_key(&schema, row)?;
+        let old_primary_key = primary_key_row(&schema, row)?;
+        let mut new_row = row.clone();
+        for (column, value) in &resolved_assignments {
+            new_row.insert(column.clone(), value.clone());
+        }
+        let new_row = normalize_row(&schema, new_row)?;
+        let new_key = row_key(&schema, &new_row)?;
+        work_bytes = checked_dml_add(work_bytes, estimated_row_bytes(&new_row)?)?;
+        work_bytes = checked_dml_add(work_bytes, estimated_row_bytes(&old_primary_key)?)?;
+        work_bytes = checked_dml_add(
+            work_bytes,
+            checked_dml_add(old_key.len(), checked_dml_add(new_key.len(), 192)?)?,
+        )?;
+        ensure_dml_work_bytes(work_bytes)?;
+        work_bytes = retain_dml_change(work_bytes, table)?;
+        if old_key != new_key {
+            work_bytes = retain_dml_change(work_bytes, table)?;
+        }
+
+        if let Some(columns) = returning {
+            result_bytes = retain_returned_row(result_bytes, &new_row, columns)?;
+            returned.push(project_returning_row(&new_row, columns, table)?);
+        }
+        updates.push(PlannedUpdate {
+            old_key,
+            old_primary_key,
+            new_key,
+            new_row,
+        });
+        Ok(VisitControl::Continue)
+    })?;
+    require_complete_dml_scan(visit_outcome, table)?;
+
+    let row_count = updates.len();
+    let old_keys = updates
+        .iter()
+        .map(|update| update.old_key.as_str())
+        .collect::<HashSet<_>>();
+    let mut destinations = HashMap::with_capacity(row_count);
+    for update in &updates {
+        if destinations
+            .insert(update.new_key.as_str(), update.old_key.as_str())
+            .is_some()
+        {
+            return Err(EngineError::constraint_violation(format!(
+                "UPDATE of `{table}` would duplicate a primary key"
+            )));
+        }
+        if update.new_key != update.old_key
+            && !old_keys.contains(update.new_key.as_str())
+            && storage
+                .lookup_primary_key(table, &update.new_row)?
+                .is_some()
+        {
             return Err(EngineError::constraint_violation(format!(
                 "UPDATE of `{table}` would duplicate a primary key"
             )));
         }
     }
 
-    let row_count = updated.len();
-    let returned = project_rows(updated, returning, table)?;
     if row_count > 0 {
-        storage.replace_table_unrevisioned(table, rows)?;
+        let mut deletes = Vec::with_capacity(row_count);
+        let mut upserts = Vec::with_capacity(row_count);
+        for update in updates {
+            if update.old_key != update.new_key {
+                deletes.push(Change::Delete {
+                    table: table.to_owned(),
+                    key: update.old_primary_key,
+                });
+            }
+            upserts.push(Change::Upsert {
+                table: table.to_owned(),
+                row: update.new_row,
+            });
+        }
+        deletes.extend(upserts);
+        storage.apply_row_changes_unrevisioned(deletes)?;
     }
     Ok(WriteOutcome {
         command: "UPDATE",
@@ -445,19 +588,58 @@ fn delete<S: StorageDriver>(
     }
     validate_projection(&schema, returning)?;
 
-    let mut kept = Vec::new();
-    let mut deleted = Vec::new();
-    for row in storage.scan_table(table)? {
-        if matches_predicate(&row, predicate, table)? {
-            deleted.push(row);
-        } else {
-            kept.push(row);
+    let mut changes = Vec::new();
+    let mut returned = Vec::new();
+    let mut scanned = 0usize;
+    let mut work_bytes = 0usize;
+    let mut result_bytes = 0usize;
+    let visit_outcome = storage.visit_table(table, &mut |row| {
+        scanned = scanned.saturating_add(1);
+        if scanned > MAX_DML_SCAN_ROWS {
+            return Err(dml_limit_error(format!(
+                "A data-modification statement cannot scan more than {MAX_DML_SCAN_ROWS} rows"
+            )));
         }
-    }
-    let row_count = deleted.len();
-    let returned = project_rows(deleted, returning, table)?;
+        if !matches_predicate(row, predicate, table)? {
+            return Ok(VisitControl::Continue);
+        }
+        if changes.len() == MAX_DML_CHANGED_ROWS {
+            return Err(dml_limit_error(format!(
+                "A data-modification statement cannot change more than {MAX_DML_CHANGED_ROWS} rows"
+            )));
+        }
+
+        let mut charge = 32usize;
+        for column in &schema.primary_key {
+            let value = row.get(column).ok_or_else(|| {
+                EngineError::invalid_change(format!(
+                    "Row for `{}` is missing primary-key column `{column}`",
+                    schema.name
+                ))
+            })?;
+            charge = checked_dml_add(charge, 64)?;
+            charge = checked_dml_add(charge, checked_dml_mul(column.len(), 2)?)?;
+            charge = checked_dml_add(charge, checked_dml_mul(estimated_value_bytes(value)?, 2)?)?;
+        }
+        charge = checked_dml_add(charge, 96)?;
+        ensure_dml_work_bytes(checked_dml_add(work_bytes, charge)?)?;
+        work_bytes = retain_dml_change(work_bytes, table)?;
+        if let Some(columns) = returning {
+            result_bytes = retain_returned_row(result_bytes, row, columns)?;
+            returned.push(project_returning_row(row, columns, table)?);
+        }
+        let key = primary_key_row(&schema, row)?;
+        work_bytes = checked_dml_add(work_bytes, charge)?;
+        changes.push(Change::Delete {
+            table: table.to_owned(),
+            key,
+        });
+        Ok(VisitControl::Continue)
+    })?;
+    require_complete_dml_scan(visit_outcome, table)?;
+    let row_count = changes.len();
     if row_count > 0 {
-        storage.replace_table_unrevisioned(table, kept)?;
+        storage.apply_row_changes_unrevisioned(changes)?;
     }
     Ok(WriteOutcome {
         command: "DELETE",
@@ -523,18 +705,146 @@ fn column_default(schema: &TableSchema, name: &str) -> Result<Value> {
         .ok_or_else(|| EngineError::column_not_found(name, &schema.name))
 }
 
-fn project_rows(rows: Vec<Row>, returning: Option<&[String]>, table: &str) -> Result<Vec<Row>> {
-    let Some(columns) = returning else {
-        return Ok(vec![]);
-    };
-    let projection = if columns.is_empty() {
-        None
+fn primary_key_row(schema: &TableSchema, row: &Row) -> Result<Row> {
+    let mut key = Map::new();
+    for column in &schema.primary_key {
+        let value = row.get(column).ok_or_else(|| {
+            EngineError::invalid_change(format!(
+                "Row for `{}` is missing primary-key column `{column}`",
+                schema.name
+            ))
+        })?;
+        key.insert(column.clone(), value.clone());
+    }
+    Ok(key)
+}
+
+fn prospective_insert_row_bytes(
+    schema: &TableSchema,
+    columns: &[String],
+    values: &[SqlValue],
+    default_values: bool,
+) -> Result<usize> {
+    let mut bytes = 32usize;
+    if schema.columns.is_empty() {
+        for (column, value) in columns.iter().zip(values) {
+            let SqlValue::Value(value) = value else {
+                continue;
+            };
+            bytes = checked_dml_add(bytes, 64)?;
+            bytes = checked_dml_add(bytes, checked_dml_mul(column.len(), 2)?)?;
+            bytes = checked_dml_add(bytes, checked_dml_mul(estimated_value_bytes(value)?, 2)?)?;
+        }
+        return Ok(bytes);
+    }
+
+    for definition in &schema.columns {
+        let explicit = (!default_values)
+            .then(|| {
+                columns
+                    .iter()
+                    .position(|column| column == &definition.name)
+                    .and_then(|index| values.get(index))
+            })
+            .flatten();
+        let value = match explicit {
+            Some(SqlValue::Value(value)) => value,
+            Some(SqlValue::Default) | None => definition.default.as_ref().unwrap_or(&Value::Null),
+        };
+        bytes = checked_dml_add(bytes, 64)?;
+        bytes = checked_dml_add(bytes, checked_dml_mul(definition.name.len(), 2)?)?;
+        bytes = checked_dml_add(bytes, checked_dml_mul(estimated_value_bytes(value)?, 2)?)?;
+    }
+    Ok(bytes)
+}
+
+fn project_returning_row(row: &Row, columns: &[String], table: &str) -> Result<Row> {
+    if columns.is_empty() {
+        return Ok(row.clone());
+    }
+    let mut projected = Map::new();
+    for column in columns {
+        projected.insert(
+            column.clone(),
+            row.get(column)
+                .ok_or_else(|| EngineError::column_not_found(column, table))?
+                .clone(),
+        );
+    }
+    Ok(projected)
+}
+
+fn retain_dml_row(current: usize, row: &Row) -> Result<usize> {
+    let next = checked_dml_add(current, checked_dml_add(estimated_row_bytes(row)?, 96)?)?;
+    ensure_dml_work_bytes(next)?;
+    Ok(next)
+}
+
+fn retain_dml_change(current: usize, table: &str) -> Result<usize> {
+    let charge = checked_dml_add(table.len(), DML_CHANGE_RETAINED_BYTES)?;
+    let next = checked_dml_add(current, charge)?;
+    ensure_dml_work_bytes(next)?;
+    Ok(next)
+}
+
+fn retain_returned_row(current: usize, row: &Row, columns: &[String]) -> Result<usize> {
+    let bytes = if columns.is_empty() {
+        estimated_row_bytes(row)?
     } else {
-        Some(columns)
+        let mut bytes = 32usize;
+        for column in columns {
+            let value = row
+                .get(column)
+                .ok_or_else(|| EngineError::column_not_found(column, "RETURNING"))?;
+            bytes = checked_dml_add(bytes, 64)?;
+            bytes = checked_dml_add(bytes, checked_dml_mul(column.len(), 2)?)?;
+            bytes = checked_dml_add(bytes, checked_dml_mul(estimated_value_bytes(value)?, 2)?)?;
+        }
+        bytes
     };
-    rows.into_iter()
-        .map(|row| project_row(row, projection, table))
-        .collect()
+    let next = checked_dml_add(current, bytes)?;
+    if next > MAX_DML_RESULT_BYTES {
+        return Err(dml_limit_error(format!(
+            "A data-modification statement cannot materialize more than {MAX_DML_RESULT_BYTES} bytes of RETURNING results"
+        )));
+    }
+    Ok(next)
+}
+
+fn checked_dml_add(left: usize, right: usize) -> Result<usize> {
+    left.checked_add(right).ok_or_else(dml_overflow_error)
+}
+
+fn checked_dml_mul(left: usize, right: usize) -> Result<usize> {
+    left.checked_mul(right).ok_or_else(dml_overflow_error)
+}
+
+fn ensure_dml_work_bytes(bytes: usize) -> Result<()> {
+    if bytes > MAX_DML_WORK_BYTES {
+        Err(dml_limit_error(format!(
+            "A data-modification statement cannot retain more than {MAX_DML_WORK_BYTES} bytes of working state"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn dml_overflow_error() -> EngineError {
+    dml_limit_error("A data-modification statement size overflowed".to_owned())
+}
+
+fn dml_limit_error(message: String) -> EngineError {
+    EngineError::new("RESOURCE_LIMIT", message)
+}
+
+fn require_complete_dml_scan(outcome: VisitOutcome, table: &str) -> Result<()> {
+    match outcome {
+        VisitOutcome::Complete => Ok(()),
+        VisitOutcome::Stopped => Err(EngineError::new(
+            "STORAGE_CORRUPT",
+            format!("The storage visitor for `{table}` stopped without being asked"),
+        )),
+    }
 }
 
 struct MutationParser<'a> {
@@ -1117,4 +1427,331 @@ fn unsupported_expression() -> EngineError {
     EngineError::unsupported_sql(
         "This SQL subset supports literals, parameters, NULL, booleans, and DEFAULT values",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::{ApplyOutcome, ChangeBatch, InMemoryStorage, IndexDefinition, StorageReader};
+
+    struct UnexpectedStopStorage {
+        inner: InMemoryStorage,
+        mutation_calls: usize,
+    }
+
+    impl StorageReader for UnexpectedStopStorage {
+        fn visit_table(
+            &self,
+            _table: &str,
+            _visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+        ) -> Result<VisitOutcome> {
+            Ok(VisitOutcome::Stopped)
+        }
+
+        fn table_row_count(&self, table: &str) -> Result<usize> {
+            self.inner.table_row_count(table)
+        }
+
+        fn lookup_primary_key(&self, table: &str, key: &Row) -> Result<Option<Row>> {
+            self.inner.lookup_primary_key(table, key)
+        }
+
+        fn index_definition(&self, name: &str) -> Option<IndexDefinition> {
+            self.inner.index_definition(name)
+        }
+
+        fn indexes_for_table(&self, table: &str) -> Result<Vec<IndexDefinition>> {
+            self.inner.indexes_for_table(table)
+        }
+
+        fn visit_index(
+            &self,
+            table: &str,
+            columns: &[String],
+            key: &Row,
+            visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+        ) -> Result<Option<VisitOutcome>> {
+            self.inner.visit_index(table, columns, key, visitor)
+        }
+
+        fn table_schema(&self, table: &str) -> Result<TableSchema> {
+            self.inner.table_schema(table)
+        }
+
+        fn revision(&self) -> u64 {
+            self.inner.revision()
+        }
+    }
+
+    impl StorageDriver for UnexpectedStopStorage {
+        fn define_table(&mut self, schema: TableSchema) -> Result<()> {
+            self.mutation_calls += 1;
+            self.inner.define_table(schema)
+        }
+
+        fn drop_table(&mut self, table: &str) -> Result<()> {
+            self.mutation_calls += 1;
+            self.inner.drop_table(table)
+        }
+
+        fn add_column(&mut self, table: &str, column: ColumnDefinition) -> Result<()> {
+            self.mutation_calls += 1;
+            self.inner.add_column(table, column)
+        }
+
+        fn replace_table_snapshot(
+            &mut self,
+            schema: TableSchema,
+            rows: Vec<Row>,
+        ) -> Result<ApplyOutcome> {
+            self.mutation_calls += 1;
+            self.inner.replace_table_snapshot(schema, rows)
+        }
+
+        fn replace_table(&mut self, table: &str, rows: Vec<Row>) -> Result<ApplyOutcome> {
+            self.mutation_calls += 1;
+            self.inner.replace_table(table, rows)
+        }
+
+        fn apply_batch(&mut self, batch: &ChangeBatch) -> Result<ApplyOutcome> {
+            self.mutation_calls += 1;
+            self.inner.apply_batch(batch)
+        }
+
+        fn define_index(&mut self, definition: IndexDefinition) -> Result<()> {
+            self.mutation_calls += 1;
+            self.inner.define_index(definition)
+        }
+
+        fn drop_index(&mut self, name: &str) -> Result<()> {
+            self.mutation_calls += 1;
+            self.inner.drop_index(name)
+        }
+
+        fn apply_row_changes_unrevisioned(&mut self, changes: Vec<Change>) -> Result<()> {
+            self.mutation_calls += 1;
+            self.inner.apply_row_changes_unrevisioned(changes)
+        }
+
+        fn replace_table_unrevisioned(&mut self, table: &str, rows: Vec<Row>) -> Result<()> {
+            self.mutation_calls += 1;
+            self.inner.replace_table_unrevisioned(table, rows)
+        }
+
+        fn advance_revision(&mut self) -> Result<u64> {
+            self.mutation_calls += 1;
+            self.inner.advance_revision()
+        }
+    }
+
+    fn row(value: Value) -> Row {
+        value
+            .as_object()
+            .expect("test row must be an object")
+            .clone()
+    }
+
+    fn nested_json(depth: usize) -> Value {
+        (0..depth).fold(Value::Null, |value, _| Value::Array(vec![value]))
+    }
+
+    fn storage() -> InMemoryStorage {
+        let mut storage = InMemoryStorage::default();
+        storage
+            .define_table(TableSchema {
+                name: "items".to_owned(),
+                primary_key: vec!["id".to_owned()],
+                columns: vec![
+                    ColumnDefinition {
+                        name: "id".to_owned(),
+                        data_type: ColumnType::Integer,
+                        nullable: false,
+                        default: None,
+                    },
+                    ColumnDefinition {
+                        name: "value".to_owned(),
+                        data_type: ColumnType::Text,
+                        nullable: false,
+                        default: None,
+                    },
+                ],
+            })
+            .unwrap();
+        storage
+    }
+
+    fn execute_sql(storage: &mut InMemoryStorage, sql: &str, params: &[Value]) -> WriteOutcome {
+        let Statement::Write(statement) = parse(sql, params).unwrap() else {
+            panic!("test SQL must be a write statement");
+        };
+        execute(storage, &statement).unwrap()
+    }
+
+    #[test]
+    fn dml_uses_exact_insert_lookups_and_one_streaming_update_or_delete_scan() {
+        let mut storage = storage();
+
+        execute_sql(
+            &mut storage,
+            "INSERT INTO items (id, value) VALUES (1, 'one'), (2, 'two')",
+            &[],
+        );
+        assert_eq!(storage.access_counts(), (0, 2));
+        assert_eq!(storage.visitor_counts(), (0, 0));
+
+        let before_access = storage.access_counts();
+        let before_visitors = storage.visitor_counts();
+        let update = execute_sql(
+            &mut storage,
+            "UPDATE items SET value = 'changed' WHERE id = 2 RETURNING value",
+            &[],
+        );
+        assert_eq!(update.row_count, 1);
+        assert_eq!(update.rows, vec![row(json!({"value": "changed"}))]);
+        assert_eq!(
+            storage.access_counts(),
+            (before_access.0 + 1, before_access.1)
+        );
+        assert_eq!(
+            storage.visitor_counts(),
+            (before_visitors.0 + 2, before_visitors.1)
+        );
+
+        let before_access = storage.access_counts();
+        let before_visitors = storage.visitor_counts();
+        let delete = execute_sql(
+            &mut storage,
+            "DELETE FROM items WHERE id = 1 RETURNING value",
+            &[],
+        );
+        assert_eq!(delete.row_count, 1);
+        assert_eq!(delete.rows, vec![row(json!({"value": "one"}))]);
+        assert_eq!(
+            storage.access_counts(),
+            (before_access.0 + 1, before_access.1)
+        );
+        assert_eq!(
+            storage.visitor_counts(),
+            (before_visitors.0 + 2, before_visitors.1)
+        );
+    }
+
+    #[test]
+    fn dml_work_and_returning_budgets_fail_before_cloning_large_visited_values() {
+        let mut storage = storage();
+        let huge = "x".repeat(crate::storage::MAX_LOGICAL_ROW_BYTES - 256);
+        storage
+            .replace_table(
+                "items",
+                (0..19)
+                    .map(|id| row(json!({"id": id, "value": huge})))
+                    .collect(),
+            )
+            .unwrap();
+        let revision = storage.revision();
+
+        let Statement::Write(update) = parse("UPDATE items SET id = 100", &[]).unwrap() else {
+            unreachable!()
+        };
+        let error = match execute(&mut storage, &update) {
+            Ok(_) => panic!("oversized UPDATE should fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "RESOURCE_LIMIT");
+        assert_eq!(storage.revision(), revision);
+
+        let Statement::Write(delete_returning) =
+            parse("DELETE FROM items RETURNING value", &[]).unwrap()
+        else {
+            unreachable!()
+        };
+        let error = match execute(&mut storage, &delete_returning) {
+            Ok(_) => panic!("oversized RETURNING should fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "RESOURCE_LIMIT");
+        assert_eq!(storage.table_row_count("items").unwrap(), 19);
+        assert_eq!(storage.revision(), revision);
+
+        let deleted = execute_sql(&mut storage, "DELETE FROM items", &[]);
+        assert_eq!(deleted.row_count, 19);
+        assert_eq!(storage.table_row_count("items").unwrap(), 0);
+        // Statement execution is deliberately unrevisioned; the Engine publishes after success.
+        assert_eq!(storage.revision(), revision);
+    }
+
+    #[test]
+    fn update_and_delete_fail_closed_when_a_storage_scan_stops_unexpectedly() {
+        for sql in [
+            "UPDATE items SET value = 'changed' WHERE id = 1",
+            "DELETE FROM items WHERE id = 1",
+        ] {
+            let mut inner = storage();
+            inner
+                .replace_table("items", vec![row(json!({"id": 1, "value": "unchanged"}))])
+                .unwrap();
+            let revision = inner.revision();
+            let mut storage = UnexpectedStopStorage {
+                inner,
+                mutation_calls: 0,
+            };
+            let Statement::Write(statement) = parse(sql, &[]).unwrap() else {
+                unreachable!()
+            };
+
+            let error = execute(&mut storage, &statement).unwrap_err();
+
+            assert_eq!(error.code, "STORAGE_CORRUPT");
+            assert!(error.message.contains("stopped without being asked"));
+            assert_eq!(storage.mutation_calls, 0);
+            assert_eq!(storage.inner.revision(), revision);
+            assert_eq!(
+                storage
+                    .inner
+                    .lookup_primary_key("items", &row(json!({"id": 1})))
+                    .unwrap(),
+                Some(row(json!({"id": 1, "value": "unchanged"})))
+            );
+        }
+    }
+
+    #[test]
+    fn deeply_nested_json_dml_fails_before_mutation() {
+        let mut storage = InMemoryStorage::default();
+        storage
+            .define_table(TableSchema {
+                name: "documents".to_owned(),
+                primary_key: vec!["id".to_owned()],
+                columns: vec![
+                    ColumnDefinition {
+                        name: "id".to_owned(),
+                        data_type: ColumnType::Integer,
+                        nullable: false,
+                        default: None,
+                    },
+                    ColumnDefinition {
+                        name: "payload".to_owned(),
+                        data_type: ColumnType::Json,
+                        nullable: false,
+                        default: None,
+                    },
+                ],
+            })
+            .unwrap();
+        let revision = storage.revision();
+        let error = match parse(
+            "INSERT INTO documents (id, payload) VALUES (1, $1)",
+            &[nested_json(crate::storage::MAX_JSON_DEPTH + 1)],
+        ) {
+            Ok(_) => panic!("deeply nested SQL parameter should fail before binding"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, "BIND_ERROR");
+        assert!(error.message.contains("cannot nest more than 64 levels"));
+        assert_eq!(storage.table_row_count("documents").unwrap(), 0);
+        assert_eq!(storage.revision(), revision);
+    }
 }

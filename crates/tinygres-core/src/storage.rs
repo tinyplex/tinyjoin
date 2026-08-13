@@ -11,6 +11,13 @@ use crate::{
 };
 
 const MAX_COLUMNS: usize = 256;
+pub(crate) const MAX_JSON_DEPTH: usize = 64;
+pub(crate) const MAX_BATCH_CHANGES: usize = 100_000;
+pub(crate) const MAX_LOGICAL_VALUE_BYTES: usize = crate::MAX_BTREE_VALUE_BYTES;
+pub(crate) const MAX_LOGICAL_ROW_BYTES: usize = crate::MAX_BTREE_VALUE_BYTES - 8;
+pub(crate) const MAX_STORAGE_KEY_BYTES: usize = crate::MAX_BTREE_KEY_BYTES;
+const MAX_ROW_WRITE_CHANGES: usize = 200_000;
+const MAX_ROW_WRITE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VisitControl {
@@ -82,6 +89,13 @@ pub trait StorageDriver: StorageReader {
     fn apply_batch(&mut self, batch: &ChangeBatch) -> Result<ApplyOutcome>;
     fn define_index(&mut self, definition: IndexDefinition) -> Result<()>;
     fn drop_index(&mut self, name: &str) -> Result<()>;
+    /// Atomically applies an already planned row write-set without publishing a revision.
+    ///
+    /// Callers use this for one SQL statement, then publish exactly one revision only after the
+    /// complete statement succeeds. Deletes and upserts are interpreted as one final-state write
+    /// set, so primary-key and unique-index swaps do not depend on mutation order.
+    #[doc(hidden)]
+    fn apply_row_changes_unrevisioned(&mut self, changes: Vec<Change>) -> Result<()>;
     #[doc(hidden)]
     fn replace_table_unrevisioned(&mut self, table: &str, rows: Vec<Row>) -> Result<()>;
     #[doc(hidden)]
@@ -113,6 +127,13 @@ struct TableData {
 struct IndexData {
     definition: IndexDefinition,
     postings: BTreeMap<String, BTreeSet<String>>,
+}
+
+struct PreparedIndexChange {
+    index: String,
+    primary_key: String,
+    old_key: Option<String>,
+    new_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -230,9 +251,14 @@ impl InMemoryStorage {
         rows: &BTreeMap<String, Row>,
     ) -> Result<BTreeMap<String, IndexData>> {
         let mut indexes = self.indexes.clone();
+        let schema = &self
+            .tables
+            .get(table)
+            .expect("the rebuilt index table exists")
+            .schema;
         for index in indexes.values_mut() {
             if index.definition.table == table {
-                index.postings = build_postings(&index.definition, rows)?;
+                index.postings = build_postings(schema, &index.definition, rows)?;
             }
         }
         Ok(indexes)
@@ -360,6 +386,17 @@ impl StorageDriver for InMemoryStorage {
     }
 
     fn apply_batch(&mut self, batch: &ChangeBatch) -> Result<ApplyOutcome> {
+        let schemas = self
+            .tables
+            .iter()
+            .map(|(name, table)| (name.as_str(), &table.schema))
+            .collect();
+        let indexes = self
+            .indexes
+            .values()
+            .map(|index| &index.definition)
+            .collect::<Vec<_>>();
+        preflight_change_batch(&batch.changes, &schemas, &indexes)?;
         if batch.changes.is_empty() {
             return Ok(ApplyOutcome {
                 revision: self.revision,
@@ -369,40 +406,14 @@ impl StorageDriver for InMemoryStorage {
 
         // Apply to a clone first so a malformed later change cannot leave a partial batch.
         let mut candidate = self.clone();
-        let mut changed_tables = BTreeSet::new();
-
-        for change in &batch.changes {
-            match change {
-                Change::Upsert { table, row } => {
-                    let target = candidate
-                        .tables
-                        .get_mut(table)
-                        .ok_or_else(|| EngineError::table_not_found(table))?;
-                    let row = normalize_row(&target.schema, row.clone())?;
-                    let key = row_key(&target.schema, &row)?;
-                    target.rows.insert(key, row);
-                    changed_tables.insert(table.clone());
-                }
-                Change::Delete { table, key } => {
-                    let target = candidate
-                        .tables
-                        .get_mut(table)
-                        .ok_or_else(|| EngineError::table_not_found(table))?;
-                    let key = row_key(&target.schema, key)?;
-                    target.rows.remove(&key);
-                    changed_tables.insert(table.clone());
-                }
-            }
-        }
-
-        for table in &changed_tables {
-            let rows = &candidate
-                .tables
-                .get(table)
-                .expect("a changed table was resolved above")
-                .rows;
-            candidate.indexes = candidate.rebuilt_indexes_for_table(table, rows)?;
-        }
+        candidate.apply_row_changes_unrevisioned(batch.changes.clone())?;
+        let changed_tables = batch
+            .changes
+            .iter()
+            .map(|change| match change {
+                Change::Upsert { table, .. } | Change::Delete { table, .. } => table.clone(),
+            })
+            .collect::<BTreeSet<_>>();
 
         candidate.revision = next_revision(self.revision)?;
         let outcome = ApplyOutcome {
@@ -423,7 +434,12 @@ impl StorageDriver for InMemoryStorage {
             .get(&definition.table)
             .expect("index validation resolved the table")
             .rows;
-        let postings = build_postings(&definition, rows)?;
+        let schema = &self
+            .tables
+            .get(&definition.table)
+            .expect("index validation resolved the table")
+            .schema;
+        let postings = build_postings(schema, &definition, rows)?;
         self.indexes.insert(
             definition.name.clone(),
             IndexData {
@@ -440,6 +456,201 @@ impl StorageDriver for InMemoryStorage {
                 "INDEX_NOT_FOUND",
                 format!("Index `{name}` is not defined"),
             ));
+        }
+        Ok(())
+    }
+
+    fn apply_row_changes_unrevisioned(&mut self, changes: Vec<Change>) -> Result<()> {
+        if changes.len() > MAX_ROW_WRITE_CHANGES {
+            return Err(row_write_limit_error(format!(
+                "A row write-set cannot contain more than {MAX_ROW_WRITE_CHANGES} changes"
+            )));
+        }
+        if changes.is_empty() {
+            return Ok(());
+        }
+
+        // Collapse the input into its final value for each primary key before touching live
+        // state. SQL UPDATE emits all moved-key deletes before its upserts; treating the whole
+        // collection as a final write-set makes key and unique-index swaps order independent.
+        let mut retained_bytes = 0usize;
+        let mut tables = BTreeMap::<String, BTreeMap<String, Option<Row>>>::new();
+        for change in changes {
+            let (table, key, next) = match change {
+                Change::Upsert { table, row } => {
+                    let schema = &self
+                        .tables
+                        .get(&table)
+                        .ok_or_else(|| EngineError::table_not_found(&table))?
+                        .schema;
+                    let row = normalize_row(schema, row)?;
+                    let key = row_key(schema, &row)?;
+                    (table, key, Some(row))
+                }
+                Change::Delete { table, key } => {
+                    let schema = &self
+                        .tables
+                        .get(&table)
+                        .ok_or_else(|| EngineError::table_not_found(&table))?
+                        .schema;
+                    validate_primary_key_values(schema, &key)?;
+                    let key = row_key(schema, &key)?;
+                    (table, key, None)
+                }
+            };
+
+            let next_bytes = next.as_ref().map_or(Ok(0), estimated_row_bytes)?;
+            let charge = key
+                .len()
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(next_bytes))
+                .and_then(|bytes| bytes.checked_add(96))
+                .ok_or_else(row_write_overflow_error)?;
+            let table_changes = tables.entry(table).or_default();
+            if let Some(previous) = table_changes.insert(key.clone(), next) {
+                let previous_bytes = previous.as_ref().map_or(Ok(0), estimated_row_bytes)?;
+                let previous_charge = key
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|bytes| bytes.checked_add(previous_bytes))
+                    .and_then(|bytes| bytes.checked_add(96))
+                    .ok_or_else(row_write_overflow_error)?;
+                retained_bytes = retained_bytes
+                    .checked_sub(previous_charge)
+                    .ok_or_else(row_write_overflow_error)?;
+            }
+            retained_bytes = retained_bytes
+                .checked_add(charge)
+                .ok_or_else(row_write_overflow_error)?;
+            ensure_row_write_bytes(retained_bytes)?;
+        }
+
+        // Precompute every old and new index entry. All validation and allocation that can fail
+        // happens before the first live row or posting is changed.
+        let mut index_changes = Vec::new();
+        for (table_name, row_changes) in &tables {
+            let table = self
+                .tables
+                .get(table_name)
+                .expect("every changed table was resolved above");
+            for index in self
+                .indexes
+                .values()
+                .filter(|index| index.definition.table == *table_name)
+            {
+                let mut incoming = BTreeMap::<String, BTreeSet<String>>::new();
+                for (primary_key, next) in row_changes {
+                    let old_key = table
+                        .rows
+                        .get(primary_key)
+                        .map(|row| index_key_from_stored_row(&table.schema, &index.definition, row))
+                        .transpose()?
+                        .flatten();
+                    let new_key = next
+                        .as_ref()
+                        .map(|row| index_key(&table.schema, &index.definition, row))
+                        .transpose()?
+                        .flatten();
+
+                    let old_key_bytes = old_key
+                        .as_ref()
+                        .map_or(Ok(0), |key| checked_row_write_mul(key.len(), 2))?;
+                    let new_key_bytes = new_key
+                        .as_ref()
+                        .map_or(Ok(0), |key| checked_row_write_mul(key.len(), 2))?;
+                    let charge = checked_row_write_add(
+                        checked_row_write_add(
+                            checked_row_write_mul(primary_key.len(), 2)?,
+                            old_key_bytes,
+                        )?,
+                        checked_row_write_add(
+                            new_key_bytes,
+                            checked_row_write_add(index.definition.name.len(), 128)?,
+                        )?,
+                    )?;
+                    retained_bytes = retained_bytes
+                        .checked_add(charge)
+                        .ok_or_else(row_write_overflow_error)?;
+                    ensure_row_write_bytes(retained_bytes)?;
+
+                    if let Some(new_key) = &new_key {
+                        incoming
+                            .entry(new_key.clone())
+                            .or_default()
+                            .insert(primary_key.clone());
+                    }
+                    index_changes.push(PreparedIndexChange {
+                        index: index.definition.name.clone(),
+                        primary_key: primary_key.clone(),
+                        old_key,
+                        new_key,
+                    });
+                }
+
+                if index.definition.unique {
+                    for (key, new_primary_keys) in incoming {
+                        if new_primary_keys.len() > 1 {
+                            return Err(unique_index_violation(&index.definition.name));
+                        }
+                        let has_unchanged_entry =
+                            index.postings.get(&key).is_some_and(|existing| {
+                                existing
+                                    .iter()
+                                    .any(|primary_key| !row_changes.contains_key(primary_key))
+                            });
+                        if has_unchanged_entry {
+                            return Err(unique_index_violation(&index.definition.name));
+                        }
+                    }
+                }
+            }
+        }
+
+        // From here onward every operation is infallible. Remove stale postings first so swaps
+        // are applied as one final state, then publish rows and their replacement postings.
+        for change in &index_changes {
+            let Some(old_key) = &change.old_key else {
+                continue;
+            };
+            let index = self
+                .indexes
+                .get_mut(&change.index)
+                .expect("the prepared index still exists");
+            if let Some(postings) = index.postings.get_mut(old_key) {
+                postings.remove(&change.primary_key);
+                if postings.is_empty() {
+                    index.postings.remove(old_key);
+                }
+            }
+        }
+        for (table_name, row_changes) in tables {
+            let rows = &mut self
+                .tables
+                .get_mut(&table_name)
+                .expect("every changed table still exists")
+                .rows;
+            for (primary_key, next) in row_changes {
+                match next {
+                    Some(row) => {
+                        rows.insert(primary_key, row);
+                    }
+                    None => {
+                        rows.remove(&primary_key);
+                    }
+                }
+            }
+        }
+        for change in index_changes {
+            let Some(new_key) = change.new_key else {
+                continue;
+            };
+            self.indexes
+                .get_mut(&change.index)
+                .expect("the prepared index still exists")
+                .postings
+                .entry(new_key)
+                .or_default()
+                .insert(change.primary_key);
         }
         Ok(())
     }
@@ -563,7 +774,7 @@ impl StorageReader for InMemoryStorage {
         else {
             return Ok(None);
         };
-        let Some(index_key) = index_key(&index.definition, key)? else {
+        let Some(index_key) = index_lookup_key(&table_data.schema, &index.definition, key)? else {
             return Ok(Some(VisitOutcome::Complete));
         };
         for row in index
@@ -609,6 +820,10 @@ fn validate_index_definition(
     definition: &IndexDefinition,
     tables: &BTreeMap<String, TableData>,
 ) -> Result<()> {
+    validate_catalog_name_bound(&definition.name)
+        .map_err(|error| EngineError::invalid_schema(error.message))?;
+    validate_catalog_name_bound(&definition.table)
+        .map_err(|error| EngineError::invalid_schema(error.message))?;
     if definition.name.trim().is_empty() {
         return Err(EngineError::invalid_schema("An index name cannot be empty"));
     }
@@ -629,6 +844,8 @@ fn validate_index_definition(
     }
     let mut seen = HashSet::new();
     for name in &definition.columns {
+        validate_catalog_name_bound(name)
+            .map_err(|error| EngineError::invalid_schema(error.message))?;
         if !seen.insert(name) {
             return Err(EngineError::invalid_schema(format!(
                 "Index `{}` names column `{name}` more than once",
@@ -653,6 +870,7 @@ fn validate_index_definition(
 }
 
 fn build_postings(
+    schema: &TableSchema,
     definition: &IndexDefinition,
     rows: &BTreeMap<String, Row>,
 ) -> Result<BTreeMap<String, BTreeSet<String>>> {
@@ -660,7 +878,7 @@ fn build_postings(
     for (primary_key, row) in rows {
         // PostgreSQL's default UNIQUE semantics treat every key containing NULL
         // as distinct. NULL comparisons cannot use an equality lookup either.
-        let Some(key) = index_key(definition, row)? else {
+        let Some(key) = index_key_from_stored_row(schema, definition, row)? else {
             continue;
         };
         let entries = postings.entry(key).or_default();
@@ -675,7 +893,20 @@ fn build_postings(
     Ok(postings)
 }
 
-fn index_key(definition: &IndexDefinition, row: &Row) -> Result<Option<String>> {
+fn index_key(
+    schema: &TableSchema,
+    definition: &IndexDefinition,
+    row: &Row,
+) -> Result<Option<String>> {
+    validate_secondary_storage_key_bound(schema, definition, row)?;
+    index_key_from_stored_row(schema, definition, row)
+}
+
+fn index_key_from_stored_row(
+    _schema: &TableSchema,
+    definition: &IndexDefinition,
+    row: &Row,
+) -> Result<Option<String>> {
     let mut values = Vec::with_capacity(definition.columns.len());
     for column in &definition.columns {
         let value = row.get(column).ok_or_else(|| {
@@ -694,7 +925,21 @@ fn index_key(definition: &IndexDefinition, row: &Row) -> Result<Option<String>> 
     })
 }
 
+fn index_lookup_key(
+    schema: &TableSchema,
+    definition: &IndexDefinition,
+    row: &Row,
+) -> Result<Option<String>> {
+    let Some(bytes) = storage_tuple_bytes(schema, &definition.columns, row, true)? else {
+        return Ok(None);
+    };
+    ensure_storage_key_bytes(checked_row_write_add(bytes, 1)?)?;
+    index_key_from_stored_row(schema, definition, row)
+}
+
 fn validate_schema(schema: &TableSchema) -> Result<()> {
+    validate_catalog_name_bound(&schema.name)
+        .map_err(|error| EngineError::invalid_schema(error.message))?;
     if schema.name.trim().is_empty() {
         return Err(EngineError::invalid_schema("A table name cannot be empty"));
     }
@@ -707,6 +952,8 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
 
     let mut columns = HashSet::new();
     for column in &schema.primary_key {
+        validate_catalog_name_bound(column)
+            .map_err(|error| EngineError::invalid_schema(error.message))?;
         if column.trim().is_empty() {
             return Err(EngineError::invalid_schema(format!(
                 "Table `{}` contains an empty primary-key column",
@@ -727,6 +974,8 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
 
     let mut catalog_columns = HashSet::new();
     for column in &schema.columns {
+        validate_catalog_name_bound(&column.name)
+            .map_err(|error| EngineError::invalid_schema(error.message))?;
         if column.name.trim().is_empty() {
             return Err(EngineError::invalid_schema(format!(
                 "Table `{}` contains an empty column name",
@@ -745,7 +994,19 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
                 column.name, schema.name
             )));
         }
+        if schema.primary_key.contains(&column.name) && column.data_type == ColumnType::Json {
+            return Err(EngineError::invalid_schema(format!(
+                "Primary-key column `{}` in `{}` cannot use JSON page storage keys",
+                column.name, schema.name
+            )));
+        }
         if let Some(default) = &column.default {
+            validate_json_value(default).map_err(|error| {
+                EngineError::invalid_schema(format!(
+                    "Default for column `{}` is invalid: {}",
+                    column.name, error.message
+                ))
+            })?;
             validate_value(column, default, &schema.name).map_err(|error| {
                 EngineError::invalid_schema(format!(
                     "Default for column `{}` is invalid: {}",
@@ -767,6 +1028,7 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
 }
 
 pub(crate) fn normalize_row(schema: &TableSchema, mut row: Row) -> Result<Row> {
+    validate_row_value_limits(&row).map_err(|error| EngineError::invalid_change(error.message))?;
     if schema.columns.is_empty() {
         return Ok(row);
     }
@@ -789,6 +1051,7 @@ pub(crate) fn normalize_row(schema: &TableSchema, mut row: Row) -> Result<Row> {
             &schema.name,
         )?;
     }
+    validate_row_value_limits(&row).map_err(|error| EngineError::invalid_change(error.message))?;
     Ok(row)
 }
 
@@ -808,7 +1071,15 @@ fn validate_value(column: &ColumnDefinition, value: &Value, table: &str) -> Resu
         ColumnType::Integer => is_javascript_safe_integer(value),
         ColumnType::Float => value.is_number(),
         ColumnType::Text => value.is_string(),
-        ColumnType::Json => true,
+        ColumnType::Json => {
+            estimated_value_bytes(value).map_err(|error| {
+                EngineError::invalid_change(format!(
+                    "Column `{}` in `{table}` contains invalid JSON: {}",
+                    column.name, error.message
+                ))
+            })?;
+            true
+        }
     };
     if valid {
         Ok(())
@@ -842,6 +1113,7 @@ fn column_type_name(data_type: ColumnType) -> &'static str {
 }
 
 pub(crate) fn row_key(schema: &TableSchema, row: &Row) -> Result<String> {
+    validate_primary_storage_key_bound(schema, row)?;
     let mut values = Vec::with_capacity(schema.primary_key.len());
     for column in &schema.primary_key {
         let value = row.get(column).ok_or_else(|| {
@@ -861,6 +1133,454 @@ pub(crate) fn row_key(schema: &TableSchema, row: &Row) -> Result<String> {
     serde_json::to_string(&values).map_err(|error| {
         EngineError::invalid_change(format!("Could not encode primary key: {error}"))
     })
+}
+
+fn validate_primary_key_values(schema: &TableSchema, row: &Row) -> Result<()> {
+    if schema.columns.is_empty() {
+        return Ok(());
+    }
+    for name in &schema.primary_key {
+        let value = row.get(name).ok_or_else(|| {
+            EngineError::invalid_change(format!(
+                "Row for `{}` is missing primary-key column `{name}`",
+                schema.name
+            ))
+        })?;
+        let column = schema
+            .columns
+            .iter()
+            .find(|column| column.name == *name)
+            .expect("schema validation requires every primary-key column in the catalog");
+        validate_value(column, value, &schema.name)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn estimated_row_bytes(row: &Row) -> Result<usize> {
+    validate_row_value_limits(row)?;
+    let mut bytes = 32usize;
+    for (key, value) in row {
+        bytes = checked_row_write_add(bytes, 64)?;
+        bytes = checked_row_write_add(bytes, checked_row_write_mul(key.len(), 2)?)?;
+        bytes = checked_row_write_add(
+            bytes,
+            checked_row_write_mul(estimated_value_bytes(value)?, 2)?,
+        )?;
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn estimated_value_bytes(value: &Value) -> Result<usize> {
+    validate_json_value(value)?;
+    estimated_value_bytes_at_depth(value, 0)
+}
+
+fn estimated_value_bytes_at_depth(value: &Value, depth: usize) -> Result<usize> {
+    debug_assert!(depth <= MAX_JSON_DEPTH);
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(16),
+        Value::String(value) => checked_row_write_add(24, value.len()),
+        Value::Array(values) => {
+            let mut bytes = 32usize;
+            for value in values {
+                bytes = checked_row_write_add(bytes, 32)?;
+                bytes = checked_row_write_add(
+                    bytes,
+                    estimated_value_bytes_at_depth(value, depth + 1)?,
+                )?;
+            }
+            Ok(bytes)
+        }
+        Value::Object(values) => {
+            let mut bytes = 32usize;
+            for (key, value) in values {
+                bytes = checked_row_write_add(bytes, 64)?;
+                bytes = checked_row_write_add(bytes, checked_row_write_mul(key.len(), 2)?)?;
+                bytes = checked_row_write_add(
+                    bytes,
+                    estimated_value_bytes_at_depth(value, depth + 1)?,
+                )?;
+            }
+            Ok(bytes)
+        }
+    }
+}
+
+pub(crate) fn validate_json_value(value: &Value) -> Result<usize> {
+    let bytes = encoded_json_bytes(value, 0)?;
+    if bytes > MAX_LOGICAL_VALUE_BYTES {
+        Err(row_write_limit_error(format!(
+            "A JSON value cannot exceed {MAX_LOGICAL_VALUE_BYTES} encoded bytes"
+        )))
+    } else {
+        Ok(bytes)
+    }
+}
+
+fn validate_row_value_limits(row: &Row) -> Result<usize> {
+    let mut bytes = 2usize;
+    for (index, (key, value)) in row.iter().enumerate() {
+        if index != 0 {
+            bytes = checked_row_write_add(bytes, 1)?;
+        }
+        bytes = checked_row_write_add(bytes, encoded_json_string_bytes(key)?)?;
+        bytes = checked_row_write_add(bytes, 1)?;
+        bytes = checked_row_write_add(bytes, encoded_json_bytes(value, 1)?)?;
+        if bytes > MAX_LOGICAL_ROW_BYTES {
+            return Err(row_write_limit_error(format!(
+                "A row cannot exceed {MAX_LOGICAL_ROW_BYTES} encoded bytes"
+            )));
+        }
+    }
+    Ok(bytes)
+}
+
+fn encoded_json_bytes(value: &Value, depth: usize) -> Result<usize> {
+    if depth > MAX_JSON_DEPTH {
+        return Err(row_write_limit_error(format!(
+            "JSON cannot nest more than {MAX_JSON_DEPTH} levels"
+        )));
+    }
+    match value {
+        Value::Null => Ok(4),
+        Value::Bool(false) => Ok(5),
+        Value::Bool(true) => Ok(4),
+        Value::Number(number) => Ok(number.to_string().len()),
+        Value::String(value) => encoded_json_string_bytes(value),
+        Value::Array(values) => {
+            let mut bytes = 2usize;
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    bytes = checked_row_write_add(bytes, 1)?;
+                }
+                bytes = checked_row_write_add(bytes, encoded_json_bytes(value, depth + 1)?)?;
+                if bytes > MAX_LOGICAL_VALUE_BYTES {
+                    return Err(row_write_limit_error(format!(
+                        "A JSON value cannot exceed {MAX_LOGICAL_VALUE_BYTES} encoded bytes"
+                    )));
+                }
+            }
+            Ok(bytes)
+        }
+        Value::Object(values) => {
+            let mut bytes = 2usize;
+            for (index, (key, value)) in values.iter().enumerate() {
+                if index != 0 {
+                    bytes = checked_row_write_add(bytes, 1)?;
+                }
+                bytes = checked_row_write_add(bytes, encoded_json_string_bytes(key)?)?;
+                bytes = checked_row_write_add(bytes, 1)?;
+                bytes = checked_row_write_add(bytes, encoded_json_bytes(value, depth + 1)?)?;
+                if bytes > MAX_LOGICAL_VALUE_BYTES {
+                    return Err(row_write_limit_error(format!(
+                        "A JSON value cannot exceed {MAX_LOGICAL_VALUE_BYTES} encoded bytes"
+                    )));
+                }
+            }
+            Ok(bytes)
+        }
+    }
+}
+
+fn encoded_json_string_bytes(value: &str) -> Result<usize> {
+    value.chars().try_fold(2usize, |bytes, character| {
+        let escaped = match character {
+            '"' | '\\' | '\u{0008}' | '\u{000c}' | '\n' | '\r' | '\t' => 2,
+            '\u{0000}'..='\u{001f}' => 6,
+            character => character.len_utf8(),
+        };
+        checked_row_write_add(bytes, escaped)
+    })
+}
+
+fn validate_primary_storage_key_bound(schema: &TableSchema, row: &Row) -> Result<()> {
+    let bytes = storage_tuple_bytes(schema, &schema.primary_key, row, false)?
+        .ok_or_else(|| EngineError::invalid_change("A primary key cannot contain null"))?;
+    ensure_storage_key_bytes(bytes)
+}
+
+fn validate_secondary_storage_key_bound(
+    schema: &TableSchema,
+    definition: &IndexDefinition,
+    row: &Row,
+) -> Result<()> {
+    let Some(index_bytes) = storage_tuple_bytes(schema, &definition.columns, row, true)? else {
+        return Ok(());
+    };
+    let primary_bytes = storage_tuple_bytes(schema, &schema.primary_key, row, false)?
+        .ok_or_else(|| EngineError::invalid_change("A primary key cannot contain null"))?;
+    ensure_storage_key_bytes(checked_row_write_add(
+        checked_row_write_add(index_bytes, 1)?,
+        primary_bytes,
+    )?)
+}
+
+fn storage_tuple_bytes(
+    schema: &TableSchema,
+    columns: &[String],
+    row: &Row,
+    omit_nulls: bool,
+) -> Result<Option<usize>> {
+    let mut bytes = 0usize;
+    for name in columns {
+        let value = row.get(name).ok_or_else(|| {
+            EngineError::invalid_change(format!(
+                "Row for `{}` is missing key column `{name}`",
+                schema.name
+            ))
+        })?;
+        if value == &Value::Null {
+            if omit_nulls {
+                return Ok(None);
+            }
+            return Err(EngineError::invalid_change(format!(
+                "Primary-key column `{name}` in `{}` cannot be null",
+                schema.name
+            )));
+        }
+        let data_type = schema
+            .columns
+            .iter()
+            .find(|column| column.name == *name)
+            .map(|column| column.data_type);
+        let payload = match data_type {
+            Some(ColumnType::Boolean) => 1,
+            Some(ColumnType::Integer | ColumnType::Float) => 8,
+            Some(ColumnType::Text) => value.as_str().map(str::len).ok_or_else(|| {
+                EngineError::type_mismatch(format!(
+                    "Key column `{name}` in `{}` expects text",
+                    schema.name
+                ))
+            })?,
+            Some(ColumnType::Json) => validate_json_value(value)?,
+            None => match value {
+                Value::Bool(_) => 1,
+                Value::Number(number) => number.to_string().len(),
+                Value::String(value) => value.len(),
+                Value::Array(_) | Value::Object(_) => validate_json_value(value)?,
+                Value::Null => unreachable!(),
+            },
+        };
+        bytes = checked_row_write_add(bytes, checked_row_write_add(3, payload)?)?;
+        ensure_storage_key_bytes(bytes)?;
+    }
+    Ok(Some(bytes))
+}
+
+fn ensure_storage_key_bytes(bytes: usize) -> Result<()> {
+    if bytes > MAX_STORAGE_KEY_BYTES {
+        Err(EngineError::invalid_change(format!(
+            "An encoded primary or index key cannot exceed {MAX_STORAGE_KEY_BYTES} bytes"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_catalog_name_bound(name: &str) -> Result<()> {
+    if name.len().saturating_add(1) > MAX_STORAGE_KEY_BYTES {
+        Err(row_write_limit_error(format!(
+            "A catalog name cannot exceed {} UTF-8 bytes",
+            MAX_STORAGE_KEY_BYTES - 1
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn checked_row_write_add(left: usize, right: usize) -> Result<usize> {
+    left.checked_add(right).ok_or_else(row_write_overflow_error)
+}
+
+fn checked_row_write_mul(left: usize, right: usize) -> Result<usize> {
+    left.checked_mul(right).ok_or_else(row_write_overflow_error)
+}
+
+fn ensure_row_write_bytes(bytes: usize) -> Result<()> {
+    if bytes > MAX_ROW_WRITE_BYTES {
+        Err(row_write_limit_error(format!(
+            "A row write-set cannot retain more than {MAX_ROW_WRITE_BYTES} bytes"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn row_write_overflow_error() -> EngineError {
+    row_write_limit_error("A row write-set size overflowed".to_owned())
+}
+
+fn row_write_limit_error(message: String) -> EngineError {
+    EngineError::new("RESOURCE_LIMIT", message)
+}
+
+pub(crate) fn ensure_batch_change_count(count: usize) -> Result<()> {
+    if count > MAX_BATCH_CHANGES {
+        Err(EngineError::new(
+            "TRANSACTION_TOO_LARGE",
+            format!("A change batch cannot contain more than {MAX_BATCH_CHANGES} changes"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn preflight_change_batch(
+    changes: &[Change],
+    schemas: &BTreeMap<&str, &TableSchema>,
+    indexes: &[&IndexDefinition],
+) -> Result<()> {
+    ensure_batch_change_count(changes.len())?;
+    let mut batch_bytes = 0usize;
+    for change in changes {
+        let (table, input, is_delete) = match change {
+            Change::Upsert { table, row } => (table, row, false),
+            Change::Delete { table, key } => (table, key, true),
+        };
+        validate_catalog_name_bound(table)
+            .map_err(|error| EngineError::invalid_change(error.message))?;
+        let schema = schemas
+            .get(table.as_str())
+            .ok_or_else(|| EngineError::table_not_found(table))?;
+        let input_row_bytes = validate_row_value_limits(input)
+            .map_err(|error| EngineError::invalid_change(error.message))?;
+        let mut retained = estimated_row_bytes(input)?;
+        if is_delete {
+            validate_primary_key_values(schema, input)?;
+            validate_primary_storage_key_bound(schema, input)?;
+        }
+        let row_bytes = if !is_delete && !schema.columns.is_empty() {
+            let mut row_bytes = 2;
+            for (index, column) in schema.columns.iter().enumerate() {
+                let value = column.default.as_ref().unwrap_or(&Value::Null);
+                let value = input.get(&column.name).unwrap_or(value);
+                if index != 0 {
+                    row_bytes = checked_row_write_add(row_bytes, 1)?;
+                }
+                let value_bytes = encoded_json_bytes(value, 1)
+                    .map_err(|error| EngineError::invalid_change(error.message))?;
+                row_bytes = checked_row_write_add(
+                    row_bytes,
+                    checked_row_write_add(
+                        encoded_json_string_bytes(&column.name)?,
+                        checked_row_write_add(value_bytes, 1)?,
+                    )?,
+                )?;
+                if !input.contains_key(&column.name) {
+                    retained = checked_row_write_add(retained, 64)?;
+                    retained = checked_row_write_add(
+                        retained,
+                        checked_row_write_mul(column.name.len(), 2)?,
+                    )?;
+                    retained = checked_row_write_add(
+                        retained,
+                        checked_row_write_mul(estimated_value_bytes(value)?, 2)?,
+                    )?;
+                }
+            }
+            if row_bytes > MAX_LOGICAL_ROW_BYTES {
+                return Err(EngineError::invalid_change(format!(
+                    "A normalized row cannot exceed {MAX_LOGICAL_ROW_BYTES} encoded bytes"
+                )));
+            }
+            row_bytes
+        } else {
+            input_row_bytes
+        };
+        if !is_delete {
+            validate_prospective_storage_keys(schema, input, indexes)?;
+        }
+        debug_assert!(row_bytes <= MAX_LOGICAL_ROW_BYTES);
+        batch_bytes = checked_row_write_add(
+            batch_bytes,
+            checked_row_write_add(table.len(), checked_row_write_add(retained, 64)?)?,
+        )?;
+        if batch_bytes > MAX_ROW_WRITE_BYTES {
+            return Err(EngineError::new(
+                "TRANSACTION_TOO_LARGE",
+                format!("A change batch cannot retain more than {MAX_ROW_WRITE_BYTES} bytes"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_prospective_storage_keys(
+    schema: &TableSchema,
+    input: &Row,
+    indexes: &[&IndexDefinition],
+) -> Result<()> {
+    let value_for = |name: &str| {
+        input.get(name).or_else(|| {
+            schema
+                .columns
+                .iter()
+                .find(|column| column.name == name)
+                .and_then(|column| column.default.as_ref())
+        })
+    };
+    let tuple_bytes = |columns: &[String], omit_nulls: bool| -> Result<Option<usize>> {
+        let mut bytes = 0usize;
+        for name in columns {
+            let value = value_for(name).unwrap_or(&Value::Null);
+            if value == &Value::Null {
+                if omit_nulls {
+                    return Ok(None);
+                }
+                return Err(EngineError::invalid_change(format!(
+                    "Primary-key column `{name}` in `{}` cannot be null",
+                    schema.name
+                )));
+            }
+            let data_type = schema
+                .columns
+                .iter()
+                .find(|column| column.name == *name)
+                .map(|column| column.data_type);
+            let payload = match data_type {
+                Some(ColumnType::Boolean) => 1,
+                Some(ColumnType::Integer | ColumnType::Float) => 8,
+                Some(ColumnType::Text) => value.as_str().map(str::len).ok_or_else(|| {
+                    EngineError::type_mismatch(format!(
+                        "Key column `{name}` in `{}` expects text",
+                        schema.name
+                    ))
+                })?,
+                Some(ColumnType::Json) => validate_json_value(value)?,
+                None => match value {
+                    Value::Bool(_) => 1,
+                    Value::Number(number) => number.to_string().len(),
+                    Value::String(value) => value.len(),
+                    Value::Array(_) | Value::Object(_) => validate_json_value(value)?,
+                    Value::Null => unreachable!(),
+                },
+            };
+            bytes = checked_row_write_add(bytes, checked_row_write_add(3, payload)?)?;
+            ensure_storage_key_bytes(bytes)?;
+        }
+        Ok(Some(bytes))
+    };
+
+    let primary_bytes =
+        tuple_bytes(&schema.primary_key, false)?.expect("primary key tuple does not omit nulls");
+    for definition in indexes
+        .iter()
+        .copied()
+        .filter(|definition| definition.table == schema.name)
+    {
+        let Some(index_bytes) = tuple_bytes(&definition.columns, true)? else {
+            continue;
+        };
+        ensure_storage_key_bytes(checked_row_write_add(
+            checked_row_write_add(index_bytes, 1)?,
+            primary_bytes,
+        )?)?;
+    }
+    Ok(())
+}
+
+fn unique_index_violation(index: &str) -> EngineError {
+    EngineError::constraint_violation(format!("Index `{index}` would contain duplicate values"))
 }
 
 fn next_revision(revision: u64) -> Result<u64> {
@@ -884,6 +1604,10 @@ mod tests {
             .as_object()
             .expect("test row must be an object")
             .clone()
+    }
+
+    fn nested_json(depth: usize) -> Value {
+        (0..depth).fold(Value::Null, |value, _| Value::Array(vec![value]))
     }
 
     fn storage() -> InMemoryStorage {
@@ -977,6 +1701,268 @@ mod tests {
             vec![row(json!({"id": 1, "title": "before"}))]
         );
         assert_eq!(storage.revision(), 1);
+    }
+
+    #[test]
+    fn typed_delete_keys_are_validated_before_an_atomic_batch_is_published() {
+        let mut storage = typed_storage();
+        storage
+            .apply_batch(&ChangeBatch {
+                changes: vec![Change::Upsert {
+                    table: "users".to_owned(),
+                    row: row(json!({"id": 1, "email": "kept@example.com"})),
+                }],
+                ..ChangeBatch::default()
+            })
+            .unwrap();
+        let revision = storage.revision();
+
+        let error = storage
+            .apply_batch(&ChangeBatch {
+                changes: vec![
+                    Change::Delete {
+                        table: "users".to_owned(),
+                        key: row(json!({"id": "wrong"})),
+                    },
+                    Change::Delete {
+                        table: "users".to_owned(),
+                        key: row(json!({"id": 1})),
+                    },
+                ],
+                ..ChangeBatch::default()
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, "TYPE_MISMATCH");
+        assert_eq!(storage.revision(), revision);
+        assert_eq!(
+            storage
+                .lookup_primary_key("users", &row(json!({"id": 1})))
+                .unwrap(),
+            Some(row(json!({"id": 1, "email": "kept@example.com"})))
+        );
+
+        let oversized = storage
+            .apply_batch(&ChangeBatch {
+                changes: vec![Change::Delete {
+                    table: "users".to_owned(),
+                    key: row(json!({"id": 1, "extra": "x".repeat(MAX_LOGICAL_VALUE_BYTES + 1)})),
+                }],
+                ..ChangeBatch::default()
+            })
+            .unwrap_err();
+        assert_eq!(oversized.code, "INVALID_CHANGE");
+        assert_eq!(storage.revision(), revision);
+    }
+
+    #[test]
+    fn public_batches_reject_oversized_secondary_keys_before_mutation() {
+        let mut storage = typed_storage();
+        storage
+            .define_index(IndexDefinition {
+                name: "users_email".to_owned(),
+                table: "users".to_owned(),
+                columns: vec!["email".to_owned()],
+                unique: false,
+            })
+            .unwrap();
+        let revision = storage.revision();
+
+        let error = storage
+            .apply_batch(&ChangeBatch {
+                changes: vec![Change::Upsert {
+                    table: "users".to_owned(),
+                    row: row(json!({"id": 1, "email": "x".repeat(MAX_STORAGE_KEY_BYTES)})),
+                }],
+                ..ChangeBatch::default()
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, "INVALID_CHANGE");
+        assert_eq!(storage.revision(), revision);
+        assert_eq!(storage.table_row_count("users").unwrap(), 0);
+    }
+
+    #[test]
+    fn deeply_nested_json_change_batches_fail_atomically() {
+        let mut storage = storage();
+        storage
+            .replace_table("posts", vec![row(json!({"id": 1, "title": "kept"}))])
+            .unwrap();
+        let revision = storage.revision();
+
+        let error = storage
+            .apply_batch(&ChangeBatch {
+                changes: vec![Change::Upsert {
+                    table: "posts".to_owned(),
+                    row: row(json!({
+                        "id": 2,
+                        "payload": nested_json(MAX_JSON_DEPTH + 1),
+                    })),
+                }],
+                ..ChangeBatch::default()
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, "INVALID_CHANGE");
+        assert!(error.message.contains("cannot nest more than 64 levels"));
+        assert_eq!(storage.revision(), revision);
+        assert_eq!(
+            storage.scan_table("posts").unwrap(),
+            vec![row(json!({"id": 1, "title": "kept"}))]
+        );
+    }
+
+    #[test]
+    fn public_change_batches_share_the_paged_change_count_limit() {
+        let mut storage = storage();
+        storage
+            .replace_table("posts", vec![row(json!({"id": 1, "title": "kept"}))])
+            .unwrap();
+        let revision = storage.revision();
+
+        let error = storage
+            .apply_batch(&ChangeBatch {
+                changes: (0..=MAX_BATCH_CHANGES)
+                    .map(|id| Change::Delete {
+                        table: "posts".to_owned(),
+                        key: row(json!({"id": id})),
+                    })
+                    .collect(),
+                ..ChangeBatch::default()
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, "TRANSACTION_TOO_LARGE");
+        assert!(error.message.contains("100000 changes"));
+        assert_eq!(storage.revision(), revision);
+        assert_eq!(
+            storage.scan_table("posts").unwrap(),
+            vec![row(json!({"id": 1, "title": "kept"}))]
+        );
+    }
+
+    #[test]
+    fn row_write_sets_apply_primary_and_unique_swaps_against_the_final_state() {
+        let mut storage = InMemoryStorage::default();
+        storage
+            .define_table(TableSchema {
+                name: "accounts".to_owned(),
+                primary_key: vec!["id".to_owned()],
+                columns: vec![
+                    ColumnDefinition {
+                        name: "id".to_owned(),
+                        data_type: ColumnType::Integer,
+                        nullable: false,
+                        default: None,
+                    },
+                    ColumnDefinition {
+                        name: "tenant".to_owned(),
+                        data_type: ColumnType::Integer,
+                        nullable: false,
+                        default: None,
+                    },
+                    ColumnDefinition {
+                        name: "email".to_owned(),
+                        data_type: ColumnType::Text,
+                        nullable: true,
+                        default: None,
+                    },
+                ],
+            })
+            .unwrap();
+        storage
+            .replace_table(
+                "accounts",
+                vec![
+                    row(json!({"id": 1, "tenant": 7, "email": "a@example.com"})),
+                    row(json!({"id": 2, "tenant": 7, "email": "b@example.com"})),
+                    row(json!({"id": 3, "tenant": 7, "email": null})),
+                    row(json!({"id": 4, "tenant": 7, "email": null})),
+                ],
+            )
+            .unwrap();
+        storage
+            .define_index(IndexDefinition {
+                name: "accounts_tenant_email".to_owned(),
+                table: "accounts".to_owned(),
+                columns: vec!["tenant".to_owned(), "email".to_owned()],
+                unique: true,
+            })
+            .unwrap();
+
+        storage
+            .apply_row_changes_unrevisioned(vec![
+                Change::Delete {
+                    table: "accounts".to_owned(),
+                    key: row(json!({"id": 1})),
+                },
+                Change::Delete {
+                    table: "accounts".to_owned(),
+                    key: row(json!({"id": 2})),
+                },
+                Change::Upsert {
+                    table: "accounts".to_owned(),
+                    row: row(json!({"id": 1, "tenant": 7, "email": "a@example.com"})),
+                },
+                Change::Upsert {
+                    table: "accounts".to_owned(),
+                    row: row(json!({"id": 2, "tenant": 7, "email": "b@example.com"})),
+                },
+                Change::Upsert {
+                    table: "accounts".to_owned(),
+                    row: row(json!({"id": 1, "tenant": 7, "email": "b@example.com"})),
+                },
+                Change::Upsert {
+                    table: "accounts".to_owned(),
+                    row: row(json!({"id": 2, "tenant": 7, "email": "a@example.com"})),
+                },
+            ])
+            .unwrap();
+        assert_eq!(
+            storage
+                .lookup_primary_key("accounts", &row(json!({"id": 1})))
+                .unwrap()
+                .unwrap()["email"],
+            "b@example.com"
+        );
+        assert_eq!(
+            storage
+                .lookup_index(
+                    "accounts",
+                    &["tenant".to_owned(), "email".to_owned()],
+                    &row(json!({"tenant": 7, "email": "a@example.com"})),
+                )
+                .unwrap()
+                .unwrap()[0]["id"],
+            2
+        );
+        assert_eq!(
+            storage
+                .lookup_index(
+                    "accounts",
+                    &["tenant".to_owned(), "email".to_owned()],
+                    &row(json!({"tenant": 7, "email": null})),
+                )
+                .unwrap(),
+            Some(vec![])
+        );
+
+        let before = storage.scan_table("accounts").unwrap();
+        let error = storage
+            .apply_row_changes_unrevisioned(vec![
+                Change::Upsert {
+                    table: "accounts".to_owned(),
+                    row: row(json!({"id": 3, "tenant": 7, "email": "same@example.com"})),
+                },
+                Change::Upsert {
+                    table: "accounts".to_owned(),
+                    row: row(json!({"id": 4, "tenant": 7, "email": "same@example.com"})),
+                },
+            ])
+            .unwrap_err();
+        assert_eq!(error.code, "CONSTRAINT_VIOLATION");
+        assert_eq!(storage.scan_table("accounts").unwrap(), before);
     }
 
     #[test]

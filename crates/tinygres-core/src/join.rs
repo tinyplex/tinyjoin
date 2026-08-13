@@ -2028,7 +2028,7 @@ mod tests {
 
     #[test]
     fn execution_rejects_oversized_build_and_result_rows_before_cloning_them() {
-        fn engine_with_payloads(left_payload: String, right_payload: String) -> Engine {
+        fn engine_with_payloads(left_payloads: Vec<String>, right_payloads: Vec<String>) -> Engine {
             let mut engine = Engine::default();
             for table in ["budget_left", "budget_right"] {
                 engine
@@ -2046,24 +2046,32 @@ mod tests {
             engine
                 .replace_table(
                     "budget_left",
-                    vec![row(
-                        json!({"id": 1, "join_key": 1, "payload": left_payload}),
-                    )],
+                    left_payloads
+                        .into_iter()
+                        .enumerate()
+                        .map(|(id, payload)| {
+                            row(json!({"id": id, "join_key": 1, "payload": payload}))
+                        })
+                        .collect(),
                 )
                 .unwrap();
             engine
                 .replace_table(
                     "budget_right",
-                    vec![row(
-                        json!({"id": 2, "join_key": 1, "payload": right_payload}),
-                    )],
+                    right_payloads
+                        .into_iter()
+                        .enumerate()
+                        .map(|(id, payload)| {
+                            row(json!({"id": id + 100, "join_key": 1, "payload": payload}))
+                        })
+                        .collect(),
                 )
                 .unwrap();
             engine
         }
 
-        let oversized = "x".repeat(super::MAX_JOIN_WORK_BYTES / 2);
-        let build_error = engine_with_payloads(String::new(), oversized.clone())
+        let oversized = "x".repeat(crate::storage::MAX_LOGICAL_ROW_BYTES - 256);
+        let build_error = engine_with_payloads(vec![String::new()], vec![oversized.clone(); 17])
             .query_sql(
                 "SELECT l.id AS id FROM budget_left l JOIN budget_right r \
                  ON l.join_key = r.join_key",
@@ -2072,7 +2080,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(build_error.code, "QUERY_WORK_LIMIT_EXCEEDED");
 
-        let result_error = engine_with_payloads(oversized, String::new())
+        let result_error = engine_with_payloads(vec![oversized; 17], vec![String::new()])
             .query_sql(
                 "SELECT l.payload AS payload FROM budget_left l LEFT JOIN budget_right r \
                  ON l.join_key = r.join_key",
