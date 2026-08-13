@@ -11,11 +11,13 @@ use crate::{
         CATALOG_TREE_ID, CatalogHeader, CatalogIndexRecord, CatalogKey, CatalogTableRecord,
         FIRST_USER_TREE_ID, MAX_CATALOG_INDEXES, MAX_CATALOG_TABLES, decode_catalog_header_record,
         decode_catalog_index_record, decode_catalog_key, decode_catalog_table_record, decode_row,
-        encode_catalog_header_record, encode_catalog_index_record, encode_catalog_table_record,
-        encode_primary_key, encode_row, encode_secondary_index_entry_key,
-        encode_secondary_index_prefix, secondary_index_entry_matches_prefix,
-        secondary_index_primary_key, secondary_index_primary_key_for_definition,
+        encode_catalog_header_record, encode_catalog_index_key, encode_catalog_index_record,
+        encode_catalog_table_key, encode_catalog_table_record, encode_primary_key, encode_row,
+        encode_secondary_index_entry_key, encode_secondary_index_prefix,
+        secondary_index_entry_matches_prefix, secondary_index_primary_key,
+        secondary_index_primary_key_for_definition,
     },
+    paged_schema::{DroppedTree, SchemaDropPlan, publish_schema_drop},
     storage::{
         normalize_row, preflight_change_batch, preflight_row_write_set,
         validate_index_columns_for_schema, validate_index_definition_shape,
@@ -701,6 +703,142 @@ impl<D: PageDevice> PagedStorage<D> {
         Ok(revision)
     }
 
+    /// Drops one secondary index and publishes its reclaimed pages with the catalog update.
+    pub(crate) fn drop_index_and_advance(&mut self, name: &str) -> Result<u64> {
+        self.ensure_ready()?;
+        let index = self.indexes.get(name).ok_or_else(|| {
+            EngineError::new("INDEX_NOT_FOUND", format!("Index `{name}` is not defined"))
+        })?;
+        let tree = DroppedTree {
+            tree_id: index.tree_id,
+            root_page_id: index.root_page_id,
+        };
+        let index_count = self
+            .indexes
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| storage_corrupt("The catalog index count underflowed"))?;
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| EngineError::new("REVISION_OVERFLOW", "Database revision overflowed"))?;
+        let header = encode_catalog_header_record(&CatalogHeader {
+            next_tree_id: self.next_tree_id,
+            table_count: u32::try_from(self.tables.len())
+                .map_err(|_| limit_error("The catalog contains too many tables"))?,
+            index_count: u32::try_from(index_count)
+                .map_err(|_| limit_error("The catalog contains too many indexes"))?,
+        })?;
+        let key = encode_catalog_index_key(name)?;
+        ensure_batch_bytes(header.0.len() + header.1.len() + key.len() + 192)?;
+        let plan = SchemaDropPlan {
+            revision,
+            header,
+            catalog_keys: vec![key],
+            trees: vec![tree],
+        };
+
+        let mut pager = self.pager.borrow_mut();
+        if let Err(error) = publish_schema_drop(&mut pager, plan) {
+            if error.code == "RECOVERY_REQUIRED" || pager.is_recovery_required() {
+                self.recovery_required = true;
+            }
+            return Err(error);
+        }
+        drop(pager);
+        self.indexes.remove(name);
+        self.revision = revision;
+        Ok(revision)
+    }
+
+    /// Drops one table and all of its secondary indexes in one durable pager generation.
+    pub(crate) fn drop_table_and_advance(&mut self, name: &str) -> Result<u64> {
+        self.ensure_ready()?;
+        let table = self
+            .tables
+            .get(name)
+            .ok_or_else(|| EngineError::table_not_found(name))?;
+        let mut catalog_keys = Vec::new();
+        let mut trees = Vec::new();
+        let mut retained_bytes = 0usize;
+        let mut dropped_index_count = 0usize;
+        // BTreeMap iteration gives deterministic index-name order. Reclaim child indexes before
+        // their table so a late validation failure can abort one complete candidate.
+        for (index_name, index) in self
+            .indexes
+            .iter()
+            .filter(|(_, index)| index.definition.table == name)
+        {
+            let key = encode_catalog_index_key(index_name)?;
+            retained_bytes = retained_bytes
+                .checked_add(key.len() + 64)
+                .ok_or_else(batch_too_large)?;
+            ensure_batch_bytes(retained_bytes)?;
+            catalog_keys.push(key);
+            trees.push(DroppedTree {
+                tree_id: index.tree_id,
+                root_page_id: index.root_page_id,
+            });
+            dropped_index_count += 1;
+        }
+        let table_key = encode_catalog_table_key(name)?;
+        retained_bytes = retained_bytes
+            .checked_add(table_key.len() + 64)
+            .ok_or_else(batch_too_large)?;
+        ensure_batch_bytes(retained_bytes)?;
+        catalog_keys.push(table_key);
+        trees.push(DroppedTree {
+            tree_id: table.tree_id,
+            root_page_id: table.root_page_id,
+        });
+
+        let table_count = self
+            .tables
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| storage_corrupt("The catalog table count underflowed"))?;
+        let index_count = self
+            .indexes
+            .len()
+            .checked_sub(dropped_index_count)
+            .ok_or_else(|| storage_corrupt("The catalog index count underflowed"))?;
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| EngineError::new("REVISION_OVERFLOW", "Database revision overflowed"))?;
+        let header = encode_catalog_header_record(&CatalogHeader {
+            next_tree_id: self.next_tree_id,
+            table_count: u32::try_from(table_count)
+                .map_err(|_| limit_error("The catalog contains too many tables"))?,
+            index_count: u32::try_from(index_count)
+                .map_err(|_| limit_error("The catalog contains too many indexes"))?,
+        })?;
+        retained_bytes = retained_bytes
+            .checked_add(header.0.len() + header.1.len() + 128)
+            .ok_or_else(batch_too_large)?;
+        ensure_batch_bytes(retained_bytes)?;
+        let plan = SchemaDropPlan {
+            revision,
+            header,
+            catalog_keys,
+            trees,
+        };
+
+        let mut pager = self.pager.borrow_mut();
+        if let Err(error) = publish_schema_drop(&mut pager, plan) {
+            if error.code == "RECOVERY_REQUIRED" || pager.is_recovery_required() {
+                self.recovery_required = true;
+            }
+            return Err(error);
+        }
+        drop(pager);
+        self.tables.remove(name);
+        self.indexes
+            .retain(|_, index| index.definition.table != name);
+        self.revision = revision;
+        Ok(revision)
+    }
+
     /// Atomically applies page-native row upserts and deletes in one durable generation.
     ///
     /// This narrow mutation surface deliberately remains an inherent method until the remaining
@@ -1328,6 +1466,10 @@ struct TableInput {
 }
 
 impl<D: PageDevice> StorageReader for PagedStorage<D> {
+    fn ensure_readable(&self) -> Result<()> {
+        self.ensure_ready()
+    }
+
     fn visit_table(
         &self,
         table: &str,
@@ -2314,6 +2456,216 @@ mod tests {
             );
             assert_eq!(reopened.revision(), old_revision + u64::from(expected_new));
         }
+    }
+
+    #[test]
+    fn destructive_schema_changes_reclaim_pages_and_preserve_the_tree_id_high_water_mark() {
+        let mut paged =
+            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source()).unwrap();
+        let next_tree_id = paged.next_tree_id;
+        let dropped_roots = [
+            paged.indexes["posts_author"].root_page_id.unwrap(),
+            paged.indexes["posts_state_rank"].root_page_id.unwrap(),
+            paged.tables["posts"].root_page_id.unwrap(),
+        ];
+        let initial_live_pages = paged
+            .pager
+            .borrow()
+            .active_metadata()
+            .superblock
+            .live_data_page_count;
+
+        let revision = paged.revision();
+        paged.drop_index_and_advance("posts_author").unwrap();
+        assert_eq!(paged.revision(), revision + 1);
+        assert_eq!(paged.next_tree_id, next_tree_id);
+        assert!(paged.index_definition("posts_author").is_none());
+        let after_index_pages = paged
+            .pager
+            .borrow()
+            .active_metadata()
+            .superblock
+            .live_data_page_count;
+        assert!(after_index_pages < initial_live_pages);
+
+        paged.drop_table_and_advance("posts").unwrap();
+        assert_eq!(paged.revision(), revision + 2);
+        assert_eq!(paged.next_tree_id, next_tree_id);
+        assert_eq!(
+            paged.table_schema("posts").unwrap_err().code,
+            "TABLE_NOT_FOUND"
+        );
+        assert!(paged.index_definition("posts_state_rank").is_none());
+        assert!(paged.table_schema("authors").is_ok());
+        let after_table_pages = paged
+            .pager
+            .borrow()
+            .active_metadata()
+            .superblock
+            .live_data_page_count;
+        assert!(after_table_pages < after_index_pages);
+
+        // The next object uses the monotonic high-water mark, while its pages reuse physical
+        // slots reclaimed by the dropped table and indexes.
+        paged
+            .define_table(schema(
+                "replacement",
+                &[
+                    ("id", ColumnType::Integer, false),
+                    ("value", ColumnType::Text, false),
+                ],
+            ))
+            .unwrap();
+        assert_eq!(paged.tables["replacement"].tree_id, next_tree_id);
+        paged
+            .apply_batch(&ChangeBatch {
+                changes: vec![Change::Upsert {
+                    table: "replacement".to_owned(),
+                    row: row(json!({"id": 1, "value": "reused"})),
+                }],
+                ..ChangeBatch::default()
+            })
+            .unwrap();
+        assert!(dropped_roots.iter().any(|root| {
+            paged
+                .pager
+                .borrow()
+                .active_metadata()
+                .allocation_bitmap
+                .is_allocated(*root)
+                .unwrap()
+        }));
+
+        let reopened = PagedStorage::open(paged.into_device()).unwrap();
+        assert_eq!(reopened.next_tree_id, next_tree_id + 1);
+        assert_eq!(
+            reopened.table_schema("posts").unwrap_err().code,
+            "TABLE_NOT_FOUND"
+        );
+        assert_eq!(
+            reopened
+                .lookup_primary_key("replacement", &row(json!({"id": 1})))
+                .unwrap()
+                .unwrap()["value"],
+            json!("reused")
+        );
+    }
+
+    #[test]
+    fn interrupted_schema_drops_reopen_at_the_complete_old_or_new_catalog() {
+        for drop_table in [false, true] {
+            for (failing_flush, expected_new) in [(1, false), (2, false), (3, true)] {
+                let device = DurableDevice::default();
+                let control = device.clone();
+                let mut paged = PagedStorage::from_in_memory(device, &source()).unwrap();
+                let revision = paged.revision();
+                control.arm_after_flush(failing_flush);
+                let error = if drop_table {
+                    paged.drop_table_and_advance("posts").unwrap_err()
+                } else {
+                    paged.drop_index_and_advance("posts_author").unwrap_err()
+                };
+                if expected_new {
+                    assert_eq!(error.code, "RECOVERY_REQUIRED");
+                    assert_eq!(
+                        paged.ensure_readable().unwrap_err().code,
+                        "RECOVERY_REQUIRED"
+                    );
+                    assert_eq!(
+                        crate::statement::plan_drop_index(&paged, "missing", true)
+                            .unwrap_err()
+                            .code,
+                        "RECOVERY_REQUIRED"
+                    );
+                    assert_eq!(
+                        crate::statement::plan_drop_table(&paged, "missing", true)
+                            .unwrap_err()
+                            .code,
+                        "RECOVERY_REQUIRED"
+                    );
+                } else {
+                    assert_eq!(error.code, "INJECTED_IO");
+                    assert_eq!(paged.revision(), revision);
+                    assert!(paged.table_schema("posts").is_ok());
+                    assert!(paged.index_definition("posts_author").is_some());
+                }
+
+                let device = paged.into_device();
+                control.crash();
+                let reopened = PagedStorage::open(device).unwrap();
+                assert_eq!(reopened.revision(), revision + u64::from(expected_new));
+                if drop_table {
+                    assert_eq!(reopened.table_schema("posts").is_err(), expected_new);
+                    assert_eq!(
+                        reopened.index_definition("posts_author").is_none(),
+                        expected_new
+                    );
+                    assert_eq!(
+                        reopened.index_definition("posts_state_rank").is_none(),
+                        expected_new
+                    );
+                } else {
+                    assert!(reopened.table_schema("posts").is_ok());
+                    assert_eq!(
+                        reopened.index_definition("posts_author").is_none(),
+                        expected_new
+                    );
+                    assert!(reopened.index_definition("posts_state_rank").is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_dropped_tree_aborts_before_catalog_publication() {
+        let device = CountingDevice::new();
+        let control = device.clone();
+        let imported = PagedStorage::from_in_memory(device, &source()).unwrap();
+        let authors_root = imported.tables["authors"].root_page_id.unwrap();
+        let posts_root = imported.tables["posts"].root_page_id.unwrap();
+        let original = *control.inner.borrow().page(authors_root).unwrap();
+        let device = imported.into_device();
+        let mut pager = Pager::with_cache_capacity(device, PAGE_SIZE).unwrap();
+        let revision = pager.database_revision();
+        let catalog_root = pager.catalog_root_page_id().unwrap();
+        let (next_tree_id, tables, indexes) =
+            load_and_validate_catalog(&mut pager, catalog_root).unwrap();
+        // Ensure the target root is not resident in the one-page cache when its device bytes are
+        // corrupted after opening.
+        pager.read_page(posts_root).unwrap();
+        let mut paged = PagedStorage {
+            pager: RefCell::new(pager),
+            revision,
+            next_tree_id,
+            tables,
+            indexes,
+            recovery_required: false,
+        };
+        let mut corrupt = original;
+        corrupt[PAGE_SIZE - 1] ^= 1;
+        control
+            .inner
+            .borrow_mut()
+            .write_page(authors_root, &corrupt)
+            .unwrap();
+
+        let error = paged.drop_table_and_advance("authors").unwrap_err();
+        assert_eq!(error.code, "INVALID_PAGE");
+        assert_eq!(paged.revision(), revision);
+        assert!(paged.table_schema("authors").is_ok());
+        assert!(paged.table_schema("posts").is_ok());
+
+        // Restore the deliberately damaged committed page and reopen. The failed candidate did
+        // not publish either its frees or its catalog deletion.
+        control
+            .inner
+            .borrow_mut()
+            .write_page(authors_root, &original)
+            .unwrap();
+        let reopened = PagedStorage::open(paged.into_device()).unwrap();
+        assert_eq!(reopened.revision(), revision);
+        assert!(reopened.table_schema("authors").is_ok());
+        assert!(reopened.table_schema("posts").is_ok());
     }
 
     #[test]

@@ -198,19 +198,31 @@ fn drop_table<S: StorageDriver>(
     table: &str,
     if_exists: bool,
 ) -> Result<WriteOutcome> {
-    if storage.table_schema(table).is_err() {
-        if if_exists {
-            return Ok(WriteOutcome {
-                command: "DROP TABLE",
-                row_count: 0,
-                rows: vec![],
-                tables: vec![],
-                mutated: false,
-            });
-        }
-        return Err(EngineError::table_not_found(table));
+    let outcome = plan_drop_table(storage, table, if_exists)?;
+    if outcome.mutated {
+        storage.drop_table(table)?;
     }
-    storage.drop_table(table)?;
+    Ok(outcome)
+}
+
+pub(crate) fn plan_drop_table<S: StorageReader>(
+    storage: &S,
+    table: &str,
+    if_exists: bool,
+) -> Result<WriteOutcome> {
+    storage.ensure_readable()?;
+    if let Err(error) = storage.table_schema(table) {
+        if error.code != "TABLE_NOT_FOUND" || !if_exists {
+            return Err(error);
+        }
+        return Ok(WriteOutcome {
+            command: "DROP TABLE",
+            row_count: 0,
+            rows: vec![],
+            tables: vec![],
+            mutated: false,
+        });
+    }
     Ok(WriteOutcome {
         command: "DROP TABLE",
         row_count: 0,
@@ -225,6 +237,19 @@ fn drop_index<S: StorageDriver>(
     name: &str,
     if_exists: bool,
 ) -> Result<WriteOutcome> {
+    let outcome = plan_drop_index(storage, name, if_exists)?;
+    if outcome.mutated {
+        storage.drop_index(name)?;
+    }
+    Ok(outcome)
+}
+
+pub(crate) fn plan_drop_index<S: StorageReader>(
+    storage: &S,
+    name: &str,
+    if_exists: bool,
+) -> Result<WriteOutcome> {
+    storage.ensure_readable()?;
     let Some(definition) = storage.index_definition(name) else {
         if if_exists {
             return Ok(WriteOutcome {
@@ -240,7 +265,6 @@ fn drop_index<S: StorageDriver>(
             format!("Index `{name}` is not defined"),
         ));
     };
-    storage.drop_index(name)?;
     Ok(WriteOutcome {
         command: "DROP INDEX",
         row_count: 0,

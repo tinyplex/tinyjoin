@@ -36,6 +36,15 @@ pub enum VisitOutcome {
 /// Keeping this contract independent of mutation lets a page-backed reader
 /// stream rows before its copy-on-write write path is complete.
 pub trait StorageReader {
+    /// Fails when the reader cannot safely answer from its current view.
+    ///
+    /// In-memory readers are always ready. Durable readers override this after an ambiguous
+    /// publication so metadata-only no-op statements cannot accidentally report success.
+    #[doc(hidden)]
+    fn ensure_readable(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn visit_table(
         &self,
         table: &str,

@@ -9,7 +9,7 @@ use crate::{
 
 /// A SQL engine which publishes row mutations directly through the crash-safe page store.
 ///
-/// This page-native engine slice supports reads, `CREATE TABLE`, `CREATE INDEX`, and standalone
+/// This page-native engine slice supports reads, table/index creation and removal, and standalone
 /// `INSERT`, `UPDATE`, and `DELETE` statements, including bounded explicit row transactions. Other
 /// page-native DDL is not part of this surface yet.
 pub struct PagedEngine<D: PageDevice> {
@@ -108,6 +108,26 @@ impl<D: PageDevice> PagedEngine<D> {
                         )?;
                         let revision = if outcome.mutated {
                             self.storage.create_index_and_advance(definition.clone())?
+                        } else {
+                            self.storage.revision()
+                        };
+                        (outcome, revision)
+                    }
+                    WriteStatement::DropIndex { name, if_exists } => {
+                        let outcome =
+                            crate::statement::plan_drop_index(&self.storage, name, *if_exists)?;
+                        let revision = if outcome.mutated {
+                            self.storage.drop_index_and_advance(name)?
+                        } else {
+                            self.storage.revision()
+                        };
+                        (outcome, revision)
+                    }
+                    WriteStatement::DropTable { table, if_exists } => {
+                        let outcome =
+                            crate::statement::plan_drop_table(&self.storage, table, *if_exists)?;
+                        let revision = if outcome.mutated {
+                            self.storage.drop_table_and_advance(table)?
                         } else {
                             self.storage.revision()
                         };
@@ -720,6 +740,66 @@ mod tests {
     }
 
     #[test]
+    fn page_native_drop_index_and_table_match_in_memory_and_reopen() {
+        let source = source();
+        let mut expected = Engine::new(source.clone());
+        let mut actual =
+            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+
+        for sql in [
+            "DROP INDEX accounts_email",
+            "DROP INDEX IF EXISTS accounts_email",
+            "CREATE INDEX accounts_active ON accounts (active)",
+            "DROP TABLE accounts",
+            "DROP TABLE IF EXISTS accounts",
+        ] {
+            assert_eq!(
+                actual.execute_sql(sql, &[]).unwrap(),
+                expected.execute_sql(sql, &[]).unwrap(),
+                "{sql}"
+            );
+        }
+        for sql in ["DROP INDEX accounts_email", "DROP TABLE accounts"] {
+            assert_eq!(
+                actual.execute_sql(sql, &[]).unwrap_err(),
+                expected.execute_sql(sql, &[]).unwrap_err(),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            actual.query_sql("SELECT * FROM accounts", &[]).unwrap_err(),
+            expected
+                .query_sql("SELECT * FROM accounts", &[])
+                .unwrap_err()
+        );
+
+        let revision = actual.revision();
+        let mut reopened = PagedEngine::open(actual.into_device()).unwrap();
+        assert_eq!(reopened.revision(), revision);
+        assert_eq!(
+            reopened
+                .query_sql("SELECT * FROM accounts", &[])
+                .unwrap_err()
+                .code,
+            "TABLE_NOT_FOUND"
+        );
+        assert_eq!(
+            reopened
+                .execute_sql("DROP INDEX IF EXISTS accounts_active", &[])
+                .unwrap()
+                .revision,
+            revision
+        );
+        assert_eq!(
+            reopened
+                .execute_sql("DROP TABLE IF EXISTS accounts", &[])
+                .unwrap()
+                .revision,
+            revision
+        );
+    }
+
+    #[test]
     fn query_sql_rejects_mutations_without_publishing() {
         let source = source();
         let engine =
@@ -815,6 +895,8 @@ mod tests {
         for sql in [
             "CREATE TABLE later (id INTEGER PRIMARY KEY)",
             "CREATE INDEX accounts_active_tx ON accounts (active)",
+            "DROP INDEX accounts_email",
+            "DROP TABLE accounts",
         ] {
             assert_eq!(
                 engine.execute_sql(sql, &[]).unwrap_err().code,

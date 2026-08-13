@@ -256,6 +256,10 @@ pub(crate) fn encode_catalog_table_record(
     Ok((key, value))
 }
 
+pub(crate) fn encode_catalog_table_key(name: &str) -> Result<Vec<u8>> {
+    encode_catalog_key(CATALOG_TABLE_KEY, name)
+}
+
 pub(crate) fn decode_catalog_table_record(key: &[u8], value: &[u8]) -> Result<CatalogTableRecord> {
     let CatalogKey::Table(name) = decode_catalog_key(key)? else {
         return Err(storage_corrupt(
@@ -300,6 +304,10 @@ pub(crate) fn encode_catalog_index_record(
         "index definition",
     )?;
     Ok((key, value))
+}
+
+pub(crate) fn encode_catalog_index_key(name: &str) -> Result<Vec<u8>> {
+    encode_catalog_key(CATALOG_INDEX_KEY, name)
 }
 
 pub(crate) fn decode_catalog_index_record(key: &[u8], value: &[u8]) -> Result<CatalogIndexRecord> {
