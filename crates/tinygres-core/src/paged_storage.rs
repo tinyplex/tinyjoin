@@ -16,7 +16,7 @@ use crate::{
         secondary_index_entry_matches_prefix, secondary_index_primary_key,
         secondary_index_primary_key_for_definition,
     },
-    storage::{normalize_row, preflight_change_batch},
+    storage::{normalize_row, preflight_change_batch, preflight_row_write_set},
 };
 
 /// A relational view over the crash-safe paged B-tree store.
@@ -64,6 +64,11 @@ struct PagedRowChange {
 
 const MAX_PAGED_BATCH_OPERATIONS: usize = 1_000_000;
 const MAX_PAGED_BATCH_BYTES: usize = 16 * 1024 * 1024;
+type RowWritePreflight = for<'a> fn(
+    &[Change],
+    &BTreeMap<&'a str, &'a TableSchema>,
+    &[&'a IndexDefinition],
+) -> Result<()>;
 
 impl<D: PageDevice> PagedStorage<D> {
     /// Opens and validates a previously published paged database.
@@ -313,16 +318,28 @@ impl<D: PageDevice> PagedStorage<D> {
             });
         }
 
-        let write_set = self.prepare_row_write_set(&batch.changes)?;
+        let write_set = self.prepare_batch_write_set(&batch.changes)?;
         self.commit_row_write_set(write_set)
+    }
+
+    fn prepare_batch_write_set(&self, input_changes: &[Change]) -> Result<PagedRowWriteSet> {
+        self.prepare_row_write_set_with(input_changes, preflight_change_batch)
     }
 
     pub(crate) fn prepare_row_write_set(
         &self,
         input_changes: &[Change],
     ) -> Result<PagedRowWriteSet> {
+        self.prepare_row_write_set_with(input_changes, preflight_row_write_set)
+    }
+
+    fn prepare_row_write_set_with(
+        &self,
+        input_changes: &[Change],
+        preflight: RowWritePreflight,
+    ) -> Result<PagedRowWriteSet> {
         self.ensure_ready()?;
-        preflight_batch(input_changes, &self.tables, &self.indexes)?;
+        preflight_batch(input_changes, &self.tables, &self.indexes, preflight)?;
         let mut retained_bytes = 0usize;
         let mut tables = BTreeMap::<String, BTreeMap<Vec<u8>, PagedRowChange>>::new();
         for change in input_changes {
@@ -671,6 +688,7 @@ fn preflight_batch(
     changes: &[Change],
     tables: &BTreeMap<String, PagedTable>,
     indexes: &BTreeMap<String, PagedIndex>,
+    preflight: RowWritePreflight,
 ) -> Result<()> {
     let schemas = tables
         .iter()
@@ -680,7 +698,7 @@ fn preflight_batch(
         .values()
         .map(|index| &index.definition)
         .collect::<Vec<_>>();
-    preflight_change_batch(changes, &schemas, &definitions)?;
+    preflight(changes, &schemas, &definitions)?;
     let mut bytes = 0usize;
     let mut operations = 0usize;
     let mut changed_tables = BTreeSet::new();
@@ -2156,8 +2174,15 @@ mod tests {
                 key: row(json!({"id": id})),
             })
             .collect::<Vec<_>>();
-        preflight_batch(&changes[..at_limit], &tables, &indexes).unwrap();
-        let error = preflight_batch(&changes, &tables, &indexes).unwrap_err();
+        preflight_batch(
+            &changes[..at_limit],
+            &tables,
+            &indexes,
+            preflight_change_batch,
+        )
+        .unwrap();
+        let error =
+            preflight_batch(&changes, &tables, &indexes, preflight_change_batch).unwrap_err();
         assert_eq!(error.code, "TRANSACTION_TOO_LARGE");
     }
 

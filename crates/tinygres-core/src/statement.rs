@@ -10,7 +10,7 @@ use crate::query::{
 use crate::storage::{estimated_row_bytes, estimated_value_bytes, normalize_row, row_key};
 use crate::{
     Change, ColumnDefinition, ColumnType, EngineError, Predicate, QueryPlan, Result, Row,
-    StorageDriver, TableSchema, VisitControl, VisitOutcome,
+    StorageDriver, StorageReader, TableSchema, VisitControl, VisitOutcome,
 };
 
 const MAX_COLUMNS: usize = 256;
@@ -84,6 +84,11 @@ pub(crate) struct WriteOutcome {
     pub mutated: bool,
 }
 
+pub(crate) struct PlannedDml {
+    pub outcome: WriteOutcome,
+    pub changes: Vec<Change>,
+}
+
 pub(crate) fn parse(sql: &str, params: &[Value]) -> Result<Statement> {
     validate_sql_input(sql, params)?;
     let tokens = tokenize(sql)?;
@@ -127,12 +132,31 @@ pub(crate) fn execute<S: StorageDriver>(
             column,
             if_not_exists,
         } => add_column(storage, table, column, *if_not_exists),
+        WriteStatement::Insert { .. }
+        | WriteStatement::Update { .. }
+        | WriteStatement::Delete { .. } => {
+            let PlannedDml { outcome, changes } = plan_dml(storage, statement)?;
+            storage.apply_row_changes_unrevisioned(changes)?;
+            Ok(outcome)
+        }
+    }
+}
+
+/// Plans one SQL row mutation without modifying storage.
+///
+/// Both the in-memory and paged engines use this path so validation, resource limits, affected-row
+/// selection, and `RETURNING` semantics cannot drift between their publication mechanisms.
+pub(crate) fn plan_dml<S: StorageReader>(
+    storage: &S,
+    statement: &WriteStatement,
+) -> Result<PlannedDml> {
+    match statement {
         WriteStatement::Insert {
             table,
             columns,
             values,
             returning,
-        } => insert(
+        } => plan_insert(
             storage,
             table,
             columns.as_deref(),
@@ -144,7 +168,7 @@ pub(crate) fn execute<S: StorageDriver>(
             assignments,
             predicate,
             returning,
-        } => update(
+        } => plan_update(
             storage,
             table,
             assignments,
@@ -155,7 +179,14 @@ pub(crate) fn execute<S: StorageDriver>(
             table,
             predicate,
             returning,
-        } => delete(storage, table, predicate.as_ref(), returning.as_deref()),
+        } => plan_delete(storage, table, predicate.as_ref(), returning.as_deref()),
+        WriteStatement::CreateTable { .. }
+        | WriteStatement::CreateIndex { .. }
+        | WriteStatement::DropTable { .. }
+        | WriteStatement::DropIndex { .. }
+        | WriteStatement::AddColumn { .. } => Err(EngineError::unsupported_sql(
+            "Page-native SQL currently supports SELECT, INSERT, UPDATE, and DELETE; import the schema before opening a PagedEngine",
+        )),
     }
 }
 
@@ -304,13 +335,13 @@ fn create_table<S: StorageDriver>(
     })
 }
 
-fn insert<S: StorageDriver>(
-    storage: &mut S,
+fn plan_insert<S: StorageReader>(
+    storage: &S,
     table: &str,
     columns: Option<&[String]>,
     value_rows: &[Vec<SqlValue>],
     returning: Option<&[String]>,
-) -> Result<WriteOutcome> {
+) -> Result<PlannedDml> {
     let schema = storage.table_schema(table)?;
     let default_values =
         columns.is_none() && value_rows.len() == 1 && value_rows.first().is_some_and(Vec::is_empty);
@@ -386,23 +417,25 @@ fn insert<S: StorageDriver>(
     }
 
     let row_count = changes.len();
-    storage.apply_row_changes_unrevisioned(changes)?;
-    Ok(WriteOutcome {
-        command: "INSERT",
-        row_count,
-        rows: returned,
-        tables: vec![table.to_owned()],
-        mutated: true,
+    Ok(PlannedDml {
+        outcome: WriteOutcome {
+            command: "INSERT",
+            row_count,
+            rows: returned,
+            tables: vec![table.to_owned()],
+            mutated: true,
+        },
+        changes,
     })
 }
 
-fn update<S: StorageDriver>(
-    storage: &mut S,
+fn plan_update<S: StorageReader>(
+    storage: &S,
     table: &str,
     assignments: &[(String, SqlValue)],
     predicate: Option<&Predicate>,
     returning: Option<&[String]>,
-) -> Result<WriteOutcome> {
+) -> Result<PlannedDml> {
     let schema = storage.table_schema(table)?;
     validate_named_columns(
         &schema,
@@ -546,7 +579,7 @@ fn update<S: StorageDriver>(
         }
     }
 
-    if row_count > 0 {
+    let changes = if row_count > 0 {
         let mut deletes = Vec::with_capacity(row_count);
         let mut upserts = Vec::with_capacity(row_count);
         for update in updates {
@@ -562,26 +595,31 @@ fn update<S: StorageDriver>(
             });
         }
         deletes.extend(upserts);
-        storage.apply_row_changes_unrevisioned(deletes)?;
-    }
-    Ok(WriteOutcome {
-        command: "UPDATE",
-        row_count,
-        rows: returned,
-        tables: (row_count > 0)
-            .then(|| table.to_owned())
-            .into_iter()
-            .collect(),
-        mutated: row_count > 0,
+        deletes
+    } else {
+        Vec::new()
+    };
+    Ok(PlannedDml {
+        outcome: WriteOutcome {
+            command: "UPDATE",
+            row_count,
+            rows: returned,
+            tables: (row_count > 0)
+                .then(|| table.to_owned())
+                .into_iter()
+                .collect(),
+            mutated: row_count > 0,
+        },
+        changes,
     })
 }
 
-fn delete<S: StorageDriver>(
-    storage: &mut S,
+fn plan_delete<S: StorageReader>(
+    storage: &S,
     table: &str,
     predicate: Option<&Predicate>,
     returning: Option<&[String]>,
-) -> Result<WriteOutcome> {
+) -> Result<PlannedDml> {
     let schema = storage.table_schema(table)?;
     if let Some(predicate) = predicate.filter(|_| !schema.columns.is_empty()) {
         validate_predicate_columns(predicate, &schema, table)?;
@@ -638,18 +676,18 @@ fn delete<S: StorageDriver>(
     })?;
     require_complete_dml_scan(visit_outcome, table)?;
     let row_count = changes.len();
-    if row_count > 0 {
-        storage.apply_row_changes_unrevisioned(changes)?;
-    }
-    Ok(WriteOutcome {
-        command: "DELETE",
-        row_count,
-        rows: returned,
-        tables: (row_count > 0)
-            .then(|| table.to_owned())
-            .into_iter()
-            .collect(),
-        mutated: row_count > 0,
+    Ok(PlannedDml {
+        outcome: WriteOutcome {
+            command: "DELETE",
+            row_count,
+            rows: returned,
+            tables: (row_count > 0)
+                .then(|| table.to_owned())
+                .into_iter()
+                .collect(),
+            mutated: row_count > 0,
+        },
+        changes,
     })
 }
 

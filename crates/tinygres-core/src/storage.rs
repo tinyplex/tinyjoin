@@ -1431,6 +1431,27 @@ pub(crate) fn preflight_change_batch(
     indexes: &[&IndexDefinition],
 ) -> Result<()> {
     ensure_batch_change_count(changes.len())?;
+    preflight_row_changes(changes, schemas, indexes)
+}
+
+pub(crate) fn preflight_row_write_set(
+    changes: &[Change],
+    schemas: &BTreeMap<&str, &TableSchema>,
+    indexes: &[&IndexDefinition],
+) -> Result<()> {
+    if changes.len() > MAX_ROW_WRITE_CHANGES {
+        return Err(row_write_limit_error(format!(
+            "A row write-set cannot contain more than {MAX_ROW_WRITE_CHANGES} changes"
+        )));
+    }
+    preflight_row_changes(changes, schemas, indexes)
+}
+
+fn preflight_row_changes(
+    changes: &[Change],
+    schemas: &BTreeMap<&str, &TableSchema>,
+    indexes: &[&IndexDefinition],
+) -> Result<()> {
     let mut batch_bytes = 0usize;
     for change in changes {
         let (table, input, is_delete) = match change {
