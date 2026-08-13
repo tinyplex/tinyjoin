@@ -4,6 +4,9 @@ import {
   type JournalScan,
   scanJournal,
 } from './journal-codec.js';
+import {assertDatabaseName, StorageError} from './storage-error.js';
+
+export {assertDatabaseName, StorageError} from './storage-error.js';
 
 const RECORD_MAGIC = new Uint8Array([
   0x54, 0x47, 0x52, 0x53, 0x4f, 0x50, 0x46, 0x31,
@@ -69,18 +72,6 @@ interface DirectoryHandleLike {
 
 interface OpfsProvider {
   getDirectory(): Promise<DirectoryHandleLike>;
-}
-
-export class StorageError extends Error {
-  readonly code: string;
-  readonly retryable: boolean;
-
-  constructor(code: string, message: string, retryable = false) {
-    super(message);
-    this.name = 'StorageError';
-    this.code = code;
-    this.retryable = retryable;
-  }
 }
 
 export async function createOpfsSnapshotStore(
@@ -159,15 +150,6 @@ export async function createOpfsSnapshotStore(
       error,
       'OPFS_UNAVAILABLE',
       'TinyGres could not initialize its OPFS database directory',
-    );
-  }
-}
-
-export function assertDatabaseName(databaseName: string): void {
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(databaseName)) {
-    throw new StorageError(
-      'INVALID_STORAGE_NAME',
-      'An OPFS database name must be 1-64 ASCII letters, numbers, dots, underscores, or hyphens, and start with a letter or number',
     );
   }
 }

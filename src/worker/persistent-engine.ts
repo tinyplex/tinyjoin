@@ -13,11 +13,8 @@ import {
   decodeJournalTransaction,
   type JournalMutation,
 } from './journal-payload.js';
-import {
-  StorageError,
-  type SnapshotCandidate,
-  type SnapshotStore,
-} from './snapshot-store.js';
+import type {SnapshotCandidate, SnapshotStore} from './snapshot-store.js';
+import {StorageError} from './storage-error.js';
 
 const CHECKPOINT_RECORDS = 128;
 const CHECKPOINT_BYTES = 1024 * 1024;

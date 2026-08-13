@@ -6,7 +6,7 @@ import {
   type NormalizedSupabaseTableOptions,
   type SourceOptions,
 } from '../source-options.js';
-import {assertDatabaseName} from './snapshot-store.js';
+import {assertDatabaseName} from './storage-error.js';
 
 const SOURCE_STORAGE_FORMAT_VERSION = 1;
 

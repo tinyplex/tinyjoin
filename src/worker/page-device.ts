@@ -1,4 +1,4 @@
-import {StorageError} from './snapshot-store.js';
+import {StorageError} from './storage-error.js';
 
 export const PAGE_SIZE = 4096;
 export const MAX_PAGES = 65_536;
