@@ -8,6 +8,7 @@ mod join;
 mod model;
 mod page;
 mod paged_codec;
+mod paged_storage;
 mod pager;
 mod prepared;
 mod query;
@@ -38,6 +39,7 @@ pub use page::{
     RawMetadataSlot, RecoveredMetadata, SUPERBLOCK_PAGE_COUNT, Superblock, SuperblockSlot,
     build_next_metadata, recover_metadata,
 };
+pub use paged_storage::PagedStorage;
 pub use pager::{Pager, PagerWriteTransaction};
 pub use prepared::PreparedCommit;
 pub use storage::{InMemoryStorage, StorageDriver, StorageReader, VisitControl, VisitOutcome};
