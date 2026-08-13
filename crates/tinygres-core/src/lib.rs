@@ -1,20 +1,35 @@
 mod aggregate;
+mod cache;
+mod device;
 mod engine;
 mod error;
 mod join;
 mod model;
+mod page;
 mod prepared;
 mod query;
 mod snapshot;
 mod statement;
 mod storage;
 
+pub use cache::{
+    CandidateId, DEFAULT_PAGE_CACHE_BYTES, DEFAULT_PAGE_CACHE_PAGES, MAX_PAGE_CACHE_BYTES,
+    MAX_PAGE_CACHE_PAGES, PageCache,
+};
+pub use device::{MemoryPageDevice, PageDevice};
 pub use engine::{Engine, Prepared};
 pub use error::{EngineError, Result};
 pub use model::{
     ApplyOutcome, Change, ChangeBatch, ColumnDefinition, ColumnType, ExecuteResult, Filter,
     FilterOperator, IndexDefinition, NullOrder, OrderBy, OrderDirection, Predicate, QueryPlan,
     QueryResult, Row, SourceCursor, TableSchema,
+};
+pub use page::{
+    ALLOCATION_BITMAP_BYTES, AllocationBitmap, BITMAP_CHUNK_COUNT, BITMAP_PAGE_COUNT, BitmapSlot,
+    FIRST_DATA_PAGE_ID, MAX_DATABASE_BYTES, MAX_PAGE_COUNT, MAX_PAGE_PAYLOAD_SIZE,
+    MetadataPublicationStep, PAGE_HEADER_SIZE, PAGE_SIZE, Page, PageId, PageType, PendingMetadata,
+    RawMetadataSlot, RecoveredMetadata, SUPERBLOCK_PAGE_COUNT, Superblock, SuperblockSlot,
+    build_next_metadata, recover_metadata,
 };
 pub use prepared::PreparedCommit;
 pub use storage::{InMemoryStorage, StorageDriver, VisitControl, VisitOutcome};
