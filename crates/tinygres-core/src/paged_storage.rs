@@ -5,8 +5,8 @@ use std::{
 
 use crate::{
     ApplyOutcome, Btree, Change, ChangeBatch, EngineError, InMemoryStorage, IndexDefinition,
-    PageDevice, PageId, Pager, Result, Row, StorageDriver, StorageReader, TableSchema, TreeId,
-    VisitControl, VisitOutcome,
+    PageDevice, PageId, Pager, Result, Row, StorageReader, TableSchema, TreeId, VisitControl,
+    VisitOutcome,
     paged_codec::{
         CATALOG_TREE_ID, CatalogHeader, CatalogIndexRecord, CatalogKey, CatalogTableRecord,
         FIRST_USER_TREE_ID, MAX_CATALOG_INDEXES, MAX_CATALOG_TABLES, MAX_PAGED_VALUE_BYTES,
@@ -451,9 +451,7 @@ impl<D: PageDevice> PagedStorage<D> {
                     schema.name
                 )));
             }
-            // Reuse the canonical in-memory schema validator without cloning the complete catalog.
-            let mut validation = InMemoryStorage::default();
-            validation.define_table(schema.clone())?;
+            validate_schema(&schema)?;
             additions.insert(schema.name.clone(), schema);
         }
         let initialize_catalog = self.pager.borrow().catalog_root_page_id().is_none();
