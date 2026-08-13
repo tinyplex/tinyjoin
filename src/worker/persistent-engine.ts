@@ -8,7 +8,7 @@ import type {
   SqlResult,
   TableSchema,
 } from '../protocol.js';
-import type {PreparedMutation, WorkerEngine} from './engine.js';
+import type {LegacyRecoveryEngine, PreparedMutation} from './engine.js';
 import {
   decodeJournalTransaction,
   type JournalMutation,
@@ -30,9 +30,9 @@ type JournalSnapshotStore = SnapshotStore & {
 };
 
 export function createPersistentEngine(
-  engine: WorkerEngine,
+  engine: LegacyRecoveryEngine,
   store: SnapshotStore,
-): WorkerEngine {
+): LegacyRecoveryEngine {
   const journalStore = isJournalStore(store) ? store : undefined;
   const recovery = restoreNewestValidSnapshot(engine, store);
   if (journalStore) {
@@ -58,7 +58,7 @@ export function createPersistentEngine(
       firstError = error;
     }
     try {
-      engine.close?.();
+      engine.close();
     } catch (error) {
       firstError ??= error;
     }
@@ -337,7 +337,7 @@ function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
 }
 
 function restoreNewestValidSnapshot(
-  engine: WorkerEngine,
+  engine: LegacyRecoveryEngine,
   store: SnapshotStore,
 ): {restored: boolean; replayedLegacyJournal: boolean} {
   for (const candidate of store.candidates()) {
@@ -373,7 +373,7 @@ function restoreNewestValidSnapshot(
 }
 
 function replayCandidate(
-  engine: WorkerEngine,
+  engine: LegacyRecoveryEngine,
   candidate: SnapshotCandidate,
 ): boolean {
   if (candidate.journalError) {
@@ -431,7 +431,10 @@ function replayCandidate(
   return replayedLegacyJournal;
 }
 
-function replayMutation(engine: WorkerEngine, mutation: JournalMutation): void {
+function replayMutation(
+  engine: LegacyRecoveryEngine,
+  mutation: JournalMutation,
+): void {
   switch (mutation.type) {
     case 'defineTables':
       engine.defineTables(mutation.schemas);

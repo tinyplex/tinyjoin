@@ -8,7 +8,7 @@ import {
   type WorkerRequest,
   type WorkerResponse,
 } from '../../src/protocol.ts';
-import type {WorkerEngine} from '../../src/worker/engine.ts';
+import type {LegacyRecoveryEngine} from '../../src/worker/engine.ts';
 import {startWorker, type WorkerScope} from '../../src/worker/host.ts';
 import {createPersistentEngine} from '../../src/worker/persistent-engine.ts';
 import type {SnapshotStore} from '../../src/worker/snapshot-store.ts';
@@ -56,7 +56,7 @@ function mockEngine() {
     revision: ++revision,
     tables: [table],
   });
-  const engine: WorkerEngine = {
+  const engine: LegacyRecoveryEngine = {
     defineTable: vi.fn(),
     defineTables: vi.fn(),
     replaceTableSnapshot: vi.fn((schema) => outcome(schema.name)),
@@ -162,7 +162,7 @@ describe('startWorker', () => {
   it('routes requests through the engine and returns versioned responses', async () => {
     const scope = new FakeScope();
     const engine = mockEngine();
-    startWorker({scope, engineFactory: async () => engine});
+    startWorker({scope, durableEngineFactory: async () => engine});
 
     scope.send({
       v: PROTOCOL_VERSION,
@@ -196,7 +196,7 @@ describe('startWorker', () => {
   it('microbatches table invalidations from adjacent mutations', async () => {
     const scope = new FakeScope();
     const engine = mockEngine();
-    startWorker({scope, engineFactory: async () => engine});
+    startWorker({scope, durableEngineFactory: async () => engine});
 
     scope.send({
       v: PROTOCOL_VERSION,
@@ -243,7 +243,7 @@ describe('startWorker', () => {
   it('invalidates writable SQL immediately but a transaction only when it commits', async () => {
     const scope = new FakeScope();
     const engine = mockEngine();
-    startWorker({scope, engineFactory: async () => engine});
+    startWorker({scope, durableEngineFactory: async () => engine});
     scope.send({
       v: PROTOCOL_VERSION,
       id: 1,
@@ -343,7 +343,7 @@ describe('startWorker', () => {
   it('requires the active transaction token and rollback emits no invalidation', async () => {
     const scope = new FakeScope();
     const engine = mockEngine();
-    startWorker({scope, engineFactory: async () => engine});
+    startWorker({scope, durableEngineFactory: async () => engine});
     scope.send({
       v: PROTOCOL_VERSION,
       id: 1,
@@ -399,7 +399,7 @@ describe('startWorker', () => {
       },
       start: vi.fn(async () => undefined),
     };
-    startWorker({scope, source, engineFactory: async () => engine});
+    startWorker({scope, source, durableEngineFactory: async () => engine});
     scope.send({
       v: PROTOCOL_VERSION,
       id: 1,
@@ -442,7 +442,7 @@ describe('startWorker', () => {
   it('rejects malformed messages without invoking the engine', async () => {
     const scope = new FakeScope();
     const engine = mockEngine();
-    startWorker({scope, engineFactory: async () => engine});
+    startWorker({scope, durableEngineFactory: async () => engine});
 
     scope.send({v: 99, id: 8, method: 'query', params: {}});
     await waitForPosted(scope, 1);
@@ -462,7 +462,7 @@ describe('startWorker', () => {
   it('rejects well-shaped methods with unsafe parameters', async () => {
     const scope = new FakeScope();
     const engine = mockEngine();
-    startWorker({scope, engineFactory: async () => engine});
+    startWorker({scope, durableEngineFactory: async () => engine});
 
     scope.send({
       v: PROTOCOL_VERSION,
@@ -482,8 +482,12 @@ describe('startWorker', () => {
 
   it('fails explicit OPFS initialization instead of falling back to memory', async () => {
     const scope = new FakeScope();
-    const engine = mockEngine();
-    startWorker({scope, engineFactory: async () => engine});
+    const engineFactory = vi.fn(async () => {
+      throw Object.assign(new Error('OPFS is unavailable'), {
+        code: 'OPFS_UNAVAILABLE',
+      });
+    });
+    startWorker({scope, durableEngineFactory: engineFactory});
 
     scope.send({
       v: PROTOCOL_VERSION,
@@ -501,8 +505,40 @@ describe('startWorker', () => {
       ok: false,
       error: {code: 'OPFS_UNAVAILABLE'},
     });
-    expect(engine.defineTables).not.toHaveBeenCalled();
-    expect(engine.close).toHaveBeenCalledOnce();
+    expect(engineFactory).toHaveBeenCalledWith({
+      kind: 'opfs',
+      name: 'unit-test',
+    });
+  });
+
+  it('does not wrap a storage-owning engine factory in legacy persistence', async () => {
+    const scope = new FakeScope();
+    const engine = mockEngine();
+    const engineFactory = vi.fn(async () => engine);
+    startWorker({scope, durableEngineFactory: engineFactory});
+
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 10,
+      method: 'init',
+      params: {
+        schemas: [{name: 'posts', primaryKey: ['id']}],
+        storage: {kind: 'opfs', name: 'factory-owned'},
+      },
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 1);
+
+    expect(scope.posted[0]).toEqual({
+      v: PROTOCOL_VERSION,
+      id: 10,
+      ok: true,
+      result: {revision: 0, sourceConfigured: false},
+    });
+    expect(engineFactory).toHaveBeenCalledWith({
+      kind: 'opfs',
+      name: 'factory-owned',
+    });
+    expect(engine.defineTables).toHaveBeenCalledOnce();
   });
 
   it('makes a failed initialization terminal and releases its engine', async () => {
@@ -513,7 +549,7 @@ describe('startWorker', () => {
         code: 'INVALID_SCHEMA',
       });
     });
-    startWorker({scope, engineFactory: async () => engine});
+    startWorker({scope, durableEngineFactory: async () => engine});
 
     scope.send({
       v: PROTOCOL_VERSION,
@@ -538,7 +574,7 @@ describe('startWorker', () => {
   it('releases the existing engine when a second init changes storage', async () => {
     const scope = new FakeScope();
     const engine = mockEngine();
-    startWorker({scope, engineFactory: async () => engine});
+    startWorker({scope, durableEngineFactory: async () => engine});
     scope.send({
       v: PROTOCOL_VERSION,
       id: 1,
@@ -587,7 +623,7 @@ describe('startWorker', () => {
       close: vi.fn(),
     };
     const engine = createPersistentEngine(baseEngine, store);
-    startWorker({scope, engineFactory: async () => engine});
+    startWorker({scope, durableEngineFactory: async () => engine});
     scope.send({
       v: PROTOCOL_VERSION,
       id: 1,
@@ -646,7 +682,7 @@ describe('startWorker', () => {
         });
       },
     };
-    startWorker({scope, source, engineFactory: async () => engine});
+    startWorker({scope, source, durableEngineFactory: async () => engine});
 
     scope.send({
       v: PROTOCOL_VERSION,
@@ -696,7 +732,7 @@ describe('startWorker', () => {
     startWorker({
       scope,
       builtinSourceFactory,
-      engineFactory: async () => engine,
+      durableEngineFactory: async () => engine,
     });
 
     scope.send({
@@ -766,7 +802,7 @@ describe('startWorker', () => {
     startWorker({
       scope,
       builtinSourceFactory: () => construction.promise,
-      engineFactory: async () => engine,
+      durableEngineFactory: async () => engine,
     });
     scope.send({
       v: PROTOCOL_VERSION,
@@ -827,7 +863,7 @@ describe('startWorker', () => {
           code: 'SOURCE_IMPORT_FAILED',
         });
       },
-      engineFactory: async () => engine,
+      durableEngineFactory: async () => engine,
     });
     scope.send({
       v: PROTOCOL_VERSION,
@@ -884,7 +920,7 @@ describe('startWorker', () => {
       start: vi.fn(async () => undefined),
       close: vi.fn(async () => undefined),
     };
-    startWorker({scope, source, engineFactory});
+    startWorker({scope, source, durableEngineFactory: engineFactory});
     scope.send({
       v: PROTOCOL_VERSION,
       id: 1,
@@ -915,7 +951,7 @@ describe('startWorker', () => {
   it('rejects invalid built-in source config before opening storage', async () => {
     const scope = new FakeScope();
     const engineFactory = vi.fn(async () => mockEngine());
-    startWorker({scope, engineFactory});
+    startWorker({scope, durableEngineFactory: engineFactory});
     scope.send({
       v: PROTOCOL_VERSION,
       id: 1,
@@ -947,7 +983,7 @@ describe('startWorker', () => {
     startWorker({
       scope,
       builtinSourceFactory,
-      engineFactory: async () => engine,
+      durableEngineFactory: async () => engine,
     });
     scope.send({
       v: PROTOCOL_VERSION,
@@ -978,10 +1014,14 @@ describe('startWorker', () => {
 
   it('passes the resolved source-bound storage name to the engine factory', async () => {
     const scope = new FakeScope();
-    const engineFactory = vi.fn(async () => mockEngine());
+    const engineFactory = vi.fn(async () => {
+      throw Object.assign(new Error('stop after resolving storage'), {
+        code: 'STORAGE_OPEN_FAILED',
+      });
+    });
     startWorker({
       scope,
-      engineFactory,
+      durableEngineFactory: engineFactory,
       sourceIdentityHasher: async () => 'a'.repeat(64),
     });
     scope.send({
@@ -1016,7 +1056,11 @@ describe('startWorker', () => {
       },
       start: vi.fn(async () => undefined),
     };
-    startWorker({scope, source, engineFactory: async () => mockEngine()});
+    startWorker({
+      scope,
+      source,
+      durableEngineFactory: async () => mockEngine(),
+    });
     scope.send({
       v: PROTOCOL_VERSION,
       id: 1,
@@ -1057,7 +1101,7 @@ describe('startWorker', () => {
     startWorker({
       scope,
       source,
-      engineFactory: async () => mockEngine(),
+      durableEngineFactory: async () => mockEngine(),
     });
 
     scope.send({
@@ -1098,7 +1142,7 @@ describe('startWorker', () => {
       order.push('scope');
       scope.closed = true;
     });
-    startWorker({scope, engineFactory: async () => engine});
+    startWorker({scope, durableEngineFactory: async () => engine});
 
     scope.send({
       v: PROTOCOL_VERSION,

@@ -10,7 +10,7 @@ import type {
   SqlResult,
   TableSchema,
 } from '../../src/protocol.ts';
-import type {WorkerEngine} from '../../src/worker/engine.ts';
+import type {LegacyRecoveryEngine} from '../../src/worker/engine.ts';
 import {createPersistentEngine} from '../../src/worker/persistent-engine.ts';
 import {
   encodeJournalTransaction,
@@ -30,7 +30,7 @@ type EngineState = {
   tables: Record<string, {schema: TableSchema; rows: Row[]}>;
 };
 
-class StateEngine implements WorkerEngine {
+class StateEngine implements LegacyRecoveryEngine {
   state: EngineState = {revision: 0, tables: {}};
   closed = false;
   failImport = false;

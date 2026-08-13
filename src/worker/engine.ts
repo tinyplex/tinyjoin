@@ -24,6 +24,16 @@ export interface WorkerEngine {
   query(plan: QueryPlan): QueryResult;
   querySql(sql: string, params: JsonValue[]): QueryResult;
   executeSql(sql: string, params: JsonValue[]): SqlResult;
+  beginTransaction(): void;
+  commitTransaction(): ApplyOutcome;
+  rollbackTransaction(): void;
+  inTransaction(): boolean;
+  revision(): number;
+  close(): void;
+}
+
+/** Recovery-only capabilities retained by the temporary legacy persistence path. */
+export interface LegacyRecoveryEngine extends WorkerEngine {
   prepareDefineTables(schemas: TableSchema[]): PreparedMutation<null>;
   prepareReplaceTableSnapshot(
     schema: TableSchema,
@@ -38,14 +48,8 @@ export interface WorkerEngine {
   installPreparedCommit(commit: Uint8Array): ApplyOutcome;
   abortPreparedCommit(): void;
   replayCommit(commit: Uint8Array): ApplyOutcome;
-  beginTransaction(): void;
-  commitTransaction(): ApplyOutcome;
-  rollbackTransaction(): void;
-  inTransaction(): boolean;
-  revision(): number;
   exportSnapshot(): Uint8Array;
   importSnapshot(snapshot: Uint8Array): void;
-  close?(): void;
 }
 
 export type WorkerEngineFactory = (
@@ -54,7 +58,7 @@ export type WorkerEngineFactory = (
 
 export async function createWasmEngine(
   _resolvedStorage: StorageOptions,
-): Promise<WorkerEngine> {
+): Promise<LegacyRecoveryEngine> {
   const wasm = await import('../wasm/tinygres_wasm.js');
   await wasm.default();
   const engine = new wasm.WasmEngine();

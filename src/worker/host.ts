@@ -13,6 +13,7 @@ import {
 } from '../protocol.js';
 import {
   createWasmEngine,
+  type LegacyRecoveryEngine,
   type WorkerEngine,
   type WorkerEngineFactory,
 } from './engine.js';
@@ -45,7 +46,8 @@ export interface WorkerScope {
 export interface StartWorkerOptions {
   source?: ReplicaSource;
   scope?: WorkerScope;
-  engineFactory?: WorkerEngineFactory;
+  /** Creates an engine that owns durability for the fully resolved storage. */
+  durableEngineFactory?: WorkerEngineFactory;
   builtinSourceFactory?: BuiltinSourceFactory;
   sourceIdentityHasher?: SourceIdentityHasher;
 }
@@ -58,7 +60,8 @@ export function startWorker(
   options: StartWorkerOptions = {},
 ): WorkerController {
   const scope = options.scope ?? (globalThis as unknown as WorkerScope);
-  const engineFactory = options.engineFactory ?? createWasmEngine;
+  const engineFactory =
+    options.durableEngineFactory ?? createLegacyConfiguredEngine;
   const builtinSourceFactory =
     options.builtinSourceFactory ?? loadBuiltinSource;
   const sourceIdentityHasher = options.sourceIdentityHasher;
@@ -354,7 +357,7 @@ export function startWorker(
       }
       await sourceRunPromise?.catch(() => undefined);
       try {
-        engine?.close?.();
+        engine?.close();
       } catch (error) {
         firstError ??= error;
       }
@@ -543,22 +546,24 @@ async function createSourceBoundEngine(
   engineFactory: WorkerEngineFactory,
   sourceIdentityHasher: SourceIdentityHasher | undefined,
 ): Promise<WorkerEngine> {
-  if (storage.kind !== 'opfs' || !source) {
-    return createConfiguredEngine(storage, engineFactory);
-  }
-  const name = await bindOpfsStorageName(
-    storage.name,
-    source,
-    sourceIdentityHasher,
-  );
-  return createConfiguredEngine({kind: 'opfs', name}, engineFactory);
+  const resolvedStorage =
+    storage.kind === 'opfs' && source
+      ? {
+          kind: 'opfs' as const,
+          name: await bindOpfsStorageName(
+            storage.name,
+            source,
+            sourceIdentityHasher,
+          ),
+        }
+      : storage;
+  return engineFactory(resolvedStorage);
 }
 
-async function createConfiguredEngine(
+async function createLegacyConfiguredEngine(
   storage: StorageOptions,
-  engineFactory: WorkerEngineFactory,
 ): Promise<WorkerEngine> {
-  const engine = await engineFactory(storage);
+  const engine: LegacyRecoveryEngine = await createWasmEngine(storage);
   if (storage.kind === 'memory') {
     return engine;
   }
@@ -571,7 +576,7 @@ async function createConfiguredEngine(
     try {
       store?.close();
     } finally {
-      engine.close?.();
+      engine.close();
     }
     throw error;
   }
