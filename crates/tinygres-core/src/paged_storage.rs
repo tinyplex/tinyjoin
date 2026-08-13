@@ -9,18 +9,23 @@ use crate::{
     VisitControl, VisitOutcome,
     paged_codec::{
         CATALOG_TREE_ID, CatalogHeader, CatalogIndexRecord, CatalogKey, CatalogTableRecord,
-        FIRST_USER_TREE_ID, MAX_CATALOG_INDEXES, MAX_CATALOG_TABLES, decode_catalog_header_record,
-        decode_catalog_index_record, decode_catalog_key, decode_catalog_table_record, decode_row,
-        encode_catalog_header_record, encode_catalog_index_key, encode_catalog_index_record,
-        encode_catalog_table_key, encode_catalog_table_record, encode_primary_key, encode_row,
+        FIRST_USER_TREE_ID, MAX_CATALOG_INDEXES, MAX_CATALOG_TABLES, MAX_TREE_ID,
+        decode_catalog_header_record, decode_catalog_index_record, decode_catalog_key,
+        decode_catalog_table_record, decode_row, encode_catalog_header_record,
+        encode_catalog_index_key, encode_catalog_index_record, encode_catalog_table_key,
+        encode_catalog_table_record, encode_primary_key, encode_row,
         encode_secondary_index_entry_key, encode_secondary_index_prefix,
         secondary_index_entry_matches_prefix, secondary_index_primary_key,
         secondary_index_primary_key_for_definition,
     },
-    paged_schema::{DroppedTree, SchemaDropPlan, publish_schema_drop},
+    paged_schema::{
+        DroppedTree, ReplacementIndex, SchemaDropPlan, TableReplacementPlan, publish_schema_drop,
+        publish_table_replacement,
+    },
     storage::{
         normalize_row, preflight_change_batch, preflight_row_write_set,
         validate_index_columns_for_schema, validate_index_definition_shape,
+        validate_primary_storage_key_bound, validate_schema, validated_index_key,
     },
 };
 
@@ -839,6 +844,295 @@ impl<D: PageDevice> PagedStorage<D> {
         Ok(revision)
     }
 
+    /// Atomically defines or replaces a complete table snapshot.
+    ///
+    /// The current Rust/JavaScript API receives the source as a buffered `Vec<Row>`; this method
+    /// bounds that buffer and its canonical keys to 16 MiB before opening a pager candidate. The
+    /// new table and every affected index get fresh monotonic tree IDs even when `rows` is empty.
+    /// Index construction itself streams the fresh candidate table.
+    pub fn replace_table_snapshot(
+        &mut self,
+        schema: TableSchema,
+        mut rows: Vec<Row>,
+    ) -> Result<ApplyOutcome> {
+        self.ensure_ready()?;
+
+        // Preserve the in-memory contract's ordering: validate the logical shape, then resolve an
+        // existing-schema conflict before applying page-codec or batch-size constraints.
+        validate_schema(&schema)?;
+        let existing = self.tables.get(&schema.name);
+        if let Some(existing) = existing
+            && existing.schema != schema
+        {
+            return Err(EngineError::invalid_schema(format!(
+                "Table `{}` is already defined with a different schema",
+                schema.name
+            )));
+        }
+
+        // Walk borrowed metadata first. These conservative estimates cover the owned plan copy,
+        // the codec's temporary JSON model, and encoded catalog bytes, so adversarial metadata is
+        // rejected before any of those copies are materialized.
+        let mut retained_bytes = estimated_schema_work_bytes(&schema)?;
+        let mut affected_index_count = 0usize;
+        let mut unique_index_count = 0usize;
+        for index in self
+            .indexes
+            .values()
+            .filter(|index| index.definition.table == schema.name)
+        {
+            affected_index_count = affected_index_count
+                .checked_add(1)
+                .ok_or_else(batch_too_large)?;
+            unique_index_count = unique_index_count
+                .checked_add(usize::from(index.definition.unique))
+                .ok_or_else(batch_too_large)?;
+            retained_bytes = retained_bytes
+                .checked_add(estimated_index_definition_work_bytes(&index.definition)?)
+                .ok_or_else(batch_too_large)?;
+            ensure_batch_bytes(retained_bytes)?;
+        }
+        ensure_batch_bytes(retained_bytes)?;
+        let catalog_rootless = self.pager.borrow().catalog_root_page_id().is_none();
+        preflight_snapshot_operations(
+            rows.len(),
+            affected_index_count,
+            unique_index_count,
+            existing.is_some(),
+            catalog_rootless,
+        )?;
+        let next_tree_id = replacement_next_tree_id(self.next_tree_id, affected_index_count)?;
+
+        let row_slots = rows
+            .len()
+            .checked_mul(std::mem::size_of::<Row>())
+            .ok_or_else(batch_too_large)?;
+        retained_bytes = retained_bytes
+            .checked_add(row_slots)
+            .ok_or_else(batch_too_large)?;
+        ensure_batch_bytes(retained_bytes)?;
+        let mut primary_keys = BTreeSet::new();
+        let legacy_order_slots = rows
+            .len()
+            .checked_mul(std::mem::size_of::<(String, usize)>())
+            .ok_or_else(batch_too_large)?;
+        retained_bytes = retained_bytes
+            .checked_add(legacy_order_slots)
+            .ok_or_else(batch_too_large)?;
+        ensure_batch_bytes(retained_bytes)?;
+        let mut legacy_row_order = Vec::with_capacity(rows.len());
+        for (row_index, row) in rows.iter_mut().enumerate() {
+            let normalized = normalize_row(&schema, std::mem::take(row))?;
+            validate_primary_storage_key_bound(&schema, &normalized)?;
+            let key = encode_primary_key(&schema, &normalized)?;
+            let key_bytes = key.len().checked_add(64).ok_or_else(batch_too_large)?;
+            if primary_keys.contains(&key) {
+                return Err(EngineError::invalid_change(format!(
+                    "Snapshot for `{}` contains a duplicate primary key",
+                    schema.name
+                )));
+            }
+            let legacy_key = crate::storage::row_key(&schema, &normalized)?;
+            let prospective_bytes = retained_bytes
+                .checked_add(estimated_row_bytes(&normalized)?)
+                .and_then(|bytes| bytes.checked_add(key_bytes))
+                .and_then(|bytes| bytes.checked_add(legacy_key.len()))
+                .and_then(|bytes| bytes.checked_add(64))
+                .ok_or_else(batch_too_large)?;
+            ensure_batch_bytes(prospective_bytes)?;
+            assert!(primary_keys.insert(key));
+            legacy_row_order.push((legacy_key, row_index));
+            retained_bytes = prospective_bytes;
+            *row = normalized;
+        }
+        legacy_row_order.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        for row in &rows {
+            encode_row(row)?;
+        }
+        // Mirror InMemory's deterministic index rebuild order: index name (the BTreeMap order),
+        // then legacy JSON primary key. One unique-key set is retained and released per index.
+        for index in self
+            .indexes
+            .values()
+            .filter(|index| index.definition.table == schema.name)
+        {
+            let mut unique_keys = index.definition.unique.then(BTreeSet::new);
+            let mut unique_bytes = 0usize;
+            for (_, row_index) in &legacy_row_order {
+                let row = &rows[*row_index];
+                let Some(legacy_index_key) = validated_index_key(&schema, &index.definition, row)?
+                else {
+                    continue;
+                };
+                if let Some(unique_keys) = &mut unique_keys {
+                    if unique_keys.contains(&legacy_index_key) {
+                        return Err(EngineError::constraint_violation(format!(
+                            "Index `{}` would contain duplicate values",
+                            index.definition.name
+                        )));
+                    }
+                    let prospective_unique_bytes = retained_bytes
+                        .checked_add(unique_bytes)
+                        .and_then(|bytes| bytes.checked_add(legacy_index_key.len()))
+                        .and_then(|bytes| bytes.checked_add(64))
+                        .ok_or_else(batch_too_large)?;
+                    ensure_batch_bytes(prospective_unique_bytes)?;
+                    unique_bytes = unique_bytes
+                        .checked_add(legacy_index_key.len())
+                        .and_then(|bytes| bytes.checked_add(64))
+                        .ok_or_else(batch_too_large)?;
+                    assert!(unique_keys.insert(legacy_index_key));
+                }
+                // Keep the exact page-key codec as a defense after the shared logical validator.
+                encode_secondary_index_entry_key(&schema, &index.definition, row)?;
+            }
+        }
+
+        let table_tree_id = self.next_tree_id;
+        let provisional_table = encode_catalog_table_record(&CatalogTableRecord {
+            schema: schema.clone(),
+            tree_id: table_tree_id,
+            root_page_id: None,
+            row_count: 0,
+        })?;
+        let provisional_table_bytes = provisional_table
+            .0
+            .len()
+            .checked_add(provisional_table.1.len())
+            .and_then(|bytes| bytes.checked_add(128))
+            .ok_or_else(batch_too_large)?;
+        retained_bytes = retained_bytes
+            .checked_add(provisional_table_bytes)
+            .ok_or_else(batch_too_large)?;
+        ensure_batch_bytes(retained_bytes)?;
+        drop(provisional_table);
+
+        let mut allocated_tree_id = table_tree_id
+            .checked_add(1)
+            .expect("replacement tree-ID preflight proved the first increment");
+        let mut replacement_indexes = Vec::with_capacity(affected_index_count);
+        for index in self
+            .indexes
+            .values()
+            .filter(|index| index.definition.table == schema.name)
+        {
+            let tree_id = allocated_tree_id;
+            allocated_tree_id = allocated_tree_id
+                .checked_add(1)
+                .expect("replacement tree-ID preflight proved every increment");
+            replacement_indexes.push(ReplacementIndex {
+                definition: index.definition.clone(),
+                tree_id,
+                old_tree: Some(DroppedTree {
+                    tree_id: index.tree_id,
+                    root_page_id: index.root_page_id,
+                }),
+            });
+        }
+        debug_assert_eq!(allocated_tree_id, next_tree_id);
+
+        let table_count = self
+            .tables
+            .len()
+            .checked_add(usize::from(existing.is_none()))
+            .ok_or_else(|| limit_error("The catalog table count overflowed"))?;
+        if table_count > MAX_CATALOG_TABLES as usize {
+            return Err(limit_error(format!(
+                "A catalog cannot contain more than {MAX_CATALOG_TABLES} tables"
+            )));
+        }
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| EngineError::new("REVISION_OVERFLOW", "Database revision overflowed"))?;
+        let header = encode_catalog_header_record(&CatalogHeader {
+            next_tree_id,
+            table_count: u32::try_from(table_count)
+                .map_err(|_| limit_error("The catalog contains too many tables"))?,
+            index_count: u32::try_from(self.indexes.len())
+                .map_err(|_| limit_error("The catalog contains too many indexes"))?,
+        })?;
+        let header_bytes = header
+            .0
+            .len()
+            .checked_add(header.1.len())
+            .ok_or_else(batch_too_large)?;
+        retained_bytes = retained_bytes
+            .checked_add(header_bytes)
+            .ok_or_else(batch_too_large)?;
+        for index in &replacement_indexes {
+            let provisional = encode_catalog_index_record(&CatalogIndexRecord {
+                definition: index.definition.clone(),
+                tree_id: index.tree_id,
+                root_page_id: None,
+                entry_count: 0,
+            })?;
+            let provisional_bytes = provisional
+                .0
+                .len()
+                .checked_add(provisional.1.len())
+                .and_then(|bytes| bytes.checked_add(96))
+                .ok_or_else(batch_too_large)?;
+            retained_bytes = retained_bytes
+                .checked_add(provisional_bytes)
+                .ok_or_else(batch_too_large)?;
+        }
+        ensure_batch_bytes(retained_bytes)?;
+
+        let old_table = existing.map(|table| DroppedTree {
+            tree_id: table.tree_id,
+            root_page_id: table.root_page_id,
+        });
+        let table_name = schema.name.clone();
+        let plan = TableReplacementPlan {
+            revision,
+            header,
+            schema,
+            rows,
+            table_tree_id,
+            old_table,
+            indexes: replacement_indexes,
+        };
+        let mut pager = self.pager.borrow_mut();
+        let published = match publish_table_replacement(&mut pager, plan) {
+            Ok(published) => published,
+            Err(error) => {
+                if error.code == "RECOVERY_REQUIRED" || pager.is_recovery_required() {
+                    self.recovery_required = true;
+                }
+                return Err(error);
+            }
+        };
+        drop(pager);
+
+        self.tables.insert(
+            table_name.clone(),
+            PagedTable {
+                schema: published.schema,
+                tree_id: table_tree_id,
+                root_page_id: published.table_root_page_id,
+                row_count: published.row_count,
+            },
+        );
+        for index in published.indexes {
+            self.indexes.insert(
+                index.definition.name.clone(),
+                PagedIndex {
+                    definition: index.definition,
+                    tree_id: index.tree_id,
+                    root_page_id: index.root_page_id,
+                    entry_count: index.entry_count,
+                },
+            );
+        }
+        self.next_tree_id = next_tree_id;
+        self.revision = revision;
+        Ok(ApplyOutcome {
+            revision,
+            tables: vec![table_name],
+        })
+    }
+
     /// Atomically applies page-native row upserts and deletes in one durable generation.
     ///
     /// This narrow mutation surface deliberately remains an inherent method until the remaining
@@ -1331,6 +1625,141 @@ fn preflight_batch(
         .and_then(|operations| operations.checked_add(affected_index_count))
         .ok_or_else(batch_too_large)?;
     if operations > MAX_PAGED_BATCH_OPERATIONS {
+        return Err(operation_limit());
+    }
+    Ok(())
+}
+
+fn estimated_schema_work_bytes(schema: &TableSchema) -> Result<usize> {
+    let mut bytes = 512usize
+        .checked_add(estimated_string_work_bytes(&schema.name)?)
+        .ok_or_else(batch_too_large)?;
+    for column in &schema.primary_key {
+        bytes = bytes
+            .checked_add(estimated_string_work_bytes(column)?)
+            .and_then(|bytes| bytes.checked_add(64))
+            .ok_or_else(batch_too_large)?;
+    }
+    for column in &schema.columns {
+        bytes = bytes
+            .checked_add(estimated_string_work_bytes(&column.name)?)
+            .and_then(|bytes| bytes.checked_add(192))
+            .ok_or_else(batch_too_large)?;
+        if let Some(default) = &column.default {
+            bytes = bytes
+                .checked_add(estimated_json_bytes(default, 0)?)
+                .and_then(|bytes| bytes.checked_add(64))
+                .ok_or_else(batch_too_large)?;
+        }
+    }
+    Ok(bytes)
+}
+
+fn estimated_index_definition_work_bytes(definition: &IndexDefinition) -> Result<usize> {
+    let table_bytes = estimated_string_work_bytes(&definition.table)?;
+    let mut bytes = 256usize
+        .checked_add(estimated_string_work_bytes(&definition.name)?)
+        .and_then(|bytes| bytes.checked_add(table_bytes))
+        .ok_or_else(batch_too_large)?;
+    for column in &definition.columns {
+        bytes = bytes
+            .checked_add(estimated_string_work_bytes(column)?)
+            .and_then(|bytes| bytes.checked_add(64))
+            .ok_or_else(batch_too_large)?;
+    }
+    Ok(bytes)
+}
+
+fn estimated_string_work_bytes(value: &str) -> Result<usize> {
+    value
+        .len()
+        .checked_mul(6)
+        .and_then(|bytes| bytes.checked_add(64))
+        .ok_or_else(batch_too_large)
+}
+
+fn replacement_next_tree_id(next_tree_id: TreeId, index_count: usize) -> Result<TreeId> {
+    let tree_count = index_count
+        .checked_add(1)
+        .and_then(|count| TreeId::try_from(count).ok())
+        .ok_or_else(|| limit_error("The catalog tree ID range is exhausted"))?;
+    let next_tree_id = next_tree_id
+        .checked_add(tree_count)
+        .ok_or_else(|| limit_error("The catalog tree ID range is exhausted"))?;
+    if next_tree_id > MAX_TREE_ID {
+        return Err(limit_error("The catalog tree ID range is exhausted"));
+    }
+    Ok(next_tree_id)
+}
+
+fn snapshot_operation_count(
+    row_count: usize,
+    index_count: usize,
+    unique_index_count: usize,
+    replacing_existing: bool,
+    catalog_rootless: bool,
+) -> Result<usize> {
+    let index_row_operations = index_count.checked_mul(3).ok_or_else(batch_too_large)?;
+    let unique_row_operations = unique_index_count
+        .checked_mul(2)
+        .ok_or_else(batch_too_large)?;
+    // Per row: validate/build the fresh table entry and publish its upsert; logically validate
+    // every index in legacy order; visit and emit every possible candidate index entry; and probe
+    // both the logical and candidate key sets for every unique index. NULL entries only make the
+    // actual work smaller than this conservative bound.
+    let per_row_operations = 2usize
+        .checked_add(index_row_operations)
+        .and_then(|operations| operations.checked_add(unique_row_operations))
+        .ok_or_else(batch_too_large)?;
+    let row_operations = row_count
+        .checked_mul(per_row_operations)
+        .ok_or_else(batch_too_large)?;
+    // A non-empty replacement creates one fresh table root, opens one candidate-table cursor per
+    // index, and may create one fresh root for every index. Counting the latter even when all
+    // values turn out to be NULL keeps preflight independent of row contents.
+    let build_setup_operations = if row_count == 0 {
+        0
+    } else {
+        index_count
+            .checked_mul(2)
+            .and_then(|operations| operations.checked_add(1))
+            .ok_or_else(batch_too_large)?
+    };
+    // One header and table record plus one record for each rebuilt index.
+    let catalog_operations = 2usize
+        .checked_add(index_count)
+        .and_then(|operations| operations.checked_add(usize::from(catalog_rootless)))
+        .ok_or_else(batch_too_large)?;
+    // Replacements validate/reclaim every old child index, followed by the old table.
+    let reclaim_operations = if replacing_existing {
+        1usize
+            .checked_add(index_count)
+            .ok_or_else(batch_too_large)?
+    } else {
+        0
+    };
+    row_operations
+        .checked_add(build_setup_operations)
+        .and_then(|operations| operations.checked_add(catalog_operations))
+        .and_then(|operations| operations.checked_add(reclaim_operations))
+        .ok_or_else(batch_too_large)
+}
+
+fn preflight_snapshot_operations(
+    row_count: usize,
+    index_count: usize,
+    unique_index_count: usize,
+    replacing_existing: bool,
+    catalog_rootless: bool,
+) -> Result<()> {
+    if snapshot_operation_count(
+        row_count,
+        index_count,
+        unique_index_count,
+        replacing_existing,
+        catalog_rootless,
+    )? > MAX_PAGED_BATCH_OPERATIONS
+    {
         return Err(operation_limit());
     }
     Ok(())
@@ -1999,8 +2428,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        ColumnDefinition, ColumnType, Engine, MemoryPageDevice, PAGE_SIZE, PageDevice, QueryResult,
-        StorageDriver,
+        ColumnDefinition, ColumnType, Engine, MAX_BTREE_KEY_BYTES, MemoryPageDevice, PAGE_SIZE,
+        PageDevice, QueryResult, StorageDriver,
     };
 
     #[derive(Clone)]
@@ -2456,6 +2885,502 @@ mod tests {
             );
             assert_eq!(reopened.revision(), old_revision + u64::from(expected_new));
         }
+    }
+
+    #[test]
+    fn snapshot_replacement_allocates_fresh_trees_rebuilds_indexes_and_handles_empty_rows() {
+        let mut source = source();
+        source
+            .define_index(IndexDefinition {
+                name: "posts_rank_unique".to_owned(),
+                table: "posts".to_owned(),
+                columns: vec!["rank".to_owned()],
+                unique: true,
+            })
+            .unwrap();
+        let schema = source.table_schema("posts").unwrap();
+        let mut paged =
+            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let old_table_tree = paged.tables["posts"].tree_id;
+        let old_index_trees = paged
+            .indexes
+            .values()
+            .filter(|index| index.definition.table == "posts")
+            .map(|index| (index.definition.name.clone(), index.tree_id))
+            .collect::<BTreeMap<_, _>>();
+        let first_tree_id = paged.next_tree_id;
+        let revision = paged.revision();
+
+        let outcome = paged
+            .replace_table_snapshot(
+                schema.clone(),
+                vec![
+                    row(json!({"id": 20, "author_id": 1, "state": "live", "rank": 8})),
+                    row(json!({"id": 21, "author_id": 1, "state": null, "rank": 9})),
+                ],
+            )
+            .unwrap();
+        assert_eq!(outcome.revision, revision + 1);
+        assert_eq!(outcome.tables, vec!["posts"]);
+        assert_eq!(paged.tables["posts"].tree_id, first_tree_id);
+        assert_ne!(paged.tables["posts"].tree_id, old_table_tree);
+        for (offset, (name, index)) in paged
+            .indexes
+            .iter()
+            .filter(|(_, index)| index.definition.table == "posts")
+            .enumerate()
+        {
+            assert_eq!(index.tree_id, first_tree_id + 1 + offset as u64);
+            assert_ne!(index.tree_id, old_index_trees[name]);
+        }
+        assert_eq!(paged.indexes["posts_state_rank"].entry_count, 1);
+        assert_eq!(paged.indexes["posts_author"].entry_count, 2);
+        assert_eq!(paged.indexes["posts_rank_unique"].entry_count, 2);
+        let after_nonempty_next_tree_id = paged.next_tree_id;
+
+        paged.replace_table_snapshot(schema, Vec::new()).unwrap();
+        assert_eq!(paged.revision(), revision + 2);
+        assert_eq!(paged.tables["posts"].tree_id, after_nonempty_next_tree_id);
+        assert_eq!(paged.tables["posts"].root_page_id, None);
+        assert_eq!(paged.tables["posts"].row_count, 0);
+        for index in paged
+            .indexes
+            .values()
+            .filter(|index| index.definition.table == "posts")
+        {
+            assert_eq!(index.root_page_id, None);
+            assert_eq!(index.entry_count, 0);
+        }
+
+        let reopened = PagedStorage::open(paged.into_device()).unwrap();
+        assert_eq!(reopened.revision(), revision + 2);
+        assert_eq!(reopened.table_row_count("posts").unwrap(), 0);
+        assert_eq!(reopened.next_tree_id, after_nonempty_next_tree_id + 4);
+    }
+
+    #[test]
+    fn snapshot_replacement_matches_shared_primary_and_secondary_key_limit_errors() {
+        let schema = schema(
+            "items",
+            &[
+                ("id", ColumnType::Text, false),
+                ("tag", ColumnType::Text, false),
+            ],
+        );
+        let mut source = InMemoryStorage::default();
+        source.define_table(schema.clone()).unwrap();
+        source
+            .define_index(IndexDefinition {
+                name: "items_tag".to_owned(),
+                table: "items".to_owned(),
+                columns: vec!["tag".to_owned()],
+                unique: false,
+            })
+            .unwrap();
+
+        for rows in [
+            vec![row(json!({
+                "id": "x".repeat(MAX_BTREE_KEY_BYTES),
+                "tag": "short",
+            }))],
+            vec![row(json!({
+                "id": "short",
+                "tag": "x".repeat(MAX_BTREE_KEY_BYTES),
+            }))],
+        ] {
+            let expected = source
+                .clone()
+                .replace_table_snapshot(schema.clone(), rows.clone())
+                .unwrap_err();
+            let mut paged =
+                PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+            let revision = paged.revision();
+            let actual = paged
+                .replace_table_snapshot(schema.clone(), rows)
+                .unwrap_err();
+            assert_eq!(actual, expected);
+            assert_eq!(actual.code, "INVALID_CHANGE");
+            assert_eq!(paged.revision(), revision);
+            assert_eq!(paged.table_row_count("items").unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn snapshot_replacement_matches_primary_key_limit_without_indexes() {
+        let schema = schema("items", &[("id", ColumnType::Text, false)]);
+        let mut source = InMemoryStorage::default();
+        source.define_table(schema.clone()).unwrap();
+        let rows = vec![row(json!({"id": "x".repeat(MAX_BTREE_KEY_BYTES)}))];
+        let expected = source
+            .clone()
+            .replace_table_snapshot(schema.clone(), rows.clone())
+            .unwrap_err();
+        assert_eq!(expected.code, "INVALID_CHANGE");
+
+        let mut paged =
+            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let revision = paged.revision();
+        let actual = paged.replace_table_snapshot(schema, rows).unwrap_err();
+        assert_eq!(actual, expected);
+        assert_eq!(paged.revision(), revision);
+        assert_eq!(paged.table_row_count("items").unwrap(), 0);
+    }
+
+    #[test]
+    fn duplicate_unique_snapshot_aborts_with_old_catalog_rows_and_tree_ids_intact() {
+        let mut source = InMemoryStorage::default();
+        let schema = schema(
+            "accounts",
+            &[
+                ("id", ColumnType::Integer, false),
+                ("email", ColumnType::Text, true),
+            ],
+        );
+        source.define_table(schema.clone()).unwrap();
+        source
+            .replace_table(
+                "accounts",
+                vec![
+                    row(json!({"id": 1, "email": "ada@example.com"})),
+                    row(json!({"id": 2, "email": null})),
+                ],
+            )
+            .unwrap();
+        source
+            .define_index(IndexDefinition {
+                name: "accounts_email".to_owned(),
+                table: "accounts".to_owned(),
+                columns: vec!["email".to_owned()],
+                unique: true,
+            })
+            .unwrap();
+        let mut paged =
+            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let revision = paged.revision();
+        let next_tree_id = paged.next_tree_id;
+        let table_tree_id = paged.tables["accounts"].tree_id;
+        let index_tree_id = paged.indexes["accounts_email"].tree_id;
+        let before = paged.scan_table("accounts").unwrap();
+
+        let error = paged
+            .replace_table_snapshot(
+                schema,
+                vec![
+                    row(json!({"id": 3, "email": "same@example.com"})),
+                    row(json!({"id": 4, "email": "same@example.com"})),
+                ],
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "CONSTRAINT_VIOLATION");
+        assert_eq!(paged.revision(), revision);
+        assert_eq!(paged.next_tree_id, next_tree_id);
+        assert_eq!(paged.tables["accounts"].tree_id, table_tree_id);
+        assert_eq!(paged.indexes["accounts_email"].tree_id, index_tree_id);
+        assert_eq!(paged.scan_table("accounts").unwrap(), before);
+
+        let reopened = PagedStorage::open(paged.into_device()).unwrap();
+        assert_eq!(reopened.revision(), revision);
+        assert_eq!(reopened.scan_table("accounts").unwrap(), before);
+    }
+
+    #[test]
+    fn duplicate_primary_key_precedes_oversized_secondary_key_like_in_memory() {
+        let schema = schema(
+            "items",
+            &[
+                ("id", ColumnType::Integer, false),
+                ("tag", ColumnType::Text, false),
+            ],
+        );
+        let mut source = InMemoryStorage::default();
+        source.define_table(schema.clone()).unwrap();
+        source
+            .define_index(IndexDefinition {
+                name: "items_tag".to_owned(),
+                table: "items".to_owned(),
+                columns: vec!["tag".to_owned()],
+                unique: false,
+            })
+            .unwrap();
+        let rows = vec![
+            row(json!({"id": 1, "tag": "x".repeat(MAX_BTREE_KEY_BYTES)})),
+            row(json!({"id": 1, "tag": "short"})),
+        ];
+        let expected = source
+            .clone()
+            .replace_table_snapshot(schema.clone(), rows.clone())
+            .unwrap_err();
+        assert_eq!(expected.code, "INVALID_CHANGE");
+        assert!(expected.message.contains("duplicate primary key"));
+
+        let mut paged =
+            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let revision = paged.revision();
+        let next_tree_id = paged.next_tree_id;
+        let actual = paged.replace_table_snapshot(schema, rows).unwrap_err();
+        assert_eq!(actual, expected);
+        assert_eq!(paged.revision(), revision);
+        assert_eq!(paged.next_tree_id, next_tree_id);
+        assert_eq!(paged.table_row_count("items").unwrap(), 0);
+    }
+
+    #[test]
+    fn earlier_unique_index_violation_precedes_a_later_oversized_index_key() {
+        let schema = schema(
+            "items",
+            &[
+                ("id", ColumnType::Integer, false),
+                ("early", ColumnType::Text, false),
+                ("late", ColumnType::Text, false),
+            ],
+        );
+        let mut source = InMemoryStorage::default();
+        source.define_table(schema.clone()).unwrap();
+        source
+            .define_index(IndexDefinition {
+                name: "a_early_unique".to_owned(),
+                table: "items".to_owned(),
+                columns: vec!["early".to_owned()],
+                unique: true,
+            })
+            .unwrap();
+        source
+            .define_index(IndexDefinition {
+                name: "z_late".to_owned(),
+                table: "items".to_owned(),
+                columns: vec!["late".to_owned()],
+                unique: false,
+            })
+            .unwrap();
+        let rows = vec![
+            row(json!({"id": 2, "early": "same", "late": "short"})),
+            row(json!({
+                "id": 1,
+                "early": "same",
+                "late": "x".repeat(MAX_BTREE_KEY_BYTES),
+            })),
+        ];
+        let expected = source
+            .clone()
+            .replace_table_snapshot(schema.clone(), rows.clone())
+            .unwrap_err();
+        assert_eq!(expected.code, "CONSTRAINT_VIOLATION");
+        assert!(expected.message.contains("a_early_unique"));
+
+        let mut paged =
+            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let revision = paged.revision();
+        let actual = paged.replace_table_snapshot(schema, rows).unwrap_err();
+        assert_eq!(actual, expected);
+        assert_eq!(paged.revision(), revision);
+        assert_eq!(paged.table_row_count("items").unwrap(), 0);
+    }
+
+    #[test]
+    fn interrupted_snapshot_replacement_reopens_at_the_complete_old_or_new_generation() {
+        for (failing_flush, expected_new) in [(1, false), (2, false), (3, true)] {
+            let device = DurableDevice::default();
+            let control = device.clone();
+            let source = source();
+            let schema = source.table_schema("posts").unwrap();
+            let mut paged = PagedStorage::from_in_memory(device, &source).unwrap();
+            let revision = paged.revision();
+            control.arm_after_flush(failing_flush);
+            let error = paged
+                .replace_table_snapshot(
+                    schema,
+                    vec![row(json!({
+                        "id": 99,
+                        "author_id": 1,
+                        "state": "new",
+                        "rank": 9,
+                    }))],
+                )
+                .unwrap_err();
+            if expected_new {
+                assert_eq!(error.code, "RECOVERY_REQUIRED");
+                assert_eq!(
+                    paged.ensure_readable().unwrap_err().code,
+                    "RECOVERY_REQUIRED"
+                );
+                assert_eq!(
+                    paged
+                        .replace_table_snapshot(source.table_schema("posts").unwrap(), Vec::new(),)
+                        .unwrap_err()
+                        .code,
+                    "RECOVERY_REQUIRED"
+                );
+            } else {
+                assert_eq!(error.code, "INJECTED_IO");
+                assert_eq!(paged.revision(), revision);
+                assert_eq!(paged.table_row_count("posts").unwrap(), 3);
+            }
+
+            let device = paged.into_device();
+            control.crash();
+            let reopened = PagedStorage::open(device).unwrap();
+            assert_eq!(reopened.revision(), revision + u64::from(expected_new));
+            assert_eq!(
+                reopened.table_row_count("posts").unwrap(),
+                if expected_new { 1 } else { 3 }
+            );
+            assert_eq!(
+                reopened
+                    .lookup_primary_key("posts", &row(json!({"id": 99})))
+                    .unwrap()
+                    .is_some(),
+                expected_new
+            );
+            assert!(reopened.table_schema("authors").is_ok());
+            assert!(reopened.index_definition("posts_author").is_some());
+            assert!(reopened.index_definition("posts_state_rank").is_some());
+        }
+    }
+
+    #[test]
+    fn corrupt_old_table_after_index_reclaims_aborts_the_complete_replacement() {
+        let device = CountingDevice::new();
+        let control = device.clone();
+        let source = source();
+        let schema = source.table_schema("posts").unwrap();
+        let imported = PagedStorage::from_in_memory(device, &source).unwrap();
+        let table_root = imported.tables["posts"].root_page_id.unwrap();
+        let unrelated_root = imported.tables["authors"].root_page_id.unwrap();
+        let original = *control.inner.borrow().page(table_root).unwrap();
+        let old_index_roots = imported
+            .indexes
+            .values()
+            .filter(|index| index.definition.table == "posts")
+            .map(|index| index.root_page_id.unwrap())
+            .collect::<Vec<_>>();
+        let device = imported.into_device();
+        let mut pager = Pager::with_cache_capacity(device, PAGE_SIZE).unwrap();
+        let revision = pager.database_revision();
+        let catalog_root = pager.catalog_root_page_id().unwrap();
+        let (next_tree_id, tables, indexes) =
+            load_and_validate_catalog(&mut pager, catalog_root).unwrap();
+        // Evict the target table root from the one-page cache before damaging its device bytes.
+        pager.read_page(unrelated_root).unwrap();
+        let mut paged = PagedStorage {
+            pager: RefCell::new(pager),
+            revision,
+            next_tree_id,
+            tables,
+            indexes,
+            recovery_required: false,
+        };
+        let mut corrupt = original;
+        corrupt[PAGE_SIZE - 1] ^= 1;
+        control
+            .inner
+            .borrow_mut()
+            .write_page(table_root, &corrupt)
+            .unwrap();
+
+        let error = paged
+            .replace_table_snapshot(
+                schema,
+                vec![row(json!({
+                    "id": 99,
+                    "author_id": 1,
+                    "state": "new",
+                    "rank": 9,
+                }))],
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "INVALID_PAGE");
+        assert_eq!(paged.revision(), revision);
+        assert_eq!(paged.table_row_count("posts").unwrap(), 3);
+        for root in old_index_roots {
+            assert!(
+                paged
+                    .pager
+                    .borrow()
+                    .active_metadata()
+                    .allocation_bitmap
+                    .is_allocated(root)
+                    .unwrap()
+            );
+        }
+
+        control
+            .inner
+            .borrow_mut()
+            .write_page(table_root, &original)
+            .unwrap();
+        let reopened = PagedStorage::open(paged.into_device()).unwrap();
+        assert_eq!(reopened.revision(), revision);
+        assert_eq!(reopened.table_row_count("posts").unwrap(), 3);
+        assert!(reopened.index_definition("posts_author").is_some());
+        assert!(reopened.index_definition("posts_state_rank").is_some());
+    }
+
+    #[test]
+    fn conflicting_oversized_schema_preserves_invalid_schema_error_order() {
+        let mut source = InMemoryStorage::default();
+        let existing = schema("wide", &[("id", ColumnType::Integer, false)]);
+        source.define_table(existing).unwrap();
+        let mut conflicting = schema("wide", &[("id", ColumnType::Integer, false)]);
+        conflicting
+            .columns
+            .extend((1..256).map(|number| ColumnDefinition {
+                name: format!("column_{number}"),
+                data_type: ColumnType::Text,
+                nullable: false,
+                default: Some(json!("x".repeat(5_000))),
+            }));
+        let expected = source
+            .clone()
+            .replace_table_snapshot(conflicting.clone(), Vec::new())
+            .unwrap_err();
+        assert_eq!(expected.code, "INVALID_SCHEMA");
+
+        let mut paged =
+            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let revision = paged.revision();
+        let actual = paged
+            .replace_table_snapshot(conflicting, Vec::new())
+            .unwrap_err();
+        assert_eq!(actual, expected);
+        assert_eq!(paged.revision(), revision);
+    }
+
+    #[test]
+    fn snapshot_metadata_work_is_bounded_before_plan_clones() {
+        let mut source = InMemoryStorage::default();
+        let mut wide = schema("wide", &[("id", ColumnType::Integer, false)]);
+        wide.columns.extend((1..128).map(|number| ColumnDefinition {
+            name: format!("column_{number}_{}", "x".repeat(880)),
+            data_type: ColumnType::Text,
+            nullable: true,
+            default: None,
+        }));
+        source.define_table(wide.clone()).unwrap();
+        let indexed_columns = wide
+            .columns
+            .iter()
+            .skip(1)
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        for number in 0..24 {
+            source
+                .define_index(IndexDefinition {
+                    name: format!("wide_{number}"),
+                    table: "wide".to_owned(),
+                    columns: indexed_columns.clone(),
+                    unique: false,
+                })
+                .unwrap();
+        }
+        let mut paged =
+            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let revision = paged.revision();
+        let next_tree_id = paged.next_tree_id;
+        let error = paged.replace_table_snapshot(wide, Vec::new()).unwrap_err();
+        assert_eq!(error.code, "TRANSACTION_TOO_LARGE");
+        assert_eq!(paged.revision(), revision);
+        assert_eq!(paged.next_tree_id, next_tree_id);
+        assert_eq!(paged.table_row_count("wide").unwrap(), 0);
     }
 
     #[test]
@@ -3312,6 +4237,66 @@ mod tests {
         let error =
             preflight_batch(&changes, &tables, &indexes, preflight_change_batch).unwrap_err();
         assert_eq!(error.code, "TRANSACTION_TOO_LARGE");
+    }
+
+    #[test]
+    fn snapshot_operation_budget_counts_unique_probes_tree_setup_and_reclaims() {
+        // One row with two indexes (one unique): two table operations, six logical/candidate index
+        // operations, two logical/candidate unique probes, one table-root create, two cursor
+        // seeks, two index-root creates, four catalog writes, and three old-tree reclaim calls.
+        assert_eq!(snapshot_operation_count(1, 2, 1, true, false).unwrap(), 22);
+        assert_eq!(snapshot_operation_count(0, 2, 1, true, false).unwrap(), 7);
+        assert_eq!(snapshot_operation_count(1, 0, 0, false, true).unwrap(), 6);
+
+        // With no indexes an existing replacement costs two operations per row plus the table
+        // create, two catalog writes, and old-table reclaim. Exercise the exact limit without
+        // allocating or materializing half a million rows.
+        let at_limit = (MAX_PAGED_BATCH_OPERATIONS - 4) / 2;
+        assert_eq!(
+            snapshot_operation_count(at_limit, 0, 0, true, false).unwrap(),
+            MAX_PAGED_BATCH_OPERATIONS
+        );
+        preflight_snapshot_operations(at_limit, 0, 0, true, false).unwrap();
+        assert_eq!(
+            preflight_snapshot_operations(at_limit + 1, 0, 0, true, false)
+                .unwrap_err()
+                .code,
+            "TRANSACTION_TOO_LARGE"
+        );
+    }
+
+    #[test]
+    fn snapshot_row_order_slot_budget_is_checked_before_exact_capacity_allocation() {
+        let rows = MAX_PAGED_BATCH_BYTES
+            .div_ceil(std::mem::size_of::<(String, usize)>())
+            .checked_add(1)
+            .unwrap();
+        let slots = rows
+            .checked_mul(std::mem::size_of::<(String, usize)>())
+            .unwrap();
+        assert!(slots > MAX_PAGED_BATCH_BYTES);
+        assert_eq!(
+            ensure_batch_bytes(slots).unwrap_err().code,
+            "TRANSACTION_TOO_LARGE"
+        );
+    }
+
+    #[test]
+    fn snapshot_tree_id_preflight_reserves_a_representable_high_water_mark() {
+        assert_eq!(
+            replacement_next_tree_id(MAX_TREE_ID - 1, 0).unwrap(),
+            MAX_TREE_ID
+        );
+        assert_eq!(
+            replacement_next_tree_id(MAX_TREE_ID, 0).unwrap_err().code,
+            "STORAGE_LIMIT"
+        );
+        assert_eq!(
+            replacement_next_tree_id(MAX_TREE_ID - 1, 1)
+                .unwrap_err()
+                .code,
+            "STORAGE_LIMIT"
+        );
     }
 
     #[test]

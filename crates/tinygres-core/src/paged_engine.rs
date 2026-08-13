@@ -47,6 +47,20 @@ impl<D: PageDevice> PagedEngine<D> {
         self.storage.define_tables(schemas)
     }
 
+    /// Atomically defines or replaces one complete table snapshot.
+    ///
+    /// The current browser bridge supplies `rows` as one buffered JavaScript array. The paged
+    /// storage layer bounds that buffer and streams secondary-index construction internally; a
+    /// future source API can replace the boundary buffering without changing the durable format.
+    pub fn replace_table_snapshot(
+        &mut self,
+        schema: TableSchema,
+        rows: Vec<crate::Row>,
+    ) -> Result<ApplyOutcome> {
+        self.ensure_no_transaction()?;
+        self.storage.replace_table_snapshot(schema, rows)
+    }
+
     pub fn query(&self, plan: &QueryPlan) -> Result<QueryResult> {
         crate::query::execute(&self.read_view(), plan)
     }
@@ -604,6 +618,99 @@ mod tests {
             expected
                 .query_sql("SELECT id, title FROM tasks ORDER BY id", &[])
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn page_native_snapshot_replacement_matches_in_memory_and_reopens() {
+        let source = source();
+        let schema = source.table_schema("accounts").unwrap();
+        let replacement = vec![
+            row(json!({"id": 3, "email": "grace@example.com"})),
+            row(json!({"id": 4, "email": null, "active": true})),
+        ];
+        let mut expected = Engine::new(source.clone());
+        let mut actual =
+            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+
+        assert_eq!(
+            actual
+                .replace_table_snapshot(schema.clone(), replacement.clone())
+                .unwrap(),
+            expected
+                .replace_table_snapshot(schema.clone(), replacement.clone())
+                .unwrap()
+        );
+        assert_eq!(
+            actual
+                .query_sql("SELECT id, email, active FROM accounts ORDER BY id", &[])
+                .unwrap(),
+            expected
+                .query_sql("SELECT id, email, active FROM accounts ORDER BY id", &[])
+                .unwrap()
+        );
+
+        actual.begin_transaction().unwrap();
+        assert_eq!(
+            actual
+                .replace_table_snapshot(schema, replacement)
+                .unwrap_err()
+                .code,
+            "TRANSACTION_ACTIVE"
+        );
+        assert!(actual.in_transaction());
+        actual.rollback_transaction().unwrap();
+
+        let revision = actual.revision();
+        let reopened = PagedEngine::open(actual.into_device()).unwrap();
+        assert_eq!(reopened.revision(), revision);
+        assert_eq!(
+            reopened
+                .query_sql("SELECT id, email, active FROM accounts ORDER BY id", &[])
+                .unwrap(),
+            expected
+                .query_sql("SELECT id, email, active FROM accounts ORDER BY id", &[])
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn rootless_snapshot_replacement_defines_and_populates_a_table() {
+        let schema = TableSchema {
+            name: "notes".to_owned(),
+            primary_key: vec!["id".to_owned()],
+            columns: vec![
+                crate::ColumnDefinition {
+                    name: "id".to_owned(),
+                    data_type: crate::ColumnType::Integer,
+                    nullable: false,
+                    default: None,
+                },
+                crate::ColumnDefinition {
+                    name: "body".to_owned(),
+                    data_type: crate::ColumnType::Text,
+                    nullable: false,
+                    default: None,
+                },
+            ],
+        };
+        let rows = vec![row(json!({"id": 1, "body": "first"}))];
+        let mut expected = Engine::default();
+        let mut actual = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        assert_eq!(
+            actual
+                .replace_table_snapshot(schema.clone(), rows.clone())
+                .unwrap(),
+            expected.replace_table_snapshot(schema, rows).unwrap()
+        );
+        assert_eq!(
+            actual.query_sql("SELECT * FROM notes", &[]).unwrap(),
+            expected.query_sql("SELECT * FROM notes", &[]).unwrap()
+        );
+        let reopened = PagedEngine::open(actual.into_device()).unwrap();
+        assert_eq!(
+            reopened.query_sql("SELECT * FROM notes", &[]).unwrap(),
+            expected.query_sql("SELECT * FROM notes", &[]).unwrap()
         );
     }
 

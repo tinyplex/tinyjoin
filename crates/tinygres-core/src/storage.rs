@@ -899,7 +899,7 @@ fn build_postings(
     for (primary_key, row) in rows {
         // PostgreSQL's default UNIQUE semantics treat every key containing NULL
         // as distinct. NULL comparisons cannot use an equality lookup either.
-        let Some(key) = index_key_from_stored_row(schema, definition, row)? else {
+        let Some(key) = validated_index_key(schema, definition, row)? else {
             continue;
         };
         let entries = postings.entry(key).or_default();
@@ -915,6 +915,14 @@ fn build_postings(
 }
 
 fn index_key(
+    schema: &TableSchema,
+    definition: &IndexDefinition,
+    row: &Row,
+) -> Result<Option<String>> {
+    validated_index_key(schema, definition, row)
+}
+
+pub(crate) fn validated_index_key(
     schema: &TableSchema,
     definition: &IndexDefinition,
     row: &Row,
@@ -958,7 +966,7 @@ fn index_lookup_key(
     index_key_from_stored_row(schema, definition, row)
 }
 
-fn validate_schema(schema: &TableSchema) -> Result<()> {
+pub(crate) fn validate_schema(schema: &TableSchema) -> Result<()> {
     validate_catalog_name_bound(&schema.name)
         .map_err(|error| EngineError::invalid_schema(error.message))?;
     if schema.name.trim().is_empty() {
@@ -1314,13 +1322,13 @@ fn encoded_json_string_bytes(value: &str) -> Result<usize> {
     })
 }
 
-fn validate_primary_storage_key_bound(schema: &TableSchema, row: &Row) -> Result<()> {
+pub(crate) fn validate_primary_storage_key_bound(schema: &TableSchema, row: &Row) -> Result<()> {
     let bytes = storage_tuple_bytes(schema, &schema.primary_key, row, false)?
         .ok_or_else(|| EngineError::invalid_change("A primary key cannot contain null"))?;
     ensure_storage_key_bytes(bytes)
 }
 
-fn validate_secondary_storage_key_bound(
+pub(crate) fn validate_secondary_storage_key_bound(
     schema: &TableSchema,
     definition: &IndexDefinition,
     row: &Row,
