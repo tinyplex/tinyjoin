@@ -5,28 +5,30 @@ use std::{
 
 use crate::{
     ApplyOutcome, Btree, Change, ChangeBatch, EngineError, InMemoryStorage, IndexDefinition,
-    PageDevice, PageId, Pager, Result, Row, StorageReader, TableSchema, TreeId, VisitControl,
-    VisitOutcome,
+    PageDevice, PageId, Pager, Result, Row, StorageDriver, StorageReader, TableSchema, TreeId,
+    VisitControl, VisitOutcome,
     paged_codec::{
         CATALOG_TREE_ID, CatalogHeader, CatalogIndexRecord, CatalogKey, CatalogTableRecord,
-        FIRST_USER_TREE_ID, decode_catalog_header_record, decode_catalog_index_record,
-        decode_catalog_key, decode_catalog_table_record, decode_row, encode_catalog_header_record,
-        encode_catalog_index_record, encode_catalog_table_record, encode_primary_key, encode_row,
-        encode_secondary_index_entry_key, encode_secondary_index_prefix,
-        secondary_index_entry_matches_prefix, secondary_index_primary_key,
-        secondary_index_primary_key_for_definition,
+        FIRST_USER_TREE_ID, MAX_CATALOG_TABLES, decode_catalog_header_record,
+        decode_catalog_index_record, decode_catalog_key, decode_catalog_table_record, decode_row,
+        encode_catalog_header_record, encode_catalog_index_record, encode_catalog_table_record,
+        encode_primary_key, encode_row, encode_secondary_index_entry_key,
+        encode_secondary_index_prefix, secondary_index_entry_matches_prefix,
+        secondary_index_primary_key, secondary_index_primary_key_for_definition,
     },
     storage::{normalize_row, preflight_change_batch, preflight_row_write_set},
 };
 
 /// A relational view over the crash-safe paged B-tree store.
 ///
-/// [`Self::apply_batch`] is the first page-native mutation contract. The broader SQL/DDL storage
-/// driver remains deliberately unavailable until every operation can share the same atomic
-/// publication path. [`Self::from_in_memory`] is a deterministic one-shot importer.
+/// Table definitions and row changes publish directly through the pager's atomic generation
+/// switch. The broader SQL/DDL storage driver remains deliberately unavailable until every
+/// operation can share that publication path. [`Self::from_in_memory`] is a deterministic one-shot
+/// importer.
 pub struct PagedStorage<D: PageDevice> {
     pager: RefCell<Pager<D>>,
     revision: u64,
+    next_tree_id: TreeId,
     tables: BTreeMap<String, PagedTable>,
     indexes: BTreeMap<String, PagedIndex>,
     recovery_required: bool,
@@ -69,6 +71,11 @@ type RowWritePreflight = for<'a> fn(
     &BTreeMap<&'a str, &'a TableSchema>,
     &[&'a IndexDefinition],
 ) -> Result<()>;
+type LoadedCatalog = (
+    TreeId,
+    BTreeMap<String, PagedTable>,
+    BTreeMap<String, PagedIndex>,
+);
 
 impl<D: PageDevice> PagedStorage<D> {
     /// Opens and validates a previously published paged database.
@@ -84,16 +91,19 @@ impl<D: PageDevice> PagedStorage<D> {
             return Ok(Self {
                 pager: RefCell::new(pager),
                 revision,
+                next_tree_id: FIRST_USER_TREE_ID,
                 tables: BTreeMap::new(),
                 indexes: BTreeMap::new(),
                 recovery_required: false,
             });
         };
 
-        let (tables, indexes) = load_and_validate_catalog(&mut pager, catalog_root_page_id)?;
+        let (next_tree_id, tables, indexes) =
+            load_and_validate_catalog(&mut pager, catalog_root_page_id)?;
         Ok(Self {
             pager: RefCell::new(pager),
             revision,
+            next_tree_id,
             tables,
             indexes,
             recovery_required: false,
@@ -289,10 +299,11 @@ impl<D: PageDevice> PagedStorage<D> {
         }
         transaction.commit(revision, 0, Some(catalog_root))?;
 
-        let (tables, indexes) = load_and_validate_catalog(&mut pager, catalog_root)?;
+        let (next_tree_id, tables, indexes) = load_and_validate_catalog(&mut pager, catalog_root)?;
         Ok(Self {
             pager: RefCell::new(pager),
             revision,
+            next_tree_id,
             tables,
             indexes,
             recovery_required: false,
@@ -301,6 +312,177 @@ impl<D: PageDevice> PagedStorage<D> {
 
     pub fn into_device(self) -> D {
         self.pager.into_inner().into_device()
+    }
+
+    /// Atomically defines one table without advancing the database revision.
+    ///
+    /// Schema-only initialization deliberately matches [`InMemoryStorage`]: it is durable, but it
+    /// does not represent a row-data revision. Defining the identical schema again is a no-op.
+    pub fn define_table(&mut self, schema: TableSchema) -> Result<()> {
+        self.define_tables(vec![schema])
+    }
+
+    /// Atomically defines a collection of tables without advancing the database revision.
+    ///
+    /// Calling this on a rootless device, including with an empty collection, publishes the empty
+    /// catalog header required by later page-native mutations. A failed definition batch publishes
+    /// none of its schemas.
+    pub fn define_tables(&mut self, schemas: Vec<TableSchema>) -> Result<()> {
+        self.publish_table_definitions(schemas, false).map(|_| ())
+    }
+
+    /// Defines a SQL-created table and advances the database revision in the same pager generation.
+    pub(crate) fn create_table_and_advance(&mut self, schema: TableSchema) -> Result<u64> {
+        let changed = self.publish_table_definitions(vec![schema], true)?;
+        debug_assert!(
+            changed,
+            "SQL CREATE TABLE is planned only for a missing table"
+        );
+        Ok(self.revision)
+    }
+
+    fn publish_table_definitions(
+        &mut self,
+        schemas: Vec<TableSchema>,
+        advance_revision: bool,
+    ) -> Result<bool> {
+        self.ensure_ready()?;
+        if schemas.len() > MAX_CATALOG_TABLES as usize {
+            return Err(limit_error(format!(
+                "A table-definition batch cannot contain more than {MAX_CATALOG_TABLES} schemas"
+            )));
+        }
+
+        let mut additions = BTreeMap::<String, TableSchema>::new();
+        for schema in schemas {
+            let existing = self
+                .tables
+                .get(&schema.name)
+                .map(|table| &table.schema)
+                .or_else(|| additions.get(&schema.name));
+            if let Some(existing) = existing {
+                if existing == &schema {
+                    continue;
+                }
+                return Err(EngineError::invalid_schema(format!(
+                    "Table `{}` is already defined with a different schema",
+                    schema.name
+                )));
+            }
+            // Reuse the canonical in-memory schema validator without cloning the complete catalog.
+            let mut validation = InMemoryStorage::default();
+            validation.define_table(schema.clone())?;
+            additions.insert(schema.name.clone(), schema);
+        }
+        let initialize_catalog = self.pager.borrow().catalog_root_page_id().is_none();
+        if additions.is_empty() && !initialize_catalog {
+            return Ok(false);
+        }
+
+        let mut next_tree_id = self.next_tree_id;
+        let table_count = self
+            .tables
+            .len()
+            .checked_add(additions.len())
+            .ok_or_else(|| limit_error("The catalog table count overflowed"))?;
+        if table_count > MAX_CATALOG_TABLES as usize {
+            return Err(limit_error(format!(
+                "A catalog cannot contain more than {MAX_CATALOG_TABLES} tables"
+            )));
+        }
+        let mut new_tables = Vec::with_capacity(additions.len());
+        let mut encoded_records = Vec::with_capacity(additions.len());
+        let mut retained_bytes = 0usize;
+        for schema in additions.into_values() {
+            let tree_id = next_tree_id;
+            next_tree_id = next_tree_id
+                .checked_add(1)
+                .ok_or_else(|| limit_error("The catalog tree ID range is exhausted"))?;
+            let record = CatalogTableRecord {
+                schema: schema.clone(),
+                tree_id,
+                root_page_id: None,
+                row_count: 0,
+            };
+            let encoded = encode_catalog_table_record(&record)?;
+            retained_bytes = retained_bytes
+                .checked_add(encoded.0.len())
+                .and_then(|bytes| bytes.checked_add(encoded.1.len()))
+                .and_then(|bytes| bytes.checked_add(64))
+                .ok_or_else(batch_too_large)?;
+            ensure_batch_bytes(retained_bytes)?;
+            encoded_records.push(encoded);
+            new_tables.push((
+                schema.name.clone(),
+                PagedTable {
+                    schema,
+                    tree_id,
+                    root_page_id: None,
+                    row_count: 0,
+                },
+            ));
+        }
+
+        let header = CatalogHeader {
+            next_tree_id,
+            table_count: u32::try_from(table_count)
+                .map_err(|_| limit_error("The catalog contains too many tables"))?,
+            index_count: u32::try_from(self.indexes.len())
+                .map_err(|_| limit_error("The catalog contains too many indexes"))?,
+        };
+        // Encode every application-level value before allocating candidate pages.
+        let header = encode_catalog_header_record(&header)?;
+        let revision = if advance_revision {
+            self.revision.checked_add(1).ok_or_else(|| {
+                EngineError::new("REVISION_OVERFLOW", "Database revision overflowed")
+            })?
+        } else {
+            self.revision
+        };
+
+        let mut pager = self.pager.borrow_mut();
+        let applied_journal_sequence = pager.applied_journal_sequence();
+        let existing_catalog_root = pager.catalog_root_page_id();
+        let mut transaction = pager.begin_write()?;
+        let result = (|| {
+            let mut catalog_root = match existing_catalog_root {
+                Some(root) => root,
+                None => Btree::create(&mut transaction, CATALOG_TREE_ID)?,
+            };
+            catalog_root = Btree::upsert(
+                &mut transaction,
+                catalog_root,
+                CATALOG_TREE_ID,
+                &header.0,
+                &header.1,
+            )?;
+            for (key, value) in &encoded_records {
+                catalog_root =
+                    Btree::upsert(&mut transaction, catalog_root, CATALOG_TREE_ID, key, value)?;
+            }
+            Ok(catalog_root)
+        })();
+        let catalog_root = match result {
+            Ok(catalog_root) => catalog_root,
+            Err(error) => {
+                transaction.abort();
+                return Err(error);
+            }
+        };
+        if let Err(error) =
+            transaction.commit(revision, applied_journal_sequence, Some(catalog_root))
+        {
+            if error.code == "RECOVERY_REQUIRED" || pager.is_recovery_required() {
+                self.recovery_required = true;
+            }
+            return Err(error);
+        }
+        drop(pager);
+
+        self.tables.extend(new_tables);
+        self.next_tree_id = next_tree_id;
+        self.revision = revision;
+        Ok(true)
     }
 
     /// Atomically applies page-native row upserts and deletes in one durable generation.
@@ -1063,7 +1245,7 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
 fn load_and_validate_catalog<D: PageDevice>(
     pager: &mut Pager<D>,
     catalog_root_page_id: PageId,
-) -> Result<(BTreeMap<String, PagedTable>, BTreeMap<String, PagedIndex>)> {
+) -> Result<LoadedCatalog> {
     let mut header = None;
     let mut table_records = BTreeMap::new();
     let mut index_records = BTreeMap::new();
@@ -1117,16 +1299,6 @@ fn load_and_validate_catalog<D: PageDevice>(
         validate_catalog_tree_id(record.tree_id, header.next_tree_id, &mut tree_ids)?;
         validate_index_against_catalog(&record.definition, &table_records)?;
     }
-    let expected_next_tree_id = FIRST_USER_TREE_ID
-        .checked_add((table_records.len() + index_records.len()) as u64)
-        .ok_or_else(|| storage_corrupt("The catalog tree ID range overflowed"))?;
-    if header.next_tree_id != expected_next_tree_id {
-        return Err(storage_corrupt(format!(
-            "Catalog next tree ID {} does not match its {} trees",
-            header.next_tree_id,
-            table_records.len() + index_records.len()
-        )));
-    }
     if tree_ids.len() != 1 + table_records.len() + index_records.len() {
         return Err(storage_corrupt("Catalog tree IDs are not unique"));
     }
@@ -1170,7 +1342,7 @@ fn load_and_validate_catalog<D: PageDevice>(
             ))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
-    Ok((tables, indexes))
+    Ok((header.next_tree_id, tables, indexes))
 }
 
 fn validate_catalog_tree_id(
@@ -1610,6 +1782,169 @@ mod tests {
         storage
     }
 
+    #[test]
+    fn table_definitions_are_atomic_same_revision_and_reopenable() {
+        let device = MemoryPageDevice::new(0).unwrap();
+        let mut paged = PagedStorage::open(device).unwrap();
+        assert_eq!(paged.revision(), 0);
+
+        // Even an empty initializer publishes the canonical catalog root at the same revision.
+        paged.define_tables(vec![]).unwrap();
+        let device = paged.into_device();
+        let pager = Pager::open_or_create(device).unwrap();
+        assert_eq!(pager.database_revision(), 0);
+        assert!(pager.catalog_root_page_id().is_some());
+
+        let mut paged = PagedStorage::open(pager.into_device()).unwrap();
+        let accounts = schema(
+            "accounts",
+            &[
+                ("id", ColumnType::Integer, false),
+                ("name", ColumnType::Text, false),
+            ],
+        );
+        let notes = schema(
+            "notes",
+            &[
+                ("id", ColumnType::Integer, false),
+                ("body", ColumnType::Text, true),
+            ],
+        );
+        paged
+            .define_tables(vec![notes.clone(), accounts.clone()])
+            .unwrap();
+        assert_eq!(paged.revision(), 0);
+        assert_eq!(paged.table_schema("accounts").unwrap(), accounts);
+        assert_eq!(paged.table_schema("notes").unwrap(), notes);
+
+        paged.define_table(accounts.clone()).unwrap();
+        assert_eq!(paged.revision(), 0);
+        let conflicting = TableSchema {
+            primary_key: vec!["name".to_owned()],
+            ..accounts.clone()
+        };
+        assert_eq!(
+            paged
+                .define_tables(vec![
+                    schema("would_have_existed", &[("id", ColumnType::Integer, false)]),
+                    conflicting,
+                ])
+                .unwrap_err()
+                .code,
+            "INVALID_SCHEMA"
+        );
+        assert_eq!(
+            paged.table_schema("would_have_existed").unwrap_err().code,
+            "TABLE_NOT_FOUND"
+        );
+
+        let reopened = PagedStorage::open(paged.into_device()).unwrap();
+        assert_eq!(reopened.revision(), 0);
+        assert_eq!(reopened.table_schema("accounts").unwrap(), accounts);
+        assert_eq!(reopened.table_schema("notes").unwrap(), notes);
+    }
+
+    #[test]
+    fn interrupted_table_definition_reopens_at_the_old_or_new_catalog() {
+        for (failing_flush, expected_new) in [(1, false), (2, false), (3, true)] {
+            let device = DurableDevice::default();
+            let control = device.clone();
+            let mut paged = PagedStorage::open(device).unwrap();
+            control.arm_after_flush(failing_flush);
+
+            let error = paged
+                .define_table(schema("accounts", &[("id", ColumnType::Integer, false)]))
+                .unwrap_err();
+            if expected_new {
+                assert_eq!(error.code, "RECOVERY_REQUIRED");
+                assert_eq!(
+                    paged.table_schema("accounts").unwrap_err().code,
+                    "RECOVERY_REQUIRED"
+                );
+            } else {
+                assert_eq!(error.code, "INJECTED_IO");
+                assert_eq!(
+                    paged.table_schema("accounts").unwrap_err().code,
+                    "TABLE_NOT_FOUND"
+                );
+            }
+
+            let device = paged.into_device();
+            control.crash();
+            let reopened = PagedStorage::open(device).unwrap();
+            assert_eq!(reopened.revision(), 0);
+            assert_eq!(reopened.table_schema("accounts").is_ok(), expected_new);
+        }
+    }
+
+    #[test]
+    fn gapped_catalog_retains_its_monotonic_tree_id_allocator() {
+        let mut source = InMemoryStorage::default();
+        for name in ["alpha", "beta", "gamma"] {
+            source
+                .define_table(schema(name, &[("id", ColumnType::Integer, false)]))
+                .unwrap();
+        }
+        let paged =
+            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let device = paged.into_device();
+        let mut pager = Pager::open_or_create(device).unwrap();
+        let catalog_root = pager.catalog_root_page_id().unwrap();
+        let revision = pager.database_revision();
+
+        // Simulate a future DROP by removing one catalog record while leaving next_tree_id at its
+        // monotonic high-water mark. The dropped tree itself is empty in this fixture.
+        let (_, tables, indexes) = load_and_validate_catalog(&mut pager, catalog_root).unwrap();
+        let dropped = tables["beta"].tree_id;
+        let previous_next_tree_id = FIRST_USER_TREE_ID + (tables.len() + indexes.len()) as u64;
+        let (table_key, _) = encode_catalog_table_record(&CatalogTableRecord {
+            schema: tables["beta"].schema.clone(),
+            tree_id: dropped,
+            root_page_id: tables["beta"].root_page_id,
+            row_count: tables["beta"].row_count as u64,
+        })
+        .unwrap();
+        let mut transaction = pager.begin_write().unwrap();
+        let (catalog_root, removed) =
+            Btree::delete(&mut transaction, catalog_root, CATALOG_TREE_ID, &table_key).unwrap();
+        assert!(removed);
+        let mut catalog_root = catalog_root.unwrap();
+        let (header_key, header_value) = encode_catalog_header_record(&CatalogHeader {
+            next_tree_id: previous_next_tree_id,
+            table_count: (tables.len() - 1) as u32,
+            index_count: indexes.len() as u32,
+        })
+        .unwrap();
+        catalog_root = Btree::upsert(
+            &mut transaction,
+            catalog_root,
+            CATALOG_TREE_ID,
+            &header_key,
+            &header_value,
+        )
+        .unwrap();
+        transaction.commit(revision, 0, Some(catalog_root)).unwrap();
+
+        let mut reopened = PagedStorage::open(pager.into_device()).unwrap();
+        assert_eq!(reopened.next_tree_id, previous_next_tree_id);
+        reopened
+            .define_table(schema("replacement", &[("id", ColumnType::Integer, false)]))
+            .unwrap();
+        assert_eq!(
+            reopened.tables["replacement"].tree_id,
+            previous_next_tree_id
+        );
+        assert_ne!(reopened.tables["replacement"].tree_id, dropped);
+        assert_eq!(reopened.next_tree_id, previous_next_tree_id + 1);
+
+        let reopened = PagedStorage::open(reopened.into_device()).unwrap();
+        assert_eq!(
+            reopened.tables["replacement"].tree_id,
+            previous_next_tree_id
+        );
+        assert_eq!(reopened.next_tree_id, previous_next_tree_id + 1);
+    }
+
     fn query_pair(source: &InMemoryStorage, sql: &str) -> (QueryResult, QueryResult) {
         let expected = Engine::new(source.clone()).query_sql(sql, &[]).unwrap();
         let paged =
@@ -1988,10 +2323,12 @@ mod tests {
         let mut pager = Pager::with_cache_capacity(device, PAGE_SIZE).unwrap();
         let revision = pager.database_revision();
         let catalog_root = pager.catalog_root_page_id().unwrap();
-        let (tables, indexes) = load_and_validate_catalog(&mut pager, catalog_root).unwrap();
+        let (next_tree_id, tables, indexes) =
+            load_and_validate_catalog(&mut pager, catalog_root).unwrap();
         let mut paged = PagedStorage {
             pager: RefCell::new(pager),
             revision,
+            next_tree_id,
             tables,
             indexes,
             recovery_required: false,

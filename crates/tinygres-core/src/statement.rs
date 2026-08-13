@@ -185,7 +185,7 @@ pub(crate) fn plan_dml<S: StorageReader>(
         | WriteStatement::DropTable { .. }
         | WriteStatement::DropIndex { .. }
         | WriteStatement::AddColumn { .. } => Err(EngineError::unsupported_sql(
-            "Page-native SQL currently supports SELECT, INSERT, UPDATE, and DELETE; import the schema before opening a PagedEngine",
+            "Page-native SQL currently supports SELECT, CREATE TABLE, INSERT, UPDATE, and DELETE",
         )),
     }
 }
@@ -312,6 +312,18 @@ fn create_table<S: StorageDriver>(
     schema: &TableSchema,
     if_not_exists: bool,
 ) -> Result<WriteOutcome> {
+    let outcome = plan_create_table(storage, schema, if_not_exists)?;
+    if outcome.mutated {
+        storage.define_table(schema.clone())?;
+    }
+    Ok(outcome)
+}
+
+pub(crate) fn plan_create_table<S: StorageReader>(
+    storage: &S,
+    schema: &TableSchema,
+    if_not_exists: bool,
+) -> Result<WriteOutcome> {
     if storage.table_schema(&schema.name).is_ok() {
         if if_not_exists {
             return Ok(WriteOutcome {
@@ -325,7 +337,6 @@ fn create_table<S: StorageDriver>(
         return Err(EngineError::table_already_exists(&schema.name));
     }
 
-    storage.define_table(schema.clone())?;
     Ok(WriteOutcome {
         command: "CREATE TABLE",
         row_count: 0,

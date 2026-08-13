@@ -2,16 +2,15 @@ use serde_json::Value;
 
 use crate::{
     EngineError, ExecuteResult, InMemoryStorage, PageDevice, PagedStorage, QueryPlan, QueryResult,
-    Result, StorageReader,
-    statement::{PlannedDml, Statement},
+    Result, StorageReader, TableSchema,
+    statement::{PlannedDml, Statement, WriteStatement},
 };
 
 /// A SQL engine which publishes row mutations directly through the crash-safe page store.
 ///
-/// This first page-native engine slice supports reads plus standalone `INSERT`, `UPDATE`, and
-/// `DELETE` statements. Schemas must currently be imported with [`Self::from_in_memory`] (or by
-/// constructing a [`PagedStorage`] directly); page-native DDL and explicit transactions are not
-/// part of this surface yet.
+/// This page-native engine slice supports reads, `CREATE TABLE`, and standalone `INSERT`, `UPDATE`,
+/// and `DELETE` statements. Other page-native DDL and explicit transactions are not part of this
+/// surface yet.
 pub struct PagedEngine<D: PageDevice> {
     storage: PagedStorage<D>,
 }
@@ -29,6 +28,16 @@ impl<D: PageDevice> PagedEngine<D> {
     /// Imports an in-memory catalog and its rows as one paged generation.
     pub fn from_in_memory(device: D, source: &InMemoryStorage) -> Result<Self> {
         PagedStorage::from_in_memory(device, source).map(Self::new)
+    }
+
+    /// Atomically defines one initialization schema without advancing the database revision.
+    pub fn define_table(&mut self, schema: TableSchema) -> Result<()> {
+        self.storage.define_table(schema)
+    }
+
+    /// Atomically defines initialization schemas without advancing the database revision.
+    pub fn define_tables(&mut self, schemas: Vec<TableSchema>) -> Result<()> {
+        self.storage.define_tables(schemas)
     }
 
     pub fn query(&self, plan: &QueryPlan) -> Result<QueryResult> {
@@ -63,14 +72,35 @@ impl<D: PageDevice> PagedEngine<D> {
                 execute_query_result(crate::join::execute(&self.storage, &plan)?)
             }
             Statement::Write(statement) => {
-                let PlannedDml { outcome, changes } =
-                    crate::statement::plan_dml(&self.storage, &statement)?;
-                debug_assert_eq!(outcome.mutated, !changes.is_empty());
-                let revision = if outcome.mutated {
-                    let write_set = self.storage.prepare_row_write_set(&changes)?;
-                    self.storage.commit_row_write_set(write_set)?.revision
-                } else {
-                    self.storage.revision()
+                let (outcome, revision) = match &statement {
+                    WriteStatement::CreateTable {
+                        schema,
+                        if_not_exists,
+                    } => {
+                        let outcome = crate::statement::plan_create_table(
+                            &self.storage,
+                            schema,
+                            *if_not_exists,
+                        )?;
+                        let revision = if outcome.mutated {
+                            self.storage.create_table_and_advance(schema.clone())?
+                        } else {
+                            self.storage.revision()
+                        };
+                        (outcome, revision)
+                    }
+                    _ => {
+                        let PlannedDml { outcome, changes } =
+                            crate::statement::plan_dml(&self.storage, &statement)?;
+                        debug_assert_eq!(outcome.mutated, !changes.is_empty());
+                        let revision = if outcome.mutated {
+                            let write_set = self.storage.prepare_row_write_set(&changes)?;
+                            self.storage.commit_row_write_set(write_set)?.revision
+                        } else {
+                            self.storage.revision()
+                        };
+                        (outcome, revision)
+                    }
                 };
                 Ok(ExecuteResult {
                     command: outcome.command.to_owned(),
@@ -253,20 +283,112 @@ mod tests {
             assert_eq!(engine.revision(), revision, "{sql}");
         }
 
-        let error = engine
+        let created = engine
             .execute_sql("CREATE TABLE later (id INTEGER PRIMARY KEY)", &[])
-            .unwrap_err();
-        assert_eq!(error.code, "UNSUPPORTED_SQL");
-        assert!(error.message.contains("import the schema"));
-        assert_eq!(engine.revision(), revision);
+            .unwrap();
+        assert_eq!(created.command, "CREATE TABLE");
+        assert_eq!(created.revision, revision + 1);
+        assert_eq!(created.tables, vec!["later"]);
+        assert_eq!(
+            engine
+                .execute_sql(
+                    "CREATE TABLE IF NOT EXISTS later (other TEXT PRIMARY KEY)",
+                    &[],
+                )
+                .unwrap()
+                .revision,
+            revision + 1
+        );
+        assert_eq!(
+            engine
+                .execute_sql("CREATE TABLE later (id INTEGER PRIMARY KEY)", &[])
+                .unwrap_err()
+                .code,
+            "TABLE_ALREADY_EXISTS"
+        );
 
         let reopened = PagedEngine::open(engine.into_device()).unwrap();
-        assert_eq!(reopened.revision(), revision);
+        assert_eq!(reopened.revision(), revision + 1);
         assert_eq!(
             reopened
                 .query_sql("SELECT * FROM accounts ORDER BY id", &[])
                 .unwrap(),
-            rows
+            QueryResult {
+                revision: revision + 1,
+                rows: rows.rows,
+            }
+        );
+        assert!(
+            reopened
+                .query_sql("SELECT id FROM later", &[])
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rootless_engine_defines_initial_schemas_without_advancing_revision() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let schemas = vec![
+            TableSchema {
+                name: "notes".to_owned(),
+                primary_key: vec!["id".to_owned()],
+                columns: vec![],
+            },
+            TableSchema {
+                name: "accounts".to_owned(),
+                primary_key: vec!["id".to_owned()],
+                columns: vec![],
+            },
+        ];
+        engine.define_tables(schemas).unwrap();
+        assert_eq!(engine.revision(), 0);
+        assert!(
+            engine
+                .query_sql("SELECT id FROM accounts", &[])
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+
+        let mut reopened = PagedEngine::open(engine.into_device()).unwrap();
+        assert_eq!(reopened.revision(), 0);
+        let inserted = reopened
+            .execute_sql("INSERT INTO accounts (id) VALUES (1) RETURNING id", &[])
+            .unwrap();
+        assert_eq!(inserted.revision, 1);
+        assert_eq!(inserted.rows, vec![row(json!({"id": 1}))]);
+    }
+
+    #[test]
+    fn rootless_sql_create_matches_the_in_memory_engine_and_reopens() {
+        let mut expected = Engine::default();
+        let mut actual = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let sql = "CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL)";
+
+        assert_eq!(
+            actual.execute_sql(sql, &[]).unwrap(),
+            expected.execute_sql(sql, &[]).unwrap()
+        );
+        assert_eq!(actual.revision(), 1);
+        assert_eq!(
+            actual
+                .execute_sql("INSERT INTO tasks (id, title) VALUES (1, 'first')", &[])
+                .unwrap(),
+            expected
+                .execute_sql("INSERT INTO tasks (id, title) VALUES (1, 'first')", &[])
+                .unwrap()
+        );
+
+        let reopened = PagedEngine::open(actual.into_device()).unwrap();
+        assert_eq!(
+            reopened
+                .query_sql("SELECT id, title FROM tasks ORDER BY id", &[])
+                .unwrap(),
+            expected
+                .query_sql("SELECT id, title FROM tasks ORDER BY id", &[])
+                .unwrap()
         );
     }
 
