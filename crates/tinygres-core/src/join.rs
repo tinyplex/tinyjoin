@@ -11,14 +11,18 @@ use crate::query::{
 use crate::storage::StorageReader;
 use crate::{
     ColumnDefinition, ColumnType, EngineError, FilterOperator, NullOrder, OrderDirection,
-    Predicate, QueryResult, Result, Row, TableSchema,
+    Predicate, QueryResult, Result, Row, TableSchema, VisitControl, VisitOutcome,
 };
 
 const MAX_PROJECTIONS: usize = 256;
 const MAX_ON_TERMS: usize = 32;
 const MAX_ORDER_COLUMNS: usize = 32;
+const MAX_JOIN_BUILD_ROWS: usize = 100_000;
 const MAX_JOIN_PAIRS: usize = 1_000_000;
+const MAX_SCAN_ROWS: usize = 1_000_000;
 const MAX_RESULT_ROWS: usize = 100_000;
+const MAX_JOIN_WORK_BYTES: usize = 16 * 1024 * 1024;
+const MAX_JOIN_RESULT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ColumnRef {
@@ -83,9 +87,42 @@ struct Relation {
 }
 
 #[derive(Clone)]
-struct JoinedRow {
+struct OwnedJoinedRow {
     left: Row,
     right: Option<Row>,
+}
+
+#[derive(Clone, Copy)]
+struct JoinedRow<'a> {
+    left: &'a Row,
+    right: Option<&'a Row>,
+}
+
+impl OwnedJoinedRow {
+    fn as_borrowed(&self) -> JoinedRow<'_> {
+        JoinedRow {
+            left: &self.left,
+            right: self.right.as_ref(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct WorkBudget {
+    retained: usize,
+}
+
+impl WorkBudget {
+    fn retain(&mut self, bytes: usize) -> Result<()> {
+        let retained = checked_add(self.retained, bytes)?;
+        ensure_work_budget(retained)?;
+        self.retained = retained;
+        Ok(())
+    }
+
+    fn ensure_transient(&self, bytes: usize) -> Result<()> {
+        ensure_work_budget(checked_add(self.retained, bytes)?)
+    }
 }
 
 pub(crate) fn is_join_select(tokens: &[Token]) -> bool {
@@ -116,6 +153,9 @@ pub(crate) fn execute<S: StorageReader>(storage: &S, plan: &JoinPlan) -> Result<
     };
     validate_plan(plan, &left, &right)?;
 
+    // LIMIT 0 remains a validation-only operation, matching the other SELECT
+    // executors. Every join that can inspect a pair is preflighted below before
+    // either table is visited.
     if plan.limit == Some(0) {
         return Ok(QueryResult {
             revision: storage.revision(),
@@ -123,9 +163,14 @@ pub(crate) fn execute<S: StorageReader>(storage: &S, plan: &JoinPlan) -> Result<
         });
     }
 
-    let left_rows = storage.scan_table(&left.source.table)?;
-    let right_rows = storage.scan_table(&right.source.table)?;
-    if left_rows.len().saturating_mul(right_rows.len()) > MAX_JOIN_PAIRS {
+    let left_count = storage.table_row_count(&left.source.table)?;
+    let right_count = storage.table_row_count(&right.source.table)?;
+    let scan_rows = left_count.saturating_add(right_count);
+    if scan_rows > MAX_SCAN_ROWS {
+        return Err(scan_limit_error());
+    }
+    let pair_count = left_count.saturating_mul(right_count);
+    if pair_count > MAX_JOIN_PAIRS {
         return Err(EngineError::invalid_query(format!(
             "A join cannot examine more than {MAX_JOIN_PAIRS} candidate pairs"
         )));
@@ -136,65 +181,213 @@ pub(crate) fn execute<S: StorageReader>(storage: &S, plan: &JoinPlan) -> Result<
         .iter()
         .map(|condition| resolved_condition(condition, &left, &right))
         .collect::<Result<Vec<_>>>()?;
-    let mut rows = Vec::new();
-    for left_row in left_rows {
-        let mut matched = false;
-        for right_row in &right_rows {
-            if conditions
-                .iter()
-                .all(|condition| condition_matches(condition, &left_row, right_row))
-            {
-                matched = true;
-                rows.push(JoinedRow {
-                    left: left_row.clone(),
-                    right: Some(right_row.clone()),
-                });
-                if rows.len() > MAX_RESULT_ROWS {
-                    return Err(EngineError::invalid_query(format!(
-                        "A join cannot materialize more than {MAX_RESULT_ROWS} rows"
-                    )));
-                }
-            }
-        }
-        if !matched && plan.kind == JoinKind::Left {
-            rows.push(JoinedRow {
-                left: left_row,
-                right: None,
-            });
-            if rows.len() > MAX_RESULT_ROWS {
-                return Err(EngineError::invalid_query(format!(
-                    "A join cannot materialize more than {MAX_RESULT_ROWS} rows"
-                )));
-            }
-        }
-    }
-
-    if let Some(predicate) = &plan.predicate {
-        let mut filtered = Vec::with_capacity(rows.len());
-        for row in rows {
-            let flattened = flattened_row(&row, &left, &right);
-            if matches_predicate(&flattened, Some(predicate), "joined row")? {
-                filtered.push(row);
-            }
-        }
-        rows = filtered;
-    }
-
-    if !plan.order_by.is_empty() {
-        rows.sort_by(|first, second| compare_joined_rows(first, second, plan, &left, &right));
-    }
-
-    let rows = rows
-        .into_iter()
-        .skip(plan.offset)
-        .take(plan.limit.unwrap_or(usize::MAX))
-        .map(|row| project_joined_row(&row, plan, &left, &right))
-        .collect::<Result<Vec<_>>>()?;
+    let rows = if plan.order_by.is_empty() {
+        execute_unordered(storage, plan, &left, &right, &conditions, right_count)?
+    } else {
+        execute_ordered(storage, plan, &left, &right, &conditions, right_count)?
+    };
 
     Ok(QueryResult {
         revision: storage.revision(),
         rows,
     })
+}
+
+fn execute_unordered<S: StorageReader>(
+    storage: &S,
+    plan: &JoinPlan,
+    left: &Relation,
+    right: &Relation,
+    conditions: &[ResolvedCondition],
+    right_count: usize,
+) -> Result<Vec<Row>> {
+    let mut rows = Vec::new();
+    let mut skipped = 0_usize;
+    let mut result_bytes = 0_usize;
+    visit_joined_rows(
+        storage,
+        plan.kind,
+        left,
+        right,
+        conditions,
+        right_count,
+        &mut |joined, budget| {
+            if !matches_joined_predicate(joined, plan, left, right, budget)? {
+                return Ok(VisitControl::Continue);
+            }
+            if skipped < plan.offset {
+                skipped += 1;
+                return Ok(VisitControl::Continue);
+            }
+            if rows.len() == MAX_RESULT_ROWS {
+                return Err(result_rows_limit_error());
+            }
+            let projected_bytes = projected_row_bytes(joined, plan, left, right)?;
+            let next_result_bytes = checked_add(result_bytes, projected_bytes)?;
+            ensure_result_budget(next_result_bytes)?;
+            rows.push(project_joined_row(joined, plan, left, right)?);
+            result_bytes = next_result_bytes;
+            if plan.limit.is_some_and(|limit| rows.len() == limit) {
+                Ok(VisitControl::Stop)
+            } else {
+                Ok(VisitControl::Continue)
+            }
+        },
+    )?;
+    Ok(rows)
+}
+
+fn execute_ordered<S: StorageReader>(
+    storage: &S,
+    plan: &JoinPlan,
+    left: &Relation,
+    right: &Relation,
+    conditions: &[ResolvedCondition],
+    right_count: usize,
+) -> Result<Vec<Row>> {
+    let mut joined_rows = Vec::new();
+    visit_joined_rows(
+        storage,
+        plan.kind,
+        left,
+        right,
+        conditions,
+        right_count,
+        &mut |joined, budget| {
+            if !matches_joined_predicate(joined, plan, left, right, budget)? {
+                return Ok(VisitControl::Continue);
+            }
+            if joined_rows.len() == MAX_RESULT_ROWS {
+                return Err(result_rows_limit_error());
+            }
+            budget.retain(joined_row_bytes(joined)?)?;
+            joined_rows.push(OwnedJoinedRow {
+                left: joined.left.clone(),
+                right: joined.right.cloned(),
+            });
+            Ok(VisitControl::Continue)
+        },
+    )?;
+
+    joined_rows.sort_by(|first, second| {
+        compare_joined_rows(first.as_borrowed(), second.as_borrowed(), plan, left, right)
+    });
+
+    let mut rows = Vec::new();
+    let mut result_bytes = 0_usize;
+    for joined in joined_rows
+        .iter()
+        .skip(plan.offset)
+        .take(plan.limit.unwrap_or(usize::MAX))
+    {
+        let joined = joined.as_borrowed();
+        let projected_bytes = projected_row_bytes(joined, plan, left, right)?;
+        let next_result_bytes = checked_add(result_bytes, projected_bytes)?;
+        ensure_result_budget(next_result_bytes)?;
+        rows.push(project_joined_row(joined, plan, left, right)?);
+        result_bytes = next_result_bytes;
+    }
+    Ok(rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn visit_joined_rows<S: StorageReader>(
+    storage: &S,
+    kind: JoinKind,
+    left: &Relation,
+    right: &Relation,
+    conditions: &[ResolvedCondition],
+    right_count: usize,
+    visitor: &mut impl for<'a> FnMut(JoinedRow<'a>, &mut WorkBudget) -> Result<VisitControl>,
+) -> Result<()> {
+    if right_count > MAX_JOIN_BUILD_ROWS {
+        return Err(EngineError::new(
+            "QUERY_WORK_LIMIT_EXCEEDED",
+            format!("A join cannot retain more than {MAX_JOIN_BUILD_ROWS} rows on its build side"),
+        ));
+    }
+
+    let mut budget = WorkBudget::default();
+    let mut scanned = 0_usize;
+    let mut build_rows = Vec::new();
+    let build_outcome = storage.visit_table(&right.source.table, &mut |row| {
+        count_scanned_row(&mut scanned)?;
+        if build_rows.len() == MAX_JOIN_BUILD_ROWS {
+            return Err(EngineError::new(
+                "QUERY_WORK_LIMIT_EXCEEDED",
+                format!(
+                    "A join cannot retain more than {MAX_JOIN_BUILD_ROWS} rows on its build side"
+                ),
+            ));
+        }
+        budget.retain(owned_row_bytes(row)?)?;
+        build_rows.push(row.clone());
+        Ok(VisitControl::Continue)
+    })?;
+    if build_outcome != VisitOutcome::Complete {
+        return Err(malformed_reader_error(
+            "The right-side table visitor stopped before completing the join build",
+        ));
+    }
+
+    let mut pairs = 0_usize;
+    let mut stop_requested = false;
+    let probe_outcome = storage.visit_table(&left.source.table, &mut |probe| {
+        if stop_requested {
+            return Ok(VisitControl::Stop);
+        }
+        count_scanned_row(&mut scanned)?;
+        let mut matched = false;
+        for build in &build_rows {
+            count_join_pair(&mut pairs)?;
+            let joined = JoinedRow {
+                left: probe,
+                right: Some(build),
+            };
+            if conditions_match(conditions, probe, build)? {
+                matched = true;
+                if visitor(joined, &mut budget)? == VisitControl::Stop {
+                    stop_requested = true;
+                    return Ok(VisitControl::Stop);
+                }
+            }
+        }
+        if kind == JoinKind::Left && !matched {
+            let joined = JoinedRow {
+                left: probe,
+                right: None,
+            };
+            if visitor(joined, &mut budget)? == VisitControl::Stop {
+                stop_requested = true;
+                return Ok(VisitControl::Stop);
+            }
+        }
+        Ok(VisitControl::Continue)
+    })?;
+    match (probe_outcome, stop_requested) {
+        (VisitOutcome::Complete, false) | (VisitOutcome::Stopped, true) => Ok(()),
+        (VisitOutcome::Stopped, false) => Err(malformed_reader_error(
+            "The left-side table visitor stopped without being asked",
+        )),
+        (VisitOutcome::Complete, true) => Err(malformed_reader_error(
+            "The left-side table visitor ignored a stop request",
+        )),
+    }
+}
+
+fn matches_joined_predicate(
+    row: JoinedRow<'_>,
+    plan: &JoinPlan,
+    left: &Relation,
+    right: &Relation,
+    budget: &WorkBudget,
+) -> Result<bool> {
+    let Some(predicate) = &plan.predicate else {
+        return Ok(true);
+    };
+    budget.ensure_transient(flattened_row_bytes(row, left, right)?)?;
+    let flattened = flattened_row(row, left, right);
+    matches_predicate(&flattened, Some(predicate), "joined row")
 }
 
 #[derive(Clone)]
@@ -248,7 +441,16 @@ fn resolved_condition(
     })
 }
 
-fn condition_matches(condition: &ResolvedCondition, left: &Row, right: &Row) -> bool {
+fn conditions_match(conditions: &[ResolvedCondition], left: &Row, right: &Row) -> Result<bool> {
+    for condition in conditions {
+        if !condition_matches(condition, left, right)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn condition_matches(condition: &ResolvedCondition, left: &Row, right: &Row) -> Result<bool> {
     let left_row = if condition.left_from_left {
         left
     } else {
@@ -261,14 +463,14 @@ fn condition_matches(condition: &ResolvedCondition, left: &Row, right: &Row) -> 
     };
     let left_value = left_row
         .get(&condition.left_column)
-        .expect("resolved join column exists");
+        .ok_or_else(|| missing_join_column_error(&condition.left_column))?;
     let right_value = right_row
         .get(&condition.right_column)
-        .expect("resolved join column exists");
+        .ok_or_else(|| missing_join_column_error(&condition.right_column))?;
     if left_value == &Value::Null || right_value == &Value::Null {
-        return false;
+        return Ok(false);
     }
-    values_equal(condition.data_type, left_value, right_value)
+    Ok(values_equal(condition.data_type, left_value, right_value))
 }
 
 fn values_equal(data_type: ColumnType, left: &Value, right: &Value) -> bool {
@@ -465,7 +667,7 @@ fn compatible_join_types(left: ColumnType, right: ColumnType) -> bool {
         )
 }
 
-fn flattened_row(row: &JoinedRow, left: &Relation, right: &Relation) -> Row {
+fn flattened_row(row: JoinedRow<'_>, left: &Relation, right: &Relation) -> Row {
     let mut flattened = Map::new();
     for definition in &left.schema.columns {
         let value = row
@@ -510,7 +712,7 @@ fn flattened_row(row: &JoinedRow, left: &Relation, right: &Relation) -> Row {
 }
 
 fn project_joined_row(
-    row: &JoinedRow,
+    row: JoinedRow<'_>,
     plan: &JoinPlan,
     left: &Relation,
     right: &Relation,
@@ -519,38 +721,34 @@ fn project_joined_row(
     for projection in &plan.projections {
         projected.insert(
             projection.output.clone(),
-            joined_value(row, &projection.source, left, right)?,
+            joined_value(row, &projection.source, left, right)?.clone(),
         );
     }
     Ok(projected)
 }
 
-fn joined_value(
-    row: &JoinedRow,
+fn joined_value<'a>(
+    row: JoinedRow<'a>,
     reference: &ColumnRef,
     left: &Relation,
     right: &Relation,
-) -> Result<Value> {
+) -> Result<&'a Value> {
+    static NULL_VALUE: Value = Value::Null;
     let (from_left, _, _) = resolve_column(reference, left, right)?;
     if from_left {
-        Ok(row
-            .left
-            .get(&reference.column)
-            .cloned()
-            .unwrap_or(Value::Null))
+        Ok(row.left.get(&reference.column).unwrap_or(&NULL_VALUE))
     } else {
         Ok(row
             .right
             .as_ref()
             .and_then(|right| right.get(&reference.column))
-            .cloned()
-            .unwrap_or(Value::Null))
+            .unwrap_or(&NULL_VALUE))
     }
 }
 
 fn compare_joined_rows(
-    first: &JoinedRow,
-    second: &JoinedRow,
+    first: JoinedRow<'_>,
+    second: JoinedRow<'_>,
     plan: &JoinPlan,
     left: &Relation,
     right: &Relation,
@@ -575,7 +773,7 @@ fn compare_joined_rows(
                 )
             }
         };
-        let ordering = compare_values(&first_value, &second_value, order);
+        let ordering = compare_values(first_value, second_value, order);
         if ordering != Ordering::Equal {
             return ordering;
         }
@@ -618,6 +816,179 @@ fn compare_values(left: &Value, right: &Value, order: &JoinOrder) -> Ordering {
     } else {
         ordering
     }
+}
+
+fn projected_row_bytes(
+    row: JoinedRow<'_>,
+    plan: &JoinPlan,
+    left: &Relation,
+    right: &Relation,
+) -> Result<usize> {
+    let mut bytes = 32_usize;
+    for projection in &plan.projections {
+        bytes = checked_add(bytes, 64)?;
+        bytes = checked_add(bytes, checked_mul(projection.output.len(), 2)?)?;
+        bytes = checked_add(
+            bytes,
+            checked_mul(
+                owned_value_bytes(joined_value(row, &projection.source, left, right)?)?,
+                2,
+            )?,
+        )?;
+    }
+    Ok(bytes)
+}
+
+fn joined_row_bytes(row: JoinedRow<'_>) -> Result<usize> {
+    let mut bytes = checked_add(64, owned_row_bytes(row.left)?)?;
+    if let Some(right) = row.right {
+        bytes = checked_add(bytes, owned_row_bytes(right)?)?;
+    }
+    Ok(bytes)
+}
+
+fn flattened_row_bytes(row: JoinedRow<'_>, left: &Relation, right: &Relation) -> Result<usize> {
+    let mut bytes = 32_usize;
+    for definition in &left.schema.columns {
+        bytes = checked_add(bytes, 128)?;
+        bytes = checked_add(
+            bytes,
+            checked_mul(left.source.alias.len() + 1 + definition.name.len(), 2)?,
+        )?;
+        bytes = checked_add(bytes, checked_mul(definition.name.len(), 2)?)?;
+        bytes = checked_add(
+            bytes,
+            checked_mul(
+                owned_value_bytes(row.left.get(&definition.name).unwrap_or(&Value::Null))?,
+                4,
+            )?,
+        )?;
+    }
+    for definition in &right.schema.columns {
+        bytes = checked_add(bytes, 128)?;
+        bytes = checked_add(
+            bytes,
+            checked_mul(right.source.alias.len() + 1 + definition.name.len(), 2)?,
+        )?;
+        bytes = checked_add(bytes, checked_mul(definition.name.len(), 2)?)?;
+        let value = row
+            .right
+            .and_then(|right| right.get(&definition.name))
+            .unwrap_or(&Value::Null);
+        bytes = checked_add(bytes, checked_mul(owned_value_bytes(value)?, 4)?)?;
+    }
+    Ok(bytes)
+}
+
+fn owned_row_bytes(row: &Row) -> Result<usize> {
+    let mut bytes = 32_usize;
+    for (key, value) in row {
+        bytes = checked_add(bytes, 64)?;
+        bytes = checked_add(bytes, checked_mul(key.len(), 2)?)?;
+        bytes = checked_add(bytes, checked_mul(owned_value_bytes(value)?, 2)?)?;
+    }
+    Ok(bytes)
+}
+
+fn owned_value_bytes(value: &Value) -> Result<usize> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(16),
+        Value::String(value) => checked_add(24, value.len()),
+        Value::Array(values) => {
+            let mut bytes = 32_usize;
+            for value in values {
+                bytes = checked_add(bytes, 32)?;
+                bytes = checked_add(bytes, owned_value_bytes(value)?)?;
+            }
+            Ok(bytes)
+        }
+        Value::Object(values) => {
+            let mut bytes = 32_usize;
+            for (key, value) in values {
+                bytes = checked_add(bytes, 64)?;
+                bytes = checked_add(bytes, checked_mul(key.len(), 2)?)?;
+                bytes = checked_add(bytes, owned_value_bytes(value)?)?;
+            }
+            Ok(bytes)
+        }
+    }
+}
+
+fn count_scanned_row(scanned: &mut usize) -> Result<()> {
+    *scanned = scanned.saturating_add(1);
+    if *scanned > MAX_SCAN_ROWS {
+        Err(scan_limit_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn count_join_pair(pairs: &mut usize) -> Result<()> {
+    *pairs = pairs.saturating_add(1);
+    if *pairs > MAX_JOIN_PAIRS {
+        Err(EngineError::invalid_query(format!(
+            "A join cannot examine more than {MAX_JOIN_PAIRS} candidate pairs"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_work_budget(bytes: usize) -> Result<()> {
+    if bytes > MAX_JOIN_WORK_BYTES {
+        Err(work_limit_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_result_budget(bytes: usize) -> Result<()> {
+    if bytes > MAX_JOIN_RESULT_BYTES {
+        Err(EngineError::new(
+            "QUERY_WORK_LIMIT_EXCEEDED",
+            format!("A join cannot materialize more than {MAX_JOIN_RESULT_BYTES} bytes of results"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn checked_add(left: usize, right: usize) -> Result<usize> {
+    left.checked_add(right).ok_or_else(work_limit_error)
+}
+
+fn checked_mul(left: usize, right: usize) -> Result<usize> {
+    left.checked_mul(right).ok_or_else(work_limit_error)
+}
+
+fn work_limit_error() -> EngineError {
+    EngineError::new(
+        "QUERY_WORK_LIMIT_EXCEEDED",
+        format!("A join cannot retain more than {MAX_JOIN_WORK_BYTES} bytes of working state"),
+    )
+}
+
+fn scan_limit_error() -> EngineError {
+    EngineError::new(
+        "QUERY_WORK_LIMIT_EXCEEDED",
+        format!("A join cannot scan more than {MAX_SCAN_ROWS} rows"),
+    )
+}
+
+fn result_rows_limit_error() -> EngineError {
+    EngineError::invalid_query(format!(
+        "A join cannot materialize more than {MAX_RESULT_ROWS} rows"
+    ))
+}
+
+fn malformed_reader_error(message: impl Into<String>) -> EngineError {
+    EngineError::new("STORAGE_CORRUPT", message)
+}
+
+fn missing_join_column_error(column: &str) -> EngineError {
+    malformed_reader_error(format!(
+        "A joined storage row is missing resolved ON column `{column}`"
+    ))
 }
 
 fn parse_column_ref_text(value: &str) -> ColumnRef {
@@ -983,7 +1354,83 @@ impl<'a> Parser<'a> {
 mod tests {
     use serde_json::{Value, json};
 
-    use crate::{Engine, Row, TableSchema};
+    use crate::{
+        Engine, InMemoryStorage, IndexDefinition, Result, Row, StorageReader, TableSchema,
+        VisitControl, VisitOutcome,
+    };
+
+    #[derive(Clone, Copy)]
+    enum ReaderFault {
+        None,
+        StopRight,
+        OmitLeftJoinKey,
+    }
+
+    struct AdversarialStorage {
+        inner: InMemoryStorage,
+        fault: ReaderFault,
+    }
+
+    impl StorageReader for AdversarialStorage {
+        fn visit_table(
+            &self,
+            table: &str,
+            visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+        ) -> Result<VisitOutcome> {
+            if matches!(self.fault, ReaderFault::StopRight) && table == "right_items" {
+                return Ok(VisitOutcome::Stopped);
+            }
+            if matches!(self.fault, ReaderFault::OmitLeftJoinKey) && table == "left_items" {
+                return self.inner.visit_table(table, &mut |row| {
+                    let mut malformed = row.clone();
+                    malformed.remove("k1");
+                    visitor(&malformed)
+                });
+            }
+            self.inner.visit_table(table, visitor)
+        }
+
+        fn table_row_count(&self, table: &str) -> Result<usize> {
+            self.inner.table_schema(table)?;
+            // Deliberately stale low hint: execution must use it only for
+            // preflight, never as proof that a relation is empty.
+            Ok(0)
+        }
+
+        fn scan_table(&self, _table: &str) -> Result<Vec<Row>> {
+            panic!("join execution must use visit_table")
+        }
+
+        fn lookup_primary_key(&self, table: &str, key: &Row) -> Result<Option<Row>> {
+            self.inner.lookup_primary_key(table, key)
+        }
+
+        fn index_definition(&self, name: &str) -> Option<IndexDefinition> {
+            self.inner.index_definition(name)
+        }
+
+        fn indexes_for_table(&self, table: &str) -> Result<Vec<IndexDefinition>> {
+            self.inner.indexes_for_table(table)
+        }
+
+        fn visit_index(
+            &self,
+            table: &str,
+            columns: &[String],
+            key: &Row,
+            visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+        ) -> Result<Option<VisitOutcome>> {
+            self.inner.visit_index(table, columns, key, visitor)
+        }
+
+        fn table_schema(&self, table: &str) -> Result<TableSchema> {
+            self.inner.table_schema(table)
+        }
+
+        fn revision(&self) -> u64 {
+            self.inner.revision()
+        }
+    }
 
     fn row(value: Value) -> Row {
         value
@@ -1054,6 +1501,117 @@ mod tests {
                 row(json!({"left_id": 5, "right_id": 106})),
             ]
         );
+    }
+
+    #[test]
+    fn streams_with_visitors_and_stops_the_probe_after_an_unordered_limit() {
+        let storage = database().into_storage();
+        let before = storage.visitor_counts();
+        let plan = super::parse_sql(
+            "SELECT l.id AS left_id, r.rid AS right_id \
+             FROM left_items l LEFT JOIN right_items r ON l.k1 = r.k1 LIMIT 1",
+            &[],
+        )
+        .unwrap();
+
+        let result = super::execute(&storage, &plan).unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![row(json!({"left_id": 1, "right_id": 101}))]
+        );
+        let after = storage.visitor_counts();
+        // LEFT JOIN retains the seven right rows, then stops the streamed left
+        // side after its first row produces the requested result.
+        assert_eq!(after.0 - before.0, 8);
+        assert_eq!(after.1, before.1);
+    }
+
+    #[test]
+    fn inner_join_preserves_left_major_streaming_without_collectors() {
+        let storage = database().into_storage();
+        let before = storage.visitor_counts();
+        let plan = super::parse_sql(
+            "SELECT l.id AS left_id, r.rid AS right_id \
+             FROM left_items l JOIN right_items r ON l.k1 = r.k1 LIMIT 1",
+            &[],
+        )
+        .unwrap();
+
+        let result = super::execute(&storage, &plan).unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![row(json!({"left_id": 1, "right_id": 101}))]
+        );
+        let after = storage.visitor_counts();
+        // The seven-row right side is retained and the left-side visitor stops
+        // on its first row. In particular, scan_table was never called.
+        assert_eq!(after.0 - before.0, 8);
+        assert_eq!(after.1, before.1);
+    }
+
+    #[test]
+    fn preserves_left_major_order_for_unordered_pagination_and_order_ties() {
+        let engine = database();
+        let expected = vec![
+            row(json!({"left_id": 1, "right_id": 103})),
+            row(json!({"left_id": 2, "right_id": 101})),
+            row(json!({"left_id": 2, "right_id": 102})),
+            row(json!({"left_id": 2, "right_id": 103})),
+        ];
+        assert_eq!(
+            engine
+                .query_sql(
+                    "SELECT l.id AS left_id, r.rid AS right_id \
+                     FROM left_items l JOIN right_items r ON l.k1 = r.k1 \
+                     LIMIT 4 OFFSET 2",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            expected
+        );
+        assert_eq!(
+            engine
+                .query_sql(
+                    "SELECT l.id AS left_id, r.rid AS right_id \
+                     FROM left_items l JOIN right_items r ON l.k1 = r.k1 \
+                     ORDER BY l.k1 LIMIT 4 OFFSET 2",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            expected
+        );
+    }
+
+    #[test]
+    fn stale_count_hints_do_not_skip_rows_and_malformed_visitors_fail_closed() {
+        let plan = super::parse_sql(
+            "SELECT l.id AS left_id, r.rid AS right_id \
+             FROM left_items l JOIN right_items r ON l.k1 = r.k1",
+            &[],
+        )
+        .unwrap();
+        let storage = AdversarialStorage {
+            inner: database().into_storage(),
+            fault: ReaderFault::None,
+        };
+        assert_eq!(super::execute(&storage, &plan).unwrap().rows.len(), 8);
+
+        for (fault, expected_message) in [
+            (ReaderFault::StopRight, "stopped before completing"),
+            (ReaderFault::OmitLeftJoinKey, "missing resolved ON column"),
+        ] {
+            let storage = AdversarialStorage {
+                inner: database().into_storage(),
+                fault,
+            };
+            let error = super::execute(&storage, &plan).unwrap_err();
+            assert_eq!(error.code, "STORAGE_CORRUPT");
+            assert!(error.message.contains(expected_message), "{error:?}");
+        }
     }
 
     #[test]
@@ -1433,16 +1991,94 @@ mod tests {
                 .rows
                 .is_empty()
         );
+        let storage = engine.into_storage();
+        let before = storage.visitor_counts();
+        let plan = super::parse_sql(
+            "SELECT l.id AS left_id FROM many_left l JOIN many_right r \
+             ON l.join_key = r.join_key",
+            &[],
+        )
+        .unwrap();
         assert_eq!(
-            engine
-                .query_sql(
-                    "SELECT l.id AS left_id FROM many_left l JOIN many_right r \
-                     ON l.join_key = r.join_key",
-                    &[],
-                )
-                .unwrap_err()
-                .code,
+            super::execute(&storage, &plan).unwrap_err().code,
             "INVALID_QUERY"
         );
+        assert_eq!(storage.visitor_counts(), before);
+    }
+
+    #[test]
+    fn byte_budgets_are_checked_before_retaining_rows() {
+        let mut budget = super::WorkBudget::default();
+        budget.retain(super::MAX_JOIN_WORK_BYTES).unwrap();
+        assert_eq!(budget.retained, super::MAX_JOIN_WORK_BYTES);
+        assert_eq!(
+            budget.retain(1).unwrap_err().code,
+            "QUERY_WORK_LIMIT_EXCEEDED"
+        );
+        assert_eq!(budget.retained, super::MAX_JOIN_WORK_BYTES);
+
+        super::ensure_result_budget(super::MAX_JOIN_RESULT_BYTES).unwrap();
+        assert_eq!(
+            super::ensure_result_budget(super::MAX_JOIN_RESULT_BYTES + 1)
+                .unwrap_err()
+                .code,
+            "QUERY_WORK_LIMIT_EXCEEDED"
+        );
+    }
+
+    #[test]
+    fn execution_rejects_oversized_build_and_result_rows_before_cloning_them() {
+        fn engine_with_payloads(left_payload: String, right_payload: String) -> Engine {
+            let mut engine = Engine::default();
+            for table in ["budget_left", "budget_right"] {
+                engine
+                    .execute_sql(
+                        &format!(
+                            "CREATE TABLE {table} (\
+                                id INTEGER PRIMARY KEY, join_key INTEGER NOT NULL, \
+                                payload TEXT NOT NULL\
+                            )"
+                        ),
+                        &[],
+                    )
+                    .unwrap();
+            }
+            engine
+                .replace_table(
+                    "budget_left",
+                    vec![row(
+                        json!({"id": 1, "join_key": 1, "payload": left_payload}),
+                    )],
+                )
+                .unwrap();
+            engine
+                .replace_table(
+                    "budget_right",
+                    vec![row(
+                        json!({"id": 2, "join_key": 1, "payload": right_payload}),
+                    )],
+                )
+                .unwrap();
+            engine
+        }
+
+        let oversized = "x".repeat(super::MAX_JOIN_WORK_BYTES / 2);
+        let build_error = engine_with_payloads(String::new(), oversized.clone())
+            .query_sql(
+                "SELECT l.id AS id FROM budget_left l JOIN budget_right r \
+                 ON l.join_key = r.join_key",
+                &[],
+            )
+            .unwrap_err();
+        assert_eq!(build_error.code, "QUERY_WORK_LIMIT_EXCEEDED");
+
+        let result_error = engine_with_payloads(oversized, String::new())
+            .query_sql(
+                "SELECT l.payload AS payload FROM budget_left l LEFT JOIN budget_right r \
+                 ON l.join_key = r.join_key",
+                &[],
+            )
+            .unwrap_err();
+        assert_eq!(result_error.code, "QUERY_WORK_LIMIT_EXCEEDED");
     }
 }
