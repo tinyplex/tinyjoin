@@ -56,7 +56,20 @@ export class OpfsPageDevice implements PageDevice {
 
   constructor(handle: SyncPageAccessHandle) {
     this.#handle = handle;
-    this.#repairTornTail();
+    try {
+      this.#repairTornTail();
+    } catch (error) {
+      // Construction takes ownership of the handle immediately. If validation
+      // or repair fails, close that handle without allowing a cleanup failure
+      // to replace the error that explains why the database could not open.
+      this.#closed = true;
+      try {
+        handle.close();
+      } catch {
+        // The original open error is more actionable and must be preserved.
+      }
+      throw error;
+    }
   }
 
   pageCount(): number {

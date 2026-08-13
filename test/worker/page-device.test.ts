@@ -422,12 +422,14 @@ describe('OPFS page device', () => {
     expect(() => new OpfsPageDevice(oversized)).toThrow(
       expect.objectContaining({code: 'STORAGE_DATABASE_TOO_LARGE'}),
     );
+    expect(oversized.closeCalls).toBe(1);
 
     const invalid = new FakeSyncHandle();
     invalid.size = Number.NaN;
     expect(() => new OpfsPageDevice(invalid)).toThrow(
       expect.objectContaining({code: 'STORAGE_CORRUPT'}),
     );
+    expect(invalid.closeCalls).toBe(1);
   });
 
   it('fails closed when a torn-tail repair cannot be made durable', () => {
@@ -437,6 +439,7 @@ describe('OPFS page device', () => {
     expect(() => new OpfsPageDevice(truncateFailure)).toThrow(
       expect.objectContaining({code: 'STORAGE_COMMIT_OUTCOME_UNKNOWN'}),
     );
+    expect(truncateFailure.closeCalls).toBe(1);
 
     const flushFailure = new FakeSyncHandle();
     flushFailure.size = PAGE_SIZE + 1;
@@ -444,14 +447,27 @@ describe('OPFS page device', () => {
     expect(() => new OpfsPageDevice(flushFailure)).toThrow(
       expect.objectContaining({code: 'STORAGE_COMMIT_OUTCOME_UNKNOWN'}),
     );
+    expect(flushFailure.closeCalls).toBe(1);
   });
 
-  it('maps size and close failures and closes only once', () => {
+  it('maps size and close failures, owns handles, and closes only once', () => {
     const sizeHandle = new FakeSyncHandle();
     sizeHandle.sizeError = new Error('broken metadata');
     expect(() => new OpfsPageDevice(sizeHandle)).toThrow(
       expect.objectContaining({code: 'STORAGE_READ_FAILED', retryable: true}),
     );
+    expect(sizeHandle.closeCalls).toBe(1);
+
+    const failedOpen = new FakeSyncHandle();
+    failedOpen.sizeError = new Error('original size failure');
+    failedOpen.closeError = new Error('cleanup close failure');
+    expect(() => new OpfsPageDevice(failedOpen)).toThrow(
+      expect.objectContaining({
+        code: 'STORAGE_READ_FAILED',
+        message: expect.stringContaining('original size failure'),
+      }),
+    );
+    expect(failedOpen.closeCalls).toBe(1);
 
     const closeHandle = new FakeSyncHandle();
     closeHandle.closeError = new Error('close failed');
