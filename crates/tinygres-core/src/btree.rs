@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use crate::{
-    EngineError, FIRST_DATA_PAGE_ID, MAX_PAGE_COUNT, MAX_PAGE_PAYLOAD_SIZE, Page, PageDevice,
-    PageId, PageType, Pager, PagerWriteTransaction, Result, snapshot::crc32,
+    CandidateId, EngineError, FIRST_DATA_PAGE_ID, MAX_PAGE_COUNT, MAX_PAGE_PAYLOAD_SIZE, Page,
+    PageDevice, PageId, PageType, Pager, PagerWriteTransaction, Result, snapshot::crc32,
 };
 
 pub type TreeId = u64;
@@ -54,6 +54,7 @@ impl Btree {
                 root,
                 &Node::leaf(tree_id, generation, Vec::new()),
             )?;
+            transaction.mark_btree_mutated(tree_id)?;
             Ok(root)
         })();
         if result.is_err() {
@@ -144,7 +145,7 @@ impl Btree {
                 None,
                 None,
             )?;
-            if let Some(split) = inserted.split {
+            let root = if let Some(split) = inserted.split {
                 let level = split
                     .left_level
                     .checked_add(1)
@@ -166,10 +167,12 @@ impl Btree {
                     }],
                 );
                 write_node(transaction, new_root, &root)?;
-                Ok(new_root)
+                new_root
             } else {
-                Ok(inserted.page_id)
-            }
+                inserted.page_id
+            };
+            transaction.mark_btree_mutated(tree_id)?;
+            Ok(root)
         })();
         if result.is_err() {
             transaction.mark_failed();
@@ -205,6 +208,9 @@ impl Btree {
                 None,
                 None,
             )?;
+            if deleted.removed {
+                transaction.mark_btree_mutated(tree_id)?;
+            }
             Ok((deleted.page_id, deleted.removed))
         })();
         if result.is_err() {
@@ -233,24 +239,137 @@ impl Btree {
         tree_id: TreeId,
         lower_bound: &[u8],
     ) -> Result<BtreeCursor> {
-        validate_tree_id(tree_id)?;
-        validate_key(lower_bound)?;
-        let generation = pager.generation();
-        let mut cursor = BtreeCursor {
-            tree_id,
-            root_page_id,
-            generation,
-            path: Vec::new(),
-            leaf_page_id: root_page_id,
-            leaf_index: 0,
-            leaf_generation: generation,
-            leaf_entries: Vec::new(),
-            finished: false,
-            visited_pages: HashSet::new(),
-        };
-        cursor.seek(pager, lower_bound)?;
-        Ok(cursor)
+        open_cursor(pager, root_page_id, tree_id, lower_bound)
     }
+
+    /// Opens a detached cursor over a tree visible to an open pager transaction.
+    ///
+    /// Unlike [`Self::cursor`], this can read both pages shared from the committed generation and
+    /// pages owned by the candidate. This lets a schema operation stream one committed tree while
+    /// it builds another without collecting the source rows. The cursor is tied to the exact
+    /// transaction which opened it and must be advanced with
+    /// [`BtreeCursor::next_in_transaction`].
+    pub fn cursor_in_transaction<D: PageDevice>(
+        transaction: &mut PagerWriteTransaction<'_, D>,
+        root_page_id: PageId,
+        tree_id: TreeId,
+    ) -> Result<BtreeCursor> {
+        Self::cursor_from_in_transaction(transaction, root_page_id, tree_id, &[])
+    }
+
+    /// Opens a transaction cursor at the first key greater than or equal to `lower_bound`.
+    pub fn cursor_from_in_transaction<D: PageDevice>(
+        transaction: &mut PagerWriteTransaction<'_, D>,
+        root_page_id: PageId,
+        tree_id: TreeId,
+        lower_bound: &[u8],
+    ) -> Result<BtreeCursor> {
+        open_cursor(transaction, root_page_id, tree_id, lower_bound)
+    }
+
+    /// Validates and atomically removes every page reachable from `root_page_id`.
+    ///
+    /// Node and overflow pages are all traversed before the candidate allocation bitmap is
+    /// changed, so corruption cannot leave a partially reclaimed tree. The root may belong to the
+    /// committed generation or to the current candidate. On error the transaction is failed and
+    /// must be aborted, matching [`Self::upsert`] and [`Self::delete`].
+    pub fn reclaim<D: PageDevice>(
+        transaction: &mut PagerWriteTransaction<'_, D>,
+        root_page_id: PageId,
+        tree_id: TreeId,
+    ) -> Result<()> {
+        validate_tree_id(tree_id)?;
+        let result = reclaim_tree(transaction, root_page_id, tree_id)
+            .and_then(|()| transaction.mark_btree_mutated(tree_id));
+        if result.is_err() {
+            transaction.mark_failed();
+        }
+        result
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CursorView {
+    Committed {
+        generation: u64,
+    },
+    Candidate {
+        generation: u64,
+        candidate_id: CandidateId,
+        tree_version: u64,
+    },
+}
+
+impl CursorView {
+    fn generation(self) -> u64 {
+        match self {
+            Self::Committed { generation } | Self::Candidate { generation, .. } => generation,
+        }
+    }
+}
+
+trait BtreeReadView {
+    fn read_btree_page(&mut self, id: PageId) -> Result<Page>;
+    fn cursor_view(&self, tree_id: TreeId) -> Result<CursorView>;
+    fn requires_view_generation(&self, _id: PageId) -> bool {
+        false
+    }
+}
+
+impl<D: PageDevice> BtreeReadView for Pager<D> {
+    fn read_btree_page(&mut self, id: PageId) -> Result<Page> {
+        self.read_page(id)
+    }
+
+    fn cursor_view(&self, _tree_id: TreeId) -> Result<CursorView> {
+        Ok(CursorView::Committed {
+            generation: self.generation(),
+        })
+    }
+}
+
+impl<D: PageDevice> BtreeReadView for PagerWriteTransaction<'_, D> {
+    fn read_btree_page(&mut self, id: PageId) -> Result<Page> {
+        self.read_page(id)
+    }
+
+    fn cursor_view(&self, tree_id: TreeId) -> Result<CursorView> {
+        Ok(CursorView::Candidate {
+            generation: self.generation()?,
+            candidate_id: self.candidate_id(),
+            tree_version: self.btree_version(tree_id)?,
+        })
+    }
+
+    fn requires_view_generation(&self, id: PageId) -> bool {
+        self.owns_page(id)
+    }
+}
+
+fn open_cursor(
+    reader: &mut impl BtreeReadView,
+    root_page_id: PageId,
+    tree_id: TreeId,
+    lower_bound: &[u8],
+) -> Result<BtreeCursor> {
+    validate_tree_id(tree_id)?;
+    validate_key(lower_bound)?;
+    let view = reader.cursor_view(tree_id)?;
+    let generation = view.generation();
+    let mut cursor = BtreeCursor {
+        tree_id,
+        root_page_id,
+        view,
+        path: Vec::new(),
+        leaf_page_id: root_page_id,
+        leaf_index: 0,
+        leaf_generation: generation,
+        leaf_entries: Vec::new(),
+        finished: false,
+        visited_pages: HashSet::new(),
+    };
+    cursor.seek(reader, lower_bound)?;
+    Ok(cursor)
 }
 
 /// Resumable forward cursor state which does not hold a pager borrow.
@@ -258,7 +377,7 @@ impl Btree {
 pub struct BtreeCursor {
     tree_id: TreeId,
     root_page_id: PageId,
-    generation: u64,
+    view: CursorView,
     path: Vec<CursorFrame>,
     leaf_page_id: PageId,
     leaf_index: usize,
@@ -278,7 +397,7 @@ impl BtreeCursor {
     }
 
     pub fn generation(&self) -> u64 {
-        self.generation
+        self.view.generation()
     }
 
     /// Returns the next owned key/value pair, or `None` after the final leaf.
@@ -286,32 +405,45 @@ impl BtreeCursor {
         &mut self,
         pager: &mut Pager<D>,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        self.next_from(pager)
+    }
+
+    /// Returns the next pair from a cursor opened by
+    /// [`Btree::cursor_in_transaction`] or [`Btree::cursor_from_in_transaction`].
+    pub fn next_in_transaction<D: PageDevice>(
+        &mut self,
+        transaction: &mut PagerWriteTransaction<'_, D>,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        self.next_from(transaction)
+    }
+
+    fn next_from(&mut self, reader: &mut impl BtreeReadView) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         if self.finished {
             return Ok(None);
         }
-        self.ensure_generation(pager)?;
+        self.ensure_view(reader)?;
 
         loop {
             if let Some(entry) = self.leaf_entries.get(self.leaf_index) {
-                let value = materialize_committed_value(
-                    pager,
+                let value = materialize_value(
+                    reader,
                     self.tree_id,
-                    self.generation,
+                    self.view.generation(),
                     self.leaf_generation,
                     &entry.value,
                 )?;
                 self.leaf_index += 1;
                 return Ok(Some((entry.key.clone(), value)));
             }
-            if !self.advance_leaf(pager)? {
+            if !self.advance_leaf(reader)? {
                 self.finished = true;
                 return Ok(None);
             }
         }
     }
 
-    fn seek<D: PageDevice>(&mut self, pager: &mut Pager<D>, lower_bound: &[u8]) -> Result<()> {
-        self.ensure_generation(pager)?;
+    fn seek(&mut self, reader: &mut impl BtreeReadView, lower_bound: &[u8]) -> Result<()> {
+        self.ensure_view(reader)?;
         self.path.clear();
         self.visited_pages.clear();
         let mut page_id = self.root_page_id;
@@ -325,10 +457,10 @@ impl BtreeCursor {
                 )));
             }
             let node = Node::decode(
-                pager.read_page(page_id)?,
+                reader.read_btree_page(page_id)?,
                 self.tree_id,
-                self.generation,
-                false,
+                self.view.generation(),
+                reader.requires_view_generation(page_id),
             )?;
             validate_expected_level(page_id, node.level, expected_level)?;
             validate_child_generation(page_id, node.generation, parent_generation)?;
@@ -362,13 +494,13 @@ impl BtreeCursor {
         )))
     }
 
-    fn advance_leaf<D: PageDevice>(&mut self, pager: &mut Pager<D>) -> Result<bool> {
+    fn advance_leaf(&mut self, reader: &mut impl BtreeReadView) -> Result<bool> {
         while let Some(mut frame) = self.path.pop() {
             let node = Node::decode(
-                pager.read_page(frame.page_id)?,
+                reader.read_btree_page(frame.page_id)?,
                 self.tree_id,
-                self.generation,
-                false,
+                self.view.generation(),
+                reader.requires_view_generation(frame.page_id),
             )?;
             let NodeKind::Internal(internal) = node.kind else {
                 return Err(invalid_btree(format!(
@@ -389,15 +521,20 @@ impl BtreeCursor {
                 let expected_level = node.level - 1;
                 let parent_generation = node.generation;
                 self.path.push(frame);
-                return self.descend_leftmost(pager, next_child, expected_level, parent_generation);
+                return self.descend_leftmost(
+                    reader,
+                    next_child,
+                    expected_level,
+                    parent_generation,
+                );
             }
         }
         Ok(false)
     }
 
-    fn descend_leftmost<D: PageDevice>(
+    fn descend_leftmost(
         &mut self,
-        pager: &mut Pager<D>,
+        reader: &mut impl BtreeReadView,
         mut page_id: PageId,
         mut expected_level: u8,
         mut parent_generation: u64,
@@ -410,10 +547,10 @@ impl BtreeCursor {
                 )));
             }
             let node = Node::decode(
-                pager.read_page(page_id)?,
+                reader.read_btree_page(page_id)?,
                 self.tree_id,
-                self.generation,
-                false,
+                self.view.generation(),
+                reader.requires_view_generation(page_id),
             )?;
             validate_expected_level(page_id, node.level, Some(expected_level))?;
             validate_child_generation(page_id, node.generation, Some(parent_generation))?;
@@ -445,14 +582,14 @@ impl BtreeCursor {
         )))
     }
 
-    fn ensure_generation<D: PageDevice>(&self, pager: &Pager<D>) -> Result<()> {
-        if pager.generation() != self.generation {
+    fn ensure_view(&self, reader: &impl BtreeReadView) -> Result<()> {
+        let current = reader.cursor_view(self.tree_id)?;
+        if current != self.view {
             return Err(EngineError::new(
                 "CURSOR_INVALIDATED",
                 format!(
-                    "The cursor was opened at page generation {}, but the pager is now at generation {}",
-                    self.generation,
-                    pager.generation()
+                    "The cursor was opened for {:?}, but the current reader is {:?}",
+                    self.view, current
                 ),
             ));
         }
@@ -1538,6 +1675,127 @@ fn materialize_committed_value<D: PageDevice>(
     }
 }
 
+fn materialize_value(
+    reader: &mut impl BtreeReadView,
+    tree_id: TreeId,
+    view_generation: u64,
+    leaf_generation: u64,
+    value: &LeafValue,
+) -> Result<Vec<u8>> {
+    match value {
+        LeafValue::Inline(value) => Ok(value.clone()),
+        LeafValue::Overflow(descriptor) => read_overflow_chain(
+            |page_id| reader.read_btree_page(page_id),
+            tree_id,
+            view_generation,
+            leaf_generation,
+            descriptor,
+        )
+        .map(|(value, _)| value),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PendingReclaimPage {
+    page_id: PageId,
+    depth: usize,
+    expected_level: Option<u8>,
+    parent_generation: Option<u64>,
+}
+
+fn reclaim_tree<D: PageDevice>(
+    transaction: &mut PagerWriteTransaction<'_, D>,
+    root_page_id: PageId,
+    tree_id: TreeId,
+) -> Result<()> {
+    let view_generation = transaction.generation()?;
+    let mut pending = vec![PendingReclaimPage {
+        page_id: root_page_id,
+        depth: 0,
+        expected_level: None,
+        parent_generation: None,
+    }];
+    let mut reachable = HashSet::new();
+    let mut pages = Vec::new();
+
+    while let Some(current) = pending.pop() {
+        if current.depth >= MAX_TREE_DEPTH {
+            return Err(invalid_btree(format!(
+                "Tree {tree_id} exceeds the maximum depth of {MAX_TREE_DEPTH}"
+            )));
+        }
+        if !reachable.insert(current.page_id) {
+            return Err(invalid_btree(format!(
+                "Tree {tree_id} references page {} more than once",
+                current.page_id
+            )));
+        }
+
+        let owned = transaction.owns_page(current.page_id);
+        let node = Node::decode(
+            transaction.read_page(current.page_id)?,
+            tree_id,
+            view_generation,
+            owned,
+        )?;
+        validate_expected_level(current.page_id, node.level, current.expected_level)?;
+        validate_child_generation(current.page_id, node.generation, current.parent_generation)?;
+        pages.push(current.page_id);
+
+        match node.kind {
+            NodeKind::Leaf(entries) => {
+                for entry in entries {
+                    let LeafValue::Overflow(descriptor) = entry.value else {
+                        continue;
+                    };
+                    // Reclamation must validate the complete value, including its end-to-end
+                    // checksum, before changing the candidate allocation bitmap.
+                    let (_, overflow_pages) = read_overflow_chain(
+                        |page_id| transaction.read_page(page_id),
+                        tree_id,
+                        view_generation,
+                        node.generation,
+                        &descriptor,
+                    )?;
+                    for page_id in overflow_pages {
+                        if !reachable.insert(page_id) {
+                            return Err(invalid_btree(format!(
+                                "Tree {tree_id} references page {page_id} more than once"
+                            )));
+                        }
+                        pages.push(page_id);
+                    }
+                }
+            }
+            NodeKind::Internal(internal) => {
+                let expected_level = node.level.checked_sub(1).ok_or_else(|| {
+                    invalid_btree(format!(
+                        "Internal B-tree page {} has no child level",
+                        current.page_id
+                    ))
+                })?;
+                for child_index in (0..=internal.entries.len()).rev() {
+                    pending.push(PendingReclaimPage {
+                        page_id: internal.child(child_index)?,
+                        depth: current.depth + 1,
+                        expected_level: Some(expected_level),
+                        parent_generation: Some(node.generation),
+                    });
+                }
+            }
+        }
+    }
+
+    for page_id in pages {
+        if transaction.owns_page(page_id) {
+            transaction.release_new_page(page_id)?;
+        } else {
+            transaction.free_shared_page(page_id)?;
+        }
+    }
+    Ok(())
+}
+
 fn release_leaf_value<D: PageDevice>(
     transaction: &mut PagerWriteTransaction<'_, D>,
     tree_id: TreeId,
@@ -2610,6 +2868,251 @@ mod tests {
             cursor.next(&mut pager).unwrap_err().code,
             "CURSOR_INVALIDATED"
         );
+    }
+
+    #[test]
+    fn candidate_cursor_streams_shared_and_candidate_trees_during_one_write() {
+        const TARGET_TREE: TreeId = TREE + 1;
+
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let mut source_root = create_tree(&mut pager);
+        {
+            let mut transaction = pager.begin_write().unwrap();
+            for number in 0..20 {
+                source_root = Btree::upsert(
+                    &mut transaction,
+                    source_root,
+                    TREE,
+                    &key(number),
+                    &value(number),
+                )
+                .unwrap();
+            }
+            transaction.commit(2, 2, Some(source_root)).unwrap();
+        }
+
+        let mut transaction = pager.begin_write().unwrap();
+        let mut source = Btree::cursor_in_transaction(&mut transaction, source_root, TREE).unwrap();
+        let mut target_root = Btree::create(&mut transaction, TARGET_TREE).unwrap();
+        let mut copied = 0_u32;
+        while let Some((source_key, source_value)) =
+            source.next_in_transaction(&mut transaction).unwrap()
+        {
+            target_root = Btree::upsert(
+                &mut transaction,
+                target_root,
+                TARGET_TREE,
+                &source_key,
+                &source_value,
+            )
+            .unwrap();
+            copied += 1;
+        }
+        assert_eq!(copied, 20);
+
+        let mut candidate =
+            Btree::cursor_from_in_transaction(&mut transaction, target_root, TARGET_TREE, &key(7))
+                .unwrap();
+        assert_eq!(
+            candidate.next_in_transaction(&mut transaction).unwrap(),
+            Some((key(7), value(7)))
+        );
+        assert_eq!(
+            candidate.next_in_transaction(&mut transaction).unwrap(),
+            Some((key(8), value(8)))
+        );
+        transaction.commit(3, 3, Some(target_root)).unwrap();
+
+        let mut cursor = Btree::cursor(&mut pager, target_root, TARGET_TREE).unwrap();
+        let mut copied = 0;
+        while cursor.next(&mut pager).unwrap().is_some() {
+            copied += 1;
+        }
+        assert_eq!(copied, 20);
+    }
+
+    #[test]
+    fn candidate_cursor_rejects_the_wrong_transaction_and_wrong_generation() {
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let root = create_tree(&mut pager);
+        let mut transaction = pager.begin_write().unwrap();
+        let mut candidate = Btree::cursor_in_transaction(&mut transaction, root, TREE).unwrap();
+        assert_eq!(
+            candidate
+                .next(&mut Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap())
+                .unwrap_err()
+                .code,
+            "CURSOR_INVALIDATED"
+        );
+        transaction.abort();
+
+        let mut other = pager.begin_write().unwrap();
+        assert_eq!(
+            candidate.next_in_transaction(&mut other).unwrap_err().code,
+            "CURSOR_INVALIDATED"
+        );
+        other.abort();
+    }
+
+    #[test]
+    fn candidate_cursor_is_invalidated_only_when_its_tree_changes() {
+        const OTHER_TREE: TreeId = TREE + 1;
+
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let root = create_tree(&mut pager);
+        let mut transaction = pager.begin_write().unwrap();
+        let mut cursor = Btree::cursor_in_transaction(&mut transaction, root, TREE).unwrap();
+        let other_root = Btree::create(&mut transaction, OTHER_TREE).unwrap();
+        let _other_root = Btree::upsert(
+            &mut transaction,
+            other_root,
+            OTHER_TREE,
+            b"unrelated",
+            b"value",
+        )
+        .unwrap();
+        assert_eq!(cursor.next_in_transaction(&mut transaction).unwrap(), None);
+
+        let mut cursor = Btree::cursor_in_transaction(&mut transaction, root, TREE).unwrap();
+        let _next_root = Btree::upsert(&mut transaction, root, TREE, b"changed", b"value").unwrap();
+        assert_eq!(
+            cursor
+                .next_in_transaction(&mut transaction)
+                .unwrap_err()
+                .code,
+            "CURSOR_INVALIDATED"
+        );
+        transaction.abort();
+    }
+
+    #[test]
+    fn reclaim_frees_internal_leaf_and_overflow_pages_and_abort_preserves_them() {
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let mut root = create_tree(&mut pager);
+        let overflow = vec![9; MAX_OVERFLOW_CHUNK_BYTES * 2 + 31];
+        {
+            let mut transaction = pager.begin_write().unwrap();
+            for number in 0..30 {
+                let inline = value(number);
+                let stored_value = if number == 14 {
+                    overflow.as_slice()
+                } else {
+                    inline.as_slice()
+                };
+                root = Btree::upsert(&mut transaction, root, TREE, &key(number), stored_value)
+                    .unwrap();
+            }
+            transaction.commit(2, 2, Some(root)).unwrap();
+        }
+        assert!(
+            Node::decode(
+                pager.read_page(root).unwrap(),
+                TREE,
+                pager.generation(),
+                false,
+            )
+            .unwrap()
+            .level
+                > 0
+        );
+        let live_before = pager.active_metadata().superblock.live_data_page_count;
+
+        let mut aborted = pager.begin_write().unwrap();
+        Btree::reclaim(&mut aborted, root, TREE).unwrap();
+        aborted.abort();
+        assert_eq!(
+            Btree::get(&mut pager, root, TREE, &key(14)).unwrap(),
+            Some(overflow.clone())
+        );
+        assert_eq!(
+            pager.active_metadata().superblock.live_data_page_count,
+            live_before
+        );
+
+        let mut transaction = pager.begin_write().unwrap();
+        Btree::reclaim(&mut transaction, root, TREE).unwrap();
+        transaction.commit(3, 3, None).unwrap();
+        assert_eq!(pager.active_metadata().superblock.live_data_page_count, 0);
+        assert_eq!(
+            pager.read_page(root).unwrap_err().code,
+            "PAGE_NOT_ALLOCATED"
+        );
+
+        let device = pager.into_device();
+        let mut reopened = Pager::open_or_create(device).unwrap();
+        assert_eq!(
+            reopened.active_metadata().superblock.live_data_page_count,
+            0
+        );
+        let mut transaction = reopened.begin_write().unwrap();
+        let reused = Btree::create(&mut transaction, TREE).unwrap();
+        assert!(reused >= FIRST_DATA_PAGE_ID);
+        transaction.abort();
+    }
+
+    #[test]
+    fn reclaim_releases_a_wholly_candidate_tree_without_publication() {
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let live_before = pager.active_metadata().superblock.live_data_page_count;
+        let mut transaction = pager.begin_write().unwrap();
+        let mut root = Btree::create(&mut transaction, TREE).unwrap();
+        root = Btree::upsert(
+            &mut transaction,
+            root,
+            TREE,
+            b"overflow",
+            &vec![1; MAX_OVERFLOW_CHUNK_BYTES + 1],
+        )
+        .unwrap();
+        Btree::reclaim(&mut transaction, root, TREE).unwrap();
+        transaction.commit(1, 1, None).unwrap();
+        assert_eq!(
+            pager.active_metadata().superblock.live_data_page_count,
+            live_before
+        );
+    }
+
+    #[test]
+    fn reclaim_corruption_fails_before_freeing_any_page_and_poison_requires_abort() {
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let mut root = create_tree(&mut pager);
+        root = upsert_and_commit(
+            &mut pager,
+            root,
+            2,
+            b"overflow",
+            &vec![3; MAX_OVERFLOW_CHUNK_BYTES + 19],
+        );
+        let descriptor = overflow_descriptor_from_root(&mut pager, root, b"overflow");
+        let active = pager.active_metadata().clone();
+        let mut device = pager.into_device();
+        let mut overflow = Page::decode(device.page(descriptor.first_page_id).unwrap()).unwrap();
+        overflow.payload[OVERFLOW_HEADER_SIZE] ^= 1;
+        device
+            .write_page(descriptor.first_page_id, &overflow.encode().unwrap())
+            .unwrap();
+        let mut pager = Pager::open_or_create(device).unwrap();
+        let mut transaction = pager.begin_write().unwrap();
+        assert_eq!(
+            Btree::reclaim(&mut transaction, root, TREE)
+                .unwrap_err()
+                .code,
+            "INVALID_OVERFLOW_PAGE"
+        );
+        assert_eq!(
+            transaction.generation().unwrap_err().code,
+            "TRANSACTION_FAILED"
+        );
+        transaction.abort();
+        assert_eq!(
+            pager.active_metadata().allocation_bitmap,
+            active.allocation_bitmap
+        );
+        assert_eq!(
+            pager.active_metadata().superblock.live_data_page_count,
+            active.superblock.live_data_page_count
+        );
+        assert_eq!(pager.read_page(root).unwrap().id, root);
     }
 
     #[test]

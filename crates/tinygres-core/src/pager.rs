@@ -1,6 +1,6 @@
 use std::{
     cell::{RefCell, RefMut},
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     rc::Rc,
 };
 
@@ -132,6 +132,7 @@ impl<D: PageDevice> Pager<D> {
             next_bitmap,
             new_pages: BTreeSet::new(),
             written_pages: BTreeSet::new(),
+            btree_versions: BTreeMap::new(),
             next_allocation_page_id: FIRST_DATA_PAGE_ID,
             failed: false,
             finished: false,
@@ -178,6 +179,7 @@ pub struct PagerWriteTransaction<'a, D: PageDevice> {
     next_bitmap: AllocationBitmap,
     new_pages: BTreeSet<PageId>,
     written_pages: BTreeSet<PageId>,
+    btree_versions: BTreeMap<u64, u64>,
     next_allocation_page_id: PageId,
     failed: bool,
     finished: bool,
@@ -207,6 +209,25 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
     /// Prevents a partially-built higher-level structure from being published.
     pub(crate) fn mark_failed(&mut self) {
         self.failed = true;
+    }
+
+    /// Returns the transaction-local mutation version for one B-tree.
+    ///
+    /// Detached B-tree cursors use this to remain valid while unrelated trees are written, but
+    /// fail closed if their own tree changes within the same candidate generation.
+    pub(crate) fn btree_version(&self, tree_id: u64) -> Result<u64> {
+        self.ensure_open()?;
+        Ok(self.btree_versions.get(&tree_id).copied().unwrap_or(0))
+    }
+
+    /// Advances the transaction-local mutation version for one B-tree.
+    pub(crate) fn mark_btree_mutated(&mut self, tree_id: u64) -> Result<()> {
+        self.ensure_open()?;
+        let version = self.btree_versions.entry(tree_id).or_default();
+        *version = version
+            .checked_add(1)
+            .ok_or_else(|| pager_error("The B-tree mutation version space is exhausted"))?;
+        Ok(())
     }
 
     /// Allocates the next safe page ID, wrapping once to reuse lower free pages.
