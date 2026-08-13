@@ -296,9 +296,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
 
     /// Removes a page shared from the active generation from the candidate root.
     ///
-    /// A newly allocated page cannot be freed in the same transaction because the cache keeps its
-    /// reservation until installation. Callers can simply leave such a page allocated, or abort
-    /// and rebuild the candidate.
+    /// Newly allocated pages must instead be released with [`Self::release_new_page`].
     pub fn free_shared_page(&mut self, id: PageId) -> Result<()> {
         self.ensure_open()?;
         ensure_data_page(id)?;
@@ -311,6 +309,28 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
             return Err(page_not_allocated(id));
         }
         self.next_bitmap.set_allocated(id, false)
+    }
+
+    /// Releases a newly allocated page which is no longer reachable from this candidate.
+    ///
+    /// The caller must remove every candidate reference to the page first. Any bytes already
+    /// written through cache eviction remain an unreachable physical orphan and are safe to reuse.
+    pub fn release_new_page(&mut self, id: PageId) -> Result<()> {
+        self.ensure_open()?;
+        ensure_data_page(id)?;
+        if !self.new_pages.contains(&id) {
+            return Err(pager_error(format!(
+                "Page {id} was not allocated by this write transaction"
+            )));
+        }
+        self.pager
+            .cache
+            .release_candidate_page(self.candidate, id)?;
+        self.next_bitmap.set_allocated(id, false)?;
+        self.new_pages.remove(&id);
+        self.written_pages.remove(&id);
+        self.next_allocation_page_id = self.next_allocation_page_id.min(id);
+        Ok(())
     }
 
     pub fn abort(mut self) {
@@ -785,6 +805,20 @@ mod tests {
         transaction.free_shared_page(root).unwrap();
         transaction.commit(3, 3, Some(disposable)).unwrap();
         assert_eq!(pager.read_page(disposable).unwrap().payload, vec![9]);
+    }
+
+    #[test]
+    fn released_new_page_is_reused_and_does_not_need_initialization() {
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let mut transaction = pager.begin_write().unwrap();
+        let released = transaction.allocate_page().unwrap();
+        transaction.write_new_page(&leaf(released, 1)).unwrap();
+        transaction.release_new_page(released).unwrap();
+        assert!(!transaction.owns_page(released));
+        assert_eq!(transaction.allocate_page().unwrap(), released);
+        transaction.write_new_page(&leaf(released, 2)).unwrap();
+        transaction.commit(1, 1, Some(released)).unwrap();
+        assert_eq!(pager.read_page(released).unwrap().payload, vec![2]);
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]

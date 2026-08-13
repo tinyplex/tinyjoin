@@ -184,6 +184,25 @@ impl<D: PageDevice> PageCache<D> {
         Ok(())
     }
 
+    /// Releases one page reserved by a candidate after its owner has proved that no candidate
+    /// page references it. A previously-evicted write may remain as an unreachable physical
+    /// orphan, but it is removed from the candidate's logical allocation set by the pager.
+    pub fn release_candidate_page(&mut self, candidate: CandidateId, id: PageId) -> Result<()> {
+        self.ensure_reserved_by(candidate, id)?;
+        self.reservations.remove(&id);
+        self.entries
+            .retain(|entry| entry.owner != Owner::Candidate(candidate) || entry.id != id);
+        if !self
+            .reservations
+            .values()
+            .any(|reservation| reservation.candidate == candidate)
+        {
+            self.unflushed_owners.remove(&Owner::Candidate(candidate));
+        }
+        self.rebuild_lookup();
+        Ok(())
+    }
+
     pub fn flush_candidate(&mut self, candidate: CandidateId) -> Result<()> {
         self.flush_owner(Owner::Candidate(candidate))
     }
@@ -547,6 +566,35 @@ mod tests {
             .install_candidate(8, &bitmap_allocating(&active, &[page_id]))
             .unwrap();
         assert_eq!(cache.read_page(page_id).unwrap(), &[8; PAGE_SIZE]);
+    }
+
+    #[test]
+    fn released_candidate_page_loses_its_reservation_and_cached_view() {
+        let active = active_bitmap();
+        let page_id = FIRST_DATA_PAGE_ID;
+        let mut cache = PageCache::with_capacity(
+            MemoryPageDevice::new(FIRST_DATA_PAGE_ID + 1).unwrap(),
+            PAGE_SIZE,
+        )
+        .unwrap();
+        cache.reserve_candidate_page(7, page_id, &active).unwrap();
+        cache
+            .write_candidate_page(7, page_id, &[7; PAGE_SIZE])
+            .unwrap();
+        cache.release_candidate_page(7, page_id).unwrap();
+        assert_eq!(cache.candidate_page_count(7), 0);
+        assert_eq!(
+            cache.read_candidate_page(7, page_id).unwrap_err().code,
+            "PAGE_CACHE_ERROR"
+        );
+        cache.reserve_candidate_page(7, page_id, &active).unwrap();
+        cache
+            .write_candidate_page(7, page_id, &[8; PAGE_SIZE])
+            .unwrap();
+        assert_eq!(
+            cache.read_candidate_page(7, page_id).unwrap(),
+            &[8; PAGE_SIZE]
+        );
     }
 
     #[test]

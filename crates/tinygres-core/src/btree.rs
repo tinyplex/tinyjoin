@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::{
     EngineError, FIRST_DATA_PAGE_ID, MAX_PAGE_COUNT, MAX_PAGE_PAYLOAD_SIZE, Page, PageDevice,
-    PageId, PageType, Pager, PagerWriteTransaction, Result,
+    PageId, PageType, Pager, PagerWriteTransaction, Result, snapshot::crc32,
 };
 
 pub type TreeId = u64;
@@ -10,6 +10,7 @@ pub type TreeId = u64;
 pub const MAX_BTREE_KEY_BYTES: usize = 1_024;
 pub const MAX_BTREE_INLINE_VALUE_BYTES: usize = 1_024;
 pub const MAX_BTREE_INLINE_ENTRY_BYTES: usize = 1_536;
+pub const MAX_BTREE_VALUE_BYTES: usize = 1024 * 1024;
 
 const NODE_MAGIC: &[u8; 4] = b"TGBT";
 const NODE_FORMAT_VERSION: u16 = 1;
@@ -17,15 +18,24 @@ const NODE_FLAGS: u8 = 0;
 const NODE_HEADER_SIZE: usize = 40;
 const SLOT_SIZE: usize = 2;
 const LEAF_CELL_HEADER_SIZE: usize = 8;
+const OVERFLOW_DESCRIPTOR_SIZE: usize = 24;
 const INTERNAL_CELL_HEADER_SIZE: usize = 12;
-const CELL_FLAGS: u16 = 0;
+const INLINE_CELL_FLAGS: u16 = 0;
+const OVERFLOW_CELL_FLAGS: u16 = 1;
 const NO_PAGE_ID: PageId = u64::MAX;
 const MAX_TREE_DEPTH: usize = 64;
 
+const OVERFLOW_MAGIC: &[u8; 4] = b"TGOV";
+const OVERFLOW_FORMAT_VERSION: u16 = 1;
+const OVERFLOW_FLAGS: u16 = 0;
+const OVERFLOW_HEADER_SIZE: usize = 56;
+const MAX_OVERFLOW_CHUNK_BYTES: usize = MAX_PAGE_PAYLOAD_SIZE - OVERFLOW_HEADER_SIZE;
+const MAX_OVERFLOW_PAGE_COUNT: usize = MAX_BTREE_VALUE_BYTES.div_ceil(MAX_OVERFLOW_CHUNK_BYTES);
+
 /// A versioned, lexicographically ordered B-tree stored in pager data pages.
 ///
-/// Keys and values are opaque bytes. SQL-aware sortable encodings and overflow values belong to
-/// the storage layer above this primitive. This first bounded slice stores values inline only.
+/// Keys and values are opaque bytes. SQL-aware sortable encodings belong to the storage layer
+/// above this primitive. Values up to one MiB are stored inline or in validated overflow chains.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Btree;
 
@@ -77,12 +87,20 @@ impl Btree {
             let node = Node::decode(page, tree_id, generation, false)?;
             validate_expected_level(page_id, node.level, expected_level)?;
             validate_child_generation(page_id, node.generation, parent_generation)?;
+            let node_generation = node.generation;
             match node.kind {
                 NodeKind::Leaf(entries) => {
-                    return Ok(entries
-                        .binary_search_by(|entry| entry.key.as_slice().cmp(key))
-                        .ok()
-                        .map(|index| entries[index].value.clone()));
+                    return match entries.binary_search_by(|entry| entry.key.as_slice().cmp(key)) {
+                        Ok(index) => materialize_committed_value(
+                            pager,
+                            tree_id,
+                            generation,
+                            node_generation,
+                            &entries[index].value,
+                        )
+                        .map(Some),
+                        Err(_) => Ok(None),
+                    };
                 }
                 NodeKind::Internal(internal) => {
                     page_id = internal.child_for(key);
@@ -109,7 +127,8 @@ impl Btree {
         value: &[u8],
     ) -> Result<PageId> {
         validate_tree_id(tree_id)?;
-        validate_entry(key, value)?;
+        validate_key(key)?;
+        validate_value(value)?;
         let result = (|| {
             let generation = transaction.generation()?;
             let mut visited = HashSet::new();
@@ -188,6 +207,7 @@ impl Btree {
             path: Vec::new(),
             leaf_page_id: root_page_id,
             leaf_index: 0,
+            leaf_generation: generation,
             leaf_entries: Vec::new(),
             finished: false,
             visited_pages: HashSet::new(),
@@ -206,6 +226,7 @@ pub struct BtreeCursor {
     path: Vec<CursorFrame>,
     leaf_page_id: PageId,
     leaf_index: usize,
+    leaf_generation: u64,
     leaf_entries: Vec<LeafEntry>,
     finished: bool,
     visited_pages: HashSet<PageId>,
@@ -236,8 +257,15 @@ impl BtreeCursor {
 
         loop {
             if let Some(entry) = self.leaf_entries.get(self.leaf_index) {
+                let value = materialize_committed_value(
+                    pager,
+                    self.tree_id,
+                    self.generation,
+                    self.leaf_generation,
+                    &entry.value,
+                )?;
                 self.leaf_index += 1;
-                return Ok(Some((entry.key.clone(), entry.value.clone())));
+                return Ok(Some((entry.key.clone(), value)));
             }
             if !self.advance_leaf(pager)? {
                 self.finished = true;
@@ -273,6 +301,7 @@ impl BtreeCursor {
                     self.leaf_page_id = page_id;
                     self.leaf_index =
                         entries.partition_point(|entry| entry.key.as_slice() < lower_bound);
+                    self.leaf_generation = node.generation;
                     self.leaf_entries = entries;
                     return Ok(());
                 }
@@ -356,6 +385,7 @@ impl BtreeCursor {
                 NodeKind::Leaf(entries) => {
                     self.leaf_page_id = page_id;
                     self.leaf_index = 0;
+                    self.leaf_generation = node.generation;
                     self.leaf_entries = entries;
                     return Ok(true);
                 }
@@ -419,7 +449,247 @@ enum NodeKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LeafEntry {
     key: Vec<u8>,
-    value: Vec<u8>,
+    value: LeafValue,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LeafValue {
+    Inline(Vec<u8>),
+    Overflow(OverflowDescriptor),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OverflowDescriptor {
+    first_page_id: PageId,
+    generation: u64,
+    total_length: u32,
+    checksum: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OverflowPage {
+    tree_id: TreeId,
+    generation: u64,
+    chunk_index: u32,
+    chunk_count: u32,
+    next_page_id: Option<PageId>,
+    total_length: u32,
+    checksum: u32,
+    chunk: Vec<u8>,
+}
+
+impl LeafValue {
+    fn flags(&self) -> u16 {
+        match self {
+            Self::Inline(_) => INLINE_CELL_FLAGS,
+            Self::Overflow(_) => OVERFLOW_CELL_FLAGS,
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        match self {
+            Self::Inline(value) => value.len(),
+            Self::Overflow(_) => OVERFLOW_DESCRIPTOR_SIZE,
+        }
+    }
+
+    fn encode_into(&self, destination: &mut Vec<u8>) {
+        match self {
+            Self::Inline(value) => destination.extend_from_slice(value),
+            Self::Overflow(descriptor) => {
+                destination.extend_from_slice(&descriptor.first_page_id.to_le_bytes());
+                destination.extend_from_slice(&descriptor.generation.to_le_bytes());
+                destination.extend_from_slice(&descriptor.total_length.to_le_bytes());
+                destination.extend_from_slice(&descriptor.checksum.to_le_bytes());
+            }
+        }
+    }
+}
+
+impl OverflowPage {
+    fn encode(&self, page_id: PageId) -> Result<Page> {
+        validate_overflow_page_id(page_id)?;
+        validate_tree_id(self.tree_id)?;
+        if self.generation == 0 {
+            return Err(invalid_overflow("Overflow generation must be positive"));
+        }
+        if self.chunk_count == 0
+            || self.chunk_count as usize > MAX_OVERFLOW_PAGE_COUNT
+            || self.chunk_index >= self.chunk_count
+        {
+            return Err(invalid_overflow(format!(
+                "Overflow chunk index {} is outside chunk count {}",
+                self.chunk_index, self.chunk_count
+            )));
+        }
+        if self.total_length == 0 || self.total_length as usize > MAX_BTREE_VALUE_BYTES {
+            return Err(invalid_overflow(format!(
+                "Overflow total length {} is outside 1..={MAX_BTREE_VALUE_BYTES}",
+                self.total_length
+            )));
+        }
+        let expected_chunk_count = (self.total_length as usize).div_ceil(MAX_OVERFLOW_CHUNK_BYTES);
+        if self.chunk_count as usize != expected_chunk_count {
+            return Err(invalid_overflow(format!(
+                "Overflow chunk count {} does not match total length {}",
+                self.chunk_count, self.total_length
+            )));
+        }
+        let expected_chunk_length = overflow_chunk_length(
+            self.total_length as usize,
+            self.chunk_index as usize,
+            self.chunk_count as usize,
+        )?;
+        if self.chunk.len() != expected_chunk_length {
+            return Err(invalid_overflow(format!(
+                "Overflow chunk {} is {} bytes, not {expected_chunk_length}",
+                self.chunk_index,
+                self.chunk.len()
+            )));
+        }
+        match (self.chunk_index + 1 == self.chunk_count, self.next_page_id) {
+            (true, None) | (false, Some(_)) => {}
+            (true, Some(_)) => {
+                return Err(invalid_overflow("The final overflow chunk has a next page"));
+            }
+            (false, None) => {
+                return Err(invalid_overflow(
+                    "A non-final overflow chunk has no next page",
+                ));
+            }
+        }
+        if let Some(next_page_id) = self.next_page_id {
+            validate_overflow_page_id(next_page_id)?;
+            if next_page_id == page_id {
+                return Err(invalid_overflow(format!(
+                    "Overflow page {page_id} references itself"
+                )));
+            }
+        }
+
+        let mut payload = vec![0; OVERFLOW_HEADER_SIZE + self.chunk.len()];
+        payload[..4].copy_from_slice(OVERFLOW_MAGIC);
+        payload[4..6].copy_from_slice(&OVERFLOW_FORMAT_VERSION.to_le_bytes());
+        payload[6..8].copy_from_slice(&OVERFLOW_FLAGS.to_le_bytes());
+        payload[8..16].copy_from_slice(&self.tree_id.to_le_bytes());
+        payload[16..24].copy_from_slice(&self.generation.to_le_bytes());
+        payload[24..28].copy_from_slice(&self.chunk_index.to_le_bytes());
+        payload[28..32].copy_from_slice(&self.chunk_count.to_le_bytes());
+        payload[32..40].copy_from_slice(&self.next_page_id.unwrap_or(NO_PAGE_ID).to_le_bytes());
+        payload[40..44].copy_from_slice(&self.total_length.to_le_bytes());
+        payload[44..48].copy_from_slice(&self.checksum.to_le_bytes());
+        payload[48..52].copy_from_slice(&(self.chunk.len() as u32).to_le_bytes());
+        payload[OVERFLOW_HEADER_SIZE..].copy_from_slice(&self.chunk);
+        Page::new(page_id, PageType::Overflow, payload)
+    }
+
+    fn decode(
+        page: Page,
+        expected_tree_id: TreeId,
+        descriptor: &OverflowDescriptor,
+        expected_index: u32,
+        expected_count: u32,
+    ) -> Result<Self> {
+        validate_overflow_page_id(page.id)?;
+        if page.page_type != PageType::Overflow {
+            return Err(invalid_overflow(format!(
+                "Overflow chain page {} has type {:?}",
+                page.id, page.page_type
+            )));
+        }
+        if page.payload.len() < OVERFLOW_HEADER_SIZE {
+            return Err(invalid_overflow(format!(
+                "Overflow page {} payload is truncated to {} bytes",
+                page.id,
+                page.payload.len()
+            )));
+        }
+        let bytes = &page.payload;
+        if &bytes[..4] != OVERFLOW_MAGIC {
+            return Err(invalid_overflow(format!(
+                "Overflow page {} magic does not match",
+                page.id
+            )));
+        }
+        let version = read_u16(bytes, 4);
+        if version != OVERFLOW_FORMAT_VERSION {
+            return Err(unsupported_overflow(format!(
+                "Overflow page {} format version {version} is not supported",
+                page.id
+            )));
+        }
+        let flags = read_u16(bytes, 6);
+        if flags != OVERFLOW_FLAGS {
+            return Err(unsupported_overflow(format!(
+                "Overflow page {} flags {flags:#06x} are not supported",
+                page.id
+            )));
+        }
+        let tree_id = read_u64(bytes, 8);
+        let generation = read_u64(bytes, 16);
+        let chunk_index = read_u32(bytes, 24);
+        let chunk_count = read_u32(bytes, 28);
+        let raw_next_page_id = read_u64(bytes, 32);
+        let total_length = read_u32(bytes, 40);
+        let checksum = read_u32(bytes, 44);
+        let chunk_length = read_u32(bytes, 48) as usize;
+        if bytes[52..56].iter().any(|byte| *byte != 0) {
+            return Err(invalid_overflow(format!(
+                "Overflow page {} reserved bytes must be zero",
+                page.id
+            )));
+        }
+        if tree_id != expected_tree_id
+            || generation != descriptor.generation
+            || chunk_index != expected_index
+            || chunk_count != expected_count
+            || total_length != descriptor.total_length
+            || checksum != descriptor.checksum
+        {
+            return Err(invalid_overflow(format!(
+                "Overflow page {} does not match its descriptor or chain position",
+                page.id
+            )));
+        }
+        let expected_chunk_length = overflow_chunk_length(
+            total_length as usize,
+            chunk_index as usize,
+            chunk_count as usize,
+        )?;
+        if chunk_length != expected_chunk_length
+            || OVERFLOW_HEADER_SIZE + chunk_length != bytes.len()
+        {
+            return Err(invalid_overflow(format!(
+                "Overflow page {} chunk length {chunk_length} does not match expected {expected_chunk_length}",
+                page.id
+            )));
+        }
+        let next_page_id = if raw_next_page_id == NO_PAGE_ID {
+            None
+        } else {
+            validate_overflow_page_id(raw_next_page_id)?;
+            Some(raw_next_page_id)
+        };
+        match (chunk_index + 1 == chunk_count, next_page_id) {
+            (true, None) | (false, Some(_)) => {}
+            _ => {
+                return Err(invalid_overflow(format!(
+                    "Overflow page {} has an invalid chain terminator",
+                    page.id
+                )));
+            }
+        }
+        Ok(Self {
+            tree_id,
+            generation,
+            chunk_index,
+            chunk_count,
+            next_page_id,
+            total_length,
+            checksum,
+            chunk: bytes[OVERFLOW_HEADER_SIZE..].to_vec(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -511,7 +781,7 @@ impl Node {
                 if self.level != 0 {
                     return Err(invalid_btree("A leaf node must have level zero"));
                 }
-                validate_sorted_leaf_entries(entries)?;
+                validate_sorted_leaf_entries(entries, self.generation)?;
                 let cells = entries
                     .iter()
                     .map(encode_leaf_cell)
@@ -672,7 +942,7 @@ impl Node {
                 let mut entries = Vec::with_capacity(item_count);
                 for index in 0..item_count {
                     let offset = read_slot(bytes, index, free_start)?;
-                    let (entry, cell_end) = decode_leaf_cell(bytes, offset)?;
+                    let (entry, cell_end) = decode_leaf_cell(bytes, offset, generation)?;
                     validate_packed_cell(
                         page.id,
                         index,
@@ -685,7 +955,7 @@ impl Node {
                     entries.push(entry);
                 }
                 validate_cell_floor(page.id, expected_cell_end, free_end)?;
-                validate_sorted_leaf_entries(&entries).map_err(as_corruption)?;
+                validate_sorted_leaf_entries(&entries, generation).map_err(as_corruption)?;
                 NodeKind::Leaf(entries)
             }
             PageType::BtreeInternal => {
@@ -738,7 +1008,9 @@ impl Node {
     fn encoded_size(&self) -> Result<usize> {
         let cells_size = match &self.kind {
             NodeKind::Leaf(entries) => entries.iter().try_fold(0usize, |size, entry| {
-                size.checked_add(LEAF_CELL_HEADER_SIZE + entry.key.len() + entry.value.len())
+                size.checked_add(
+                    LEAF_CELL_HEADER_SIZE + entry.key.len() + entry.value.encoded_len(),
+                )
             }),
             NodeKind::Internal(internal) => {
                 internal.entries.iter().try_fold(0usize, |size, entry| {
@@ -805,13 +1077,24 @@ fn insert_recursive<D: PageDevice>(
 
     match &mut node.kind {
         NodeKind::Leaf(entries) => {
-            match entries.binary_search_by(|entry| entry.key.as_slice().cmp(key)) {
-                Ok(index) => entries[index].value = value.to_vec(),
+            let location = entries.binary_search_by(|entry| entry.key.as_slice().cmp(key));
+            if let Ok(index) = location {
+                release_leaf_value(
+                    transaction,
+                    tree_id,
+                    generation,
+                    node_generation,
+                    &entries[index].value,
+                )?;
+            }
+            let value = store_leaf_value(transaction, tree_id, generation, key, value)?;
+            match location {
+                Ok(index) => entries[index].value = value,
                 Err(index) => entries.insert(
                     index,
                     LeafEntry {
                         key: key.to_vec(),
-                        value: value.to_vec(),
+                        value,
                     },
                 ),
             }
@@ -999,14 +1282,166 @@ fn write_node<D: PageDevice>(
     transaction.write_new_page(&node.encode(page_id)?)
 }
 
+fn store_leaf_value<D: PageDevice>(
+    transaction: &mut PagerWriteTransaction<'_, D>,
+    tree_id: TreeId,
+    generation: u64,
+    key: &[u8],
+    value: &[u8],
+) -> Result<LeafValue> {
+    if value.len() <= MAX_BTREE_INLINE_VALUE_BYTES
+        && key.len() + value.len() <= MAX_BTREE_INLINE_ENTRY_BYTES
+    {
+        return Ok(LeafValue::Inline(value.to_vec()));
+    }
+
+    let chunk_count = value.len().div_ceil(MAX_OVERFLOW_CHUNK_BYTES);
+    if chunk_count == 0 || chunk_count > MAX_OVERFLOW_PAGE_COUNT {
+        return Err(limit_error(format!(
+            "Overflow value requires {chunk_count} pages, exceeding {MAX_OVERFLOW_PAGE_COUNT}"
+        )));
+    }
+    let mut page_ids = Vec::with_capacity(chunk_count);
+    for _ in 0..chunk_count {
+        page_ids.push(transaction.allocate_page()?);
+    }
+    let checksum = crc32(value);
+    for (index, page_id) in page_ids.iter().copied().enumerate() {
+        let start = index * MAX_OVERFLOW_CHUNK_BYTES;
+        let end = (start + MAX_OVERFLOW_CHUNK_BYTES).min(value.len());
+        let overflow = OverflowPage {
+            tree_id,
+            generation,
+            chunk_index: index as u32,
+            chunk_count: chunk_count as u32,
+            next_page_id: page_ids.get(index + 1).copied(),
+            total_length: value.len() as u32,
+            checksum,
+            chunk: value[start..end].to_vec(),
+        };
+        transaction.write_new_page(&overflow.encode(page_id)?)?;
+    }
+    Ok(LeafValue::Overflow(OverflowDescriptor {
+        first_page_id: page_ids[0],
+        generation,
+        total_length: value.len() as u32,
+        checksum,
+    }))
+}
+
+fn materialize_committed_value<D: PageDevice>(
+    pager: &mut Pager<D>,
+    tree_id: TreeId,
+    view_generation: u64,
+    leaf_generation: u64,
+    value: &LeafValue,
+) -> Result<Vec<u8>> {
+    match value {
+        LeafValue::Inline(value) => Ok(value.clone()),
+        LeafValue::Overflow(descriptor) => read_overflow_chain(
+            |page_id| pager.read_page(page_id),
+            tree_id,
+            view_generation,
+            leaf_generation,
+            descriptor,
+        )
+        .map(|(value, _)| value),
+    }
+}
+
+fn release_leaf_value<D: PageDevice>(
+    transaction: &mut PagerWriteTransaction<'_, D>,
+    tree_id: TreeId,
+    view_generation: u64,
+    leaf_generation: u64,
+    value: &LeafValue,
+) -> Result<()> {
+    let LeafValue::Overflow(descriptor) = value else {
+        return Ok(());
+    };
+    // Validate and materialize the complete chain before changing allocation state. A malformed
+    // descriptor must never cause a partially-reclaimed chain.
+    let (_, pages) = read_overflow_chain(
+        |page_id| transaction.read_page(page_id),
+        tree_id,
+        view_generation,
+        leaf_generation,
+        descriptor,
+    )?;
+    for page_id in pages {
+        if transaction.owns_page(page_id) {
+            transaction.release_new_page(page_id)?;
+        } else {
+            transaction.free_shared_page(page_id)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_overflow_chain(
+    mut read_page: impl FnMut(PageId) -> Result<Page>,
+    tree_id: TreeId,
+    view_generation: u64,
+    leaf_generation: u64,
+    descriptor: &OverflowDescriptor,
+) -> Result<(Vec<u8>, Vec<PageId>)> {
+    validate_overflow_descriptor(descriptor, leaf_generation)?;
+    if descriptor.generation > view_generation {
+        return Err(invalid_overflow(format!(
+            "Overflow generation {} exceeds view generation {view_generation}",
+            descriptor.generation
+        )));
+    }
+    let chunk_count = (descriptor.total_length as usize).div_ceil(MAX_OVERFLOW_CHUNK_BYTES);
+    let mut value = Vec::with_capacity(descriptor.total_length as usize);
+    let mut pages = Vec::with_capacity(chunk_count);
+    let mut visited = HashSet::with_capacity(chunk_count);
+    let mut page_id = descriptor.first_page_id;
+    for index in 0..chunk_count {
+        if !visited.insert(page_id) {
+            return Err(invalid_overflow(format!(
+                "Overflow chain contains a cycle through page {page_id}"
+            )));
+        }
+        let overflow = OverflowPage::decode(
+            read_page(page_id)?,
+            tree_id,
+            descriptor,
+            index as u32,
+            chunk_count as u32,
+        )?;
+        value.extend_from_slice(&overflow.chunk);
+        pages.push(page_id);
+        if index + 1 < chunk_count {
+            page_id = overflow.next_page_id.ok_or_else(|| {
+                invalid_overflow(format!("Overflow chain ended after page {page_id}"))
+            })?;
+        }
+    }
+    if value.len() != descriptor.total_length as usize {
+        return Err(invalid_overflow(format!(
+            "Overflow chain materialized {} bytes, not {}",
+            value.len(),
+            descriptor.total_length
+        )));
+    }
+    if crc32(&value) != descriptor.checksum {
+        return Err(invalid_overflow(
+            "Overflow chain end-to-end checksum does not match",
+        ));
+    }
+    Ok((value, pages))
+}
+
 fn encode_leaf_cell(entry: &LeafEntry) -> Result<Vec<u8>> {
-    validate_entry(&entry.key, &entry.value)?;
-    let mut cell = Vec::with_capacity(LEAF_CELL_HEADER_SIZE + entry.key.len() + entry.value.len());
+    validate_key(&entry.key)?;
+    let mut cell =
+        Vec::with_capacity(LEAF_CELL_HEADER_SIZE + entry.key.len() + entry.value.encoded_len());
     cell.extend_from_slice(&(entry.key.len() as u16).to_le_bytes());
-    cell.extend_from_slice(&CELL_FLAGS.to_le_bytes());
-    cell.extend_from_slice(&(entry.value.len() as u32).to_le_bytes());
+    cell.extend_from_slice(&entry.value.flags().to_le_bytes());
+    cell.extend_from_slice(&(entry.value.encoded_len() as u32).to_le_bytes());
     cell.extend_from_slice(&entry.key);
-    cell.extend_from_slice(&entry.value);
+    entry.value.encode_into(&mut cell);
     Ok(cell)
 }
 
@@ -1014,29 +1449,53 @@ fn encode_internal_cell(entry: &InternalEntry) -> Result<Vec<u8>> {
     validate_key(&entry.key)?;
     let mut cell = Vec::with_capacity(INTERNAL_CELL_HEADER_SIZE + entry.key.len());
     cell.extend_from_slice(&(entry.key.len() as u16).to_le_bytes());
-    cell.extend_from_slice(&CELL_FLAGS.to_le_bytes());
+    cell.extend_from_slice(&INLINE_CELL_FLAGS.to_le_bytes());
     cell.extend_from_slice(&entry.right_child.to_le_bytes());
     cell.extend_from_slice(&entry.key);
     Ok(cell)
 }
 
-fn decode_leaf_cell(bytes: &[u8], offset: usize) -> Result<(LeafEntry, usize)> {
+fn decode_leaf_cell(
+    bytes: &[u8],
+    offset: usize,
+    leaf_generation: u64,
+) -> Result<(LeafEntry, usize)> {
     let header_end = checked_end(offset, LEAF_CELL_HEADER_SIZE, bytes.len())?;
     let key_length = read_u16(bytes, offset) as usize;
     let flags = read_u16(bytes, offset + 2);
-    if flags != CELL_FLAGS {
-        return Err(unsupported_btree(format!(
-            "Leaf cell flags {flags:#06x} are not supported"
-        )));
-    }
     let value_length = read_u32(bytes, offset + 4) as usize;
     let key_end = checked_end(header_end, key_length, bytes.len())?;
     let value_end = checked_end(key_end, value_length, bytes.len())?;
-    validate_decoded_entry(key_length, value_length)?;
+    let value = match flags {
+        INLINE_CELL_FLAGS => {
+            validate_decoded_inline_entry(key_length, value_length)?;
+            LeafValue::Inline(bytes[key_end..value_end].to_vec())
+        }
+        OVERFLOW_CELL_FLAGS => {
+            if value_length != OVERFLOW_DESCRIPTOR_SIZE {
+                return Err(invalid_btree(format!(
+                    "Overflow descriptor is {value_length} bytes, not {OVERFLOW_DESCRIPTOR_SIZE}"
+                )));
+            }
+            let descriptor = OverflowDescriptor {
+                first_page_id: read_u64(bytes, key_end),
+                generation: read_u64(bytes, key_end + 8),
+                total_length: read_u32(bytes, key_end + 16),
+                checksum: read_u32(bytes, key_end + 20),
+            };
+            validate_overflow_descriptor(&descriptor, leaf_generation)?;
+            LeafValue::Overflow(descriptor)
+        }
+        _ => {
+            return Err(unsupported_btree(format!(
+                "Leaf cell flags {flags:#06x} are not supported"
+            )));
+        }
+    };
     Ok((
         LeafEntry {
             key: bytes[header_end..key_end].to_vec(),
-            value: bytes[key_end..value_end].to_vec(),
+            value,
         },
         value_end,
     ))
@@ -1046,7 +1505,7 @@ fn decode_internal_cell(bytes: &[u8], offset: usize) -> Result<(InternalEntry, u
     let header_end = checked_end(offset, INTERNAL_CELL_HEADER_SIZE, bytes.len())?;
     let key_length = read_u16(bytes, offset) as usize;
     let flags = read_u16(bytes, offset + 2);
-    if flags != CELL_FLAGS {
+    if flags != INLINE_CELL_FLAGS {
         return Err(unsupported_btree(format!(
             "Internal cell flags {flags:#06x} are not supported"
         )));
@@ -1113,9 +1572,9 @@ fn checked_end(offset: usize, length: usize, bound: usize) -> Result<usize> {
     Ok(end)
 }
 
-fn validate_sorted_leaf_entries(entries: &[LeafEntry]) -> Result<()> {
+fn validate_sorted_leaf_entries(entries: &[LeafEntry], leaf_generation: u64) -> Result<()> {
     for entry in entries {
-        validate_entry(&entry.key, &entry.value)?;
+        validate_stored_entry(&entry.key, &entry.value, leaf_generation)?;
     }
     validate_strictly_sorted(entries.iter().map(|entry| entry.key.as_slice()))
 }
@@ -1175,24 +1634,95 @@ fn validate_key(key: &[u8]) -> Result<()> {
     }
 }
 
-fn validate_entry(key: &[u8], value: &[u8]) -> Result<()> {
-    validate_key(key)?;
-    if value.len() > MAX_BTREE_INLINE_VALUE_BYTES {
+fn validate_value(value: &[u8]) -> Result<()> {
+    if value.len() > MAX_BTREE_VALUE_BYTES {
         return Err(limit_error(format!(
-            "Inline B-tree value is {} bytes, exceeding {MAX_BTREE_INLINE_VALUE_BYTES}; overflow pages are not implemented yet",
+            "B-tree value is {} bytes, exceeding {MAX_BTREE_VALUE_BYTES}",
             value.len()
-        )));
-    }
-    if key.len() + value.len() > MAX_BTREE_INLINE_ENTRY_BYTES {
-        return Err(limit_error(format!(
-            "Inline B-tree key and value total {} bytes, exceeding {MAX_BTREE_INLINE_ENTRY_BYTES}",
-            key.len() + value.len()
         )));
     }
     Ok(())
 }
 
-fn validate_decoded_entry(key_length: usize, value_length: usize) -> Result<()> {
+fn validate_overflow_descriptor(
+    descriptor: &OverflowDescriptor,
+    leaf_generation: u64,
+) -> Result<()> {
+    validate_overflow_page_id(descriptor.first_page_id)?;
+    if descriptor.generation == 0 || descriptor.generation > leaf_generation {
+        return Err(invalid_overflow(format!(
+            "Overflow generation {} is outside leaf generation {leaf_generation}",
+            descriptor.generation
+        )));
+    }
+    let total_length = descriptor.total_length as usize;
+    if total_length == 0 || total_length > MAX_BTREE_VALUE_BYTES {
+        return Err(invalid_overflow(format!(
+            "Overflow total length {total_length} is outside 1..={MAX_BTREE_VALUE_BYTES}"
+        )));
+    }
+    let chunk_count = total_length.div_ceil(MAX_OVERFLOW_CHUNK_BYTES);
+    if chunk_count == 0 || chunk_count > MAX_OVERFLOW_PAGE_COUNT {
+        return Err(invalid_overflow(format!(
+            "Overflow descriptor requires invalid chunk count {chunk_count}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_overflow_page_id(page_id: PageId) -> Result<()> {
+    if !(FIRST_DATA_PAGE_ID..MAX_PAGE_COUNT).contains(&page_id) {
+        return Err(invalid_overflow(format!(
+            "Overflow page ID {page_id} is outside the data-page range"
+        )));
+    }
+    Ok(())
+}
+
+fn overflow_chunk_length(
+    total_length: usize,
+    chunk_index: usize,
+    chunk_count: usize,
+) -> Result<usize> {
+    if chunk_count == 0 || chunk_index >= chunk_count {
+        return Err(invalid_overflow(format!(
+            "Overflow chunk index {chunk_index} is outside count {chunk_count}"
+        )));
+    }
+    let expected_count = total_length.div_ceil(MAX_OVERFLOW_CHUNK_BYTES);
+    if expected_count != chunk_count {
+        return Err(invalid_overflow(format!(
+            "Overflow total length {total_length} needs {expected_count} chunks, not {chunk_count}"
+        )));
+    }
+    if chunk_index + 1 == chunk_count {
+        Ok(total_length - chunk_index * MAX_OVERFLOW_CHUNK_BYTES)
+    } else {
+        Ok(MAX_OVERFLOW_CHUNK_BYTES)
+    }
+}
+
+fn validate_stored_entry(key: &[u8], value: &LeafValue, leaf_generation: u64) -> Result<()> {
+    validate_key(key)?;
+    match value {
+        LeafValue::Inline(value) => {
+            if value.len() > MAX_BTREE_INLINE_VALUE_BYTES
+                || key.len() + value.len() > MAX_BTREE_INLINE_ENTRY_BYTES
+            {
+                return Err(limit_error(format!(
+                    "Inline B-tree key and value total {} bytes outside supported bounds",
+                    key.len() + value.len()
+                )));
+            }
+        }
+        LeafValue::Overflow(descriptor) => {
+            validate_overflow_descriptor(descriptor, leaf_generation)?
+        }
+    }
+    Ok(())
+}
+
+fn validate_decoded_inline_entry(key_length: usize, value_length: usize) -> Result<()> {
     if key_length > MAX_BTREE_KEY_BYTES
         || value_length > MAX_BTREE_INLINE_VALUE_BYTES
         || key_length.saturating_add(value_length) > MAX_BTREE_INLINE_ENTRY_BYTES
@@ -1285,6 +1815,14 @@ fn limit_error(message: impl Into<String>) -> EngineError {
     EngineError::new("BTREE_LIMIT", message)
 }
 
+fn invalid_overflow(message: impl Into<String>) -> EngineError {
+    EngineError::new("INVALID_OVERFLOW_PAGE", message)
+}
+
+fn unsupported_overflow(message: impl Into<String>) -> EngineError {
+    EngineError::new("UNSUPPORTED_OVERFLOW_PAGE", message)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1311,6 +1849,43 @@ mod tests {
         let root = Btree::create(&mut transaction, TREE).unwrap();
         transaction.commit(1, 1, Some(root)).unwrap();
         root
+    }
+
+    fn upsert_and_commit(
+        pager: &mut Pager<MemoryPageDevice>,
+        root: PageId,
+        revision: u64,
+        key: &[u8],
+        value: &[u8],
+    ) -> PageId {
+        let mut transaction = pager.begin_write().unwrap();
+        let root = Btree::upsert(&mut transaction, root, TREE, key, value).unwrap();
+        transaction.commit(revision, revision, Some(root)).unwrap();
+        root
+    }
+
+    fn overflow_descriptor_from_root(
+        pager: &mut Pager<MemoryPageDevice>,
+        root: PageId,
+        key: &[u8],
+    ) -> OverflowDescriptor {
+        let node = Node::decode(
+            pager.read_page(root).unwrap(),
+            TREE,
+            pager.generation(),
+            false,
+        )
+        .unwrap();
+        let NodeKind::Leaf(entries) = node.kind else {
+            panic!("test expected a leaf root");
+        };
+        let entry = &entries[entries
+            .binary_search_by(|entry| entry.key.as_slice().cmp(key))
+            .unwrap()];
+        let LeafValue::Overflow(descriptor) = &entry.value else {
+            panic!("test expected overflow value");
+        };
+        descriptor.clone()
     }
 
     #[derive(Debug)]
@@ -1342,6 +1917,44 @@ mod tests {
         fn flush(&mut self) -> Result<()> {
             Ok(())
         }
+    }
+
+    fn into_sparse_pager_with_free_pages(
+        pager: Pager<MemoryPageDevice>,
+        free_pages: &[PageId],
+    ) -> Pager<SparseDevice> {
+        let active = pager.active_metadata().clone();
+        let mut memory = pager.into_device();
+        let mut bitmap = active.allocation_bitmap;
+        for id in FIRST_DATA_PAGE_ID..MAX_PAGE_COUNT {
+            bitmap.set_allocated(id, true).unwrap();
+        }
+        for id in free_pages {
+            bitmap.set_allocated(*id, false).unwrap();
+        }
+        let mut superblock = active.superblock;
+        superblock.live_data_page_count =
+            (MAX_PAGE_COUNT - FIRST_DATA_PAGE_ID - free_pages.len() as u64) as u32;
+        for (chunk, page) in bitmap.encode_pages().unwrap().iter().enumerate() {
+            memory
+                .write_page(superblock.bitmap_slot.page_id(chunk), page)
+                .unwrap();
+        }
+        memory
+            .write_page(
+                superblock.slot.page_id(),
+                &superblock.encode_page().unwrap(),
+            )
+            .unwrap();
+
+        let physical_count = memory.page_count();
+        let mut pages = HashMap::new();
+        for id in 0..physical_count {
+            let mut bytes = [0; crate::PAGE_SIZE];
+            memory.read_page(id, &mut bytes).unwrap();
+            pages.insert(id, bytes);
+        }
+        Pager::open_or_create(SparseDevice { pages }).unwrap()
     }
 
     #[test]
@@ -1424,6 +2037,178 @@ mod tests {
             Btree::get(&mut reopened, root, TREE, &key(79)).unwrap(),
             Some(value(79))
         );
+    }
+
+    #[test]
+    fn inline_boundaries_and_one_mib_overflow_round_trip_get_cursor_and_reopen() {
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let mut root = create_tree(&mut pager);
+        let inline = vec![11; MAX_BTREE_INLINE_VALUE_BYTES];
+        let forced_overflow = vec![12; MAX_BTREE_INLINE_VALUE_BYTES + 1];
+        let maximum = (0..MAX_BTREE_VALUE_BYTES)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+
+        {
+            let mut transaction = pager.begin_write().unwrap();
+            root = Btree::upsert(&mut transaction, root, TREE, b"inline", &inline).unwrap();
+            root =
+                Btree::upsert(&mut transaction, root, TREE, b"overflow", &forced_overflow).unwrap();
+            root = Btree::upsert(&mut transaction, root, TREE, b"maximum", &maximum).unwrap();
+            transaction.commit(2, 2, Some(root)).unwrap();
+        }
+
+        assert_eq!(
+            Btree::get(&mut pager, root, TREE, b"inline").unwrap(),
+            Some(inline.clone())
+        );
+        assert_eq!(
+            Btree::get(&mut pager, root, TREE, b"overflow").unwrap(),
+            Some(forced_overflow.clone())
+        );
+        assert_eq!(
+            Btree::get(&mut pager, root, TREE, b"maximum").unwrap(),
+            Some(maximum.clone())
+        );
+        let mut cursor = Btree::cursor(&mut pager, root, TREE).unwrap();
+        let mut seen = std::collections::HashMap::new();
+        while let Some((key, value)) = cursor.next(&mut pager).unwrap() {
+            seen.insert(key, value);
+        }
+        assert_eq!(seen.get(b"inline".as_slice()), Some(&inline));
+        assert_eq!(seen.get(b"overflow".as_slice()), Some(&forced_overflow));
+        assert_eq!(seen.get(b"maximum".as_slice()), Some(&maximum));
+
+        let device = pager.into_device();
+        let mut reopened = Pager::open_or_create(device).unwrap();
+        assert_eq!(
+            Btree::get(&mut reopened, root, TREE, b"maximum").unwrap(),
+            Some(maximum)
+        );
+    }
+
+    #[test]
+    fn combined_inline_entry_boundary_spills_without_rejecting_the_value() {
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let mut root = create_tree(&mut pager);
+        let key = vec![1; MAX_BTREE_KEY_BYTES];
+        let inline = vec![2; MAX_BTREE_INLINE_ENTRY_BYTES - MAX_BTREE_KEY_BYTES];
+        let spilled = vec![3; inline.len() + 1];
+        {
+            let mut transaction = pager.begin_write().unwrap();
+            root = Btree::upsert(&mut transaction, root, TREE, &key, &inline).unwrap();
+            let node = Node::decode(
+                transaction.read_page(root).unwrap(),
+                TREE,
+                transaction.generation().unwrap(),
+                true,
+            )
+            .unwrap();
+            let NodeKind::Leaf(entries) = node.kind else {
+                panic!("test expected leaf");
+            };
+            assert!(matches!(entries[0].value, LeafValue::Inline(_)));
+            root = Btree::upsert(&mut transaction, root, TREE, &key, &spilled).unwrap();
+            let node = Node::decode(
+                transaction.read_page(root).unwrap(),
+                TREE,
+                transaction.generation().unwrap(),
+                true,
+            )
+            .unwrap();
+            let NodeKind::Leaf(entries) = node.kind else {
+                panic!("test expected leaf");
+            };
+            assert!(matches!(entries[0].value, LeafValue::Overflow(_)));
+            transaction.commit(2, 2, Some(root)).unwrap();
+        }
+        assert_eq!(
+            Btree::get(&mut pager, root, TREE, &key).unwrap(),
+            Some(spilled)
+        );
+    }
+
+    #[test]
+    fn overflow_replacements_reclaim_shared_and_candidate_chains() {
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let mut root = create_tree(&mut pager);
+        let large_a = vec![1; MAX_OVERFLOW_CHUNK_BYTES * 3 + 17];
+        let large_b = vec![2; MAX_OVERFLOW_CHUNK_BYTES * 2 + 29];
+        let large_c = vec![3; MAX_OVERFLOW_CHUNK_BYTES + 7];
+
+        root = upsert_and_commit(&mut pager, root, 2, b"value", &large_a);
+        let first_a = overflow_descriptor_from_root(&mut pager, root, b"value").first_page_id;
+        let before_replace = pager.active_metadata().superblock.live_data_page_count;
+        root = upsert_and_commit(&mut pager, root, 3, b"value", b"small");
+        assert_eq!(
+            Btree::get(&mut pager, root, TREE, b"value").unwrap(),
+            Some(b"small".to_vec())
+        );
+        assert_eq!(
+            pager.read_page(first_a).unwrap_err().code,
+            "PAGE_NOT_ALLOCATED"
+        );
+        assert!(pager.active_metadata().superblock.live_data_page_count < before_replace);
+
+        root = upsert_and_commit(&mut pager, root, 4, b"value", &large_b);
+        let first_b = overflow_descriptor_from_root(&mut pager, root, b"value").first_page_id;
+        root = upsert_and_commit(&mut pager, root, 5, b"value", &large_c);
+        assert_eq!(
+            Btree::get(&mut pager, root, TREE, b"value").unwrap(),
+            Some(large_c.clone())
+        );
+        assert_eq!(
+            pager.read_page(first_b).unwrap_err().code,
+            "PAGE_NOT_ALLOCATED"
+        );
+
+        let before_same_transaction = pager.active_metadata().superblock.live_data_page_count;
+        {
+            let mut transaction = pager.begin_write().unwrap();
+            root = Btree::upsert(&mut transaction, root, TREE, b"same-tx", &large_a).unwrap();
+            root = Btree::upsert(&mut transaction, root, TREE, b"same-tx", b"tiny").unwrap();
+            root = Btree::upsert(&mut transaction, root, TREE, b"same-tx", &large_b).unwrap();
+            root = Btree::upsert(&mut transaction, root, TREE, b"same-tx", &large_c).unwrap();
+            transaction.commit(6, 6, Some(root)).unwrap();
+        }
+        assert_eq!(
+            pager.active_metadata().superblock.live_data_page_count,
+            before_same_transaction + large_c.len().div_ceil(MAX_OVERFLOW_CHUNK_BYTES) as u32
+        );
+        assert_eq!(
+            Btree::get(&mut pager, root, TREE, b"same-tx").unwrap(),
+            Some(large_c)
+        );
+    }
+
+    #[test]
+    fn overflow_allocation_failure_poisons_and_can_be_aborted() {
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let root = create_tree(&mut pager);
+        let only_free_page = MAX_PAGE_COUNT - 1;
+        let mut pager = into_sparse_pager_with_free_pages(pager, &[only_free_page]);
+        let mut transaction = pager.begin_write().unwrap();
+        assert_eq!(
+            Btree::upsert(
+                &mut transaction,
+                root,
+                TREE,
+                b"large",
+                &vec![7; MAX_OVERFLOW_CHUNK_BYTES + 1]
+            )
+            .unwrap_err()
+            .code,
+            "DATABASE_FULL"
+        );
+        assert_eq!(
+            transaction.generation().unwrap_err().code,
+            "TRANSACTION_FAILED"
+        );
+        transaction.abort();
+        assert_eq!(Btree::get(&mut pager, root, TREE, b"large").unwrap(), None);
+        let mut retry = pager.begin_write().unwrap();
+        assert_eq!(retry.allocate_page().unwrap(), only_free_page);
+        retry.abort();
     }
 
     #[test]
@@ -1535,19 +2320,7 @@ mod tests {
                 root,
                 TREE,
                 b"k",
-                &vec![0; MAX_BTREE_INLINE_VALUE_BYTES + 1]
-            )
-            .unwrap_err()
-            .code,
-            "BTREE_LIMIT"
-        );
-        assert_eq!(
-            Btree::upsert(
-                &mut transaction,
-                root,
-                TREE,
-                &vec![0; MAX_BTREE_KEY_BYTES],
-                &vec![0; MAX_BTREE_INLINE_ENTRY_BYTES - MAX_BTREE_KEY_BYTES + 1]
+                &vec![0; MAX_BTREE_VALUE_BYTES + 1]
             )
             .unwrap_err()
             .code,
@@ -1562,11 +2335,11 @@ mod tests {
         let entries = vec![
             LeafEntry {
                 key: b"a".to_vec(),
-                value: b"1".to_vec(),
+                value: LeafValue::Inline(b"1".to_vec()),
             },
             LeafEntry {
                 key: b"b".to_vec(),
-                value: b"2".to_vec(),
+                value: LeafValue::Inline(b"2".to_vec()),
             },
         ];
         let page = Node::leaf(TREE, 2, entries.clone())
@@ -1620,7 +2393,7 @@ mod tests {
             2,
             vec![LeafEntry {
                 key: b"a".to_vec(),
-                value: b"b".to_vec(),
+                value: LeafValue::Inline(b"b".to_vec()),
             }],
         )
         .encode(FIRST_DATA_PAGE_ID)
@@ -1628,6 +2401,187 @@ mod tests {
         let mut bytes = page.encode().unwrap();
         bytes[100] ^= 1;
         assert_eq!(Page::decode(&bytes).unwrap_err().code, "INVALID_PAGE");
+    }
+
+    #[test]
+    fn overflow_codec_rejects_cycle_truncation_position_tree_generation_and_checksum() {
+        let value = vec![9; MAX_OVERFLOW_CHUNK_BYTES + 13];
+        let checksum = crc32(&value);
+        let descriptor = OverflowDescriptor {
+            first_page_id: FIRST_DATA_PAGE_ID,
+            generation: 2,
+            total_length: value.len() as u32,
+            checksum,
+        };
+        let first = OverflowPage {
+            tree_id: TREE,
+            generation: 2,
+            chunk_index: 0,
+            chunk_count: 2,
+            next_page_id: Some(FIRST_DATA_PAGE_ID + 1),
+            total_length: value.len() as u32,
+            checksum,
+            chunk: value[..MAX_OVERFLOW_CHUNK_BYTES].to_vec(),
+        };
+        let second = OverflowPage {
+            tree_id: TREE,
+            generation: 2,
+            chunk_index: 1,
+            chunk_count: 2,
+            next_page_id: None,
+            total_length: value.len() as u32,
+            checksum,
+            chunk: value[MAX_OVERFLOW_CHUNK_BYTES..].to_vec(),
+        };
+        let pages = HashMap::from([
+            (
+                FIRST_DATA_PAGE_ID,
+                first.encode(FIRST_DATA_PAGE_ID).unwrap(),
+            ),
+            (
+                FIRST_DATA_PAGE_ID + 1,
+                second.encode(FIRST_DATA_PAGE_ID + 1).unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            read_overflow_chain(
+                |id| Ok(pages.get(&id).unwrap().clone()),
+                TREE,
+                2,
+                2,
+                &descriptor
+            )
+            .unwrap()
+            .0,
+            value
+        );
+
+        let mut bad_checksum = descriptor.clone();
+        bad_checksum.checksum ^= 1;
+        assert_eq!(
+            read_overflow_chain(
+                |id| Ok(pages.get(&id).unwrap().clone()),
+                TREE,
+                2,
+                2,
+                &bad_checksum
+            )
+            .unwrap_err()
+            .code,
+            "INVALID_OVERFLOW_PAGE"
+        );
+
+        let mut cycle_first = first.clone();
+        cycle_first.next_page_id = Some(FIRST_DATA_PAGE_ID);
+        let cycle_page = cycle_first.encode(FIRST_DATA_PAGE_ID).unwrap_err();
+        assert_eq!(cycle_page.code, "INVALID_OVERFLOW_PAGE");
+
+        let mut wrong_tree = first.clone();
+        wrong_tree.tree_id += 1;
+        assert_eq!(
+            OverflowPage::decode(
+                wrong_tree.encode(FIRST_DATA_PAGE_ID).unwrap(),
+                TREE,
+                &descriptor,
+                0,
+                2
+            )
+            .unwrap_err()
+            .code,
+            "INVALID_OVERFLOW_PAGE"
+        );
+        let mut wrong_generation = first.clone();
+        wrong_generation.generation += 1;
+        assert_eq!(
+            OverflowPage::decode(
+                wrong_generation.encode(FIRST_DATA_PAGE_ID).unwrap(),
+                TREE,
+                &descriptor,
+                0,
+                2
+            )
+            .unwrap_err()
+            .code,
+            "INVALID_OVERFLOW_PAGE"
+        );
+        assert_eq!(
+            OverflowPage::decode(
+                second.encode(FIRST_DATA_PAGE_ID + 1).unwrap(),
+                TREE,
+                &descriptor,
+                0,
+                2
+            )
+            .unwrap_err()
+            .code,
+            "INVALID_OVERFLOW_PAGE"
+        );
+        let truncated = Page::new(
+            FIRST_DATA_PAGE_ID,
+            PageType::Overflow,
+            vec![0; OVERFLOW_HEADER_SIZE - 1],
+        )
+        .unwrap();
+        assert_eq!(
+            OverflowPage::decode(truncated, TREE, &descriptor, 0, 2)
+                .unwrap_err()
+                .code,
+            "INVALID_OVERFLOW_PAGE"
+        );
+    }
+
+    #[test]
+    fn get_and_cursor_reject_corrupt_overflow_data_and_cycles_after_reopen() {
+        fn committed_overflow() -> (MemoryPageDevice, PageId, OverflowDescriptor) {
+            let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+            let root = create_tree(&mut pager);
+            let root = upsert_and_commit(
+                &mut pager,
+                root,
+                2,
+                b"large",
+                &vec![5; MAX_OVERFLOW_CHUNK_BYTES * 2 + 1],
+            );
+            let descriptor = overflow_descriptor_from_root(&mut pager, root, b"large");
+            (pager.into_device(), root, descriptor)
+        }
+
+        let (mut device, root, descriptor) = committed_overflow();
+        let mut overflow = Page::decode(device.page(descriptor.first_page_id).unwrap()).unwrap();
+        overflow.payload[OVERFLOW_HEADER_SIZE] ^= 1;
+        device
+            .write_page(descriptor.first_page_id, &overflow.encode().unwrap())
+            .unwrap();
+        let mut pager = Pager::open_or_create(device).unwrap();
+        assert_eq!(
+            Btree::get(&mut pager, root, TREE, b"large")
+                .unwrap_err()
+                .code,
+            "INVALID_OVERFLOW_PAGE"
+        );
+        let mut cursor = Btree::cursor(&mut pager, root, TREE).unwrap();
+        assert_eq!(
+            cursor.next(&mut pager).unwrap_err().code,
+            "INVALID_OVERFLOW_PAGE"
+        );
+        assert_eq!(
+            cursor.next(&mut pager).unwrap_err().code,
+            "INVALID_OVERFLOW_PAGE"
+        );
+
+        let (mut device, root, descriptor) = committed_overflow();
+        let mut overflow = Page::decode(device.page(descriptor.first_page_id).unwrap()).unwrap();
+        overflow.payload[32..40].copy_from_slice(&descriptor.first_page_id.to_le_bytes());
+        device
+            .write_page(descriptor.first_page_id, &overflow.encode().unwrap())
+            .unwrap();
+        let mut pager = Pager::open_or_create(device).unwrap();
+        assert_eq!(
+            Btree::get(&mut pager, root, TREE, b"large")
+                .unwrap_err()
+                .code,
+            "INVALID_OVERFLOW_PAGE"
+        );
     }
 
     #[test]
