@@ -6,6 +6,7 @@ mod error;
 mod join;
 mod model;
 mod page;
+mod pager;
 mod prepared;
 mod query;
 mod snapshot;
@@ -31,5 +32,6 @@ pub use page::{
     RawMetadataSlot, RecoveredMetadata, SUPERBLOCK_PAGE_COUNT, Superblock, SuperblockSlot,
     build_next_metadata, recover_metadata,
 };
+pub use pager::{Pager, PagerWriteTransaction};
 pub use prepared::PreparedCommit;
 pub use storage::{InMemoryStorage, StorageDriver, VisitControl, VisitOutcome};

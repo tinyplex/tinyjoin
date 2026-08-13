@@ -1,5 +1,17 @@
 use crate::{EngineError, MAX_PAGE_COUNT, PAGE_SIZE, PageId, Result};
 
+/// Synchronous durable storage used by the copy-on-write pager.
+///
+/// Implementations must expose a dense sequence of complete 4 KiB pages. A
+/// write may replace an existing page or append exactly `page_count()`; gaps
+/// are rejected. Reads observe successful writes immediately. `flush()` is a
+/// device-wide durability barrier for every successful preceding write.
+///
+/// Callers only overwrite pages which are unreachable from the active
+/// superblock. A failed write may have changed its target page and must report
+/// that uncertainty, but it must not modify any other page. A failed flush may
+/// have made all, some, or none of the preceding writes durable; the pager's
+/// publication state machine determines whether reopening is required.
 pub trait PageDevice {
     fn page_count(&self) -> PageId;
     fn read_page(&mut self, id: PageId, destination: &mut [u8]) -> Result<()>;
