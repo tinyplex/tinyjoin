@@ -79,6 +79,32 @@ function mockEngine() {
         tables: [table],
       };
     }),
+    prepareDefineTables: vi.fn(() => ({result: null, commit: null})),
+    prepareReplaceTableSnapshot: vi.fn((schema) => ({
+      result: outcome(schema.name),
+      commit: null,
+    })),
+    prepareApplyBatch: vi.fn((batch) => ({
+      result: outcome(batch.changes[0]?.table ?? 'none'),
+      commit: null,
+    })),
+    prepareExecuteSql: vi.fn(() => ({
+      result: {
+        command: 'INSERT',
+        revision,
+        rowCount: 0,
+        rows: [],
+        tables: [],
+      },
+      commit: null,
+    })),
+    prepareCommitTransaction: vi.fn(() => ({
+      result: {revision, tables: []},
+      commit: null,
+    })),
+    installPreparedCommit: vi.fn(() => ({revision, tables: []})),
+    abortPreparedCommit: vi.fn(),
+    replayCommit: vi.fn(() => ({revision, tables: []})),
     beginTransaction: vi.fn(() => {
       transactionActive = true;
       transactionTables.clear();

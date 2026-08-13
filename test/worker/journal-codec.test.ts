@@ -35,14 +35,51 @@ describe('journal envelope codec', () => {
     expect(scan.tail).toBe('clean');
     expect(scan.validBytes).toBe(bytes.byteLength);
     expect(
-      scan.records.map(({sequence, payload}) => ({
+      scan.records.map(({sequence, kind, payload}) => ({
         sequence,
+        kind,
         payload: [...payload],
       })),
     ).toEqual([
-      {sequence: 42n, payload: [1, 2, 3]},
-      {sequence: 43n, payload: [4, 5]},
+      {sequence: 42n, kind: 'prepared-commit', payload: [1, 2, 3]},
+      {sequence: 43n, kind: 'prepared-commit', payload: [4, 5]},
     ]);
+  });
+
+  it('distinguishes legacy mutations from opaque prepared commits', () => {
+    const scan = scanJournal(
+      journal(
+        0n,
+        encodeJournalRecord(
+          1n,
+          new TextEncoder().encode('{"version":1}'),
+          'legacy-mutations',
+        ),
+        encodeJournalRecord(2n, new Uint8Array([0x54, 0x47, 0x43, 0x4d])),
+      ),
+    );
+
+    expect(scan.records.map(({sequence, kind}) => ({sequence, kind}))).toEqual([
+      {sequence: 1n, kind: 'legacy-mutations'},
+      {sequence: 2n, kind: 'prepared-commit'},
+    ]);
+  });
+
+  it('rejects a fully framed record with an unknown payload version', () => {
+    const record = encodeJournalRecord(1n, new Uint8Array([1]));
+    const view = new DataView(record.buffer);
+    view.setUint16(4, 3, true);
+    view.setUint32(20, testCrc32(record.subarray(0, 20)), true);
+    const footerOffset = record.byteLength - 8;
+    view.setUint32(
+      footerOffset,
+      testCrc32(record.subarray(0, footerOffset)),
+      true,
+    );
+
+    expect(() => scanJournal(journal(0n, record))).toThrowError(
+      expect.objectContaining({code: 'STORAGE_VERSION_UNSUPPORTED'}),
+    );
   });
 
   it('treats every incomplete final-record prefix as a disposable tail', () => {
@@ -83,10 +120,7 @@ describe('journal envelope codec', () => {
   });
 
   it('rejects a sequence gap instead of replaying ambiguous history', () => {
-    const bytes = journal(
-      7n,
-      encodeJournalRecord(9n, new Uint8Array([1])),
-    );
+    const bytes = journal(7n, encodeJournalRecord(9n, new Uint8Array([1])));
 
     expect(() => scanJournal(bytes)).toThrowError(
       expect.objectContaining({code: 'STORAGE_JOURNAL_CORRUPT'}),
@@ -105,3 +139,14 @@ describe('journal envelope codec', () => {
     }
   });
 });
+
+function testCrc32(bytes: Uint8Array): number {
+  let value = 0xffff_ffff;
+  for (const byte of bytes) {
+    value ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = (value & 1) === 1 ? 0xedb8_8320 ^ (value >>> 1) : value >>> 1;
+    }
+  }
+  return (value ^ 0xffff_ffff) >>> 0;
+}

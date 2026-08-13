@@ -174,6 +174,25 @@ impl InMemoryStorage {
         }
         Ok(indexes)
     }
+
+    pub(crate) fn table_names(&self) -> impl Iterator<Item = &str> {
+        self.tables.keys().map(String::as_str)
+    }
+
+    pub(crate) fn table_rows(&self, table: &str) -> Result<&BTreeMap<String, Row>> {
+        self.tables
+            .get(table)
+            .map(|table| &table.rows)
+            .ok_or_else(|| EngineError::table_not_found(table))
+    }
+
+    pub(crate) fn index_names(&self) -> impl Iterator<Item = &str> {
+        self.indexes.keys().map(String::as_str)
+    }
+
+    pub(crate) fn set_revision(&mut self, revision: u64) {
+        self.revision = revision;
+    }
 }
 
 impl StorageDriver for InMemoryStorage {

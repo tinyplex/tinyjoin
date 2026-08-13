@@ -7,7 +7,8 @@ const JOURNAL_HEADER_BYTES = 28;
 
 const RECORD_MAGIC = new Uint8Array([0x54, 0x47, 0x54, 0x58]);
 const RECORD_COMMIT_MAGIC = new Uint8Array([0x54, 0x47, 0x4f, 0x4b]);
-const RECORD_VERSION = 1;
+const LEGACY_MUTATIONS_RECORD_VERSION = 1;
+const PREPARED_COMMIT_RECORD_VERSION = 2;
 const RECORD_FLAGS = 0;
 const RECORD_HEADER_BYTES = 24;
 const RECORD_FOOTER_BYTES = 8;
@@ -19,8 +20,11 @@ export const MAX_JOURNAL_RECORD_BYTES = 16 * 1024 * 1024;
 
 export interface JournalRecord {
   sequence: bigint;
+  kind: JournalRecordKind;
   payload: Uint8Array;
 }
+
+export type JournalRecordKind = 'legacy-mutations' | 'prepared-commit';
 
 export interface JournalScan {
   baseSequence: bigint;
@@ -55,6 +59,7 @@ export function encodeJournalHeader(baseSequence: bigint): Uint8Array {
 export function encodeJournalRecord(
   sequence: bigint,
   payload: Uint8Array,
+  kind: JournalRecordKind = 'prepared-commit',
 ): Uint8Array {
   assertSequence(sequence);
   if (sequence === 0n) {
@@ -75,7 +80,7 @@ export function encodeJournalRecord(
   );
   encoded.set(RECORD_MAGIC);
   const view = new DataView(encoded.buffer);
-  view.setUint16(4, RECORD_VERSION, true);
+  view.setUint16(4, recordVersion(kind), true);
   view.setUint16(6, RECORD_FLAGS, true);
   view.setBigUint64(8, sequence, true);
   view.setUint32(16, payload.byteLength, true);
@@ -175,7 +180,8 @@ export function scanJournal(bytes: Uint8Array): JournalScan {
     ) {
       throw corruptRecord('record checksum', sequence);
     }
-    if (headerView.getUint16(4, true) !== RECORD_VERSION) {
+    const kind = recordKind(headerView.getUint16(4, true));
+    if (kind === undefined) {
       throw new JournalFormatError(
         'STORAGE_VERSION_UNSUPPORTED',
         `TinyGres journal transaction ${sequence} uses an unsupported format version`,
@@ -190,16 +196,30 @@ export function scanJournal(bytes: Uint8Array): JournalScan {
 
     records.push({
       sequence,
-      payload: bytes.slice(
-        offset + RECORD_HEADER_BYTES,
-        footerOffset,
-      ),
+      kind,
+      payload: bytes.slice(offset + RECORD_HEADER_BYTES, footerOffset),
     });
     expectedSequence = sequence;
     offset += recordBytes;
   }
 
   return {baseSequence, records, validBytes: offset, tail: 'clean'};
+}
+
+function recordVersion(kind: JournalRecordKind): number {
+  return kind === 'legacy-mutations'
+    ? LEGACY_MUTATIONS_RECORD_VERSION
+    : PREPARED_COMMIT_RECORD_VERSION;
+}
+
+function recordKind(version: number): JournalRecordKind | undefined {
+  if (version === LEGACY_MUTATIONS_RECORD_VERSION) {
+    return 'legacy-mutations';
+  }
+  if (version === PREPARED_COMMIT_RECORD_VERSION) {
+    return 'prepared-commit';
+  }
+  return undefined;
 }
 
 function assertSequence(sequence: bigint): void {

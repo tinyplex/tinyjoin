@@ -255,13 +255,20 @@ stronger retention can make an explicit, user-appropriate
 `navigator.storage.persist()` request; TinyGres does not make that policy
 decision during startup.
 
-The journal checkpoints after 128 records or 1 MiB. A small update to the
-10,000-row browser fixture currently appends hundreds of bytes rather than
-rewriting its multi-megabyte checkpoint. This transitional engine still exports
-one in-memory pre-mutation snapshot so it can roll back a failed OPFS flush, and
-caps snapshots and individual journal transactions at 16 MiB. A prepared Rust
-commit seam and paged storage are later milestones for removing that remaining
-whole-database memory cost and raising the data-size ceiling.
+The journal checkpoints after 128 records or 1 MiB. Before a persistent
+mutation, Rust prepares deterministic, checksummed row and catalog deltas while
+the committed database remains visible. The worker flushes those opaque bytes
+and their independent commit marker, then publishes the already-validated
+candidate in memory. A known append failure aborts the candidate; an uncertain
+outcome or a failure after the durable append requires a reopen. Normal journal
+mutations therefore no longer export and import a whole-database snapshot just
+to provide rollback. A one-row update to the 10,000-row browser fixture appends
+hundreds of bytes and is gated below 16 KiB.
+
+Checkpoints and individual prepared commits remain capped at 16 MiB, and the
+current query engine still keeps the complete database in WASM memory. Paged
+storage is the next milestone for raising the database-size ceiling and bounding
+the working set.
 
 ## Supabase adapter
 
@@ -547,11 +554,13 @@ startup and compilation cost.
 
 ## Direction
 
-The immediate direction is prepared commits and paged persistence, removing the
-remaining whole-database in-memory rollback snapshot and the transitional
-16 MiB ceiling. The initial bounded join slice establishes qualified column
-references without making ambiguous row semantics part of the public contract.
-Full PostgreSQL catalogs, extensions, server
+Canonical prepared commits now remove the whole-database rollback copy from
+ordinary durable writes. The immediate direction is a bounded paged persistence
+layer, followed by streamed result cursors and cancellation so database and
+result size are not tied to one WASM allocation or `postMessage`. The initial
+bounded join slice establishes qualified column references without making
+ambiguous row semantics part of the public contract. Full PostgreSQL catalogs,
+extensions, server
 concurrency, and arbitrary wire compatibility are not goals. The existing
 adapter boundary remains available for optional remote read sources and a later
 cursor-aligned gateway without defining the core product around sync.

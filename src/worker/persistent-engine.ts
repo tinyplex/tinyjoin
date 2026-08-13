@@ -8,12 +8,9 @@ import type {
   SqlResult,
   TableSchema,
 } from '../protocol.js';
-import type {WorkerEngine} from './engine.js';
+import type {PreparedMutation, WorkerEngine} from './engine.js';
 import {
   decodeJournalTransaction,
-  encodeJournalTransaction,
-  JOURNAL_TRANSACTION_VERSION,
-  MAX_JOURNAL_SQL_STATEMENTS,
   type JournalMutation,
 } from './journal-payload.js';
 import {
@@ -37,14 +34,17 @@ export function createPersistentEngine(
   store: SnapshotStore,
 ): WorkerEngine {
   const journalStore = isJournalStore(store) ? store : undefined;
-  const restored = restoreNewestValidSnapshot(engine, store);
-  if (journalStore && !restored) {
-    journalStore.checkpoint(engine.exportSnapshot());
+  const recovery = restoreNewestValidSnapshot(engine, store);
+  if (journalStore) {
+    if (!recovery.restored || recovery.replayedLegacyJournal) {
+      // A checkpoint after legacy replay makes all later recovery independent
+      // of historical SQL parser behavior. Alternating slots keep migration
+      // crash-safe: the legacy pair remains valid until this publishes.
+      journalStore.checkpoint(engine.exportSnapshot());
+    }
   }
   let closed = false;
   let poisoned = false;
-  let transactionSnapshot: Uint8Array | undefined;
-  let transactionStatements: {sql: string; params: JsonValue[]}[] | undefined;
 
   const closeResources = (): void => {
     if (closed) {
@@ -101,30 +101,15 @@ export function createPersistentEngine(
     }
   };
 
-  const mutate = <Result>(
-    operation: () => Result,
-    mutations: JournalMutation[],
-  ): Result => {
+  const mutateSnapshot = <Result>(operation: () => Result): Result => {
     assertUsable();
     checkpointIfNeeded();
     const previous = engine.exportSnapshot();
-    const revisionBefore = engine.revision();
     try {
       const result = operation();
       const next = engine.exportSnapshot();
       if (!bytesEqual(previous, next)) {
-        if (journalStore) {
-          journalStore.append(
-            encodeJournalTransaction({
-              version: JOURNAL_TRANSACTION_VERSION,
-              revisionBefore,
-              revisionAfter: engine.revision(),
-              mutations,
-            }),
-          );
-        } else {
-          store.commit(next);
-        }
+        store.commit(next);
       }
       return result;
     } catch (error) {
@@ -144,11 +129,60 @@ export function createPersistentEngine(
     }
   };
 
+  const mutatePrepared = <Result>(
+    prepare: () => PreparedMutation<Result>,
+  ): Result => {
+    assertUsable();
+    checkpointIfNeeded();
+    const prepared = prepare();
+    if (prepared.commit === null) {
+      return prepared.result;
+    }
+    let abortFailed = false;
+
+    try {
+      journalStore!.append(prepared.commit);
+    } catch (error) {
+      try {
+        engine.abortPreparedCommit();
+      } catch {
+        abortFailed = true;
+        poison();
+      }
+      if (errorCode(error) === 'STORAGE_COMMIT_OUTCOME_UNKNOWN') {
+        poison();
+      }
+      if (abortFailed) {
+        throw new StorageError(
+          'STORAGE_ROLLBACK_FAILED',
+          `TinyGres could not discard a prepared mutation after storage rejected it: ${errorMessage(error)}`,
+        );
+      }
+      throw error;
+    }
+
+    try {
+      engine.installPreparedCommit(prepared.commit);
+    } catch (error) {
+      // The append and its independent marker are already durable. Rolling
+      // memory back, retrying, or acknowledging would all be dishonest. A
+      // reopen will replay the exact canonical bytes that reached storage.
+      poison();
+      throw new StorageError(
+        'STORAGE_COMMIT_DURABLE_REOPEN_REQUIRED',
+        `TinyGres durably stored a commit but could not publish it in memory; reopen the database to recover it, and do not retry until its effects have been inspected: ${errorMessage(error)}`,
+      );
+    }
+    return prepared.result;
+  };
+
   return {
     defineTable(schema: TableSchema): void {
-      mutate(() => engine.defineTable(schema), [
-        {type: 'defineTables', schemas: [schema]},
-      ]);
+      if (journalStore) {
+        mutatePrepared(() => engine.prepareDefineTables([schema]));
+      } else {
+        mutateSnapshot(() => engine.defineTable(schema));
+      }
     },
     defineTables(schemas: TableSchema[]): void {
       if (schemas.length === 0) {
@@ -156,22 +190,21 @@ export function createPersistentEngine(
         engine.defineTables(schemas);
         return;
       }
-      mutate(() => engine.defineTables(schemas), [
-        {type: 'defineTables', schemas},
-      ]);
+      if (journalStore) {
+        mutatePrepared(() => engine.prepareDefineTables(schemas));
+      } else {
+        mutateSnapshot(() => engine.defineTables(schemas));
+      }
     },
-    replaceTableSnapshot(
-      schema: TableSchema,
-      rows: Row[],
-    ): ApplyOutcome {
-      return mutate(() => engine.replaceTableSnapshot(schema, rows), [
-        {type: 'replaceTableSnapshot', schema, rows},
-      ]);
+    replaceTableSnapshot(schema: TableSchema, rows: Row[]): ApplyOutcome {
+      return journalStore
+        ? mutatePrepared(() => engine.prepareReplaceTableSnapshot(schema, rows))
+        : mutateSnapshot(() => engine.replaceTableSnapshot(schema, rows));
     },
     applyBatch(batch: ChangeBatch): ApplyOutcome {
-      return mutate(() => engine.applyBatch(batch), [
-        {type: 'applyBatch', batch},
-      ]);
+      return journalStore
+        ? mutatePrepared(() => engine.prepareApplyBatch(batch))
+        : mutateSnapshot(() => engine.applyBatch(batch));
     },
     query(plan: QueryPlan): QueryResult {
       assertUsable();
@@ -184,88 +217,58 @@ export function createPersistentEngine(
     executeSql(sql: string, params: JsonValue[]): SqlResult {
       assertUsable();
       if (engine.inTransaction()) {
-        if (
-          transactionStatements &&
-          transactionStatements.length >= MAX_JOURNAL_SQL_STATEMENTS
-        ) {
-          throw new StorageError(
-            'STORAGE_JOURNAL_PAYLOAD_INVALID',
-            `A transaction cannot contain more than ${MAX_JOURNAL_SQL_STATEMENTS} SQL statements`,
-          );
-        }
-        const result = engine.executeSql(sql, params);
-        transactionStatements?.push({sql, params});
-        return result;
+        return engine.executeSql(sql, params);
       }
-      return mutate(() => engine.executeSql(sql, params), [
-        {type: 'executeSql', statements: [{sql, params}]},
-      ]);
+      return journalStore
+        ? mutatePrepared(() => engine.prepareExecuteSql(sql, params))
+        : mutateSnapshot(() => engine.executeSql(sql, params));
+    },
+    prepareDefineTables(schemas) {
+      assertUsable();
+      return engine.prepareDefineTables(schemas);
+    },
+    prepareReplaceTableSnapshot(schema, rows) {
+      assertUsable();
+      return engine.prepareReplaceTableSnapshot(schema, rows);
+    },
+    prepareApplyBatch(batch) {
+      assertUsable();
+      return engine.prepareApplyBatch(batch);
+    },
+    prepareExecuteSql(sql, params) {
+      assertUsable();
+      return engine.prepareExecuteSql(sql, params);
+    },
+    prepareCommitTransaction() {
+      assertUsable();
+      return engine.prepareCommitTransaction();
+    },
+    installPreparedCommit(commit) {
+      assertUsable();
+      return engine.installPreparedCommit(commit);
+    },
+    abortPreparedCommit() {
+      assertUsable();
+      engine.abortPreparedCommit();
+    },
+    replayCommit(commit) {
+      assertUsable();
+      return engine.replayCommit(commit);
     },
     beginTransaction(): void {
       assertUsable();
       checkpointIfNeeded();
-      const previous = engine.exportSnapshot();
       engine.beginTransaction();
-      transactionSnapshot = previous;
-      transactionStatements = [];
     },
     commitTransaction(): ApplyOutcome {
       assertUsable();
-      if (!transactionSnapshot) {
-        return engine.commitTransaction();
-      }
-      const previous = transactionSnapshot;
-      const statements = transactionStatements ?? [];
-      const revisionBefore = engine.revision();
-      try {
-        const result = engine.commitTransaction();
-        const next = engine.exportSnapshot();
-        if (!bytesEqual(previous, next)) {
-          if (journalStore) {
-            journalStore.append(
-              encodeJournalTransaction({
-                version: JOURNAL_TRANSACTION_VERSION,
-                revisionBefore,
-                revisionAfter: engine.revision(),
-                mutations: [{type: 'executeSql', statements}],
-              }),
-            );
-          } else {
-            store.commit(next);
-          }
-        }
-        transactionSnapshot = undefined;
-        transactionStatements = undefined;
-        return result;
-      } catch (error) {
-        transactionSnapshot = undefined;
-        transactionStatements = undefined;
-        try {
-          if (engine.inTransaction()) {
-            engine.rollbackTransaction();
-          }
-          engine.importSnapshot(previous);
-        } catch (rollbackError) {
-          poison();
-          throw new StorageError(
-            'STORAGE_ROLLBACK_FAILED',
-            `TinyGres could not restore memory after a failed durable transaction: ${errorMessage(rollbackError)}`,
-          );
-        }
-        if (errorCode(error) === 'STORAGE_COMMIT_OUTCOME_UNKNOWN') {
-          poison();
-        }
-        throw error;
-      }
+      return journalStore
+        ? mutatePrepared(() => engine.prepareCommitTransaction())
+        : mutateSnapshot(() => engine.commitTransaction());
     },
     rollbackTransaction(): void {
       assertUsable();
-      try {
-        engine.rollbackTransaction();
-      } finally {
-        transactionSnapshot = undefined;
-        transactionStatements = undefined;
-      }
+      engine.rollbackTransaction();
     },
     inTransaction(): boolean {
       assertUsable();
@@ -310,8 +313,6 @@ export function createPersistentEngine(
       try {
         if (!closed && !poisoned && engine.inTransaction()) {
           engine.rollbackTransaction();
-          transactionSnapshot = undefined;
-          transactionStatements = undefined;
         }
       } catch (error) {
         rollbackError = error;
@@ -338,13 +339,13 @@ function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
 function restoreNewestValidSnapshot(
   engine: WorkerEngine,
   store: SnapshotStore,
-): boolean {
+): {restored: boolean; replayedLegacyJournal: boolean} {
   for (const candidate of store.candidates()) {
     try {
       engine.importSnapshot(candidate.snapshot);
-      replayCandidate(engine, candidate);
+      const replayedLegacyJournal = replayCandidate(engine, candidate);
       store.select(candidate);
-      return true;
+      return {restored: true, replayedLegacyJournal};
     } catch (error) {
       const code = errorCode(error);
       if (code === 'UNSUPPORTED_SNAPSHOT') {
@@ -368,17 +369,36 @@ function restoreNewestValidSnapshot(
       'TinyGres found OPFS snapshot data but no valid database state',
     );
   }
-  return false;
+  return {restored: false, replayedLegacyJournal: false};
 }
 
 function replayCandidate(
   engine: WorkerEngine,
   candidate: SnapshotCandidate,
-): void {
+): boolean {
   if (candidate.journalError) {
     throw candidate.journalError;
   }
+  let replayedLegacyJournal = false;
   for (const record of candidate.journal?.records ?? []) {
+    if (record.kind === 'prepared-commit') {
+      try {
+        engine.replayCommit(record.payload);
+      } catch (error) {
+        if (errorCode(error) === 'UNSUPPORTED_PREPARED_COMMIT') {
+          throw new StorageError(
+            'STORAGE_VERSION_UNSUPPORTED',
+            `TinyGres journal transaction ${record.sequence} uses an unsupported prepared commit format`,
+          );
+        }
+        throw new StorageError(
+          'STORAGE_JOURNAL_CORRUPT',
+          `TinyGres could not replay journal transaction ${record.sequence}: ${errorMessage(error)}`,
+        );
+      }
+      continue;
+    }
+    replayedLegacyJournal = true;
     let transaction;
     try {
       transaction = decodeJournalTransaction(record.payload);
@@ -408,6 +428,7 @@ function replayCandidate(
       );
     }
   }
+  return replayedLegacyJournal;
 }
 
 function replayMutation(engine: WorkerEngine, mutation: JournalMutation): void {

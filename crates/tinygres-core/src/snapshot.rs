@@ -105,7 +105,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 }
 
 // A compact tableless implementation of the standard IEEE CRC-32 checksum.
-fn crc32(bytes: &[u8]) -> u32 {
+pub(crate) fn crc32(bytes: &[u8]) -> u32 {
     let mut checksum = u32::MAX;
     for byte in bytes {
         checksum ^= u32::from(*byte);
