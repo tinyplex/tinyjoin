@@ -19,12 +19,12 @@ use crate::{
         secondary_index_primary_key_for_definition,
     },
     paged_schema::{
-        DroppedTree, ReplacementIndex, SchemaDropPlan, TableReplacementPlan, publish_schema_drop,
-        publish_table_replacement,
+        AddColumnPlan, DroppedTree, ReplacementIndex, SchemaDropPlan, TableReplacementPlan,
+        publish_added_column, publish_schema_drop, publish_table_replacement,
     },
     storage::{
-        normalize_row, preflight_change_batch, preflight_row_write_set,
-        validate_index_columns_for_schema, validate_index_definition_shape,
+        normalize_row, preflight_change_batch, preflight_row_write_set, schema_with_added_column,
+        validate_added_column, validate_index_columns_for_schema, validate_index_definition_shape,
         validate_primary_storage_key_bound, validate_schema, validated_index_key,
     },
 };
@@ -844,6 +844,119 @@ impl<D: PageDevice> PagedStorage<D> {
         Ok(revision)
     }
 
+    /// Streams `ALTER TABLE ADD COLUMN` into one crash-safe paged generation.
+    pub(crate) fn add_column_and_advance(
+        &mut self,
+        table_name: &str,
+        column: &crate::ColumnDefinition,
+    ) -> Result<u64> {
+        self.ensure_ready()?;
+        let table = self
+            .tables
+            .get(table_name)
+            .ok_or_else(|| EngineError::table_not_found(table_name))?;
+
+        // Preserve logical validation and populated-NOT-NULL error order before applying any
+        // page-specific work or tree-ID limit, without retaining a prospective schema clone.
+        validate_added_column(&table.schema, column)?;
+        if table.row_count != 0 && !column.nullable && column.default.is_none() {
+            return Err(EngineError::constraint_violation(format!(
+                "Column `{}` in `{table_name}` cannot be null",
+                column.name
+            )));
+        }
+
+        // Bound borrowed metadata before constructing the owned prospective schema and plan.
+        let current_schema_work = estimated_schema_work_bytes(&table.schema)?;
+        let column_work = estimated_column_work_bytes(column)?;
+        let mut fixed_work_bytes = current_schema_work
+            .checked_add(column_work)
+            .ok_or_else(batch_too_large)?;
+        ensure_batch_bytes(fixed_work_bytes)?;
+        let new_schema = schema_with_added_column(&table.schema, column)?;
+
+        let rooted = table.root_page_id.is_some();
+        preflight_add_column_operations(table.row_count, rooted)?;
+        let (new_tree_id, next_tree_id) = if rooted {
+            (
+                self.next_tree_id,
+                replacement_next_tree_id(self.next_tree_id, 0)?,
+            )
+        } else {
+            (table.tree_id, self.next_tree_id)
+        };
+        let header = encode_catalog_header_record(&CatalogHeader {
+            next_tree_id,
+            table_count: u32::try_from(self.tables.len())
+                .map_err(|_| limit_error("The catalog contains too many tables"))?,
+            index_count: u32::try_from(self.indexes.len())
+                .map_err(|_| limit_error("The catalog contains too many indexes"))?,
+        })?;
+        // Charge the concurrently retained prospective-schema/catalog codec work before cloning
+        // the schema into a physical record. The six-times string/default estimates cover the
+        // record clone, serde model, and encoded bytes at their encoding peak; exact encoded bytes
+        // are retained in the final fixed budget below as a separate defense.
+        let new_schema_work = estimated_schema_work_bytes(&new_schema)?;
+        fixed_work_bytes = fixed_work_bytes
+            // `new_schema` is retained in the plan while the provisional/final catalog record
+            // holds a clone and serde holds its temporary model. Charge all three concurrent
+            // owned copies before constructing either latter allocation.
+            .checked_add(new_schema_work.checked_mul(3).ok_or_else(batch_too_large)?)
+            .and_then(|bytes| bytes.checked_add(header.0.len()))
+            .and_then(|bytes| bytes.checked_add(header.1.len()))
+            .and_then(|bytes| bytes.checked_add(512))
+            .ok_or_else(batch_too_large)?;
+        ensure_batch_bytes(fixed_work_bytes)?;
+        let provisional_table = encode_catalog_table_record(&CatalogTableRecord {
+            schema: new_schema.clone(),
+            tree_id: new_tree_id,
+            root_page_id: table.root_page_id,
+            row_count: table.row_count as u64,
+        })?;
+        fixed_work_bytes = fixed_work_bytes
+            .checked_add(provisional_table.0.len())
+            .and_then(|bytes| bytes.checked_add(provisional_table.1.len()))
+            .ok_or_else(batch_too_large)?;
+        ensure_batch_bytes(fixed_work_bytes)?;
+        drop(provisional_table);
+
+        let plan = AddColumnPlan {
+            base_revision: self.revision,
+            header,
+            old_schema: table.schema.clone(),
+            new_schema,
+            old_tree: DroppedTree {
+                tree_id: table.tree_id,
+                root_page_id: table.root_page_id,
+            },
+            new_tree_id,
+            row_count: table.row_count,
+            fixed_work_bytes,
+        };
+        let mut pager = self.pager.borrow_mut();
+        let published = match publish_added_column(&mut pager, plan) {
+            Ok(published) => published,
+            Err(error) => {
+                if error.code == "RECOVERY_REQUIRED" || pager.is_recovery_required() {
+                    self.recovery_required = true;
+                }
+                return Err(error);
+            }
+        };
+        drop(pager);
+
+        let table = self
+            .tables
+            .get_mut(table_name)
+            .expect("ALTER TABLE resolved the committed table");
+        table.schema = published.schema;
+        table.tree_id = published.tree_id;
+        table.root_page_id = published.root_page_id;
+        self.next_tree_id = next_tree_id;
+        self.revision = published.revision;
+        Ok(published.revision)
+    }
+
     /// Atomically defines or replaces a complete table snapshot.
     ///
     /// The current Rust/JavaScript API receives the source as a buffered `Vec<Row>`; this method
@@ -1647,10 +1760,23 @@ fn estimated_schema_work_bytes(schema: &TableSchema) -> Result<usize> {
             .ok_or_else(batch_too_large)?;
         if let Some(default) = &column.default {
             bytes = bytes
-                .checked_add(estimated_json_bytes(default, 0)?)
+                .checked_add(crate::storage::estimated_value_bytes(default)?)
                 .and_then(|bytes| bytes.checked_add(64))
                 .ok_or_else(batch_too_large)?;
         }
+    }
+    Ok(bytes)
+}
+
+fn estimated_column_work_bytes(column: &crate::ColumnDefinition) -> Result<usize> {
+    let mut bytes = 192usize
+        .checked_add(estimated_string_work_bytes(&column.name)?)
+        .ok_or_else(batch_too_large)?;
+    if let Some(default) = &column.default {
+        bytes = bytes
+            .checked_add(crate::storage::estimated_value_bytes(default)?)
+            .and_then(|bytes| bytes.checked_add(64))
+            .ok_or_else(batch_too_large)?;
     }
     Ok(bytes)
 }
@@ -1760,6 +1886,27 @@ fn preflight_snapshot_operations(
         catalog_rootless,
     )? > MAX_PAGED_BATCH_OPERATIONS
     {
+        return Err(operation_limit());
+    }
+    Ok(())
+}
+
+fn add_column_operation_count(row_count: usize, rooted: bool) -> Result<usize> {
+    if !rooted {
+        // Catalog header and table-record publication only.
+        return Ok(2);
+    }
+    // Each committed row is visited/transformed and upserted once. Fixed operations are candidate
+    // cursor setup, fresh table-root creation, old-tree validation/reclaim, header upsert, and
+    // table-record upsert.
+    row_count
+        .checked_mul(2)
+        .and_then(|operations| operations.checked_add(5))
+        .ok_or_else(batch_too_large)
+}
+
+fn preflight_add_column_operations(row_count: usize, rooted: bool) -> Result<()> {
+    if add_column_operation_count(row_count, rooted)? > MAX_PAGED_BATCH_OPERATIONS {
         return Err(operation_limit());
     }
     Ok(())
@@ -2832,6 +2979,76 @@ mod tests {
     }
 
     #[test]
+    fn add_column_streams_a_table_larger_than_the_transient_work_budget() {
+        const ROWS: usize = 520;
+        const PAYLOAD_BYTES: usize = 32 * 1024;
+        let cumulative_payload_bytes = ROWS * PAYLOAD_BYTES;
+        assert!(cumulative_payload_bytes > MAX_PAGED_BATCH_BYTES);
+        let schema = schema(
+            "large_items",
+            &[
+                ("id", ColumnType::Integer, false),
+                ("payload", ColumnType::Text, false),
+            ],
+        );
+        let mut source = InMemoryStorage::default();
+        source.define_table(schema).unwrap();
+        source
+            .replace_table(
+                "large_items",
+                (0..ROWS)
+                    .map(|id| {
+                        row(json!({
+                            "id": id,
+                            "payload": format!("{id:04}{}", "x".repeat(PAYLOAD_BYTES - 4)),
+                        }))
+                    })
+                    .collect(),
+            )
+            .unwrap();
+
+        let device = CountingDevice::new();
+        let control = device.clone();
+        let imported = PagedStorage::from_in_memory(device, &source).unwrap();
+        let device = imported.into_device();
+        let mut pager = Pager::with_cache_capacity(device, PAGE_SIZE).unwrap();
+        let revision = pager.database_revision();
+        let catalog_root = pager.catalog_root_page_id().unwrap();
+        let (next_tree_id, tables, indexes) =
+            load_and_validate_catalog(&mut pager, catalog_root).unwrap();
+        let mut paged = PagedStorage {
+            pager: RefCell::new(pager),
+            revision,
+            next_tree_id,
+            tables,
+            indexes,
+            recovery_required: false,
+        };
+        control.reset_reads();
+        paged
+            .add_column_and_advance(
+                "large_items",
+                &ColumnDefinition {
+                    name: "active".to_owned(),
+                    data_type: ColumnType::Boolean,
+                    nullable: false,
+                    default: Some(json!(false)),
+                },
+            )
+            .unwrap();
+        assert_eq!(paged.table_row_count("large_items").unwrap(), ROWS);
+        assert!(control.reads() > 1);
+        for id in [0, ROWS - 1] {
+            let row = paged
+                .lookup_primary_key("large_items", &row(json!({"id": id})))
+                .unwrap()
+                .unwrap();
+            assert_eq!(row["active"], false);
+            assert_eq!(row["payload"].as_str().unwrap().len(), PAYLOAD_BYTES);
+        }
+    }
+
+    #[test]
     fn interrupted_index_build_reopens_at_the_old_or_new_catalog() {
         for (failing_flush, expected_new) in [(1, false), (2, false), (3, true)] {
             let device = DurableDevice::default();
@@ -3238,6 +3455,107 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_add_column_reopens_at_the_complete_old_or_new_schema() {
+        for (failing_flush, expected_new) in [(1, false), (2, false), (3, true)] {
+            let device = DurableDevice::default();
+            let control = device.clone();
+            let source = source();
+            let mut paged = PagedStorage::from_in_memory(device, &source).unwrap();
+            let revision = paged.revision();
+            let old_table_tree = paged.tables["posts"].tree_id;
+            let allocated_tree = paged.next_tree_id;
+            let old_next_tree_id = paged.next_tree_id;
+            let old_indexes = paged
+                .indexes
+                .iter()
+                .filter(|(_, index)| index.definition.table == "posts")
+                .map(|(name, index)| {
+                    (
+                        name.clone(),
+                        (index.tree_id, index.root_page_id, index.entry_count),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            control.arm_after_flush(failing_flush);
+            let error = paged
+                .add_column_and_advance(
+                    "posts",
+                    &ColumnDefinition {
+                        name: "priority".to_owned(),
+                        data_type: ColumnType::Integer,
+                        nullable: false,
+                        default: Some(json!(3)),
+                    },
+                )
+                .unwrap_err();
+            if expected_new {
+                assert_eq!(error.code, "RECOVERY_REQUIRED");
+                assert_eq!(
+                    paged.ensure_readable().unwrap_err().code,
+                    "RECOVERY_REQUIRED"
+                );
+                // Even an existing-name IF NOT EXISTS path must not expose stale metadata after
+                // an ambiguous publication.
+                assert_eq!(
+                    crate::statement::plan_add_column(
+                        &paged,
+                        "posts",
+                        &ColumnDefinition {
+                            name: "id".to_owned(),
+                            data_type: ColumnType::Json,
+                            nullable: true,
+                            default: None,
+                        },
+                        true,
+                    )
+                    .unwrap_err()
+                    .code,
+                    "RECOVERY_REQUIRED"
+                );
+            } else {
+                assert_eq!(error.code, "INJECTED_IO");
+                assert_eq!(paged.revision(), revision);
+                assert!(
+                    paged.tables["posts"]
+                        .schema
+                        .columns
+                        .iter()
+                        .all(|column| column.name != "priority")
+                );
+            }
+
+            let device = paged.into_device();
+            control.crash();
+            let reopened = PagedStorage::open(device).unwrap();
+            assert_eq!(reopened.revision(), revision + u64::from(expected_new));
+            assert_eq!(
+                reopened.tables["posts"].tree_id,
+                if expected_new {
+                    allocated_tree
+                } else {
+                    old_table_tree
+                }
+            );
+            assert_eq!(
+                reopened.next_tree_id,
+                old_next_tree_id + u64::from(expected_new)
+            );
+            for (name, expected) in &old_indexes {
+                let index = &reopened.indexes[name];
+                assert_eq!(
+                    (index.tree_id, index.root_page_id, index.entry_count),
+                    *expected
+                );
+            }
+            let row = reopened
+                .lookup_primary_key("posts", &row(json!({"id": 10})))
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.get("priority"), expected_new.then_some(&json!(3)));
+        }
+    }
+
+    #[test]
     fn corrupt_old_table_after_index_reclaims_aborts_the_complete_replacement() {
         let device = CountingDevice::new();
         let control = device.clone();
@@ -3316,6 +3634,89 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_old_table_aborts_add_column_without_publishing_or_freeing() {
+        let device = CountingDevice::new();
+        let control = device.clone();
+        let imported = PagedStorage::from_in_memory(device, &source()).unwrap();
+        let table_root = imported.tables["posts"].root_page_id.unwrap();
+        let unrelated_root = imported.tables["authors"].root_page_id.unwrap();
+        let original = *control.inner.borrow().page(table_root).unwrap();
+        let device = imported.into_device();
+        let mut pager = Pager::with_cache_capacity(device, PAGE_SIZE).unwrap();
+        let revision = pager.database_revision();
+        let catalog_root = pager.catalog_root_page_id().unwrap();
+        let (next_tree_id, tables, indexes) =
+            load_and_validate_catalog(&mut pager, catalog_root).unwrap();
+        let old_table = tables["posts"].clone();
+        let old_index_roots = indexes
+            .values()
+            .filter(|index| index.definition.table == "posts")
+            .map(|index| index.root_page_id.unwrap())
+            .collect::<Vec<_>>();
+        // Evict the target root from the one-page cache before damaging the committed bytes.
+        pager.read_page(unrelated_root).unwrap();
+        let mut paged = PagedStorage {
+            pager: RefCell::new(pager),
+            revision,
+            next_tree_id,
+            tables,
+            indexes,
+            recovery_required: false,
+        };
+        let mut corrupt = original;
+        corrupt[PAGE_SIZE - 1] ^= 1;
+        control
+            .inner
+            .borrow_mut()
+            .write_page(table_root, &corrupt)
+            .unwrap();
+
+        let error = paged
+            .add_column_and_advance(
+                "posts",
+                &ColumnDefinition {
+                    name: "priority".to_owned(),
+                    data_type: ColumnType::Integer,
+                    nullable: false,
+                    default: Some(json!(3)),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "INVALID_PAGE");
+        assert_eq!(paged.revision(), revision);
+        assert_eq!(paged.next_tree_id, next_tree_id);
+        assert_eq!(paged.tables["posts"].tree_id, old_table.tree_id);
+        assert_eq!(paged.tables["posts"].root_page_id, old_table.root_page_id);
+        for root in old_index_roots {
+            assert!(
+                paged
+                    .pager
+                    .borrow()
+                    .active_metadata()
+                    .allocation_bitmap
+                    .is_allocated(root)
+                    .unwrap()
+            );
+        }
+
+        control
+            .inner
+            .borrow_mut()
+            .write_page(table_root, &original)
+            .unwrap();
+        let reopened = PagedStorage::open(paged.into_device()).unwrap();
+        assert_eq!(reopened.revision(), revision);
+        assert_eq!(reopened.tables["posts"].tree_id, old_table.tree_id);
+        assert!(
+            reopened.tables["posts"]
+                .schema
+                .columns
+                .iter()
+                .all(|column| column.name != "priority")
+        );
+    }
+
+    #[test]
     fn conflicting_oversized_schema_preserves_invalid_schema_error_order() {
         let mut source = InMemoryStorage::default();
         let existing = schema("wide", &[("id", ColumnType::Integer, false)]);
@@ -3381,6 +3782,42 @@ mod tests {
         assert_eq!(paged.revision(), revision);
         assert_eq!(paged.next_tree_id, next_tree_id);
         assert_eq!(paged.table_row_count("wide").unwrap(), 0);
+    }
+
+    #[test]
+    fn add_column_bounds_container_defaults_before_catalog_schema_clones() {
+        let mut source = InMemoryStorage::default();
+        source
+            .define_table(schema("items", &[("id", ColumnType::Integer, false)]))
+            .unwrap();
+        let mut paged =
+            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let revision = paged.revision();
+        let old_table = paged.tables["items"].clone();
+        let old_next_tree_id = paged.next_tree_id;
+        // This is physically encodable (well below the 1 MiB catalog value cap), but its
+        // concurrently retained schema, record clone, and serde Value model exceed the 16 MiB
+        // transient-work contract. Null-heavy arrays expose container-node accounting that a
+        // string-only multiplier would miss.
+        let column = ColumnDefinition {
+            name: "metadata".to_owned(),
+            data_type: ColumnType::Json,
+            nullable: false,
+            default: Some(Value::Array(vec![Value::Null; 150_000])),
+        };
+        let error = paged.add_column_and_advance("items", &column).unwrap_err();
+        assert_eq!(error.code, "TRANSACTION_TOO_LARGE");
+        assert_eq!(paged.revision(), revision);
+        assert_eq!(paged.next_tree_id, old_next_tree_id);
+        assert_eq!(paged.tables["items"].tree_id, old_table.tree_id);
+        assert_eq!(paged.tables["items"].root_page_id, None);
+        assert!(
+            paged.tables["items"]
+                .schema
+                .columns
+                .iter()
+                .all(|column| column.name != "metadata")
+        );
     }
 
     #[test]
@@ -3591,6 +4028,289 @@ mod tests {
         assert_eq!(reopened.revision(), revision);
         assert!(reopened.table_schema("authors").is_ok());
         assert!(reopened.table_schema("posts").is_ok());
+    }
+
+    #[test]
+    fn add_column_rewrites_only_the_table_and_preserves_every_index_tree() {
+        let source = source();
+        let mut paged =
+            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let revision = paged.revision();
+        let old_table = paged.tables["posts"].clone();
+        let old_next_tree_id = paged.next_tree_id;
+        let old_indexes = paged
+            .indexes
+            .iter()
+            .filter(|(_, index)| index.definition.table == "posts")
+            .map(|(name, index)| {
+                (
+                    name.clone(),
+                    (index.tree_id, index.root_page_id, index.entry_count),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            paged
+                .add_column_and_advance(
+                    "posts",
+                    &ColumnDefinition {
+                        name: "priority".to_owned(),
+                        data_type: ColumnType::Integer,
+                        nullable: false,
+                        default: Some(json!(3)),
+                    },
+                )
+                .unwrap(),
+            revision + 1
+        );
+        let table = &paged.tables["posts"];
+        assert_eq!(table.tree_id, old_next_tree_id);
+        assert_ne!(table.root_page_id, old_table.root_page_id);
+        assert_eq!(table.row_count, old_table.row_count);
+        assert_eq!(paged.next_tree_id, old_next_tree_id + 1);
+        for (name, expected) in &old_indexes {
+            let index = &paged.indexes[name];
+            assert_eq!(
+                (index.tree_id, index.root_page_id, index.entry_count),
+                *expected
+            );
+        }
+        assert!(
+            !paged
+                .pager
+                .borrow()
+                .active_metadata()
+                .allocation_bitmap
+                .is_allocated(old_table.root_page_id.unwrap())
+                .unwrap()
+        );
+
+        let mut indexed_rows = Vec::new();
+        assert_eq!(
+            paged
+                .visit_index(
+                    "posts",
+                    &["author_id".to_owned()],
+                    &row(json!({"author_id": 1})),
+                    &mut |row| {
+                        indexed_rows.push(row.clone());
+                        Ok(VisitControl::Continue)
+                    },
+                )
+                .unwrap(),
+            Some(VisitOutcome::Complete)
+        );
+        indexed_rows.sort_by_key(|row| row["id"].as_i64().unwrap());
+        assert_eq!(indexed_rows.len(), 2);
+        assert!(indexed_rows.iter().all(|row| row["priority"] == 3));
+
+        let reopened = PagedStorage::open(paged.into_device()).unwrap();
+        assert_eq!(reopened.revision(), revision + 1);
+        assert_eq!(reopened.next_tree_id, old_next_tree_id + 1);
+        assert_eq!(reopened.tables["posts"].tree_id, old_next_tree_id);
+        for (name, expected) in old_indexes {
+            let index = &reopened.indexes[&name];
+            assert_eq!(
+                (index.tree_id, index.root_page_id, index.entry_count),
+                expected
+            );
+        }
+        assert_eq!(
+            reopened
+                .lookup_primary_key("posts", &row(json!({"id": 12})))
+                .unwrap()
+                .unwrap()["priority"],
+            3
+        );
+    }
+
+    #[test]
+    fn empty_add_column_is_metadata_only_even_at_the_tree_id_ceiling() {
+        let mut source = InMemoryStorage::default();
+        source
+            .define_table(schema("empty", &[("id", ColumnType::Integer, false)]))
+            .unwrap();
+        let mut paged =
+            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let revision = paged.revision();
+        let old_table = paged.tables["empty"].clone();
+        paged.next_tree_id = MAX_TREE_ID;
+        paged
+            .add_column_and_advance(
+                "empty",
+                &ColumnDefinition {
+                    name: "required".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                    default: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(paged.revision(), revision + 1);
+        assert_eq!(paged.next_tree_id, MAX_TREE_ID);
+        assert_eq!(paged.tables["empty"].tree_id, old_table.tree_id);
+        assert_eq!(paged.tables["empty"].root_page_id, None);
+        assert_eq!(paged.tables["empty"].row_count, 0);
+
+        let error = paged
+            .apply_batch(&ChangeBatch {
+                changes: vec![Change::Upsert {
+                    table: "empty".to_owned(),
+                    row: row(json!({"id": 1})),
+                }],
+                ..ChangeBatch::default()
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "CONSTRAINT_VIOLATION");
+        assert_eq!(paged.revision(), revision + 1);
+
+        let reopened = PagedStorage::open(paged.into_device()).unwrap();
+        assert_eq!(reopened.next_tree_id, MAX_TREE_ID);
+        assert_eq!(reopened.tables["empty"].tree_id, old_table.tree_id);
+        assert!(
+            reopened.tables["empty"]
+                .schema
+                .columns
+                .iter()
+                .any(|column| column.name == "required")
+        );
+    }
+
+    #[test]
+    fn rooted_add_column_requires_one_representable_fresh_tree_id() {
+        let mut paged =
+            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source()).unwrap();
+        let revision = paged.revision();
+        let old_table = paged.tables["posts"].clone();
+        paged.next_tree_id = MAX_TREE_ID;
+        let constraint = paged
+            .add_column_and_advance(
+                "posts",
+                &ColumnDefinition {
+                    name: "required".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                    default: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(constraint.code, "CONSTRAINT_VIOLATION");
+        let error = paged
+            .add_column_and_advance(
+                "posts",
+                &ColumnDefinition {
+                    name: "priority".to_owned(),
+                    data_type: ColumnType::Integer,
+                    nullable: false,
+                    default: Some(json!(3)),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "STORAGE_LIMIT");
+        assert_eq!(paged.revision(), revision);
+        assert_eq!(paged.tables["posts"].tree_id, old_table.tree_id);
+        assert_eq!(paged.tables["posts"].root_page_id, old_table.root_page_id);
+    }
+
+    #[test]
+    fn add_column_row_growth_error_precedes_revision_overflow() {
+        let schema = schema(
+            "large",
+            &[
+                ("id", ColumnType::Integer, false),
+                ("payload", ColumnType::Text, false),
+            ],
+        );
+        let empty = row(json!({"id": 1, "payload": ""}));
+        let overhead = serde_json::to_vec(&empty).unwrap().len();
+        let payload_bytes = crate::storage::MAX_LOGICAL_ROW_BYTES - overhead;
+        let existing = row(json!({"id": 1, "payload": "x".repeat(payload_bytes)}));
+        let mut source = InMemoryStorage::default();
+        source.define_table(schema).unwrap();
+        source.replace_table("large", vec![existing]).unwrap();
+        let column = ColumnDefinition {
+            name: "extra".to_owned(),
+            data_type: ColumnType::Text,
+            nullable: false,
+            default: Some(json!("y")),
+        };
+        let mut expected = source.clone();
+        let expected_error = expected.add_column("large", column.clone()).unwrap_err();
+        assert_eq!(expected_error.code, "INVALID_CHANGE");
+
+        let mut paged =
+            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let old_tree = paged.tables["large"].clone();
+        let old_next_tree_id = paged.next_tree_id;
+        paged.revision = u64::MAX;
+        let actual = paged.add_column_and_advance("large", &column).unwrap_err();
+        assert_eq!(actual, expected_error);
+        assert_eq!(paged.revision(), u64::MAX);
+        assert_eq!(paged.next_tree_id, old_next_tree_id);
+        assert_eq!(paged.tables["large"].tree_id, old_tree.tree_id);
+        assert_eq!(paged.tables["large"].root_page_id, old_tree.root_page_id);
+    }
+
+    #[test]
+    fn add_column_operation_budget_counts_stream_rewrite_and_fixed_publication() {
+        assert_eq!(add_column_operation_count(0, false).unwrap(), 2);
+        assert_eq!(add_column_operation_count(499_997, true).unwrap(), 999_999);
+        preflight_add_column_operations(499_997, true).unwrap();
+        assert_eq!(
+            add_column_operation_count(499_998, true).unwrap(),
+            1_000_001
+        );
+        assert_eq!(
+            preflight_add_column_operations(499_998, true)
+                .unwrap_err()
+                .code,
+            "TRANSACTION_TOO_LARGE"
+        );
+    }
+
+    #[test]
+    fn repeated_add_column_reuses_reclaimed_pages_without_a_live_page_leak() {
+        let mut paged =
+            PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source()).unwrap();
+        let initial_revision = paged.revision();
+        let initial_next_tree_id = paged.next_tree_id;
+        let mut physical_pages_after_first = None;
+        for number in 0..8 {
+            let old_root = paged.tables["posts"].root_page_id.unwrap();
+            paged
+                .add_column_and_advance(
+                    "posts",
+                    &ColumnDefinition {
+                        name: format!("added_{number}"),
+                        data_type: ColumnType::Boolean,
+                        nullable: false,
+                        default: Some(json!(false)),
+                    },
+                )
+                .unwrap();
+            assert!(
+                !paged
+                    .pager
+                    .borrow()
+                    .active_metadata()
+                    .allocation_bitmap
+                    .is_allocated(old_root)
+                    .unwrap()
+            );
+            let page_count = paged.pager.borrow().physical_page_count();
+            if let Some(first) = physical_pages_after_first {
+                assert!(page_count <= first + 2);
+            } else {
+                physical_pages_after_first = Some(page_count);
+            }
+        }
+        assert_eq!(paged.revision(), initial_revision + 8);
+        assert_eq!(paged.next_tree_id, initial_next_tree_id + 8);
+        assert_eq!(paged.tables["posts"].row_count, 3);
+        let reopened = PagedStorage::open(paged.into_device()).unwrap();
+        assert_eq!(reopened.revision(), initial_revision + 8);
+        assert_eq!(reopened.tables["posts"].schema.columns.len(), 12);
     }
 
     #[test]

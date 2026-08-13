@@ -331,28 +331,7 @@ impl StorageDriver for InMemoryStorage {
             .tables
             .get(table)
             .ok_or_else(|| EngineError::table_not_found(table))?;
-        if current.schema.columns.is_empty() {
-            return Err(EngineError::unsupported_sql(format!(
-                "ALTER TABLE ADD COLUMN requires a typed table catalog for `{table}`"
-            )));
-        }
-        if current.schema.columns.len() >= MAX_COLUMNS {
-            return Err(EngineError::invalid_schema(format!(
-                "Table `{table}` cannot contain more than {MAX_COLUMNS} columns"
-            )));
-        }
-        if current
-            .schema
-            .columns
-            .iter()
-            .any(|existing| existing.name == column.name)
-        {
-            return Err(EngineError::column_already_exists(&column.name, table));
-        }
-
-        let mut schema = current.schema.clone();
-        schema.columns.push(column.clone());
-        validate_schema(&schema)?;
+        let schema = schema_with_added_column(&current.schema, &column)?;
         let value = column.default.clone().unwrap_or(Value::Null);
         let mut rows = BTreeMap::new();
         for (key, row) in &current.rows {
@@ -694,6 +673,75 @@ impl StorageDriver for InMemoryStorage {
         self.revision = next_revision(self.revision)?;
         Ok(self.revision)
     }
+}
+
+/// Builds and validates the exact schema produced by `ALTER TABLE ADD COLUMN`.
+///
+/// Statement planning and every storage backend share this borrowed-schema helper so typed-catalog,
+/// column-count, duplicate-name, default, and type errors retain one deterministic contract.
+pub(crate) fn schema_with_added_column(
+    current: &TableSchema,
+    column: &ColumnDefinition,
+) -> Result<TableSchema> {
+    validate_added_column(current, column)?;
+    let mut schema = current.clone();
+    schema.columns.push(column.clone());
+    // Keep the complete schema validator as a defense if either helper evolves independently.
+    validate_schema(&schema)?;
+    Ok(schema)
+}
+
+/// Validates an appended column without retaining a prospective schema clone.
+///
+/// The paged publisher uses this narrow seam to preserve logical error order before applying its
+/// physical work limits; [`schema_with_added_column`] remains the owned-schema construction path.
+pub(crate) fn validate_added_column(
+    current: &TableSchema,
+    column: &ColumnDefinition,
+) -> Result<()> {
+    let table = &current.name;
+    if current.columns.is_empty() {
+        return Err(EngineError::unsupported_sql(format!(
+            "ALTER TABLE ADD COLUMN requires a typed table catalog for `{table}`"
+        )));
+    }
+    if current.columns.len() >= MAX_COLUMNS {
+        return Err(EngineError::invalid_schema(format!(
+            "Table `{table}` cannot contain more than {MAX_COLUMNS} columns"
+        )));
+    }
+    if current
+        .columns
+        .iter()
+        .any(|existing| existing.name == column.name)
+    {
+        return Err(EngineError::column_already_exists(&column.name, table));
+    }
+    // Existing committed schemas have already passed this validator, but retaining the check keeps
+    // this shared helper deterministic for direct storage callers and corrupted test fixtures.
+    validate_schema(current)?;
+    validate_catalog_name_bound(&column.name)
+        .map_err(|error| EngineError::invalid_schema(error.message))?;
+    if column.name.trim().is_empty() {
+        return Err(EngineError::invalid_schema(format!(
+            "Table `{table}` contains an empty column name"
+        )));
+    }
+    if let Some(default) = &column.default {
+        validate_json_value(default).map_err(|error| {
+            EngineError::invalid_schema(format!(
+                "Default for column `{}` is invalid: {}",
+                column.name, error.message
+            ))
+        })?;
+        validate_value(column, default, table).map_err(|error| {
+            EngineError::invalid_schema(format!(
+                "Default for column `{}` is invalid: {}",
+                column.name, error.message
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 impl StorageReader for InMemoryStorage {
@@ -1082,6 +1130,84 @@ pub(crate) fn normalize_row(schema: &TableSchema, mut row: Row) -> Result<Row> {
     }
     validate_row_value_limits(&row).map_err(|error| EngineError::invalid_change(error.message))?;
     Ok(row)
+}
+
+/// Returns the canonical JSON body length already enforced by row normalization, without
+/// allocating an encoded copy.
+pub(crate) fn logical_row_encoded_bytes(row: &Row) -> Result<usize> {
+    validate_row_value_limits(row)
+}
+
+/// Conservatively estimates the owned serde model produced from canonical JSON without parsing or
+/// allocating that model. This is intentionally structural: compact arrays such as `[0,0,...]`
+/// can expand far beyond any constant multiple suitable for string-heavy inputs. Every primitive
+/// contributes at least 48 bytes. The ALTER caller retains twice this estimate, so an array of `n`
+/// primitives is charged at least `96n`: enough for serde's geometrically grown parsed Vec (at
+/// most `2n` 32-byte `Value` slots) plus the exact-`n` normalized clone. Strings, keys, nested
+/// containers, and encoded buffers are charged separately on top.
+pub(crate) fn estimated_encoded_json_model_bytes(bytes: &[u8]) -> Result<usize> {
+    let mut work = 64usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'[' | b'{' => {
+                work = checked_row_write_add(work, 64)?;
+                index += 1;
+            }
+            b']' | b'}' | b',' | b':' | b' ' | b'\n' | b'\r' | b'\t' => index += 1,
+            b'"' => {
+                index += 1;
+                let start = index;
+                let mut escaped = false;
+                while index < bytes.len() {
+                    match bytes[index] {
+                        b'"' if !escaped => break,
+                        b'\\' if !escaped => escaped = true,
+                        _ => escaped = false,
+                    }
+                    index += 1;
+                }
+                if index == bytes.len() {
+                    return Err(EngineError::invalid_change(
+                        "Encoded JSON contains an unterminated string",
+                    ));
+                }
+                let encoded = index - start;
+                work = checked_row_write_add(work, 64)?;
+                work = checked_row_write_add(work, checked_row_write_mul(encoded, 2)?)?;
+                index += 1;
+            }
+            byte if byte.is_ascii_digit() || byte == b'-' => {
+                work = checked_row_write_add(work, 48)?;
+                index += 1;
+                while index < bytes.len()
+                    && matches!(bytes[index], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+                {
+                    index += 1;
+                }
+            }
+            b't' if bytes[index..].starts_with(b"true") => {
+                // Includes the array/map slot which owns this primitive. Vec growth may reserve
+                // nearly twice its logical length, and callers can retain a normalized clone.
+                work = checked_row_write_add(work, 48)?;
+                index += 4;
+            }
+            b'f' if bytes[index..].starts_with(b"false") => {
+                work = checked_row_write_add(work, 48)?;
+                index += 5;
+            }
+            b'n' if bytes[index..].starts_with(b"null") => {
+                work = checked_row_write_add(work, 48)?;
+                index += 4;
+            }
+            _ => {
+                return Err(EngineError::invalid_change(
+                    "Encoded JSON contains an invalid token",
+                ));
+            }
+        }
+    }
+    Ok(work)
 }
 
 fn validate_value(column: &ColumnDefinition, value: &Value, table: &str) -> Result<()> {

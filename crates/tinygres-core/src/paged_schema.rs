@@ -51,6 +51,24 @@ pub(crate) struct PublishedTableReplacement {
     pub indexes: Vec<PublishedIndex>,
 }
 
+pub(crate) struct AddColumnPlan {
+    pub base_revision: u64,
+    pub header: (Vec<u8>, Vec<u8>),
+    pub old_schema: TableSchema,
+    pub new_schema: TableSchema,
+    pub old_tree: DroppedTree,
+    pub new_tree_id: TreeId,
+    pub row_count: usize,
+    pub fixed_work_bytes: usize,
+}
+
+pub(crate) struct PublishedColumnAddition {
+    pub revision: u64,
+    pub schema: TableSchema,
+    pub tree_id: TreeId,
+    pub root_page_id: Option<PageId>,
+}
+
 /// Reclaims complete relational trees and removes their catalog records in one pager generation.
 ///
 /// Each tree is fully validated by [`Btree::reclaim`] before any of its pages are marked free.
@@ -289,6 +307,254 @@ pub(crate) fn publish_table_replacement<D: PageDevice>(
     })
 }
 
+/// Rewrites one rooted table through a bounded candidate cursor, or publishes a metadata-only
+/// schema record for an empty table. Existing index trees remain byte-logically unchanged because
+/// an appended non-key column cannot change any of their entries.
+pub(crate) fn publish_added_column<D: PageDevice>(
+    pager: &mut Pager<D>,
+    plan: AddColumnPlan,
+) -> Result<PublishedColumnAddition> {
+    let applied_journal_sequence = pager.applied_journal_sequence();
+    let catalog_root = pager
+        .catalog_root_page_id()
+        .ok_or_else(|| storage_corrupt("ALTER TABLE requires an existing paged catalog root"))?;
+    let column = plan.new_schema.columns.last().ok_or_else(|| {
+        storage_corrupt("ALTER TABLE prospective schema is missing its appended column")
+    })?;
+    let default_work = column
+        .default
+        .as_ref()
+        .map(crate::storage::estimated_value_bytes)
+        .transpose()?
+        .unwrap_or(16);
+    let column_name_work = column
+        .name
+        .len()
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(64))
+        .ok_or_else(alter_work_limit)?;
+    let mut transaction = pager.begin_write()?;
+    let result = (|| {
+        let mut new_root_page_id = None;
+        let mut rewritten_count = 0usize;
+        if let Some(old_root_page_id) = plan.old_tree.root_page_id {
+            let mut rows = Btree::cursor_in_transaction(
+                &mut transaction,
+                old_root_page_id,
+                plan.old_tree.tree_id,
+            )?;
+            while let Some((primary_key, value)) = rows.next_in_transaction(&mut transaction)? {
+                ensure_alter_decode_work(plan.fixed_work_bytes, &primary_key, &value)?;
+                let mut row = validated_candidate_row(&plan.old_schema, &primary_key, &value)?;
+                let old_row_work = crate::storage::estimated_row_bytes(&row)?;
+                ensure_alter_transform_work(
+                    plan.fixed_work_bytes,
+                    primary_key.len(),
+                    value.len(),
+                    old_row_work,
+                    default_work,
+                    column_name_work,
+                )?;
+                let added_value = column.default.clone().unwrap_or(serde_json::Value::Null);
+                if row.insert(column.name.clone(), added_value).is_some() {
+                    return Err(storage_corrupt(format!(
+                        "Stored row in `{}` already contains new column `{}`",
+                        plan.old_schema.name, column.name
+                    )));
+                }
+                let row = normalize_row(&plan.new_schema, row)?;
+                let encoded_primary_key = encode_primary_key(&plan.new_schema, &row)?;
+                if encoded_primary_key != primary_key {
+                    return Err(storage_corrupt(format!(
+                        "ALTER TABLE changed a primary key in `{}`",
+                        plan.old_schema.name
+                    )));
+                }
+                let new_row_work = crate::storage::estimated_row_bytes(&row)?;
+                let encoded_row_work = crate::storage::logical_row_encoded_bytes(&row)?
+                    .checked_add(8)
+                    .ok_or_else(alter_work_limit)?;
+                // Semantic row transformation intentionally precedes the physical work limit so
+                // legacy row-size/type errors retain their ordering. The exact encoded length is
+                // computed without allocation, then bounded before the codec constructs bytes.
+                ensure_alter_row_work(
+                    plan.fixed_work_bytes,
+                    primary_key.len(),
+                    value.len(),
+                    old_row_work,
+                    new_row_work,
+                    encoded_row_work,
+                )?;
+                let encoded_row = encode_row(&row)?;
+                debug_assert_eq!(encoded_row.len(), encoded_row_work);
+                let root = match new_root_page_id {
+                    Some(root) => root,
+                    None => Btree::create(&mut transaction, plan.new_tree_id)?,
+                };
+                new_root_page_id = Some(Btree::upsert(
+                    &mut transaction,
+                    root,
+                    plan.new_tree_id,
+                    &primary_key,
+                    &encoded_row,
+                )?);
+                rewritten_count = rewritten_count
+                    .checked_add(1)
+                    .ok_or_else(|| storage_corrupt("ALTER TABLE row count overflowed"))?;
+            }
+            if rewritten_count != plan.row_count {
+                return Err(storage_corrupt(format!(
+                    "Table `{}` catalog count {} does not match {rewritten_count} rewritten rows",
+                    plan.old_schema.name, plan.row_count
+                )));
+            }
+            Btree::reclaim(&mut transaction, old_root_page_id, plan.old_tree.tree_id)?;
+        } else if plan.row_count != 0 {
+            return Err(storage_corrupt(format!(
+                "Rootless table `{}` has {} rows",
+                plan.old_schema.name, plan.row_count
+            )));
+        }
+
+        let revision = plan
+            .base_revision
+            .checked_add(1)
+            .ok_or_else(|| EngineError::new("REVISION_OVERFLOW", "Database revision overflowed"))?;
+        let (table_key, table_value) = encode_catalog_table_record(&CatalogTableRecord {
+            schema: plan.new_schema.clone(),
+            tree_id: plan.new_tree_id,
+            root_page_id: new_root_page_id,
+            row_count: plan.row_count as u64,
+        })?;
+        let catalog_root = Btree::upsert(
+            &mut transaction,
+            catalog_root,
+            CATALOG_TREE_ID,
+            &plan.header.0,
+            &plan.header.1,
+        )?;
+        let catalog_root = Btree::upsert(
+            &mut transaction,
+            catalog_root,
+            CATALOG_TREE_ID,
+            &table_key,
+            &table_value,
+        )?;
+        Ok((revision, catalog_root, new_root_page_id))
+    })();
+    let (revision, catalog_root, root_page_id) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            transaction.abort();
+            return Err(error);
+        }
+    };
+    transaction.commit(revision, applied_journal_sequence, Some(catalog_root))?;
+    Ok(PublishedColumnAddition {
+        revision,
+        schema: plan.new_schema,
+        tree_id: plan.new_tree_id,
+        root_page_id,
+    })
+}
+
+fn ensure_alter_decode_work(fixed: usize, key: &[u8], encoded_value: &[u8]) -> Result<()> {
+    // Candidate cursor key/value, serde's parsed row, canonical re-encoding performed by the row
+    // decoder, and normalization's validation clone are simultaneously live before exact decoded
+    // sizes are available. Structurally scan the encoded JSON body so compact container values do
+    // not evade the bound through a constant byte multiplier.
+    const ROW_HEADER_BYTES: usize = 8;
+    let body = encoded_value.get(ROW_HEADER_BYTES..).ok_or_else(|| {
+        storage_corrupt("Encoded ALTER source row is shorter than its record header")
+    })?;
+    let model_work = crate::storage::estimated_encoded_json_model_bytes(body)
+        .map_err(|error| storage_corrupt(error.message))?;
+    let bytes = fixed
+        .checked_add(key.len())
+        .and_then(|bytes| bytes.checked_add(encoded_value.len()))
+        .and_then(|bytes| {
+            model_work
+                .checked_mul(2)
+                .and_then(|models| bytes.checked_add(models))
+        })
+        // Canonical re-encoding performed by decode_row.
+        .and_then(|bytes| bytes.checked_add(body.len()))
+        .and_then(|bytes| bytes.checked_add(1024))
+        .ok_or_else(alter_work_limit)?;
+    ensure_alter_work_bytes(bytes)
+}
+
+fn ensure_alter_transform_work(
+    fixed: usize,
+    key: usize,
+    encoded_value: usize,
+    old_row: usize,
+    default_value: usize,
+    column_name: usize,
+) -> Result<()> {
+    // Charge the row retained from decode, its imminent default/name clones, and the later
+    // normalize/schema-validation clone before retaining either appended value.
+    let bytes = fixed
+        .checked_add(key)
+        .and_then(|bytes| bytes.checked_add(encoded_value))
+        .and_then(|bytes| {
+            old_row
+                .checked_mul(3)
+                .and_then(|rows| bytes.checked_add(rows))
+        })
+        .and_then(|bytes| {
+            default_value
+                .checked_mul(2)
+                .and_then(|values| bytes.checked_add(values))
+        })
+        .and_then(|bytes| bytes.checked_add(column_name))
+        .and_then(|bytes| bytes.checked_add(512))
+        .ok_or_else(alter_work_limit)?;
+    ensure_alter_work_bytes(bytes)
+}
+
+fn ensure_alter_row_work(
+    fixed: usize,
+    key: usize,
+    old_value: usize,
+    old_row: usize,
+    new_row: usize,
+    encoded_row: usize,
+) -> Result<()> {
+    let bytes = fixed
+        .checked_add(key)
+        .and_then(|bytes| bytes.checked_add(old_value))
+        .and_then(|bytes| {
+            old_row
+                .checked_mul(2)
+                .and_then(|row| bytes.checked_add(row))
+        })
+        .and_then(|bytes| {
+            new_row
+                .checked_mul(2)
+                .and_then(|row| bytes.checked_add(row))
+        })
+        .and_then(|bytes| bytes.checked_add(encoded_row))
+        .and_then(|bytes| bytes.checked_add(512))
+        .ok_or_else(alter_work_limit)?;
+    ensure_alter_work_bytes(bytes)
+}
+
+fn ensure_alter_work_bytes(bytes: usize) -> Result<()> {
+    if bytes > 16 * 1024 * 1024 {
+        Err(alter_work_limit())
+    } else {
+        Ok(())
+    }
+}
+
+fn alter_work_limit() -> EngineError {
+    EngineError::new(
+        "TRANSACTION_TOO_LARGE",
+        "ALTER TABLE cannot require more than 16777216 bytes of transient row work",
+    )
+}
+
 fn validated_candidate_row(schema: &TableSchema, key: &[u8], value: &[u8]) -> Result<Row> {
     let row = crate::paged_codec::decode_row(value)?;
     let normalized = normalize_row(schema, row.clone()).map_err(|error| {
@@ -308,4 +574,45 @@ fn validated_candidate_row(schema: &TableSchema, key: &[u8], value: &[u8]) -> Re
 
 fn storage_corrupt(message: impl Into<String>) -> EngineError {
     EngineError::new("STORAGE_CORRUPT", message)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn alter_transient_preflights_have_exact_before_allocation_boundaries() {
+        const LIMIT: usize = 16 * 1024 * 1024;
+        // Decode: encoded record + two parsed/normalized models + canonical re-encoding.
+        let small = crate::paged_codec::encode_row(
+            json!({"id": 1}).as_object().expect("fixture is an object"),
+        )
+        .unwrap();
+        ensure_alter_decode_work(0, &[], &small).unwrap();
+        let compact_array = crate::paged_codec::encode_row(
+            json!({"id": 1, "values": vec![serde_json::Value::Null; 190_000]})
+                .as_object()
+                .expect("fixture is an object"),
+        )
+        .unwrap();
+        assert!(compact_array.len() < crate::paged_codec::MAX_PAGED_VALUE_BYTES);
+        assert_eq!(
+            ensure_alter_decode_work(0, &[], &compact_array)
+                .unwrap_err()
+                .code,
+            "TRANSACTION_TOO_LARGE"
+        );
+
+        // Transform: fixed + key + encoded + 3*old row + 2*default + name + 512.
+        let old_row = (LIMIT - 512) / 3;
+        ensure_alter_transform_work(0, 0, 0, old_row, 0, 0).unwrap();
+        assert_eq!(
+            ensure_alter_transform_work(0, 3, 0, old_row, 0, 0)
+                .unwrap_err()
+                .code,
+            "TRANSACTION_TOO_LARGE"
+        );
+    }
 }

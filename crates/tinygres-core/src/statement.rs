@@ -8,7 +8,7 @@ use crate::query::{
     validate_predicate_columns, validate_sql_input,
 };
 use crate::storage::{
-    estimated_row_bytes, estimated_value_bytes, normalize_row, row_key,
+    estimated_row_bytes, estimated_value_bytes, normalize_row, row_key, schema_with_added_column,
     validate_index_columns_for_schema, validate_index_definition_shape,
 };
 use crate::{
@@ -280,6 +280,20 @@ fn add_column<S: StorageDriver>(
     column: &ColumnDefinition,
     if_not_exists: bool,
 ) -> Result<WriteOutcome> {
+    let outcome = plan_add_column(storage, table, column, if_not_exists)?;
+    if outcome.mutated {
+        storage.add_column(table, column.clone())?;
+    }
+    Ok(outcome)
+}
+
+pub(crate) fn plan_add_column<S: StorageReader>(
+    storage: &S,
+    table: &str,
+    column: &ColumnDefinition,
+    if_not_exists: bool,
+) -> Result<WriteOutcome> {
+    storage.ensure_readable()?;
     let schema = storage.table_schema(table)?;
     if schema
         .columns
@@ -297,7 +311,7 @@ fn add_column<S: StorageDriver>(
         }
         return Err(EngineError::column_already_exists(&column.name, table));
     }
-    storage.add_column(table, column.clone())?;
+    schema_with_added_column(&schema, column)?;
     Ok(WriteOutcome {
         command: "ALTER TABLE",
         row_count: 0,

@@ -9,9 +9,9 @@ use crate::{
 
 /// A SQL engine which publishes row mutations directly through the crash-safe page store.
 ///
-/// This page-native engine slice supports reads, table/index creation and removal, and standalone
-/// `INSERT`, `UPDATE`, and `DELETE` statements, including bounded explicit row transactions. Other
-/// page-native DDL is not part of this surface yet.
+/// This page-native engine slice supports reads, table/index lifecycle, streaming column addition,
+/// and standalone `INSERT`, `UPDATE`, and `DELETE` statements, including bounded explicit row
+/// transactions. Other page-native DDL is not part of this surface yet.
 pub struct PagedEngine<D: PageDevice> {
     storage: PagedStorage<D>,
     transaction: Option<PagedTransaction>,
@@ -142,6 +142,24 @@ impl<D: PageDevice> PagedEngine<D> {
                             crate::statement::plan_drop_table(&self.storage, table, *if_exists)?;
                         let revision = if outcome.mutated {
                             self.storage.drop_table_and_advance(table)?
+                        } else {
+                            self.storage.revision()
+                        };
+                        (outcome, revision)
+                    }
+                    WriteStatement::AddColumn {
+                        table,
+                        column,
+                        if_not_exists,
+                    } => {
+                        let outcome = crate::statement::plan_add_column(
+                            &self.storage,
+                            table,
+                            column,
+                            *if_not_exists,
+                        )?;
+                        let revision = if outcome.mutated {
+                            self.storage.add_column_and_advance(table, column)?
                         } else {
                             self.storage.revision()
                         };
@@ -301,7 +319,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::{Change, ChangeBatch, Engine, MemoryPageDevice, PAGE_SIZE, PageId, Row};
+    use crate::{
+        Change, ChangeBatch, Engine, MemoryPageDevice, PAGE_SIZE, PageId, Row, StorageDriver,
+    };
 
     #[derive(Default)]
     struct DurableState {
@@ -773,6 +793,180 @@ mod tests {
     }
 
     #[test]
+    fn page_native_add_column_matches_in_memory_backfill_and_error_order() {
+        let source = source();
+        let mut expected = Engine::new(source.clone());
+        let mut actual =
+            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+
+        for sql in [
+            "ALTER TABLE accounts ADD COLUMN score INTEGER NOT NULL DEFAULT 7",
+            "ALTER TABLE accounts ADD COLUMN note TEXT",
+        ] {
+            assert_eq!(
+                actual.execute_sql(sql, &[]).unwrap(),
+                expected.execute_sql(sql, &[]).unwrap(),
+                "{sql}"
+            );
+        }
+        for sql in [
+            "SELECT id, email, score, note FROM accounts ORDER BY id",
+            "SELECT id, score FROM accounts WHERE email = 'ada@example.com'",
+        ] {
+            assert_eq!(
+                actual.query_sql(sql, &[]).unwrap(),
+                expected.query_sql(sql, &[]).unwrap(),
+                "{sql}"
+            );
+        }
+
+        let revision = actual.revision();
+        // Name resolution deliberately precedes validation of the requested replacement shape.
+        let duplicate =
+            "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS score BOOLEAN NOT NULL DEFAULT 'bad'";
+        assert_eq!(
+            actual.execute_sql(duplicate, &[]).unwrap(),
+            expected.execute_sql(duplicate, &[]).unwrap()
+        );
+        assert_eq!(actual.revision(), revision);
+        assert_eq!(
+            actual
+                .execute_sql("ALTER TABLE accounts ADD COLUMN score BOOLEAN", &[])
+                .unwrap_err(),
+            expected
+                .execute_sql("ALTER TABLE accounts ADD COLUMN score BOOLEAN", &[])
+                .unwrap_err()
+        );
+        assert_eq!(actual.revision(), revision);
+
+        let reopened = PagedEngine::open(actual.into_device()).unwrap();
+        assert_eq!(reopened.revision(), revision);
+        assert_eq!(
+            reopened
+                .query_sql(
+                    "SELECT id, email, score, note FROM accounts ORDER BY id",
+                    &[]
+                )
+                .unwrap(),
+            expected
+                .query_sql(
+                    "SELECT id, email, score, note FROM accounts ORDER BY id",
+                    &[]
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn page_native_add_column_handles_empty_required_untyped_and_missing_tables() {
+        let mut expected = Engine::default();
+        let mut actual = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        for engine_sql in [
+            "CREATE TABLE empty_items (id INTEGER PRIMARY KEY)",
+            "ALTER TABLE empty_items ADD COLUMN required TEXT NOT NULL",
+        ] {
+            assert_eq!(
+                actual.execute_sql(engine_sql, &[]).unwrap(),
+                expected.execute_sql(engine_sql, &[]).unwrap()
+            );
+        }
+        assert_eq!(
+            actual
+                .execute_sql("INSERT INTO empty_items (id) VALUES (1)", &[])
+                .unwrap_err(),
+            expected
+                .execute_sql("INSERT INTO empty_items (id) VALUES (1)", &[])
+                .unwrap_err()
+        );
+
+        let mut legacy = InMemoryStorage::default();
+        legacy
+            .define_table(TableSchema {
+                name: "legacy".to_owned(),
+                primary_key: vec!["id".to_owned()],
+                columns: vec![],
+            })
+            .unwrap();
+        let mut expected_legacy = Engine::new(legacy.clone());
+        let mut actual_legacy =
+            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &legacy).unwrap();
+        for sql in [
+            "ALTER TABLE legacy ADD COLUMN value TEXT",
+            "ALTER TABLE missing ADD COLUMN value TEXT",
+        ] {
+            assert_eq!(
+                actual_legacy.execute_sql(sql, &[]).unwrap_err(),
+                expected_legacy.execute_sql(sql, &[]).unwrap_err(),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn page_native_add_column_failure_is_atomic_and_duplicate_wins_at_column_limit() {
+        let source = source();
+        let mut expected = Engine::new(source.clone());
+        let mut actual =
+            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let revision = actual.revision();
+        let sql = "ALTER TABLE accounts ADD COLUMN required TEXT NOT NULL";
+        assert_eq!(
+            actual.execute_sql(sql, &[]).unwrap_err(),
+            expected.execute_sql(sql, &[]).unwrap_err()
+        );
+        assert_eq!(actual.revision(), revision);
+        assert_eq!(
+            actual
+                .query_sql("SELECT required FROM accounts", &[])
+                .unwrap_err(),
+            expected
+                .query_sql("SELECT required FROM accounts", &[])
+                .unwrap_err()
+        );
+
+        let mut wide = TableSchema {
+            name: "wide".to_owned(),
+            primary_key: vec!["id".to_owned()],
+            columns: vec![crate::ColumnDefinition {
+                name: "id".to_owned(),
+                data_type: crate::ColumnType::Integer,
+                nullable: false,
+                default: None,
+            }],
+        };
+        wide.columns
+            .extend((1..256).map(|number| crate::ColumnDefinition {
+                name: format!("column_{number}"),
+                data_type: crate::ColumnType::Text,
+                nullable: true,
+                default: None,
+            }));
+        let mut source = InMemoryStorage::default();
+        source.define_table(wide).unwrap();
+        let mut expected = Engine::new(source.clone());
+        let mut actual =
+            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let revision = actual.revision();
+        let no_op = "ALTER TABLE wide ADD COLUMN IF NOT EXISTS id JSON NOT NULL DEFAULT NULL";
+        assert_eq!(
+            actual.execute_sql(no_op, &[]).unwrap(),
+            expected.execute_sql(no_op, &[]).unwrap()
+        );
+        assert_eq!(actual.revision(), revision);
+        for sql in [
+            "ALTER TABLE wide ADD COLUMN id BOOLEAN",
+            "ALTER TABLE wide ADD COLUMN overflow TEXT",
+        ] {
+            assert_eq!(
+                actual.execute_sql(sql, &[]).unwrap_err(),
+                expected.execute_sql(sql, &[]).unwrap_err(),
+                "{sql}"
+            );
+            assert_eq!(actual.revision(), revision);
+        }
+    }
+
+    #[test]
     fn page_native_unique_index_omits_nulls_and_rolls_back_duplicates() {
         let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
         engine
@@ -1002,6 +1196,7 @@ mod tests {
         for sql in [
             "CREATE TABLE later (id INTEGER PRIMARY KEY)",
             "CREATE INDEX accounts_active_tx ON accounts (active)",
+            "ALTER TABLE accounts ADD COLUMN note TEXT",
             "DROP INDEX accounts_email",
             "DROP TABLE accounts",
         ] {
