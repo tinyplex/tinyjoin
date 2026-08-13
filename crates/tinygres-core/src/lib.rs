@@ -17,4 +17,4 @@ pub use model::{
     QueryResult, Row, SourceCursor, TableSchema,
 };
 pub use prepared::PreparedCommit;
-pub use storage::{InMemoryStorage, StorageDriver};
+pub use storage::{InMemoryStorage, StorageDriver, VisitControl, VisitOutcome};

@@ -12,6 +12,18 @@ use crate::{
 
 const MAX_COLUMNS: usize = 256;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VisitControl {
+    Continue,
+    Stop,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VisitOutcome {
+    Complete,
+    Stopped,
+}
+
 pub trait StorageDriver {
     fn define_table(&mut self, schema: TableSchema) -> Result<()>;
     fn drop_table(&mut self, table: &str) -> Result<()>;
@@ -23,13 +35,40 @@ pub trait StorageDriver {
     ) -> Result<ApplyOutcome>;
     fn replace_table(&mut self, table: &str, rows: Vec<Row>) -> Result<ApplyOutcome>;
     fn apply_batch(&mut self, batch: &ChangeBatch) -> Result<ApplyOutcome>;
-    fn scan_table(&self, table: &str) -> Result<Vec<Row>>;
+    fn visit_table(
+        &self,
+        table: &str,
+        visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome>;
+    fn table_row_count(&self, table: &str) -> Result<usize>;
+    fn scan_table(&self, table: &str) -> Result<Vec<Row>> {
+        let mut rows = Vec::new();
+        self.visit_table(table, &mut |row| {
+            rows.push(row.clone());
+            Ok(VisitControl::Continue)
+        })?;
+        Ok(rows)
+    }
     fn lookup_primary_key(&self, table: &str, key: &Row) -> Result<Option<Row>>;
     fn define_index(&mut self, definition: IndexDefinition) -> Result<()>;
     fn drop_index(&mut self, name: &str) -> Result<()>;
     fn index_definition(&self, name: &str) -> Option<IndexDefinition>;
     fn indexes_for_table(&self, table: &str) -> Result<Vec<IndexDefinition>>;
-    fn lookup_index(&self, table: &str, columns: &[String], key: &Row) -> Result<Option<Vec<Row>>>;
+    fn visit_index(
+        &self,
+        table: &str,
+        columns: &[String],
+        key: &Row,
+        visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+    ) -> Result<Option<VisitOutcome>>;
+    fn lookup_index(&self, table: &str, columns: &[String], key: &Row) -> Result<Option<Vec<Row>>> {
+        let mut rows = Vec::new();
+        let outcome = self.visit_index(table, columns, key, &mut |row| {
+            rows.push(row.clone());
+            Ok(VisitControl::Continue)
+        })?;
+        Ok(outcome.map(|_| rows))
+    }
     fn table_schema(&self, table: &str) -> Result<TableSchema>;
     #[doc(hidden)]
     fn replace_table_unrevisioned(&mut self, table: &str, rows: Vec<Row>) -> Result<()>;
@@ -47,6 +86,10 @@ pub struct InMemoryStorage {
     scan_count: Cell<usize>,
     #[cfg(test)]
     lookup_count: Cell<usize>,
+    #[cfg(test)]
+    visited_row_count: Cell<usize>,
+    #[cfg(test)]
+    collector_count: Cell<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -147,6 +190,10 @@ impl InMemoryStorage {
             scan_count: Cell::new(0),
             #[cfg(test)]
             lookup_count: Cell::new(0),
+            #[cfg(test)]
+            visited_row_count: Cell::new(0),
+            #[cfg(test)]
+            collector_count: Cell::new(0),
         };
         for definition in snapshot.indexes {
             storage
@@ -159,6 +206,11 @@ impl InMemoryStorage {
     #[cfg(test)]
     pub(crate) fn access_counts(&self) -> (usize, usize) {
         (self.scan_count.get(), self.lookup_count.get())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn visitor_counts(&self) -> (usize, usize) {
+        (self.visited_row_count.get(), self.collector_count.get())
     }
 
     fn rebuilt_indexes_for_table(
@@ -350,13 +402,43 @@ impl StorageDriver for InMemoryStorage {
         Ok(outcome)
     }
 
-    fn scan_table(&self, table: &str) -> Result<Vec<Row>> {
+    fn visit_table(
+        &self,
+        table: &str,
+        visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
         #[cfg(test)]
         self.scan_count.set(self.scan_count.get() + 1);
+        let table = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::table_not_found(table))?;
+        for row in table.rows.values() {
+            #[cfg(test)]
+            self.visited_row_count.set(self.visited_row_count.get() + 1);
+            if visitor(row)? == VisitControl::Stop {
+                return Ok(VisitOutcome::Stopped);
+            }
+        }
+        Ok(VisitOutcome::Complete)
+    }
+
+    fn table_row_count(&self, table: &str) -> Result<usize> {
         self.tables
             .get(table)
-            .map(|table| table.rows.values().cloned().collect())
+            .map(|table| table.rows.len())
             .ok_or_else(|| EngineError::table_not_found(table))
+    }
+
+    #[cfg(test)]
+    fn scan_table(&self, table: &str) -> Result<Vec<Row>> {
+        self.collector_count.set(self.collector_count.get() + 1);
+        let mut rows = Vec::new();
+        self.visit_table(table, &mut |row| {
+            rows.push(row.clone());
+            Ok(VisitControl::Continue)
+        })?;
+        Ok(rows)
     }
 
     fn lookup_primary_key(&self, table: &str, key: &Row) -> Result<Option<Row>> {
@@ -417,7 +499,13 @@ impl StorageDriver for InMemoryStorage {
             .collect())
     }
 
-    fn lookup_index(&self, table: &str, columns: &[String], key: &Row) -> Result<Option<Vec<Row>>> {
+    fn visit_index(
+        &self,
+        table: &str,
+        columns: &[String],
+        key: &Row,
+        visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+    ) -> Result<Option<VisitOutcome>> {
         #[cfg(test)]
         self.lookup_count.set(self.lookup_count.get() + 1);
         let table_data = self
@@ -432,16 +520,33 @@ impl StorageDriver for InMemoryStorage {
             return Ok(None);
         };
         let Some(index_key) = index_key(&index.definition, key)? else {
-            return Ok(Some(vec![]));
+            return Ok(Some(VisitOutcome::Complete));
         };
-        let rows = index
+        for row in index
             .postings
             .get(&index_key)
             .into_iter()
             .flatten()
-            .filter_map(|primary_key| table_data.rows.get(primary_key).cloned())
-            .collect();
-        Ok(Some(rows))
+            .filter_map(|primary_key| table_data.rows.get(primary_key))
+        {
+            #[cfg(test)]
+            self.visited_row_count.set(self.visited_row_count.get() + 1);
+            if visitor(row)? == VisitControl::Stop {
+                return Ok(Some(VisitOutcome::Stopped));
+            }
+        }
+        Ok(Some(VisitOutcome::Complete))
+    }
+
+    #[cfg(test)]
+    fn lookup_index(&self, table: &str, columns: &[String], key: &Row) -> Result<Option<Vec<Row>>> {
+        self.collector_count.set(self.collector_count.get() + 1);
+        let mut rows = Vec::new();
+        let outcome = self.visit_index(table, columns, key, &mut |row| {
+            rows.push(row.clone());
+            Ok(VisitControl::Continue)
+        })?;
+        Ok(outcome.map(|_| rows))
     }
 
     fn table_schema(&self, table: &str) -> Result<TableSchema> {
@@ -1215,5 +1320,75 @@ mod tests {
             .code,
             "INVALID_SNAPSHOT"
         );
+    }
+
+    #[test]
+    fn visitors_stop_without_collecting_the_remaining_rows() {
+        let mut storage = storage();
+        storage
+            .replace_table(
+                "posts",
+                vec![
+                    row(json!({"id": 1})),
+                    row(json!({"id": 2})),
+                    row(json!({"id": 3})),
+                ],
+            )
+            .unwrap();
+
+        let mut visited = Vec::new();
+        let outcome = storage
+            .visit_table("posts", &mut |row| {
+                visited.push(row["id"].clone());
+                Ok(VisitControl::Stop)
+            })
+            .unwrap();
+
+        assert_eq!(outcome, VisitOutcome::Stopped);
+        assert_eq!(visited, vec![json!(1)]);
+        assert_eq!(storage.table_row_count("posts").unwrap(), 3);
+        assert_eq!(storage.visitor_counts(), (1, 0));
+    }
+
+    #[test]
+    fn index_visitors_distinguish_an_absent_index_from_an_empty_posting() {
+        let mut storage = typed_storage();
+        storage
+            .replace_table(
+                "users",
+                vec![row(json!({"id": 1, "email": "one@example.com"}))],
+            )
+            .unwrap();
+        let columns = vec!["email".to_owned()];
+        let key = row(json!({"email": "missing@example.com"}));
+        let mut calls = 0;
+
+        assert_eq!(
+            storage
+                .visit_index("users", &columns, &key, &mut |_| {
+                    calls += 1;
+                    Ok(VisitControl::Continue)
+                })
+                .unwrap(),
+            None
+        );
+        storage
+            .define_index(IndexDefinition {
+                name: "users_email".to_owned(),
+                table: "users".to_owned(),
+                columns: columns.clone(),
+                unique: false,
+            })
+            .unwrap();
+        assert_eq!(
+            storage
+                .visit_index("users", &columns, &key, &mut |_| {
+                    calls += 1;
+                    Ok(VisitControl::Continue)
+                })
+                .unwrap(),
+            Some(VisitOutcome::Complete)
+        );
+        assert_eq!(calls, 0);
     }
 }

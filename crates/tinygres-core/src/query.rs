@@ -5,7 +5,8 @@ use serde_json::{Map, Number, Value};
 
 use crate::{
     ColumnDefinition, ColumnType, EngineError, Filter, FilterOperator, NullOrder, OrderBy,
-    OrderDirection, Predicate, QueryPlan, QueryResult, Result, Row, StorageDriver,
+    OrderDirection, Predicate, QueryPlan, QueryResult, Result, Row, StorageDriver, VisitControl,
+    VisitOutcome,
 };
 
 const MAX_SQL_BYTES: usize = 64 * 1024;
@@ -17,6 +18,9 @@ const MAX_IN_VALUES: usize = 1024;
 const MAX_ORDER_COLUMNS: usize = 32;
 const MAX_PARAMETERS: usize = 1024;
 const MAX_COMMENT_DEPTH: usize = 32;
+const MAX_RESULT_ROWS: usize = 100_000;
+const MAX_SCAN_ROWS: usize = 1_000_000;
+const MAX_ORDERED_ROWS: usize = 100_000;
 
 pub(crate) fn execute<S: StorageDriver>(storage: &S, plan: &QueryPlan) -> Result<QueryResult> {
     if plan.table.trim().is_empty() {
@@ -49,6 +53,15 @@ pub(crate) fn execute<S: StorageDriver>(storage: &S, plan: &QueryPlan) -> Result
         )));
     }
     validate_predicate_complexity(plan.predicate.as_ref())?;
+
+    if plan.limit.is_some_and(|limit| limit > MAX_RESULT_ROWS) {
+        return Err(result_limit_exceeded());
+    }
+    if let Some(limit) = plan.limit {
+        plan.offset.checked_add(limit).ok_or_else(|| {
+            EngineError::invalid_query("Query OFFSET plus LIMIT exceeds the supported range")
+        })?;
+    }
 
     let schema = storage.table_schema(&plan.table)?;
     if !schema.columns.is_empty() {
@@ -89,34 +102,11 @@ pub(crate) fn execute<S: StorageDriver>(storage: &S, plan: &QueryPlan) -> Result
         });
     }
 
-    let table_rows = if let Some(key) = primary_key_lookup(plan, &schema) {
-        storage
-            .lookup_primary_key(&plan.table, &key)?
-            .into_iter()
-            .collect()
-    } else if let Some(rows) = secondary_index_lookup(storage, plan, &schema)? {
-        rows
+    let rows = if plan.order_by.is_empty() {
+        execute_unordered(storage, plan, &schema)?
     } else {
-        storage.scan_table(&plan.table)?
+        execute_ordered(storage, plan, &schema)?
     };
-    let mut rows = Vec::new();
-    for row in table_rows {
-        if !matches_filters(&row, &plan.filters, &plan.table)?
-            || !matches_predicate(&row, plan.predicate.as_ref(), &plan.table)?
-        {
-            continue;
-        }
-        rows.push(row);
-    }
-    if !plan.order_by.is_empty() {
-        sort_rows(&mut rows, &plan.order_by, &plan.table)?;
-    }
-    let rows = rows
-        .into_iter()
-        .skip(plan.offset)
-        .take(plan.limit.unwrap_or(usize::MAX))
-        .map(|row| project_row(row, plan.columns.as_deref(), &plan.table))
-        .collect::<Result<Vec<_>>>()?;
 
     Ok(QueryResult {
         revision: storage.revision(),
@@ -124,11 +114,105 @@ pub(crate) fn execute<S: StorageDriver>(storage: &S, plan: &QueryPlan) -> Result
     })
 }
 
-fn secondary_index_lookup<S: StorageDriver>(
+fn execute_unordered<S: StorageDriver>(
     storage: &S,
     plan: &QueryPlan,
     schema: &crate::TableSchema,
-) -> Result<Option<Vec<Row>>> {
+) -> Result<Vec<Row>> {
+    let mut scanned = 0_usize;
+    let mut skipped_matches = 0_usize;
+    let mut rows = Vec::new();
+    visit_candidate_rows(storage, plan, schema, &mut |row| {
+        count_scanned_row(&mut scanned)?;
+        if !matches_filters(row, &plan.filters, &plan.table)?
+            || !matches_predicate(row, plan.predicate.as_ref(), &plan.table)?
+        {
+            return Ok(VisitControl::Continue);
+        }
+        if skipped_matches < plan.offset {
+            skipped_matches += 1;
+            return Ok(VisitControl::Continue);
+        }
+        if rows.len() == MAX_RESULT_ROWS {
+            return Err(result_limit_exceeded());
+        }
+        rows.push(project_row(
+            row.clone(),
+            plan.columns.as_deref(),
+            &plan.table,
+        )?);
+        if plan.limit.is_some_and(|limit| rows.len() == limit) {
+            Ok(VisitControl::Stop)
+        } else {
+            Ok(VisitControl::Continue)
+        }
+    })?;
+    Ok(rows)
+}
+
+fn execute_ordered<S: StorageDriver>(
+    storage: &S,
+    plan: &QueryPlan,
+    schema: &crate::TableSchema,
+) -> Result<Vec<Row>> {
+    let mut scanned = 0_usize;
+    let mut rows = Vec::new();
+    visit_candidate_rows(storage, plan, schema, &mut |row| {
+        count_scanned_row(&mut scanned)?;
+        if matches_filters(row, &plan.filters, &plan.table)?
+            && matches_predicate(row, plan.predicate.as_ref(), &plan.table)?
+        {
+            if rows.len() == MAX_ORDERED_ROWS {
+                return Err(EngineError::new(
+                    "QUERY_WORK_LIMIT_EXCEEDED",
+                    format!(
+                        "An ordered query cannot collect more than {MAX_ORDERED_ROWS} matching rows"
+                    ),
+                ));
+            }
+            rows.push(row.clone());
+        }
+        Ok(VisitControl::Continue)
+    })?;
+    sort_rows(&mut rows, &plan.order_by, &plan.table)?;
+    let take = plan.limit.unwrap_or(MAX_RESULT_ROWS + 1);
+    let rows = rows
+        .into_iter()
+        .skip(plan.offset)
+        .take(take)
+        .map(|row| project_row(row, plan.columns.as_deref(), &plan.table))
+        .collect::<Result<Vec<_>>>()?;
+    if rows.len() > MAX_RESULT_ROWS {
+        return Err(result_limit_exceeded());
+    }
+    Ok(rows)
+}
+
+fn visit_candidate_rows<S: StorageDriver>(
+    storage: &S,
+    plan: &QueryPlan,
+    schema: &crate::TableSchema,
+    visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+) -> Result<VisitOutcome> {
+    if let Some(key) = primary_key_lookup(plan, schema) {
+        return match storage.lookup_primary_key(&plan.table, &key)? {
+            Some(row) if visitor(&row)? == VisitControl::Stop => Ok(VisitOutcome::Stopped),
+            _ => Ok(VisitOutcome::Complete),
+        };
+    }
+    if let Some((columns, key)) = secondary_index_key(storage, plan, schema)?
+        && let Some(outcome) = storage.visit_index(&plan.table, &columns, &key, visitor)?
+    {
+        return Ok(outcome);
+    }
+    storage.visit_table(&plan.table, visitor)
+}
+
+fn secondary_index_key<S: StorageDriver>(
+    storage: &S,
+    plan: &QueryPlan,
+    schema: &crate::TableSchema,
+) -> Result<Option<(Vec<String>, Row)>> {
     let mut equalities = Map::new();
     for filter in &plan.filters {
         if filter.operator == FilterOperator::Eq && filter.value != Value::Null {
@@ -147,10 +231,29 @@ fn secondary_index_lookup<S: StorageDriver>(
                 .iter()
                 .map(|column| (column.clone(), equalities[column].clone()))
                 .collect();
-            return storage.lookup_index(&plan.table, &definition.columns, &key);
+            return Ok(Some((definition.columns, key)));
         }
     }
     Ok(None)
+}
+
+fn count_scanned_row(scanned: &mut usize) -> Result<()> {
+    *scanned += 1;
+    if *scanned > MAX_SCAN_ROWS {
+        Err(EngineError::new(
+            "QUERY_WORK_LIMIT_EXCEEDED",
+            format!("A query cannot scan more than {MAX_SCAN_ROWS} rows"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn result_limit_exceeded() -> EngineError {
+    EngineError::new(
+        "RESULT_LIMIT_EXCEEDED",
+        format!("A query cannot return more than {MAX_RESULT_ROWS} rows"),
+    )
 }
 
 pub(crate) fn parse_sql(sql: &str, params: &[Value]) -> Result<QueryPlan> {
@@ -1574,10 +1677,15 @@ fn unsupported_shape() -> EngineError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use serde_json::json;
 
     use super::*;
-    use crate::{ColumnDefinition, Engine, InMemoryStorage, TableSchema};
+    use crate::{
+        ApplyOutcome, ChangeBatch, ColumnDefinition, Engine, InMemoryStorage, IndexDefinition,
+        TableSchema,
+    };
 
     fn row(value: Value) -> Row {
         value
@@ -1633,6 +1741,201 @@ mod tests {
         engine
     }
 
+    struct VisitorOnlyStorage {
+        schema: TableSchema,
+        repeated_row: Row,
+        repetitions: usize,
+        table_rows: Vec<Row>,
+        index: Option<(IndexDefinition, Option<Vec<Row>>)>,
+        table_visits: Cell<usize>,
+        index_visits: Cell<usize>,
+    }
+
+    impl VisitorOnlyStorage {
+        fn new(repeated_row: Row, repetitions: usize) -> Self {
+            Self {
+                schema: TableSchema {
+                    name: "items".to_owned(),
+                    primary_key: vec!["id".to_owned()],
+                    columns: vec![
+                        ColumnDefinition {
+                            name: "id".to_owned(),
+                            data_type: ColumnType::Integer,
+                            nullable: false,
+                            default: None,
+                        },
+                        ColumnDefinition {
+                            name: "user_id".to_owned(),
+                            data_type: ColumnType::Integer,
+                            nullable: false,
+                            default: None,
+                        },
+                        ColumnDefinition {
+                            name: "selected".to_owned(),
+                            data_type: ColumnType::Boolean,
+                            nullable: true,
+                            default: None,
+                        },
+                    ],
+                },
+                repeated_row,
+                repetitions,
+                table_rows: Vec::new(),
+                index: None,
+                table_visits: Cell::new(0),
+                index_visits: Cell::new(0),
+            }
+        }
+    }
+
+    impl StorageDriver for VisitorOnlyStorage {
+        fn define_table(&mut self, _schema: TableSchema) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn drop_table(&mut self, _table: &str) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn add_column(&mut self, _table: &str, _column: ColumnDefinition) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn replace_table_snapshot(
+            &mut self,
+            _schema: TableSchema,
+            _rows: Vec<Row>,
+        ) -> Result<ApplyOutcome> {
+            unimplemented!()
+        }
+
+        fn replace_table(&mut self, _table: &str, _rows: Vec<Row>) -> Result<ApplyOutcome> {
+            unimplemented!()
+        }
+
+        fn apply_batch(&mut self, _batch: &ChangeBatch) -> Result<ApplyOutcome> {
+            unimplemented!()
+        }
+
+        fn visit_table(
+            &self,
+            table: &str,
+            visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+        ) -> Result<VisitOutcome> {
+            if table != self.schema.name {
+                return Err(EngineError::table_not_found(table));
+            }
+            for row in std::iter::repeat_n(&self.repeated_row, self.repetitions)
+                .chain(self.table_rows.iter())
+            {
+                self.table_visits.set(self.table_visits.get() + 1);
+                if visitor(row)? == VisitControl::Stop {
+                    return Ok(VisitOutcome::Stopped);
+                }
+            }
+            Ok(VisitOutcome::Complete)
+        }
+
+        fn table_row_count(&self, table: &str) -> Result<usize> {
+            if table != self.schema.name {
+                return Err(EngineError::table_not_found(table));
+            }
+            Ok(self.repetitions + self.table_rows.len())
+        }
+
+        fn scan_table(&self, _table: &str) -> Result<Vec<Row>> {
+            panic!("simple queries must use visit_table")
+        }
+
+        fn lookup_primary_key(&self, _table: &str, _key: &Row) -> Result<Option<Row>> {
+            Ok(None)
+        }
+
+        fn define_index(&mut self, _definition: IndexDefinition) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn drop_index(&mut self, _name: &str) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn index_definition(&self, name: &str) -> Option<IndexDefinition> {
+            self.index
+                .as_ref()
+                .map(|(definition, _)| definition)
+                .filter(|definition| definition.name == name)
+                .cloned()
+        }
+
+        fn indexes_for_table(&self, table: &str) -> Result<Vec<IndexDefinition>> {
+            if table != self.schema.name {
+                return Err(EngineError::table_not_found(table));
+            }
+            Ok(self
+                .index
+                .as_ref()
+                .map(|(definition, _)| vec![definition.clone()])
+                .unwrap_or_default())
+        }
+
+        fn visit_index(
+            &self,
+            table: &str,
+            columns: &[String],
+            _key: &Row,
+            visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+        ) -> Result<Option<VisitOutcome>> {
+            if table != self.schema.name {
+                return Err(EngineError::table_not_found(table));
+            }
+            let Some((definition, postings)) = &self.index else {
+                return Ok(None);
+            };
+            if definition.columns != columns {
+                return Ok(None);
+            }
+            let Some(postings) = postings else {
+                return Ok(None);
+            };
+            for row in postings {
+                self.index_visits.set(self.index_visits.get() + 1);
+                if visitor(row)? == VisitControl::Stop {
+                    return Ok(Some(VisitOutcome::Stopped));
+                }
+            }
+            Ok(Some(VisitOutcome::Complete))
+        }
+
+        fn lookup_index(
+            &self,
+            _table: &str,
+            _columns: &[String],
+            _key: &Row,
+        ) -> Result<Option<Vec<Row>>> {
+            panic!("simple queries must use visit_index")
+        }
+
+        fn table_schema(&self, table: &str) -> Result<TableSchema> {
+            if table == self.schema.name {
+                Ok(self.schema.clone())
+            } else {
+                Err(EngineError::table_not_found(table))
+            }
+        }
+
+        fn replace_table_unrevisioned(&mut self, _table: &str, _rows: Vec<Row>) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn advance_revision(&mut self) -> Result<u64> {
+            unimplemented!()
+        }
+
+        fn revision(&self) -> u64 {
+            7
+        }
+    }
+
     #[test]
     fn executes_projection_parameter_filter_and_limit() {
         let result = engine()
@@ -1648,12 +1951,43 @@ mod tests {
 
     #[test]
     fn limit_zero_returns_no_rows() {
-        let result = engine()
+        let database = engine();
+        assert_eq!(
+            database
+                .query_sql("SELECT missing FROM posts LIMIT 0", &[])
+                .unwrap_err()
+                .code,
+            "COLUMN_NOT_FOUND"
+        );
+        assert_eq!(
+            database
+                .query_sql("SELECT * FROM posts WHERE id = 'bad' LIMIT 0", &[])
+                .unwrap_err()
+                .code,
+            "TYPE_MISMATCH"
+        );
+        let result = database
             .query_sql("SELECT * FROM posts LIMIT 0", &[])
             .unwrap();
 
         assert_eq!(result.revision, 1);
         assert!(result.rows.is_empty());
+        assert_eq!(database.into_storage().visitor_counts(), (0, 0));
+    }
+
+    #[test]
+    fn unordered_limits_stop_visiting_at_the_requested_window() {
+        let database = engine();
+        assert_eq!(
+            database
+                .query_sql("SELECT id FROM posts LIMIT 1 OFFSET 1", &[])
+                .unwrap()
+                .rows,
+            vec![row(json!({"id": 2}))]
+        );
+        let storage = database.into_storage();
+        assert_eq!(storage.visitor_counts(), (2, 0));
+        assert_eq!(storage.access_counts(), (1, 0));
     }
 
     #[test]
@@ -1742,6 +2076,7 @@ mod tests {
                 row(json!({"id": 2})),
             ]
         );
+        assert_eq!(database.into_storage().visitor_counts(), (6, 0));
     }
 
     #[test]
@@ -1819,7 +2154,9 @@ mod tests {
                 .rows,
             vec![row(json!({"title": "three"}))]
         );
-        assert_eq!(database.into_storage().access_counts(), (0, 1));
+        let storage = database.into_storage();
+        assert_eq!(storage.access_counts(), (0, 1));
+        assert_eq!(storage.visitor_counts(), (2, 0));
 
         let mut database = engine();
         database
@@ -1841,6 +2178,134 @@ mod tests {
             .query_sql("SELECT * FROM posts WHERE user_id = 7 OR user_id = 8", &[])
             .unwrap();
         assert_eq!(database.into_storage().access_counts(), (1, 0));
+    }
+
+    #[test]
+    fn visitor_index_absence_falls_back_but_an_empty_posting_does_not() {
+        let definition = IndexDefinition {
+            name: "items_user".to_owned(),
+            table: "items".to_owned(),
+            columns: vec!["user_id".to_owned()],
+            unique: false,
+        };
+        let matching = row(json!({"id": 1, "user_id": 7, "selected": true}));
+        let mut absent =
+            VisitorOnlyStorage::new(row(json!({"id": 0, "user_id": 0, "selected": false})), 0);
+        absent.table_rows.push(matching.clone());
+        absent.index = Some((definition.clone(), None));
+        assert_eq!(
+            execute(
+                &absent,
+                &parse_sql(
+                    "SELECT id FROM items WHERE user_id = 7 AND selected = true",
+                    &[],
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .rows,
+            vec![row(json!({"id": 1}))]
+        );
+        assert_eq!(absent.table_visits.get(), 1);
+
+        let mut empty = VisitorOnlyStorage::new(matching, 0);
+        empty.index = Some((definition, Some(Vec::new())));
+        assert!(
+            execute(
+                &empty,
+                &parse_sql("SELECT id FROM items WHERE user_id = 7", &[]).unwrap(),
+            )
+            .unwrap()
+            .rows
+            .is_empty()
+        );
+        assert_eq!(empty.table_visits.get(), 0);
+    }
+
+    #[test]
+    fn index_visitors_apply_residual_filters_before_stopping() {
+        let mut storage =
+            VisitorOnlyStorage::new(row(json!({"id": 0, "user_id": 0, "selected": false})), 0);
+        storage.index = Some((
+            IndexDefinition {
+                name: "items_user".to_owned(),
+                table: "items".to_owned(),
+                columns: vec!["user_id".to_owned()],
+                unique: false,
+            },
+            Some(vec![
+                row(json!({"id": 1, "user_id": 7, "selected": false})),
+                row(json!({"id": 2, "user_id": 7, "selected": true})),
+                row(json!({"id": 3, "user_id": 7, "selected": true})),
+            ]),
+        ));
+        assert_eq!(
+            execute(
+                &storage,
+                &parse_sql(
+                    "SELECT id FROM items WHERE user_id = 7 AND selected = true LIMIT 1",
+                    &[],
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .rows,
+            vec![row(json!({"id": 2}))]
+        );
+        assert_eq!(storage.index_visits.get(), 2);
+        assert_eq!(storage.table_visits.get(), 0);
+    }
+
+    #[test]
+    fn simple_query_work_and_result_caps_are_explicit_and_read_free_when_static() {
+        let non_match = row(json!({"id": 1, "user_id": 1, "selected": false}));
+        let storage = VisitorOnlyStorage::new(non_match.clone(), MAX_SCAN_ROWS + 1);
+        let error = execute(
+            &storage,
+            &parse_sql("SELECT * FROM items WHERE selected = true", &[]).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "QUERY_WORK_LIMIT_EXCEEDED");
+        assert_eq!(storage.table_visits.get(), MAX_SCAN_ROWS + 1);
+
+        let storage = VisitorOnlyStorage::new(
+            row(json!({"id": 1, "user_id": 1, "selected": true})),
+            MAX_RESULT_ROWS + 1,
+        );
+        assert_eq!(
+            execute(&storage, &parse_sql("SELECT * FROM items", &[]).unwrap())
+                .unwrap_err()
+                .code,
+            "RESULT_LIMIT_EXCEEDED"
+        );
+        assert_eq!(storage.table_visits.get(), MAX_RESULT_ROWS + 1);
+
+        let storage = VisitorOnlyStorage::new(
+            row(json!({"id": 1, "user_id": 1, "selected": true})),
+            MAX_ORDERED_ROWS + 1,
+        );
+        assert_eq!(
+            execute(
+                &storage,
+                &parse_sql("SELECT * FROM items ORDER BY id LIMIT 1", &[]).unwrap(),
+            )
+            .unwrap_err()
+            .code,
+            "QUERY_WORK_LIMIT_EXCEEDED"
+        );
+        assert_eq!(storage.table_visits.get(), MAX_ORDERED_ROWS + 1);
+
+        let storage = VisitorOnlyStorage::new(non_match, 1);
+        let mut plan = parse_sql("SELECT * FROM items", &[]).unwrap();
+        plan.limit = Some(MAX_RESULT_ROWS + 1);
+        assert_eq!(
+            execute(&storage, &plan).unwrap_err().code,
+            "RESULT_LIMIT_EXCEEDED"
+        );
+        plan.limit = Some(2);
+        plan.offset = usize::MAX;
+        assert_eq!(execute(&storage, &plan).unwrap_err().code, "INVALID_QUERY");
+        assert_eq!(storage.table_visits.get(), 0);
     }
 
     #[test]
