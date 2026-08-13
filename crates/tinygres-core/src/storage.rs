@@ -24,7 +24,52 @@ pub enum VisitOutcome {
     Stopped,
 }
 
-pub trait StorageDriver {
+/// Read-only relational storage used by query planning and execution.
+///
+/// Keeping this contract independent of mutation lets a page-backed reader
+/// stream rows before its copy-on-write write path is complete.
+pub trait StorageReader {
+    fn visit_table(
+        &self,
+        table: &str,
+        visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome>;
+    fn table_row_count(&self, table: &str) -> Result<usize>;
+    /// Compatibility collector for operators not yet converted to streaming execution.
+    #[doc(hidden)]
+    fn scan_table(&self, table: &str) -> Result<Vec<Row>> {
+        let mut rows = Vec::new();
+        self.visit_table(table, &mut |row| {
+            rows.push(row.clone());
+            Ok(VisitControl::Continue)
+        })?;
+        Ok(rows)
+    }
+    fn lookup_primary_key(&self, table: &str, key: &Row) -> Result<Option<Row>>;
+    fn index_definition(&self, name: &str) -> Option<IndexDefinition>;
+    fn indexes_for_table(&self, table: &str) -> Result<Vec<IndexDefinition>>;
+    fn visit_index(
+        &self,
+        table: &str,
+        columns: &[String],
+        key: &Row,
+        visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+    ) -> Result<Option<VisitOutcome>>;
+    /// Compatibility collector for callers that need all matching index rows.
+    #[doc(hidden)]
+    fn lookup_index(&self, table: &str, columns: &[String], key: &Row) -> Result<Option<Vec<Row>>> {
+        let mut rows = Vec::new();
+        let outcome = self.visit_index(table, columns, key, &mut |row| {
+            rows.push(row.clone());
+            Ok(VisitControl::Continue)
+        })?;
+        Ok(outcome.map(|_| rows))
+    }
+    fn table_schema(&self, table: &str) -> Result<TableSchema>;
+    fn revision(&self) -> u64;
+}
+
+pub trait StorageDriver: StorageReader {
     fn define_table(&mut self, schema: TableSchema) -> Result<()>;
     fn drop_table(&mut self, table: &str) -> Result<()>;
     fn add_column(&mut self, table: &str, column: ColumnDefinition) -> Result<()>;
@@ -35,46 +80,12 @@ pub trait StorageDriver {
     ) -> Result<ApplyOutcome>;
     fn replace_table(&mut self, table: &str, rows: Vec<Row>) -> Result<ApplyOutcome>;
     fn apply_batch(&mut self, batch: &ChangeBatch) -> Result<ApplyOutcome>;
-    fn visit_table(
-        &self,
-        table: &str,
-        visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
-    ) -> Result<VisitOutcome>;
-    fn table_row_count(&self, table: &str) -> Result<usize>;
-    fn scan_table(&self, table: &str) -> Result<Vec<Row>> {
-        let mut rows = Vec::new();
-        self.visit_table(table, &mut |row| {
-            rows.push(row.clone());
-            Ok(VisitControl::Continue)
-        })?;
-        Ok(rows)
-    }
-    fn lookup_primary_key(&self, table: &str, key: &Row) -> Result<Option<Row>>;
     fn define_index(&mut self, definition: IndexDefinition) -> Result<()>;
     fn drop_index(&mut self, name: &str) -> Result<()>;
-    fn index_definition(&self, name: &str) -> Option<IndexDefinition>;
-    fn indexes_for_table(&self, table: &str) -> Result<Vec<IndexDefinition>>;
-    fn visit_index(
-        &self,
-        table: &str,
-        columns: &[String],
-        key: &Row,
-        visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
-    ) -> Result<Option<VisitOutcome>>;
-    fn lookup_index(&self, table: &str, columns: &[String], key: &Row) -> Result<Option<Vec<Row>>> {
-        let mut rows = Vec::new();
-        let outcome = self.visit_index(table, columns, key, &mut |row| {
-            rows.push(row.clone());
-            Ok(VisitControl::Continue)
-        })?;
-        Ok(outcome.map(|_| rows))
-    }
-    fn table_schema(&self, table: &str) -> Result<TableSchema>;
     #[doc(hidden)]
     fn replace_table_unrevisioned(&mut self, table: &str, rows: Vec<Row>) -> Result<()>;
     #[doc(hidden)]
     fn advance_revision(&mut self) -> Result<u64>;
-    fn revision(&self) -> u64;
 }
 
 #[derive(Clone, Debug, Default)]
@@ -402,6 +413,70 @@ impl StorageDriver for InMemoryStorage {
         Ok(outcome)
     }
 
+    fn define_index(&mut self, definition: IndexDefinition) -> Result<()> {
+        validate_index_definition(&definition, &self.tables)?;
+        if self.indexes.contains_key(&definition.name) {
+            return Err(EngineError::index_already_exists(&definition.name));
+        }
+        let rows = &self
+            .tables
+            .get(&definition.table)
+            .expect("index validation resolved the table")
+            .rows;
+        let postings = build_postings(&definition, rows)?;
+        self.indexes.insert(
+            definition.name.clone(),
+            IndexData {
+                definition,
+                postings,
+            },
+        );
+        Ok(())
+    }
+
+    fn drop_index(&mut self, name: &str) -> Result<()> {
+        if self.indexes.remove(name).is_none() {
+            return Err(EngineError::new(
+                "INDEX_NOT_FOUND",
+                format!("Index `{name}` is not defined"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn replace_table_unrevisioned(&mut self, table: &str, rows: Vec<Row>) -> Result<()> {
+        let current = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::table_not_found(table))?;
+        let mut replacement = BTreeMap::new();
+
+        for row in rows {
+            let row = normalize_row(&current.schema, row)?;
+            let key = row_key(&current.schema, &row)?;
+            if replacement.insert(key, row).is_some() {
+                return Err(EngineError::invalid_change(format!(
+                    "Snapshot for `{table}` contains a duplicate primary key"
+                )));
+            }
+        }
+
+        let indexes = self.rebuilt_indexes_for_table(table, &replacement)?;
+        self.tables
+            .get_mut(table)
+            .expect("table was checked above")
+            .rows = replacement;
+        self.indexes = indexes;
+        Ok(())
+    }
+
+    fn advance_revision(&mut self) -> Result<u64> {
+        self.revision = next_revision(self.revision)?;
+        Ok(self.revision)
+    }
+}
+
+impl StorageReader for InMemoryStorage {
     fn visit_table(
         &self,
         table: &str,
@@ -450,37 +525,6 @@ impl StorageDriver for InMemoryStorage {
             .ok_or_else(|| EngineError::table_not_found(table))?;
         let key = row_key(&table.schema, key)?;
         Ok(table.rows.get(&key).cloned())
-    }
-
-    fn define_index(&mut self, definition: IndexDefinition) -> Result<()> {
-        validate_index_definition(&definition, &self.tables)?;
-        if self.indexes.contains_key(&definition.name) {
-            return Err(EngineError::index_already_exists(&definition.name));
-        }
-        let rows = &self
-            .tables
-            .get(&definition.table)
-            .expect("index validation resolved the table")
-            .rows;
-        let postings = build_postings(&definition, rows)?;
-        self.indexes.insert(
-            definition.name.clone(),
-            IndexData {
-                definition,
-                postings,
-            },
-        );
-        Ok(())
-    }
-
-    fn drop_index(&mut self, name: &str) -> Result<()> {
-        if self.indexes.remove(name).is_none() {
-            return Err(EngineError::new(
-                "INDEX_NOT_FOUND",
-                format!("Index `{name}` is not defined"),
-            ));
-        }
-        Ok(())
     }
 
     fn index_definition(&self, name: &str) -> Option<IndexDefinition> {
@@ -554,37 +598,6 @@ impl StorageDriver for InMemoryStorage {
             .get(table)
             .map(|table| table.schema.clone())
             .ok_or_else(|| EngineError::table_not_found(table))
-    }
-
-    fn replace_table_unrevisioned(&mut self, table: &str, rows: Vec<Row>) -> Result<()> {
-        let current = self
-            .tables
-            .get(table)
-            .ok_or_else(|| EngineError::table_not_found(table))?;
-        let mut replacement = BTreeMap::new();
-
-        for row in rows {
-            let row = normalize_row(&current.schema, row)?;
-            let key = row_key(&current.schema, &row)?;
-            if replacement.insert(key, row).is_some() {
-                return Err(EngineError::invalid_change(format!(
-                    "Snapshot for `{table}` contains a duplicate primary key"
-                )));
-            }
-        }
-
-        let indexes = self.rebuilt_indexes_for_table(table, &replacement)?;
-        self.tables
-            .get_mut(table)
-            .expect("table was checked above")
-            .rows = replacement;
-        self.indexes = indexes;
-        Ok(())
-    }
-
-    fn advance_revision(&mut self) -> Result<u64> {
-        self.revision = next_revision(self.revision)?;
-        Ok(self.revision)
     }
 
     fn revision(&self) -> u64 {

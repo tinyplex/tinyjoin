@@ -3,10 +3,10 @@ use std::str::FromStr;
 
 use serde_json::{Map, Number, Value};
 
+use crate::storage::StorageReader;
 use crate::{
     ColumnDefinition, ColumnType, EngineError, Filter, FilterOperator, NullOrder, OrderBy,
-    OrderDirection, Predicate, QueryPlan, QueryResult, Result, Row, StorageDriver, VisitControl,
-    VisitOutcome,
+    OrderDirection, Predicate, QueryPlan, QueryResult, Result, Row, VisitControl, VisitOutcome,
 };
 
 const MAX_SQL_BYTES: usize = 64 * 1024;
@@ -22,7 +22,7 @@ const MAX_RESULT_ROWS: usize = 100_000;
 const MAX_SCAN_ROWS: usize = 1_000_000;
 const MAX_ORDERED_ROWS: usize = 100_000;
 
-pub(crate) fn execute<S: StorageDriver>(storage: &S, plan: &QueryPlan) -> Result<QueryResult> {
+pub(crate) fn execute<S: StorageReader>(storage: &S, plan: &QueryPlan) -> Result<QueryResult> {
     if plan.table.trim().is_empty() {
         return Err(EngineError::invalid_query(
             "A query must name exactly one table",
@@ -114,7 +114,7 @@ pub(crate) fn execute<S: StorageDriver>(storage: &S, plan: &QueryPlan) -> Result
     })
 }
 
-fn execute_unordered<S: StorageDriver>(
+fn execute_unordered<S: StorageReader>(
     storage: &S,
     plan: &QueryPlan,
     schema: &crate::TableSchema,
@@ -150,7 +150,7 @@ fn execute_unordered<S: StorageDriver>(
     Ok(rows)
 }
 
-fn execute_ordered<S: StorageDriver>(
+fn execute_ordered<S: StorageReader>(
     storage: &S,
     plan: &QueryPlan,
     schema: &crate::TableSchema,
@@ -188,7 +188,7 @@ fn execute_ordered<S: StorageDriver>(
     Ok(rows)
 }
 
-fn visit_candidate_rows<S: StorageDriver>(
+fn visit_candidate_rows<S: StorageReader>(
     storage: &S,
     plan: &QueryPlan,
     schema: &crate::TableSchema,
@@ -208,7 +208,7 @@ fn visit_candidate_rows<S: StorageDriver>(
     storage.visit_table(&plan.table, visitor)
 }
 
-fn secondary_index_key<S: StorageDriver>(
+fn secondary_index_key<S: StorageReader>(
     storage: &S,
     plan: &QueryPlan,
     schema: &crate::TableSchema,
@@ -1682,10 +1682,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::{
-        ApplyOutcome, ChangeBatch, ColumnDefinition, Engine, InMemoryStorage, IndexDefinition,
-        TableSchema,
-    };
+    use crate::{ColumnDefinition, Engine, InMemoryStorage, IndexDefinition, TableSchema};
 
     fn row(value: Value) -> Row {
         value
@@ -1788,35 +1785,7 @@ mod tests {
         }
     }
 
-    impl StorageDriver for VisitorOnlyStorage {
-        fn define_table(&mut self, _schema: TableSchema) -> Result<()> {
-            unimplemented!()
-        }
-
-        fn drop_table(&mut self, _table: &str) -> Result<()> {
-            unimplemented!()
-        }
-
-        fn add_column(&mut self, _table: &str, _column: ColumnDefinition) -> Result<()> {
-            unimplemented!()
-        }
-
-        fn replace_table_snapshot(
-            &mut self,
-            _schema: TableSchema,
-            _rows: Vec<Row>,
-        ) -> Result<ApplyOutcome> {
-            unimplemented!()
-        }
-
-        fn replace_table(&mut self, _table: &str, _rows: Vec<Row>) -> Result<ApplyOutcome> {
-            unimplemented!()
-        }
-
-        fn apply_batch(&mut self, _batch: &ChangeBatch) -> Result<ApplyOutcome> {
-            unimplemented!()
-        }
-
+    impl StorageReader for VisitorOnlyStorage {
         fn visit_table(
             &self,
             table: &str,
@@ -1849,14 +1818,6 @@ mod tests {
 
         fn lookup_primary_key(&self, _table: &str, _key: &Row) -> Result<Option<Row>> {
             Ok(None)
-        }
-
-        fn define_index(&mut self, _definition: IndexDefinition) -> Result<()> {
-            unimplemented!()
-        }
-
-        fn drop_index(&mut self, _name: &str) -> Result<()> {
-            unimplemented!()
         }
 
         fn index_definition(&self, name: &str) -> Option<IndexDefinition> {
@@ -1921,14 +1882,6 @@ mod tests {
             } else {
                 Err(EngineError::table_not_found(table))
             }
-        }
-
-        fn replace_table_unrevisioned(&mut self, _table: &str, _rows: Vec<Row>) -> Result<()> {
-            unimplemented!()
-        }
-
-        fn advance_revision(&mut self) -> Result<u64> {
-            unimplemented!()
         }
 
         fn revision(&self) -> u64 {
@@ -2178,6 +2131,26 @@ mod tests {
             .query_sql("SELECT * FROM posts WHERE user_id = 7 OR user_id = 8", &[])
             .unwrap();
         assert_eq!(database.into_storage().access_counts(), (1, 0));
+    }
+
+    #[test]
+    fn engine_queries_a_storage_reader_without_a_write_contract() {
+        let mut storage =
+            VisitorOnlyStorage::new(row(json!({"id": 0, "user_id": 0, "selected": false})), 0);
+        storage
+            .table_rows
+            .push(row(json!({"id": 1, "user_id": 7, "selected": true})));
+        let engine = Engine::new(storage);
+
+        let result = engine
+            .query_sql(
+                "SELECT id FROM items WHERE user_id = 7 AND selected = true",
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(result.revision, 7);
+        assert_eq!(result.rows, vec![row(json!({"id": 1}))]);
     }
 
     #[test]

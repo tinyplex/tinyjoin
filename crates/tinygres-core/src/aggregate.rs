@@ -8,9 +8,10 @@ use crate::query::{
     Token, bind_parameter, is_reserved_keyword, matches_predicate, parse_predicate_at, tokenize,
     validate_predicate_columns, validate_predicate_types, validate_sql_input,
 };
+use crate::storage::StorageReader;
 use crate::{
     ColumnDefinition, ColumnType, EngineError, NullOrder, OrderBy, OrderDirection, Predicate,
-    QueryResult, Result, Row, StorageDriver, TableSchema,
+    QueryResult, Result, Row, TableSchema,
 };
 
 const MAX_SELECT_ITEMS: usize = 256;
@@ -112,7 +113,7 @@ pub(crate) fn parse_sql(sql: &str, params: &[Value]) -> Result<AggregatePlan> {
     Parser::new(tokenize(sql)?, params).parse()
 }
 
-pub(crate) fn execute<S: StorageDriver>(storage: &S, plan: &AggregatePlan) -> Result<QueryResult> {
+pub(crate) fn execute<S: StorageReader>(storage: &S, plan: &AggregatePlan) -> Result<QueryResult> {
     let schema = storage.table_schema(&plan.table)?;
     validate_plan(plan, &schema)?;
 

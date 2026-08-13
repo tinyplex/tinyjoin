@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::storage::StorageReader;
 use crate::{
     Change, ChangeBatch, EngineError, InMemoryStorage, IndexDefinition, Result, Row, StorageDriver,
     TableSchema,

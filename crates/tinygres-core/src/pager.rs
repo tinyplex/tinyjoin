@@ -132,6 +132,8 @@ impl<D: PageDevice> Pager<D> {
             next_bitmap,
             new_pages: BTreeSet::new(),
             written_pages: BTreeSet::new(),
+            next_allocation_page_id: FIRST_DATA_PAGE_ID,
+            failed: false,
             finished: false,
         })
     }
@@ -176,6 +178,8 @@ pub struct PagerWriteTransaction<'a, D: PageDevice> {
     next_bitmap: AllocationBitmap,
     new_pages: BTreeSet<PageId>,
     written_pages: BTreeSet<PageId>,
+    next_allocation_page_id: PageId,
+    failed: bool,
     finished: bool,
 }
 
@@ -184,7 +188,28 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
         self.candidate
     }
 
-    /// Allocates the lowest safe page ID.
+    /// Returns the generation which this candidate will publish.
+    pub fn generation(&self) -> Result<u64> {
+        self.ensure_open()?;
+        self.pager
+            .active
+            .superblock
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| pager_error("The page generation space is exhausted"))
+    }
+
+    /// Reports whether `id` was allocated by this write transaction.
+    pub fn owns_page(&self, id: PageId) -> bool {
+        !self.finished && self.new_pages.contains(&id)
+    }
+
+    /// Prevents a partially-built higher-level structure from being published.
+    pub(crate) fn mark_failed(&mut self) {
+        self.failed = true;
+    }
+
+    /// Allocates the next safe page ID, wrapping once to reuse lower free pages.
     ///
     /// Pages freed by this same transaction are not reusable until a later generation because
     /// they remain reachable from the currently active root. When allocation extends the physical
@@ -192,8 +217,9 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
     /// candidate pages in any order without violating a dense PageDevice contract.
     pub fn allocate_page(&mut self) -> Result<PageId> {
         self.ensure_open()?;
+        let start = self.next_allocation_page_id;
         let mut selected = None;
-        for id in FIRST_DATA_PAGE_ID..MAX_PAGE_COUNT {
+        for id in (start..MAX_PAGE_COUNT).chain(FIRST_DATA_PAGE_ID..start) {
             if !self.pager.active.allocation_bitmap.is_allocated(id)?
                 && !self.next_bitmap.is_allocated(id)?
             {
@@ -209,6 +235,11 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
                 ),
             )
         })?;
+        self.next_allocation_page_id = if id + 1 == MAX_PAGE_COUNT {
+            FIRST_DATA_PAGE_ID
+        } else {
+            id + 1
+        };
 
         let page_count = self.pager.device.page_count();
         if id > page_count {
@@ -388,6 +419,11 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
     fn ensure_open(&self) -> Result<()> {
         if self.finished {
             Err(pager_error("The write transaction is already finished"))
+        } else if self.failed {
+            Err(EngineError::new(
+                "TRANSACTION_FAILED",
+                "The page transaction encountered an error and must be aborted",
+            ))
         } else {
             self.pager.ensure_usable()
         }
@@ -862,7 +898,7 @@ mod tests {
     fn every_interrupted_empty_bootstrap_can_be_reopened_and_completed() {
         // Initialization performs eight zero writes, six bitmap writes, a bitmap flush, two
         // superblock writes, and a final flush. A crash after each possible before/after failure
-        // must leave only zero pages or exact generation-1 empty metadata components.
+        // may leave a bytewise mix of zero pages and exact generation-1 empty metadata pages.
         for operation in 1..=18 {
             for timing in [FailureTiming::Before, FailureTiming::After] {
                 let device = FaultDevice::default();
@@ -890,21 +926,31 @@ mod tests {
     fn torn_empty_bootstrap_pages_can_be_reopened_and_completed() {
         let (_, expected) = empty_metadata_layout().unwrap();
         for (page_id, expected_page) in expected.iter().enumerate() {
-            for split in [1, PAGE_SIZE / 2, PAGE_SIZE - 1] {
-                let device = FaultDevice::default();
-                {
-                    let mut state = device.0.borrow_mut();
-                    state.working_pages = vec![[0; PAGE_SIZE]; FIRST_DATA_PAGE_ID as usize];
-                    state.working_pages[page_id][..split].copy_from_slice(&expected_page[..split]);
-                    state.durable_pages = state.working_pages.clone();
-                }
+            for expected_to_zero in [false, true] {
+                for split in [1, PAGE_SIZE / 2, PAGE_SIZE - 1] {
+                    let device = FaultDevice::default();
+                    {
+                        let mut state = device.0.borrow_mut();
+                        state.working_pages = vec![[0; PAGE_SIZE]; FIRST_DATA_PAGE_ID as usize];
+                        if expected_to_zero {
+                            state.working_pages[page_id] = *expected_page;
+                            state.working_pages[page_id][..split].fill(0);
+                        } else {
+                            state.working_pages[page_id][..split]
+                                .copy_from_slice(&expected_page[..split]);
+                        }
+                        state.durable_pages = state.working_pages.clone();
+                    }
 
-                let pager = Pager::open_or_create(device).unwrap_or_else(|error| {
-                    panic!("torn bootstrap page {page_id} at byte {split} did not recover: {error}")
-                });
-                assert_eq!(pager.generation(), 1);
-                assert_eq!(pager.catalog_root_page_id(), None);
-                assert_eq!(pager.physical_page_count(), FIRST_DATA_PAGE_ID);
+                    let pager = Pager::open_or_create(device).unwrap_or_else(|error| {
+                        panic!(
+                            "torn bootstrap page {page_id} at byte {split} (expected_to_zero={expected_to_zero}) did not recover: {error}"
+                        )
+                    });
+                    assert_eq!(pager.generation(), 1);
+                    assert_eq!(pager.catalog_root_page_id(), None);
+                    assert_eq!(pager.physical_page_count(), FIRST_DATA_PAGE_ID);
+                }
             }
         }
     }

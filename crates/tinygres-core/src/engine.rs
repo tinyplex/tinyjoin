@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use serde_json::Value;
 
+use crate::storage::StorageReader;
 use crate::{
     ApplyOutcome, ChangeBatch, EngineError, ExecuteResult, InMemoryStorage, PreparedCommit,
     QueryPlan, QueryResult, Result, Row, StorageDriver, TableSchema,
@@ -202,7 +203,7 @@ impl Engine<InMemoryStorage> {
     }
 }
 
-impl<S: StorageDriver> Engine<S> {
+impl<S> Engine<S> {
     pub fn new(storage: S) -> Self {
         Self {
             storage,
@@ -210,7 +211,9 @@ impl<S: StorageDriver> Engine<S> {
             prepared: None,
         }
     }
+}
 
+impl<S: StorageDriver> Engine<S> {
     pub fn define_table(&mut self, schema: TableSchema) -> Result<()> {
         self.ensure_no_prepared()?;
         self.ensure_no_transaction()?;
@@ -238,7 +241,9 @@ impl<S: StorageDriver> Engine<S> {
         self.ensure_no_transaction()?;
         self.storage.apply_batch(batch)
     }
+}
 
+impl<S: StorageReader> Engine<S> {
     pub fn query(&self, plan: &QueryPlan) -> Result<QueryResult> {
         crate::query::execute(self.read_storage(), plan)
     }
@@ -261,7 +266,9 @@ impl<S: StorageDriver> Engine<S> {
     pub fn revision(&self) -> u64 {
         self.storage.revision()
     }
+}
 
+impl<S> Engine<S> {
     pub fn in_transaction(&self) -> bool {
         self.transaction.is_some()
     }

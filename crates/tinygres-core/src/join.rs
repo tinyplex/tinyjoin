@@ -8,9 +8,10 @@ use crate::query::{
     Token, bind_parameter, is_reserved_keyword, matches_predicate, parse_predicate_at, tokenize,
     validate_sql_input,
 };
+use crate::storage::StorageReader;
 use crate::{
     ColumnDefinition, ColumnType, EngineError, FilterOperator, NullOrder, OrderDirection,
-    Predicate, QueryResult, Result, Row, StorageDriver, TableSchema,
+    Predicate, QueryResult, Result, Row, TableSchema,
 };
 
 const MAX_PROJECTIONS: usize = 256;
@@ -104,7 +105,7 @@ pub(crate) fn parse_sql(sql: &str, params: &[Value]) -> Result<JoinPlan> {
     Parser::new(tokenize(sql)?, params).parse()
 }
 
-pub(crate) fn execute<S: StorageDriver>(storage: &S, plan: &JoinPlan) -> Result<QueryResult> {
+pub(crate) fn execute<S: StorageReader>(storage: &S, plan: &JoinPlan) -> Result<QueryResult> {
     let left = Relation {
         schema: storage.table_schema(&plan.left.table)?,
         source: plan.left.clone(),

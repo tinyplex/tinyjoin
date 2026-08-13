@@ -1,4 +1,5 @@
 mod aggregate;
+mod btree;
 mod cache;
 mod device;
 mod engine;
@@ -13,6 +14,10 @@ mod snapshot;
 mod statement;
 mod storage;
 
+pub use btree::{
+    Btree, BtreeCursor, MAX_BTREE_INLINE_ENTRY_BYTES, MAX_BTREE_INLINE_VALUE_BYTES,
+    MAX_BTREE_KEY_BYTES, TreeId,
+};
 pub use cache::{
     CandidateId, DEFAULT_PAGE_CACHE_BYTES, DEFAULT_PAGE_CACHE_PAGES, MAX_PAGE_CACHE_BYTES,
     MAX_PAGE_CACHE_PAGES, PageCache,
@@ -34,4 +39,4 @@ pub use page::{
 };
 pub use pager::{Pager, PagerWriteTransaction};
 pub use prepared::PreparedCommit;
-pub use storage::{InMemoryStorage, StorageDriver, VisitControl, VisitOutcome};
+pub use storage::{InMemoryStorage, StorageDriver, StorageReader, VisitControl, VisitOutcome};
