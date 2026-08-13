@@ -27,8 +27,6 @@ import {
   type PreparedBuiltinSource,
   type SourceIdentityHasher,
 } from './builtin-source.js';
-import {createPersistentEngine} from './persistent-engine.js';
-import {createOpfsSnapshotStore} from './snapshot-store.js';
 
 export interface WorkerScope {
   postMessage(message: WorkerResponse | WorkerEvent): void;
@@ -568,8 +566,13 @@ async function createLegacyConfiguredEngine(
     return engine;
   }
 
-  let store: Awaited<ReturnType<typeof createOpfsSnapshotStore>> | undefined;
+  let store: import('./snapshot-store.js').SnapshotStore | undefined;
   try {
+    const [{createPersistentEngine}, {createOpfsSnapshotStore}] =
+      await Promise.all([
+        import('./persistent-engine.js'),
+        import('./snapshot-store.js'),
+      ]);
     store = await createOpfsSnapshotStore(storage.name);
     return createPersistentEngine(engine, store);
   } catch (error) {
