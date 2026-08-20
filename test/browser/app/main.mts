@@ -1,5 +1,5 @@
 import {
-  createClient,
+  create,
   type ChangeBatch,
   type TableSchema,
 } from '../../../dist/index.js';
@@ -54,7 +54,7 @@ let invalidations = 0;
 let simulatedChanges = 0;
 
 async function boot(): Promise<void> {
-  const database = createClient({schemas: [postsSchema]});
+  const database = create({schemas: [postsSchema]});
   await database.ready();
   await database.replaceTable(postsSchema, initialPosts);
   await renderQuery(database);
@@ -138,7 +138,7 @@ async function boot(): Promise<void> {
 }
 
 async function pageTransactionDdlProbe(
-  database: ReturnType<typeof createClient>,
+  database: ReturnType<typeof create>,
 ): Promise<{
   committedRows: number;
   ddlCodes: string[];
@@ -363,7 +363,7 @@ async function joinDatabaseProbe(): Promise<{
     article_id: number | null;
   }>;
 }> {
-  const database = createClient();
+  const database = create();
   try {
     await database.ready();
     await database.exec(`
@@ -424,7 +424,7 @@ async function joinDatabaseProbe(): Promise<{
 }
 
 async function renderQuery(
-  database: ReturnType<typeof createClient>,
+  database: ReturnType<typeof create>,
 ): Promise<void> {
   const startedAt = performance.now();
   const result = await database.query<Post>(
@@ -600,7 +600,7 @@ function openOpfsClient(databaseName: string, schemas: TableSchema[]) {
     {name: `tinygres-${databaseName}`, type: 'module'},
   );
   return {
-    client: createClient({
+    client: create({
       worker,
       schemas,
       storage: {kind: 'opfs', name: databaseName},

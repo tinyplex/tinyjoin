@@ -1,4 +1,4 @@
-import {createClient, type ClientOptions} from 'tinygres';
+import {create, type ClientOptions} from 'tinygres';
 
 type Post = {
   id: number;
@@ -37,7 +37,7 @@ async function run(
   workerMode: string,
   persistence: string | null,
 ): Promise<void> {
-  const database = createClient(clientOptions);
+  const database = create(clientOptions);
   let succeeded = false;
 
   try {

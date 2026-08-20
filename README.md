@@ -66,7 +66,7 @@ appears first in `PATH`, then checks for the target before invoking `wasm-pack`.
 ## Browser API
 
 ```ts
-import { createClient } from "tinygres";
+import { create } from "tinygres";
 
 type Task = {
   id: number;
@@ -74,11 +74,9 @@ type Task = {
   done: boolean;
 };
 
-const db = createClient({
+const db = create({
   storage: { kind: "opfs", name: "my-app-v1" },
 });
-
-await db.ready();
 
 await db.exec(`
   CREATE TABLE tasks (
@@ -144,14 +142,17 @@ atomically replaces one table and `applyBatch({changes})` atomically applies
 explicit `upsert` and `delete` operations. These are local database operations;
 they perform no I/O beyond the configured database storage.
 
-`createClient` creates a dedicated module worker by default. It is safe
+`create` starts opening the database in a dedicated module worker and returns
+the client immediately. `exec()`, `query()`, and the other async operations
+wait for initialization automatically. Call `ready()` only when an application
+needs to observe opening or initialization separately. It is safe
 to import during server rendering; the worker is only constructed when the
 function is called in a browser.
 
 For an application-owned worker, pass `worker`, `workerFactory`, or `workerUrl`:
 
 ```ts
-const db = createClient({
+const db = create({
   workerFactory: () =>
     new Worker(new URL("./tinygres.worker.ts", import.meta.url), {
       name: "tinygres",
@@ -176,7 +177,7 @@ Memory remains the default. Opt into persistent browser storage by assigning a
 stable name to the database:
 
 ```ts
-const db = createClient({
+const db = create({
   schemas: [{ name: "posts", primaryKey: ["id"] }],
   storage: { kind: "opfs", name: "my-project-public-posts-v1" },
 });

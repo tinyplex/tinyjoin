@@ -347,7 +347,7 @@ class ClientTransaction implements Transaction, QueryExecutor {
   }
 }
 
-export function createClient(options: ClientOptions = {}): Client {
+export function create(options: ClientOptions = {}): Client {
   return new Client(options);
 }
 

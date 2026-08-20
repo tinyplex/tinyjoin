@@ -1,4 +1,4 @@
-export {createClient, Client} from './client/client.js';
+export {create, Client} from './client/client.js';
 export type {
   SubscriptionOptions,
   TablesChangedEvent,

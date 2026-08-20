@@ -99,7 +99,7 @@ const ssrOutput = run(
   [
     '--input-type=module',
     '--eval',
-    "const pkg = await import('tinygres'); if (typeof pkg.createClient !== 'function') throw new Error('missing client export'); console.log('SSR_IMPORT_OK');",
+    "const pkg = await import('tinygres'); if (typeof pkg.create !== 'function') throw new Error('missing create export'); console.log('SSR_IMPORT_OK');",
   ],
   appDirectory,
 );
