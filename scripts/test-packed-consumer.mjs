@@ -1,6 +1,5 @@
 import {spawn, spawnSync} from 'node:child_process';
 import {rmSync} from 'node:fs';
-import {createServer} from 'node:http';
 import {
   cp,
   mkdir,
@@ -16,12 +15,8 @@ import {dirname, join, relative, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 import {chromium} from '@playwright/test';
-import {WebSocketServer} from 'ws';
 
-import {
-  requireWasmArtifacts,
-  wasmArtifacts,
-} from './wasm-artifacts.mjs';
+import {requireWasmArtifacts, wasmArtifacts} from './wasm-artifacts.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const fixture = resolve(root, 'test/consumers/vite');
@@ -41,7 +36,7 @@ await mkdir(packageDirectory, {recursive: true});
 
 // Build and pack the same clean dist directory that is published to npm.
 run(npm, ['run', 'build'], root);
-await assertBuildLibRejectsMissingMigrationArtifact();
+await assertBuildLibRejectsMissingWasmArtifacts();
 const packOutput = run(
   npm,
   [
@@ -67,7 +62,9 @@ await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 run(npm, ['install', '--no-audit', '--no-fund'], appDirectory);
 const installedPackage = resolve(appDirectory, 'node_modules/tinygres');
 const installedRealPath = await realpath(installedPackage);
-const nodeModulesRealPath = await realpath(resolve(appDirectory, 'node_modules'));
+const nodeModulesRealPath = await realpath(
+  resolve(appDirectory, 'node_modules'),
+);
 if (installedRealPath !== resolve(nodeModulesRealPath, 'tinygres')) {
   throw new Error(
     `Expected a packed install under node_modules, received ${installedRealPath}`,
@@ -95,6 +92,7 @@ if (
     `Published TinyGres unexpectedly has runtime dependencies: ${Object.keys(installedManifest.dependencies).join(', ')}`,
   );
 }
+await assertInstalledOpfsLoader(installedPackage);
 
 const ssrOutput = run(
   process.execPath,
@@ -112,15 +110,16 @@ if (!ssrOutput.includes('SSR_IMPORT_OK')) {
 run(npm, ['run', 'typecheck'], appDirectory);
 run(npm, ['run', 'build'], appDirectory);
 const builtFiles = await listFiles(resolve(appDirectory, 'dist'));
-await assertConsumerMigrationBoundary(builtFiles);
+await assertConsumerPrivateRuntimeBoundary(builtFiles);
 if (!builtFiles.some((file) => file.endsWith('.wasm'))) {
-  throw new Error(`The consumer build emitted no WASM asset:\n${builtFiles.join('\n')}`);
+  throw new Error(
+    `The consumer build emitted no WASM asset:\n${builtFiles.join('\n')}`,
+  );
 }
 
 let server;
 let serverOutput = '';
 let browser;
-let supabaseMock;
 let completed = false;
 try {
   server = spawn(
@@ -147,21 +146,23 @@ try {
   server.stderr.on('data', (chunk) => {
     serverOutput += String(chunk);
   });
-  supabaseMock = await startSupabaseMock();
   await waitForServer(server, baseUrl, () => serverOutput);
   browser = await chromium.launch({headless: true});
   const page = await browser.newPage();
+  // Routing disables Chromium's HTTP cache. Every lazy module/WASM load is
+  // therefore observable on the exact navigation that requested it.
+  await page.route('**/*', (route) => route.continue());
   const runtimeRequests = [];
   page.on('request', (request) => runtimeRequests.push(request.url()));
 
-  const appLocal = await exerciseWithoutMigration(
+  const appLocal = await exerciseMemory(
     page,
     `${baseUrl}/?worker=app-local`,
     runtimeRequests,
   );
   console.log(`APP_LOCAL_WORKER_OK ${JSON.stringify(appLocal)}`);
 
-  const packageDefault = await exerciseWithoutMigration(
+  const packageDefault = await exerciseMemory(
     page,
     `${baseUrl}/?worker=default`,
     runtimeRequests,
@@ -169,52 +170,29 @@ try {
   console.log(`PACKAGE_DEFAULT_WORKER_OK ${JSON.stringify(packageDefault)}`);
 
   for (const workerMode of ['app-local', 'default']) {
-    const parameters = new URLSearchParams({
+    const freshDatabaseName = `packed-fresh-${workerMode}-${Date.now()}`;
+    const freshParameters = new URLSearchParams({
       worker: workerMode,
-      source: 'supabase',
-      supabaseUrl: supabaseMock.url,
+      database: freshDatabaseName,
     });
-    const result = await exerciseSupabaseWithoutMigration(
+    const written = await exerciseFreshOpfs(
       page,
-      `${baseUrl}/?${parameters}`,
+      `${baseUrl}/?${freshParameters}&persistence=write`,
+      runtimeRequests,
+    );
+    const restored = await exercisePersistedOpfs(
+      page,
+      `${baseUrl}/?${freshParameters}&persistence=read`,
       runtimeRequests,
     );
     console.log(
-      `SUPABASE_${workerMode.toUpperCase().replace('-', '_')}_WORKER_OK ${JSON.stringify(result)}`,
-    );
-  }
-  if (supabaseMock.restRequests !== 4 || supabaseMock.joins !== 2) {
-    throw new Error(
-      `Expected two complete packed Supabase snapshots and joins, received ${JSON.stringify(supabaseMock)}`,
-    );
-  }
-  supabaseMock.throwIfFailed();
-
-  for (const workerMode of ['app-local', 'default']) {
-    const databaseName = `packed-${workerMode}-${Date.now()}`;
-    const parameters = new URLSearchParams({
-      worker: workerMode,
-      database: databaseName,
-    });
-    const written = await exerciseWithMigration(
-      page,
-      `${baseUrl}/?${parameters}&persistence=write`,
-      runtimeRequests,
-    );
-    const restored = await exercisePersistedWithMigration(
-      page,
-      `${baseUrl}/?${parameters}&persistence=read`,
-      runtimeRequests,
-    );
-    console.log(
-      `OPFS_${workerMode.toUpperCase().replace('-', '_')}_WORKER_OK ${JSON.stringify({written, restored})}`,
+      `OPFS_FRESH_${workerMode.toUpperCase().replace('-', '_')}_WORKER_OK ${JSON.stringify({written, restored})}`,
     );
   }
   completed = true;
 } finally {
   const cleanup = await Promise.allSettled([
     browser?.close(),
-    supabaseMock?.close(),
     server ? stopServer(server) : undefined,
   ]);
   if (completed) {
@@ -249,33 +227,34 @@ function run(command, args, cwd) {
   return output;
 }
 
-async function assertBuildLibRejectsMissingMigrationArtifact() {
-  const fixture = resolve(
-    generatedRoot,
-    'missing-migration-artifact',
-  );
-  const missing = 'wasm-migration/tinygres_migration_wasm_bg.wasm';
-  await Promise.all(
-    wasmArtifacts
-      .filter((artifact) => artifact !== missing)
-      .map(async (artifact) => {
-        const path = resolve(fixture, artifact);
-        await mkdir(dirname(path), {recursive: true});
-        await writeFile(path, 'fixture');
-      }),
-  );
-  try {
-    await requireWasmArtifacts(fixture);
-  } catch (error) {
-    if (
-      error instanceof Error &&
-      error.message.includes('Missing default or migration WASM artifacts')
-    ) {
-      return;
+async function assertBuildLibRejectsMissingWasmArtifacts() {
+  for (const missing of wasmArtifacts) {
+    const fixture = resolve(
+      generatedRoot,
+      `missing-${missing.replaceAll('/', '-')}`,
+    );
+    await Promise.all(
+      wasmArtifacts
+        .filter((artifact) => artifact !== missing)
+        .map(async (artifact) => {
+          const path = resolve(fixture, artifact);
+          await mkdir(dirname(path), {recursive: true});
+          await writeFile(path, 'fixture');
+        }),
+    );
+    try {
+      await requireWasmArtifacts(fixture);
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message.includes('Missing TinyGres WASM artifacts')
+      ) {
+        continue;
+      }
+      throw error;
     }
-    throw error;
+    throw new Error(`Build precondition accepted missing artifact ${missing}`);
   }
-  throw new Error('Build precondition accepted a missing migration artifact');
 }
 
 function parsePackOutput(output) {
@@ -300,82 +279,146 @@ function assertPackedFiles(packed) {
     'package.json',
     'index.js',
     'index.d.ts',
-    'adapters/supabase/builtin.js',
-    'adapters/supabase/native-realtime.js',
-    'source-options.js',
-    'worker/builtin-source.js',
     'worker/default-entry.js',
     'wasm/tinygres_wasm.js',
     'wasm/tinygres_wasm_bg.wasm',
-    'wasm-migration/tinygres_migration_wasm.js',
-    'wasm-migration/tinygres_migration_wasm_bg.wasm',
-    'worker-migration/tinygres_migration_runtime.js',
+    'worker-opfs/tinygres_opfs_runtime.js',
+    'worker/opfs-loader.js',
   ]) {
     if (!files.includes(required)) {
       throw new Error(`Packed TinyGres is missing ${required}`);
     }
   }
-  const nestedManifests = files.filter((file) => file.endsWith('/package.json'));
+  const integrationFiles = files.filter(
+    (file) =>
+      file.startsWith('adapters/') ||
+      file === 'source-options.js' ||
+      file === 'source-options.d.ts' ||
+      file === 'worker/builtin-source.js' ||
+      file === 'worker/builtin-source.d.ts',
+  );
+  if (integrationFiles.length > 0) {
+    throw new Error(
+      `Packed TinyGres contains integration modules: ${integrationFiles.join(', ')}`,
+    );
+  }
+  const nestedManifests = files.filter((file) =>
+    file.endsWith('/package.json'),
+  );
   if (nestedManifests.length > 0) {
     throw new Error(
       `Packed TinyGres contains nested package manifests: ${nestedManifests.join(', ')}`,
     );
   }
-  for (const privateModule of [
-    'worker/journal-codec.js',
-    'worker/journal-payload.js',
-    'worker/migration-engine.js',
-    'worker/persistent-engine.js',
-    'worker/snapshot-store.js',
+  for (const privateModule of ['opfs-engine', 'page-storage']) {
+    for (const extension of ['js', 'd.ts']) {
+      const path = `worker/${privateModule}.${extension}`;
+      if (files.includes(path)) {
+        throw new Error(
+          `Packed TinyGres exposes private storage implementation module ${path}`,
+        );
+      }
+    }
+  }
+  const packagedWasm = files.filter((file) => file.endsWith('.wasm'));
+  if (
+    packagedWasm.length !== 1 ||
+    packagedWasm[0] !== 'wasm/tinygres_wasm_bg.wasm'
+  ) {
+    throw new Error(
+      `Packed TinyGres must contain exactly its page WASM: ${packagedWasm.join(', ')}`,
+    );
+  }
+  const privateRuntimeAssets = files.filter((file) =>
+    file.startsWith('worker-'),
+  );
+  if (
+    privateRuntimeAssets.length !== 1 ||
+    privateRuntimeAssets[0] !== 'worker-opfs/tinygres_opfs_runtime.js'
+  ) {
+    throw new Error(
+      `Packed TinyGres must contain exactly its OPFS runtime: ${privateRuntimeAssets.join(', ')}`,
+    );
+  }
+}
+
+async function assertInstalledOpfsLoader(packageDirectory) {
+  const path = resolve(packageDirectory, 'worker/opfs-loader.js');
+  const source = await readFile(path, 'utf8');
+  for (const marker of [
+    "'../worker-opfs/tinygres_opfs_runtime.js'",
+    '/* @vite-ignore */',
+    '/* webpackIgnore: true */',
   ]) {
-    if (files.includes(privateModule)) {
-      throw new Error(
-        `Packed TinyGres exposes migration implementation module ${privateModule}`,
-      );
+    if (!source.includes(marker)) {
+      throw new Error(`Packed OPFS loader is missing ${marker}: ${path}`);
     }
   }
 }
 
-async function assertConsumerMigrationBoundary(files) {
+async function assertConsumerPrivateRuntimeBoundary(files) {
   const javascript = files.filter((file) => file.endsWith('.js'));
-  const runtime = javascript.filter((file) =>
-    /tinygres_migration_runtime(?:-[^/]*)?\.js$/.test(file),
+  const wasm = files.filter((file) => file.endsWith('.wasm'));
+  const opfsRuntime = javascript.filter((file) =>
+    /tinygres_opfs_runtime(?:-[^/]*)?\.js$/.test(file),
   );
-  const glue = javascript.filter((file) =>
-    /tinygres_migration_wasm(?:-[^/]*)?\.js$/.test(file),
+  const pageWasm = wasm.filter((file) =>
+    /tinygres_wasm_bg(?:-[^/]*)?\.wasm$/.test(file),
   );
-  if (runtime.length !== 1 || glue.length !== 1) {
+  if (opfsRuntime.length !== 1 || pageWasm.length !== 1 || wasm.length !== 1) {
     throw new Error(
-      `Consumer build did not emit one migration runtime and glue asset:\n${javascript.join('\n')}`,
+      `Consumer build did not emit exactly one OPFS runtime and one page WASM:\n${files.join('\n')}`,
     );
   }
 
-  const implementationMarkers = [
-    'A journal transaction payload cannot be empty',
-    'The TinyGres persistent engine is closed',
-    'TinyGres could not determine whether the final OPFS commit marker was durable',
+  const opfsImplementationMarkers = [
+    'createOpfsWasmEngine',
     'Another TinyGres worker already has this OPFS database open',
   ];
-  const runtimeSource = await readFile(runtime[0], 'utf8');
-  for (const marker of implementationMarkers) {
-    if (!runtimeSource.includes(marker)) {
+  const privateOpfsImplementationMarkers = [
+    'Another TinyGres worker already has this OPFS database open',
+  ];
+  const opfsRuntimeSource = await readFile(opfsRuntime[0], 'utf8');
+  if (Buffer.byteLength(opfsRuntimeSource) > 96 * 1024) {
+    throw new Error(
+      `Consumer OPFS runtime exceeds its 96 KiB raw gate: ${opfsRuntime[0]}`,
+    );
+  }
+  for (const marker of opfsImplementationMarkers) {
+    if (!opfsRuntimeSource.includes(marker)) {
       throw new Error(
-        `Migration runtime is missing expected implementation marker: ${marker}`,
+        `OPFS runtime is missing expected implementation marker: ${marker}`,
+      );
+    }
+  }
+  for (const [pattern, description] of [
+    [/\bimport\s*\(/, 'a dynamic import'],
+    [/\bnew URL\s*\(/, 'an unresolved asset URL'],
+    [
+      /data:(?:application\/wasm|text\/javascript)/i,
+      'an inlined runtime or WASM data URL',
+    ],
+    [/tinygres_wasm(?:_bg)?/i, 'default WASM glue'],
+    [/WASM returned an invalid binary response/, 'the WASM wire adapter'],
+  ]) {
+    if (pattern.test(opfsRuntimeSource)) {
+      throw new Error(
+        `OPFS runtime eagerly contains ${description}: ${opfsRuntime[0]}`,
       );
     }
   }
 
   for (const file of javascript) {
-    if (runtime.includes(file) || glue.includes(file)) {
+    if (opfsRuntime.includes(file)) {
       continue;
     }
     const source = await readFile(file, 'utf8');
-    const leaked = implementationMarkers.find((marker) =>
+    const leaked = privateOpfsImplementationMarkers.find((marker) =>
       source.includes(marker),
     );
     if (leaked) {
       throw new Error(
-        `Consumer JavaScript eagerly contains migration implementation code (${leaked}): ${file}`,
+        `Consumer JavaScript eagerly contains OPFS implementation code (${leaked}): ${file}`,
       );
     }
   }
@@ -416,298 +459,85 @@ async function waitForServer(child, url, output) {
 
 async function exercise(page, url) {
   await page.goto(url);
-  await page
-    .locator('body[data-status="passed"][data-closed="true"]')
-    .waitFor({timeout: 30_000});
-  const text = await page.locator('#result').textContent();
+  const text = await waitForConsumerResult(page, 'packed consumer');
   const result = JSON.parse(text ?? 'null');
   if (
-    result.initialRevision !== 1 ||
-    result.initialTitle !== 'from packed snapshot' ||
-    result.changedRevision !== 2 ||
-    result.changedTitle !== 'from packed change'
+    result.initialRevision !== 2 ||
+    result.initialTitle !== 'from packed insert' ||
+    result.changedRevision !== 3 ||
+    result.changedTitle !== 'from packed update'
   ) {
     throw new Error(`Unexpected packed-consumer result: ${text}`);
   }
   return result;
 }
 
-async function exerciseWithoutMigration(page, url, requests) {
-  return captureMigrationRequests(requests, false, () => exercise(page, url));
+async function exerciseMemory(page, url, requests) {
+  return captureLazyRequests(requests, {opfs: false}, () =>
+    exercise(page, url),
+  );
 }
 
-async function exerciseWithMigration(page, url, requests) {
-  return captureMigrationRequests(requests, true, () => exercise(page, url));
+async function exerciseFreshOpfs(page, url, requests) {
+  return captureLazyRequests(requests, {opfs: true}, () => exercise(page, url));
 }
 
 async function exercisePersisted(page, url) {
   await page.goto(url);
-  await page
-    .locator('body[data-status="passed"][data-closed="true"]')
-    .waitFor({timeout: 30_000});
-  const text = await page.locator('#result').textContent();
+  const text = await waitForConsumerResult(page, 'packed OPFS restart');
   const result = JSON.parse(text ?? 'null');
-  if (result.revision !== 2 || result.title !== 'from packed change') {
+  if (result.revision !== 3 || result.title !== 'from packed update') {
     throw new Error(`Unexpected packed OPFS restart result: ${text}`);
   }
   return result;
 }
 
-async function exercisePersistedWithMigration(page, url, requests) {
-  return captureMigrationRequests(requests, true, () =>
+async function exercisePersistedOpfs(page, url, requests) {
+  return captureLazyRequests(requests, {opfs: true}, () =>
     exercisePersisted(page, url),
   );
 }
 
-async function exerciseSupabase(page, url) {
-  await page.goto(url);
+async function waitForConsumerResult(page, description) {
   await page
-    .locator('body[data-status="passed"][data-closed="true"]')
+    .locator(
+      'body[data-status="passed"][data-closed="true"], body[data-status="failed"]',
+    )
     .waitFor({timeout: 30_000});
-  const text = await page.locator('#result').textContent();
-  const result = JSON.parse(text ?? 'null');
-  if (
-    result.phase !== 'live-best-effort' ||
-    result.revision !== 1 ||
-    result.title !== 'from packed Supabase snapshot'
-  ) {
-    throw new Error(`Unexpected packed Supabase result: ${text}`);
+  const [status, text] = await Promise.all([
+    page.locator('body').getAttribute('data-status'),
+    page.locator('#result').textContent(),
+  ]);
+  if (status === 'failed') {
+    throw new Error(
+      `${description} failed: ${text ?? 'unknown browser error'}`,
+    );
   }
-  return result;
+  return text;
 }
 
-async function exerciseSupabaseWithoutMigration(page, url, requests) {
-  return captureMigrationRequests(requests, false, () =>
-    exerciseSupabase(page, url),
-  );
-}
-
-async function captureMigrationRequests(requests, expected, exerciseRuntime) {
+async function captureLazyRequests(requests, expected, exerciseRuntime) {
   const firstRequest = requests.length;
   const result = await exerciseRuntime();
   const capturedRequests = requests.slice(firstRequest);
-  const migrationRequests = capturedRequests.filter((url) =>
-    isMigrationRequest(url),
+  const opfsRequests = capturedRequests.filter((url) =>
+    isOpfsRuntimeRequest(url),
   );
-  const requestedRuntime = migrationRequests.some((url) =>
-    /tinygres_migration_runtime(?:-[^/]*)?\.js(?:\?|$)/.test(url),
-  );
-  const requestedGlue = migrationRequests.some((url) =>
-    /tinygres_migration_wasm(?:-[^/]*)?\.js(?:\?|$)/.test(url),
-  );
-  const requestedWasm = migrationRequests.some((url) =>
-    /tinygres_migration_wasm_bg(?:-[^/]+)?\.wasm(?:\?|$)/.test(url),
-  );
-  if (expected && (!requestedRuntime || !requestedGlue || !requestedWasm)) {
+  if (expected.opfs && opfsRequests.length !== 1) {
     throw new Error(
-      `Persistent packed runtime did not lazily load migration runtime, glue, and WASM: ${capturedRequests.join(', ')}`,
+      `Packed OPFS runtime did not lazily load exactly one runtime chunk: ${capturedRequests.join(', ')}`,
     );
   }
-  if (!expected && migrationRequests.length > 0) {
+  if (!expected.opfs && opfsRequests.length > 0) {
     throw new Error(
-      `Memory packed runtime unexpectedly loaded migration artifacts: ${migrationRequests.join(', ')}`,
+      `Memory packed runtime unexpectedly loaded OPFS code: ${opfsRequests.join(', ')}`,
     );
   }
   return result;
 }
 
-function isMigrationRequest(url) {
-  return (
-    url.includes('tinygres_migration_runtime') ||
-    url.includes('/worker-migration/') ||
-    url.includes('tinygres_migration_wasm') ||
-    url.includes('migration-engine') ||
-    url.includes('persistent-engine') ||
-    url.includes('snapshot-store')
-  );
-}
-
-async function startSupabaseMock() {
-  const state = {errors: [], joins: 0, restRequests: 0};
-  const server = createServer((request, response) => {
-    const url = new URL(request.url ?? '/', 'http://127.0.0.1');
-    if (request.method === 'OPTIONS') {
-      respondCors(response, 204);
-      return;
-    }
-    try {
-      if (request.method !== 'GET' || url.pathname !== '/rest/v1/posts') {
-        throw new Error(`Unexpected packed Supabase HTTP request: ${request.method} ${url}`);
-      }
-      state.restRequests += 1;
-      const headers = request.headers;
-      const firstPage = headers.range === '0-499';
-      const terminatingPage = headers.range === '1-500';
-      if (
-        headers.apikey !== 'sb_publishable_packed_test' ||
-        headers.authorization !== undefined ||
-        headers['accept-profile'] !== 'public' ||
-        (!firstPage && !terminatingPage) ||
-        url.searchParams.get('select') !== 'id,title' ||
-        url.searchParams.get('order') !== 'id.asc'
-      ) {
-        throw new Error(
-          `Unexpected packed Supabase snapshot request: ${url} ${JSON.stringify(headers)}`,
-        );
-      }
-      respondCors(
-        response,
-        200,
-        JSON.stringify(
-          firstPage
-            ? [{id: 1, title: 'from packed Supabase snapshot'}]
-            : [],
-        ),
-      );
-    } catch (error) {
-      state.errors.push(error);
-      respondCors(response, 500, JSON.stringify({message: String(error)}));
-    }
-  });
-  const webSockets = new WebSocketServer({noServer: true});
-  server.on('upgrade', (request, socket, head) => {
-    const url = new URL(request.url ?? '/', 'http://127.0.0.1');
-    if (url.pathname !== '/realtime/v1/websocket') {
-      socket.destroy();
-      return;
-    }
-    webSockets.handleUpgrade(request, socket, head, (webSocket) => {
-      webSockets.emit('connection', webSocket, request);
-    });
-  });
-  webSockets.on('connection', (socket, request) => {
-    try {
-      const endpoint = new URL(request.url ?? '/', 'http://127.0.0.1');
-      if (
-        endpoint.searchParams.get('apikey') !==
-          'sb_publishable_packed_test' ||
-        endpoint.searchParams.get('vsn') !== '1.0.0'
-      ) {
-        throw new Error(`Unexpected packed Supabase Realtime URL: ${endpoint}`);
-      }
-    } catch (error) {
-      state.errors.push(error);
-      socket.close(1008, 'Invalid test connection');
-      return;
-    }
-    socket.on('message', (message) => {
-      try {
-        const frame = JSON.parse(String(message));
-        if (frame.event === 'heartbeat') {
-          socket.send(
-            JSON.stringify({
-              topic: 'phoenix',
-              event: 'phx_reply',
-              payload: {status: 'ok', response: {}},
-              ref: frame.ref,
-            }),
-          );
-          return;
-        }
-        if (frame.event !== 'phx_join') {
-          return;
-        }
-        state.joins += 1;
-        const subscriptions = frame.payload?.config?.postgres_changes;
-        if (
-          !Array.isArray(subscriptions) ||
-          subscriptions.length !== 1 ||
-          frame.payload?.config?.broadcast?.replication_ready !== true ||
-          subscriptions[0]?.schema !== 'public' ||
-          subscriptions[0]?.table !== 'posts' ||
-          JSON.stringify(subscriptions[0]?.select) !==
-            JSON.stringify(['id', 'title'])
-        ) {
-          throw new Error(
-            `Unexpected packed Supabase join: ${JSON.stringify(frame)}`,
-          );
-        }
-        socket.send(
-          JSON.stringify({
-            topic: frame.topic,
-            event: 'phx_reply',
-            payload: {
-              status: 'ok',
-              response: {
-                postgres_changes: [
-                  {id: 101, event: '*', schema: 'public', table: 'posts'},
-                ],
-              },
-            },
-            ref: frame.ref,
-            join_ref: frame.ref,
-          }),
-        );
-        for (const payload of [
-          {
-            status: 'ok',
-            extension: 'postgres_changes',
-            message: 'Subscribed to PostgreSQL',
-          },
-          {
-            status: 'ok',
-            extension: 'system',
-            message: 'Replication connection established',
-          },
-        ]) {
-          socket.send(
-            JSON.stringify({
-              topic: frame.topic,
-              event: 'system',
-              payload,
-              ref: null,
-              join_ref: frame.ref,
-            }),
-          );
-        }
-      } catch (error) {
-        state.errors.push(error);
-        socket.close(1011, 'Invalid test frame');
-      }
-    });
-  });
-  await new Promise((resolvePromise, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', resolvePromise);
-  });
-  const address = server.address();
-  if (!address || typeof address === 'string') {
-    throw new Error('Packed Supabase server did not bind an IPv4 port');
-  }
-  return {
-    get joins() {
-      return state.joins;
-    },
-    get restRequests() {
-      return state.restRequests;
-    },
-    url: `http://127.0.0.1:${address.port}`,
-    throwIfFailed() {
-      if (state.errors.length > 0) {
-        throw state.errors[0];
-      }
-    },
-    async close() {
-      for (const socket of webSockets.clients) {
-        socket.terminate();
-      }
-      await new Promise((resolvePromise) => webSockets.close(resolvePromise));
-      await new Promise((resolvePromise, reject) =>
-        server.close((error) => (error ? reject(error) : resolvePromise())),
-      );
-    },
-  };
-}
-
-function respondCors(response, status, body = '') {
-  response.writeHead(status, {
-    'Access-Control-Allow-Headers':
-      'accept-profile, apikey, authorization, range, range-unit',
-    'Access-Control-Allow-Methods': 'GET, OPTIONS',
-    'Access-Control-Allow-Origin': '*',
-    'Content-Type': 'application/json',
-  });
-  response.end(body);
+function isOpfsRuntimeRequest(url) {
+  return url.includes('tinygres_opfs_runtime') || url.includes('/worker-opfs/');
 }
 
 async function stopServer(child) {

@@ -1,9 +1,4 @@
-import {
-  copyFile,
-  readFile,
-  rm,
-  writeFile,
-} from 'node:fs/promises';
+import {copyFile, readFile, rm, writeFile} from 'node:fs/promises';
 import {spawnSync} from 'node:child_process';
 import {dirname, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -31,7 +26,8 @@ if (compile.status !== 0) {
   process.exit(compile.status ?? 1);
 }
 
-await buildMigrationRuntime();
+await buildPrivateOpfsRuntime();
+await assertOpfsLoaderBoundary();
 
 const manifest = JSON.parse(
   await readFile(resolve(root, 'package.json'), 'utf8'),
@@ -50,10 +46,6 @@ manifest.exports = {
     types: './worker/index.d.ts',
     import: './worker/index.js',
   },
-  './supabase': {
-    types: './adapters/supabase/index.d.ts',
-    import: './adapters/supabase/index.js',
-  },
   './package.json': './package.json',
 };
 
@@ -64,14 +56,24 @@ await writeFile(
 await copyFile(resolve(root, 'LICENSE'), resolve(dist, 'LICENSE'));
 await copyFile(resolve(root, 'README.md'), resolve(dist, 'README.md'));
 
-async function buildMigrationRuntime() {
-  const entry = resolve(dist, 'worker/migration-runtime.js');
-  const declaration = resolve(dist, 'worker/migration-runtime.d.ts');
-  const outputDirectory = resolve(dist, 'worker-migration');
-  const output = resolve(
-    outputDirectory,
-    'tinygres_migration_runtime.js',
+async function buildPrivateOpfsRuntime() {
+  await buildOpfsRuntime();
+
+  // These page-storage modules are private build inputs. Only their
+  // self-contained runtime asset is published, so memory-only sessions do not
+  // pull OPFS code into their Worker bundle.
+  await Promise.all(
+    ['opfs-engine', 'page-storage'].flatMap((module) => [
+      rm(resolve(dist, `worker/${module}.js`), {force: true}),
+      rm(resolve(dist, `worker/${module}.d.ts`), {force: true}),
+    ]),
   );
+}
+
+async function buildOpfsRuntime() {
+  const entry = resolve(dist, 'worker/opfs-engine.js');
+  const outputDirectory = resolve(dist, 'worker-opfs');
+  const output = resolve(outputDirectory, 'tinygres_opfs_runtime.js');
 
   await viteBuild({
     build: {
@@ -80,7 +82,7 @@ async function buildMigrationRuntime() {
       emptyOutDir: true,
       lib: {
         entry,
-        fileName: () => 'tinygres_migration_runtime.js',
+        fileName: () => 'tinygres_opfs_runtime.js',
         formats: ['es'],
       },
       minify: 'oxc',
@@ -91,51 +93,80 @@ async function buildMigrationRuntime() {
   });
 
   const generated = await readFile(output, 'utf8');
+  const source = assertSelfContainedRuntime(
+    generated,
+    output,
+    'OPFS runtime',
+    [
+      'createOpfsWasmEngine',
+      'Another TinyGres worker already has this OPFS database open',
+    ],
+    [
+      [/\bimport\s*\(/, 'a dynamic import'],
+      [/tinygres_wasm(?:_bg)?/i, 'default WASM glue'],
+      [/WASM returned an invalid binary response/, 'the WASM wire adapter'],
+    ],
+  );
+  const rawBytes = Buffer.byteLength(source);
+  const maximumRawBytes = 96 * 1024;
+  if (rawBytes > maximumRawBytes) {
+    throw new Error(
+      `OPFS runtime is ${rawBytes} bytes, above the ${maximumRawBytes}-byte private-runtime gate: ${output}`,
+    );
+  }
+  await writeFile(output, source);
+}
+
+function assertSelfContainedRuntime(
+  generated,
+  output,
+  label,
+  requiredMarkers,
+  additionalForbidden = [],
+) {
   // Rolldown's region comments include absolute source identifiers. They are
-  // useful in debug bundles, but would make the published internal asset leak
+  // useful in debug bundles, but would make a published internal asset leak
   // and depend on the checkout path.
   const source = generated.replace(/^\/\/#(?:end)?region.*(?:\r?\n|$)/gm, '');
   const forbidden = [
-    [/data:application\/wasm/i, 'an inlined WASM data URL'],
-    [/\bimport(?:\s+[\w{*]|\s*["'])/, 'a static import'],
+    [
+      /data:(?:application\/wasm|text\/javascript)/i,
+      'an inlined runtime or WASM data URL',
+    ],
+    [/\bimport(?![\w$]|\s*(?:\(|\.))/, 'a static import'],
     [/\bfrom\s*["'][.]{0,2}\//, 'an unresolved relative import'],
     [/\bnew URL\s*\(/, 'an unresolved asset URL'],
     [/\bfile:\/\//, 'an absolute file URL'],
     [/(?:^|[^\w])\/(?:Users|private|tmp)\//, 'an absolute POSIX path'],
     [/(?:^|[^\w])[A-Za-z]:\\/, 'an absolute Windows path'],
     [new RegExp(escapeRegExp(root)), 'the source checkout path'],
+    ...additionalForbidden,
   ];
   for (const [pattern, description] of forbidden) {
     if (pattern.test(source)) {
-      throw new Error(
-        `Migration runtime contains ${description}: ${output}`,
-      );
+      throw new Error(`${label} contains ${description}: ${output}`);
     }
   }
-  if (!source.includes('createMigrationConfiguredEngine')) {
-    throw new Error(
-      `Migration runtime does not export createMigrationConfiguredEngine: ${output}`,
-    );
+  for (const marker of requiredMarkers) {
+    if (!source.includes(marker)) {
+      throw new Error(`${label} is missing ${marker}: ${output}`);
+    }
   }
-  await writeFile(output, source);
+  return source;
+}
 
-  // This source entry is private build input. Only the self-contained runtime
-  // asset is published, so normal Worker bundles cannot pull migration code
-  // into the memory-only path through the module graph.
-  await Promise.all([
-    rm(entry, {force: true}),
-    rm(declaration, {force: true}),
-    ...[
-      'journal-codec',
-      'journal-payload',
-      'migration-engine',
-      'persistent-engine',
-      'snapshot-store',
-    ].flatMap((module) => [
-      rm(resolve(dist, `worker/${module}.js`), {force: true}),
-      rm(resolve(dist, `worker/${module}.d.ts`), {force: true}),
-    ]),
-  ]);
+async function assertOpfsLoaderBoundary() {
+  const path = resolve(dist, 'worker/opfs-loader.js');
+  const source = await readFile(path, 'utf8');
+  for (const marker of [
+    "'../worker-opfs/tinygres_opfs_runtime.js'",
+    '/* @vite-ignore */',
+    '/* webpackIgnore: true */',
+  ]) {
+    if (!source.includes(marker)) {
+      throw new Error(`OPFS loader is missing ${marker}: ${path}`);
+    }
+  }
 }
 
 function escapeRegExp(value) {

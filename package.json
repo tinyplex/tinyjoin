@@ -9,12 +9,10 @@
     "build": "node scripts/build.mjs",
     "build:lib": "node scripts/build-lib.mjs",
     "build:wasm": "node scripts/build-wasm.mjs",
-    "build:wasm:migration": "node scripts/build-wasm-migration.mjs",
     "cargo": "node scripts/cargo.mjs",
-    "check": "npm run typecheck && npm test && npm run build && npm run test:wasm:built && npm run check:size && npm run check:size:migration",
+    "check": "npm run typecheck && npm test && npm run build && npm run test:wasm:built && npm run check:size",
     "check:release": "npm run check && npm run test:browser && npm run test:package",
     "check:size": "node scripts/check-size.mjs",
-    "check:size:migration": "node scripts/check-size-wasm-migration.mjs",
     "prePublishPackage": "npm i && npm run check:release",
     "publishPackage": "npm run prePublishPackage && npm publish ./dist",
     "test": "npm run test:rust && npm run test:ts",
@@ -45,11 +43,9 @@
   "devDependencies": {
     "@playwright/test": "^1.62.1",
     "@types/node": "^26.2.0",
-    "@types/ws": "^8.18.1",
     "typescript": "^7.0.2",
     "vite": "^8.2.1",
     "vitest": "^4.1.10",
-    "wasm-pack": "^0.15.0",
-    "ws": "^8.21.3"
+    "wasm-pack": "^0.15.0"
   }
 }
