@@ -303,32 +303,46 @@ safe-integer boundary.
 Typed local tables can be joined with a deliberately bounded relational form:
 
 ```sql
-SELECT author.id AS author_id, article.title AS article_title
-FROM authors AS author
-LEFT JOIN articles AS article ON author.id = article.author_id
-WHERE author.active = true
-ORDER BY author_id, article.id NULLS LAST
+SELECT post.id AS post_id, tag.name AS tag_name
+FROM posts AS post
+JOIN post_tags AS post_tag ON post.id = post_tag.post_id
+JOIN tags AS tag ON post_tag.tag_id = tag.id
+ORDER BY post_id, tag_name
 ```
 
-- exactly two tables with `JOIN`/`INNER JOIN` or `LEFT [OUTER] JOIN`;
+- two to eight typed table sources in a left-deep chain, using `JOIN`/`INNER
+  JOIN` or `LEFT [OUTER] JOIN` at each step;
 - optional bare or `AS` table aliases and qualified column references;
-- one or more cross-table column equalities in `ON`, combined with `AND`;
+- one or more column equalities in each `ON`, combined with `AND`, with at most
+  32 across the query; every equality connects the incoming table to a table
+  already in the chain;
 - the existing predicates in `WHERE`, plus `ORDER BY`, `LIMIT`, and `OFFSET`;
   and
 - explicit column projections with distinct output names, using `AS` where
-  the two tables contain the same column name.
+  multiple tables contain the same column name.
 
-Both sides require typed catalogs. Unqualified references are accepted only
-when exactly one table contains the column; ambiguous references are rejected.
-`NULL` join keys do not match, and a left join represents columns from an
-unmatched right row as `NULL`. Integer and float keys can be compared, while
-JSON join keys are rejected. Without `ORDER BY`, joined row order is not part
-of the contract. Quoted table aliases and column names remain case-sensitive,
-but this first join slice rejects literal dots inside them.
+Every source requires a typed catalog and a unique alias. Unqualified
+references are accepted only when exactly one source contains the column;
+ambiguous references are rejected. Join steps are evaluated in written,
+left-to-right order. `NULL` join keys do not match, and a left join represents
+columns from its unmatched incoming table as `NULL`; a later inner join can
+therefore remove that null-extended row. Integer and float keys can be compared,
+while JSON join keys are rejected. Without `ORDER BY`, joined row order is not
+part of the contract. Quoted table aliases and column names remain
+case-sensitive, but this join slice rejects literal dots inside them.
 
-This first implementation uses a bounded nested-loop execution path. It rejects
-more than one join, `OR` or non-equality expressions in `ON`, `SELECT *`, more
-than 1,000,000 candidate row pairs, and more than 100,000 materialized rows.
+Many-to-many relationships use an ordinary bridge table, conventionally with
+a composite primary key as in `post_tags` above. TinyGres does not implement
+foreign keys, so it does not enforce that bridge rows reference existing rows.
+
+This implementation uses a bounded left-deep nested-loop execution path without
+a join optimizer. It rejects a ninth table source, `OR` or non-equality
+expressions in `ON`, and `SELECT *`. Across the complete chain it permits at
+most 1,000,000 candidate row extensions, 100,000 retained build rows, 100,000
+result rows, and separate 16 MiB join working-state and result-data budgets.
+Before reading rows, it also rejects a chain whose source row counts imply more
+than 1,000,000 worst-case candidate extensions, without assuming that an `ON`
+condition will be selective.
 Aggregates over joins remain outside this slice.
 
 Standalone writable databases additionally support:

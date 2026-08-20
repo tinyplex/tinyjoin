@@ -82,16 +82,16 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 
 | Keyword or form | Status | TinyGres form and boundary |
 | --- | --- | --- |
-| `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or exactly one two-table join. A simple projection is `*` or plain column names. There is no `SELECT` without `FROM`. |
+| `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or a left-deep join over two to eight typed table sources. A simple projection is `*` or plain column names. There is no `SELECT` without `FROM`. |
 | `WHERE` | Supported | Predicates described below, with SQL three-valued null logic. |
 | `ORDER BY` | Narrow | Up to 32 plain columns for simple queries, projected output names for grouped/aggregate queries, and projected output names or qualified/unambiguous source columns for joins; `ASC`/`DESC` and `NULLS FIRST`/`LAST`. JSON values cannot be ordered. |
 | `LIMIT`, `OFFSET` | Supported | Non-negative integer literal or `$n` parameter. `LIMIT` is at most 100,000; `OFFSET` and `OFFSET + LIMIT` are at most 4,294,967,295. `OFFSET` may appear alone; when both occur, `LIMIT` must precede `OFFSET`. |
 | `GROUP BY` | Narrow | Up to 32 plain boolean, integer, float, or text columns (not JSON) on one typed table. Every selected non-aggregate column must be grouped explicitly. |
 | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` | Narrow | Every aggregate query requires a typed column catalog, including `COUNT(*)`. Functions accept `COUNT(*)` or one plain column argument. `SUM`/`AVG` accept integer or float; `MIN`/`MAX` accept integer, float, or text. Up to 64 aggregate calls. |
 | `HAVING`, aggregate `DISTINCT`, `FILTER`, windows | No | No post-group predicate, distinct aggregate, filter clause, or window form. |
-| `JOIN`, `INNER JOIN` | Narrow | Exactly two typed tables and 1–32 cross-table equality terms joined by `AND`. |
-| `LEFT [OUTER] JOIN` | Narrow | Same bounded equijoin form; unmatched right columns are `NULL`. |
-| `RIGHT`, `FULL`, `CROSS`, `NATURAL`, `USING`, `LATERAL` | No | No additional join families, derived relations, or third table. |
+| `JOIN`, `INNER JOIN` | Narrow | Adds one typed table to a left-deep chain of at most eight sources. Each `ON` has one or more column equalities joined by `AND`, with at most 32 across the query; every equality connects the incoming source to an earlier source. |
+| `LEFT [OUTER] JOIN` | Narrow | The same bounded chain; an unmatched incoming source is represented by `NULL` columns. A later inner join can remove that null-extended row. |
+| `RIGHT`, `FULL`, `CROSS`, `NATURAL`, `USING`, `LATERAL` | No | No additional join families, parenthesized/derived relations, or join reordering. |
 | `AS` | Narrow | Output aliases on `SELECT` items in grouped/aggregate queries, plus table and projection-output aliases in joins. Ordinary single-table projections do not accept aliases. |
 | `DISTINCT`, `WITH`, subqueries, `UNION`/`INTERSECT`/`EXCEPT` | No | No CTEs, subqueries, set operations, or distinct-row projection. |
 | `CREATE TABLE [IF NOT EXISTS]` | Narrow | Typed columns and a required inline or table-level primary key. Up to 256 columns. |
@@ -205,12 +205,33 @@ no rows. Integer `SUM` fails beyond the JavaScript-safe range, and integer
 `AVG` returns a floating-point value rather than PostgreSQL `numeric`.
 
 Join keys containing `NULL` never match. Integer and float keys may compare;
-JSON join keys are rejected. Both join sides require typed SQL catalogs, and
-the result must use distinct JSON object field names. Without `ORDER BY`, row
-order is not part of the contract.
+JSON join keys are rejected. Every source requires a typed SQL catalog and a
+unique alias, and the result must use distinct JSON object field names.
+Unqualified columns are accepted only when exactly one source contains the
+name. Without `ORDER BY`, row order is not part of the contract.
 
-The current join is a bounded nested loop, not a general PostgreSQL planner.
-Aggregates over joins are not supported.
+Join chains are evaluated as written, from left to right, by a bounded nested
+loop; TinyGres does not reorder or optimize them. Each `ON` equality must
+connect its newly introduced source to one of the sources already in scope.
+Across the full chain, candidate-extension, retained-row, result-row, and byte
+budgets are global rather than resetting for each `JOIN`. Aggregates over joins
+are not supported. Before scanning, source row counts are also used to reject a
+chain whose worst-case candidate-extension bound exceeds 1,000,000; the
+preflight does not assume that an `ON` condition will be selective.
+
+Many-to-many relationships can use a bridge table with a composite primary
+key, for example:
+
+```sql
+SELECT post.id AS post_id, tag.name AS tag_name
+FROM posts AS post
+JOIN post_tags AS post_tag ON post.id = post_tag.post_id
+JOIN tags AS tag ON post_tag.tag_id = tag.id
+ORDER BY post_id, tag_name
+```
+
+Foreign keys are not implemented, so TinyGres does not enforce the bridge
+table's references.
 
 ## Transactions and concurrency
 
@@ -264,15 +285,21 @@ rather than growing without bound.
 | Rows changed by one `UPDATE` or `DELETE` | 100,000 |
 | Ordered matching rows | 100,000 |
 | Transaction overlay | 100,000 keys and 16 MiB |
-| Join candidate pairs / returned rows | 1,000,000 / 100,000 |
-| Join retained build rows | 100,000 |
+| Table sources in one joined `SELECT` | 8 total (one base plus seven `JOIN` clauses) |
+| `ON` equalities in one joined `SELECT` | 32 across the chain |
+| Join candidate row extensions / returned rows | 1,000,000 across the chain / 100,000 |
+| Join retained build rows | 100,000 across the chain |
+| Join working state / result data | 16 MiB / 16 MiB across the chain |
 | Aggregate groups / calls | 100,000 / 64 |
 | Aggregate cells (groups times aggregate calls) | 1,000,000 |
 | Query, DML result, join, aggregate, or mutation working set | 16 MiB per operation-specific bound |
 
 An ordered query can reach its materialization limit before applying a small
-`LIMIT`. Join pair bounds apply to the candidate relation, not just returned
-rows. The 1,024-byte secondary-index key limit covers the complete encoded
-indexed tuple, separator, and primary-key tuple together, not each component
-independently. An individual JSON value remains subject to the smaller budget
-for the row that contains it.
+`LIMIT`. Join candidate-extension and retained-row bounds apply to the complete
+left-deep chain, not separately to each step and not just to returned rows. The
+candidate limit is enforced both by the conservative row-count preflight above
+and by a runtime counter. The
+1,024-byte secondary-index key limit covers the complete encoded indexed tuple,
+separator, and primary-key tuple together, not each component independently.
+An individual JSON value remains subject to the smaller budget for the row that
+contains it.
