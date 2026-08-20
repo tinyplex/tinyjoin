@@ -1401,6 +1401,11 @@ impl<'a> MutationParser<'a> {
     }
 
     fn parse_literal(&mut self) -> Result<Value> {
+        if matches!(self.tokens.get(self.position), Some(Token::Placeholder(_))) {
+            return Err(EngineError::unsupported_sql(
+                "Column DEFAULT values must be literal constants, not parameters",
+            ));
+        }
         let SqlValue::Value(value) = self.parse_sql_value(false)? else {
             unreachable!("DEFAULT was disabled for a column default")
         };
@@ -1872,5 +1877,30 @@ mod tests {
         assert!(error.message.contains("cannot nest more than 64 levels"));
         assert_eq!(storage.table_row_count("documents").unwrap(), 0);
         assert_eq!(storage.revision(), revision);
+    }
+
+    #[test]
+    fn column_defaults_are_literal_constants_not_bound_parameters() {
+        for sql in [
+            "CREATE TABLE defaults (id INTEGER PRIMARY KEY, value TEXT DEFAULT $1)",
+            "ALTER TABLE defaults ADD COLUMN value TEXT DEFAULT $1",
+        ] {
+            let error = match parse(sql, &[json!("dynamic")]) {
+                Ok(_) => panic!("column DEFAULT parameter should be rejected: {sql}"),
+                Err(error) => error,
+            };
+
+            assert_eq!(error.code, "UNSUPPORTED_SQL");
+            assert_eq!(
+                error.message,
+                "Column DEFAULT values must be literal constants, not parameters"
+            );
+        }
+
+        parse(
+            "CREATE TABLE defaults (id INTEGER PRIMARY KEY, value TEXT DEFAULT 'constant')",
+            &[],
+        )
+        .unwrap();
     }
 }
