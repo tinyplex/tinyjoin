@@ -6,18 +6,17 @@ Rust/WebAssembly engine kept off the browser's main thread.
 
 > [!IMPORTANT] TinyGres is an early database prototype, not PostgreSQL compiled
 > to WebAssembly. It intentionally implements only the documented SQL and type
-> subset. Its optional Supabase adapter remains read-only, best-effort, and
-> reconciles after reconnects; it is not a durable logical-replication stream.
+> subset. It is a standalone database engine: the package contains no hosted
+> service adapter, network client, or replication protocol.
 
 The first proof of concept deliberately does a small number of things:
 
 - owns an in-memory or opt-in persistent database inside a dedicated Web Worker;
 - evaluates a documented subset of PostgreSQL-shaped SQL in Rust/WASM;
 - supports typed tables, atomic DDL/DML, and staged transactions;
-- applies normalized snapshot and server-change batches atomically;
-- emits table-level invalidations so an application can re-query; and
-- runs an optional built-in Supabase snapshot/Realtime source behind the worker
-  boundary, while retaining an adapter seam for future transports.
+- persists the same page-native format in memory or one OPFS file;
+- applies explicit table replacements and row-change batches atomically; and
+- emits table-level invalidations so an application can re-query.
 
 ## Building from source
 
@@ -41,11 +40,12 @@ package; Rust is not required in consuming projects. Building this repository
 from source requires `rustup`. The checked-in toolchain file selects the Rust
 version and `wasm32-unknown-unknown` target, while the npm development
 dependency provides `wasm-pack`. The build stages wasm-bindgen output in a
-temporary directory and copies only the runtime JavaScript and `.wasm` files
-into `dist/wasm`, so generated package metadata never appears under `src/`.
-Cargo's compiler cache lives under `node_modules/.cache/tinygres` when using the
-project scripts rather than creating a top-level `target/` directory. Use `npm
-run cargo -- <arguments>` for other Cargo commands with the same behavior.
+temporary directory and copies only the page-native runtime JavaScript and
+`.wasm` file into `dist/wasm`, so generated package metadata never appears under
+`src/`. There is one engine artifact for both memory and OPFS storage.
+Cargo's compiler cache lives under `node_modules/.cache/tinygres` when using
+the project scripts rather than creating a top-level `target/` directory. Use
+`npm run cargo -- <arguments>` for other Cargo commands with the same behavior.
 
 If `rustc` comes from Homebrew, install rustup alongside it and activate the
 rustup proxies in the current shell:
@@ -66,59 +66,18 @@ appears first in `PATH`, then checks for the target before invoking `wasm-pack`.
 ## Browser API
 
 ```ts
-import {createClient} from 'tinygres';
+import { createClient } from "tinygres";
 
-type Post = {
+type Task = {
   id: number;
   title: string;
-  published: boolean;
+  done: boolean;
 };
 
 const db = createClient({
-  schemas: [{name: 'posts', primaryKey: ['id']}],
+  storage: { kind: "opfs", name: "my-app-v1" },
 });
 
-await db.ready();
-
-// Snapshot/source integration: this is not an application write API.
-await db.replaceTable(
-  {name: 'posts', primaryKey: ['id']},
-  [{id: 1, title: 'Hello from the worker', published: true}],
-);
-
-const result = await db.query<Post>(
-  'SELECT id, title, published FROM posts WHERE published = $1',
-  [true],
-);
-
-const unsubscribe = db.subscribe({tables: ['posts']}, async (event) => {
-  console.log('Local tables changed', event.tables, event.revision);
-  const refreshed = await db.query<Post>('SELECT * FROM posts');
-  render(refreshed.rows);
-});
-
-// A read-only source adapter normally owns this integration API.
-await db.applyBatch({
-  sourceId: 'example-source',
-  changes: [
-    {
-      type: 'upsert',
-      table: 'posts',
-      row: {id: 1, title: 'Changed on the server', published: true},
-    },
-  ],
-});
-
-unsubscribe();
-await db.close();
-```
-
-For a standalone writable database, define the catalog and mutate it with SQL:
-
-```ts
-const db = createClient({
-  storage: {kind: 'opfs', name: 'my-app-v1'},
-});
 await db.ready();
 
 await db.exec(`
@@ -130,28 +89,28 @@ await db.exec(`
   )
 `);
 
-await db.exec('CREATE INDEX tasks_done ON tasks (done)');
-await db.exec('CREATE UNIQUE INDEX tasks_title ON tasks (title)');
+await db.exec("CREATE INDEX tasks_done ON tasks (done)");
+await db.exec("CREATE UNIQUE INDEX tasks_title ON tasks (title)");
 await db.exec(
-  'ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0',
+  "ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
 );
 
 const inserted = await db.exec<Task>(
   `INSERT INTO tasks (id, title, metadata)
    VALUES ($1, $2, $3)
    RETURNING *`,
-  [1, 'Ship TinyGres', {priority: 'high'}],
+  [1, "Ship TinyGres", { priority: "high" }],
 );
 
 await db.transaction(async (tx) => {
-  await tx.exec('UPDATE tasks SET done = true WHERE id = $1', [1]);
-  await tx.exec(
-    'INSERT INTO tasks (id, title) VALUES ($1, $2)',
-    [2, 'Survives the same atomic commit'],
-  );
+  await tx.exec("UPDATE tasks SET done = true WHERE id = $1", [1]);
+  await tx.exec("INSERT INTO tasks (id, title) VALUES ($1, $2)", [
+    2,
+    "Survives the same atomic commit",
+  ]);
   // Queries inside the callback see staged rows. Other state is published only
   // after the callback and its outstanding operations complete successfully.
-  console.log((await tx.query<Task>('SELECT * FROM tasks')).rows);
+  console.log((await tx.query<Task>("SELECT * FROM tasks")).rows);
 });
 
 const summary = await db.query<{
@@ -163,6 +122,14 @@ const summary = await db.query<{
   GROUP BY done
   ORDER BY task_count DESC
 `);
+
+const unsubscribe = db.subscribe({ tables: ["tasks"] }, async (event) => {
+  console.log("Tables changed", event.tables, event.revision);
+  render((await db.query<Task>("SELECT * FROM tasks")).rows);
+});
+
+unsubscribe();
+await db.close();
 ```
 
 Every standalone SQL statement is atomic. `transaction()` stages `INSERT`,
@@ -171,9 +138,11 @@ rolls them back when the callback or a statement fails, persists one complete
 commit to OPFS, and then emits one table-level invalidation. Run DDL such as
 `CREATE`, `ALTER`, and `DROP` as standalone atomic statements. The transaction
 object must not escape its callback.
-While a replication source is configured, local SQL writes and transactions are
-rejected: the current source contract is read-only and a reconciliation snapshot
-must never silently overwrite application state.
+
+For callers that already hold complete JSON rows, `replaceTable(schema, rows)`
+atomically replaces one table and `applyBatch({changes})` atomically applies
+explicit `upsert` and `delete` operations. These are local database operations;
+they perform no I/O beyond the configured database storage.
 
 `createClient` creates a dedicated module worker by default. It is safe
 to import during server rendering; the worker is only constructed when the
@@ -184,29 +153,22 @@ For an application-owned worker, pass `worker`, `workerFactory`, or `workerUrl`:
 ```ts
 const db = createClient({
   workerFactory: () =>
-    new Worker(new URL('./tinygres.worker.ts', import.meta.url), {
-      name: 'tinygres',
-      type: 'module',
+    new Worker(new URL("./tinygres.worker.ts", import.meta.url), {
+      name: "tinygres",
+      type: "module",
     }),
-  schemas: [{name: 'posts', primaryKey: ['id']}],
+  schemas: [{ name: "posts", primaryKey: ["id"] }],
 });
 ```
 
-The worker entry can install a custom source adapter without moving network or
-replication work onto the UI thread:
+An application-owned worker starts the same standalone engine:
 
 ```ts
 // tinygres.worker.ts
-import {startWorker} from 'tinygres/worker';
+import { startWorker } from "tinygres/worker";
 
-startWorker({source: myReadOnlyReplicaSource});
+startWorker();
 ```
-
-Adapter functions live in the worker and normalize their input into table
-snapshots and change batches. They are not serialized through `postMessage`.
-When a custom source and OPFS are combined, the application must include the
-source identity and authorization scope in its storage name. TinyGres can bind
-storage automatically only for serializable built-in source configurations.
 
 ## OPFS persistence
 
@@ -215,8 +177,8 @@ stable name to the database:
 
 ```ts
 const db = createClient({
-  schemas: [{name: 'posts', primaryKey: ['id']}],
-  storage: {kind: 'opfs', name: 'my-project-public-posts-v1'},
+  schemas: [{ name: "posts", primaryKey: ["id"] }],
+  storage: { kind: "opfs", name: "my-project-public-posts-v1" },
 });
 
 await db.ready();
@@ -225,27 +187,24 @@ await db.ready();
 Names must contain 1–64 ASCII letters, numbers, dots, underscores, or hyphens,
 and start with a letter or number.
 
-`ready()` restores the saved schemas, rows, and revision before a source
-adapter starts. Mutations resolve only after a checksummed append record and
-its independent commit marker have been flushed. Recovery replays complete
-records over the latest checkpoint, truncates only an incomplete final record,
-and fails closed on framed corruption. Two alternating checkpoint/journal pairs
-ensure compaction cannot overwrite the last complete state.
+`ready()` opens the page database and validates or initializes its schemas. The
+page engine uses 4 KiB copy-on-write pages:
+candidate data and catalog pages are flushed before one checksummed metadata
+publication makes the new generation visible. A known pre-publication failure
+leaves the previous generation authoritative. An uncertain final publication
+poisons the open engine and requires a reopen, which deterministically selects
+the complete old or new generation.
+
+Each logical name maps to the single OPFS file
+`tinygres-pages-v1/db-<name>/database.pages`. Its synchronous access handle is
+both the page device and the exclusive database lock; there is no sidecar
+snapshot, journal, authority marker, or second persistence engine.
 
 OPFS persistence is deliberately single-writer. A second Worker opening the
 same name fails rather than risking concurrent mutation; closing or terminating
 the owning Worker releases the lock. Different names are independent. Include
-the project, dataset, schema version, and authenticated user or authorization
-scope in the name whenever those affect which rows may be cached. A name is a
-namespace, not an encryption or access-control boundary.
-
-For the built-in Supabase source, TinyGres derives the physical OPFS namespace
-from the logical name plus the normalized project URL, publishable key, table
-mapping, primary keys, and selected columns. Changing that visibility contract
-opens a separate cache instead of exposing rows from the previous one. Database
-policy definitions are not part of that client-side fingerprint: change the
-logical storage name (or clear the old cache) whenever an anonymous policy or
-publication changes.
+the application, dataset, and schema version in the name. A name is a namespace,
+not an encryption or access-control boundary.
 
 Synchronous OPFS access requires a secure context and a dedicated Worker. It is
 not available in a `SharedWorker`. There is no silent fallback to memory when
@@ -257,170 +216,33 @@ stronger retention can make an explicit, user-appropriate
 `navigator.storage.persist()` request; TinyGres does not make that policy
 decision during startup.
 
-The journal checkpoints after 128 records or 1 MiB. Before a persistent
-mutation, Rust prepares deterministic, checksummed row and catalog deltas while
-the committed database remains visible. The worker flushes those opaque bytes
-and their independent commit marker, then publishes the already-validated
-candidate in memory. A known append failure aborts the candidate; an uncertain
-outcome or a failure after the durable append requires a reopen. Normal journal
-mutations therefore no longer export and import a whole-database snapshot just
-to provide rollback. A one-row update to the 10,000-row browser fixture appends
-hundreds of bytes and is gated below 16 KiB.
+The physical database is capped at 65,536 pages (256 MiB). Its default page
+cache is 16 MiB, and mutation, query-result, join, and aggregate working sets
+retain their independent 16 MiB logical bounds. Ordinary queries and writes
+therefore do not deserialize the complete database into WASM memory or copy it
+through `postMessage`.
 
-Checkpoints and individual prepared commits remain capped at 16 MiB, and the
-current query engine still keeps the complete database in WASM memory. Paged
-storage is the next milestone for raising the database-size ceiling and bounding
-the working set.
+TinyGres writes only its page-native format. Earlier experimental
+checkpoint/journal and staged-migration layouts were never released and are not
+recognized or migrated. Use a new logical storage name, or clear experimental
+OPFS data, when moving a development app to this format.
 
-## Supabase adapter
-
-The first source adapter snapshots explicitly selected tables through the
-Supabase Data API, then uses Supabase Realtime to accelerate changes. The
-default worker needs only a serializable configuration; it includes the narrow
-REST and Phoenix WebSocket behavior required for this flow and has no Supabase
-SDK dependency:
-
-```ts
-import {createClient} from 'tinygres';
-
-const db = createClient({
-  storage: {kind: 'opfs', name: 'my-app-cache'},
-  source: {
-    kind: 'supabase',
-    url: import.meta.env.VITE_SUPABASE_URL,
-    publishableKey: import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
-    tables: [
-      {
-        // `schema` defaults to `public`.
-        table: 'posts',
-        primaryKey: ['id'],
-        columns: ['id', 'title', 'published'],
-      },
-    ],
-  },
-});
-
-// Local readiness never waits for the network. An OPFS cache is queryable here;
-// a new cache has the configured schemas and no rows yet.
-await db.ready();
-const cached = await db.query('SELECT * FROM posts');
-
-const unsubscribe = db.subscribeToSyncState((state) => {
-  console.log('TinyGres sync state', state.phase);
-});
-
-// Wait through transient reconnects until a complete remote baseline is live.
-await db.whenSynced({timeoutMs: 30_000});
-const reconciled = await db.query('SELECT * FROM posts');
-
-unsubscribe();
-await db.close();
-```
-
-`getSyncState()` returns the latest state, and `subscribeToSyncState()`
-immediately emits that same snapshot before reporting later transitions.
-`whenSynced()` resolves only for `live-best-effort` or a future durable-live
-state; it rejects terminal configuration/permission errors, cancellation,
-timeout, client closure, and calls made without a source.
-
-The built-in configuration deliberately supports one invariant anonymous
-visibility scope through a browser-safe Supabase publishable key. Each selected
-table must be entirely readable by the anonymous role through the Data API—for
-example, with a table-wide `USING (true)` policy—and included in Supabase's
-Realtime publication. Row-dependent anonymous RLS, policy changes, and
-visibility based on JWT claims are not supported: a browser cache cannot infer
-that a previously visible row has become hidden. Enable `REPLICA IDENTITY FULL`
-for synchronized tables so UPDATE and DELETE events contain enough old row
-identity to repair primary-key changes safely. Never put a secret or
-service-role key in browser code; TinyGres rejects those recognizable key
-forms.
-
-Authenticated sessions, token refresh, and changing per-user RLS visibility
-need an explicit auth-generation and cache-transition contract and are not yet
-supported by the built-in source. For advanced experiments, an
-application-owned worker can still inject the official Supabase client:
-
-```ts
-// tinygres.worker.ts
-import {createClient} from '@supabase/supabase-js';
-import {
-  createSupabaseJsRealtimeTransport,
-  createSupabaseSource,
-} from 'tinygres/supabase';
-import {startWorker} from 'tinygres/worker';
-
-const url = import.meta.env.VITE_SUPABASE_URL;
-const publishableKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
-const supabase = createClient(url, publishableKey, {
-  auth: {
-    autoRefreshToken: false,
-    detectSessionInUrl: false,
-    persistSession: false,
-  },
-});
-
-startWorker({
-  source: createSupabaseSource({
-    url,
-    publishableKey,
-    realtime: createSupabaseJsRealtimeTransport(supabase),
-    tables: [
-      {
-        schema: 'public',
-        table: 'posts',
-        primaryKey: ['id'],
-        columns: ['id', 'title', 'published'],
-      },
-    ],
-  }),
-});
-```
-
-```ts
-// app.ts
-const db = createClient({
-  worker: new Worker(new URL('./tinygres.worker.ts', import.meta.url), {
-    name: 'tinygres',
-    type: 'module',
-  }),
-});
-await db.ready();
-```
-
-Install `@supabase/supabase-js` in the application when using this helper;
-TinyGres deliberately does not bundle it or add it to the core runtime. The
-example above also covers anonymous/public-key access. Adapter functions remain
-inside the worker and are never passed through `postMessage`.
-
-Supabase Realtime does not provide a durable client cursor or transaction
-boundaries. TinyGres therefore reports this source as `live-best-effort`, marks
-it stale after a disconnect or untrusted payload, quarantines incremental
-changes until integrity is restored, and replaces complete table snapshots
-before reporting it live again. The REST snapshot is not transactionally
-aligned with the Realtime stream, so repeated changes during a snapshot trigger
-another bounded pass. This is an offline-readable cache with reconciliation,
-not logical replication or an upstream write path.
-
-See Supabase's documentation for [Postgres Changes setup](https://supabase.com/docs/guides/realtime/postgres-changes),
-the [Realtime wire protocol](https://supabase.com/docs/guides/realtime/protocol),
-and [browser-safe API keys](https://supabase.com/docs/guides/getting-started/api-keys).
-
-## Supabase-style builder
+## Fluent query builder
 
 The initial builder intentionally exposes only the implemented surface:
 
 ```ts
-const {data, error} = await db
-  .from<Post>('posts')
-  .select('id, title, published')
-  .eq('published', true)
-  .gte('priority', 2)
-  .order('id', {ascending: false})
+const { data, error } = await db
+  .from<Task>("tasks")
+  .select("id, title, done")
+  .eq("done", true)
+  .gte("priority", 2)
+  .order("id", { ascending: false })
   .range(0, 19);
 ```
 
-This syntax queries the local replica. It does not make a PostgREST request.
-Values are represented as JSON-compatible values.
+This syntax queries TinyGres directly and never makes a network request. Values
+are represented as JSON-compatible values.
 
 ## Current SQL compatibility
 
@@ -444,8 +266,7 @@ Raw SQL also supports a bounded single-table aggregate form:
 - `ORDER BY` projected output names or aliases, followed by `LIMIT`/`OFFSET`.
 
 Aggregate queries require a typed catalog, so this first slice applies to
-SQL-created local tables rather than legacy/source schemas that expose only
-column names.
+SQL-created tables rather than untyped schemas that expose only column names.
 
 `COUNT(column)`, `SUM`, `AVG`, `MIN`, and `MAX` skip `NULL`. A global
 aggregate over no matching rows produces one row (`COUNT` is zero and the
@@ -477,8 +298,8 @@ when exactly one table contains the column; ambiguous references are rejected.
 `NULL` join keys do not match, and a left join represents columns from an
 unmatched right row as `NULL`. Integer and float keys can be compared, while
 JSON join keys are rejected. Without `ORDER BY`, joined row order is not part
-of the contract. Quoted table aliases and source column names remain
-case-sensitive, but this first join slice rejects literal dots inside them.
+of the contract. Quoted table aliases and column names remain case-sensitive,
+but this first join slice rejects literal dots inside them.
 
 This first implementation uses a bounded nested-loop execution path. It rejects
 more than one join, `OR` or non-equality expressions in `ON`, `SELECT *`, more
@@ -490,7 +311,7 @@ Standalone writable databases additionally support:
 - `CREATE TABLE` and `CREATE TABLE IF NOT EXISTS` with a required inline or
   table-level primary key;
 - column types `BOOLEAN`, `SMALLINT`/`INTEGER`/`BIGINT`, `REAL`/`DOUBLE
-  PRECISION`, `TEXT`/`VARCHAR`, and `JSON`/`JSONB`;
+PRECISION`, `TEXT`/`VARCHAR`, and `JSON`/`JSONB`;
 - literal defaults, `NULL`/`NOT NULL`, and composite primary keys;
 - `CREATE [UNIQUE] INDEX [IF NOT EXISTS]` over boolean, integer, and text
   columns, including composite indexes;
@@ -531,40 +352,39 @@ npm run test:rust       # native Rust engine tests
 npm run build           # assemble the complete publishable dist package
 npm run test:browser    # real browser Worker/WASM flow
 npm run test:package    # pack dist and install it in a clean Vite app
-npm run check:size      # hard 700 KiB uncompressed WASM gate
+npm run check:size      # hard 700 KiB page-native WASM gate
 ```
 
-The browser tests cover the complete Phase-1 path—initialize the real module
-Worker, query, apply a fake remote change, receive an invalidation, and
-re-query—plus the persistence path through a real dedicated Worker and OPFS
-restart. The writable proof creates a typed table, inserts and updates inside a
-transaction, verifies rollback after a constraint failure, closes the Worker,
-and reopens the committed state. The Supabase suite adds a credential-free
-protocol server that exercises the
-actual default Worker, PostgREST snapshot, Phoenix join/change/reconnect flow,
-and source-bound OPFS recovery.
+The browser tests initialize the real module Worker, query, apply an atomic row
+change, receive an invalidation, and re-query, plus exercise persistence through
+a real dedicated Worker and OPFS restart. The writable proof creates a typed
+table, inserts and updates inside a transaction, verifies rollback after a
+constraint failure, closes the Worker, and reopens the committed state.
 
 The packed-package test separately proves SSR-safe import, declarations, a
 production Vite build, and real browser execution through both the packaged
-default worker and an application-owned worker. It also starts the built-in
-Supabase source through both worker modes without installing a Supabase SDK. It
-installs the tarball rather than resolving TinyGres through a workspace link.
+default worker and an application-owned worker. It covers memory and fresh OPFS
+write/reopen flows in both modes and installs the tarball rather than resolving
+TinyGres through a workspace link.
 
-The current feasibility target is an uncompressed WASM binary smaller than 700
-KiB. The size check is intentionally independent of gzip size so it cannot hide
+The single page-native WASM artifact has a hard uncompressed limit of 700 KiB.
+The check is intentionally independent of gzip size so compression cannot hide
 startup and compilation cost.
+
+The production page artifact enables WebAssembly SIMD. The current automated
+browser compatibility proof is Chromium in a dedicated Worker; TinyGres does
+not yet claim Firefox or WebKit support for this artifact, and it never silently
+falls back to another engine when compilation is unavailable.
 
 ## Direction
 
-Canonical prepared commits now remove the whole-database rollback copy from
-ordinary durable writes. The immediate direction is a bounded paged persistence
-layer, followed by streamed result cursors and cancellation so database and
-result size are not tied to one WASM allocation or `postMessage`. The initial
-bounded join slice establishes qualified column references without making
-ambiguous row semantics part of the public contract. Full PostgreSQL catalogs,
-extensions, server
-concurrency, and arbitrary wire compatibility are not goals. The existing
-adapter boundary remains available for optional remote read sources and a later
-cursor-aligned gateway without defining the core product around sync.
+The browser runtime uses the same bounded page-native engine for both memory and
+OPFS storage. The next direction is streamed result cursors and cancellation so
+even the bounded 16 MiB result model need not be materialized at once. The
+initial bounded join slice establishes qualified column references
+without making ambiguous row semantics part of the public contract. Full
+PostgreSQL catalogs, extensions, server concurrency, and arbitrary wire
+compatibility are not goals. External service integrations can be designed as
+separate packages later, against concrete requirements and a stable engine API.
 
 TinyGres is MIT licensed.

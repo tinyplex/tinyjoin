@@ -10,7 +10,6 @@
     "rustc",
     "rustup",
     "shellenv",
-    "supabase",
     "tinycreate",
     "tinygres",
     "tlsv"
