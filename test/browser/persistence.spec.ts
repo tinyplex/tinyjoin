@@ -6,8 +6,6 @@ import {join} from 'node:path';
 test('persists complete state across dedicated Worker restarts', async ({
   page,
 }) => {
-  const runtimeRequests: string[] = [];
-  page.on('request', (request) => runtimeRequests.push(request.url()));
   await page.goto('/');
   await expect(page.getByTestId('state')).toHaveText('Ready');
   const databaseName = `playwright-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
@@ -30,7 +28,6 @@ test('persists complete state across dedicated Worker restarts', async ({
   expect(report.emptyTableRows).toBe(0);
   expect(report.revision).toBe(2);
   expect(report.updatedTitle).toBe('Persisted after forced termination');
-  expect(report.journalWriteBytes).toBeLessThan(16_384);
   for (const timing of [
     report.initialCommitMs,
     report.gracefulReopenMs,
@@ -39,11 +36,6 @@ test('persists complete state across dedicated Worker restarts', async ({
   ]) {
     expect(Number.isFinite(timing) && timing >= 0).toBe(true);
   }
-  expect(
-    runtimeRequests.some((url) =>
-      url.includes('/wasm-migration/tinygres_migration_wasm.js'),
-    ),
-  ).toBe(true);
 });
 
 test('rehydrates OPFS after a browser process restart', async ({}, testInfo) => {
@@ -88,22 +80,4 @@ test('rehydrates OPFS after a browser process restart', async ({}, testInfo) => 
     await context.close().catch(() => undefined);
     await rm(profile, {force: true, recursive: true});
   }
-});
-
-test('keeps legacy transactional DDL available on the temporary OPFS path', async ({
-  page,
-}) => {
-  await page.goto('/');
-  await expect(page.getByTestId('state')).toHaveText('Ready');
-  const databaseName = `legacy-ddl-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
-
-  await expect(
-    page.evaluate((name) =>
-      window.__tinygresTest!.legacyTransactionDdlProbe(name),
-    databaseName),
-  ).resolves.toEqual({
-    reopenedRevision: 1,
-    reopenedRows: 1,
-    stagedRows: 1,
-  });
 });

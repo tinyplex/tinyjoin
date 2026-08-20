@@ -6,7 +6,7 @@ import {startWorker, type WorkerScope} from '../../src/worker/host.ts';
 
 const runtime = vi.hoisted(() => ({
   memoryCreates: 0,
-  opfsMigrationCreates: 0,
+  opfsCreates: 0,
 }));
 
 vi.mock('../../src/worker/engine.ts', async (loadActual) => {
@@ -20,9 +20,9 @@ vi.mock('../../src/worker/engine.ts', async (loadActual) => {
   };
 });
 
-vi.mock('../../src/worker/migration-loader.ts', () => ({
-  createOpfsMigrationEngine: async () => {
-    runtime.opfsMigrationCreates += 1;
+vi.mock('../../src/worker/opfs-loader.ts', () => ({
+  createOpfsWasmEngine: async () => {
+    runtime.opfsCreates += 1;
     return mockEngine();
   },
 }));
@@ -60,7 +60,7 @@ class FakeScope implements WorkerScope {
 
 beforeEach(() => {
   runtime.memoryCreates = 0;
-  runtime.opfsMigrationCreates = 0;
+  runtime.opfsCreates = 0;
 });
 
 describe('default engine selection', () => {
@@ -72,20 +72,21 @@ describe('default engine selection', () => {
 
     expect(runtime).toEqual({
       memoryCreates: 1,
-      opfsMigrationCreates: 0,
+      opfsCreates: 0,
     });
   });
 
-  it('opens OPFS through only the migration and snapshot path', async () => {
+  it('opens OPFS through only the page-storage runtime', async () => {
     const scope = new FakeScope();
     startWorker({scope});
-    scope.send(initRequest({kind: 'opfs', name: 'migration-test'}));
+    scope.send(initRequest({kind: 'opfs', name: 'page-test'}));
     await vi.waitFor(() => expect(scope.posted).toHaveLength(1));
 
     expect(runtime).toEqual({
       memoryCreates: 0,
-      opfsMigrationCreates: 1,
+      opfsCreates: 1,
     });
+    expect(scope.posted[0]).toMatchObject({id: 1, ok: true});
   });
 });
 

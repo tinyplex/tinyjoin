@@ -1,8 +1,4 @@
-import {
-  createClient,
-  type ChangeBatch,
-  type ClientOptions,
-} from 'tinygres';
+import {createClient, type ClientOptions} from 'tinygres';
 
 type Post = {
   id: number;
@@ -15,8 +11,6 @@ const search = new URLSearchParams(location.search);
 const mode = search.get('worker');
 const persistence = search.get('persistence');
 const databaseName = search.get('database');
-const source = search.get('source');
-const supabaseUrl = search.get('supabaseUrl');
 const options: ClientOptions =
   mode === 'app-local'
     ? {
@@ -30,22 +24,8 @@ const options: ClientOptions =
 if (persistence && databaseName) {
   options.storage = {kind: 'opfs', name: databaseName};
 }
-if (source === 'supabase') {
-  options.source = {
-    kind: 'supabase',
-    url: supabaseUrl ?? 'https://tinygres-packed.supabase.co',
-    publishableKey: 'sb_publishable_packed_test',
-    tables: [
-      {
-        table: 'posts',
-        primaryKey: ['id'],
-        columns: ['id', 'title'],
-      },
-    ],
-  };
-}
 
-run(options, mode ?? 'default', persistence, source).catch((error: unknown) => {
+run(options, mode ?? 'default', persistence).catch((error: unknown) => {
   body.dataset.status = 'failed';
   body.dataset.worker = mode ?? 'default';
   resultElement.textContent =
@@ -56,34 +36,12 @@ async function run(
   clientOptions: ClientOptions,
   workerMode: string,
   persistence: string | null,
-  source: string | null,
 ): Promise<void> {
-  const database = createClient({
-    ...clientOptions,
-    ...(source === 'supabase'
-      ? {}
-      : {schemas: [{name: 'posts', primaryKey: ['id']}]}),
-  });
+  const database = createClient(clientOptions);
   let succeeded = false;
 
   try {
     await database.ready();
-    if (source === 'supabase') {
-      const syncState = await database.whenSynced({timeoutMs: 15_000});
-      const snapshot = await database.query<Post>(
-        'SELECT id, title FROM posts WHERE id = $1',
-        [1],
-      );
-      resultElement.textContent = JSON.stringify({
-        worker: workerMode,
-        phase: syncState.phase,
-        revision: snapshot.revision,
-        title: snapshot.rows[0]?.title,
-      });
-      body.dataset.worker = workerMode;
-      succeeded = true;
-      return;
-    }
     if (persistence === 'read') {
       const restored = await database.query<Post>(
         'SELECT id, title FROM posts WHERE id = $1',
@@ -99,10 +57,16 @@ async function run(
       return;
     }
 
-    await database.replaceTable(
-      {name: 'posts', primaryKey: ['id']},
-      [{id: 1, title: 'from packed snapshot'}],
-    );
+    await database.exec(`
+      CREATE TABLE posts (
+        id INTEGER PRIMARY KEY,
+        title TEXT NOT NULL
+      )
+    `);
+    await database.exec('INSERT INTO posts (id, title) VALUES ($1, $2)', [
+      1,
+      'from packed insert',
+    ]);
     const before = await database.query<Post>(
       'SELECT id, title FROM posts WHERE id = $1',
       [1],
@@ -114,38 +78,27 @@ async function run(
           () => reject(new Error('Timed out waiting for table invalidation')),
           5_000,
         );
-        const unsubscribe = database.subscribe(
-          {tables: ['posts']},
-          (event) => {
-            void database.query<Post>('SELECT id, title FROM posts').then(
-              (after) => {
-                window.clearTimeout(timeout);
-                unsubscribe();
-                const changed = after.rows[0];
-                if (!changed) {
-                  reject(new Error('Changed row was not returned'));
-                  return;
-                }
-                resolve({revision: event.revision, title: changed.title});
-              },
-              reject,
-            );
-          },
-        );
+        const unsubscribe = database.subscribe({tables: ['posts']}, (event) => {
+          void database
+            .query<Post>('SELECT id, title FROM posts')
+            .then((after) => {
+              window.clearTimeout(timeout);
+              unsubscribe();
+              const changed = after.rows[0];
+              if (!changed) {
+                reject(new Error('Changed row was not returned'));
+                return;
+              }
+              resolve({revision: event.revision, title: changed.title});
+            }, reject);
+        });
       },
     );
 
-    const batch = {
-      sourceId: 'packed-vite-consumer',
-      changes: [
-        {
-          type: 'upsert',
-          table: 'posts',
-          row: {id: 1, title: 'from packed change'},
-        },
-      ],
-    } satisfies ChangeBatch;
-    await database.applyBatch(batch);
+    await database.exec('UPDATE posts SET title = $1 WHERE id = $2', [
+      'from packed update',
+      1,
+    ]);
     const after = await invalidated;
 
     const payload = {
@@ -167,7 +120,9 @@ async function run(
   }
 }
 
-function requiredElement<ElementType extends Element>(selector: string): ElementType {
+function requiredElement<ElementType extends Element>(
+  selector: string,
+): ElementType {
   const element = document.querySelector<ElementType>(selector);
   if (!element) {
     throw new Error(`Missing packed-consumer element: ${selector}`);

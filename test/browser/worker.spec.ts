@@ -3,14 +3,14 @@ import {expect, test} from '@playwright/test';
 test('queries and invalidates through the real Worker/WASM engine', async ({
   page,
 }) => {
-  const legacyRequests: string[] = [];
+  const opfsRuntimeRequests: string[] = [];
   page.on('request', (request) => {
-    if (isLegacyRuntimeRequest(request.url())) {
-      legacyRequests.push(request.url());
+    if (isOpfsRuntimeRequest(request.url())) {
+      opfsRuntimeRequests.push(request.url());
     }
   });
   await page.route(
-    /(?:wasm-migration|worker-migration|tinygres_migration_runtime|migration-engine|persistent-engine|snapshot-store)/,
+    /\/worker-opfs\/tinygres_opfs_runtime\.js(?:\?.*)?$/,
     (route) => route.abort(),
   );
   await page.goto('/');
@@ -37,7 +37,7 @@ test('queries and invalidates through the real Worker/WASM engine', async ({
     'Re-queried after invalidation at revision 2',
   );
   await expect(page.getByTestId('error')).toBeHidden();
-  expect(legacyRequests).toEqual([]);
+  expect(opfsRuntimeRequests).toEqual([]);
 });
 
 test('rejects DDL in a page-native transaction without losing rollback', async ({
@@ -57,13 +57,6 @@ test('rejects DDL in a page-native transaction without losing rollback', async (
   });
 });
 
-function isLegacyRuntimeRequest(url: string): boolean {
-  return [
-    '/wasm-migration/',
-    '/worker-migration/',
-    'tinygres_migration_runtime',
-    '/worker/migration-engine.js',
-    '/worker/persistent-engine.js',
-    '/worker/snapshot-store.js',
-  ].some((part) => url.includes(part));
+function isOpfsRuntimeRequest(url: string): boolean {
+  return /\/worker-opfs\/tinygres_opfs_runtime\.js(?:\?.*)?$/.test(url);
 }

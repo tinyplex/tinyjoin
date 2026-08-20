@@ -57,7 +57,7 @@ class MemoryPageDevice {
 const runIfBinaryExists =
   existsSync(binaryModule) && existsSync(binaryWasm) ? describe : describe.skip;
 
-runIfBinaryExists('binary TypeScript/Rust wire checkpoint', () => {
+runIfBinaryExists('binary TypeScript/Rust wire contract', () => {
   it('round-trips every public model across the current Rust WASM binary', async () => {
     const wasm = (await import(
       /* @vite-ignore */ pathToFileURL(binaryModule).href
@@ -87,15 +87,11 @@ runIfBinaryExists('binary TypeScript/Rust wire checkpoint', () => {
     engine.defineTables([schema as TableSchema]);
     expect(
       engine.applyBatch({
-        sourceId: 'source',
-        cursor: {kind: 'sequence', value: '1'},
-        transactionId: 'remote-transaction',
-        committedAt: '2026-08-14T00:00:00.000Z',
         changes: [
           {
             type: 'upsert',
             table: 'items',
-            row: {id: 1, payload: {'__proto__': 'data', signedZero: -0}},
+            row: {id: 1, payload: {__proto__: 'data', signedZero: -0}},
           },
         ],
       }).tables,
@@ -114,7 +110,7 @@ runIfBinaryExists('binary TypeScript/Rust wire checkpoint', () => {
       {
         id: 1,
         title: 'typed-default',
-        payload: {'__proto__': 'data', signedZero: 0},
+        payload: {__proto__: 'data', signedZero: 0},
       },
     ]);
 
@@ -124,9 +120,9 @@ runIfBinaryExists('binary TypeScript/Rust wire checkpoint', () => {
       [2, 'sql', {nested: [true, null, 1.25]}],
     );
     expect(engine.inTransaction()).toBe(true);
-    expect(engine.querySql('SELECT * FROM items ORDER BY id', []).rows).toHaveLength(
-      2,
-    );
+    expect(
+      engine.querySql('SELECT * FROM items ORDER BY id', []).rows,
+    ).toHaveLength(2);
     engine.rollbackTransaction();
     expect(engine.querySql('SELECT * FROM items', []).rows).toHaveLength(1);
 
@@ -148,7 +144,6 @@ runIfBinaryExists('binary TypeScript/Rust wire checkpoint', () => {
     expect(replacement.tables).toEqual(['items']);
     expect(engine.querySql('SELECT id FROM items', []).rows).toEqual([{id: 3}]);
     expect(engine.revision()).toBeGreaterThan(0);
-    expect(engine.appliedJournalSequence()).toBe(0n);
 
     engine.close();
     engine.close();

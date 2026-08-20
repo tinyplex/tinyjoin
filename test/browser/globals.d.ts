@@ -1,7 +1,6 @@
 interface Window {
   __tinygresTest?: {
     benchmark(iterations: number): Promise<number[]>;
-    closeSupabaseProbe(): Promise<void>;
     joinDatabaseProbe(): Promise<{
       innerRows: Array<{
         author_id: number;
@@ -14,16 +13,6 @@ interface Window {
         author_name: string;
         article_id: number | null;
       }>;
-    }>;
-    openSupabaseProbe(options: {
-      databaseName?: string;
-      publishableKey: string;
-      url: string;
-    }): Promise<SupabaseProbeReport>;
-    legacyTransactionDdlProbe(databaseName: string): Promise<{
-      reopenedRevision: number;
-      reopenedRows: number;
-      stagedRows: number;
     }>;
     pageTransactionDdlProbe(): Promise<{
       committedRows: number;
@@ -44,7 +33,6 @@ interface Window {
       initialCommitMs: number;
       lockErrorCode: string;
       mutationCommitMs: number;
-      journalWriteBytes: number;
       revision: number;
       rowCount: number;
       updatedTitle: string;
@@ -66,18 +54,9 @@ interface Window {
       revision: number;
       rowCount: number;
     }>;
-    readSupabaseProbe(): Promise<SupabaseProbeReport>;
-    waitForSupabaseProbe(): Promise<SupabaseProbeReport>;
     writeBrowserRestartFixture(
       databaseName: string,
       rowCount: number,
     ): Promise<{revision: number}>;
   };
-}
-
-interface SupabaseProbeReport {
-  revision: number;
-  rows: Array<{id: number; title: string}>;
-  state: import('../../src/protocol.js').SyncState;
-  states: import('../../src/protocol.js').SyncState[];
 }

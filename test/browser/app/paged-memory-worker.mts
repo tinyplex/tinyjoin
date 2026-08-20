@@ -135,8 +135,6 @@ async function run(): Promise<{
   engine.defineTables([schema as TableSchema]);
   const defineRevision = engine.revision();
   engine.applyBatch({
-    sourceId: 'browser-memory-proof',
-    cursor: {kind: 'sequence', value: '1'},
     changes: [{type: 'upsert', table: 'items', row: {id: 1}}],
   });
 

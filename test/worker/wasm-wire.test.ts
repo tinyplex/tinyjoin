@@ -17,7 +17,6 @@ import {
   decodeQueryResultResponse,
   decodeRevisionResponse,
   decodeUnitResponse,
-  decodeWatermarkResponse,
   createBinaryWasmEngine,
   encodeApplyBatch,
   encodeDefineTables,
@@ -325,10 +324,6 @@ describe('binary WASM request codec', () => {
     expect(snapshot.payload).toEqual(expectedSnapshot);
 
     const batch: ChangeBatch = {
-      sourceId: 'source',
-      cursor: {kind: 'lsn', value: '0/16'},
-      transactionId: 'tx',
-      committedAt: 'now',
       changes: [
         {type: 'upsert', table: 'items', row: {id: 2}},
         {type: 'delete', table: 'items', key: {id: 1}},
@@ -336,15 +331,6 @@ describe('binary WASM request codec', () => {
     };
     const expectedBatch = new Bytes()
       .u8(VERSION)
-      .u8(1)
-      .string('source')
-      .u8(1)
-      .string('lsn')
-      .string('0/16')
-      .u8(1)
-      .string('tx')
-      .u8(1)
-      .string('now')
       .u32(2)
       .u8(0)
       .string('items')
@@ -410,12 +396,12 @@ describe('binary WASM request codec', () => {
       expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}),
     );
 
-    expect(() =>
-      encodeQuerySql('SELECT 1', new Array(1_000_001)),
-    ).toThrow(expect.objectContaining({code: 'RESOURCE_LIMIT'}));
-    expect(() =>
-      encodeQuerySql('x'.repeat(16 * 1024 * 1024), []),
-    ).toThrow(expect.objectContaining({code: 'RESOURCE_LIMIT'}));
+    expect(() => encodeQuerySql('SELECT 1', new Array(1_000_001))).toThrow(
+      expect.objectContaining({code: 'RESOURCE_LIMIT'}),
+    );
+    expect(() => encodeQuerySql('x'.repeat(16 * 1024 * 1024), [])).toThrow(
+      expect.objectContaining({code: 'RESOURCE_LIMIT'}),
+    );
   });
 
   it('checks the decoded Rust-model estimate before allocating the wire buffer', () => {
@@ -489,12 +475,12 @@ describe('binary WASM response codec', () => {
       disposition: 'safe',
       value: {revision: 7, tables: ['items']},
     });
-    expect(
-      decodeApplyOutcomeResponse(outcome(8n, ['items'], DURABLE)),
-    ).toEqual({
-      disposition: 'durable',
-      value: {revision: 8, tables: ['items']},
-    });
+    expect(decodeApplyOutcomeResponse(outcome(8n, ['items'], DURABLE))).toEqual(
+      {
+        disposition: 'durable',
+        value: {revision: 8, tables: ['items']},
+      },
+    );
 
     const trailing = new Uint8Array([...outcome(), 99]);
     expect(() => decodeApplyOutcomeResponse(trailing)).toThrow(
@@ -505,40 +491,37 @@ describe('binary WASM response codec', () => {
     );
   });
 
-  it('keeps revision safe and returns the full u64 watermark as bigint', () => {
+  it("keeps revisions within JavaScript's safe integer range", () => {
     const maximumSafe = BigInt(Number.MAX_SAFE_INTEGER);
     expect(
       decodeRevisionResponse(success(SAFE, (bytes) => bytes.u64(maximumSafe)))
         .value,
     ).toBe(Number.MAX_SAFE_INTEGER);
     expect(() =>
-      decodeRevisionResponse(success(SAFE, (bytes) => bytes.u64(maximumSafe + 1n))),
+      decodeRevisionResponse(
+        success(SAFE, (bytes) => bytes.u64(maximumSafe + 1n)),
+      ),
     ).toThrow(expect.objectContaining({code: 'BRIDGE_SERIALIZATION_ERROR'}));
-    expect(
-      decodeWatermarkResponse(
-        success(SAFE, (bytes) => bytes.u64(0xffff_ffff_ffff_ffffn)),
-      ).value,
-    ).toBe(0xffff_ffff_ffff_ffffn);
   });
 
   it('decodes null-prototype rows, negative zero, and nested JSON exactly', () => {
     const response = success(SAFE, (bytes) =>
-      bytes
-        .u64(3n)
-        .rows([
-          {
-            ['__proto__']: 'safe',
-            zero: -0.5,
-            nested: [true, {value: null}],
-          },
-        ]),
+      bytes.u64(3n).rows([
+        {
+          ['__proto__']: 'safe',
+          zero: -0.5,
+          nested: [true, {value: null}],
+        },
+      ]),
     );
     const decoded = decodeQueryResultResponse(response).value;
     expect(Object.getPrototypeOf(decoded.rows[0])).toBeNull();
     expect(decoded.rows[0]?.['__proto__']).toBe('safe');
     expect(decoded.rows[0]?.zero).toBe(-0.5);
     expect(decoded.rows[0]?.nested).toEqual([true, {value: null}]);
-    expect(Object.getPrototypeOf((decoded.rows[0]?.nested as JsonValue[])[1])).toBeNull();
+    expect(
+      Object.getPrototypeOf((decoded.rows[0]?.nested as JsonValue[])[1]),
+    ).toBeNull();
   });
 
   it('preserves a leading U+FEFF as ordinary string data', () => {
@@ -596,14 +579,7 @@ describe('binary WASM response codec', () => {
     expect(() => decodeUnitResponse(invalidUtf8)).toThrow(WasmWireDecodeError);
 
     const duplicate = success(SAFE, (bytes) =>
-      bytes
-        .u64(1n)
-        .u32(1)
-        .u32(2)
-        .string('id')
-        .json(1)
-        .string('id')
-        .json(2),
+      bytes.u64(1n).u32(1).u32(2).string('id').json(1).string('id').json(2),
     );
     expect(() => decodeQueryResultResponse(duplicate)).toThrow(
       WasmWireDecodeError,
@@ -662,7 +638,8 @@ describe('binary WorkerEngine adapter', () => {
         () => second.query(query),
         () => first.close(),
         () => second.close(),
-        () => createBinaryWasmEngine(CallbackRawEngine, new CallbackPageDevice()),
+        () =>
+          createBinaryWasmEngine(CallbackRawEngine, new CallbackPageDevice()),
       ]) {
         try {
           reenter();
@@ -723,8 +700,6 @@ describe('binary WorkerEngine adapter', () => {
 
     raw.response = success(SAFE, (bytes) => bytes.u64(3n));
     expect(engine.revision()).toBe(3);
-    raw.response = success(SAFE, (bytes) => bytes.u64(0xffff_ffff_ffff_ffffn));
-    expect(engine.appliedJournalSequence()).toBe(0xffff_ffff_ffff_ffffn);
   });
 
   it('does not poison a potential mutation when a trusted SAFE payload is malformed', () => {
@@ -743,7 +718,9 @@ describe('binary WorkerEngine adapter', () => {
       const raw = new FakeRawEngine();
       raw.response = response;
       const engine = new BinaryWasmEngine(raw);
-      expect(() => engine.executeSql('INSERT INTO items VALUES (1)', [])).toThrow(
+      expect(() =>
+        engine.executeSql('INSERT INTO items VALUES (1)', []),
+      ).toThrow(
         expect.objectContaining({
           code: 'STORAGE_COMMIT_OUTCOME_UNKNOWN',
           retryable: false,

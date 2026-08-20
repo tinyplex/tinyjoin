@@ -1,7 +1,6 @@
 import {
   createClient,
   type ChangeBatch,
-  type SyncState,
   type TableSchema,
 } from '../../../dist/index.js';
 
@@ -53,13 +52,6 @@ const applyButton = element<HTMLButtonElement>(
 
 let invalidations = 0;
 let simulatedChanges = 0;
-let supabaseProbe:
-  | {
-      database: ReturnType<typeof createClient>;
-      states: SyncState[];
-      unsubscribe(): void;
-    }
-  | undefined;
 
 async function boot(): Promise<void> {
   const database = createClient({schemas: [postsSchema]});
@@ -80,9 +72,6 @@ async function boot(): Promise<void> {
     applyButton.disabled = true;
     simulatedChanges += 1;
     const batch = {
-      sourceId: 'browser-test',
-      transactionId: `test-change-${simulatedChanges}`,
-      committedAt: new Date().toISOString(),
       changes: [
         {
           type: 'upsert',
@@ -125,16 +114,11 @@ async function boot(): Promise<void> {
       }
       return samples;
     },
-    closeSupabaseProbe,
     joinDatabaseProbe,
-    legacyTransactionDdlProbe,
-    openSupabaseProbe,
     pageTransactionDdlProbe: () => pageTransactionDdlProbe(database),
     persistenceProbe,
     writableDatabaseProbe,
-    readSupabaseProbe,
     readBrowserRestartFixture,
-    waitForSupabaseProbe,
     writeBrowserRestartFixture,
   };
 
@@ -143,7 +127,6 @@ async function boot(): Promise<void> {
     () => {
       unsubscribe();
       delete window.__tinygresTest;
-      void closeSupabaseProbe();
       void database.close();
     },
     {once: true},
@@ -152,48 +135,6 @@ async function boot(): Promise<void> {
   stateElement.textContent = 'Ready';
   statusElement.textContent = 'Ready. The initial snapshot is queryable locally.';
   applyButton.disabled = false;
-}
-
-async function legacyTransactionDdlProbe(databaseName: string): Promise<{
-  reopenedRevision: number;
-  reopenedRows: number;
-  stagedRows: number;
-}> {
-  let connection: ReturnType<typeof openOpfsClient> | undefined =
-    openOpfsClient(databaseName, []);
-  try {
-    await connection.client.ready();
-    const stagedRows = await connection.client.transaction(
-      async (transaction) => {
-        await transaction.exec(`
-          CREATE TABLE legacy_tx_probe (
-            id INTEGER PRIMARY KEY,
-            note TEXT NOT NULL
-          )
-        `);
-        await transaction.exec(
-          'INSERT INTO legacy_tx_probe (id, note) VALUES ($1, $2)',
-          [1, 'DDL and DML committed together'],
-        );
-        return (
-          await transaction.query('SELECT id FROM legacy_tx_probe')
-        ).rows.length;
-      },
-    );
-    await connection.client.close();
-    connection = openOpfsClient(databaseName, []);
-    await connection.client.ready();
-    const reopened = await connection.client.query(
-      'SELECT id FROM legacy_tx_probe',
-    );
-    return {
-      reopenedRevision: reopened.revision,
-      reopenedRows: reopened.rows.length,
-      stagedRows,
-    };
-  } finally {
-    connection?.worker.terminate();
-  }
 }
 
 async function pageTransactionDdlProbe(
@@ -482,89 +423,6 @@ async function joinDatabaseProbe(): Promise<{
   }
 }
 
-async function openSupabaseProbe(options: {
-  databaseName?: string;
-  publishableKey: string;
-  url: string;
-}): Promise<{
-  revision: number;
-  rows: Array<{id: number; title: string}>;
-  state: SyncState;
-  states: SyncState[];
-}> {
-  await closeSupabaseProbe();
-  const database = createClient({
-    ...(options.databaseName
-      ? {storage: {kind: 'opfs' as const, name: options.databaseName}}
-      : {}),
-    source: {
-      kind: 'supabase',
-      url: options.url,
-      publishableKey: options.publishableKey,
-      tables: [
-        {
-          table: 'posts',
-          primaryKey: ['id'],
-          columns: ['id', 'title'],
-        },
-      ],
-    },
-  });
-  const states: SyncState[] = [];
-  const unsubscribe = database.subscribeToSyncState((state) => {
-    states.push(state);
-  });
-  supabaseProbe = {database, states, unsubscribe};
-  await database.ready();
-  return readSupabaseProbe();
-}
-
-async function waitForSupabaseProbe(): Promise<{
-  revision: number;
-  rows: Array<{id: number; title: string}>;
-  state: SyncState;
-  states: SyncState[];
-}> {
-  const probe = requireSupabaseProbe();
-  await probe.database.whenSynced({timeoutMs: 15_000});
-  return readSupabaseProbe();
-}
-
-async function readSupabaseProbe(): Promise<{
-  revision: number;
-  rows: Array<{id: number; title: string}>;
-  state: SyncState;
-  states: SyncState[];
-}> {
-  const probe = requireSupabaseProbe();
-  const result = await probe.database.query<{id: number; title: string}>(
-    'SELECT id, title FROM posts',
-  );
-  return {
-    revision: result.revision,
-    rows: result.rows,
-    state: probe.database.getSyncState(),
-    states: probe.states.map((state) => structuredClone(state)),
-  };
-}
-
-async function closeSupabaseProbe(): Promise<void> {
-  const probe = supabaseProbe;
-  supabaseProbe = undefined;
-  if (!probe) {
-    return;
-  }
-  probe.unsubscribe();
-  await probe.database.close();
-}
-
-function requireSupabaseProbe(): NonNullable<typeof supabaseProbe> {
-  if (!supabaseProbe) {
-    throw new Error('The Supabase browser probe is not open');
-  }
-  return supabaseProbe;
-}
-
 async function renderQuery(
   database: ReturnType<typeof createClient>,
 ): Promise<void> {
@@ -618,7 +476,6 @@ async function persistenceProbe(
   initialCommitMs: number;
   lockErrorCode: string;
   mutationCommitMs: number;
-  journalWriteBytes: number;
   revision: number;
   rowCount: number;
   updatedTitle: string;
@@ -635,7 +492,7 @@ async function persistenceProbe(
     title: `Persisted post ${id}`,
     author: `Author ${id % 17}`,
     published: id % 2 === 0,
-    body: `Bounded persistence fixture ${id} ${'x'.repeat(96)}`,
+    body: `Bounded persistence fixture ${id} ${'x'.repeat(64)}`,
   }));
 
   let first: ReturnType<typeof openOpfsClient> | undefined = openOpfsClient(
@@ -690,7 +547,6 @@ async function persistenceProbe(
     }>('SELECT id, title FROM posts');
     const empty = await reopened.client.query('SELECT * FROM empty_table');
 
-    const journalBytesBefore = await opfsJournalBytes(databaseName);
     const mutationStartedAt = performance.now();
     await reopened.client.applyBatch({
       changes: [
@@ -702,8 +558,6 @@ async function persistenceProbe(
       ],
     });
     const mutationCommitMs = performance.now() - mutationStartedAt;
-    const journalWriteBytes =
-      (await opfsJournalBytes(databaseName)) - journalBytesBefore;
     reopened.worker.terminate();
     reopened = undefined;
 
@@ -724,7 +578,6 @@ async function persistenceProbe(
       initialCommitMs,
       lockErrorCode,
       mutationCommitMs,
-      journalWriteBytes,
       revision: afterCrashResult.revision,
       rowCount: restored.rows.length,
       updatedTitle: afterCrashResult.rows[0]?.title ?? '',
@@ -739,21 +592,6 @@ async function persistenceProbe(
       }
     }
   }
-}
-
-async function opfsFileSize(databaseName: string, fileName: string): Promise<number> {
-  const root = await navigator.storage.getDirectory();
-  const tinygres = await root.getDirectoryHandle('tinygres-v1');
-  const database = await tinygres.getDirectoryHandle(`db-${databaseName}`);
-  const file = await database.getFileHandle(fileName);
-  return (await file.getFile()).size;
-}
-
-async function opfsJournalBytes(databaseName: string): Promise<number> {
-  return (
-    (await opfsFileSize(databaseName, 'journal-a.bin')) +
-    (await opfsFileSize(databaseName, 'journal-b.bin'))
-  );
 }
 
 function openOpfsClient(databaseName: string, schemas: TableSchema[]) {

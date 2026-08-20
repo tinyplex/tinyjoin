@@ -47,7 +47,7 @@ describe('QueryBuilder', () => {
     expect(executePlan).toHaveBeenLastCalledWith({table: 'posts', filters: []});
   });
 
-  it('returns Supabase-shaped errors from execution', async () => {
+  it('returns structured errors from execution', async () => {
     const executor: QueryExecutor = {
       executePlan: () =>
         Promise.reject(
