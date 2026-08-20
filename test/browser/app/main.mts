@@ -362,6 +362,12 @@ async function joinDatabaseProbe(): Promise<{
     author_name: string;
     article_id: number | null;
   }>;
+  manyToManyRows: Array<{
+    post_id: number;
+    post_title: string;
+    tag_id: number;
+    tag_name: string;
+  }>;
 }> {
   const database = create();
   try {
@@ -391,6 +397,37 @@ async function joinDatabaseProbe(): Promise<{
        (12, 2, 'Local queries', true),
        (13, NULL, 'Unassigned draft', true)`,
     );
+    await database.exec(`
+      CREATE TABLE posts (
+        id INTEGER PRIMARY KEY,
+        title TEXT NOT NULL
+      )
+    `);
+    await database.exec(`
+      CREATE TABLE tags (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL
+      )
+    `);
+    await database.exec(`
+      CREATE TABLE post_tags (
+        post_id INTEGER NOT NULL,
+        tag_id INTEGER NOT NULL,
+        PRIMARY KEY (post_id, tag_id)
+      )
+    `);
+    await database.exec(
+      `INSERT INTO posts (id, title) VALUES
+       (1, 'Worker databases'), (2, 'Local queries'), (3, 'Untagged')`,
+    );
+    await database.exec(
+      `INSERT INTO tags (id, name) VALUES
+       (10, 'wasm'), (11, 'offline'), (12, 'unused')`,
+    );
+    await database.exec(
+      `INSERT INTO post_tags (post_id, tag_id) VALUES
+       (1, 10), (1, 11), (2, 11)`,
+    );
 
     const inner = await database.query<{
       author_id: number;
@@ -417,7 +454,24 @@ async function joinDatabaseProbe(): Promise<{
          ON author.id = article.author_id
        ORDER BY author_id, article_id NULLS LAST`,
     );
-    return {innerRows: inner.rows, leftRows: left.rows};
+    const manyToMany = await database.query<{
+      post_id: number;
+      post_title: string;
+      tag_id: number;
+      tag_name: string;
+    }>(
+      `SELECT post.id AS post_id, post.title AS post_title,
+              tag.id AS tag_id, tag.name AS tag_name
+       FROM posts AS post
+       INNER JOIN post_tags AS post_tag ON post.id = post_tag.post_id
+       INNER JOIN tags AS tag ON post_tag.tag_id = tag.id
+       ORDER BY post_id, tag_id`,
+    );
+    return {
+      innerRows: inner.rows,
+      leftRows: left.rows,
+      manyToManyRows: manyToMany.rows,
+    };
   } finally {
     await database.close();
   }

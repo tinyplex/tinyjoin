@@ -13,6 +13,12 @@ interface Window {
         author_name: string;
         article_id: number | null;
       }>;
+      manyToManyRows: Array<{
+        post_id: number;
+        post_title: string;
+        tag_id: number;
+        tag_name: string;
+      }>;
     }>;
     pageTransactionDdlProbe(): Promise<{
       committedRows: number;
