@@ -277,6 +277,8 @@ function assertPackedFiles(packed) {
     : [];
   for (const required of [
     'package.json',
+    'README.md',
+    'docs/sql.md',
     'index.js',
     'index.d.ts',
     'worker/default-entry.js',

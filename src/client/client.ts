@@ -123,7 +123,7 @@ export class Client implements QueryExecutor {
     return result;
   }
 
-  /** Executes one atomic SQL DDL or DML statement. */
+  /** Executes one supported atomic SQL statement, read or write. */
   async exec<RowType extends object = Row>(
     sql: string,
     params: JsonValue[] = [],

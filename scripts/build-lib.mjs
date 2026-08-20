@@ -1,4 +1,4 @@
-import {copyFile, readFile, rm, writeFile} from 'node:fs/promises';
+import {copyFile, mkdir, readFile, rm, writeFile} from 'node:fs/promises';
 import {spawnSync} from 'node:child_process';
 import {dirname, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -55,6 +55,8 @@ await writeFile(
 );
 await copyFile(resolve(root, 'LICENSE'), resolve(dist, 'LICENSE'));
 await copyFile(resolve(root, 'README.md'), resolve(dist, 'README.md'));
+await mkdir(resolve(dist, 'docs'), {recursive: true});
+await copyFile(resolve(root, 'docs/sql.md'), resolve(dist, 'docs/sql.md'));
 
 async function buildPrivateOpfsRuntime() {
   await buildOpfsRuntime();

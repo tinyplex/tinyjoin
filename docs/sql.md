@@ -1,0 +1,278 @@
+# TinyGres SQL compatibility
+
+TinyGres implements its own deliberately bounded, PostgreSQL-shaped SQL
+dialect. It is not PostgreSQL compiled to WebAssembly, a PostgreSQL server, or
+a general PostgreSQL replacement. Familiar syntax is used where the smaller
+runtime can give it clear and deterministic semantics.
+
+This document is the compatibility contract for the current dialect. A form
+not listed as supported here is unsupported, even if its keywords happen to be
+accepted by PostgreSQL. Unsupported forms fail explicitly rather than being
+silently reinterpreted.
+
+## JavaScript entry point
+
+SQL is the primary relational interface. The normal lifecycle has four
+calls:
+
+```ts
+import { create } from "tinygres";
+
+const db = create({ storage: { kind: "memory" } });
+
+await db.exec(`
+  CREATE TABLE tasks (
+    id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    done BOOLEAN NOT NULL DEFAULT false
+  )
+`);
+await db.exec("INSERT INTO tasks (id, title) VALUES ($1, $2)", [
+  1,
+  "Write the compatibility contract",
+]);
+
+const { rows } = await db.query<{ id: number; title: string }>(
+  "SELECT id, title FROM tasks WHERE done = $1",
+  [false],
+);
+
+await db.close();
+```
+
+`create()` starts opening the Worker-backed database and returns its client
+immediately. The first operation waits for initialization; `ready()` is
+available when opening needs to be observed separately.
+
+`query()` executes one read-only `SELECT` and returns
+`{revision, rows}`. `exec()` executes exactly one supported read or write SQL
+statement and returns `{command, revision, rowCount, rows, tables}`; `rows`
+contains any `SELECT` or `RETURNING` result. Both methods accept
+JSON-compatible `$1` parameters.
+`close()` is asynchronous and idempotent.
+
+Multi-statement atomicity uses `transaction(callback)`, not SQL transaction
+statements:
+
+```ts
+await db.transaction(async (tx) => {
+  await tx.exec("UPDATE tasks SET done = true WHERE id = $1", [1]);
+  await tx.exec("INSERT INTO tasks (id, title) VALUES ($1, $2)", [
+    2,
+    "Committed together",
+  ]);
+});
+```
+
+The package also exposes a fluent read builder, table replacement/change-batch
+operations, invalidation subscriptions, and Worker/storage configuration.
+Those are a small JavaScript control surface around the SQL-first engine, not
+additional SQL syntax.
+
+## How to read the matrices
+
+- **Supported** means the exact form described here is implemented and tested.
+- **Narrow** means TinyGres implements a useful but intentionally smaller form
+  than PostgreSQL.
+- **No** means the form is rejected.
+
+These labels do not claim compatibility with a particular PostgreSQL release.
+
+## Statements and clauses
+
+| Keyword or form | Status | TinyGres form and boundary |
+| --- | --- | --- |
+| `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or exactly one two-table join. A simple projection is `*` or plain column names. There is no `SELECT` without `FROM`. |
+| `WHERE` | Supported | Predicates described below, with SQL three-valued null logic. |
+| `ORDER BY` | Narrow | Up to 32 plain columns for simple queries, projected output names for grouped/aggregate queries, and projected output names or qualified/unambiguous source columns for joins; `ASC`/`DESC` and `NULLS FIRST`/`LAST`. JSON values cannot be ordered. |
+| `LIMIT`, `OFFSET` | Supported | Non-negative integer literal or `$n` parameter. `LIMIT` is at most 100,000; `OFFSET` and `OFFSET + LIMIT` are at most 4,294,967,295. `OFFSET` may appear alone; when both occur, `LIMIT` must precede `OFFSET`. |
+| `GROUP BY` | Narrow | Up to 32 plain boolean, integer, float, or text columns (not JSON) on one typed table. Every selected non-aggregate column must be grouped explicitly. |
+| `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` | Narrow | Every aggregate query requires a typed column catalog, including `COUNT(*)`. Functions accept `COUNT(*)` or one plain column argument. `SUM`/`AVG` accept integer or float; `MIN`/`MAX` accept integer, float, or text. Up to 64 aggregate calls. |
+| `HAVING`, aggregate `DISTINCT`, `FILTER`, windows | No | No post-group predicate, distinct aggregate, filter clause, or window form. |
+| `JOIN`, `INNER JOIN` | Narrow | Exactly two typed tables and 1–32 cross-table equality terms joined by `AND`. |
+| `LEFT [OUTER] JOIN` | Narrow | Same bounded equijoin form; unmatched right columns are `NULL`. |
+| `RIGHT`, `FULL`, `CROSS`, `NATURAL`, `USING`, `LATERAL` | No | No additional join families, derived relations, or third table. |
+| `AS` | Narrow | Output aliases on `SELECT` items in grouped/aggregate queries, plus table and projection-output aliases in joins. Ordinary single-table projections do not accept aliases. |
+| `DISTINCT`, `WITH`, subqueries, `UNION`/`INTERSECT`/`EXCEPT` | No | No CTEs, subqueries, set operations, or distinct-row projection. |
+| `CREATE TABLE [IF NOT EXISTS]` | Narrow | Typed columns and a required inline or table-level primary key. Up to 256 columns. |
+| `PRIMARY KEY` | Narrow | One inline single-column declaration or one table-level column list (single or composite). It implies `NOT NULL`; JSON keys are rejected. |
+| `NULL`, `NOT NULL`, `DEFAULT` | Narrow | String, number, boolean, or `NULL` literal defaults only. No default expressions, functions, sequences, or parameters. |
+| `CREATE [UNIQUE] INDEX [IF NOT EXISTS]` | Narrow | One or more boolean, integer, or text columns. No methods, expressions, predicates, `INCLUDE`, ordering, or concurrent build. |
+| `ALTER TABLE ... ADD [COLUMN] [IF NOT EXISTS]` | Narrow | Adds one non-primary-key column and atomically backfills its literal default or `NULL`. On a nonempty table, `NOT NULL` requires a non-null default. Other `ALTER` forms are rejected. |
+| `DROP TABLE [IF EXISTS]` | Narrow | Drops the table and its indexes. No `CASCADE`/`RESTRICT` dependency model. |
+| `DROP INDEX [IF EXISTS]` | Supported | Drops one globally named index. |
+| `INSERT ... VALUES` | Narrow | Optional column list, up to 4,096 literal/parameter rows, per-cell `DEFAULT`, and optional `RETURNING`. |
+| `INSERT ... DEFAULT VALUES` | Supported | Inserts one row using defaults and `NULL` values. |
+| `INSERT ... SELECT`, `ON CONFLICT`, `MERGE` | No | No query-sourced insert, upsert clause, or merge statement. |
+| `UPDATE ... SET ... [WHERE ...]` | Narrow | Assigns literals, parameters, or `DEFAULT`; optional `RETURNING`. No expressions or `UPDATE ... FROM`. |
+| `DELETE FROM ... [WHERE ...]` | Narrow | Optional `RETURNING`. No `DELETE ... USING`. |
+| `RETURNING` | Narrow | `*` or a list of plain columns; no expressions or aliases. |
+| `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT` | No | Use the JavaScript callback transaction API. |
+| `COPY`, `TRUNCATE`, `EXPLAIN`, `VACUUM`, `ANALYZE` | No | No server maintenance or bulk-file SQL commands. |
+
+Exactly one statement is accepted, with one optional trailing semicolon.
+`exec()` is therefore not a migration-script or multi-statement parser.
+
+## Predicates and expressions
+
+| Form | Status | Semantics |
+| --- | --- | --- |
+| Strings, numbers, `TRUE`, `FALSE`, `NULL` | Supported | Single-quoted strings escape a single quote as `''`; numbers and booleans use their JSON-compatible scalar forms. |
+| `$1`, `$2`, ... | Supported | One-based JSON-compatible parameters; at most 1,024. |
+| `=`, `<>`, `!=`, `<`, `<=`, `>`, `>=` | Narrow | Strict scalar comparison, with integer/float cross-comparison. JSON supports structural equality/inequality only. |
+| `AND`, `OR`, `NOT`, parentheses | Supported | Precedence is `NOT`, then `AND`, then `OR`; SQL unknown/null propagation is preserved. |
+| `IS NULL`, `IS NOT NULL` | Supported | Tests the single runtime null value. |
+| `IN (...)`, `NOT IN (...)` | Supported | One to 1,024 literals or parameters with SQL null behavior. |
+| Arithmetic, concatenation, casts, scalar functions | No | Values are not a general expression language. |
+| `LIKE`, `ILIKE`, `BETWEEN`, `IS DISTINCT FROM`, `ANY`, `ALL` | No | These PostgreSQL predicate families are not implemented. |
+| JSON/path operators | No | JSON can be stored, returned, and compared for structural equality only. |
+
+The right side of an ordinary predicate is a literal or parameter, not another
+column or subquery. Column-to-column comparison exists only in a join's `ON`
+equality terms.
+
+## Runtime types
+
+PostgreSQL type spellings map onto five TinyGres runtime types. The spelling
+does not import PostgreSQL's storage width, coercion, operator, or catalog
+semantics.
+
+| Accepted SQL spellings | TinyGres value | Important difference |
+| --- | --- | --- |
+| `BOOLEAN`, `BOOL` | JavaScript boolean | No PostgreSQL coercions. |
+| `SMALLINT`, `INTEGER`, `INT`, `INT2`, `INT4`, `BIGINT`, `INT8` | One JavaScript-safe integer type | Range is -9,007,199,254,740,991 through 9,007,199,254,740,991. `SMALLINT`/`INTEGER` are wider and `BIGINT` is narrower than PostgreSQL. |
+| `REAL`, `FLOAT`, `FLOAT4`, `FLOAT8`, `DOUBLE PRECISION` | One finite binary64 JavaScript number | No real/double distinction, `NaN`, or infinity. |
+| `TEXT`, `VARCHAR`, `CHARACTER VARYING` | JavaScript string | No length modifiers or database collation. Ordering is deterministic Unicode code-point ordering. |
+| `JSON`, `JSONB` | The same JSON-compatible value (scalar, array, or object) | No textual/binary distinction, JSON operators, casts, or JSON index type. |
+
+SQL `NULL` and a JSON scalar `null` are the same runtime value, including in a
+JSON column. TinyGres cannot distinguish them for `NOT NULL`, `IS NULL`,
+aggregates, or defaults.
+
+There are no implicit PostgreSQL casts. Notable unavailable types include
+`NUMERIC`/`DECIMAL`, date/time/interval types, UUID, `BYTEA`, arrays,
+serial/identity, enum/domain, and user-defined types. Type modifiers such as
+`VARCHAR(100)` are rejected.
+
+## Identifiers, comments, and table names
+
+- Unquoted identifiers are folded to ASCII lower case. Double-quoted
+  identifiers preserve case and use doubled quotes to escape a quote.
+- An unquoted identifier may begin with `_`, an ASCII letter, or any non-ASCII
+  character. Later characters may additionally be ASCII digits or `$`.
+- TinyGres reserves these unquoted words case-insensitively: `SELECT`, `FROM`,
+  `WHERE`, `AND`, `OR`, `IS`, `IN`, `LIMIT`, `OFFSET`, `ORDER`, `BY`, `ASC`,
+  `DESC`, `NULLS`, `FIRST`, `LAST`, `NULL`, `TRUE`, `FALSE`, `CREATE`, `TABLE`,
+  `IF`, `NOT`, `EXISTS`, `PRIMARY`, `KEY`, `DEFAULT`, `INSERT`, `INTO`,
+  `VALUES`, `UPDATE`, `SET`, `DELETE`, `RETURNING`, `AS`, `JOIN`, `INNER`,
+  `LEFT`, `OUTER`, `ON`, `GROUP`, and `HAVING`. Double-quote one to use it as
+  an identifier. Other words used contextually by supported statements are not
+  necessarily reserved.
+- `--` line comments and nested `/* ... */` comments are supported.
+- Single-quoted strings use doubled single quotes. Dollar-quoted strings are
+  not supported.
+- A two-part table name such as `public.tasks` is accepted as one flat catalog
+  key. It does **not** create or resolve a PostgreSQL schema. `tasks` and
+  `public.tasks` are different TinyGres table names.
+- There is no `CREATE SCHEMA`, `search_path`, `information_schema`, or
+  `pg_catalog`. Index names are global catalog keys.
+
+## Constraints and indexes
+
+Every SQL-created table has a primary key. TinyGres currently implements:
+
+- primary-key uniqueness and non-nullability;
+- column `NOT NULL`;
+- scalar literal column defaults; and
+- separate unique indexes.
+
+It does not implement foreign keys, `CHECK`, exclusion constraints, generated
+columns, sequences, triggers, or dependency cascades.
+
+Composite primary and secondary indexes are supported. A unique index omits a
+key containing `NULL`, so multiple null-containing keys are allowed, matching
+PostgreSQL's default `NULLS DISTINCT` behavior. Complete primary-key equality
+uses direct lookup; complete equality for every column of a secondary index can
+use its postings. Partial composite matches, ranges, `OR`, and `NOT` scan.
+`UPDATE` and `DELETE` currently scan even for a primary-key predicate.
+
+## Aggregates and joins
+
+Aggregate null behavior follows the familiar SQL rules: `COUNT(*)` counts
+rows; other aggregates skip `NULL`; a global aggregate over no rows emits one
+row with count zero and other aggregates `NULL`; an empty grouped input emits
+no rows. Integer `SUM` fails beyond the JavaScript-safe range, and integer
+`AVG` returns a floating-point value rather than PostgreSQL `numeric`.
+
+Join keys containing `NULL` never match. Integer and float keys may compare;
+JSON join keys are rejected. Both join sides require typed SQL catalogs, and
+the result must use distinct JSON object field names. Without `ORDER BY`, row
+order is not part of the contract.
+
+The current join is a bounded nested loop, not a general PostgreSQL planner.
+Aggregates over joins are not supported.
+
+## Transactions and concurrency
+
+Each standalone write statement is atomic. A callback transaction stages
+`INSERT`, `UPDATE`, and `DELETE` statements, exposes those staged rows to reads
+through its transaction object, and publishes the complete result once.
+DDL must run as standalone statements.
+
+If a transaction statement fails, that statement installs no partial change,
+but the transaction is not put into PostgreSQL's aborted state. If the callback
+catches the error, earlier staged writes may still commit. Letting the error
+escape the callback rolls the transaction back.
+
+Requests are serialized through one Worker. OPFS persistence permits one open
+Worker for a database name; it is an exclusive writer rather than a
+PostgreSQL-style set of concurrent sessions. There is no MVCC session model,
+isolation-level selection, savepoints, lock manager, or deadlock detection.
+
+## PostgreSQL facilities that are not present
+
+TinyGres has no PostgreSQL wire protocol, SQLSTATE-compatible error protocol,
+server process, roles or grants, system catalogs, extensions, stored
+procedures, triggers, notifications, WAL, replication, point-in-time recovery,
+or PostgreSQL file-format compatibility. Rows and parameters are
+JSON-compatible JavaScript values; query results do not include PostgreSQL type
+OIDs or field metadata.
+
+Persistence is TinyGres's own page format in memory or one browser OPFS file.
+It is not a PostgreSQL data directory.
+
+## Hard limits
+
+Limits are part of the runtime contract: oversized work fails explicitly
+rather than growing without bound.
+
+| Resource | Current limit |
+| --- | ---: |
+| Physical database | 65,536 4 KiB pages (256 MiB) |
+| Tables / indexes | 4,096 each |
+| Columns per table or projection | 256 |
+| Catalog name | 1,023 UTF-8 bytes |
+| Complete encoded storage key | 1,024 bytes |
+| Encoded logical row data | 1,048,568 bytes |
+| Complete paged row / individual encoded JSON value | 1,048,576 bytes |
+| JSON nesting | 64 levels |
+| SQL text / tokens / parameters | 64 KiB / 4,096 / 1,024 |
+| Predicate nodes / nesting / `IN` values | 256 / 32 / 1,024 |
+| Rows in one `INSERT ... VALUES` | 4,096 |
+| Explicit `LIMIT` / `OFFSET` / `OFFSET + LIMIT` | 100,000 / 4,294,967,295 / 4,294,967,295 |
+| Rows scanned / returned by a query | 1,000,000 / 100,000 |
+| Rows changed by one `UPDATE` or `DELETE` | 100,000 |
+| Ordered matching rows | 100,000 |
+| Transaction overlay | 100,000 keys and 16 MiB |
+| Join candidate pairs / returned rows | 1,000,000 / 100,000 |
+| Join retained build rows | 100,000 |
+| Aggregate groups / calls | 100,000 / 64 |
+| Aggregate cells (groups times aggregate calls) | 1,000,000 |
+| Query, DML result, join, aggregate, or mutation working set | 16 MiB per operation-specific bound |
+
+An ordered query can reach its materialization limit before applying a small
+`LIMIT`. Join pair bounds apply to the candidate relation, not just returned
+rows. The 1,024-byte secondary-index key limit covers the complete encoded
+indexed tuple, separator, and primary-key tuple together, not each component
+independently. An individual JSON value remains subject to the smaller budget
+for the row that contains it.

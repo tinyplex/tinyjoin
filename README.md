@@ -132,10 +132,12 @@ await db.close();
 
 Every standalone SQL statement is atomic. `transaction()` stages `INSERT`,
 `UPDATE`, and `DELETE` statements against an isolated candidate database,
-rolls them back when the callback or a statement fails, persists one complete
-commit to OPFS, and then emits one table-level invalidation. Run DDL such as
-`CREATE`, `ALTER`, and `DROP` as standalone atomic statements. The transaction
-object must not escape its callback.
+rolls them back when the callback rejects (including for an uncaught statement
+error), persists one complete commit to OPFS, and then emits one table-level
+invalidation. A caught statement error does not abort the transaction or erase
+earlier staged writes. Run DDL such as `CREATE`, `ALTER`, and `DROP` as
+standalone atomic statements. The transaction object must not escape its
+callback.
 
 For callers that already hold complete JSON rows, `replaceTable(schema, rows)`
 atomically replaces one table and `applyBatch({changes})` atomically applies
@@ -148,6 +150,13 @@ wait for initialization automatically. Call `ready()` only when an application
 needs to observe opening or initialization separately. It is safe
 to import during server rendering; the worker is only constructed when the
 function is called in a browser.
+
+`query()` returns `{revision, rows}`. `exec()` accepts exactly one supported
+read or write statement and returns
+`{command, revision, rowCount, rows, tables}`, including any `SELECT` or
+`RETURNING` rows. These are TinyGres result objects rather than PostgreSQL wire
+results; see the [SQL compatibility contract](./docs/sql.md) for the exact
+dialect, type semantics, and limits.
 
 For an application-owned worker, pass `worker`, `workerFactory`, or `workerUrl`:
 
@@ -245,11 +254,22 @@ const { data, error } = await db
 This syntax queries TinyGres directly and never makes a network request. Values
 are represented as JSON-compatible values.
 
-## Current SQL compatibility
+## SQL compatibility
+
+TinyGres is intentionally much smaller than a full PostgreSQL implementation.
+It has a custom parser and page engine, five JSON-compatible runtime types, and
+no PostgreSQL server, wire protocol, catalogs, extensions, roles, or data-file
+compatibility. Familiar SQL spelling does not imply support for an unlisted
+PostgreSQL feature.
+
+The authoritative [SQL compatibility contract](./docs/sql.md) provides a
+statement-and-keyword matrix, predicate and type matrices, transaction and
+concurrency differences, unsupported feature families, and hard operational
+limits. The summary below describes the main implemented slice.
 
 TinyGres currently accepts one statement at a time. `SELECT` supports:
 
-- one unqualified or schema-qualified table;
+- one unqualified or two-part table name;
 - `*` or a list of simple column names;
 - `=`, `<>`/`!=`, `<`, `<=`, `>`, and `>=` comparisons;
 - `AND`, `OR`, `NOT`, parentheses, `IN`/`NOT IN`, and `IS [NOT] NULL`
@@ -258,6 +278,10 @@ TinyGres currently accepts one statement at a time. `SELECT` supports:
 - simple multi-column `ORDER BY` with `ASC`/`DESC` and
   `NULLS FIRST`/`NULLS LAST`;
 - optional non-negative `LIMIT` and `OFFSET`.
+
+A two-part name such as `public.tasks` is stored as one flat TinyGres table
+name. There is no PostgreSQL schema namespace or `search_path`, and the
+unqualified name `tasks` does not resolve it.
 
 Raw SQL also supports a bounded single-table aggregate form:
 
@@ -332,14 +356,14 @@ ordering rather than PostgreSQL database collations.
 Integers are restricted to JavaScript's exactly representable safe-integer
 range. Type names are compatibility spellings over this smaller runtime type
 set: for example, `BIGINT` does not provide 64-bit values and `JSONB` currently
-uses JSON-compatible structured values. `NULL = NULL` does not match, following
+uses JSON-compatible values. `NULL = NULL` does not match, following
 SQL null semantics.
 
 Aliases on ordinary non-aggregate, non-join projections, `HAVING`, aggregate
 `DISTINCT`/`FILTER`/window forms, subqueries, general expressions, multiple or
 non-equijoins, foreign keys, `ON CONFLICT`, sequences/generated IDs, type
-modifiers, and SQL `BEGIN` tokens are rejected with an `UNSUPPORTED_SQL` or
-schema error. `ALTER` is
+modifiers, and SQL `BEGIN` tokens are rejected explicitly; the error code
+depends on the form. `ALTER` is
 currently limited to adding a column; renaming or removing columns is not
 implemented. This is an explicit compatibility boundary, not an accidental
 promise of full PostgreSQL behavior.
