@@ -1,4 +1,4 @@
-use crate::{EngineError, Result, snapshot::crc32};
+use crate::{EngineError, Result, checksum::crc32};
 
 // Keep browser corruption diagnostics static and let the stable error code
 // carry the precise class. Native builds retain the detailed values.
@@ -260,7 +260,6 @@ pub struct Superblock {
     pub slot: SuperblockSlot,
     pub generation: u64,
     pub database_revision: u64,
-    pub applied_journal_sequence: u64,
     pub bitmap_slot: BitmapSlot,
     pub bitmap_generation: u64,
     pub catalog_root_page_id: Option<PageId>,
@@ -278,7 +277,6 @@ impl Superblock {
             slot,
             generation: 1,
             database_revision: 0,
-            applied_journal_sequence: 0,
             bitmap_slot,
             bitmap_generation: 1,
             catalog_root_page_id: None,
@@ -297,7 +295,8 @@ impl Superblock {
         payload[16..24].copy_from_slice(&self.max_page_count.to_le_bytes());
         payload[24..32].copy_from_slice(&self.generation.to_le_bytes());
         payload[32..40].copy_from_slice(&self.database_revision.to_le_bytes());
-        payload[40..48].copy_from_slice(&self.applied_journal_sequence.to_le_bytes());
+        // Bytes 40..48 are reserved for a future page-format field. They must remain zero until
+        // that field has a current, durable semantic and the format version advances.
         payload[48..56].copy_from_slice(&self.bitmap_generation.to_le_bytes());
         payload[56..64]
             .copy_from_slice(&self.catalog_root_page_id.unwrap_or(u64::MAX).to_le_bytes());
@@ -351,7 +350,11 @@ impl Superblock {
                 "Superblock maximum page count does not match this build",
             ));
         }
-        if payload[72..].iter().any(|byte| *byte != 0) {
+        if payload[40..48]
+            .iter()
+            .chain(payload[72..].iter())
+            .any(|byte| *byte != 0)
+        {
             return Err(invalid_page("Superblock reserved bytes must be zero"));
         }
         if read_u16(payload, 68) as usize != BITMAP_CHUNK_COUNT {
@@ -375,7 +378,6 @@ impl Superblock {
             slot,
             generation: read_u64(payload, 24),
             database_revision: read_u64(payload, 32),
-            applied_journal_sequence: read_u64(payload, 40),
             bitmap_generation: read_u64(payload, 48),
             bitmap_slot: BitmapSlot::try_from(payload[71])?,
             catalog_root_page_id,
@@ -719,7 +721,6 @@ impl RecoveredMetadata {
     fn logically_matches(&self, other: &Self) -> bool {
         self.superblock.generation == other.superblock.generation
             && self.superblock.database_revision == other.superblock.database_revision
-            && self.superblock.applied_journal_sequence == other.superblock.applied_journal_sequence
             && self.superblock.bitmap_generation == other.superblock.bitmap_generation
             && self.superblock.catalog_root_page_id == other.superblock.catalog_root_page_id
             && self.superblock.live_data_page_count == other.superblock.live_data_page_count
@@ -825,7 +826,6 @@ pub fn recover_metadata(
 pub fn build_next_metadata(
     active: &RecoveredMetadata,
     database_revision: u64,
-    applied_journal_sequence: u64,
     catalog_root_page_id: Option<PageId>,
     allocation_bitmap: &AllocationBitmap,
 ) -> Result<PendingMetadata> {
@@ -844,12 +844,6 @@ pub fn build_next_metadata(
             "Database revision cannot move backwards during metadata publication",
         ));
     }
-    if applied_journal_sequence < active.superblock.applied_journal_sequence {
-        return Err(invalid_page(
-            "Applied journal sequence cannot move backwards during metadata publication",
-        ));
-    }
-
     let slot = active.superblock.slot.inactive();
     let bitmap_slot = slot.bitmap_slot();
     let allocation_bitmap = allocation_bitmap.retarget(generation, bitmap_slot)?;
@@ -861,7 +855,6 @@ pub fn build_next_metadata(
         slot,
         generation,
         database_revision,
-        applied_journal_sequence,
         bitmap_slot,
         bitmap_generation: generation,
         catalog_root_page_id,
@@ -985,7 +978,6 @@ mod tests {
         slot: SuperblockSlot,
         generation: u64,
         database_revision: u64,
-        applied_journal_sequence: u64,
         extra_page: bool,
     ) -> EncodedMetadata {
         let mut allocation_bitmap = AllocationBitmap::new(generation, slot.bitmap_slot()).unwrap();
@@ -1001,7 +993,6 @@ mod tests {
             slot,
             generation,
             database_revision,
-            applied_journal_sequence,
             bitmap_slot: slot.bitmap_slot(),
             bitmap_generation: generation,
             catalog_root_page_id: Some(FIRST_DATA_PAGE_ID),
@@ -1106,7 +1097,6 @@ mod tests {
             let mut expected = Superblock::new(slot);
             expected.generation = 8;
             expected.database_revision = 31;
-            expected.applied_journal_sequence = 29;
             expected.bitmap_generation = 8;
             expected.catalog_root_page_id = Some(FIRST_DATA_PAGE_ID + 9);
             expected.live_data_page_count = 17;
@@ -1122,6 +1112,7 @@ mod tests {
             (12, 1, "UNSUPPORTED_PAGE"),
             (16, 1, "UNSUPPORTED_PAGE"),
             (24, 0, "INVALID_PAGE"),
+            (40, 1, "INVALID_PAGE"),
             (48, 2, "INVALID_PAGE"),
             (68, 2, "UNSUPPORTED_PAGE"),
             (70, 2, "INVALID_PAGE"),
@@ -1307,19 +1298,18 @@ mod tests {
 
     #[test]
     fn metadata_recovery_selects_the_highest_complete_generation() {
-        let older = encoded_metadata(SuperblockSlot::A, 8, 20, 19, false);
-        let newer = encoded_metadata(SuperblockSlot::B, 9, 21, 20, false);
+        let older = encoded_metadata(SuperblockSlot::A, 8, 20, false);
+        let newer = encoded_metadata(SuperblockSlot::B, 9, 21, false);
         let recovered = recover_metadata(older.raw(), newer.raw()).unwrap().unwrap();
         assert_eq!(recovered.superblock.slot, SuperblockSlot::B);
         assert_eq!(recovered.superblock.generation, 9);
         assert_eq!(recovered.superblock.database_revision, 21);
-        assert_eq!(recovered.superblock.applied_journal_sequence, 20);
     }
 
     #[test]
     fn metadata_recovery_falls_back_from_each_torn_or_corrupt_newer_component() {
-        let older = encoded_metadata(SuperblockSlot::A, 8, 20, 19, false);
-        let newer = encoded_metadata(SuperblockSlot::B, 9, 21, 20, false);
+        let older = encoded_metadata(SuperblockSlot::A, 8, 20, false);
+        let newer = encoded_metadata(SuperblockSlot::B, 9, 21, false);
 
         for length in 0..PAGE_HEADER_SIZE {
             let torn = RawMetadataSlot {
@@ -1410,9 +1400,9 @@ mod tests {
 
     #[test]
     fn metadata_recovery_falls_back_from_a_mixed_bitmap_generation() {
-        let older = encoded_metadata(SuperblockSlot::A, 8, 20, 19, false);
-        let newer = encoded_metadata(SuperblockSlot::B, 9, 21, 20, false);
-        let stale_bitmap = encoded_metadata(SuperblockSlot::B, 8, 20, 19, false);
+        let older = encoded_metadata(SuperblockSlot::A, 8, 20, false);
+        let newer = encoded_metadata(SuperblockSlot::B, 9, 21, false);
+        let stale_bitmap = encoded_metadata(SuperblockSlot::B, 8, 20, false);
         let mixed = RawMetadataSlot::new(
             &newer.superblock,
             [
@@ -1428,21 +1418,21 @@ mod tests {
 
     #[test]
     fn equal_generation_roots_must_be_logically_identical() {
-        let slot_a = encoded_metadata(SuperblockSlot::A, 12, 30, 29, false);
-        let slot_b = encoded_metadata(SuperblockSlot::B, 12, 30, 29, false);
+        let slot_a = encoded_metadata(SuperblockSlot::A, 12, 30, false);
+        let slot_b = encoded_metadata(SuperblockSlot::B, 12, 30, false);
         let recovered = recover_metadata(slot_a.raw(), slot_b.raw())
             .unwrap()
             .unwrap();
         assert_eq!(recovered.superblock.generation, 12);
 
-        let different_root = encoded_metadata(SuperblockSlot::B, 12, 31, 29, false);
+        let different_root = encoded_metadata(SuperblockSlot::B, 12, 31, false);
         assert_eq!(
             recover_metadata(slot_a.raw(), different_root.raw())
                 .unwrap_err()
                 .code,
             "INVALID_PAGE"
         );
-        let different_bitmap = encoded_metadata(SuperblockSlot::B, 12, 30, 29, true);
+        let different_bitmap = encoded_metadata(SuperblockSlot::B, 12, 30, true);
         assert_eq!(
             recover_metadata(slot_a.raw(), different_bitmap.raw())
                 .unwrap_err()
@@ -1453,8 +1443,8 @@ mod tests {
 
     #[test]
     fn unsupported_metadata_fails_closed_even_with_an_older_valid_root() {
-        let older = encoded_metadata(SuperblockSlot::A, 8, 20, 19, false);
-        let newer = encoded_metadata(SuperblockSlot::B, 9, 21, 20, false);
+        let older = encoded_metadata(SuperblockSlot::A, 8, 20, false);
+        let newer = encoded_metadata(SuperblockSlot::B, 9, 21, false);
         for component in 0..=BITMAP_CHUNK_COUNT {
             let mut unsupported_superblock = newer.superblock;
             let mut unsupported_chunks = newer.bitmap_chunks.clone();
@@ -1498,14 +1488,12 @@ mod tests {
             SuperblockSlot::A,
             8,
             crate::revision::MAX_DATABASE_REVISION,
-            19,
             false,
         );
         let newer = encoded_metadata(
             SuperblockSlot::B,
             9,
             crate::revision::MAX_DATABASE_REVISION,
-            20,
             false,
         );
         let mut unsupported_revision = newer.superblock;
@@ -1528,7 +1516,7 @@ mod tests {
 
     #[test]
     fn next_metadata_targets_the_inactive_pair_and_has_a_fixed_publication_order() {
-        let active_bytes = encoded_metadata(SuperblockSlot::A, 8, 20, 19, false);
+        let active_bytes = encoded_metadata(SuperblockSlot::A, 8, 20, false);
         let active = recover_metadata(active_bytes.raw(), RawMetadataSlot::empty())
             .unwrap()
             .unwrap();
@@ -1539,7 +1527,6 @@ mod tests {
         let pending = build_next_metadata(
             &active,
             21,
-            20,
             Some(FIRST_DATA_PAGE_ID + 1),
             &allocation_bitmap,
         )
@@ -1580,8 +1567,8 @@ mod tests {
     }
 
     #[test]
-    fn next_metadata_rejects_generation_wrap_and_backwards_progress() {
-        let active_bytes = encoded_metadata(SuperblockSlot::A, 8, 20, 19, false);
+    fn next_metadata_rejects_generation_wrap_and_backwards_revision() {
+        let active_bytes = encoded_metadata(SuperblockSlot::A, 8, 20, false);
         let active = recover_metadata(active_bytes.raw(), RawMetadataSlot::empty())
             .unwrap()
             .unwrap();
@@ -1589,7 +1576,6 @@ mod tests {
             build_next_metadata(
                 &active,
                 19,
-                20,
                 Some(FIRST_DATA_PAGE_ID),
                 &active.allocation_bitmap,
             )
@@ -1597,20 +1583,7 @@ mod tests {
             .code,
             "INVALID_PAGE"
         );
-        assert_eq!(
-            build_next_metadata(
-                &active,
-                21,
-                18,
-                Some(FIRST_DATA_PAGE_ID),
-                &active.allocation_bitmap,
-            )
-            .unwrap_err()
-            .code,
-            "INVALID_PAGE"
-        );
-
-        let exhausted_bytes = encoded_metadata(SuperblockSlot::A, u64::MAX, 20, 19, false);
+        let exhausted_bytes = encoded_metadata(SuperblockSlot::A, u64::MAX, 20, false);
         let exhausted = recover_metadata(exhausted_bytes.raw(), RawMetadataSlot::empty())
             .unwrap()
             .unwrap();
@@ -1618,7 +1591,6 @@ mod tests {
             build_next_metadata(
                 &exhausted,
                 21,
-                20,
                 Some(FIRST_DATA_PAGE_ID),
                 &exhausted.allocation_bitmap,
             )

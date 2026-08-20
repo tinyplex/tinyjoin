@@ -97,7 +97,7 @@ export class QueryBuilder<RowType extends object = Row>
     return this.#with({offset});
   }
 
-  /** Uses the same option names as Supabase's query builder. */
+  /** Orders rows by a column, with explicit direction and null placement. */
   order(column: string, options: OrderOptions = {}): QueryBuilder<RowType> {
     if (!column.trim()) {
       throw new ClientError({

@@ -1,7 +1,9 @@
 mod aggregate;
 mod btree;
 mod cache;
+mod checksum;
 mod device;
+#[cfg(test)]
 mod engine;
 mod error;
 mod join;
@@ -13,9 +15,11 @@ mod paged_schema;
 mod paged_storage;
 mod paged_transaction;
 mod pager;
+#[cfg(test)]
 mod prepared;
 mod query;
 mod revision;
+#[cfg(test)]
 mod snapshot;
 mod statement;
 mod storage;
@@ -29,12 +33,13 @@ pub use cache::{
     MAX_PAGE_CACHE_PAGES, PageCache,
 };
 pub use device::{MemoryPageDevice, PageDevice};
-pub use engine::{Engine, Prepared};
+#[cfg(test)]
+pub(crate) use engine::Engine;
 pub use error::{EngineError, Result};
 pub use model::{
     ApplyOutcome, Change, ChangeBatch, ColumnDefinition, ColumnType, ExecuteResult, Filter,
     FilterOperator, IndexDefinition, NullOrder, OrderBy, OrderDirection, Predicate, QueryPlan,
-    QueryResult, Row, SourceCursor, TableSchema,
+    QueryResult, Row, TableSchema,
 };
 pub use page::{
     ALLOCATION_BITMAP_BYTES, AllocationBitmap, BITMAP_CHUNK_COUNT, BITMAP_PAGE_COUNT, BitmapSlot,
@@ -46,5 +51,8 @@ pub use page::{
 pub use paged_engine::PagedEngine;
 pub use paged_storage::PagedStorage;
 pub use pager::{Pager, PagerWriteTransaction};
-pub use prepared::PreparedCommit;
-pub use storage::{InMemoryStorage, StorageDriver, StorageReader, VisitControl, VisitOutcome};
+#[cfg(test)]
+pub(crate) use prepared::PreparedCommit;
+#[cfg(test)]
+pub(crate) use storage::InMemoryStorage;
+pub use storage::{StorageDriver, StorageReader, VisitControl, VisitOutcome};

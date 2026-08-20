@@ -67,8 +67,8 @@ impl PagedTransaction {
             return Ok(());
         }
         // Detect collisions in the statement's original sequence before the overlay's canonical
-        // key map can collapse them. Public replication batches retain their documented
-        // last-write behavior; this stricter rule is specific to hidden SQL write-sets.
+        // key map can collapse them. Direct change batches retain their documented last-write
+        // behavior; this stricter rule is specific to hidden SQL write-sets.
         storage.validate_sql_row_change_sequence(&changes)?;
 
         let mut patch = OverlayPatch::default();
@@ -447,44 +447,43 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::{ColumnDefinition, ColumnType, InMemoryStorage, MemoryPageDevice, StorageDriver};
+    use crate::{ColumnDefinition, ColumnType, MemoryPageDevice};
 
     fn row(value: Value) -> Row {
         value.as_object().unwrap().clone()
     }
 
     fn storage() -> PagedStorage<MemoryPageDevice> {
-        let mut source = InMemoryStorage::default();
-        source
-            .define_table(TableSchema {
-                name: "items".to_owned(),
-                primary_key: vec!["id".to_owned()],
-                columns: vec![
-                    ColumnDefinition {
-                        name: "id".to_owned(),
-                        data_type: ColumnType::Integer,
-                        nullable: false,
-                        default: None,
-                    },
-                    ColumnDefinition {
-                        name: "name".to_owned(),
-                        data_type: ColumnType::Text,
-                        nullable: false,
-                        default: None,
-                    },
-                ],
-            })
-            .unwrap();
-        source
-            .replace_table(
-                "items",
+        let schema = TableSchema {
+            name: "items".to_owned(),
+            primary_key: vec!["id".to_owned()],
+            columns: vec![
+                ColumnDefinition {
+                    name: "id".to_owned(),
+                    data_type: ColumnType::Integer,
+                    nullable: false,
+                    default: None,
+                },
+                ColumnDefinition {
+                    name: "name".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                    default: None,
+                },
+            ],
+        };
+        let mut storage = PagedStorage::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        storage.define_table(schema.clone()).unwrap();
+        storage
+            .replace_table_snapshot(
+                schema,
                 vec![
                     row(json!({"id": 1, "name": "one"})),
                     row(json!({"id": 2, "name": "two"})),
                 ],
             )
             .unwrap();
-        PagedStorage::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap()
+        storage
     }
 
     #[test]

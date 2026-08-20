@@ -1,8 +1,8 @@
 use serde_json::Value;
 
 use crate::{
-    ApplyOutcome, ChangeBatch, EngineError, ExecuteResult, InMemoryStorage, PageDevice,
-    PagedStorage, QueryPlan, QueryResult, Result, StorageReader, TableSchema,
+    ApplyOutcome, ChangeBatch, EngineError, ExecuteResult, PageDevice, PagedStorage, QueryPlan,
+    QueryResult, Result, StorageReader, TableSchema,
     paged_transaction::{PagedReadView, PagedTransaction},
     statement::{PlannedDml, Statement, WriteStatement},
 };
@@ -28,21 +28,6 @@ impl<D: PageDevice> PagedEngine<D> {
     /// Opens a previously published paged database.
     pub fn open(device: D) -> Result<Self> {
         PagedStorage::open(device).map(Self::new)
-    }
-
-    /// Imports an in-memory catalog and its rows as one paged generation.
-    pub fn from_in_memory(device: D, source: &InMemoryStorage) -> Result<Self> {
-        PagedStorage::from_in_memory(device, source).map(Self::new)
-    }
-
-    /// Imports an in-memory catalog and its recovered journal watermark as one generation.
-    pub fn from_in_memory_with_journal_sequence(
-        device: D,
-        source: &InMemoryStorage,
-        applied_journal_sequence: u64,
-    ) -> Result<Self> {
-        PagedStorage::from_in_memory_with_journal_sequence(device, source, applied_journal_sequence)
-            .map(Self::new)
     }
 
     /// Atomically defines one initialization schema without advancing the database revision.
@@ -71,7 +56,7 @@ impl<D: PageDevice> PagedEngine<D> {
     ///
     /// The current browser bridge supplies `rows` as one buffered JavaScript array. The paged
     /// storage layer bounds that buffer and streams secondary-index construction internally; a
-    /// future source API can replace the boundary buffering without changing the durable format.
+    /// future streaming input can replace the boundary buffer without changing the durable format.
     pub fn replace_table_snapshot(
         &mut self,
         schema: TableSchema,
@@ -221,11 +206,6 @@ impl<D: PageDevice> PagedEngine<D> {
         self.storage.revision()
     }
 
-    /// Returns the legacy journal sequence incorporated into the active paged generation.
-    pub fn applied_journal_sequence(&self) -> u64 {
-        self.storage.applied_journal_sequence()
-    }
-
     #[doc(hidden)]
     pub fn ensure_readiness(&self) -> Result<()> {
         self.storage.ensure_readiness()
@@ -358,7 +338,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        Change, ChangeBatch, Engine, MemoryPageDevice, PAGE_SIZE, PageId, Row, StorageDriver,
+        Change, ChangeBatch, Engine, InMemoryStorage, MemoryPageDevice, PAGE_SIZE, PageId, Row,
+        StorageDriver,
     };
 
     #[derive(Default)]
@@ -462,33 +443,64 @@ mod tests {
         engine.into_storage()
     }
 
-    #[test]
-    fn sequence_aware_import_exposes_and_reopens_the_recovery_watermark() {
-        let source = source();
-        let engine = PagedEngine::from_in_memory_with_journal_sequence(
-            MemoryPageDevice::new(0).unwrap(),
-            &source,
-            47,
-        )
-        .unwrap();
-        assert_eq!(engine.revision(), source.revision());
-        assert_eq!(engine.applied_journal_sequence(), 47);
-
-        let reopened = PagedEngine::open(engine.into_device()).unwrap();
-        assert_eq!(reopened.revision(), source.revision());
-        assert_eq!(reopened.applied_journal_sequence(), 47);
-
-        let ordinary =
-            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
-        assert_eq!(ordinary.applied_journal_sequence(), 0);
+    /// Builds engine tests through the current page-native publication APIs.
+    fn page_native_fixture<D: PageDevice>(
+        device: D,
+        source: &InMemoryStorage,
+    ) -> Result<PagedEngine<D>> {
+        let mut engine = PagedEngine::open(device)?;
+        let schemas = source
+            .table_names()
+            .map(|name| source.table_schema_ref(name).cloned())
+            .collect::<Result<Vec<_>>>()?;
+        let populated_tables = source
+            .table_names()
+            .map(|name| {
+                source
+                    .table_rows(name)
+                    .map(|rows| usize::from(!rows.is_empty()))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .sum::<usize>();
+        let index_count = source.index_names().count();
+        let minimum_revision = populated_tables.saturating_add(index_count) as u64;
+        let revisioned_table_count = source
+            .revision()
+            .saturating_sub(minimum_revision)
+            .min(schemas.len() as u64) as usize;
+        for (offset, schema) in schemas.into_iter().enumerate() {
+            if offset < revisioned_table_count {
+                engine.storage.create_table_and_advance(schema)?;
+            } else {
+                engine.define_table(schema)?;
+            }
+        }
+        for name in source.table_names() {
+            let schema = source.table_schema_ref(name)?.clone();
+            let rows = source
+                .table_rows(name)?
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            if !rows.is_empty() {
+                engine.replace_table_snapshot(schema, rows)?;
+            }
+        }
+        for name in source.index_names() {
+            let definition = source.index_definition_ref(name).cloned().ok_or_else(|| {
+                EngineError::new("STORAGE_CORRUPT", "Test fixture index has no definition")
+            })?;
+            engine.storage.create_index_and_advance(definition)?;
+        }
+        Ok(engine)
     }
 
     #[test]
     fn page_native_dml_matches_in_memory_and_reopens() {
         let source = source();
         let mut expected = Engine::new(source.clone());
-        let mut actual =
-            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let mut actual = page_native_fixture(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
 
         for (sql, params) in [
             (
@@ -551,8 +563,7 @@ mod tests {
     #[test]
     fn failed_and_no_match_dml_do_not_publish() {
         let source = source();
-        let mut engine =
-            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let mut engine = page_native_fixture(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
         let revision = engine.revision();
         let rows = engine
             .query_sql("SELECT * FROM accounts ORDER BY id", &[])
@@ -677,8 +688,7 @@ mod tests {
     #[test]
     fn page_native_apply_batch_rejects_active_transactions_before_delegating() {
         let source = source();
-        let mut engine =
-            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let mut engine = page_native_fixture(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
         let revision = engine.revision();
         let batch = ChangeBatch {
             changes: vec![Change::Upsert {
@@ -689,7 +699,6 @@ mod tests {
                     "active": true,
                 })),
             }],
-            ..ChangeBatch::default()
         };
 
         engine.begin_transaction().unwrap();
@@ -728,7 +737,7 @@ mod tests {
         let source = source();
         let device = DurableDevice::default();
         let control = device.clone();
-        let mut engine = PagedEngine::from_in_memory(device, &source).unwrap();
+        let mut engine = page_native_fixture(device, &source).unwrap();
         let batch = ChangeBatch {
             changes: vec![Change::Upsert {
                 table: "accounts".to_owned(),
@@ -738,7 +747,6 @@ mod tests {
                     "active": false,
                 })),
             }],
-            ..ChangeBatch::default()
         };
 
         control.arm_after_flush(3);
@@ -790,8 +798,7 @@ mod tests {
             row(json!({"id": 4, "email": null, "active": true})),
         ];
         let mut expected = Engine::new(source.clone());
-        let mut actual =
-            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let mut actual = page_native_fixture(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
 
         assert_eq!(
             actual
@@ -878,8 +885,7 @@ mod tests {
     fn page_native_create_index_matches_planning_if_not_exists_and_reopens() {
         let source = source();
         let mut expected = Engine::new(source.clone());
-        let mut actual =
-            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let mut actual = page_native_fixture(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
 
         let sql = "CREATE INDEX accounts_active ON accounts (active)";
         assert_eq!(
@@ -936,8 +942,7 @@ mod tests {
     fn page_native_add_column_matches_in_memory_backfill_and_error_order() {
         let source = source();
         let mut expected = Engine::new(source.clone());
-        let mut actual =
-            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let mut actual = page_native_fixture(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
 
         for sql in [
             "ALTER TABLE accounts ADD COLUMN score INTEGER NOT NULL DEFAULT 7",
@@ -1019,24 +1024,24 @@ mod tests {
                 .unwrap_err()
         );
 
-        let mut legacy = InMemoryStorage::default();
-        legacy
+        let mut untyped = InMemoryStorage::default();
+        untyped
             .define_table(TableSchema {
-                name: "legacy".to_owned(),
+                name: "untyped".to_owned(),
                 primary_key: vec!["id".to_owned()],
                 columns: vec![],
             })
             .unwrap();
-        let mut expected_legacy = Engine::new(legacy.clone());
-        let mut actual_legacy =
-            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &legacy).unwrap();
+        let mut expected_untyped = Engine::new(untyped.clone());
+        let mut actual_untyped =
+            page_native_fixture(MemoryPageDevice::new(0).unwrap(), &untyped).unwrap();
         for sql in [
-            "ALTER TABLE legacy ADD COLUMN value TEXT",
+            "ALTER TABLE untyped ADD COLUMN value TEXT",
             "ALTER TABLE missing ADD COLUMN value TEXT",
         ] {
             assert_eq!(
-                actual_legacy.execute_sql(sql, &[]).unwrap_err(),
-                expected_legacy.execute_sql(sql, &[]).unwrap_err(),
+                actual_untyped.execute_sql(sql, &[]).unwrap_err(),
+                expected_untyped.execute_sql(sql, &[]).unwrap_err(),
                 "{sql}"
             );
         }
@@ -1046,8 +1051,7 @@ mod tests {
     fn page_native_add_column_failure_is_atomic_and_duplicate_wins_at_column_limit() {
         let source = source();
         let mut expected = Engine::new(source.clone());
-        let mut actual =
-            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let mut actual = page_native_fixture(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
         let revision = actual.revision();
         let sql = "ALTER TABLE accounts ADD COLUMN required TEXT NOT NULL";
         assert_eq!(
@@ -1084,8 +1088,7 @@ mod tests {
         let mut source = InMemoryStorage::default();
         source.define_table(wide).unwrap();
         let mut expected = Engine::new(source.clone());
-        let mut actual =
-            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let mut actual = page_native_fixture(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
         let revision = actual.revision();
         let no_op = "ALTER TABLE wide ADD COLUMN IF NOT EXISTS id JSON NOT NULL DEFAULT NULL";
         assert_eq!(
@@ -1184,8 +1187,7 @@ mod tests {
     fn page_native_drop_index_and_table_match_in_memory_and_reopen() {
         let source = source();
         let mut expected = Engine::new(source.clone());
-        let mut actual =
-            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let mut actual = page_native_fixture(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
 
         for sql in [
             "DROP INDEX accounts_email",
@@ -1243,8 +1245,7 @@ mod tests {
     #[test]
     fn query_sql_rejects_mutations_without_publishing() {
         let source = source();
-        let engine =
-            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let engine = page_native_fixture(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
         let revision = engine.revision();
         assert_eq!(
             engine
@@ -1260,8 +1261,7 @@ mod tests {
     fn explicit_row_transactions_match_in_memory_read_their_writes_and_reopen() {
         let source = source();
         let mut expected = Engine::new(source.clone());
-        let mut actual =
-            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let mut actual = page_native_fixture(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
         let base_revision = actual.revision();
         expected.begin_transaction().unwrap();
         actual.begin_transaction().unwrap();
@@ -1312,8 +1312,7 @@ mod tests {
     #[test]
     fn failed_transaction_statement_preserves_prior_work_and_ddl_is_rejected() {
         let source = source();
-        let mut engine =
-            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let mut engine = page_native_fixture(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
         let revision = engine.revision();
         engine.begin_transaction().unwrap();
         engine
@@ -1366,8 +1365,7 @@ mod tests {
     #[test]
     fn rollback_empty_and_dirty_net_zero_transactions_have_exact_revision_semantics() {
         let source = source();
-        let mut engine =
-            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let mut engine = page_native_fixture(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
         let revision = engine.revision();
 
         engine.begin_transaction().unwrap();
@@ -1423,8 +1421,7 @@ mod tests {
     #[test]
     fn transaction_validates_unique_indexes_against_its_complete_final_state() {
         let source = source();
-        let mut engine =
-            PagedEngine::from_in_memory(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
+        let mut engine = page_native_fixture(MemoryPageDevice::new(0).unwrap(), &source).unwrap();
         engine.begin_transaction().unwrap();
         // The committed unique postings must be interpreted through all staged deletes/upserts.
         engine
@@ -1467,7 +1464,7 @@ mod tests {
         let source = source();
         let device = DurableDevice::default();
         let control = device.clone();
-        let mut engine = PagedEngine::from_in_memory(device, &source).unwrap();
+        let mut engine = page_native_fixture(device, &source).unwrap();
         let revision = engine.revision();
         engine.begin_transaction().unwrap();
         engine
@@ -1507,7 +1504,7 @@ mod tests {
         let source = source();
         let device = DurableDevice::default();
         let control = device.clone();
-        let mut engine = PagedEngine::from_in_memory(device, &source).unwrap();
+        let mut engine = page_native_fixture(device, &source).unwrap();
         let revision = engine.revision();
         engine.begin_transaction().unwrap();
         engine
@@ -1636,7 +1633,7 @@ mod tests {
         let source = source();
         let device = DurableDevice::default();
         let control = device.clone();
-        let mut engine = PagedEngine::from_in_memory(device, &source).unwrap();
+        let mut engine = page_native_fixture(device, &source).unwrap();
         assert!(!engine.in_transaction());
         control.arm_after_flush(3);
         assert_eq!(
@@ -1718,8 +1715,8 @@ mod tests {
             vec![row(json!({"id": 2, "label": "prior"}))]
         );
 
-        // Replication batches intentionally retain last-write semantics for the same physical
-        // key, even when typed aliases use different JSON number spellings.
+        // Direct batches intentionally retain last-write semantics for the same physical key,
+        // even when typed aliases use different JSON number spellings.
         let mut storage = reopened.into_storage();
         storage
             .apply_batch(&ChangeBatch {
@@ -1733,7 +1730,6 @@ mod tests {
                         row: row(json!({"id": -0.0, "label": "last"})),
                     },
                 ],
-                ..ChangeBatch::default()
             })
             .unwrap();
         assert_eq!(

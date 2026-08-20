@@ -1221,7 +1221,7 @@ mod tests {
         assert!(positive_zero < float);
 
         let untyped = TableSchema {
-            name: "legacy".to_owned(),
+            name: "untyped".to_owned(),
             primary_key: vec!["id".to_owned()],
             columns: vec![],
         };

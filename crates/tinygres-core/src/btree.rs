@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::{
     CandidateId, EngineError, FIRST_DATA_PAGE_ID, MAX_PAGE_COUNT, MAX_PAGE_PAYLOAD_SIZE, Page,
-    PageDevice, PageId, PageType, Pager, PagerWriteTransaction, Result, snapshot::crc32,
+    PageDevice, PageId, PageType, Pager, PagerWriteTransaction, Result, checksum::crc32,
 };
 
 // Page diagnostics are intentionally compact in the browser build. The stable
@@ -2325,7 +2325,7 @@ mod tests {
     fn create_tree(pager: &mut Pager<MemoryPageDevice>) -> PageId {
         let mut transaction = pager.begin_write().unwrap();
         let root = Btree::create(&mut transaction, TREE).unwrap();
-        transaction.commit(1, 1, Some(root)).unwrap();
+        transaction.commit(1, Some(root)).unwrap();
         root
     }
 
@@ -2338,7 +2338,7 @@ mod tests {
     ) -> PageId {
         let mut transaction = pager.begin_write().unwrap();
         let root = Btree::upsert(&mut transaction, root, TREE, key, value).unwrap();
-        transaction.commit(revision, revision, Some(root)).unwrap();
+        transaction.commit(revision, Some(root)).unwrap();
         root
     }
 
@@ -2480,7 +2480,7 @@ mod tests {
             for _ in 0..3 {
                 root = Btree::upsert(&mut transaction, root, TREE, &key(79), &value(79)).unwrap();
             }
-            transaction.commit(2, 2, Some(root)).unwrap();
+            transaction.commit(2, Some(root)).unwrap();
         }
 
         let root_node = Node::decode(
@@ -2530,7 +2530,7 @@ mod tests {
         {
             let mut transaction = pager.begin_write().unwrap();
             root = Btree::upsert(&mut transaction, root, TREE, &key(37), b"replacement").unwrap();
-            transaction.commit(3, 3, Some(root)).unwrap();
+            transaction.commit(3, Some(root)).unwrap();
         }
         assert_eq!(
             Btree::get(&mut pager, root, TREE, &key(37)).unwrap(),
@@ -2556,7 +2556,7 @@ mod tests {
                 root = Btree::upsert(&mut transaction, root, TREE, &key(number), &value(number))
                     .unwrap();
             }
-            transaction.commit(2, 2, Some(root)).unwrap();
+            transaction.commit(2, Some(root)).unwrap();
         }
         assert!(
             Node::decode(
@@ -2590,7 +2590,7 @@ mod tests {
                 Btree::delete(&mut transaction, root, TREE, &boundary_key).unwrap();
             assert!(removed);
             root = next.unwrap();
-            transaction.commit(3, 3, Some(root)).unwrap();
+            transaction.commit(3, Some(root)).unwrap();
         }
         assert!(assert_exact_separators(&mut pager, root).is_some());
 
@@ -2610,7 +2610,7 @@ mod tests {
                 assert!(removed);
                 root = next.unwrap();
             }
-            transaction.commit(4, 4, Some(root)).unwrap();
+            transaction.commit(4, Some(root)).unwrap();
         }
         assert_ne!(root, committed_root);
         assert_eq!(Btree::get(&mut pager, root, TREE, &key(69)).unwrap(), None);
@@ -2628,7 +2628,7 @@ mod tests {
         {
             let mut transaction = pager.begin_write().unwrap();
             root = Btree::upsert(&mut transaction, root, TREE, &key(65), &value(65)).unwrap();
-            transaction.commit(5, 5, Some(root)).unwrap();
+            transaction.commit(5, Some(root)).unwrap();
         }
         let mut cursor = Btree::cursor(&mut pager, root, TREE).unwrap();
         let mut reinserted = Vec::new();
@@ -2667,7 +2667,7 @@ mod tests {
                 Btree::delete(&mut transaction, root, TREE, b"large").unwrap();
             assert!(removed);
             assert_eq!(empty_root, None);
-            transaction.commit(3, 3, None).unwrap();
+            transaction.commit(3, None).unwrap();
         }
         assert!(pager.active_metadata().superblock.live_data_page_count < live_before);
         assert_eq!(
@@ -2686,7 +2686,7 @@ mod tests {
                 root = Btree::upsert(&mut transaction, root, TREE, &key(number), &value(number))
                     .unwrap();
             }
-            transaction.commit(2, 2, Some(root)).unwrap();
+            transaction.commit(2, Some(root)).unwrap();
         }
         let live_before = pager.active_metadata().superblock.live_data_page_count;
         let mut next_root = Some(root);
@@ -2700,14 +2700,14 @@ mod tests {
                 next_root = next;
             }
             assert_eq!(next_root, None);
-            transaction.commit(3, 3, None).unwrap();
+            transaction.commit(3, None).unwrap();
         }
         assert!(pager.active_metadata().superblock.live_data_page_count < live_before);
 
         let mut transaction = pager.begin_write().unwrap();
         let reused = Btree::create(&mut transaction, TREE).unwrap();
         let reused = Btree::upsert(&mut transaction, reused, TREE, b"again", b"works").unwrap();
-        transaction.commit(4, 4, Some(reused)).unwrap();
+        transaction.commit(4, Some(reused)).unwrap();
         assert_eq!(
             Btree::get(&mut pager, reused, TREE, b"again").unwrap(),
             Some(b"works".to_vec())
@@ -2730,7 +2730,7 @@ mod tests {
             root =
                 Btree::upsert(&mut transaction, root, TREE, b"overflow", &forced_overflow).unwrap();
             root = Btree::upsert(&mut transaction, root, TREE, b"maximum", &maximum).unwrap();
-            transaction.commit(2, 2, Some(root)).unwrap();
+            transaction.commit(2, Some(root)).unwrap();
         }
 
         assert_eq!(
@@ -2795,7 +2795,7 @@ mod tests {
                 panic!("test expected leaf");
             };
             assert!(matches!(entries[0].value, LeafValue::Overflow(_)));
-            transaction.commit(2, 2, Some(root)).unwrap();
+            transaction.commit(2, Some(root)).unwrap();
         }
         assert_eq!(
             Btree::get(&mut pager, root, TREE, &key).unwrap(),
@@ -2844,7 +2844,7 @@ mod tests {
             root = Btree::upsert(&mut transaction, root, TREE, b"same-tx", b"tiny").unwrap();
             root = Btree::upsert(&mut transaction, root, TREE, b"same-tx", &large_b).unwrap();
             root = Btree::upsert(&mut transaction, root, TREE, b"same-tx", &large_c).unwrap();
-            transaction.commit(6, 6, Some(root)).unwrap();
+            transaction.commit(6, Some(root)).unwrap();
         }
         assert_eq!(
             pager.active_metadata().superblock.live_data_page_count,
@@ -2894,7 +2894,7 @@ mod tests {
 
         let mut transaction = pager.begin_write().unwrap();
         let next_root = Btree::upsert(&mut transaction, root, TREE, b"a", b"b").unwrap();
-        transaction.commit(2, 2, Some(next_root)).unwrap();
+        transaction.commit(2, Some(next_root)).unwrap();
         assert_eq!(
             cursor.next(&mut pager).unwrap_err().code,
             "CURSOR_INVALIDATED"
@@ -2919,7 +2919,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            transaction.commit(2, 2, Some(source_root)).unwrap();
+            transaction.commit(2, Some(source_root)).unwrap();
         }
 
         let mut transaction = pager.begin_write().unwrap();
@@ -2952,7 +2952,7 @@ mod tests {
             candidate.next_in_transaction(&mut transaction).unwrap(),
             Some((key(8), value(8)))
         );
-        transaction.commit(3, 3, Some(target_root)).unwrap();
+        transaction.commit(3, Some(target_root)).unwrap();
 
         let mut cursor = Btree::cursor(&mut pager, target_root, TARGET_TREE).unwrap();
         let mut copied = 0;
@@ -3033,7 +3033,7 @@ mod tests {
                 root = Btree::upsert(&mut transaction, root, TREE, &key(number), stored_value)
                     .unwrap();
             }
-            transaction.commit(2, 2, Some(root)).unwrap();
+            transaction.commit(2, Some(root)).unwrap();
         }
         assert!(
             Node::decode(
@@ -3062,7 +3062,7 @@ mod tests {
 
         let mut transaction = pager.begin_write().unwrap();
         Btree::reclaim(&mut transaction, root, TREE).unwrap();
-        transaction.commit(3, 3, None).unwrap();
+        transaction.commit(3, None).unwrap();
         assert_eq!(pager.active_metadata().superblock.live_data_page_count, 0);
         assert_eq!(
             pager.read_page(root).unwrap_err().code,
@@ -3096,7 +3096,7 @@ mod tests {
         )
         .unwrap();
         Btree::reclaim(&mut transaction, root, TREE).unwrap();
-        transaction.commit(1, 1, None).unwrap();
+        transaction.commit(1, None).unwrap();
         assert_eq!(
             pager.active_metadata().superblock.live_data_page_count,
             live_before
@@ -3156,7 +3156,7 @@ mod tests {
                 root = Btree::upsert(&mut transaction, root, TREE, &key(number), &value(number))
                     .unwrap();
             }
-            transaction.commit(2, 2, Some(root)).unwrap();
+            transaction.commit(2, Some(root)).unwrap();
         }
         assert!(
             Node::decode(
@@ -3207,7 +3207,7 @@ mod tests {
             "DATABASE_FULL"
         );
         assert_eq!(
-            transaction.commit(3, 3, Some(root)).unwrap_err().code,
+            transaction.commit(3, Some(root)).unwrap_err().code,
             "TRANSACTION_FAILED"
         );
         assert_eq!(
@@ -3572,7 +3572,7 @@ mod tests {
             let cell_offset = read_u16(&page.payload, NODE_HEADER_SIZE) as usize;
             page.payload[cell_offset + 4..cell_offset + 12].copy_from_slice(&left.to_le_bytes());
             transaction.write_new_page(&page).unwrap();
-            transaction.commit(1, 1, Some(duplicate_root)).unwrap();
+            transaction.commit(1, Some(duplicate_root)).unwrap();
         }
         assert_eq!(
             Btree::cursor(&mut pager, duplicate_root, TREE)
@@ -3616,7 +3616,7 @@ mod tests {
                 ),
             )
             .unwrap();
-            transaction.commit(1, 1, Some(wrong_level_root)).unwrap();
+            transaction.commit(1, Some(wrong_level_root)).unwrap();
         }
         assert_eq!(
             Btree::get(&mut pager, wrong_level_root, TREE, b"a")

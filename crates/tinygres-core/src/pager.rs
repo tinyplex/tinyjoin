@@ -104,10 +104,6 @@ impl<D: PageDevice> Pager<D> {
         self.active.superblock.database_revision
     }
 
-    pub fn applied_journal_sequence(&self) -> u64 {
-        self.active.superblock.applied_journal_sequence
-    }
-
     pub fn generation(&self) -> u64 {
         self.active.superblock.generation
     }
@@ -387,7 +383,6 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
     pub fn commit(
         mut self,
         database_revision: u64,
-        applied_journal_sequence: u64,
         catalog_root_page_id: Option<PageId>,
     ) -> Result<()> {
         self.ensure_open()?;
@@ -408,7 +403,6 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
         let pending = match build_next_metadata(
             &self.pager.active,
             database_revision,
-            applied_journal_sequence,
             catalog_root_page_id,
             &self.next_bitmap,
         ) {
@@ -751,11 +745,10 @@ mod tests {
             root = transaction.allocate_page().unwrap();
             transaction.write_new_page(&leaf(root, 7)).unwrap();
             assert_eq!(transaction.read_page(root).unwrap().payload, vec![7]);
-            transaction.commit(1, 4, Some(root)).unwrap();
+            transaction.commit(1, Some(root)).unwrap();
         }
         assert_eq!(pager.read_page(root).unwrap().payload, vec![7]);
         assert_eq!(pager.database_revision(), 1);
-        assert_eq!(pager.applied_journal_sequence(), 4);
         assert_eq!(pager.generation(), 2);
 
         let device = pager.into_device();
@@ -773,14 +766,14 @@ mod tests {
             root = transaction.allocate_page().unwrap();
             transaction.write_new_page(&leaf(root, 7)).unwrap();
             transaction
-                .commit(crate::revision::MAX_DATABASE_REVISION, 0, Some(root))
+                .commit(crate::revision::MAX_DATABASE_REVISION, Some(root))
                 .unwrap();
         }
         let flushes = pager.device.0.borrow().flush_count();
         let transaction = pager.begin_write().unwrap();
         assert_eq!(
             transaction
-                .commit(crate::revision::MAX_DATABASE_REVISION + 1, 0, Some(root),)
+                .commit(crate::revision::MAX_DATABASE_REVISION + 1, Some(root))
                 .unwrap_err()
                 .code,
             "REVISION_OVERFLOW"
@@ -821,7 +814,7 @@ mod tests {
         let mut transaction = pager.begin_write().unwrap();
         assert_eq!(transaction.allocate_page().unwrap(), orphan);
         transaction.write_new_page(&leaf(orphan, 8)).unwrap();
-        transaction.commit(1, 1, Some(orphan)).unwrap();
+        transaction.commit(1, Some(orphan)).unwrap();
         assert_eq!(pager.read_page(orphan).unwrap().payload, vec![8]);
     }
 
@@ -831,7 +824,7 @@ mod tests {
         let transaction = pager.begin_write().unwrap();
         assert_eq!(
             transaction
-                .commit(0, 0, Some(FIRST_DATA_PAGE_ID))
+                .commit(0, Some(FIRST_DATA_PAGE_ID))
                 .unwrap_err()
                 .code,
             "INVALID_PAGE"
@@ -840,19 +833,19 @@ mod tests {
         let mut transaction = pager.begin_write().unwrap();
         let page = transaction.allocate_page().unwrap();
         assert_eq!(
-            transaction.commit(1, 1, Some(page)).unwrap_err().code,
+            transaction.commit(1, Some(page)).unwrap_err().code,
             "PAGER_ERROR"
         );
 
         let mut transaction = pager.begin_write().unwrap();
         let page = transaction.allocate_page().unwrap();
         transaction.write_new_page(&leaf(page, 1)).unwrap();
-        transaction.commit(2, 2, Some(page)).unwrap();
+        transaction.commit(2, Some(page)).unwrap();
 
         let mut transaction = pager.begin_write().unwrap();
         transaction.free_shared_page(page).unwrap();
         assert_eq!(
-            transaction.commit(1, 2, Some(page)).unwrap_err().code,
+            transaction.commit(1, Some(page)).unwrap_err().code,
             "INVALID_PAGE"
         );
         assert!(!pager.is_recovery_required());
@@ -870,20 +863,20 @@ mod tests {
             disposable = transaction.allocate_page().unwrap();
             transaction.write_new_page(&leaf(root, 1)).unwrap();
             transaction.write_new_page(&leaf(disposable, 2)).unwrap();
-            transaction.commit(1, 1, Some(root)).unwrap();
+            transaction.commit(1, Some(root)).unwrap();
         }
         assert_eq!(pager.read_page(disposable).unwrap().payload, vec![2]);
         {
             let mut transaction = pager.begin_write().unwrap();
             transaction.free_shared_page(disposable).unwrap();
-            transaction.commit(2, 2, Some(root)).unwrap();
+            transaction.commit(2, Some(root)).unwrap();
         }
 
         let mut transaction = pager.begin_write().unwrap();
         assert_eq!(transaction.allocate_page().unwrap(), disposable);
         transaction.write_new_page(&leaf(disposable, 9)).unwrap();
         transaction.free_shared_page(root).unwrap();
-        transaction.commit(3, 3, Some(disposable)).unwrap();
+        transaction.commit(3, Some(disposable)).unwrap();
         assert_eq!(pager.read_page(disposable).unwrap().payload, vec![9]);
     }
 
@@ -897,7 +890,7 @@ mod tests {
         assert!(!transaction.owns_page(released));
         assert_eq!(transaction.allocate_page().unwrap(), released);
         transaction.write_new_page(&leaf(released, 2)).unwrap();
-        transaction.commit(1, 1, Some(released)).unwrap();
+        transaction.commit(1, Some(released)).unwrap();
         assert_eq!(pager.read_page(released).unwrap().payload, vec![2]);
     }
 
@@ -1096,7 +1089,7 @@ mod tests {
         let mut transaction = pager.begin_write().unwrap();
         let root = transaction.allocate_page().unwrap();
         transaction.write_new_page(&leaf(root, 1)).unwrap();
-        transaction.commit(1, 1, Some(root)).unwrap();
+        transaction.commit(1, Some(root)).unwrap();
         drop(pager);
         device.disarm();
         (device, root)
@@ -1124,7 +1117,7 @@ mod tests {
                 let (transaction, new_root) = prepare_replacement(&mut pager, old_root);
                 device.arm(operation, timing);
                 assert_ne!(
-                    transaction.commit(2, 2, Some(new_root)).unwrap_err().code,
+                    transaction.commit(2, Some(new_root)).unwrap_err().code,
                     "RECOVERY_REQUIRED"
                 );
                 assert!(!pager.is_recovery_required());
@@ -1151,7 +1144,7 @@ mod tests {
             let (transaction, new_root) = prepare_replacement(&mut pager, old_root);
             device.arm(operation, timing);
             assert_eq!(
-                transaction.commit(2, 2, Some(new_root)).unwrap_err().code,
+                transaction.commit(2, Some(new_root)).unwrap_err().code,
                 "RECOVERY_REQUIRED"
             );
             assert!(pager.is_recovery_required());
@@ -1183,7 +1176,7 @@ mod tests {
         pager.fail_install_once = true;
         let (transaction, new_root) = prepare_replacement(&mut pager, old_root);
         assert_eq!(
-            transaction.commit(2, 2, Some(new_root)).unwrap_err().code,
+            transaction.commit(2, Some(new_root)).unwrap_err().code,
             "RECOVERY_REQUIRED"
         );
         assert!(pager.is_recovery_required());
@@ -1201,7 +1194,7 @@ mod tests {
         let mut transaction = pager.begin_write().unwrap();
         let root = transaction.allocate_page().unwrap();
         transaction.write_new_page(&leaf(root, 1)).unwrap();
-        transaction.commit(1, 1, Some(root)).unwrap();
+        transaction.commit(1, Some(root)).unwrap();
         let mut device = pager.into_device();
         let orphan = device.page_count();
         device.write_page(orphan, &[9; PAGE_SIZE]).unwrap();
@@ -1222,7 +1215,6 @@ mod tests {
             slot: SuperblockSlot::B,
             generation: 2,
             database_revision: 1,
-            applied_journal_sequence: 1,
             bitmap_slot: BitmapSlot::B,
             bitmap_generation: 2,
             catalog_root_page_id: Some(missing),
@@ -1282,7 +1274,6 @@ mod tests {
             slot: SuperblockSlot::A,
             generation: 1,
             database_revision: 1,
-            applied_journal_sequence: 1,
             bitmap_slot: BitmapSlot::A,
             bitmap_generation: 1,
             catalog_root_page_id: Some(FIRST_DATA_PAGE_ID),

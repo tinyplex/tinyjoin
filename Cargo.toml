@@ -2,7 +2,6 @@
 members = [
   "crates/tinygres-core",
   "crates/tinygres-wasm",
-  "crates/tinygres-wasm-migration",
 ]
 resolver = "2"
 

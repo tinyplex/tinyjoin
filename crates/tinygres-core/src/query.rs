@@ -1706,7 +1706,7 @@ fn primary_key_lookup(plan: &QueryPlan, schema: &crate::TableSchema) -> Option<R
 }
 
 /// A direct B-tree lookup must be semantically indistinguishable from scanning
-/// and evaluating the predicate. Untyped replication schemas cannot prove that
+/// and evaluating the predicate. Untyped table schemas cannot prove that
 /// a lookup miss is not really an incompatible-type error. Floats likewise
 /// have multiple JSON encodings that compare numerically equal (`1`/`1.0`).
 fn exact_primary_key_value(schema: &crate::TableSchema, column: &str, value: &Value) -> bool {
@@ -2497,14 +2497,14 @@ mod tests {
         let mut database = Engine::default();
         database
             .define_table(TableSchema {
-                name: "legacy".to_owned(),
+                name: "untyped".to_owned(),
                 primary_key: vec!["id".to_owned()],
                 columns: vec![],
             })
             .unwrap();
         database
             .replace_table(
-                "legacy",
+                "untyped",
                 vec![
                     row(json!({"id": 1, "value": "one"})),
                     row(json!({"id": 2, "value": 2})),
@@ -2513,7 +2513,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             database
-                .query_sql("SELECT id FROM legacy ORDER BY value", &[])
+                .query_sql("SELECT id FROM untyped ORDER BY value", &[])
                 .unwrap_err()
                 .code,
             "TYPE_MISMATCH"

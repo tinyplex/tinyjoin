@@ -1,4 +1,3 @@
-import type {ReplicaSource, ReplicaSourceContext} from '../adapters/types.js';
 import {
   PROTOCOL_VERSION,
   isRecord,
@@ -6,7 +5,6 @@ import {
   type ApplyOutcome,
   type SerializedError,
   type StorageOptions,
-  type SyncState,
   type WorkerEvent,
   type WorkerRequest,
   type WorkerResponse,
@@ -16,17 +14,7 @@ import {
   type WorkerEngine,
   type WorkerEngineFactory,
 } from './engine.js';
-import {createOpfsMigrationEngine} from './migration-loader.js';
-import {
-  bindOpfsStorageName,
-  builtinSourceConfigurationKey,
-  loadBuiltinSource,
-  mergeSourceSchemas,
-  prepareBuiltinSource,
-  type BuiltinSourceFactory,
-  type PreparedBuiltinSource,
-  type SourceIdentityHasher,
-} from './builtin-source.js';
+import {createOpfsWasmEngine} from './opfs-loader.js';
 
 export interface WorkerScope {
   postMessage(message: WorkerResponse | WorkerEvent): void;
@@ -42,12 +30,9 @@ export interface WorkerScope {
 }
 
 export interface StartWorkerOptions {
-  source?: ReplicaSource;
   scope?: WorkerScope;
-  /** Creates an engine that owns durability for the fully resolved storage. */
+  /** Creates an engine that owns durability for the requested storage. */
   durableEngineFactory?: WorkerEngineFactory;
-  builtinSourceFactory?: BuiltinSourceFactory;
-  sourceIdentityHasher?: SourceIdentityHasher;
 }
 
 export interface WorkerController {
@@ -58,21 +43,9 @@ export function startWorker(
   options: StartWorkerOptions = {},
 ): WorkerController {
   const scope = options.scope ?? (globalThis as unknown as WorkerScope);
-  const engineFactory =
-    options.durableEngineFactory ?? createDefaultConfiguredEngine;
-  const builtinSourceFactory =
-    options.builtinSourceFactory ?? loadBuiltinSource;
-  const sourceIdentityHasher = options.sourceIdentityHasher;
-  const sourceAbortController = new AbortController();
   let enginePromise: Promise<WorkerEngine> | undefined;
   let configuredStorage: StorageOptions | undefined;
-  let configuredSource: PreparedBuiltinSource | undefined;
   let closingPromise: Promise<void> | undefined;
-  let sourceCreationPromise: Promise<ReplicaSource> | undefined = options.source
-    ? Promise.resolve(options.source)
-    : undefined;
-  let sourceRunPromise: Promise<void> | undefined;
-  let sourceStarted = false;
   let closed = false;
   let pendingRevision = 0;
   const pendingTables = new Set<string>();
@@ -110,68 +83,6 @@ export function startWorker(
     }, 0);
   };
 
-  const setSyncState = (state: SyncState): void => {
-    if (closed) {
-      return;
-    }
-    scope.postMessage({
-      v: PROTOCOL_VERSION,
-      event: 'syncStateChanged',
-      payload: state,
-    });
-  };
-
-  const sourceContext = (engine: WorkerEngine): ReplicaSourceContext => ({
-    signal: sourceAbortController.signal,
-    async defineTable(schema) {
-      engine.defineTable(schema);
-    },
-    async replaceTable(schema, rows) {
-      const outcome = engine.replaceTableSnapshot(schema, rows);
-      emitInvalidation(outcome);
-      return outcome;
-    },
-    async applyBatch(batch) {
-      const outcome = engine.applyBatch(batch);
-      emitInvalidation(outcome);
-      return outcome;
-    },
-    setSyncState,
-  });
-
-  const startSource = async (engine: WorkerEngine): Promise<void> => {
-    const sourceConfigured =
-      options.source !== undefined || configuredSource !== undefined;
-    if (!sourceConfigured || sourceStarted) {
-      return;
-    }
-    const sourceId =
-      options.source?.id || configuredSource?.options.id || 'custom-source';
-    sourceStarted = true;
-    setSyncState({phase: 'connecting', sourceId});
-    sourceCreationPromise ??= Promise.resolve().then(() =>
-      builtinSourceFactory(configuredSource!.options),
-    );
-    sourceRunPromise = (async () => {
-      try {
-        const source = await sourceCreationPromise;
-        if (sourceAbortController.signal.aborted) {
-          return;
-        }
-        await source.start(sourceContext(engine));
-      } catch (error) {
-        if (!sourceAbortController.signal.aborted) {
-          setSyncState({
-            phase: 'error',
-            sourceId,
-            error: serializeError(error),
-          });
-        }
-      }
-    })();
-    await sourceRunPromise;
-  };
-
   const respond = async (request: WorkerRequest): Promise<void> => {
     let engine: WorkerEngine | undefined;
     try {
@@ -189,42 +100,32 @@ export function startWorker(
       }
 
       engine = await engineForRequest(request);
-      const result = await handleRequest(
-        request,
-        engine,
-        emitInvalidation,
-        configuredSource,
-        options.source !== undefined || configuredSource !== undefined,
-        {
-          get activeId() {
-            return activeTransactionId;
-          },
-          begin() {
-            if (activeTransactionId !== undefined) {
-              throw workerError(
-                'TRANSACTION_ACTIVE',
-                'A TinyGres transaction is already active',
-              );
-            }
-            const id = `tx-${nextTransactionId++}`;
-            activeTransactionId = id;
-            return id;
-          },
-          clear(id) {
-            assertTransactionId(activeTransactionId, id);
-            activeTransactionId = undefined;
-          },
+      const result = await handleRequest(request, engine, emitInvalidation, {
+        get activeId() {
+          return activeTransactionId;
         },
-      );
+        begin() {
+          if (activeTransactionId !== undefined) {
+            throw workerError(
+              'TRANSACTION_ACTIVE',
+              'A TinyGres transaction is already active',
+            );
+          }
+          const id = `tx-${nextTransactionId++}`;
+          activeTransactionId = id;
+          return id;
+        },
+        clear(id) {
+          assertTransactionId(activeTransactionId, id);
+          activeTransactionId = undefined;
+        },
+      });
       scope.postMessage({
         v: PROTOCOL_VERSION,
         id: request.id,
         ok: true,
         result,
       });
-      if (request.method === 'init') {
-        void startSource(engine);
-      }
     } catch (error) {
       if (request.method === 'init') {
         if (!engine && enginePromise) {
@@ -256,17 +157,6 @@ export function startWorker(
     request: Exclude<WorkerRequest, {method: 'close'}>,
   ): Promise<WorkerEngine> => {
     if (request.method === 'init') {
-      const requestedSource = request.params.source
-        ? prepareBuiltinSource(request.params.source)
-        : undefined;
-      if (options.source && requestedSource) {
-        throw Object.assign(
-          new Error(
-            'The TinyGres worker cannot combine a fixed custom source with a built-in source configuration',
-          ),
-          {code: 'SOURCE_CONFLICT'},
-        );
-      }
       if (
         configuredStorage !== undefined &&
         !sameStorage(configuredStorage, request.params.storage)
@@ -278,26 +168,11 @@ export function startWorker(
           {code: 'STORAGE_ALREADY_INITIALIZED'},
         );
       }
-      if (
-        configuredStorage !== undefined &&
-        builtinSourceConfigurationKey(configuredSource) !==
-          builtinSourceConfigurationKey(requestedSource)
-      ) {
-        throw Object.assign(
-          new Error(
-            'The TinyGres worker is already initialized with a different built-in source',
-          ),
-          {code: 'SOURCE_ALREADY_INITIALIZED'},
-        );
-      }
       if (!enginePromise) {
         configuredStorage = request.params.storage;
-        configuredSource = requestedSource;
-        enginePromise = createSourceBoundEngine(
+        enginePromise = createEngine(
           request.params.storage,
-          requestedSource,
-          engineFactory,
-          sourceIdentityHasher,
+          options.durableEngineFactory,
         );
       }
       return enginePromise;
@@ -340,28 +215,7 @@ export function startWorker(
     closingPromise ??= (async () => {
       closed = true;
       scope.removeEventListener('message', onMessage);
-      sourceAbortController.abort();
-      let firstError: unknown;
-      let source: ReplicaSource | undefined;
-      try {
-        source = await sourceCreationPromise;
-      } catch {
-        // Source construction failures are already exposed as sync errors.
-      }
-      try {
-        await source?.close?.();
-      } catch (error) {
-        firstError = error;
-      }
-      await sourceRunPromise?.catch(() => undefined);
-      try {
-        engine?.close();
-      } catch (error) {
-        firstError ??= error;
-      }
-      if (firstError !== undefined) {
-        throw firstError;
-      }
+      engine?.close();
     })();
     return closingPromise;
   };
@@ -383,17 +237,13 @@ async function handleRequest(
   request: WorkerRequest,
   engine: WorkerEngine,
   emitInvalidation: (outcome: ApplyOutcome) => void,
-  source: PreparedBuiltinSource | undefined,
-  sourceConfigured: boolean,
   transaction: HostTransactionState,
 ): Promise<unknown> {
   switch (request.method) {
     case 'init':
       assertNoTransaction(transaction.activeId);
-      engine.defineTables(
-        mergeSourceSchemas(request.params.schemas, source?.schemas ?? []),
-      );
-      return {revision: engine.revision(), sourceConfigured};
+      engine.defineTables(request.params.schemas);
+      return {revision: engine.revision()};
     case 'defineTable':
       assertNoTransaction(transaction.activeId);
       engine.defineTable(request.params.schema);
@@ -414,23 +264,13 @@ async function handleRequest(
       return outcome;
     }
     case 'query':
-      assertTransactionId(
-        transaction.activeId,
-        request.params.transactionId,
-      );
+      assertTransactionId(transaction.activeId, request.params.transactionId);
       return engine.query(request.params.plan);
     case 'querySql':
-      assertTransactionId(
-        transaction.activeId,
-        request.params.transactionId,
-      );
+      assertTransactionId(transaction.activeId, request.params.transactionId);
       return engine.querySql(request.params.sql, request.params.params);
     case 'executeSql': {
-      assertLocalWritesAllowed(sourceConfigured);
-      assertTransactionId(
-        transaction.activeId,
-        request.params.transactionId,
-      );
+      assertTransactionId(transaction.activeId, request.params.transactionId);
       const result = engine.executeSql(
         request.params.sql,
         request.params.params,
@@ -441,7 +281,6 @@ async function handleRequest(
       return result;
     }
     case 'beginTransaction': {
-      assertLocalWritesAllowed(sourceConfigured);
       assertNoTransaction(transaction.activeId);
       engine.beginTransaction();
       try {
@@ -452,10 +291,7 @@ async function handleRequest(
       }
     }
     case 'commitTransaction': {
-      assertTransactionId(
-        transaction.activeId,
-        request.params.transactionId,
-      );
+      assertTransactionId(transaction.activeId, request.params.transactionId);
       try {
         const outcome = engine.commitTransaction();
         emitInvalidation(outcome);
@@ -474,10 +310,7 @@ async function handleRequest(
       }
     }
     case 'rollbackTransaction':
-      assertTransactionId(
-        transaction.activeId,
-        request.params.transactionId,
-      );
+      assertTransactionId(transaction.activeId, request.params.transactionId);
       try {
         engine.rollbackTransaction();
         return undefined;
@@ -493,15 +326,6 @@ interface HostTransactionState {
   readonly activeId: string | undefined;
   begin(): string;
   clear(id: string): void;
-}
-
-function assertLocalWritesAllowed(sourceConfigured: boolean): void {
-  if (sourceConfigured) {
-    throw workerError(
-      'SOURCE_DATABASE_READ_ONLY',
-      'Local SQL writes are disabled while a TinyGres replication source is configured',
-    );
-  }
 }
 
 function assertNoTransaction(activeId: string | undefined): void {
@@ -538,33 +362,20 @@ function workerError(code: string, message: string): Error {
   return Object.assign(new Error(message), {code});
 }
 
-async function createSourceBoundEngine(
+async function createEngine(
   storage: StorageOptions,
-  source: PreparedBuiltinSource | undefined,
-  engineFactory: WorkerEngineFactory,
-  sourceIdentityHasher: SourceIdentityHasher | undefined,
+  durableEngineFactory: WorkerEngineFactory | undefined,
 ): Promise<WorkerEngine> {
-  const resolvedStorage =
-    storage.kind === 'opfs' && source
-      ? {
-          kind: 'opfs' as const,
-          name: await bindOpfsStorageName(
-            storage.name,
-            source,
-            sourceIdentityHasher,
-          ),
-        }
-      : storage;
-  return engineFactory(resolvedStorage);
+  return (durableEngineFactory ?? createDefaultEngine)(storage);
 }
 
-async function createDefaultConfiguredEngine(
+async function createDefaultEngine(
   storage: StorageOptions,
 ): Promise<WorkerEngine> {
   if (storage.kind === 'memory') {
     return createMemoryWasmEngine();
   }
-  return createOpfsMigrationEngine(storage.name);
+  return createOpfsWasmEngine(storage.name);
 }
 
 function sameStorage(left: StorageOptions, right: StorageOptions): boolean {

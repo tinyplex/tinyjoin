@@ -32,8 +32,7 @@ export const WASM_OPERATION = {
   rollback: 9,
   inTransaction: 10,
   revision: 11,
-  watermark: 12,
-  close: 13,
+  close: 12,
 } as const;
 
 const JSON_NULL = 0;
@@ -88,7 +87,7 @@ interface WireColumnDefinition {
   default?: JsonValue;
 }
 
-/** Hidden typed catalog shape accepted by SQL/source-internal callers. */
+/** Hidden typed catalog shape accepted by SQL and table-replacement callers. */
 export type WireTableSchema = TableSchema & {
   columns?: readonly WireColumnDefinition[];
 };
@@ -426,7 +425,6 @@ export function encodeUnitCall(
     | typeof WASM_OPERATION.rollback
     | typeof WASM_OPERATION.inTransaction
     | typeof WASM_OPERATION.revision
-    | typeof WASM_OPERATION.watermark
     | typeof WASM_OPERATION.close,
 ): EncodedCall {
   return call(operation, operation === WASM_OPERATION.commit, () => {});
@@ -515,26 +513,6 @@ function writeColumn(sink: EncodeSink, input: unknown): void {
 
 function writeBatch(sink: EncodeSink, input: ChangeBatch): void {
   const batch = record(input, 'change batch');
-  writeOptionalString(sink, optionalField(batch, 'sourceId'), 'sourceId');
-  const cursor = optionalField(batch, 'cursor');
-  if (cursor === MISSING) {
-    sink.u8(0);
-  } else {
-    const value = record(cursor, 'source cursor');
-    sink.u8(1);
-    sink.string(requiredString(value, 'kind', 'source cursor'));
-    sink.string(requiredString(value, 'value', 'source cursor'));
-  }
-  writeOptionalString(
-    sink,
-    optionalField(batch, 'transactionId'),
-    'transactionId',
-  );
-  writeOptionalString(
-    sink,
-    optionalField(batch, 'committedAt'),
-    'committedAt',
-  );
   writeArray(
     sink,
     requiredField(batch, 'changes', 'change batch'),
@@ -780,22 +758,6 @@ function writeCount(sink: EncodeSink, count: number): void {
     throw resourceLimit();
   }
   sink.u32(count);
-}
-
-function writeOptionalString(
-  sink: EncodeSink,
-  value: unknown | typeof MISSING,
-  label: string,
-): void {
-  if (value === MISSING) {
-    sink.u8(0);
-    return;
-  }
-  if (typeof value !== 'string') {
-    throw invalidBridgeValue(`${label} must be a string`);
-  }
-  sink.u8(1);
-  sink.string(value);
 }
 
 const MISSING = Symbol('missing');
@@ -1307,12 +1269,6 @@ export function decodeRevisionResponse(
   return decodeResponse(value, (reader) => reader.safeNumber());
 }
 
-export function decodeWatermarkResponse(
-  value: unknown,
-): DecodedResponse<bigint> {
-  return decodeResponse(value, (reader) => reader.u64());
-}
-
 export function decodeApplyOutcomeResponse(
   value: unknown,
 ): DecodedResponse<ApplyOutcome> {
@@ -1487,14 +1443,6 @@ export class BinaryWasmEngine implements WorkerEngine {
     return this.#invoke(
       encodeUnitCall(WASM_OPERATION.revision),
       decodeRevisionResponse,
-    );
-  }
-
-  appliedJournalSequence(): bigint {
-    this.#assertCallable();
-    return this.#invoke(
-      encodeUnitCall(WASM_OPERATION.watermark),
-      decodeWatermarkResponse,
     );
   }
 

@@ -1,11 +1,11 @@
-import {isSourceOptions, type SourceOptions} from './source-options.js';
-
 export const PROTOCOL_VERSION = 4 as const;
 export const MAX_QUERY_POSITION = 0xffff_ffff;
 
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue =
-  JsonPrimitive | JsonValue[] | {[key: string]: JsonValue};
+  | JsonPrimitive
+  | JsonValue[]
+  | {[key: string]: JsonValue};
 export type Row = Record<string, JsonValue>;
 
 export interface TableSchema {
@@ -15,20 +15,11 @@ export interface TableSchema {
 
 export type StorageOptions = {kind: 'memory'} | {kind: 'opfs'; name: string};
 
-export interface SourceCursor {
-  kind: string;
-  value: string;
-}
-
 export type Change =
   | {type: 'upsert'; table: string; row: Row}
   | {type: 'delete'; table: string; key: Row};
 
 export interface ChangeBatch {
-  sourceId?: string;
-  cursor?: SourceCursor;
-  transactionId?: string;
-  committedAt?: string;
   changes: Change[];
 }
 
@@ -78,32 +69,13 @@ export interface SerializedError {
   retryable?: boolean;
 }
 
-export type SyncPhase =
-  | 'idle'
-  | 'connecting'
-  | 'snapshotting'
-  | 'live-best-effort'
-  | 'live-durable'
-  | 'stale'
-  | 'resyncing'
-  | 'locked'
-  | 'error';
-
-export interface SyncState {
-  phase: SyncPhase;
-  sourceId?: string;
-  lastReconciledAt?: string;
-  error?: SerializedError;
-}
-
 export interface RpcMethods {
   init: {
     request: {
       schemas: TableSchema[];
       storage: StorageOptions;
-      source?: SourceOptions;
     };
-    response: {revision: number; sourceConfigured: boolean};
+    response: {revision: number};
   };
   defineTable: {
     request: {schema: TableSchema};
@@ -172,17 +144,11 @@ export type WorkerResponse =
       error: SerializedError;
     };
 
-export type WorkerEvent =
-  | {
-      v: typeof PROTOCOL_VERSION;
-      event: 'tablesChanged';
-      payload: ApplyOutcome;
-    }
-  | {
-      v: typeof PROTOCOL_VERSION;
-      event: 'syncStateChanged';
-      payload: SyncState;
-    };
+export type WorkerEvent = {
+  v: typeof PROTOCOL_VERSION;
+  event: 'tablesChanged';
+  payload: ApplyOutcome;
+};
 
 export function isWorkerResponse(value: unknown): value is WorkerResponse {
   if (!isRecord(value) || value.v !== PROTOCOL_VERSION) {
@@ -201,9 +167,6 @@ export function isWorkerEvent(value: unknown): value is WorkerEvent {
   if (value.event === 'tablesChanged') {
     return isApplyOutcome(value.payload);
   }
-  if (value.event === 'syncStateChanged') {
-    return isSyncState(value.payload);
-  }
   return false;
 }
 
@@ -221,11 +184,9 @@ export function isWorkerRequest(value: unknown): value is WorkerRequest {
     case 'init':
       return (
         isRecord(value.params) &&
-        hasOnlyKeys(value.params, ['schemas', 'storage', 'source']) &&
+        hasOnlyKeys(value.params, ['schemas', 'storage']) &&
         isDenseArray(value.params.schemas, isTableSchema) &&
-        isStorageOptions(value.params.storage) &&
-        (!Object.hasOwn(value.params, 'source') ||
-          isSourceOptions(value.params.source))
+        isStorageOptions(value.params.storage)
       );
     case 'defineTable':
       return isRecord(value.params) && isTableSchema(value.params.schema);
@@ -340,8 +301,9 @@ function isApplyOutcome(value: unknown): value is ApplyOutcome {
   return (
     isRecord(value) &&
     Number.isSafeInteger(value.revision) &&
-    isDenseArray(value.tables, (table): table is string =>
-      typeof table === 'string'
+    isDenseArray(
+      value.tables,
+      (table): table is string => typeof table === 'string',
     )
   );
 }
@@ -367,20 +329,11 @@ function isRow(value: unknown): value is Row {
 }
 
 function isChangeBatch(value: unknown): value is ChangeBatch {
-  if (!isRecord(value)) {
-    return false;
-  }
-  if (
-    (value.sourceId !== undefined && typeof value.sourceId !== 'string') ||
-    (value.transactionId !== undefined &&
-      typeof value.transactionId !== 'string') ||
-    (value.committedAt !== undefined &&
-      typeof value.committedAt !== 'string') ||
-    (value.cursor !== undefined && !isSourceCursor(value.cursor))
-  ) {
-    return false;
-  }
-  return isDenseArray(value.changes, isChange);
+  return (
+    isRecord(value) &&
+    hasOnlyKeys(value, ['changes']) &&
+    isDenseArray(value.changes, isChange)
+  );
 }
 
 function isChange(value: unknown): value is Change {
@@ -390,14 +343,6 @@ function isChange(value: unknown): value is Change {
   return value.type === 'upsert'
     ? isRow(value.row)
     : value.type === 'delete' && isRow(value.key);
-}
-
-function isSourceCursor(value: unknown): value is SourceCursor {
-  return (
-    isRecord(value) &&
-    typeof value.kind === 'string' &&
-    typeof value.value === 'string'
-  );
 }
 
 function isQueryPlan(value: unknown): value is QueryPlan {
@@ -473,30 +418,6 @@ const FILTER_OPERATORS = new Set<unknown>([
   'lte',
   'gt',
   'gte',
-]);
-
-function isSyncState(value: unknown): value is SyncState {
-  if (!isRecord(value) || !SYNC_PHASES.has(value.phase)) {
-    return false;
-  }
-  return (
-    (value.sourceId === undefined || typeof value.sourceId === 'string') &&
-    (value.lastReconciledAt === undefined ||
-      typeof value.lastReconciledAt === 'string') &&
-    (value.error === undefined || isSerializedError(value.error))
-  );
-}
-
-const SYNC_PHASES = new Set<unknown>([
-  'idle',
-  'connecting',
-  'snapshotting',
-  'live-best-effort',
-  'live-durable',
-  'stale',
-  'resyncing',
-  'locked',
-  'error',
 ]);
 
 function isJsonValue(

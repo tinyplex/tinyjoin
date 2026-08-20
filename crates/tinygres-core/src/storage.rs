@@ -1,7 +1,10 @@
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+#[cfg(test)]
+use std::collections::BTreeSet;
+use std::collections::{BTreeMap, HashSet};
 
+#[cfg(test)]
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -38,8 +41,8 @@ pub enum VisitOutcome {
 pub trait StorageReader {
     /// Fails when the reader cannot safely answer from its current view.
     ///
-    /// In-memory readers are always ready. Durable readers override this after an ambiguous
-    /// publication so metadata-only no-op statements cannot accidentally report success.
+    /// Readers without a fallible recovery state can use this default. Durable readers override
+    /// it after an ambiguous publication so metadata-only no-op statements cannot report success.
     #[doc(hidden)]
     fn ensure_readable(&self) -> Result<()> {
         Ok(())
@@ -51,7 +54,7 @@ pub trait StorageReader {
         visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
     ) -> Result<VisitOutcome>;
     fn table_row_count(&self, table: &str) -> Result<usize>;
-    /// Compatibility collector for operators not yet converted to streaming execution.
+    /// Collecting helper for operators that require all table rows at once.
     #[doc(hidden)]
     fn scan_table(&self, table: &str) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
@@ -71,7 +74,7 @@ pub trait StorageReader {
         key: &Row,
         visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
     ) -> Result<Option<VisitOutcome>>;
-    /// Compatibility collector for callers that need all matching index rows.
+    /// Collecting helper for callers that require all matching index rows.
     #[doc(hidden)]
     fn lookup_index(&self, table: &str, columns: &[String], key: &Row) -> Result<Option<Vec<Row>>> {
         let mut rows = Vec::new();
@@ -112,7 +115,8 @@ pub trait StorageDriver: StorageReader {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct InMemoryStorage {
+#[cfg(test)]
+pub(crate) struct InMemoryStorage {
     revision: u64,
     tables: BTreeMap<String, TableData>,
     indexes: BTreeMap<String, IndexData>,
@@ -127,17 +131,20 @@ pub struct InMemoryStorage {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(test)]
 struct TableData {
     schema: TableSchema,
     rows: BTreeMap<String, Row>,
 }
 
 #[derive(Clone, Debug)]
+#[cfg(test)]
 struct IndexData {
     definition: IndexDefinition,
     postings: BTreeMap<String, BTreeSet<String>>,
 }
 
+#[cfg(test)]
 struct PreparedIndexChange {
     index: String,
     primary_key: String,
@@ -145,6 +152,7 @@ struct PreparedIndexChange {
     new_key: Option<String>,
 }
 
+#[cfg(test)]
 struct PreparedTableReplacement {
     rows: BTreeMap<String, Row>,
     indexes: BTreeMap<String, IndexData>,
@@ -152,6 +160,7 @@ struct PreparedTableReplacement {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg(test)]
 struct StorageSnapshot {
     revision: u64,
     tables: Vec<TableSnapshot>,
@@ -161,11 +170,13 @@ struct StorageSnapshot {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg(test)]
 struct TableSnapshot {
     schema: TableSchema,
     rows: Vec<Row>,
 }
 
+#[cfg(test)]
 impl InMemoryStorage {
     pub fn export_snapshot(&self) -> Result<Vec<u8>> {
         crate::revision::validate_database_revision(self.revision)?;
@@ -328,7 +339,8 @@ impl InMemoryStorage {
             .ok_or_else(|| EngineError::table_not_found(table))
     }
 
-    /// Borrows a schema so the paged importer can enforce aggregate metadata bounds before clone.
+    /// Borrows a schema without cloning its retained model.
+    #[cfg(test)]
     pub(crate) fn table_schema_ref(&self, table: &str) -> Result<&TableSchema> {
         self.tables
             .get(table)
@@ -340,7 +352,8 @@ impl InMemoryStorage {
         self.indexes.keys().map(String::as_str)
     }
 
-    /// Borrows an index definition for bounded paged-import planning.
+    /// Borrows an index definition without cloning its retained model.
+    #[cfg(test)]
     pub(crate) fn index_definition_ref(&self, name: &str) -> Option<&IndexDefinition> {
         self.indexes.get(name).map(|index| &index.definition)
     }
@@ -350,13 +363,9 @@ impl InMemoryStorage {
         self.revision = revision;
         Ok(())
     }
-
-    #[cfg(test)]
-    pub(crate) fn set_revision_unchecked_for_test(&mut self, revision: u64) {
-        self.revision = revision;
-    }
 }
 
+#[cfg(test)]
 impl StorageDriver for InMemoryStorage {
     fn define_table(&mut self, schema: TableSchema) -> Result<()> {
         validate_schema(&schema)?;
@@ -796,6 +805,7 @@ pub(crate) fn validate_added_column(
     Ok(())
 }
 
+#[cfg(test)]
 impl StorageReader for InMemoryStorage {
     fn visit_table(
         &self,
@@ -925,6 +935,7 @@ impl StorageReader for InMemoryStorage {
     }
 }
 
+#[cfg(test)]
 fn validate_index_definition(
     definition: &IndexDefinition,
     tables: &BTreeMap<String, TableData>,
@@ -990,6 +1001,7 @@ pub(crate) fn validate_index_columns_for_schema(
     Ok(())
 }
 
+#[cfg(test)]
 fn build_postings(
     schema: &TableSchema,
     definition: &IndexDefinition,
@@ -1014,6 +1026,7 @@ fn build_postings(
     Ok(postings)
 }
 
+#[cfg(test)]
 fn index_key(
     schema: &TableSchema,
     definition: &IndexDefinition,
@@ -1054,6 +1067,7 @@ fn index_key_from_stored_row(
     })
 }
 
+#[cfg(test)]
 fn index_lookup_key(
     schema: &TableSchema,
     definition: &IndexDefinition,
@@ -1603,6 +1617,7 @@ fn checked_row_write_mul(left: usize, right: usize) -> Result<usize> {
     left.checked_mul(right).ok_or_else(row_write_overflow_error)
 }
 
+#[cfg(test)]
 fn ensure_row_write_bytes(bytes: usize) -> Result<()> {
     if bytes > MAX_ROW_WRITE_BYTES {
         Err(row_write_limit_error(format!(
@@ -1807,14 +1822,17 @@ fn validate_prospective_storage_keys(
     Ok(())
 }
 
+#[cfg(test)]
 fn unique_index_violation(index: &str) -> EngineError {
     EngineError::constraint_violation(format!("Index `{index}` would contain duplicate values"))
 }
 
+#[cfg(test)]
 fn next_revision(revision: u64) -> Result<u64> {
     crate::revision::next_database_revision(revision)
 }
 
+#[cfg(test)]
 fn snapshot_validation_error(error: EngineError) -> EngineError {
     EngineError::invalid_snapshot(error.message)
 }
@@ -1917,7 +1935,6 @@ mod tests {
                         row: row(json!({"id": 2})),
                     },
                 ],
-                ..ChangeBatch::default()
             })
             .unwrap_err();
 
@@ -1938,7 +1955,6 @@ mod tests {
                     table: "users".to_owned(),
                     row: row(json!({"id": 1, "email": "kept@example.com"})),
                 }],
-                ..ChangeBatch::default()
             })
             .unwrap();
         let revision = storage.revision();
@@ -1955,7 +1971,6 @@ mod tests {
                         key: row(json!({"id": 1})),
                     },
                 ],
-                ..ChangeBatch::default()
             })
             .unwrap_err();
 
@@ -1974,7 +1989,6 @@ mod tests {
                     table: "users".to_owned(),
                     key: row(json!({"id": 1, "extra": "x".repeat(MAX_LOGICAL_VALUE_BYTES + 1)})),
                 }],
-                ..ChangeBatch::default()
             })
             .unwrap_err();
         assert_eq!(oversized.code, "INVALID_CHANGE");
@@ -2000,7 +2014,6 @@ mod tests {
                     table: "users".to_owned(),
                     row: row(json!({"id": 1, "email": "x".repeat(MAX_STORAGE_KEY_BYTES)})),
                 }],
-                ..ChangeBatch::default()
             })
             .unwrap_err();
 
@@ -2026,7 +2039,6 @@ mod tests {
                         "payload": nested_json(MAX_JSON_DEPTH + 1),
                     })),
                 }],
-                ..ChangeBatch::default()
             })
             .unwrap_err();
 
@@ -2055,7 +2067,6 @@ mod tests {
                         key: row(json!({"id": id})),
                     })
                     .collect(),
-                ..ChangeBatch::default()
             })
             .unwrap_err();
 
@@ -2217,7 +2228,6 @@ mod tests {
                     table: "memberships".to_owned(),
                     key: row(json!({"team_id": 1, "user_id": 2})),
                 }],
-                ..ChangeBatch::default()
             })
             .unwrap();
 
@@ -2353,7 +2363,6 @@ mod tests {
                     table: "memberships".to_owned(),
                     row: row(json!({"team_id": 1, "user_id": 2, "role": "admin"})),
                 }],
-                ..ChangeBatch::default()
             })
             .unwrap();
 
@@ -2452,7 +2461,6 @@ mod tests {
                     table: "posts".to_owned(),
                     row: row(json!({"id": 2, "title": "batch"})),
                 }],
-                ..ChangeBatch::default()
             })
             .unwrap_err();
         assert_eq!(error.code, "REVISION_OVERFLOW");

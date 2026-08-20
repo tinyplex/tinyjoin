@@ -79,7 +79,6 @@ pub(crate) fn publish_schema_drop<D: PageDevice>(
     plan: SchemaDropPlan,
 ) -> Result<()> {
     crate::revision::validate_database_revision(plan.revision)?;
-    let applied_journal_sequence = pager.applied_journal_sequence();
     let catalog_root = pager.catalog_root_page_id().ok_or_else(|| {
         EngineError::new(
             "STORAGE_CORRUPT",
@@ -126,7 +125,7 @@ pub(crate) fn publish_schema_drop<D: PageDevice>(
             return Err(error);
         }
     };
-    transaction.commit(plan.revision, applied_journal_sequence, Some(catalog_root))
+    transaction.commit(plan.revision, Some(catalog_root))
 }
 
 /// Builds a fresh table and its affected indexes before replacing their catalog records.
@@ -139,7 +138,6 @@ pub(crate) fn publish_table_replacement<D: PageDevice>(
     plan: TableReplacementPlan,
 ) -> Result<PublishedTableReplacement> {
     crate::revision::validate_database_revision(plan.revision)?;
-    let applied_journal_sequence = pager.applied_journal_sequence();
     let existing_catalog_root = pager.catalog_root_page_id();
     let mut transaction = pager.begin_write()?;
     let result = (|| {
@@ -288,7 +286,7 @@ pub(crate) fn publish_table_replacement<D: PageDevice>(
             return Err(error);
         }
     };
-    transaction.commit(plan.revision, applied_journal_sequence, Some(catalog_root))?;
+    transaction.commit(plan.revision, Some(catalog_root))?;
     let row_count = plan.rows.len();
     let indexes = plan
         .indexes
@@ -317,7 +315,6 @@ pub(crate) fn publish_added_column<D: PageDevice>(
     plan: AddColumnPlan,
 ) -> Result<PublishedColumnAddition> {
     crate::revision::validate_database_revision(plan.revision)?;
-    let applied_journal_sequence = pager.applied_journal_sequence();
     let catalog_root = pager
         .catalog_root_page_id()
         .ok_or_else(|| storage_corrupt("ALTER TABLE requires an existing paged catalog root"))?;
@@ -378,7 +375,7 @@ pub(crate) fn publish_added_column<D: PageDevice>(
                     .checked_add(8)
                     .ok_or_else(alter_work_limit)?;
                 // Semantic row transformation intentionally precedes the physical work limit so
-                // legacy row-size/type errors retain their ordering. The exact encoded length is
+                // logical row-size/type errors retain their ordering. The exact encoded length is
                 // computed without allocation, then bounded before the codec constructs bytes.
                 ensure_alter_row_work(
                     plan.fixed_work_bytes,
@@ -448,7 +445,7 @@ pub(crate) fn publish_added_column<D: PageDevice>(
             return Err(error);
         }
     };
-    transaction.commit(plan.revision, applied_journal_sequence, Some(catalog_root))?;
+    transaction.commit(plan.revision, Some(catalog_root))?;
     Ok(PublishedColumnAddition {
         revision: plan.revision,
         schema: plan.new_schema,

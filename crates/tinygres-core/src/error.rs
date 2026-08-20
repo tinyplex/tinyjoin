@@ -107,10 +107,12 @@ impl EngineError {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn invalid_snapshot(message: impl Into<String>) -> Self {
         Self::new("INVALID_SNAPSHOT", message)
     }
 
+    #[cfg(test)]
     pub(crate) fn unsupported_snapshot(message: impl Into<String>) -> Self {
         Self::new("UNSUPPORTED_SNAPSHOT", message)
     }

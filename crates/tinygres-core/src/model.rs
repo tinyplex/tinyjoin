@@ -29,8 +29,8 @@ pub struct ColumnDefinition {
 pub struct TableSchema {
     pub name: String,
     pub primary_key: Vec<String>,
-    /// Empty for tables defined by legacy replication sources that do not expose
-    /// a typed catalog. SQL-created tables always populate this collection.
+    /// Empty when no typed column catalog is available. SQL-created tables always populate this
+    /// collection.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<ColumnDefinition>,
 }
@@ -49,24 +49,9 @@ fn default_nullable() -> bool {
     true
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SourceCursor {
-    pub kind: String,
-    pub value: String,
-}
-
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ChangeBatch {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<SourceCursor>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transaction_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub committed_at: Option<String>,
     pub changes: Vec<Change>,
 }
 
@@ -190,4 +175,18 @@ pub struct ExecuteResult {
     pub row_count: usize,
     pub rows: Vec<Row>,
     pub tables: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChangeBatch;
+
+    #[test]
+    fn change_batches_reject_unknown_metadata() {
+        let error = serde_json::from_str::<ChangeBatch>(
+            r#"{"changes":[],"sourceId":"removed-integration"}"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field `sourceId`"));
+    }
 }

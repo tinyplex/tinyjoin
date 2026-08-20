@@ -52,10 +52,6 @@ impl Engine<InMemoryStorage> {
         self.storage.import_snapshot(bytes)
     }
 
-    pub fn prepare_define_table(&mut self, schema: TableSchema) -> Result<Prepared<()>> {
-        self.prepare_define_tables(vec![schema])
-    }
-
     pub fn prepare_define_tables(&mut self, schemas: Vec<TableSchema>) -> Result<Prepared<()>> {
         self.ensure_can_prepare()?;
         let mut candidate = self.storage.clone();
@@ -1014,17 +1010,17 @@ mod tests {
         );
         assert_eq!(engine.revision(), revision);
 
-        let mut legacy = Engine::default();
-        legacy
+        let mut untyped = Engine::default();
+        untyped
             .define_table(TableSchema {
-                name: "legacy".to_owned(),
+                name: "untyped".to_owned(),
                 primary_key: vec!["id".to_owned()],
                 columns: vec![],
             })
             .unwrap();
         assert_eq!(
-            legacy
-                .execute_sql("ALTER TABLE legacy ADD COLUMN value TEXT", &[])
+            untyped
+                .execute_sql("ALTER TABLE untyped ADD COLUMN value TEXT", &[])
                 .unwrap_err()
                 .code,
             "UNSUPPORTED_SQL"
@@ -1187,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn source_changes_rebuild_indexes_atomically() {
+    fn batch_changes_rebuild_indexes_atomically() {
         let mut engine = Engine::default();
         create_posts(&mut engine);
         engine
@@ -1202,7 +1198,6 @@ mod tests {
                         "rating": null, "metadata": null
                     })),
                 }],
-                ..ChangeBatch::default()
             })
             .unwrap();
         let revision = engine.revision();
@@ -1224,7 +1219,6 @@ mod tests {
                         })),
                     },
                 ],
-                ..ChangeBatch::default()
             })
             .unwrap_err();
         assert_eq!(error.code, "CONSTRAINT_VIOLATION");
@@ -1496,31 +1490,31 @@ mod tests {
     }
 
     #[test]
-    fn prepared_catalog_and_source_mutations_replay_with_exact_revision_semantics() {
+    fn prepared_catalog_and_batch_mutations_replay_with_exact_revision_semantics() {
         let schema = TableSchema {
             name: "posts".to_owned(),
             primary_key: vec!["id".to_owned()],
             columns: vec![],
         };
-        let mut source = Engine::default();
-        let defined = source.prepare_define_tables(vec![schema.clone()]).unwrap();
+        let mut primary = Engine::default();
+        let defined = primary.prepare_define_tables(vec![schema.clone()]).unwrap();
         assert_eq!(defined.commit.as_ref().unwrap().revision_before(), 0);
         assert_eq!(defined.commit.as_ref().unwrap().revision_after(), 0);
         let define_bytes = defined.commit.unwrap().into_bytes();
-        source.install_prepared_commit(&define_bytes).unwrap();
-        assert_eq!(source.revision(), 0);
+        primary.install_prepared_commit(&define_bytes).unwrap();
+        assert_eq!(primary.revision(), 0);
 
         let batch = ChangeBatch {
             changes: vec![Change::Upsert {
                 table: "posts".to_owned(),
                 row: row(json!({"id": 1, "title": "one"})),
             }],
-            ..ChangeBatch::default()
         };
-        let applied = source.prepare_apply_batch(&batch).unwrap();
+        let applied = primary.prepare_apply_batch(&batch).unwrap();
+        assert_eq!(applied.result.revision, 1);
         let batch_bytes = applied.commit.unwrap().into_bytes();
-        source.install_prepared_commit(&batch_bytes).unwrap();
-        assert_eq!(source.revision(), 1);
+        primary.install_prepared_commit(&batch_bytes).unwrap();
+        assert_eq!(primary.revision(), 1);
 
         let mut restored = Engine::default();
         restored.replay_commit(&define_bytes).unwrap();
@@ -1609,58 +1603,62 @@ mod tests {
 
     #[test]
     fn every_sql_mutation_prepares_installs_and_replays_the_same_state() {
-        fn apply(source: &mut Engine, replica: &mut Engine, sql: &str) -> Vec<u8> {
-            let prepared = source.prepare_execute_sql(sql, &[]).unwrap();
+        fn apply(primary: &mut Engine, replayed: &mut Engine, sql: &str) -> Vec<u8> {
+            let prepared = primary.prepare_execute_sql(sql, &[]).unwrap();
             let bytes = prepared.commit.unwrap().into_bytes();
-            source.install_prepared_commit(&bytes).unwrap();
-            replica.replay_commit(&bytes).unwrap();
+            primary.install_prepared_commit(&bytes).unwrap();
+            replayed.replay_commit(&bytes).unwrap();
             assert_eq!(
-                source.export_snapshot().unwrap(),
-                replica.export_snapshot().unwrap()
+                primary.export_snapshot().unwrap(),
+                replayed.export_snapshot().unwrap()
             );
             bytes
         }
 
-        let mut source = Engine::default();
-        let mut replica = Engine::default();
+        let mut primary = Engine::default();
+        let mut replayed = Engine::default();
         apply(
-            &mut source,
-            &mut replica,
+            &mut primary,
+            &mut replayed,
             "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT NOT NULL)",
         );
         apply(
-            &mut source,
-            &mut replica,
+            &mut primary,
+            &mut replayed,
             "INSERT INTO posts (id, title) VALUES (1, 'one'), (2, 'two')",
         );
         apply(
-            &mut source,
-            &mut replica,
+            &mut primary,
+            &mut replayed,
             "CREATE INDEX posts_title ON posts (title)",
         );
         apply(
-            &mut source,
-            &mut replica,
+            &mut primary,
+            &mut replayed,
             "UPDATE posts SET title = 'changed' WHERE id = 2",
         );
 
         // A matched write that produces the same row still preserves the
         // existing revision/invalidation contract without inventing SQL redo.
         let revision_only = apply(
-            &mut source,
-            &mut replica,
+            &mut primary,
+            &mut replayed,
             "UPDATE posts SET title = 'changed' WHERE id = 2",
         );
         assert!(String::from_utf8_lossy(&revision_only).contains("\"operations\":[]"));
 
-        apply(&mut source, &mut replica, "DELETE FROM posts WHERE id = 1");
         apply(
-            &mut source,
-            &mut replica,
+            &mut primary,
+            &mut replayed,
+            "DELETE FROM posts WHERE id = 1",
+        );
+        apply(
+            &mut primary,
+            &mut replayed,
             "ALTER TABLE posts ADD COLUMN note TEXT",
         );
-        apply(&mut source, &mut replica, "DROP INDEX posts_title");
-        apply(&mut source, &mut replica, "DROP TABLE posts");
+        apply(&mut primary, &mut replayed, "DROP INDEX posts_title");
+        apply(&mut primary, &mut replayed, "DROP TABLE posts");
     }
 
     #[test]
@@ -1670,8 +1668,8 @@ mod tests {
             primary_key: vec!["id".to_owned()],
             columns: vec![],
         };
-        let mut source = Engine::default();
-        let mut replica = Engine::default();
+        let mut primary = Engine::default();
+        let mut replayed = Engine::default();
 
         for rows in [
             vec![
@@ -1683,15 +1681,15 @@ mod tests {
                 row(json!({"id": 3, "title": "three"})),
             ],
         ] {
-            let prepared = source
+            let prepared = primary
                 .prepare_replace_table_snapshot(schema.clone(), rows)
                 .unwrap();
             let bytes = prepared.commit.unwrap().into_bytes();
-            source.install_prepared_commit(&bytes).unwrap();
-            replica.replay_commit(&bytes).unwrap();
+            primary.install_prepared_commit(&bytes).unwrap();
+            replayed.replay_commit(&bytes).unwrap();
             assert_eq!(
-                source.export_snapshot().unwrap(),
-                replica.export_snapshot().unwrap()
+                primary.export_snapshot().unwrap(),
+                replayed.export_snapshot().unwrap()
             );
         }
 
@@ -1706,15 +1704,14 @@ mod tests {
                     row: row(json!({"id": 4, "title": "four"})),
                 },
             ],
-            ..ChangeBatch::default()
         };
-        let prepared = source.prepare_apply_batch(&batch).unwrap();
+        let prepared = primary.prepare_apply_batch(&batch).unwrap();
         let bytes = prepared.commit.unwrap().into_bytes();
-        source.install_prepared_commit(&bytes).unwrap();
-        replica.replay_commit(&bytes).unwrap();
+        primary.install_prepared_commit(&bytes).unwrap();
+        replayed.replay_commit(&bytes).unwrap();
         assert_eq!(
-            source.export_snapshot().unwrap(),
-            replica.export_snapshot().unwrap()
+            primary.export_snapshot().unwrap(),
+            replayed.export_snapshot().unwrap()
         );
     }
 
@@ -1759,19 +1756,21 @@ mod tests {
             primary_key: vec!["id".to_owned()],
             columns: vec![],
         };
-        let mut source = Engine::default();
-        source.define_table(existing.clone()).unwrap();
-        let mut replica = source.clone();
+        let mut primary = Engine::default();
+        primary.define_table(existing.clone()).unwrap();
+        let mut replayed = primary.clone();
 
-        let prepared = source.prepare_define_tables(vec![existing, added]).unwrap();
+        let prepared = primary
+            .prepare_define_tables(vec![existing, added])
+            .unwrap();
         let bytes = prepared.commit.unwrap().into_bytes();
-        let installed = source.install_prepared_commit(&bytes).unwrap();
+        let installed = primary.install_prepared_commit(&bytes).unwrap();
         assert_eq!(installed.tables, vec!["added"]);
-        let replayed = replica.replay_commit(&bytes).unwrap();
-        assert_eq!(replayed.tables, vec!["added"]);
+        let replay_outcome = replayed.replay_commit(&bytes).unwrap();
+        assert_eq!(replay_outcome.tables, vec!["added"]);
         assert_eq!(
-            source.export_snapshot().unwrap(),
-            replica.export_snapshot().unwrap()
+            primary.export_snapshot().unwrap(),
+            replayed.export_snapshot().unwrap()
         );
     }
 

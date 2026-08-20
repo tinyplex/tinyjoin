@@ -3,6 +3,8 @@ use std::str::FromStr;
 
 use serde_json::{Map, Number, Value};
 
+#[cfg(test)]
+use crate::StorageDriver;
 use crate::query::{
     Token, bind_parameter, is_reserved_keyword, matches_predicate, parse_predicate_at, tokenize,
     validate_predicate_columns, validate_sql_input,
@@ -13,7 +15,7 @@ use crate::storage::{
 };
 use crate::{
     Change, ColumnDefinition, ColumnType, EngineError, Predicate, QueryPlan, Result, Row,
-    StorageDriver, StorageReader, TableSchema, VisitControl, VisitOutcome,
+    StorageReader, TableSchema, VisitControl, VisitOutcome,
 };
 
 const MAX_COLUMNS: usize = 256;
@@ -115,6 +117,7 @@ pub(crate) fn parse(sql: &str, params: &[Value]) -> Result<Statement> {
         .map(Statement::Write)
 }
 
+#[cfg(test)]
 pub(crate) fn execute<S: StorageDriver>(
     storage: &mut S,
     statement: &WriteStatement,
@@ -193,6 +196,7 @@ pub(crate) fn plan_dml<S: StorageReader>(
     }
 }
 
+#[cfg(test)]
 fn drop_table<S: StorageDriver>(
     storage: &mut S,
     table: &str,
@@ -232,6 +236,7 @@ pub(crate) fn plan_drop_table<S: StorageReader>(
     })
 }
 
+#[cfg(test)]
 fn drop_index<S: StorageDriver>(
     storage: &mut S,
     name: &str,
@@ -274,6 +279,7 @@ pub(crate) fn plan_drop_index<S: StorageReader>(
     })
 }
 
+#[cfg(test)]
 fn add_column<S: StorageDriver>(
     storage: &mut S,
     table: &str,
@@ -321,6 +327,7 @@ pub(crate) fn plan_add_column<S: StorageReader>(
     })
 }
 
+#[cfg(test)]
 fn create_index<S: StorageDriver>(
     storage: &mut S,
     definition: &crate::IndexDefinition,
@@ -366,6 +373,7 @@ pub(crate) fn plan_create_index<S: StorageReader>(
     })
 }
 
+#[cfg(test)]
 fn create_table<S: StorageDriver>(
     storage: &mut S,
     schema: &TableSchema,

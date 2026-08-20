@@ -135,12 +135,6 @@ impl WasmEngine {
                 self.engine()?.ensure_readiness()?;
                 Ok(wire::unsigned(revision))
             }
-            wire::OP_WATERMARK => {
-                reader.finish()?;
-                let watermark = self.engine()?.applied_journal_sequence();
-                self.engine()?.ensure_readiness()?;
-                Ok(wire::unsigned(watermark))
-            }
             _ => Err(EngineError::new(
                 "INVALID_BRIDGE_VALUE",
                 "Invalid binary bridge request",

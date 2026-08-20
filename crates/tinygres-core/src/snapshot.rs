@@ -1,6 +1,6 @@
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::{EngineError, Result};
+use crate::{EngineError, Result, checksum::crc32};
 
 const MAGIC: &[u8; 8] = b"TGRSNAP\0";
 // Version 3 adds secondary-index definitions. Older payloads deserialize with
@@ -102,19 +102,6 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
         bytes[offset + 2],
         bytes[offset + 3],
     ])
-}
-
-// A compact tableless implementation of the standard IEEE CRC-32 checksum.
-pub(crate) fn crc32(bytes: &[u8]) -> u32 {
-    let mut checksum = u32::MAX;
-    for byte in bytes {
-        checksum ^= u32::from(*byte);
-        for _ in 0..8 {
-            let mask = (checksum & 1).wrapping_neg();
-            checksum = (checksum >> 1) ^ (0xedb8_8320 & mask);
-        }
-    }
-    !checksum
 }
 
 #[cfg(test)]

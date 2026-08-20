@@ -165,7 +165,6 @@ pub(crate) fn apply_payload(
                                 key,
                             })
                             .collect(),
-                        ..ChangeBatch::default()
                     },
                 )?;
             }
@@ -181,7 +180,6 @@ pub(crate) fn apply_payload(
                                 row,
                             })
                             .collect(),
-                        ..ChangeBatch::default()
                     },
                 )?;
             }
@@ -339,7 +337,7 @@ fn encode_payload(payload: &CommitPayload) -> Result<Vec<u8>> {
     bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     bytes.extend_from_slice(&FLAGS.to_le_bytes());
     bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(&crate::snapshot::crc32(&body).to_le_bytes());
+    bytes.extend_from_slice(&crate::checksum::crc32(&body).to_le_bytes());
     bytes.extend_from_slice(&body);
     Ok(bytes)
 }
@@ -381,7 +379,7 @@ fn decode_payload(bytes: &[u8]) -> Result<CommitPayload> {
     }
     let body = &bytes[HEADER_LENGTH..];
     let expected = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
-    if crate::snapshot::crc32(body) != expected {
+    if crate::checksum::crc32(body) != expected {
         return Err(invalid_commit(
             "Prepared commit payload checksum does not match",
         ));

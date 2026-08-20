@@ -9,7 +9,7 @@ import type {
   StorageOptions,
   TableSchema,
 } from '../protocol.js';
-import {MemoryPageDevice} from './page-device.js';
+import {MemoryPageDevice, type PageDevice} from './page-device.js';
 import {createBinaryWasmEngine} from './wasm-wire.js';
 
 export interface WorkerEngine {
@@ -34,7 +34,14 @@ export type WorkerEngineFactory = (
 
 /** Opens the page-native default engine on an ephemeral in-memory page device. */
 export async function createMemoryWasmEngine(): Promise<WorkerEngine> {
+  return createPageWasmEngine(new MemoryPageDevice());
+}
+
+/** Opens the page-native engine on a caller-owned device transferred to WASM. */
+export async function createPageWasmEngine(
+  device: PageDevice,
+): Promise<WorkerEngine> {
   const wasm = await import('../wasm/tinygres_wasm.js');
   await wasm.default();
-  return createBinaryWasmEngine(wasm.WasmEngine, new MemoryPageDevice());
+  return createBinaryWasmEngine(wasm.WasmEngine, device);
 }

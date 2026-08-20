@@ -4,7 +4,7 @@ use serde_json::{Map, Number, Value};
 use tinygres_core::{
     ApplyOutcome, Change, ChangeBatch, ColumnDefinition, ColumnType, EngineError, ExecuteResult,
     Filter, FilterOperator, NullOrder, OrderBy, OrderDirection, QueryPlan, QueryResult, Result,
-    Row, SourceCursor, TableSchema,
+    Row, TableSchema,
 };
 
 const VERSION: u8 = 1;
@@ -24,8 +24,7 @@ pub(crate) const OP_COMMIT: u32 = 8;
 pub(crate) const OP_ROLLBACK: u32 = 9;
 pub(crate) const OP_IN_TRANSACTION: u32 = 10;
 pub(crate) const OP_REVISION: u32 = 11;
-pub(crate) const OP_WATERMARK: u32 = 12;
-pub(crate) const OP_CLOSE: u32 = 13;
+pub(crate) const OP_CLOSE: u32 = 12;
 
 const JSON_NULL: u8 = 0;
 const JSON_FALSE: u8 = 1;
@@ -128,14 +127,6 @@ impl<'a> Reader<'a> {
             std::str::from_utf8(bytes).map_err(|_| invalid("Binary bridge string is not UTF-8"))?;
         self.budget.string(length)?;
         Ok(value.to_owned())
-    }
-
-    fn optional_string(&mut self) -> Result<Option<String>> {
-        match self.u8()? {
-            0 => Ok(None),
-            1 => self.string().map(Some),
-            _ => Err(invalid("Invalid optional string tag")),
-        }
     }
 
     fn strings(&mut self) -> Result<Vec<String>> {
@@ -265,17 +256,6 @@ impl<'a> Reader<'a> {
     }
 
     pub(crate) fn batch(&mut self) -> Result<ChangeBatch> {
-        let source_id = self.optional_string()?;
-        let cursor = match self.u8()? {
-            0 => None,
-            1 => Some(SourceCursor {
-                kind: self.string()?,
-                value: self.string()?,
-            }),
-            _ => return Err(invalid("Invalid cursor tag")),
-        };
-        let transaction_id = self.optional_string()?;
-        let committed_at = self.optional_string()?;
         let length = self.count()?;
         self.budget.vector::<Change>(length)?;
         let mut changes = Vec::with_capacity(length);
@@ -289,13 +269,7 @@ impl<'a> Reader<'a> {
                 _ => return Err(invalid("Invalid change tag")),
             });
         }
-        Ok(ChangeBatch {
-            source_id,
-            cursor,
-            transaction_id,
-            committed_at,
-            changes,
-        })
+        Ok(ChangeBatch { changes })
     }
 
     pub(crate) fn query(&mut self) -> Result<QueryPlan> {
@@ -719,11 +693,9 @@ mod tests {
     ];
 
     const BATCH_GOLDEN: &[u8] = &[
-        1, 1, 1, 0, 0, 0, 115, 1, 3, 0, 0, 0, 108, 115, 110, 2, 0, 0, 0, 52, 50, 1, 2, 0, 0, 0,
-        116, 120, 1, 3, 0, 0, 0, 110, 111, 119, 2, 0, 0, 0, 0, 5, 0, 0, 0, 105, 116, 101, 109, 115,
-        2, 0, 0, 0, 2, 0, 0, 0, 105, 100, 3, 7, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 110, 97, 109, 101,
-        6, 3, 0, 0, 0, 65, 100, 97, 1, 5, 0, 0, 0, 105, 116, 101, 109, 115, 1, 0, 0, 0, 2, 0, 0, 0,
-        105, 100, 3, 8, 0, 0, 0, 0, 0, 0, 0,
+        1, 2, 0, 0, 0, 0, 5, 0, 0, 0, 105, 116, 101, 109, 115, 2, 0, 0, 0, 2, 0, 0, 0, 105, 100, 3,
+        7, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 110, 97, 109, 101, 6, 3, 0, 0, 0, 65, 100, 97, 1, 5, 0,
+        0, 0, 105, 116, 101, 109, 115, 1, 0, 0, 0, 2, 0, 0, 0, 105, 100, 3, 8, 0, 0, 0, 0, 0, 0, 0,
     ];
 
     const QUERY_GOLDEN: &[u8] = &[
@@ -781,13 +753,6 @@ mod tests {
         let mut reader = Reader::new(BATCH_GOLDEN).unwrap();
         let batch = reader.batch().unwrap();
         reader.finish().unwrap();
-        assert_eq!(batch.source_id.as_deref(), Some("s"));
-        assert_eq!(
-            batch.cursor.as_ref().map(|cursor| &*cursor.kind),
-            Some("lsn")
-        );
-        assert_eq!(batch.transaction_id.as_deref(), Some("tx"));
-        assert_eq!(batch.committed_at.as_deref(), Some("now"));
         assert_eq!(batch.changes.len(), 2);
         assert!(matches!(
             &batch.changes[0],
