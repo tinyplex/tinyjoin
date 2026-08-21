@@ -4,7 +4,7 @@ use serde_json::{Map, Number, Value};
 use tinygres_core::{
     ApplyOutcome, Change, ChangeBatch, ColumnDefinition, ColumnType, EngineError, ExecuteResult,
     Filter, FilterOperator, NullOrder, OrderBy, OrderDirection, QueryPlan, QueryResult, Result,
-    Row, TableSchema,
+    ResultField, Row, TableSchema,
 };
 
 const VERSION: u8 = 1;
@@ -17,8 +17,8 @@ pub(crate) const OP_DEFINE_TABLES: u32 = 1;
 pub(crate) const OP_REPLACE_SNAPSHOT: u32 = 2;
 pub(crate) const OP_APPLY_BATCH: u32 = 3;
 pub(crate) const OP_QUERY: u32 = 4;
-pub(crate) const OP_QUERY_SQL: u32 = 5;
-pub(crate) const OP_EXECUTE_SQL: u32 = 6;
+pub(crate) const OP_EXECUTE_SQL: u32 = 5;
+pub(crate) const OP_EXEC_SQL: u32 = 6;
 pub(crate) const OP_BEGIN: u32 = 7;
 pub(crate) const OP_COMMIT: u32 = 8;
 pub(crate) const OP_ROLLBACK: u32 = 9;
@@ -430,23 +430,43 @@ pub(crate) fn query_result(result: &QueryResult, committed: bool) -> Result<Vec<
     safe_revision(result.revision)?;
     encode_success(committed, |sink| {
         write_u64(sink, result.revision)?;
+        write_fields(sink, &result.fields)?;
         write_rows(sink, &result.rows)
     })
 }
 
 pub(crate) fn execute_result(result: &ExecuteResult, committed: bool) -> Result<Vec<u8>> {
+    encode_success(committed, |sink| write_execute_result(sink, result))
+}
+
+pub(crate) fn execute_results(results: &[ExecuteResult], committed: bool) -> Result<Vec<u8>> {
+    // Share the engine's conservative prepublication bound so a durable script response cannot
+    // discover a transport-size or node-count failure only after its pager generation commits.
+    let mut retained_bytes = 7usize;
+    for result in results {
+        tinygres_core::retain_sql_script_result(&mut retained_bytes, result)?;
+    }
+    encode_success(committed, |sink| {
+        write_length(sink, results.len())?;
+        for result in results {
+            write_execute_result(sink, result)?;
+        }
+        Ok(())
+    })
+}
+
+fn write_execute_result(sink: &mut Sink, result: &ExecuteResult) -> Result<()> {
     safe_revision(result.revision)?;
     let row_count = u64::try_from(result.row_count).map_err(|_| serialization())?;
     if row_count > MAX_SAFE_INTEGER {
         return Err(serialization());
     }
-    encode_success(committed, |sink| {
-        write_string(sink, &result.command)?;
-        write_u64(sink, result.revision)?;
-        write_u64(sink, row_count)?;
-        write_rows(sink, &result.rows)?;
-        write_strings(sink, &result.tables)
-    })
+    write_string(sink, &result.command)?;
+    write_u64(sink, result.revision)?;
+    write_u64(sink, row_count)?;
+    write_fields(sink, &result.fields)?;
+    write_rows(sink, &result.rows)?;
+    write_strings(sink, &result.tables)
 }
 
 pub(crate) fn error(error: &EngineError) -> Vec<u8> {
@@ -567,6 +587,15 @@ fn write_strings(sink: &mut Sink, values: &[String]) -> Result<()> {
     write_length(sink, values.len())?;
     for value in values {
         write_string(sink, value)?;
+    }
+    Ok(())
+}
+
+fn write_fields(sink: &mut Sink, fields: &[ResultField]) -> Result<()> {
+    write_length(sink, fields.len())?;
+    for field in fields {
+        write_string(sink, &field.name)?;
+        write_u32(sink, field.data_type_id)?;
     }
     Ok(())
 }
@@ -723,6 +752,7 @@ mod tests {
     fn output_preflight_and_error_envelope_are_bounded() {
         let result = QueryResult {
             revision: 1,
+            fields: vec![],
             rows: vec![Map::from_iter([(
                 "payload".into(),
                 Value::String("x".repeat(MAX_BYTES)),
@@ -803,6 +833,46 @@ mod tests {
                 1,
             ]
         );
+    }
+
+    #[test]
+    fn execute_result_arrays_reuse_payload_shape_and_fit_the_core_preflight_bound() {
+        let results = vec![
+            ExecuteResult {
+                command: "SELECT".into(),
+                revision: 7,
+                row_count: 1,
+                fields: vec![ResultField::unknown("payload")],
+                rows: vec![Map::from_iter([(
+                    "payload".into(),
+                    json!({"nested": [true, null, "value"]}),
+                )])],
+                tables: vec![],
+            },
+            ExecuteResult {
+                command: "INSERT".into(),
+                revision: 7,
+                row_count: 1,
+                fields: vec![],
+                rows: vec![],
+                tables: vec!["items".into()],
+            },
+        ];
+        let mut upper_bound = 7usize;
+        for result in &results {
+            tinygres_core::retain_sql_script_result(&mut upper_bound, result).unwrap();
+        }
+
+        let encoded = execute_results(&results, true).unwrap();
+        assert_eq!(
+            &encoded[..7],
+            &[VERSION, SUCCESS, DURABLE_RESPONSE, 2, 0, 0, 0]
+        );
+        assert!(encoded.len() <= upper_bound);
+        let first = execute_result(&results[0], false).unwrap();
+        let second = execute_result(&results[1], false).unwrap();
+        assert_eq!(&encoded[7..7 + first.len() - 3], &first[3..]);
+        assert_eq!(&encoded[7 + first.len() - 3..], &second[3..]);
     }
 
     #[test]

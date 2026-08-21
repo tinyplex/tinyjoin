@@ -3,6 +3,7 @@ export type {
   SubscriptionOptions,
   TablesChangedEvent,
   ClientOptions,
+  DataDir,
   Transaction,
 } from './client/client.js';
 export {ClientError} from './client/error.js';
@@ -16,11 +17,12 @@ export type {
   JsonPrimitive,
   JsonValue,
   QueryPlan,
-  QueryResult,
+  QueryOptions,
+  ResultField,
+  Results,
   OrderBy,
   Row,
+  RowMode,
   SerializedError,
-  SqlResult,
-  StorageOptions,
   TableSchema,
 } from './protocol.js';

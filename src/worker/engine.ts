@@ -18,8 +18,8 @@ export interface WorkerEngine {
   replaceTableSnapshot(schema: TableSchema, rows: Row[]): ApplyOutcome;
   applyBatch(batch: ChangeBatch): ApplyOutcome;
   query(plan: QueryPlan): QueryResult;
-  querySql(sql: string, params: JsonValue[]): QueryResult;
   executeSql(sql: string, params: JsonValue[]): SqlResult;
+  execSql(sql: string): SqlResult[];
   beginTransaction(): void;
   commitTransaction(): ApplyOutcome;
   rollbackTransaction(): void;

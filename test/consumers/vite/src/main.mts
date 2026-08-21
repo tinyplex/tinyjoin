@@ -22,7 +22,7 @@ const options: ClientOptions =
     : {};
 
 if (persistence && databaseName) {
-  options.storage = {kind: 'opfs', name: databaseName};
+  options.dataDir = `opfs://${databaseName}`;
 }
 
 run(options, mode ?? 'default', persistence).catch((error: unknown) => {
@@ -37,11 +37,10 @@ async function run(
   workerMode: string,
   persistence: string | null,
 ): Promise<void> {
-  const database = create(clientOptions);
+  const database = await create(clientOptions);
   let succeeded = false;
 
   try {
-    await database.ready();
     if (persistence === 'read') {
       const restored = await database.query<Post>(
         'SELECT id, title FROM posts WHERE id = $1',
@@ -63,7 +62,7 @@ async function run(
         title TEXT NOT NULL
       )
     `);
-    await database.exec('INSERT INTO posts (id, title) VALUES ($1, $2)', [
+    await database.query('INSERT INTO posts (id, title) VALUES ($1, $2)', [
       1,
       'from packed insert',
     ]);
@@ -95,7 +94,7 @@ async function run(
       },
     );
 
-    await database.exec('UPDATE posts SET title = $1 WHERE id = $2', [
+    await database.query('UPDATE posts SET title = $1 WHERE id = $2', [
       'from packed update',
       1,
     ]);

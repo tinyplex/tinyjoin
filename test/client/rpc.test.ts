@@ -1,38 +1,43 @@
 import {describe, expect, it, vi} from 'vitest';
 
 import {WorkerRpc} from '../../src/client/rpc.ts';
-import {PROTOCOL_VERSION, type WorkerRequest} from '../../src/protocol.ts';
+import {
+  PROTOCOL_VERSION,
+  isRpcResult,
+  isWorkerRequest,
+  type WorkerRequest,
+} from '../../src/protocol.ts';
 import {FakeWorker} from '../helpers/fake-worker.ts';
 
 describe('WorkerRpc', () => {
   it('matches out-of-order responses to their requests', async () => {
     const worker = new FakeWorker();
     const rpc = new WorkerRpc(worker);
-    const first = rpc.request('querySql', {sql: 'first', params: []});
-    const second = rpc.request('querySql', {sql: 'second', params: []});
+    const first = rpc.request('executeSql', {sql: 'first', params: []});
+    const second = rpc.request('executeSql', {sql: 'second', params: []});
     const [firstRequest, secondRequest] = worker.posted as WorkerRequest[];
 
     worker.respond({
       v: PROTOCOL_VERSION,
       id: secondRequest!.id,
       ok: true,
-      result: {revision: 2, rows: [{id: 2}]},
+      result: sqlResult(2, [{id: 2}]),
     });
     worker.respond({
       v: PROTOCOL_VERSION,
       id: firstRequest!.id,
       ok: true,
-      result: {revision: 1, rows: [{id: 1}]},
+      result: sqlResult(1, [{id: 1}]),
     });
 
-    await expect(first).resolves.toEqual({revision: 1, rows: [{id: 1}]});
-    await expect(second).resolves.toEqual({revision: 2, rows: [{id: 2}]});
+    await expect(first).resolves.toEqual(sqlResult(1, [{id: 1}]));
+    await expect(second).resolves.toEqual(sqlResult(2, [{id: 2}]));
   });
 
   it('turns structured worker failures into TinyGres errors', async () => {
     const worker = new FakeWorker();
     const rpc = new WorkerRpc(worker);
-    const request = rpc.request('querySql', {sql: 'bad', params: []});
+    const request = rpc.request('executeSql', {sql: 'bad', params: []});
     const [message] = worker.posted as WorkerRequest[];
 
     worker.respond({
@@ -53,7 +58,7 @@ describe('WorkerRpc', () => {
     const rpc = new WorkerRpc(worker);
     const listener = vi.fn();
     rpc.onEvent(listener);
-    const request = rpc.request('querySql', {sql: 'select', params: []});
+    const request = rpc.request('executeSql', {sql: 'select', params: []});
     const [message] = worker.posted as WorkerRequest[];
 
     worker.respond({
@@ -65,17 +70,191 @@ describe('WorkerRpc', () => {
       v: PROTOCOL_VERSION,
       id: message!.id,
       ok: true,
-      result: {revision: 3, rows: []},
+      result: sqlResult(3),
     });
 
     expect(listener).toHaveBeenCalledOnce();
-    await expect(request).resolves.toEqual({revision: 3, rows: []});
+    await expect(request).resolves.toEqual(sqlResult(3));
+  });
+
+  it('rejects a malformed query success and terminates the worker', async () => {
+    const worker = new FakeWorker();
+    const rpc = new WorkerRpc(worker);
+    const request = rpc.request('query', {
+      plan: {table: 'posts', filters: []},
+    });
+    const [message] = worker.posted as WorkerRequest[];
+
+    worker.respond({
+      v: PROTOCOL_VERSION,
+      id: message!.id,
+      ok: true,
+      result: {revision: 0, fields: [], rows: [], extra: true},
+    });
+
+    await expect(request).rejects.toMatchObject({code: 'PROTOCOL_MISMATCH'});
+    expect(worker.terminated).toBe(true);
+  });
+
+  it('rejects malformed exec result metadata and terminates the worker', async () => {
+    const worker = new FakeWorker();
+    const rpc = new WorkerRpc(worker);
+    const request = rpc.request('execSql', {sql: 'SELECT id FROM posts'});
+    const [message] = worker.posted as WorkerRequest[];
+
+    worker.respond({
+      v: PROTOCOL_VERSION,
+      id: message!.id,
+      ok: true,
+      result: [
+        {
+          ...sqlResult(0, [{id: 1}]),
+          fields: [{name: 'id', dataTypeID: -1}],
+        },
+      ],
+    });
+
+    await expect(request).rejects.toMatchObject({code: 'PROTOCOL_MISMATCH'});
+    expect(worker.terminated).toBe(true);
+  });
+
+  it('validates every method-specific success shape', () => {
+    const outcome = {revision: 1, tables: ['posts']};
+    const queryResult = {
+      revision: 1,
+      fields: [{name: 'id', dataTypeID: 20}],
+      rows: [{id: 1}],
+    };
+
+    expect(isRpcResult('init', {revision: 0})).toBe(true);
+    expect(isRpcResult('defineTable', undefined)).toBe(true);
+    expect(isRpcResult('replaceTable', outcome)).toBe(true);
+    expect(isRpcResult('applyBatch', outcome)).toBe(true);
+    expect(isRpcResult('query', queryResult)).toBe(true);
+    expect(isRpcResult('executeSql', sqlResult(1, [{id: 1}]))).toBe(true);
+    expect(isRpcResult('execSql', [sqlResult(1)])).toBe(true);
+    expect(isRpcResult('beginTransaction', {transactionId: 'tx-1'})).toBe(
+      true,
+    );
+    expect(isRpcResult('commitTransaction', outcome)).toBe(true);
+    expect(isRpcResult('rollbackTransaction', undefined)).toBe(true);
+    expect(isRpcResult('close', undefined)).toBe(true);
+
+    expect(isRpcResult('init', {revision: -1})).toBe(false);
+    expect(isRpcResult('defineTable', null)).toBe(false);
+    expect(isRpcResult('replaceTable', {...outcome, extra: true})).toBe(false);
+    expect(
+      isRpcResult('query', {...queryResult, rows: [{created: new Date()}]}),
+    ).toBe(false);
+    expect(
+      isRpcResult('executeSql', {
+        ...sqlResult(1),
+        rowCount: Number.MAX_SAFE_INTEGER + 1,
+      }),
+    ).toBe(false);
+    expect(isRpcResult('execSql', [sqlResult(-1)])).toBe(false);
+    expect(
+      isRpcResult('beginTransaction', {
+        transactionId: 'tx-1',
+        extra: true,
+      }),
+    ).toBe(false);
+    expect(isRpcResult('rollbackTransaction', {})).toBe(false);
+    expect(isRpcResult('close', null)).toBe(false);
+  });
+
+  it('rejects extra request envelope and parameter keys', () => {
+    const schema = {name: 'posts', primaryKey: ['id']};
+    const requests = [
+      {
+        v: PROTOCOL_VERSION,
+        id: 1,
+        method: 'init',
+        params: {schemas: [], storage: {kind: 'memory'}},
+      },
+      {
+        v: PROTOCOL_VERSION,
+        id: 2,
+        method: 'defineTable',
+        params: {schema},
+      },
+      {
+        v: PROTOCOL_VERSION,
+        id: 3,
+        method: 'replaceTable',
+        params: {schema, rows: []},
+      },
+      {
+        v: PROTOCOL_VERSION,
+        id: 4,
+        method: 'applyBatch',
+        params: {batch: {changes: []}},
+      },
+    ] as const;
+
+    for (const request of requests) {
+      expect(isWorkerRequest(request)).toBe(true);
+      expect(isWorkerRequest({...request, extra: true})).toBe(false);
+      expect(
+        isWorkerRequest({
+          ...request,
+          params: {...request.params, extra: true},
+        }),
+      ).toBe(false);
+    }
+
+    expect(
+      isWorkerRequest({
+        ...requests[0],
+        params: {schemas: [], storage: {kind: 'memory', extra: true}},
+      }),
+    ).toBe(false);
+    expect(
+      isWorkerRequest({
+        ...requests[1],
+        params: {schema: {...schema, extra: true}},
+      }),
+    ).toBe(false);
+    expect(
+      isWorkerRequest({
+        v: PROTOCOL_VERSION,
+        id: 5,
+        method: 'applyBatch',
+        params: {
+          batch: {
+            changes: [
+              {
+                type: 'upsert',
+                table: 'posts',
+                row: {id: 1},
+                extra: true,
+              },
+            ],
+          },
+        },
+      }),
+    ).toBe(false);
+    expect(
+      isWorkerRequest({
+        v: PROTOCOL_VERSION,
+        id: 6,
+        method: 'query',
+        params: {
+          plan: {
+            table: 'posts',
+            filters: [
+              {column: 'id', operator: 'eq', value: 1, extra: true},
+            ],
+          },
+        },
+      }),
+    ).toBe(false);
   });
 
   it('rejects every pending request after a protocol mismatch', async () => {
     const worker = new FakeWorker();
     const rpc = new WorkerRpc(worker);
-    const request = rpc.request('querySql', {sql: 'select', params: []});
+    const request = rpc.request('executeSql', {sql: 'select', params: []});
 
     worker.emitInvalidMessage({v: 999, id: 1, ok: true, result: []});
 
@@ -86,7 +265,7 @@ describe('WorkerRpc', () => {
   it('rejects pending work when the worker crashes', async () => {
     const worker = new FakeWorker();
     const rpc = new WorkerRpc(worker);
-    const request = rpc.request('querySql', {sql: 'select', params: []});
+    const request = rpc.request('executeSql', {sql: 'select', params: []});
 
     worker.emitError('boom');
 
@@ -96,3 +275,14 @@ describe('WorkerRpc', () => {
     });
   });
 });
+
+function sqlResult(revision: number, rows: Array<{id: number}> = []) {
+  return {
+    command: 'SELECT',
+    fields: rows.length > 0 ? [{name: 'id', dataTypeID: 20}] : [],
+    revision,
+    rowCount: rows.length,
+    rows,
+    tables: [],
+  };
+}

@@ -50,7 +50,8 @@ test('rejects DDL in a page-native transaction without losing rollback', async (
     page.evaluate(() => window.__tinygresTest!.pageTransactionDdlProbe()),
   ).resolves.toEqual({
     committedRows: 0,
-    ddlCodes: Array(5).fill('UNSUPPORTED_SQL'),
+    ddlCodes: Array(6).fill('UNSUPPORTED_SQL'),
+    rejectedScriptRows: 0,
     revisionAfter: 2,
     revisionBefore: 2,
     stagedRows: 1,

@@ -11,7 +11,7 @@ use crate::query::{
 use crate::storage::StorageReader;
 use crate::{
     ColumnDefinition, ColumnType, EngineError, NullOrder, OrderBy, OrderDirection, Predicate,
-    QueryResult, Result, Row, TableSchema, VisitControl,
+    QueryResult, Result, ResultField, Row, TableSchema, VisitControl,
 };
 
 const MAX_SELECT_ITEMS: usize = 256;
@@ -116,13 +116,15 @@ pub(crate) fn parse_sql(sql: &str, params: &[Value]) -> Result<AggregatePlan> {
     Parser::new(tokenize(sql)?, params).parse()
 }
 
-pub(crate) fn execute<S: StorageReader>(storage: &S, plan: &AggregatePlan) -> Result<QueryResult> {
+pub(crate) fn execute(storage: &dyn StorageReader, plan: &AggregatePlan) -> Result<QueryResult> {
     let schema = storage.table_schema(&plan.table)?;
     validate_plan(plan, &schema)?;
+    let fields = result_fields(plan, &schema)?;
 
     if plan.limit == Some(0) {
         return Ok(QueryResult {
             revision: storage.revision(),
+            fields,
             rows: Vec::new(),
         });
     }
@@ -236,8 +238,48 @@ pub(crate) fn execute<S: StorageReader>(storage: &S, plan: &AggregatePlan) -> Re
 
     Ok(QueryResult {
         revision: storage.revision(),
+        fields,
         rows,
     })
+}
+
+fn result_fields(plan: &AggregatePlan, schema: &TableSchema) -> Result<Vec<ResultField>> {
+    plan.items
+        .iter()
+        .map(|item| {
+            let data_type = match &item.expression {
+                SelectExpression::Column(column) => {
+                    column_definition(schema, column, &plan.table)?.data_type
+                }
+                SelectExpression::Aggregate { function, argument } => match function {
+                    AggregateFunction::Count => ColumnType::Integer,
+                    AggregateFunction::Avg => ColumnType::Float,
+                    AggregateFunction::Sum => {
+                        aggregate_argument_type(argument, schema, &plan.table)?
+                    }
+                    AggregateFunction::Min | AggregateFunction::Max => {
+                        aggregate_argument_type(argument, schema, &plan.table)?
+                    }
+                },
+            };
+            Ok(ResultField::new(&item.output, data_type))
+        })
+        .collect()
+}
+
+fn aggregate_argument_type(
+    argument: &AggregateArgument,
+    schema: &TableSchema,
+    table: &str,
+) -> Result<ColumnType> {
+    match argument {
+        AggregateArgument::Column(column) => {
+            Ok(column_definition(schema, column, table)?.data_type)
+        }
+        AggregateArgument::Star => Err(EngineError::unsupported_sql(
+            "Only COUNT accepts `*` as an aggregate argument",
+        )),
+    }
 }
 
 fn validate_plan(plan: &AggregatePlan, schema: &TableSchema) -> Result<()> {
@@ -1375,6 +1417,10 @@ mod tests {
         let result = super::execute(&storage, &plan).unwrap();
 
         assert!(result.rows.is_empty());
+        assert_eq!(
+            result.fields,
+            vec![crate::ResultField::new("rows", crate::ColumnType::Integer)]
+        );
         assert_eq!(storage.visitor_counts(), before);
     }
 
@@ -1576,15 +1622,25 @@ mod tests {
     #[test]
     fn global_and_grouped_empty_inputs_differ_like_postgres() {
         let engine = sales();
+        let global = engine
+            .query_sql(
+                "SELECT COUNT(*) AS rows, SUM(amount) AS total, AVG(score) AS mean, \
+                 MIN(label) AS first_label, MAX(label) AS last_label FROM sales WHERE id > 99",
+                &[],
+            )
+            .unwrap();
         assert_eq!(
-            engine
-                .query_sql(
-                    "SELECT COUNT(*) AS rows, SUM(amount) AS total, AVG(score) AS mean, \
-                     MIN(label) AS first_label, MAX(label) AS last_label FROM sales WHERE id > 99",
-                    &[],
-                )
-                .unwrap()
-                .rows,
+            global.fields,
+            vec![
+                crate::ResultField::new("rows", crate::ColumnType::Integer),
+                crate::ResultField::new("total", crate::ColumnType::Integer),
+                crate::ResultField::new("mean", crate::ColumnType::Float),
+                crate::ResultField::new("first_label", crate::ColumnType::Text),
+                crate::ResultField::new("last_label", crate::ColumnType::Text),
+            ]
+        );
+        assert_eq!(
+            global.rows,
             vec![row(json!({
                 "rows": 0,
                 "total": null,

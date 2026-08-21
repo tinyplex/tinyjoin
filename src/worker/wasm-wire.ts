@@ -25,8 +25,8 @@ export const WASM_OPERATION = {
   replaceSnapshot: 2,
   applyBatch: 3,
   query: 4,
-  querySql: 5,
-  executeSql: 6,
+  executeSql: 5,
+  execSql: 6,
   begin: 7,
   commit: 8,
   rollback: 9,
@@ -404,18 +404,15 @@ export function encodeQuery(plan: QueryPlan): EncodedCall {
   return call(WASM_OPERATION.query, false, (sink) => writeQuery(sink, plan));
 }
 
-export function encodeQuerySql(
-  sql: string,
-  params: readonly JsonValue[],
-): EncodedCall {
-  return sqlCall(WASM_OPERATION.querySql, false, sql, params);
-}
-
 export function encodeExecuteSql(
   sql: string,
   params: readonly JsonValue[],
 ): EncodedCall {
   return sqlCall(WASM_OPERATION.executeSql, true, sql, params);
+}
+
+export function encodeExecSql(sql: string): EncodedCall {
+  return call(WASM_OPERATION.execSql, true, (sink) => sink.string(sql));
 }
 
 export function encodeUnitCall(
@@ -1125,6 +1122,48 @@ class ResponseReader {
     return values;
   }
 
+  fields(): Array<{name: string; dataTypeID: number}> {
+    const length = this.count();
+    this.#budget.vector(length);
+    const fields = new Array<{name: string; dataTypeID: number}>(length);
+    for (let index = 0; index < length; index += 1) {
+      this.#budget.operation();
+      this.resultObject(['name', 'dataTypeID']);
+      fields[index] = {name: this.string(), dataTypeID: this.u32()};
+    }
+    return fields;
+  }
+
+  sqlResult(): SqlResult {
+    this.resultObject([
+      'command',
+      'revision',
+      'rowCount',
+      'fields',
+      'rows',
+      'tables',
+    ]);
+    return {
+      command: this.string(),
+      revision: this.safeNumber(),
+      rowCount: this.safeNumber(),
+      fields: this.fields(),
+      rows: this.rows(),
+      tables: this.strings(),
+    };
+  }
+
+  sqlResults(): SqlResult[] {
+    const length = this.count();
+    this.#budget.vector(length);
+    const results = new Array<SqlResult>(length);
+    for (let index = 0; index < length; index += 1) {
+      this.#budget.operation();
+      results[index] = this.sqlResult();
+    }
+    return results;
+  }
+
   rows(): Row[] {
     const length = this.count();
     this.#budget.vector(length);
@@ -1285,9 +1324,10 @@ export function decodeQueryResultResponse(
   value: unknown,
 ): DecodedResponse<QueryResult> {
   return decodeResponse(value, (reader) => {
-    reader.resultObject(['revision', 'rows']);
+    reader.resultObject(['revision', 'fields', 'rows']);
     return {
       revision: reader.safeNumber(),
+      fields: reader.fields(),
       rows: reader.rows(),
     };
   });
@@ -1296,16 +1336,13 @@ export function decodeQueryResultResponse(
 export function decodeSqlResultResponse(
   value: unknown,
 ): DecodedResponse<SqlResult> {
-  return decodeResponse(value, (reader) => {
-    reader.resultObject(['command', 'revision', 'rowCount', 'rows', 'tables']);
-    return {
-      command: reader.string(),
-      revision: reader.safeNumber(),
-      rowCount: reader.safeNumber(),
-      rows: reader.rows(),
-      tables: reader.strings(),
-    };
-  });
+  return decodeResponse(value, (reader) => reader.sqlResult());
+}
+
+export function decodeSqlResultsResponse(
+  value: unknown,
+): DecodedResponse<SqlResult[]> {
+  return decodeResponse(value, (reader) => reader.sqlResults());
 }
 
 function decodeResponse<T>(
@@ -1390,20 +1427,17 @@ export class BinaryWasmEngine implements WorkerEngine {
     return this.#invoke(encodeQuery(plan), decodeQueryResultResponse);
   }
 
-  querySql(sql: string, params: JsonValue[]): QueryResult {
-    this.#assertCallable();
-    return this.#invoke(
-      encodeQuerySql(sql, params),
-      decodeQueryResultResponse,
-    );
-  }
-
   executeSql(sql: string, params: JsonValue[]): SqlResult {
     this.#assertCallable();
     return this.#invoke(
       encodeExecuteSql(sql, params),
       decodeSqlResultResponse,
     );
+  }
+
+  execSql(sql: string): SqlResult[] {
+    this.#assertCallable();
+    return this.#invoke(encodeExecSql(sql), decodeSqlResultsResponse);
   }
 
   beginTransaction(): void {

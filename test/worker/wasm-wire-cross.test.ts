@@ -106,6 +106,11 @@ runIfBinaryExists('binary TypeScript/Rust wire contract', () => {
       offset: 0,
     });
     expect(Object.getPrototypeOf(planned.rows[0])).toBeNull();
+    expect(planned.fields).toEqual([
+      {name: 'id', dataTypeID: 20},
+      {name: 'title', dataTypeID: 25},
+      {name: 'payload', dataTypeID: 114},
+    ]);
     expect(planned.rows).toEqual([
       {
         id: 1,
@@ -121,10 +126,10 @@ runIfBinaryExists('binary TypeScript/Rust wire contract', () => {
     );
     expect(engine.inTransaction()).toBe(true);
     expect(
-      engine.querySql('SELECT * FROM items ORDER BY id', []).rows,
+      engine.executeSql('SELECT * FROM items ORDER BY id', []).rows,
     ).toHaveLength(2);
     engine.rollbackTransaction();
-    expect(engine.querySql('SELECT * FROM items', []).rows).toHaveLength(1);
+    expect(engine.executeSql('SELECT * FROM items', []).rows).toHaveLength(1);
 
     engine.beginTransaction();
     engine.executeSql('INSERT INTO items (id, title) VALUES ($1, $2)', [
@@ -134,15 +139,42 @@ runIfBinaryExists('binary TypeScript/Rust wire contract', () => {
     const committed = engine.commitTransaction();
     expect(committed.tables).toEqual(['items']);
     expect(engine.inTransaction()).toBe(false);
-    expect(
-      engine.querySql('SELECT title FROM items WHERE id = $1', [4]).rows,
-    ).toEqual([{title: 'committed'}]);
+    const selected = engine.executeSql(
+      'SELECT title FROM items WHERE id = $1',
+      [4],
+    );
+    expect(selected.fields).toEqual([{name: 'title', dataTypeID: 25}]);
+    expect(selected.rows).toEqual([{title: 'committed'}]);
 
     const replacement = engine.replaceTableSnapshot(schema as TableSchema, [
       {id: 3, title: 'snapshot', payload: {wide: 'ok'}},
     ]);
     expect(replacement.tables).toEqual(['items']);
-    expect(engine.querySql('SELECT id FROM items', []).rows).toEqual([{id: 3}]);
+    expect(engine.executeSql('SELECT id FROM items', []).rows).toEqual([
+      {id: 3},
+    ]);
+    expect(
+      engine.execSql(
+        'SELECT id FROM items LIMIT 0; SELECT COUNT(*) AS total FROM items LIMIT 0',
+      ),
+    ).toEqual([
+      {
+        command: 'SELECT',
+        revision: replacement.revision,
+        rowCount: 0,
+        fields: [{name: 'id', dataTypeID: 20}],
+        rows: [],
+        tables: [],
+      },
+      {
+        command: 'SELECT',
+        revision: replacement.revision,
+        rowCount: 0,
+        fields: [{name: 'total', dataTypeID: 20}],
+        rows: [],
+        tables: [],
+      },
+    ]);
     expect(engine.revision()).toBeGreaterThan(0);
 
     engine.close();

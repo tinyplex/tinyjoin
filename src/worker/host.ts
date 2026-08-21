@@ -266,9 +266,6 @@ async function handleRequest(
     case 'query':
       assertTransactionId(transaction.activeId, request.params.transactionId);
       return engine.query(request.params.plan);
-    case 'querySql':
-      assertTransactionId(transaction.activeId, request.params.transactionId);
-      return engine.querySql(request.params.sql, request.params.params);
     case 'executeSql': {
       assertTransactionId(transaction.activeId, request.params.transactionId);
       const result = engine.executeSql(
@@ -279,6 +276,20 @@ async function handleRequest(
         emitInvalidation({revision: result.revision, tables: result.tables});
       }
       return result;
+    }
+    case 'execSql': {
+      assertTransactionId(transaction.activeId, request.params.transactionId);
+      const results = engine.execSql(request.params.sql);
+      if (transaction.activeId === undefined) {
+        const tables = [...new Set(results.flatMap((result) => result.tables))];
+        if (tables.length > 0) {
+          emitInvalidation({
+            revision: Math.max(...results.map((result) => result.revision)),
+            tables,
+          });
+        }
+      }
+      return results;
     }
     case 'beginTransaction': {
       assertNoTransaction(transaction.activeId);
@@ -295,28 +306,32 @@ async function handleRequest(
       try {
         const outcome = engine.commitTransaction();
         emitInvalidation(outcome);
+        transaction.clear(request.params.transactionId);
         return outcome;
       } catch (error) {
+        let cleanedUp = false;
         try {
-          if (engine.inTransaction()) {
+          cleanedUp = !engine.inTransaction();
+          if (!cleanedUp) {
             engine.rollbackTransaction();
+            cleanedUp = true;
           }
         } catch {
-          // Preserve a storage failure from a poisoned persistent engine.
+          // Preserve the commit error. Keeping the token active lets the
+          // client retry rollback if the engine can recover on a later call.
+        }
+        if (cleanedUp) {
+          transaction.clear(request.params.transactionId);
         }
         throw error;
-      } finally {
-        transaction.clear(request.params.transactionId);
       }
     }
-    case 'rollbackTransaction':
+    case 'rollbackTransaction': {
       assertTransactionId(transaction.activeId, request.params.transactionId);
-      try {
-        engine.rollbackTransaction();
-        return undefined;
-      } finally {
-        transaction.clear(request.params.transactionId);
-      }
+      engine.rollbackTransaction();
+      transaction.clear(request.params.transactionId);
+      return undefined;
+    }
     case 'close':
       throw new Error('Close requests are handled before engine dispatch');
   }

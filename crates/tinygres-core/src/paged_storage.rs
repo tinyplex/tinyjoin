@@ -3,28 +3,37 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
 };
 
+#[cfg(test)]
+use crate::storage::preflight_change_batch;
 use crate::{
-    ApplyOutcome, Btree, Change, ChangeBatch, EngineError, IndexDefinition, PageDevice, PageId,
-    Pager, Result, Row, StorageReader, TableSchema, TreeId, VisitControl, VisitOutcome,
+    ApplyOutcome, Btree, Change, ChangeBatch, EngineError, ExecuteResult, IndexDefinition,
+    PageDevice, PageId, Pager, Result, Row, StorageReader, TableSchema, TreeId, VisitControl,
+    VisitOutcome,
     paged_codec::{
         CATALOG_TREE_ID, CatalogHeader, CatalogIndexRecord, CatalogKey, CatalogTableRecord,
-        FIRST_USER_TREE_ID, MAX_CATALOG_INDEXES, MAX_CATALOG_TABLES, MAX_TREE_ID,
-        decode_catalog_header_record, decode_catalog_index_record, decode_catalog_key,
-        decode_catalog_table_record, decode_row, encode_catalog_header_record,
-        encode_catalog_index_key, encode_catalog_index_record, encode_catalog_table_key,
-        encode_catalog_table_record, encode_primary_key, encode_row,
-        encode_secondary_index_entry_key, encode_secondary_index_prefix,
-        secondary_index_entry_matches_prefix, secondary_index_primary_key,
-        secondary_index_primary_key_for_definition,
+        FIRST_USER_TREE_ID, MAX_CATALOG_TABLES, MAX_TREE_ID, decode_catalog_header_record,
+        decode_catalog_index_record, decode_catalog_key, decode_catalog_table_record, decode_row,
+        encode_catalog_header_record, encode_catalog_index_record, encode_catalog_table_record,
+        encode_primary_key, encode_row, encode_secondary_index_entry_key,
+        encode_secondary_index_prefix, secondary_index_entry_matches_prefix,
+        secondary_index_primary_key, secondary_index_primary_key_for_definition,
     },
     paged_schema::{
-        AddColumnPlan, DroppedTree, ReplacementIndex, SchemaDropPlan, TableReplacementPlan,
-        publish_added_column, publish_schema_drop, publish_table_replacement,
+        DroppedTree, ReplacementIndex, TableReplacementPlan, publish_table_replacement,
     },
     storage::{
-        normalize_row, preflight_change_batch, preflight_row_write_set, schema_with_added_column,
-        validate_added_column, validate_index_columns_for_schema, validate_index_definition_shape,
-        validate_primary_storage_key_bound, validate_schema, validated_index_key,
+        normalize_row, preflight_row_write_set, validate_primary_storage_key_bound,
+        validate_schema, validated_index_key,
+    },
+};
+#[cfg(test)]
+use crate::{
+    paged_codec::MAX_CATALOG_INDEXES,
+    paged_codec::{encode_catalog_index_key, encode_catalog_table_key},
+    paged_schema::{AddColumnPlan, SchemaDropPlan, publish_added_column, publish_schema_drop},
+    storage::{
+        schema_with_added_column, validate_added_column, validate_index_columns_for_schema,
+        validate_index_definition_shape,
     },
 };
 
@@ -43,32 +52,22 @@ pub struct PagedStorage<D: PageDevice> {
 }
 
 #[derive(Clone, Debug)]
-struct PagedTable {
-    schema: TableSchema,
-    tree_id: TreeId,
-    root_page_id: Option<PageId>,
-    row_count: usize,
+pub(crate) struct PagedTable {
+    pub(crate) schema: TableSchema,
+    pub(crate) tree_id: TreeId,
+    pub(crate) root_page_id: Option<PageId>,
+    pub(crate) row_count: usize,
 }
 
 #[derive(Clone, Debug)]
-struct PagedIndex {
-    definition: IndexDefinition,
-    tree_id: TreeId,
-    root_page_id: Option<PageId>,
-    entry_count: usize,
-}
-
-/// A semantically validated row write-set based on one committed paged revision.
-///
-/// The future SQL transaction overlay can retain statement deltas and prepare this object only at
-/// commit time, then share the exact publication path used by direct change batches.
-pub(crate) struct PagedRowWriteSet {
-    base_revision: u64,
-    tables: BTreeMap<String, BTreeMap<Vec<u8>, PagedRowChange>>,
+pub(crate) struct PagedIndex {
+    pub(crate) definition: IndexDefinition,
+    pub(crate) tree_id: TreeId,
+    pub(crate) root_page_id: Option<PageId>,
+    pub(crate) entry_count: usize,
 }
 
 struct PagedRowChange {
-    old: Option<Row>,
     next: Option<Row>,
 }
 
@@ -128,6 +127,74 @@ impl<D: PageDevice> PagedStorage<D> {
         self.ensure_ready()
     }
 
+    pub(crate) fn execute_script(
+        &mut self,
+        statements: Vec<crate::statement::Statement>,
+    ) -> Result<Vec<ExecuteResult>> {
+        self.ensure_ready()?;
+        let publication = {
+            let mut pager = self.pager.borrow_mut();
+            crate::paged_script::execute(
+                &mut pager,
+                self.revision,
+                self.next_tree_id,
+                self.tables.clone(),
+                self.indexes.clone(),
+                statements,
+            )
+        };
+        self.accept_script_publication(publication)
+            .map(|(_, results)| results)
+    }
+
+    fn execute_changes(&mut self, changes: &[Change], change_batch: bool) -> Result<u64> {
+        self.ensure_ready()?;
+        let publication = {
+            let mut pager = self.pager.borrow_mut();
+            crate::paged_script::execute_changes(
+                &mut pager,
+                self.revision,
+                self.next_tree_id,
+                self.tables.clone(),
+                self.indexes.clone(),
+                changes,
+                change_batch,
+            )
+        };
+        self.accept_script_publication(publication)
+            .map(|(revision, _)| revision)
+    }
+
+    fn accept_script_publication(
+        &mut self,
+        publication: Result<crate::paged_script::ScriptPublication>,
+    ) -> Result<(u64, Vec<ExecuteResult>)> {
+        let publication = match publication {
+            Ok(publication) => publication,
+            Err(error) => {
+                if error.code == "RECOVERY_REQUIRED" || self.pager.borrow().is_recovery_required() {
+                    self.recovery_required = true;
+                }
+                return Err(error);
+            }
+        };
+        let crate::paged_script::ScriptPublication {
+            committed,
+            revision,
+            next_tree_id,
+            tables,
+            indexes,
+            results,
+        } = publication;
+        if committed {
+            self.revision = revision;
+            self.next_tree_id = next_tree_id;
+            self.tables = tables;
+            self.indexes = indexes;
+        }
+        Ok((revision, results))
+    }
+
     /// Atomically defines one table without advancing the database revision.
     ///
     /// Schema-only initialization is durable, but it does not represent a row-data revision.
@@ -157,6 +224,7 @@ impl<D: PageDevice> PagedStorage<D> {
         self.publish_table_definitions(schemas, false)
     }
 
+    #[cfg(test)]
     /// Defines a SQL-created table and advances the database revision in the same pager generation.
     pub(crate) fn create_table_and_advance(&mut self, schema: TableSchema) -> Result<u64> {
         let changed = self.publish_table_definitions(vec![schema], true)?;
@@ -304,6 +372,7 @@ impl<D: PageDevice> PagedStorage<D> {
         Ok(true)
     }
 
+    #[cfg(test)]
     /// Builds and publishes one secondary index without collecting its complete base table.
     ///
     /// The table cursor and the new index share one pager candidate, so the index tree, catalog
@@ -507,6 +576,7 @@ impl<D: PageDevice> PagedStorage<D> {
         Ok(revision)
     }
 
+    #[cfg(test)]
     /// Drops one secondary index and publishes its reclaimed pages with the catalog update.
     pub(crate) fn drop_index_and_advance(&mut self, name: &str) -> Result<u64> {
         self.ensure_ready()?;
@@ -552,6 +622,7 @@ impl<D: PageDevice> PagedStorage<D> {
         Ok(revision)
     }
 
+    #[cfg(test)]
     /// Drops one table and all of its secondary indexes in one durable pager generation.
     pub(crate) fn drop_table_and_advance(&mut self, name: &str) -> Result<u64> {
         self.ensure_ready()?;
@@ -637,6 +708,7 @@ impl<D: PageDevice> PagedStorage<D> {
         Ok(revision)
     }
 
+    #[cfg(test)]
     /// Streams `ALTER TABLE ADD COLUMN` into one crash-safe paged generation.
     pub(crate) fn add_column_and_advance(
         &mut self,
@@ -1054,18 +1126,21 @@ impl<D: PageDevice> PagedStorage<D> {
             });
         }
 
-        let write_set = self.prepare_batch_write_set(&batch.changes)?;
-        self.commit_row_write_set(write_set)
+        let tables = batch
+            .changes
+            .iter()
+            .map(|change| match change {
+                Change::Upsert { table, .. } | Change::Delete { table, .. } => table.clone(),
+            })
+            .collect::<BTreeSet<_>>();
+        let revision = self.execute_changes(&batch.changes, true)?;
+        Ok(ApplyOutcome {
+            revision,
+            tables: tables.into_iter().collect(),
+        })
     }
 
-    fn prepare_batch_write_set(&self, input_changes: &[Change]) -> Result<PagedRowWriteSet> {
-        self.prepare_row_write_set_with(input_changes, preflight_change_batch, false)
-    }
-
-    pub(crate) fn prepare_row_write_set(
-        &self,
-        input_changes: &[Change],
-    ) -> Result<PagedRowWriteSet> {
+    pub(crate) fn validate_row_write_set(&self, input_changes: &[Change]) -> Result<()> {
         self.prepare_row_write_set_with(input_changes, preflight_row_write_set, true)
     }
 
@@ -1101,7 +1176,7 @@ impl<D: PageDevice> PagedStorage<D> {
         input_changes: &[Change],
         preflight: RowWritePreflight,
         reject_duplicate_upserts: bool,
-    ) -> Result<PagedRowWriteSet> {
+    ) -> Result<()> {
         self.ensure_ready()?;
         preflight_batch(input_changes, &self.tables, &self.indexes, preflight)?;
         if reject_duplicate_upserts {
@@ -1152,15 +1227,12 @@ impl<D: PageDevice> PagedStorage<D> {
                 .checked_add(change_bytes)
                 .ok_or_else(batch_too_large)?;
             ensure_batch_bytes(retained_bytes)?;
-            table_changes.insert(key, PagedRowChange { old, next });
+            table_changes.insert(key, PagedRowChange { next });
         }
 
         self.validate_changed_unique_indexes(&tables, retained_bytes)?;
 
-        Ok(PagedRowWriteSet {
-            base_revision: self.revision,
-            tables,
-        })
+        Ok(())
     }
 
     fn validate_changed_unique_indexes(
@@ -1233,226 +1305,15 @@ impl<D: PageDevice> PagedStorage<D> {
         Ok(())
     }
 
-    pub(crate) fn commit_row_write_set(
+    pub(crate) fn commit_transaction_changes(
         &mut self,
-        write_set: PagedRowWriteSet,
-    ) -> Result<ApplyOutcome> {
-        let tables = write_set.tables.keys().cloned().collect();
-        self.commit_row_write_set_for_tables(write_set, tables, false)
-    }
-
-    /// Publishes a complete explicit SQL transaction in one pager generation.
-    ///
-    /// `touched_tables` is intentionally independent of the final write-set: an explicit
-    /// transaction which changes a row and later restores it still commits one revision, matching
-    /// the in-memory engine's transaction contract.
-    pub(crate) fn commit_transaction_write_set(
-        &mut self,
-        write_set: PagedRowWriteSet,
+        changes: &[Change],
         touched_tables: BTreeSet<String>,
     ) -> Result<ApplyOutcome> {
-        self.commit_row_write_set_for_tables(write_set, touched_tables, true)
-    }
-
-    fn commit_row_write_set_for_tables(
-        &mut self,
-        write_set: PagedRowWriteSet,
-        outcome_tables: BTreeSet<String>,
-        force_revision: bool,
-    ) -> Result<ApplyOutcome> {
-        self.ensure_ready()?;
-        if write_set.base_revision != self.revision {
-            return Err(EngineError::new(
-                "WRITE_CONFLICT",
-                format!(
-                    "Paged write-set revision {} does not match current revision {}",
-                    write_set.base_revision, self.revision
-                ),
-            ));
-        }
-        if write_set.tables.is_empty() && !force_revision {
-            return Ok(ApplyOutcome {
-                revision: self.revision,
-                tables: vec![],
-            });
-        }
-        let PagedRowWriteSet {
-            base_revision: _,
-            tables: changes,
-        } = write_set;
-
-        let revision = crate::revision::next_database_revision(self.revision)?;
-        let mut next_tables = self.tables.clone();
-        let mut next_indexes = self.indexes.clone();
-        let mut pager = self.pager.borrow_mut();
-        let catalog_root = pager.catalog_root_page_id().ok_or_else(|| {
-            storage_corrupt("A non-empty paged catalog must have a published root")
-        })?;
-        let mut transaction = pager.begin_write()?;
-        let result = (|| {
-            for (table_name, table_changes) in &changes {
-                let table = next_tables
-                    .get_mut(table_name)
-                    .expect("every changed table was resolved above");
-                for (key, change) in table_changes {
-                    match &change.next {
-                        Some(row) => {
-                            let current = match table.root_page_id {
-                                Some(root) => root,
-                                None => Btree::create(&mut transaction, table.tree_id)?,
-                            };
-                            table.root_page_id = Some(Btree::upsert(
-                                &mut transaction,
-                                current,
-                                table.tree_id,
-                                key,
-                                &encode_row(row)?,
-                            )?);
-                        }
-                        None => {
-                            if let Some(root) = table.root_page_id {
-                                table.root_page_id =
-                                    Btree::delete(&mut transaction, root, table.tree_id, key)?.0;
-                            }
-                        }
-                    }
-                }
-                table.row_count = adjusted_count(
-                    table.row_count,
-                    table_changes
-                        .values()
-                        .filter(|change| change.old.is_none() && change.next.is_some())
-                        .count(),
-                    table_changes
-                        .values()
-                        .filter(|change| change.old.is_some() && change.next.is_none())
-                        .count(),
-                    "table row",
-                )?;
-
-                for index in next_indexes
-                    .values_mut()
-                    .filter(|index| index.definition.table == *table_name)
-                {
-                    let mut inserted = 0usize;
-                    let mut deleted = 0usize;
-                    for change in table_changes.values() {
-                        let old_key = if let Some(old_row) = &change.old
-                            && let Some(index_key) = encode_secondary_index_entry_key(
-                                &table.schema,
-                                &index.definition,
-                                old_row,
-                            )? {
-                            Some(index_key)
-                        } else {
-                            None
-                        };
-                        let next_key = if let Some(row) = &change.next
-                            && let Some(index_key) = encode_secondary_index_entry_key(
-                                &table.schema,
-                                &index.definition,
-                                row,
-                            )? {
-                            Some(index_key)
-                        } else {
-                            None
-                        };
-                        if old_key == next_key {
-                            continue;
-                        }
-                        if let Some(index_key) = old_key
-                            && let Some(root) = index.root_page_id
-                        {
-                            let (next_root, removed) =
-                                Btree::delete(&mut transaction, root, index.tree_id, &index_key)?;
-                            if !removed {
-                                return Err(storage_corrupt(format!(
-                                    "Index `{}` is missing an entry for a committed row",
-                                    index.definition.name
-                                )));
-                            }
-                            index.root_page_id = next_root;
-                            deleted += 1;
-                        }
-                        if let Some(index_key) = next_key {
-                            let current = match index.root_page_id {
-                                Some(root) => root,
-                                None => Btree::create(&mut transaction, index.tree_id)?,
-                            };
-                            index.root_page_id = Some(Btree::upsert(
-                                &mut transaction,
-                                current,
-                                index.tree_id,
-                                &index_key,
-                                &[],
-                            )?);
-                            inserted += 1;
-                        }
-                    }
-                    index.entry_count =
-                        adjusted_count(index.entry_count, inserted, deleted, "index entry")?;
-                }
-            }
-
-            let mut catalog_root = catalog_root;
-            for table_name in changes.keys() {
-                let table = &next_tables[table_name];
-                let (key, value) = encode_catalog_table_record(&CatalogTableRecord {
-                    schema: table.schema.clone(),
-                    tree_id: table.tree_id,
-                    root_page_id: table.root_page_id,
-                    row_count: table.row_count as u64,
-                })?;
-                catalog_root = Btree::upsert(
-                    &mut transaction,
-                    catalog_root,
-                    CATALOG_TREE_ID,
-                    &key,
-                    &value,
-                )?;
-            }
-            for index in next_indexes
-                .values()
-                .filter(|index| changes.contains_key(index.definition.table.as_str()))
-            {
-                let (key, value) = encode_catalog_index_record(&CatalogIndexRecord {
-                    definition: index.definition.clone(),
-                    tree_id: index.tree_id,
-                    root_page_id: index.root_page_id,
-                    entry_count: index.entry_count as u64,
-                })?;
-                catalog_root = Btree::upsert(
-                    &mut transaction,
-                    catalog_root,
-                    CATALOG_TREE_ID,
-                    &key,
-                    &value,
-                )?;
-            }
-            Ok(catalog_root)
-        })();
-
-        let catalog_root = match result {
-            Ok(catalog_root) => catalog_root,
-            Err(error) => {
-                transaction.abort();
-                return Err(error);
-            }
-        };
-        if let Err(error) = transaction.commit(revision, Some(catalog_root)) {
-            if error.code == "RECOVERY_REQUIRED" || pager.is_recovery_required() {
-                self.recovery_required = true;
-            }
-            return Err(error);
-        }
-        drop(pager);
-
-        self.tables = next_tables;
-        self.indexes = next_indexes;
-        self.revision = revision;
+        let revision = self.execute_changes(changes, false)?;
         Ok(ApplyOutcome {
             revision,
-            tables: outcome_tables.into_iter().collect(),
+            tables: touched_tables.into_iter().collect(),
         })
     }
 
@@ -1555,6 +1416,7 @@ fn estimated_schema_work_bytes(schema: &TableSchema) -> Result<usize> {
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn estimated_column_work_bytes(column: &crate::ColumnDefinition) -> Result<usize> {
     let mut bytes = 192usize
         .checked_add(estimated_string_work_bytes(&column.name)?)
@@ -1678,6 +1540,7 @@ fn preflight_snapshot_operations(
     Ok(())
 }
 
+#[cfg(test)]
 fn add_column_operation_count(row_count: usize, rooted: bool) -> Result<usize> {
     if !rooted {
         // Catalog header and table-record publication only.
@@ -1692,6 +1555,7 @@ fn add_column_operation_count(row_count: usize, rooted: bool) -> Result<usize> {
         .ok_or_else(batch_too_large)
 }
 
+#[cfg(test)]
 fn preflight_add_column_operations(row_count: usize, rooted: bool) -> Result<()> {
     if add_column_operation_count(row_count, rooted)? > MAX_PAGED_BATCH_OPERATIONS {
         return Err(operation_limit());
@@ -1752,7 +1616,12 @@ fn committed_index_primary_keys<D: PageDevice>(
     Ok(primary_keys)
 }
 
-fn adjusted_count(current: usize, inserted: usize, deleted: usize, kind: &str) -> Result<usize> {
+pub(crate) fn adjusted_count(
+    current: usize,
+    inserted: usize,
+    deleted: usize,
+    kind: &str,
+) -> Result<usize> {
     current
         .checked_sub(deleted)
         .and_then(|count| count.checked_add(inserted))
@@ -1804,7 +1673,7 @@ fn estimated_object_bytes(values: &Row, depth: usize) -> Result<usize> {
     })
 }
 
-fn ensure_batch_bytes(bytes: usize) -> Result<()> {
+pub(crate) fn ensure_batch_bytes(bytes: usize) -> Result<()> {
     if bytes > MAX_PAGED_BATCH_BYTES {
         Err(batch_too_large())
     } else {
@@ -1812,14 +1681,14 @@ fn ensure_batch_bytes(bytes: usize) -> Result<()> {
     }
 }
 
-fn batch_too_large() -> EngineError {
+pub(crate) fn batch_too_large() -> EngineError {
     EngineError::new(
         "TRANSACTION_TOO_LARGE",
         format!("A paged batch cannot retain more than {MAX_PAGED_BATCH_BYTES} bytes"),
     )
 }
 
-fn unique_violation(index: &str) -> EngineError {
+pub(crate) fn unique_violation(index: &str) -> EngineError {
     EngineError::constraint_violation(format!("Index `{index}` would contain duplicate values"))
 }
 
@@ -2311,7 +2180,7 @@ fn expected_index_entry_count<D: PageDevice>(
     Ok(count)
 }
 
-fn validated_row(schema: &TableSchema, key: &[u8], value: &[u8]) -> Result<Row> {
+pub(crate) fn validated_row(schema: &TableSchema, key: &[u8], value: &[u8]) -> Result<Row> {
     let row = decode_row(value)?;
     let normalized = normalize_row(schema, row.clone()).map_err(|error| {
         storage_corrupt(format!(
@@ -2334,11 +2203,11 @@ fn validated_row(schema: &TableSchema, key: &[u8], value: &[u8]) -> Result<Row> 
     Ok(row)
 }
 
-fn limit_error(message: impl Into<String>) -> EngineError {
+pub(crate) fn limit_error(message: impl Into<String>) -> EngineError {
     EngineError::new("STORAGE_LIMIT", message)
 }
 
-fn storage_corrupt(message: impl Into<String>) -> EngineError {
+pub(crate) fn storage_corrupt(message: impl Into<String>) -> EngineError {
     EngineError::new("STORAGE_CORRUPT", message)
 }
 

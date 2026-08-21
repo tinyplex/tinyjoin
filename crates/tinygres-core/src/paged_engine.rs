@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use serde_json::Value;
 
 use crate::{
@@ -93,112 +95,99 @@ impl<D: PageDevice> PagedEngine<D> {
     /// pager generation. A statement which matches no rows does not publish a generation or
     /// advance the revision.
     pub fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<ExecuteResult> {
-        match crate::statement::parse(sql, params)? {
-            Statement::Select(plan) => execute_query_result(self.query(&plan)?),
-            Statement::Aggregate(plan) => {
-                execute_query_result(crate::aggregate::execute(&self.read_view(), &plan)?)
-            }
-            Statement::Join(plan) => {
-                execute_query_result(crate::join::execute(&self.read_view(), &plan)?)
-            }
-            Statement::Write(statement) => {
-                if self.transaction.is_some() {
-                    return self.execute_transaction_write(&statement);
+        let statement = crate::statement::parse(sql, params)?;
+        if self.transaction.is_none() {
+            return self
+                .storage
+                .execute_script(vec![statement])?
+                .pop()
+                .ok_or_else(|| {
+                    EngineError::new("INTERNAL_ERROR", "SQL statement produced no result")
+                });
+        }
+        self.execute_statement(statement, None)
+    }
+
+    /// Executes a semicolon-delimited SQL script as one atomic operation.
+    ///
+    /// Standalone scripts publish all DDL and DML in one pager generation. Within an explicit
+    /// transaction, scripts are limited to reads and row DML and install their cloned overlay only
+    /// after every statement succeeds.
+    pub fn exec_sql(&mut self, sql: &str) -> Result<Vec<ExecuteResult>> {
+        let script = crate::sql_script::split(sql)?;
+        if script.is_empty() {
+            return Err(EngineError::invalid_query(
+                "exec SQL must contain at least one statement",
+            ));
+        }
+        let statements = script
+            .into_iter()
+            .map(|sql| crate::statement::parse(sql, &[]))
+            .collect::<Result<Vec<_>>>()?;
+        if self.transaction.is_none() {
+            return self.storage.execute_script(statements);
+        }
+        if statements.iter().any(|statement| {
+            matches!(
+                statement,
+                Statement::Write(
+                    WriteStatement::CreateTable { .. }
+                        | WriteStatement::CreateIndex { .. }
+                        | WriteStatement::DropTable { .. }
+                        | WriteStatement::DropIndex { .. }
+                        | WriteStatement::AddColumn { .. }
+                )
+            )
+        }) {
+            return Err(EngineError::unsupported_sql(
+                "SQL scripts inside explicit transactions support SELECT, INSERT, UPDATE, and DELETE, but not DDL",
+            ));
+        }
+        let original = self
+            .transaction
+            .take()
+            .expect("the explicit transaction branch was selected above");
+        self.transaction = Some(original.clone());
+        let work = Cell::new(0);
+        let mut result_bytes = 7usize;
+        let mut results = Vec::with_capacity(statements.len());
+        for statement in statements {
+            let result = self
+                .execute_statement(statement, Some(&work))
+                .and_then(|result| {
+                    crate::paged_script::retain_result(&mut result_bytes, &result)?;
+                    Ok(result)
+                });
+            match result {
+                Ok(result) => results.push(result),
+                Err(error) => {
+                    self.transaction = Some(original);
+                    return Err(error);
                 }
-                let (outcome, revision) = match &statement {
-                    WriteStatement::CreateTable {
-                        schema,
-                        if_not_exists,
-                    } => {
-                        let outcome = crate::statement::plan_create_table(
-                            &self.storage,
-                            schema,
-                            *if_not_exists,
-                        )?;
-                        let revision = if outcome.mutated {
-                            self.storage.create_table_and_advance(schema.clone())?
-                        } else {
-                            self.storage.revision()
-                        };
-                        (outcome, revision)
-                    }
-                    WriteStatement::CreateIndex {
-                        definition,
-                        if_not_exists,
-                    } => {
-                        let outcome = crate::statement::plan_create_index(
-                            &self.storage,
-                            definition,
-                            *if_not_exists,
-                        )?;
-                        let revision = if outcome.mutated {
-                            self.storage.create_index_and_advance(definition.clone())?
-                        } else {
-                            self.storage.revision()
-                        };
-                        (outcome, revision)
-                    }
-                    WriteStatement::DropIndex { name, if_exists } => {
-                        let outcome =
-                            crate::statement::plan_drop_index(&self.storage, name, *if_exists)?;
-                        let revision = if outcome.mutated {
-                            self.storage.drop_index_and_advance(name)?
-                        } else {
-                            self.storage.revision()
-                        };
-                        (outcome, revision)
-                    }
-                    WriteStatement::DropTable { table, if_exists } => {
-                        let outcome =
-                            crate::statement::plan_drop_table(&self.storage, table, *if_exists)?;
-                        let revision = if outcome.mutated {
-                            self.storage.drop_table_and_advance(table)?
-                        } else {
-                            self.storage.revision()
-                        };
-                        (outcome, revision)
-                    }
-                    WriteStatement::AddColumn {
-                        table,
-                        column,
-                        if_not_exists,
-                    } => {
-                        let outcome = crate::statement::plan_add_column(
-                            &self.storage,
-                            table,
-                            column,
-                            *if_not_exists,
-                        )?;
-                        let revision = if outcome.mutated {
-                            self.storage.add_column_and_advance(table, column)?
-                        } else {
-                            self.storage.revision()
-                        };
-                        (outcome, revision)
-                    }
-                    _ => {
-                        let PlannedDml { outcome, changes } = {
-                            let view = self.read_view();
-                            crate::statement::plan_dml(&view, &statement)?
-                        };
-                        debug_assert_eq!(outcome.mutated, !changes.is_empty());
-                        let revision = if outcome.mutated {
-                            let write_set = self.storage.prepare_row_write_set(&changes)?;
-                            self.storage.commit_row_write_set(write_set)?.revision
-                        } else {
-                            self.storage.revision()
-                        };
-                        (outcome, revision)
-                    }
-                };
-                Ok(ExecuteResult {
-                    command: outcome.command.to_owned(),
-                    revision,
-                    row_count: outcome.row_count,
-                    rows: outcome.rows,
-                    tables: outcome.tables,
-                })
             }
+        }
+        Ok(results)
+    }
+
+    fn execute_statement(
+        &mut self,
+        statement: Statement,
+        work: Option<&Cell<usize>>,
+    ) -> Result<ExecuteResult> {
+        match statement {
+            Statement::Select(plan) => execute_query_result(crate::query::execute(
+                &self.read_view_with_work(work),
+                &plan,
+            )?),
+            Statement::Aggregate(plan) => execute_query_result(crate::aggregate::execute(
+                &self.read_view_with_work(work),
+                &plan,
+            )?),
+            Statement::Join(plan) => execute_query_result(crate::join::execute(
+                &self.read_view_with_work(work),
+                &plan,
+            )?),
+            Statement::Write(statement) => self.execute_transaction_write(&statement, work),
         }
     }
 
@@ -245,10 +234,9 @@ impl<D: PageDevice> PagedEngine<D> {
         }
         let changes = transaction.changes();
         let touched_tables = transaction.touched_tables();
-        let write_set = self.storage.prepare_row_write_set(&changes)?;
         let outcome = self
             .storage
-            .commit_transaction_write_set(write_set, touched_tables)?;
+            .commit_transaction_changes(&changes, touched_tables)?;
         self.transaction = None;
         Ok(outcome)
     }
@@ -279,6 +267,15 @@ impl<D: PageDevice> PagedEngine<D> {
         PagedReadView::new(&self.storage, self.transaction.as_ref())
     }
 
+    fn read_view_with_work<'a>(&'a self, work: Option<&'a Cell<usize>>) -> PagedReadView<'a, D> {
+        match work {
+            Some(work) => {
+                PagedReadView::with_work_budget(&self.storage, self.transaction.as_ref(), work)
+            }
+            None => self.read_view(),
+        }
+    }
+
     fn ensure_no_transaction(&self) -> Result<()> {
         self.storage.ensure_readiness()?;
         if self.in_transaction() {
@@ -288,7 +285,11 @@ impl<D: PageDevice> PagedEngine<D> {
         }
     }
 
-    fn execute_transaction_write(&mut self, statement: &WriteStatement) -> Result<ExecuteResult> {
+    fn execute_transaction_write(
+        &mut self,
+        statement: &WriteStatement,
+        work: Option<&Cell<usize>>,
+    ) -> Result<ExecuteResult> {
         self.storage.ensure_readiness()?;
         if !matches!(
             statement,
@@ -301,9 +302,14 @@ impl<D: PageDevice> PagedEngine<D> {
             ));
         }
         let PlannedDml { outcome, changes } = {
-            let view = self.read_view();
+            let view = self.read_view_with_work(work);
             crate::statement::plan_dml(&view, statement)?
         };
+        let fields = crate::statement::write_result_fields(
+            &self.read_view_with_work(work),
+            statement,
+            outcome.rows.first(),
+        )?;
         if outcome.mutated {
             self.transaction
                 .as_mut()
@@ -314,6 +320,7 @@ impl<D: PageDevice> PagedEngine<D> {
             command: outcome.command.to_owned(),
             revision: self.storage.revision(),
             row_count: outcome.row_count,
+            fields,
             rows: outcome.rows,
             tables: outcome.tables,
         })
@@ -325,6 +332,7 @@ fn execute_query_result(result: QueryResult) -> Result<ExecuteResult> {
         command: "SELECT".to_owned(),
         revision: result.revision,
         row_count: result.rows.len(),
+        fields: result.fields,
         rows: result.rows,
         tables: vec![],
     })
@@ -634,6 +642,7 @@ mod tests {
                 .unwrap(),
             QueryResult {
                 revision: revision + 1,
+                fields: rows.fields,
                 rows: rows.rows,
             }
         );
@@ -1806,6 +1815,278 @@ mod tests {
                 row(json!({"id": -0.0, "label": "standalone"})),
                 row(json!({"id": 1.0, "label": "transaction"})),
             ]
+        );
+    }
+
+    #[test]
+    fn exec_sql_requires_at_least_one_statement() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        for sql in ["", ";;;", "-- comment only ;\n/* still empty */"] {
+            assert_eq!(engine.exec_sql(sql).unwrap_err().code, "INVALID_QUERY");
+        }
+        assert_eq!(engine.revision(), 0);
+    }
+
+    #[test]
+    fn exec_sql_publishes_mixed_ddl_dml_and_select_once_and_reopens() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let results = engine
+            .exec_sql(
+                "-- the comment's semicolon is not a statement ;\n\
+                 CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL);\
+                 INSERT INTO notes (id, body) VALUES (1, 'one;two'), (2, 'second');\
+                 CREATE INDEX notes_body ON notes (body);\
+                 SELECT id, body FROM notes ORDER BY id;;;",
+            )
+            .unwrap();
+
+        assert_eq!(results.len(), 4);
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.command.as_str())
+                .collect::<Vec<_>>(),
+            ["CREATE TABLE", "INSERT", "CREATE INDEX", "SELECT"]
+        );
+        assert!(results.iter().all(|result| result.revision == 1));
+        assert_eq!(
+            results[3].rows,
+            vec![
+                row(json!({"id": 1, "body": "one;two"})),
+                row(json!({"id": 2, "body": "second"})),
+            ]
+        );
+        assert_eq!(engine.revision(), 1);
+
+        let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        assert_eq!(reopened.revision(), 1);
+        assert_eq!(
+            reopened
+                .query_sql("SELECT id FROM notes WHERE body = 'second'", &[])
+                .unwrap()
+                .rows,
+            vec![row(json!({"id": 2}))]
+        );
+    }
+
+    #[test]
+    fn exec_sql_late_failure_aborts_pages_catalog_revision_and_reopen() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .exec_sql(
+                "CREATE TABLE accounts (id INTEGER PRIMARY KEY, email TEXT);\
+                 INSERT INTO accounts (id, email) VALUES (1, 'one'), (2, 'two');\
+                 CREATE UNIQUE INDEX accounts_email ON accounts (email);",
+            )
+            .unwrap();
+        let revision = engine.revision();
+        let before = engine
+            .query_sql("SELECT id, email FROM accounts ORDER BY id", &[])
+            .unwrap();
+
+        assert_eq!(
+            engine
+                .exec_sql(
+                    "UPDATE accounts SET email = 'changed' WHERE id = 1;\
+                     CREATE TABLE should_not_exist (id INTEGER PRIMARY KEY);\
+                     INSERT INTO accounts (id, email) VALUES (3, 'two');",
+                )
+                .unwrap_err()
+                .code,
+            "CONSTRAINT_VIOLATION"
+        );
+        assert_eq!(engine.revision(), revision);
+        assert_eq!(
+            engine
+                .query_sql("SELECT id, email FROM accounts ORDER BY id", &[])
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            engine
+                .query_sql("SELECT id FROM should_not_exist", &[])
+                .unwrap_err()
+                .code,
+            "TABLE_NOT_FOUND"
+        );
+
+        let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        assert_eq!(reopened.revision(), revision);
+        assert_eq!(
+            reopened
+                .query_sql("SELECT id, email FROM accounts ORDER BY id", &[])
+                .unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn transaction_exec_is_a_savepoint_and_preflights_ddl() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .exec_sql(
+                "CREATE TABLE accounts (id INTEGER PRIMARY KEY, label TEXT NOT NULL);\
+                 INSERT INTO accounts (id, label) VALUES (1, 'base');",
+            )
+            .unwrap();
+        let revision = engine.revision();
+        engine.begin_transaction().unwrap();
+        engine
+            .execute_sql("INSERT INTO accounts (id, label) VALUES (2, 'prior')", &[])
+            .unwrap();
+
+        assert_eq!(
+            engine
+                .exec_sql(
+                    "INSERT INTO accounts (id, label) VALUES (3, 'temporary');\
+                     UPDATE accounts SET label = 'changed' WHERE id = 1;\
+                     INSERT INTO accounts (id, label) VALUES (2, 'duplicate');",
+                )
+                .unwrap_err()
+                .code,
+            "CONSTRAINT_VIOLATION"
+        );
+        assert_eq!(
+            engine
+                .query_sql("SELECT id, label FROM accounts ORDER BY id", &[])
+                .unwrap()
+                .rows,
+            vec![
+                row(json!({"id": 1, "label": "base"})),
+                row(json!({"id": 2, "label": "prior"})),
+            ]
+        );
+
+        assert_eq!(
+            engine
+                .exec_sql(
+                    "INSERT INTO accounts (id, label) VALUES (4, 'blocked');\
+                     CREATE TABLE blocked (id INTEGER PRIMARY KEY);",
+                )
+                .unwrap_err()
+                .code,
+            "UNSUPPORTED_SQL"
+        );
+        assert!(
+            engine
+                .query_sql("SELECT id FROM accounts WHERE id = 4", &[])
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+
+        let results = engine
+            .exec_sql(
+                "INSERT INTO accounts (id, label) VALUES (3, 'installed');\
+                 SELECT id, label FROM accounts ORDER BY id;",
+            )
+            .unwrap();
+        assert!(results.iter().all(|result| result.revision == revision));
+        assert_eq!(results[1].rows.len(), 3);
+        let outcome = engine.commit_transaction().unwrap();
+        assert_eq!(outcome.revision, revision + 1);
+
+        let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        assert_eq!(
+            reopened
+                .query_sql("SELECT id FROM accounts ORDER BY id", &[])
+                .unwrap()
+                .rows,
+            vec![
+                row(json!({"id": 1})),
+                row(json!({"id": 2})),
+                row(json!({"id": 3})),
+            ]
+        );
+    }
+
+    #[test]
+    fn exec_sql_rejects_cumulative_results_before_publishing() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .execute_sql(
+                "CREATE TABLE blobs (\
+                    id INTEGER PRIMARY KEY, payload TEXT NOT NULL, marker INTEGER NOT NULL DEFAULT 0\
+                 )",
+                &[],
+            )
+            .unwrap();
+        engine
+            .execute_sql(
+                "INSERT INTO blobs (id, payload) VALUES (1, $1)",
+                &[json!("x".repeat(80_000))],
+            )
+            .unwrap();
+        let revision = engine.revision();
+        let script = std::iter::once("UPDATE blobs SET marker = 1 WHERE id = 1;")
+            .chain(std::iter::repeat_n(
+                "SELECT payload FROM blobs WHERE id = 1;",
+                220,
+            ))
+            .collect::<String>();
+
+        assert_eq!(
+            engine.exec_sql(&script).unwrap_err().code,
+            "TRANSACTION_TOO_LARGE"
+        );
+        assert_eq!(engine.revision(), revision);
+        assert_eq!(
+            engine
+                .query_sql("SELECT marker FROM blobs WHERE id = 1", &[])
+                .unwrap()
+                .rows,
+            vec![row(json!({"marker": 0}))]
+        );
+        let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        assert_eq!(reopened.revision(), revision);
+        assert_eq!(
+            reopened
+                .query_sql("SELECT marker FROM blobs WHERE id = 1", &[])
+                .unwrap()
+                .rows,
+            vec![row(json!({"marker": 0}))]
+        );
+    }
+
+    #[test]
+    fn exec_sql_bounds_cumulative_scans_across_small_aggregate_results() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .execute_sql(
+                "CREATE TABLE numbers (\
+                    id INTEGER PRIMARY KEY, marker BOOLEAN NOT NULL DEFAULT false\
+                 )",
+                &[],
+            )
+            .unwrap();
+        for start in (0..4_000).step_by(500) {
+            let values = (start..start + 500)
+                .map(|id| format!("({id})"))
+                .collect::<Vec<_>>()
+                .join(",");
+            engine
+                .execute_sql(&format!("INSERT INTO numbers (id) VALUES {values}"), &[])
+                .unwrap();
+        }
+        let revision = engine.revision();
+        let script = std::iter::once("UPDATE numbers SET marker = true WHERE id = 0;")
+            .chain(std::iter::repeat_n(
+                "SELECT COUNT(*) AS count FROM numbers;",
+                250,
+            ))
+            .collect::<String>();
+
+        assert_eq!(
+            engine.exec_sql(&script).unwrap_err().code,
+            "TRANSACTION_TOO_LARGE"
+        );
+        assert_eq!(engine.revision(), revision);
+        assert_eq!(
+            engine
+                .query_sql("SELECT marker FROM numbers WHERE id = 0", &[])
+                .unwrap()
+                .rows,
+            vec![row(json!({"marker": false}))]
         );
     }
 }

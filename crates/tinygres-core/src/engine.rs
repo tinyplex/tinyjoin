@@ -358,6 +358,7 @@ impl<S: StorageDriver + Clone> Engine<S> {
                     command: "SELECT".to_owned(),
                     revision: result.revision,
                     row_count: result.rows.len(),
+                    fields: result.fields,
                     rows: result.rows,
                     tables: vec![],
                 })
@@ -368,6 +369,7 @@ impl<S: StorageDriver + Clone> Engine<S> {
                     command: "SELECT".to_owned(),
                     revision: result.revision,
                     row_count: result.rows.len(),
+                    fields: result.fields,
                     rows: result.rows,
                     tables: vec![],
                 })
@@ -378,6 +380,7 @@ impl<S: StorageDriver + Clone> Engine<S> {
                     command: "SELECT".to_owned(),
                     revision: result.revision,
                     row_count: result.rows.len(),
+                    fields: result.fields,
                     rows: result.rows,
                     tables: vec![],
                 })
@@ -386,6 +389,11 @@ impl<S: StorageDriver + Clone> Engine<S> {
                 if let Some(transaction) = &mut self.transaction {
                     let mut candidate = transaction.storage.clone();
                     let outcome = crate::statement::execute(&mut candidate, &statement)?;
+                    let fields = crate::statement::write_result_fields(
+                        &candidate,
+                        &statement,
+                        outcome.rows.first(),
+                    )?;
                     if outcome.mutated {
                         transaction.storage = candidate;
                         transaction.tables.extend(outcome.tables.iter().cloned());
@@ -394,12 +402,18 @@ impl<S: StorageDriver + Clone> Engine<S> {
                         command: outcome.command.to_owned(),
                         revision: self.storage.revision(),
                         row_count: outcome.row_count,
+                        fields,
                         rows: outcome.rows,
                         tables: outcome.tables,
                     })
                 } else {
                     let mut candidate = self.storage.clone();
                     let outcome = crate::statement::execute(&mut candidate, &statement)?;
+                    let fields = crate::statement::write_result_fields(
+                        &candidate,
+                        &statement,
+                        outcome.rows.first(),
+                    )?;
                     let revision = if outcome.mutated {
                         candidate.advance_revision()?
                     } else {
@@ -410,6 +424,7 @@ impl<S: StorageDriver + Clone> Engine<S> {
                         command: outcome.command.to_owned(),
                         revision,
                         row_count: outcome.row_count,
+                        fields,
                         rows: outcome.rows,
                         tables: outcome.tables,
                     })
@@ -525,6 +540,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(update.row_count, 1);
+        assert_eq!(
+            update.fields,
+            vec![
+                crate::ResultField::new("id", crate::ColumnType::Integer),
+                crate::ResultField::new("title", crate::ColumnType::Text),
+                crate::ResultField::new("published", crate::ColumnType::Boolean),
+                crate::ResultField::new("rating", crate::ColumnType::Float),
+                crate::ResultField::new("metadata", crate::ColumnType::Json),
+            ]
+        );
         assert_eq!(update.rows[0]["published"], json!(true));
         assert_eq!(update.rows[0]["rating"], json!(4.5));
 
@@ -532,6 +557,10 @@ mod tests {
             .execute_sql("DELETE FROM posts WHERE rating = NULL RETURNING id", &[])
             .unwrap();
         assert_eq!(null_comparison.row_count, 0);
+        assert_eq!(
+            null_comparison.fields,
+            vec![crate::ResultField::new("id", crate::ColumnType::Integer)]
+        );
         assert!(null_comparison.rows.is_empty());
         assert!(null_comparison.tables.is_empty());
         assert_eq!(null_comparison.revision, 3);
@@ -545,6 +574,44 @@ mod tests {
             engine.query_sql("SELECT id FROM posts", &[]).unwrap().rows,
             vec![row(json!({"id": 1}))]
         );
+    }
+
+    #[test]
+    fn untyped_returning_fields_use_unknown_and_empty_star_has_no_catalog_guess() {
+        let mut engine = Engine::default();
+        engine
+            .define_table(TableSchema {
+                name: "items".to_owned(),
+                primary_key: vec!["id".to_owned()],
+                columns: vec![],
+            })
+            .unwrap();
+
+        let inserted = engine
+            .execute_sql(
+                "INSERT INTO items (id, title) VALUES (1, 'one') RETURNING title, id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            inserted.fields,
+            vec![
+                crate::ResultField::unknown("title"),
+                crate::ResultField::unknown("id"),
+            ]
+        );
+
+        let explicit = engine
+            .execute_sql("DELETE FROM items WHERE id = 2 RETURNING id", &[])
+            .unwrap();
+        assert_eq!(explicit.fields, vec![crate::ResultField::unknown("id")]);
+        assert!(explicit.rows.is_empty());
+
+        let star = engine
+            .execute_sql("DELETE FROM items WHERE id = 2 RETURNING *", &[])
+            .unwrap();
+        assert!(star.fields.is_empty());
+        assert!(star.rows.is_empty());
     }
 
     #[test]

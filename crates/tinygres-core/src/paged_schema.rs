@@ -14,6 +14,7 @@ pub(crate) struct DroppedTree {
     pub root_page_id: Option<PageId>,
 }
 
+#[cfg(test)]
 pub(crate) struct SchemaDropPlan {
     pub revision: u64,
     pub header: (Vec<u8>, Vec<u8>),
@@ -51,6 +52,7 @@ pub(crate) struct PublishedTableReplacement {
     pub indexes: Vec<PublishedIndex>,
 }
 
+#[cfg(test)]
 pub(crate) struct AddColumnPlan {
     pub revision: u64,
     pub header: (Vec<u8>, Vec<u8>),
@@ -62,6 +64,7 @@ pub(crate) struct AddColumnPlan {
     pub fixed_work_bytes: usize,
 }
 
+#[cfg(test)]
 pub(crate) struct PublishedColumnAddition {
     pub revision: u64,
     pub schema: TableSchema,
@@ -74,6 +77,7 @@ pub(crate) struct PublishedColumnAddition {
 /// Each tree is fully validated by [`Btree::reclaim`] before any of its pages are marked free.
 /// Catalog changes happen only after every tree validates, and an error aborts the candidate so
 /// neither earlier frees nor catalog copy-on-write pages can become visible.
+#[cfg(test)]
 pub(crate) fn publish_schema_drop<D: PageDevice>(
     pager: &mut Pager<D>,
     plan: SchemaDropPlan,
@@ -310,6 +314,7 @@ pub(crate) fn publish_table_replacement<D: PageDevice>(
 /// Rewrites one rooted table through a bounded candidate cursor, or publishes a metadata-only
 /// schema record for an empty table. Existing index trees remain byte-logically unchanged because
 /// an appended non-key column cannot change any of their entries.
+#[cfg(test)]
 pub(crate) fn publish_added_column<D: PageDevice>(
     pager: &mut Pager<D>,
     plan: AddColumnPlan,
@@ -454,6 +459,7 @@ pub(crate) fn publish_added_column<D: PageDevice>(
     })
 }
 
+#[cfg(test)]
 fn ensure_alter_decode_work(fixed: usize, key: &[u8], encoded_value: &[u8]) -> Result<()> {
     // Candidate cursor key/value, serde's parsed row, canonical re-encoding performed by the row
     // decoder, and normalization's validation clone are simultaneously live before exact decoded
@@ -480,6 +486,7 @@ fn ensure_alter_decode_work(fixed: usize, key: &[u8], encoded_value: &[u8]) -> R
     ensure_alter_work_bytes(bytes)
 }
 
+#[cfg(test)]
 fn ensure_alter_transform_work(
     fixed: usize,
     key: usize,
@@ -509,6 +516,7 @@ fn ensure_alter_transform_work(
     ensure_alter_work_bytes(bytes)
 }
 
+#[cfg(test)]
 fn ensure_alter_row_work(
     fixed: usize,
     key: usize,
@@ -536,6 +544,7 @@ fn ensure_alter_row_work(
     ensure_alter_work_bytes(bytes)
 }
 
+#[cfg(test)]
 fn ensure_alter_work_bytes(bytes: usize) -> Result<()> {
     if bytes > 16 * 1024 * 1024 {
         Err(alter_work_limit())
@@ -544,6 +553,7 @@ fn ensure_alter_work_bytes(bytes: usize) -> Result<()> {
     }
 }
 
+#[cfg(test)]
 fn alter_work_limit() -> EngineError {
     EngineError::new(
         "TRANSACTION_TOO_LARGE",

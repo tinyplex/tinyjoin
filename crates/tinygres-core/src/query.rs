@@ -8,7 +8,8 @@ use crate::storage::{
 };
 use crate::{
     ColumnDefinition, ColumnType, EngineError, Filter, FilterOperator, NullOrder, OrderBy,
-    OrderDirection, Predicate, QueryPlan, QueryResult, Result, Row, VisitControl, VisitOutcome,
+    OrderDirection, Predicate, QueryPlan, QueryResult, Result, ResultField, Row, TableSchema,
+    VisitControl, VisitOutcome,
 };
 
 const MAX_SQL_BYTES: usize = 64 * 1024;
@@ -25,7 +26,7 @@ const MAX_QUERY_RESULT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SCAN_ROWS: usize = 1_000_000;
 const MAX_ORDERED_ROWS: usize = 100_000;
 
-pub(crate) fn execute<S: StorageReader>(storage: &S, plan: &QueryPlan) -> Result<QueryResult> {
+pub(crate) fn execute(storage: &dyn StorageReader, plan: &QueryPlan) -> Result<QueryResult> {
     if plan.table.trim().is_empty() {
         return Err(EngineError::invalid_query(
             "A query must name exactly one table",
@@ -101,6 +102,7 @@ pub(crate) fn execute<S: StorageReader>(storage: &S, plan: &QueryPlan) -> Result
     if plan.limit == Some(0) {
         return Ok(QueryResult {
             revision: storage.revision(),
+            fields: projection_fields(&schema, plan.columns.as_deref(), None)?,
             rows: Vec::new(),
         });
     }
@@ -113,12 +115,45 @@ pub(crate) fn execute<S: StorageReader>(storage: &S, plan: &QueryPlan) -> Result
 
     Ok(QueryResult {
         revision: storage.revision(),
+        fields: projection_fields(&schema, plan.columns.as_deref(), rows.first())?,
         rows,
     })
 }
 
-fn execute_unordered<S: StorageReader>(
-    storage: &S,
+/// Describes an ordinary projection in SQL order. Programmatic schemas without
+/// a typed catalog retain UNKNOWN OIDs; their `*` names can only be learned
+/// from the first returned row.
+pub(crate) fn projection_fields(
+    schema: &TableSchema,
+    columns: Option<&[String]>,
+    first_row: Option<&Row>,
+) -> Result<Vec<ResultField>> {
+    if schema.columns.is_empty() {
+        let names = columns
+            .map(|columns| columns.iter().map(String::as_str).collect::<Vec<_>>())
+            .or_else(|| first_row.map(|row| row.keys().map(String::as_str).collect::<Vec<_>>()))
+            .unwrap_or_default();
+        return Ok(names.into_iter().map(ResultField::unknown).collect());
+    }
+
+    match columns {
+        Some(columns) => columns
+            .iter()
+            .map(|name| {
+                column_definition(schema, name, &schema.name)
+                    .map(|definition| ResultField::new(name, definition.data_type))
+            })
+            .collect(),
+        None => Ok(schema
+            .columns
+            .iter()
+            .map(|definition| ResultField::new(&definition.name, definition.data_type))
+            .collect()),
+    }
+}
+
+fn execute_unordered(
+    storage: &dyn StorageReader,
     plan: &QueryPlan,
     schema: &crate::TableSchema,
 ) -> Result<Vec<Row>> {
@@ -160,8 +195,8 @@ fn execute_unordered<S: StorageReader>(
     Ok(rows)
 }
 
-fn execute_ordered<S: StorageReader>(
-    storage: &S,
+fn execute_ordered(
+    storage: &dyn StorageReader,
     plan: &QueryPlan,
     schema: &crate::TableSchema,
 ) -> Result<Vec<Row>> {
@@ -220,8 +255,8 @@ fn execute_ordered<S: StorageReader>(
     Ok(projected_rows)
 }
 
-fn visit_candidate_rows<S: StorageReader>(
-    storage: &S,
+fn visit_candidate_rows(
+    storage: &dyn StorageReader,
     plan: &QueryPlan,
     schema: &crate::TableSchema,
     visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
@@ -240,8 +275,8 @@ fn visit_candidate_rows<S: StorageReader>(
     storage.visit_table(&plan.table, visitor)
 }
 
-fn secondary_index_key<S: StorageReader>(
-    storage: &S,
+fn secondary_index_key(
+    storage: &dyn StorageReader,
     plan: &QueryPlan,
     schema: &crate::TableSchema,
 ) -> Result<Option<(Vec<String>, Row)>> {
@@ -2000,6 +2035,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.revision, 1);
+        assert_eq!(
+            result.fields,
+            vec![
+                ResultField::new("id", ColumnType::Integer),
+                ResultField::new("title", ColumnType::Text),
+            ]
+        );
         assert_eq!(result.rows, vec![row(json!({"id": 1, "title": "one"}))]);
     }
 
@@ -2025,8 +2067,61 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.revision, 1);
+        assert_eq!(
+            result.fields,
+            vec![
+                ResultField::new("id", ColumnType::Integer),
+                ResultField::new("title", ColumnType::Text),
+                ResultField::new("user_id", ColumnType::Integer),
+                ResultField::new("deleted", ColumnType::Boolean),
+            ]
+        );
         assert!(result.rows.is_empty());
         assert_eq!(database.into_storage().visitor_counts(), (0, 0));
+    }
+
+    #[test]
+    fn untyped_result_fields_are_unknown_and_star_uses_the_first_row_shape() {
+        let mut database = Engine::default();
+        for name in ["items", "empty"] {
+            database
+                .define_table(TableSchema {
+                    name: name.to_owned(),
+                    primary_key: vec!["id".to_owned()],
+                    columns: vec![],
+                })
+                .unwrap();
+        }
+        database
+            .replace_table(
+                "items",
+                vec![row(json!({"id": 1, "title": "one", "active": true}))],
+            )
+            .unwrap();
+
+        let explicit = database
+            .query_sql("SELECT title, id FROM items LIMIT 0", &[])
+            .unwrap();
+        assert_eq!(
+            explicit.fields,
+            vec![ResultField::unknown("title"), ResultField::unknown("id")]
+        );
+
+        let star = database.query_sql("SELECT * FROM items", &[]).unwrap();
+        assert_eq!(
+            star.fields,
+            star.rows[0]
+                .keys()
+                .map(ResultField::unknown)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            database
+                .query_sql("SELECT * FROM empty", &[])
+                .unwrap()
+                .fields
+                .is_empty()
+        );
     }
 
     #[test]

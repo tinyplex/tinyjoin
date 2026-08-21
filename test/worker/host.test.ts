@@ -59,8 +59,11 @@ function mockEngine() {
     defineTables: vi.fn(),
     replaceTableSnapshot: vi.fn((schema) => outcome(schema.name)),
     applyBatch: vi.fn((batch) => outcome(batch.changes[0]?.table ?? 'none')),
-    query: vi.fn(() => ({revision, rows: [{id: 1}]})),
-    querySql: vi.fn(() => ({revision, rows: [{id: 1}]})),
+    query: vi.fn(() => ({
+      revision,
+      fields: [{name: 'id', dataTypeID: 20}],
+      rows: [{id: 1}],
+    })),
     executeSql: vi.fn((sql) => {
       const command = sql.trim().split(/\s+/, 1)[0]!.toUpperCase();
       const table = 'posts';
@@ -71,11 +74,38 @@ function mockEngine() {
       }
       return {
         command,
+        fields: [],
         revision,
         rowCount: 1,
         rows: [],
         tables: [table],
       };
+    }),
+    execSql: vi.fn(() => {
+      const table = 'posts';
+      if (transactionActive) {
+        transactionTables.add(table);
+      } else {
+        revision += 1;
+      }
+      return [
+        {
+          command: 'CREATE',
+          fields: [],
+          revision,
+          rowCount: 0,
+          rows: [],
+          tables: [table],
+        },
+        {
+          command: 'SELECT',
+          fields: [{name: 'id', dataTypeID: 20}],
+          revision,
+          rowCount: 1,
+          rows: [{id: 1}],
+          tables: [],
+        },
+      ];
     }),
     beginTransaction: vi.fn(() => {
       transactionActive = true;
@@ -217,20 +247,24 @@ describe('startWorker', () => {
     scope.send({
       v: PROTOCOL_VERSION,
       id: 2,
-      method: 'querySql',
-      params: {sql: 'select * from posts', params: []},
+      method: 'query',
+      params: {plan: {table: 'posts', filters: []}},
     } satisfies WorkerRequest);
     await waitForPosted(scope, 2);
 
     expect(engine.defineTables).toHaveBeenCalledWith([
       {name: 'posts', primaryKey: ['id']},
     ]);
-    expect(engine.querySql).toHaveBeenCalledWith('select * from posts', []);
+    expect(engine.query).toHaveBeenCalledWith({table: 'posts', filters: []});
     expect(scope.posted).toContainEqual({
       v: PROTOCOL_VERSION,
       id: 2,
       ok: true,
-      result: {revision: 0, rows: [{id: 1}]},
+      result: {
+        revision: 0,
+        fields: [{name: 'id', dataTypeID: 20}],
+        rows: [{id: 1}],
+      },
     });
   });
 
@@ -307,6 +341,7 @@ describe('startWorker', () => {
       ok: true,
       result: {
         command: 'INSERT',
+        fields: [],
         revision: 1,
         rowCount: 1,
         rows: [],
@@ -353,6 +388,7 @@ describe('startWorker', () => {
         ok: true,
         result: {
           command: 'UPDATE',
+          fields: [],
           revision: 1,
           rowCount: 1,
           rows: [],
@@ -378,6 +414,60 @@ describe('startWorker', () => {
       v: PROTOCOL_VERSION,
       event: 'tablesChanged',
       payload: {revision: 2, tables: ['posts']},
+    });
+  });
+
+  it('returns every exec result and emits one combined invalidation', async () => {
+    const scope = new FakeScope();
+    const engine = mockEngine();
+    startWorker({scope, durableEngineFactory: async () => engine});
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 1,
+      method: 'init',
+      params: {schemas: [], storage: {kind: 'memory'}},
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 1);
+    scope.posted.length = 0;
+
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 2,
+      method: 'execSql',
+      params: {sql: 'CREATE TABLE posts; SELECT id FROM posts'},
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 2);
+
+    expect(engine.execSql).toHaveBeenCalledWith(
+      'CREATE TABLE posts; SELECT id FROM posts',
+    );
+    expect(scope.posted).toContainEqual({
+      v: PROTOCOL_VERSION,
+      id: 2,
+      ok: true,
+      result: [
+        {
+          command: 'CREATE',
+          fields: [],
+          revision: 1,
+          rowCount: 0,
+          rows: [],
+          tables: ['posts'],
+        },
+        {
+          command: 'SELECT',
+          fields: [{name: 'id', dataTypeID: 20}],
+          revision: 1,
+          rowCount: 1,
+          rows: [{id: 1}],
+          tables: [],
+        },
+      ],
+    });
+    expect(scope.posted).toContainEqual({
+      v: PROTOCOL_VERSION,
+      event: 'tablesChanged',
+      payload: {revision: 1, tables: ['posts']},
     });
   });
 
@@ -424,6 +514,110 @@ describe('startWorker', () => {
     expect(engine.executeSql).not.toHaveBeenCalled();
     expect(engine.rollbackTransaction).toHaveBeenCalledOnce();
     expect(scope.posted.some((message) => 'event' in message)).toBe(false);
+  });
+
+  it('keeps the transaction token active when rollback fails so cleanup can retry', async () => {
+    const scope = new FakeScope();
+    const engine = mockEngine();
+    vi.mocked(engine.rollbackTransaction).mockImplementationOnce(() => {
+      throw Object.assign(new Error('storage rollback failed'), {
+        code: 'ROLLBACK_FAILED',
+      });
+    });
+    startWorker({scope, durableEngineFactory: async () => engine});
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 1,
+      method: 'init',
+      params: {schemas: [], storage: {kind: 'memory'}},
+    } satisfies WorkerRequest);
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 2,
+      method: 'beginTransaction',
+      params: undefined,
+    } satisfies WorkerRequest);
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 3,
+      method: 'rollbackTransaction',
+      params: {transactionId: 'tx-1'},
+    } satisfies WorkerRequest);
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 4,
+      method: 'rollbackTransaction',
+      params: {transactionId: 'tx-1'},
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 4);
+
+    expect(scope.posted).toContainEqual({
+      v: PROTOCOL_VERSION,
+      id: 3,
+      ok: false,
+      error: {
+        code: 'ROLLBACK_FAILED',
+        message: 'storage rollback failed',
+      },
+    });
+    expect(scope.posted).toContainEqual({
+      v: PROTOCOL_VERSION,
+      id: 4,
+      ok: true,
+      result: undefined,
+    });
+    expect(engine.rollbackTransaction).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the transaction token active when commit cleanup fails', async () => {
+    const scope = new FakeScope();
+    const engine = mockEngine();
+    vi.mocked(engine.commitTransaction).mockImplementationOnce(() => {
+      throw Object.assign(new Error('commit failed'), {code: 'COMMIT_FAILED'});
+    });
+    vi.mocked(engine.rollbackTransaction).mockImplementationOnce(() => {
+      throw Object.assign(new Error('cleanup failed'), {code: 'CLEANUP_FAILED'});
+    });
+    startWorker({scope, durableEngineFactory: async () => engine});
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 1,
+      method: 'init',
+      params: {schemas: [], storage: {kind: 'memory'}},
+    } satisfies WorkerRequest);
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 2,
+      method: 'beginTransaction',
+      params: undefined,
+    } satisfies WorkerRequest);
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 3,
+      method: 'commitTransaction',
+      params: {transactionId: 'tx-1'},
+    } satisfies WorkerRequest);
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 4,
+      method: 'rollbackTransaction',
+      params: {transactionId: 'tx-1'},
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 4);
+
+    expect(scope.posted).toContainEqual({
+      v: PROTOCOL_VERSION,
+      id: 3,
+      ok: false,
+      error: {code: 'COMMIT_FAILED', message: 'commit failed'},
+    });
+    expect(scope.posted).toContainEqual({
+      v: PROTOCOL_VERSION,
+      id: 4,
+      ok: true,
+      result: undefined,
+    });
+    expect(engine.rollbackTransaction).toHaveBeenCalledTimes(2);
   });
 
   it('rejects malformed messages without invoking the engine', async () => {

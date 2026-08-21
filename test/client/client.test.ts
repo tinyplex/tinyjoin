@@ -1,34 +1,33 @@
 import {describe, expect, it, vi} from 'vitest';
 
-import {Client} from '../../src/client/client.ts';
+import {
+  Client,
+  create,
+  type Transaction,
+} from '../../src/client/client.ts';
 import {PROTOCOL_VERSION, type WorkerRequest} from '../../src/protocol.ts';
 import {FakeWorker} from '../helpers/fake-worker.ts';
+
+const ID_FIELD = [{name: 'id', dataTypeID: 20}];
+const POST_FIELDS = [
+  {name: 'id', dataTypeID: 20},
+  {name: 'title', dataTypeID: 25},
+];
 
 function respondingWorker(): FakeWorker {
   const worker = new FakeWorker();
   worker.onPost = (message) => {
     queueMicrotask(() => {
       if (message.method === 'init') {
-        worker.respond({
-          v: PROTOCOL_VERSION,
-          id: message.id,
-          ok: true,
-          result: {revision: 0},
-        });
+        respondOk(worker, message, {revision: 0});
       } else if (message.method === 'query') {
-        worker.respond({
-          v: PROTOCOL_VERSION,
-          id: message.id,
-          ok: true,
-          result: {revision: 2, rows: [{id: 1, title: 'hello'}]},
+        respondOk(worker, message, {
+          revision: 2,
+          rows: [{id: 1, title: 'hello'}],
+          fields: POST_FIELDS,
         });
       } else if (message.method === 'close') {
-        worker.respond({
-          v: PROTOCOL_VERSION,
-          id: message.id,
-          ok: true,
-          result: undefined,
-        });
+        respondOk(worker, message, undefined);
       }
     });
   };
@@ -42,97 +41,200 @@ function writableWorker(): FakeWorker {
   worker.onPost = (message) => {
     queueMicrotask(() => {
       if (message.method === 'init') {
-        worker.respond({
-          v: PROTOCOL_VERSION,
-          id: message.id,
-          ok: true,
-          result: {revision},
-        });
+        respondOk(worker, message, {revision});
       } else if (message.method === 'executeSql') {
-        const command = message.params.sql
-          .trim()
-          .split(/\s+/, 1)[0]!
-          .toUpperCase();
+        const command = sqlCommand(message.params.sql);
+        const writes = /^(?:ALTER|CREATE|DELETE|DROP|INSERT|UPDATE)$/.test(
+          command,
+        );
+        if (writes && message.params.transactionId === undefined) {
+          revision += 1;
+        }
+        const isSelect = command === 'SELECT';
+        const returnsId = isSelect || /RETURNING\s+id/i.test(message.params.sql);
+        respondOk(worker, message, {
+          command,
+          fields: returnsId ? ID_FIELD : [],
+          revision,
+          rowCount: isSelect || writes ? 1 : 0,
+          rows: returnsId
+            ? [{id: message.params.params[0] ?? 1}]
+            : [],
+          tables: writes ? ['posts'] : [],
+        });
+      } else if (message.method === 'execSql') {
         if (message.params.transactionId === undefined) {
           revision += 1;
         }
-        worker.respond({
-          v: PROTOCOL_VERSION,
-          id: message.id,
-          ok: true,
-          result: {
-            command,
+        respondOk(worker, message, [
+          {
+            command: 'CREATE',
+            fields: [],
             revision,
-            rowCount: 1,
-            rows: [{id: message.params.params[0] ?? 1}],
+            rowCount: 0,
+            rows: [],
             tables: ['posts'],
           },
-        });
+          {
+            command: 'INSERT',
+            fields: [],
+            revision,
+            rowCount: 1,
+            rows: [],
+            tables: ['posts'],
+          },
+          {
+            command: 'SELECT',
+            fields: ID_FIELD,
+            revision,
+            rowCount: 1,
+            rows: [{id: 1}],
+            tables: [],
+          },
+        ]);
       } else if (message.method === 'beginTransaction') {
-        worker.respond({
-          v: PROTOCOL_VERSION,
-          id: message.id,
-          ok: true,
-          result: {transactionId: `tx-${nextTransactionId++}`},
+        respondOk(worker, message, {
+          transactionId: `tx-${nextTransactionId++}`,
         });
       } else if (message.method === 'commitTransaction') {
         revision += 1;
-        worker.respond({
-          v: PROTOCOL_VERSION,
-          id: message.id,
-          ok: true,
-          result: {revision, tables: ['posts']},
-        });
+        respondOk(worker, message, {revision, tables: ['posts']});
+      } else if (
+        message.method === 'replaceTable' ||
+        message.method === 'applyBatch'
+      ) {
+        revision += 1;
+        respondOk(worker, message, {revision, tables: ['posts']});
       } else if (message.method === 'rollbackTransaction') {
-        worker.respond({
-          v: PROTOCOL_VERSION,
-          id: message.id,
-          ok: true,
-          result: undefined,
-        });
-      } else if (message.method === 'querySql' || message.method === 'query') {
-        worker.respond({
-          v: PROTOCOL_VERSION,
-          id: message.id,
-          ok: true,
-          result: {revision, rows: [{id: 1, title: 'hello'}]},
+        respondOk(worker, message, undefined);
+      } else if (message.method === 'query') {
+        respondOk(worker, message, {
+          revision,
+          rows: [{id: 1, title: 'hello'}],
+          fields: POST_FIELDS,
         });
       } else if (message.method === 'close') {
-        worker.respond({
-          v: PROTOCOL_VERSION,
-          id: message.id,
-          ok: true,
-          result: undefined,
-        });
+        respondOk(worker, message, undefined);
       }
     });
   };
   return worker;
 }
 
+function respondOk(
+  worker: FakeWorker,
+  message: WorkerRequest,
+  result: unknown,
+): void {
+  worker.respond({
+    v: PROTOCOL_VERSION,
+    id: message.id,
+    ok: true,
+    result,
+  });
+}
+
+function sqlCommand(sql: string): string {
+  return sql.trim().split(/\s+/, 1)[0]!.toUpperCase();
+}
+
 describe('Client', () => {
-  it('selects memory by default and forwards explicit OPFS storage', async () => {
-    const memoryWorker = respondingWorker();
-    const memoryClient = new Client({worker: memoryWorker});
-    await memoryClient.ready();
+  it('uses memory by default and exposes promise-backed readiness', async () => {
+    const worker = respondingWorker();
+    const client = new Client({worker});
+
+    expect(client.ready).toBe(false);
+    expect(client.closed).toBe(false);
+    await client.waitReady;
+    expect(client.ready).toBe(true);
     expect(
-      (memoryWorker.posted[0] as Extract<WorkerRequest, {method: 'init'}>)
-        .params.storage,
+      (worker.posted[0] as Extract<WorkerRequest, {method: 'init'}>).params
+        .storage,
     ).toEqual({kind: 'memory'});
 
-    const opfsWorker = respondingWorker();
-    const opfsClient = new Client({
-      worker: opfsWorker,
-      storage: {kind: 'opfs', name: 'application-cache'},
-    });
-    await opfsClient.ready();
-    expect(
-      (opfsWorker.posted[0] as Extract<WorkerRequest, {method: 'init'}>).params
-        .storage,
-    ).toEqual({kind: 'opfs', name: 'application-cache'});
+    await client.close();
+    expect(client.ready).toBe(false);
+    expect(client.closed).toBe(true);
+  });
 
-    await memoryClient.close();
-    await opfsClient.close();
+  it('creates only after initialization and resolves OPFS data directories', async () => {
+    const worker = new FakeWorker();
+    let init: Extract<WorkerRequest, {method: 'init'}> | undefined;
+    worker.onPost = (message) => {
+      if (message.method === 'init') {
+        init = message;
+      } else if (message.method === 'close') {
+        respondOk(worker, message, undefined);
+      }
+    };
+
+    let resolved = false;
+    const creating = create('opfs://application-cache', {worker}).then(
+      (client) => {
+        resolved = true;
+        return client;
+      },
+    );
+    await vi.waitFor(() => expect(init).toBeDefined());
+    expect(resolved).toBe(false);
+    expect(init!.params.storage).toEqual({
+      kind: 'opfs',
+      name: 'application-cache',
+    });
+
+    respondOk(worker, init!, {revision: 3});
+    const client = await creating;
+    expect(client.ready).toBe(true);
+    expect(client.getRevision()).toBe(3);
+    await client.close();
+  });
+
+  it('accepts dataDir in options and rejects ambiguous or unsupported storage', async () => {
+    const optionsWorker = respondingWorker();
+    const client = await create({
+      dataDir: 'opfs://options-database',
+      worker: optionsWorker,
+    });
+    expect(
+      (optionsWorker.posted[0] as Extract<WorkerRequest, {method: 'init'}>)
+        .params.storage,
+    ).toEqual({kind: 'opfs', name: 'options-database'});
+    await client.close();
+
+    const ambiguousWorker = new FakeWorker();
+    await expect(
+      create('memory://', {
+        dataDir: 'opfs://also-here',
+        worker: ambiguousWorker,
+      }),
+    ).rejects.toThrow('either positionally or in options.dataDir');
+    expect(ambiguousWorker.posted).toEqual([]);
+
+    for (const dataDir of ['idb://database', 'opfs://', 'opfs://bad/name']) {
+      const worker = new FakeWorker();
+      await expect(create(dataDir, {worker})).rejects.toThrowError(TypeError);
+      expect(worker.posted).toEqual([]);
+    }
+
+    for (const unsupported of [
+      {storage: {kind: 'opfs', name: 'old-shape'}},
+      {parsers: {}},
+    ]) {
+      const workerFactory = vi.fn(() => new FakeWorker());
+      await expect(
+        create({...unsupported, workerFactory} as never),
+      ).rejects.toThrow('client options support only');
+      expect(workerFactory).not.toHaveBeenCalled();
+    }
+
+    const inheritedOptionsFactory = vi.fn(() => new FakeWorker());
+    const inheritedOptions = Object.assign(new Date(), {
+      workerFactory: inheritedOptionsFactory,
+    });
+    await expect(create(inheritedOptions as never)).rejects.toThrow(
+      'client options support only',
+    );
+    expect(inheritedOptionsFactory).not.toHaveBeenCalled();
   });
 
   it.each([{}, {revision: 0, extra: true}, {revision: -1}])(
@@ -141,19 +243,11 @@ describe('Client', () => {
       const worker = new FakeWorker();
       worker.onPost = (message) => {
         if (message.method === 'init') {
-          queueMicrotask(() =>
-            worker.respond({
-              v: PROTOCOL_VERSION,
-              id: message.id,
-              ok: true,
-              result,
-            }),
-          );
+          queueMicrotask(() => respondOk(worker, message, result));
         }
       };
-      const client = new Client({worker});
 
-      await expect(client.ready()).rejects.toMatchObject({
+      await expect(create({worker})).rejects.toMatchObject({
         name: 'ClientError',
         code: 'PROTOCOL_MISMATCH',
       });
@@ -185,42 +279,173 @@ describe('Client', () => {
     });
   });
 
-  it('executes one atomic writable SQL statement and tracks its revision', async () => {
+  it('uses query for parameterized reads and writes with SQL results', async () => {
     const worker = writableWorker();
-    const client = new Client({worker});
+    const client = await create({worker});
 
     await expect(
-      client.exec<{id: number}>(
+      client.query<{id: number}>(
         'INSERT INTO posts (id) VALUES ($1) RETURNING id',
         [7],
       ),
     ).resolves.toEqual({
+      affectedRows: 1,
       command: 'INSERT',
+      fields: ID_FIELD,
       revision: 1,
       rowCount: 1,
       rows: [{id: 7}],
       tables: ['posts'],
     });
     expect(client.getRevision()).toBe(1);
-    const requests = worker.posted as WorkerRequest[];
     expect(
-      requests.find(
-        (message): message is Extract<WorkerRequest, {method: 'executeSql'}> =>
-          message.method === 'executeSql',
-      )?.params,
+      (worker.posted[1] as Extract<WorkerRequest, {method: 'executeSql'}>)
+        .params,
     ).toEqual({
       sql: 'INSERT INTO posts (id) VALUES ($1) RETURNING id',
       params: [7],
     });
+
+    await expect(
+      client.query<unknown[]>('SELECT id FROM posts', [], {
+        rowMode: 'array',
+      }),
+    ).resolves.toMatchObject({
+      affectedRows: 0,
+      command: 'SELECT',
+      fields: ID_FIELD,
+      rowCount: 1,
+      rows: [[1]],
+      tables: [],
+    });
     await client.close();
   });
 
-  it('scopes transaction operations to one token and commits after pending work', async () => {
+  it('parameterizes sql tagged-template values without interpolation', async () => {
     const worker = writableWorker();
-    const client = new Client({worker});
+    const client = await create({worker});
+
+    await client.sql<{id: number}>`SELECT id FROM posts WHERE id = ${7}`;
+    expect(
+      (worker.posted[1] as Extract<WorkerRequest, {method: 'executeSql'}>)
+        .params,
+    ).toEqual({sql: 'SELECT id FROM posts WHERE id = $1', params: [7]});
+    expect(() =>
+      client.sql(['SELECT 1'] as unknown as TemplateStringsArray, 1),
+    ).toThrow('must be used as a tagged template');
+    await client.close();
+  });
+
+  it('executes a parameterless SQL script and normalizes each result', async () => {
+    const worker = writableWorker();
+    const client = await create({worker});
+
+    await expect(
+      client.exec('CREATE TABLE posts; INSERT INTO posts; SELECT id FROM posts'),
+    ).resolves.toEqual([
+      {
+        affectedRows: 0,
+        command: 'CREATE',
+        fields: [],
+        revision: 1,
+        rows: [],
+        tables: ['posts'],
+      },
+      {
+        affectedRows: 1,
+        command: 'INSERT',
+        fields: [],
+        revision: 1,
+        rowCount: 1,
+        rows: [],
+        tables: ['posts'],
+      },
+      {
+        affectedRows: 0,
+        command: 'SELECT',
+        fields: ID_FIELD,
+        revision: 1,
+        rowCount: 1,
+        rows: [{id: 1}],
+        tables: [],
+      },
+    ]);
+    expect(
+      (worker.posted[1] as Extract<WorkerRequest, {method: 'execSql'}>).params,
+    ).toEqual({
+      sql: 'CREATE TABLE posts; INSERT INTO posts; SELECT id FROM posts',
+    });
+    await client.close();
+  });
+
+  it('tracks revisions returned by non-SQL bulk writes', async () => {
+    const worker = writableWorker();
+    const client = await create({worker});
+
+    await expect(
+      client.replaceTable({name: 'posts', primaryKey: ['id']}, [{id: 1}]),
+    ).resolves.toEqual({revision: 1, tables: ['posts']});
+    expect(client.getRevision()).toBe(1);
+    await expect(
+      client.applyBatch({
+        changes: [{type: 'delete', table: 'posts', key: {id: 1}}],
+      }),
+    ).resolves.toEqual({revision: 2, tables: ['posts']});
+    expect(client.getRevision()).toBe(2);
+    await client.close();
+  });
+
+  it('rejects unsupported options before executing SQL', async () => {
+    const worker = writableWorker();
+    const client = await create({worker});
+    const requestCount = worker.posted.length;
+
+    await expect(
+      client.query('INSERT INTO posts VALUES (1)', [], {
+        parsers: {},
+      } as never),
+    ).rejects.toThrow('support only rowMode');
+    expect(worker.posted).toHaveLength(requestCount);
+    await client.close();
+  });
+
+  it('rejects array row mode when field metadata is unavailable', async () => {
+    const worker = writableWorker();
+    worker.onPost = (message) => {
+      queueMicrotask(() => {
+        if (message.method === 'init') {
+          respondOk(worker, message, {revision: 0});
+        } else if (message.method === 'executeSql') {
+          respondOk(worker, message, {
+            command: 'SELECT',
+            fields: [],
+            revision: 0,
+            rowCount: 1,
+            rows: [{id: 1}],
+            tables: [],
+          });
+        } else if (message.method === 'close') {
+          respondOk(worker, message, undefined);
+        }
+      });
+    };
+    const client = await create({worker});
+
+    await expect(
+      client.query('SELECT * FROM untyped', [], {rowMode: 'array'}),
+    ).rejects.toMatchObject({code: 'ROW_METADATA_UNAVAILABLE'});
+    await client.close();
+  });
+
+  it('scopes transaction operations and commits after pending work', async () => {
+    const worker = writableWorker();
+    const client = await create({worker});
+    let escaped: Transaction | undefined;
 
     const value = await client.transaction(async (transaction) => {
-      const pendingInsert = transaction.exec(
+      escaped = transaction;
+      expect(transaction.closed).toBe(false);
+      const pendingInsert = transaction.query(
         'INSERT INTO posts (id) VALUES ($1)',
         [9],
       );
@@ -233,6 +458,7 @@ describe('Client', () => {
     });
 
     expect(value).toBe(1);
+    expect(escaped!.closed).toBe(true);
     const transactionRequests = (worker.posted as WorkerRequest[]).filter(
       (message) =>
         message.method === 'beginTransaction' ||
@@ -250,67 +476,106 @@ describe('Client', () => {
       (transactionRequests[1] as Extract<WorkerRequest, {method: 'executeSql'}>)
         .params.transactionId,
     ).toBe('tx-1');
-    expect(
-      (transactionRequests[2] as Extract<WorkerRequest, {method: 'query'}>)
-        .params.transactionId,
-    ).toBe('tx-1');
-    expect(
-      (
-        transactionRequests[3] as Extract<
-          WorkerRequest,
-          {method: 'commitTransaction'}
-        >
-      ).params.transactionId,
-    ).toBe('tx-1');
-    expect(client.getRevision()).toBe(1);
+
+    const requestCount = worker.posted.length;
+    expect(() => escaped!.query('SELECT * FROM posts')).toThrowError(
+      expect.objectContaining({code: 'TRANSACTION_CLOSED'}),
+    );
+    expect(worker.posted).toHaveLength(requestCount);
     await client.close();
   });
 
-  it('rolls a transaction back when its callback fails', async () => {
+  it('allows explicit rollback to resolve without committing', async () => {
     const worker = writableWorker();
-    const client = new Client({worker});
+    const client = await create({worker});
+
+    await expect(
+      client.transaction(async (transaction) => {
+        await transaction.query('DELETE FROM posts WHERE id = $1', [1]);
+        await transaction.rollback();
+        expect(transaction.closed).toBe(true);
+        return 'discarded';
+      }),
+    ).resolves.toBe('discarded');
+    expect(transactionMethods(worker)).toEqual([
+      'beginTransaction',
+      'executeSql',
+      'rollbackTransaction',
+    ]);
+    await client.close();
+  });
+
+  it('rolls back when its callback fails', async () => {
+    const worker = writableWorker();
+    const client = await create({worker});
     const failure = new Error('application failed');
 
     await expect(
       client.transaction(async (transaction) => {
-        await transaction.exec('DELETE FROM posts WHERE id = $1', [1]);
+        await transaction.query('DELETE FROM posts WHERE id = $1', [1]);
         throw failure;
       }),
     ).rejects.toBe(failure);
-    expect(
-      (worker.posted as WorkerRequest[])
-        .filter((message) =>
-          [
-            'beginTransaction',
-            'executeSql',
-            'commitTransaction',
-            'rollbackTransaction',
-          ].includes(message.method),
-        )
-        .map((message) => message.method),
-    ).toEqual(['beginTransaction', 'executeSql', 'rollbackTransaction']);
-    expect(client.getRevision()).toBe(0);
+    expect(transactionMethods(worker)).toEqual([
+      'beginTransaction',
+      'executeSql',
+      'rollbackTransaction',
+    ]);
     await client.close();
   });
 
-  it('serializes transaction callbacks and rejects use outside their lifetime', async () => {
+  it('retries cleanup after an explicit rollback request fails', async () => {
     const worker = writableWorker();
-    const client = new Client({worker});
+    const originalOnPost = worker.onPost!;
+    let rollbacks = 0;
+    worker.onPost = (message) => {
+      if (message.method !== 'rollbackTransaction') {
+        originalOnPost(message);
+        return;
+      }
+      rollbacks += 1;
+      queueMicrotask(() => {
+        if (rollbacks === 1) {
+          worker.respond({
+            v: PROTOCOL_VERSION,
+            id: message.id,
+            ok: false,
+            error: {code: 'ROLLBACK_FAILED', message: 'rollback failed'},
+          });
+        } else {
+          respondOk(worker, message, undefined);
+        }
+      });
+    };
+    const client = await create({worker});
+
+    await expect(
+      client.transaction(async (transaction) => {
+        try {
+          await transaction.rollback();
+        } catch {
+          // The outer transaction must still surface and clean up this failure.
+        }
+      }),
+    ).rejects.toMatchObject({code: 'ROLLBACK_FAILED'});
+    expect(rollbacks).toBe(2);
+    await client.close();
+  });
+
+  it('serializes transaction callbacks', async () => {
+    const worker = writableWorker();
+    const client = await create({worker});
     const order: string[] = [];
-    let escaped:
-      | Parameters<Parameters<Client['transaction']>[0]>[0]
-      | undefined;
 
     await Promise.all([
       client.transaction(async (transaction) => {
-        escaped = transaction;
         order.push('first-start');
-        await transaction.exec('INSERT INTO posts (id) VALUES (1)');
+        await transaction.query('INSERT INTO posts (id) VALUES (1)');
         order.push('first-end');
       }),
       client.transaction(async (transaction) => {
         order.push('second-start');
-        await transaction.exec('INSERT INTO posts (id) VALUES (2)');
+        await transaction.query('INSERT INTO posts (id) VALUES (2)');
         order.push('second-end');
       }),
     ]);
@@ -321,9 +586,6 @@ describe('Client', () => {
       'second-start',
       'second-end',
     ]);
-    expect(() => escaped!.query('SELECT * FROM posts')).toThrowError(
-      expect.objectContaining({code: 'TRANSACTION_CLOSED'}),
-    );
     expect(() => client.transaction(undefined as never)).toThrowError(
       'TinyGres transaction requires a callback',
     );
@@ -332,8 +594,7 @@ describe('Client', () => {
 
   it('notifies only subscriptions affected by a worker mutation', async () => {
     const worker = respondingWorker();
-    const client = new Client({worker});
-    await client.ready();
+    const client = await create({worker});
     const posts = vi.fn();
     const users = vi.fn();
     client.subscribe({tables: ['posts']}, posts);
@@ -348,20 +609,7 @@ describe('Client', () => {
     expect(posts).toHaveBeenCalledWith({revision: 5, tables: ['posts']});
     expect(users).not.toHaveBeenCalled();
     expect(client.getRevision()).toBe(5);
-  });
-
-  it('closes the RPC session and underlying worker', async () => {
-    const worker = respondingWorker();
-    const client = new Client({worker});
     await client.close();
-
-    expect(worker.terminated).toBe(true);
-    await client.close();
-    expect(
-      worker.posted.filter(
-        (message) => (message as WorkerRequest).method === 'close',
-      ),
-    ).toHaveLength(1);
   });
 
   it('makes concurrent close calls await the same worker cleanup', async () => {
@@ -369,34 +617,41 @@ describe('Client', () => {
     let closeRequest: Extract<WorkerRequest, {method: 'close'}> | undefined;
     worker.onPost = (message) => {
       if (message.method === 'init') {
-        queueMicrotask(() =>
-          worker.respond({
-            v: PROTOCOL_VERSION,
-            id: message.id,
-            ok: true,
-            result: {revision: 0},
-          }),
-        );
+        queueMicrotask(() => respondOk(worker, message, {revision: 0}));
       } else if (message.method === 'close') {
         closeRequest = message;
       }
     };
-    const client = new Client({worker});
-    await client.ready();
+    const client = await create({worker});
 
     const first = client.close();
     const second = client.close();
     expect(second).toBe(first);
     await vi.waitFor(() => expect(closeRequest).toBeDefined());
     expect(worker.terminated).toBe(false);
-
-    worker.respond({
-      v: PROTOCOL_VERSION,
-      id: closeRequest!.id,
-      ok: true,
-      result: undefined,
+    expect(client.ready).toBe(false);
+    expect(client.closed).toBe(false);
+    await expect(client.query('SELECT * FROM posts')).rejects.toMatchObject({
+      code: 'CLIENT_CLOSED',
     });
+
+    respondOk(worker, closeRequest!, undefined);
     await second;
     expect(worker.terminated).toBe(true);
+    expect(client.closed).toBe(true);
+    expect(client.ready).toBe(false);
   });
 });
+
+function transactionMethods(worker: FakeWorker): string[] {
+  return (worker.posted as WorkerRequest[])
+    .filter((message) =>
+      [
+        'beginTransaction',
+        'executeSql',
+        'commitTransaction',
+        'rollbackTransaction',
+      ].includes(message.method),
+    )
+    .map((message) => message.method);
+}

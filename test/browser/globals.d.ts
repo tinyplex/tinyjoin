@@ -23,6 +23,7 @@ interface Window {
     pageTransactionDdlProbe(): Promise<{
       committedRows: number;
       ddlCodes: string[];
+      rejectedScriptRows: number;
       revisionAfter: number;
       revisionBefore: number;
       stagedRows: number;
@@ -45,6 +46,8 @@ interface Window {
     }>;
     writableDatabaseProbe(databaseName: string): Promise<{
       aggregateRows: Array<{done: boolean; task_count: number}>;
+      bootstrapCommands: Array<string | undefined>;
+      bootstrapRevisions: number[];
       committedRevision: number;
       insertRows: Array<{done: boolean; id: number; title: string}>;
       invalidations: Array<{revision: number; tables: string[]}>;
@@ -53,6 +56,8 @@ interface Window {
       reopenedRevision: number;
       reopenedRows: Array<{done: boolean; id: number; title: string}>;
       rollbackCode: string;
+      scriptFailureCode: string;
+      scriptTableCode: string;
       stagedRows: Array<{done: boolean; id: number; title: string}>;
     }>;
     readBrowserRestartFixture(databaseName: string): Promise<{

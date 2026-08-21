@@ -12,6 +12,7 @@ mod page;
 mod paged_codec;
 mod paged_engine;
 mod paged_schema;
+mod paged_script;
 mod paged_storage;
 mod paged_transaction;
 mod pager;
@@ -21,6 +22,7 @@ mod query;
 mod revision;
 #[cfg(test)]
 mod snapshot;
+mod sql_script;
 mod statement;
 mod storage;
 
@@ -38,8 +40,9 @@ pub(crate) use engine::Engine;
 pub use error::{EngineError, Result};
 pub use model::{
     ApplyOutcome, Change, ChangeBatch, ColumnDefinition, ColumnType, ExecuteResult, Filter,
-    FilterOperator, IndexDefinition, NullOrder, OrderBy, OrderDirection, Predicate, QueryPlan,
-    QueryResult, Row, TableSchema,
+    FilterOperator, IndexDefinition, NullOrder, OrderBy, OrderDirection, PG_OID_BOOLEAN,
+    PG_OID_FLOAT, PG_OID_INTEGER, PG_OID_JSON, PG_OID_TEXT, PG_OID_UNKNOWN, Predicate, QueryPlan,
+    QueryResult, ResultField, Row, TableSchema,
 };
 pub use page::{
     ALLOCATION_BITMAP_BYTES, AllocationBitmap, BITMAP_CHUNK_COUNT, BITMAP_PAGE_COUNT, BitmapSlot,
@@ -49,6 +52,8 @@ pub use page::{
     build_next_metadata, recover_metadata,
 };
 pub use paged_engine::PagedEngine;
+#[doc(hidden)]
+pub use paged_script::retain_result as retain_sql_script_result;
 pub use paged_storage::PagedStorage;
 pub use pager::{Pager, PagerWriteTransaction};
 #[cfg(test)]

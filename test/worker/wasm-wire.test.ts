@@ -16,13 +16,14 @@ import {
   decodeApplyOutcomeResponse,
   decodeQueryResultResponse,
   decodeRevisionResponse,
+  decodeSqlResultsResponse,
   decodeUnitResponse,
   createBinaryWasmEngine,
   encodeApplyBatch,
   encodeDefineTables,
   encodeExecuteSql,
+  encodeExecSql,
   encodeQuery,
-  encodeQuerySql,
   encodeReplaceSnapshot,
   normalizeWasmConstructorError,
   type RawBinaryWasmEngine,
@@ -95,6 +96,14 @@ class Bytes {
     this.u32(values.length);
     for (const value of values) {
       this.string(value);
+    }
+    return this;
+  }
+
+  fields(values: ReadonlyArray<{name: string; dataTypeID: number}>): this {
+    this.u32(values.length);
+    for (const value of values) {
+      this.string(value.name).u32(value.dataTypeID);
     }
     return this;
   }
@@ -260,13 +269,30 @@ class CallbackRawEngine implements RawBinaryWasmEngine {
     } else if (this.transfer === 'write') {
       this.device.writePage(0, 0, new Uint8Array(4096).fill(9));
     }
-    return success(SAFE, (bytes) => bytes.u64(1n).rows([]));
+    return success(SAFE, (bytes) => bytes.u64(1n).fields([]).rows([]));
   }
 
   free(): void {}
 }
 
 describe('binary WASM request codec', () => {
+  it('pins the unpublished operation ABI densely', () => {
+    expect(WASM_OPERATION).toEqual({
+      defineTables: 1,
+      replaceSnapshot: 2,
+      applyBatch: 3,
+      query: 4,
+      executeSql: 5,
+      execSql: 6,
+      begin: 7,
+      commit: 8,
+      rollback: 9,
+      inTransaction: 10,
+      revision: 11,
+      close: 12,
+    });
+  });
+
   it('encodes the complete hidden typed schema catalog positionally', () => {
     const typed: WireTableSchema = {
       name: 'typed',
@@ -360,7 +386,7 @@ describe('binary WASM request codec', () => {
       .done();
     expect(encodeQuery(query).payload).toEqual(expectedQuery);
 
-    const sql = encodeQuerySql('SELECT $1, $2', [-0, '\ud800']);
+    const sql = encodeExecuteSql('SELECT $1, $2', [-0, '\ud800']);
     const expectedSql = new Bytes()
       .u8(VERSION)
       .string('SELECT $1, $2')
@@ -369,11 +395,19 @@ describe('binary WASM request codec', () => {
       .json('\ud800')
       .done();
     expect(sql.payload).toEqual(expectedSql);
+
+    const script = encodeExecSql('CREATE TABLE items; SELECT * FROM items');
+    expect(script.payload).toEqual(
+      new Bytes()
+        .u8(VERSION)
+        .string('CREATE TABLE items; SELECT * FROM items')
+        .done(),
+    );
   });
 
   it('rejects sparse arrays, accessors, revoked proxies, and oversized work', () => {
     const sparse = new Array<JsonValue>(1);
-    expect(() => encodeQuerySql('SELECT $1', sparse)).toThrow(
+    expect(() => encodeExecuteSql('SELECT $1', sparse)).toThrow(
       expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}),
     );
 
@@ -392,30 +426,36 @@ describe('binary WASM request codec', () => {
 
     const revoked = Proxy.revocable([], {});
     revoked.revoke();
-    expect(() => encodeQuerySql('SELECT 1', revoked.proxy)).toThrow(
+    expect(() => encodeExecuteSql('SELECT 1', revoked.proxy)).toThrow(
       expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}),
     );
 
-    expect(() => encodeQuerySql('SELECT 1', new Array(1_000_001))).toThrow(
+    expect(() => encodeExecuteSql('SELECT 1', new Array(1_000_001))).toThrow(
       expect.objectContaining({code: 'RESOURCE_LIMIT'}),
     );
-    expect(() => encodeQuerySql('x'.repeat(16 * 1024 * 1024), [])).toThrow(
+    expect(() =>
+      encodeExecuteSql('x'.repeat(16 * 1024 * 1024), []),
+    ).toThrow(
       expect.objectContaining({code: 'RESOURCE_LIMIT'}),
     );
   });
 
-  it('checks the decoded Rust-model estimate before allocating the wire buffer', () => {
-    // wasm32 Vec<Value> is 12 bytes and each serde_json::Value slot is 24.
-    // Including the retained SQL string, 699,049 nulls are the exact accepted
-    // side and the next slot crosses the independent 16 MiB model cap.
-    expect(
-      encodeQuerySql('SELECT', new Array<JsonValue>(699_049).fill(null)).payload
-        .byteLength,
-    ).toBeLessThan(16 * 1024 * 1024);
-    expect(() =>
-      encodeQuerySql('SELECT', new Array<JsonValue>(699_050).fill(null)),
-    ).toThrow(expect.objectContaining({code: 'RESOURCE_LIMIT'}));
-  });
+  it(
+    'checks the decoded Rust-model estimate before allocating the wire buffer',
+    () => {
+      // wasm32 Vec<Value> is 12 bytes and each serde_json::Value slot is 24.
+      // Including the retained SQL string, 699,049 nulls are the exact accepted
+      // side and the next slot crosses the independent 16 MiB model cap.
+      expect(
+        encodeExecuteSql('SELECT', new Array<JsonValue>(699_049).fill(null))
+          .payload.byteLength,
+      ).toBeLessThan(16 * 1024 * 1024);
+      expect(() =>
+        encodeExecuteSql('SELECT', new Array<JsonValue>(699_050).fill(null)),
+      ).toThrow(expect.objectContaining({code: 'RESOURCE_LIMIT'}));
+    },
+    15_000,
+  );
 
   it('revalidates the second pass and never exposes a wrongly sized allocation', () => {
     let descriptors = 0;
@@ -445,8 +485,10 @@ describe('binary WASM request codec', () => {
       }
       return value;
     };
-    expect(encodeQuerySql('SELECT $1', [nested(64)]).payload[0]).toBe(VERSION);
-    expect(() => encodeQuerySql('SELECT $1', [nested(65)])).toThrow(
+    expect(encodeExecuteSql('SELECT $1', [nested(64)]).payload[0]).toBe(
+      VERSION,
+    );
+    expect(() => encodeExecuteSql('SELECT $1', [nested(65)])).toThrow(
       expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}),
     );
   });
@@ -506,15 +548,27 @@ describe('binary WASM response codec', () => {
 
   it('decodes null-prototype rows, negative zero, and nested JSON exactly', () => {
     const response = success(SAFE, (bytes) =>
-      bytes.u64(3n).rows([
-        {
-          ['__proto__']: 'safe',
-          zero: -0.5,
-          nested: [true, {value: null}],
-        },
-      ]),
+      bytes
+        .u64(3n)
+        .fields([
+          {name: '__proto__', dataTypeID: 25},
+          {name: 'zero', dataTypeID: 701},
+          {name: 'nested', dataTypeID: 114},
+        ])
+        .rows([
+          {
+            ['__proto__']: 'safe',
+            zero: -0.5,
+            nested: [true, {value: null}],
+          },
+        ]),
     );
     const decoded = decodeQueryResultResponse(response).value;
+    expect(decoded.fields).toEqual([
+      {name: '__proto__', dataTypeID: 25},
+      {name: 'zero', dataTypeID: 701},
+      {name: 'nested', dataTypeID: 114},
+    ]);
     expect(Object.getPrototypeOf(decoded.rows[0])).toBeNull();
     expect(decoded.rows[0]?.['__proto__']).toBe('safe');
     expect(decoded.rows[0]?.zero).toBe(-0.5);
@@ -524,10 +578,53 @@ describe('binary WASM response codec', () => {
     ).toBeNull();
   });
 
+  it('decodes every result in a multi-statement SQL response', () => {
+    const decoded = decodeSqlResultsResponse(
+      success(SAFE, (bytes) =>
+        bytes
+          .u32(2)
+          .string('CREATE')
+          .u64(1n)
+          .u64(0n)
+          .fields([])
+          .rows([])
+          .strings(['items'])
+          .string('SELECT')
+          .u64(1n)
+          .u64(1n)
+          .fields([{name: 'id', dataTypeID: 20}])
+          .rows([{id: 1}])
+          .strings([]),
+      ),
+    ).value;
+
+    expect(decoded).toEqual([
+      {
+        command: 'CREATE',
+        revision: 1,
+        rowCount: 0,
+        fields: [],
+        rows: [],
+        tables: ['items'],
+      },
+      {
+        command: 'SELECT',
+        revision: 1,
+        rowCount: 1,
+        fields: [{name: 'id', dataTypeID: 20}],
+        rows: [{id: 1}],
+        tables: [],
+      },
+    ]);
+  });
+
   it('preserves a leading U+FEFF as ordinary string data', () => {
     const decoded = decodeQueryResultResponse(
       success(SAFE, (bytes) =>
-        bytes.u64(1n).rows([{leadingBom: '\ufeffdata'}]),
+        bytes
+          .u64(1n)
+          .fields([{name: 'leadingBom', dataTypeID: 25}])
+          .rows([{leadingBom: '\ufeffdata'}]),
       ),
     ).value;
     expect(decoded.rows[0]?.leadingBom).toBe('\ufeffdata');
@@ -536,9 +633,9 @@ describe('binary WASM response codec', () => {
   it('bounds the decoded model prospectively and retains disposition', () => {
     const oversized = (disposition: 0 | 1): Uint8Array => {
       const rowCount = 1_000_000;
-      const bytes = new Uint8Array(3 + 8 + 4 + rowCount * 4);
+      const bytes = new Uint8Array(3 + 8 + 4 + 4 + rowCount * 4);
       bytes.set([VERSION, SUCCESS, disposition]);
-      new DataView(bytes.buffer).setUint32(11, rowCount, true);
+      new DataView(bytes.buffer).setUint32(15, rowCount, true);
       // Every remaining u32 is an empty row. The 4 MiB wire is valid, but the
       // prospective vector plus one million JS objects exceeds 16 MiB.
       return bytes;
@@ -579,7 +676,15 @@ describe('binary WASM response codec', () => {
     expect(() => decodeUnitResponse(invalidUtf8)).toThrow(WasmWireDecodeError);
 
     const duplicate = success(SAFE, (bytes) =>
-      bytes.u64(1n).u32(1).u32(2).string('id').json(1).string('id').json(2),
+      bytes
+        .u64(1n)
+        .fields([])
+        .u32(1)
+        .u32(2)
+        .string('id')
+        .json(1)
+        .string('id')
+        .json(2),
     );
     expect(() => decodeQueryResultResponse(duplicate)).toThrow(
       WasmWireDecodeError,
@@ -700,6 +805,10 @@ describe('binary WorkerEngine adapter', () => {
 
     raw.response = success(SAFE, (bytes) => bytes.u64(3n));
     expect(engine.revision()).toBe(3);
+
+    raw.response = success(SAFE, (bytes) => bytes.u32(0));
+    expect(engine.execSql('SELECT 1; SELECT 2')).toEqual([]);
+    expect(raw.calls.at(-1)?.operation).toBe(WASM_OPERATION.execSql);
   });
 
   it('does not poison a potential mutation when a trusted SAFE payload is malformed', () => {

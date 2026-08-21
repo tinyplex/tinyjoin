@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use crate::{
     Change, EngineError, IndexDefinition, PageDevice, PagedStorage, Result, Row, StorageReader,
@@ -11,6 +14,7 @@ const MAX_TRANSACTION_BYTES: usize = 16 * 1024 * 1024;
 const OVERLAY_ENTRY_BYTES: usize = 128;
 
 /// The bounded, uncommitted row view for one page-native SQL transaction.
+#[derive(Clone)]
 pub(crate) struct PagedTransaction {
     base_revision: u64,
     entries: BTreeMap<String, BTreeMap<Vec<u8>, OverlayEntry>>,
@@ -122,7 +126,7 @@ impl PagedTransaction {
         let candidate_changes = self.candidate_changes(&patch);
         // This performs the canonical physical row/key, unique-index, operation-count, and
         // retained-byte validation against the complete transaction final state.
-        let _ = storage.prepare_row_write_set(&candidate_changes)?;
+        storage.validate_row_write_set(&candidate_changes)?;
 
         for (table, entries) in patch.entries {
             self.touched_tables.insert(table.clone());
@@ -298,6 +302,7 @@ fn write_conflict(expected: u64, actual: u64) -> EngineError {
 pub(crate) struct PagedReadView<'a, D: PageDevice> {
     storage: &'a PagedStorage<D>,
     transaction: Option<&'a PagedTransaction>,
+    work: Option<&'a Cell<usize>>,
 }
 
 impl<'a, D: PageDevice> PagedReadView<'a, D> {
@@ -308,6 +313,19 @@ impl<'a, D: PageDevice> PagedReadView<'a, D> {
         Self {
             storage,
             transaction,
+            work: None,
+        }
+    }
+
+    pub(crate) fn with_work_budget(
+        storage: &'a PagedStorage<D>,
+        transaction: Option<&'a PagedTransaction>,
+        work: &'a Cell<usize>,
+    ) -> Self {
+        Self {
+            storage,
+            transaction,
+            work: Some(work),
         }
     }
 
@@ -320,6 +338,13 @@ impl<'a, D: PageDevice> PagedReadView<'a, D> {
 }
 
 impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
+    fn charge_work(&self, operations: usize) -> Result<()> {
+        match self.work {
+            Some(work) => crate::sql_script::charge_operations(work, operations),
+            None => Ok(()),
+        }
+    }
+
     fn visit_table(
         &self,
         table: &str,
@@ -327,11 +352,15 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
     ) -> Result<VisitOutcome> {
         self.ensure_base_revision()?;
         let Some(transaction) = self.transaction else {
-            return self.storage.visit_table(table, visitor);
+            return self.storage.visit_table(table, &mut |row| {
+                self.charge_work(1)?;
+                visitor(row)
+            });
         };
         let entries = transaction.table_entries(table);
         let schema = self.storage.table_schema(table)?;
         let outcome = self.storage.visit_table(table, &mut |row| {
+            self.charge_work(1)?;
             let encoded_key = encode_primary_key(&schema, row)?;
             if entries
                 .and_then(|entries| entries.get(&encoded_key))
@@ -346,6 +375,7 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
         }
         if let Some(entries) = entries {
             for entry in entries.values() {
+                self.charge_work(1)?;
                 if entry.base == entry.next {
                     continue;
                 }
@@ -388,6 +418,7 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
 
     fn lookup_primary_key(&self, table: &str, key: &Row) -> Result<Option<Row>> {
         self.ensure_base_revision()?;
+        self.charge_work(1)?;
         if let Some(transaction) = self.transaction {
             let schema = self.storage.table_schema(table)?;
             let encoded_key = encode_primary_key(&schema, key)?;
@@ -427,7 +458,10 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
             self.storage.table_schema(table)?;
             Ok(None)
         } else {
-            self.storage.visit_index(table, columns, key, visitor)
+            self.storage.visit_index(table, columns, key, &mut |row| {
+                self.charge_work(2)?;
+                visitor(row)
+            })
         }
     }
 
@@ -570,5 +604,21 @@ mod tests {
                 .code,
             "TRANSACTION_TOO_LARGE"
         );
+    }
+
+    #[test]
+    fn script_work_budget_counts_join_candidate_pairs_beyond_row_scans() {
+        let storage = storage();
+        let work = Cell::new(crate::sql_script::MAX_SQL_SCRIPT_OPERATIONS - 7);
+        let view = PagedReadView::with_work_budget(&storage, None, &work);
+        let plan =
+            crate::join::parse_sql("SELECT a.id FROM items a JOIN items b ON a.id = b.id", &[])
+                .unwrap();
+
+        assert_eq!(
+            crate::join::execute(&view, &plan).unwrap_err().code,
+            "TRANSACTION_TOO_LARGE"
+        );
+        assert_eq!(work.get(), crate::sql_script::MAX_SQL_SCRIPT_OPERATIONS);
     }
 }

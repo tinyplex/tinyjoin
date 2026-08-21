@@ -48,6 +48,15 @@ pub trait StorageReader {
         Ok(())
     }
 
+    /// Charges work to a caller-defined budget spanning more than one query operator.
+    ///
+    /// Ordinary readers have no cross-statement budget. Script candidates override this so
+    /// repeated bounded statements cannot multiply into an unbounded batch.
+    #[doc(hidden)]
+    fn charge_work(&self, _operations: usize) -> Result<()> {
+        Ok(())
+    }
+
     fn visit_table(
         &self,
         table: &str,
@@ -1200,6 +1209,7 @@ pub(crate) fn normalize_row(schema: &TableSchema, mut row: Row) -> Result<Row> {
 
 /// Returns the canonical JSON body length already enforced by row normalization, without
 /// allocating an encoded copy.
+#[cfg(test)]
 pub(crate) fn logical_row_encoded_bytes(row: &Row) -> Result<usize> {
     validate_row_value_limits(row)
 }
@@ -1211,6 +1221,7 @@ pub(crate) fn logical_row_encoded_bytes(row: &Row) -> Result<usize> {
 /// primitives is charged at least `96n`: enough for serde's geometrically grown parsed Vec (at
 /// most `2n` 32-byte `Value` slots) plus the exact-`n` normalized clone. Strings, keys, nested
 /// containers, and encoded buffers are charged separately on top.
+#[cfg(test)]
 pub(crate) fn estimated_encoded_json_model_bytes(bytes: &[u8]) -> Result<usize> {
     let mut work = 64usize;
     let mut index = 0usize;

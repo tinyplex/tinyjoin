@@ -13,6 +13,55 @@ pub enum ColumnType {
     Json,
 }
 
+// Stable PostgreSQL type OIDs used by the public SQL result metadata. These
+// describe TinyGres's five normalized runtime types, not the spelling used in
+// CREATE TABLE (for example, INTEGER and BIGINT normalize to the same type).
+pub const PG_OID_BOOLEAN: u32 = 16;
+pub const PG_OID_INTEGER: u32 = 20;
+pub const PG_OID_TEXT: u32 = 25;
+pub const PG_OID_JSON: u32 = 114;
+pub const PG_OID_FLOAT: u32 = 701;
+pub const PG_OID_UNKNOWN: u32 = 705;
+
+impl ColumnType {
+    pub const fn postgres_oid(self) -> u32 {
+        match self {
+            Self::Boolean => PG_OID_BOOLEAN,
+            // TinyGres integers span JavaScript's safe-integer domain, which
+            // exceeds PostgreSQL INT4 but remains a subset of INT8.
+            Self::Integer => PG_OID_INTEGER,
+            Self::Float => PG_OID_FLOAT,
+            Self::Text => PG_OID_TEXT,
+            // The normalized JSON type does not promise JSONB operators or
+            // binary storage semantics, so JSON is the honest closest OID.
+            Self::Json => PG_OID_JSON,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResultField {
+    pub name: String,
+    pub data_type_id: u32,
+}
+
+impl ResultField {
+    pub fn new(name: impl Into<String>, data_type: ColumnType) -> Self {
+        Self {
+            name: name.into(),
+            data_type_id: data_type.postgres_oid(),
+        }
+    }
+
+    pub fn unknown(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            data_type_id: PG_OID_UNKNOWN,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ColumnDefinition {
@@ -164,6 +213,7 @@ pub struct ApplyOutcome {
 #[serde(rename_all = "camelCase")]
 pub struct QueryResult {
     pub revision: u64,
+    pub fields: Vec<ResultField>,
     pub rows: Vec<Row>,
 }
 
@@ -173,6 +223,7 @@ pub struct ExecuteResult {
     pub command: String,
     pub revision: u64,
     pub row_count: usize,
+    pub fields: Vec<ResultField>,
     pub rows: Vec<Row>,
     pub tables: Vec<String>,
 }

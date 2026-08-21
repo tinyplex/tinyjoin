@@ -85,14 +85,6 @@ impl WasmEngine {
                 drop(plan);
                 wire::query_result(&result, false)
             }
-            wire::OP_QUERY_SQL => {
-                let sql = reader.string()?;
-                let params = reader.values(0)?;
-                reader.finish()?;
-                let result = self.engine()?.query_sql(&sql, &params)?;
-                drop((sql, params));
-                wire::query_result(&result, false)
-            }
             wire::OP_EXECUTE_SQL => {
                 let sql = reader.string()?;
                 let params = reader.values(0)?;
@@ -103,6 +95,21 @@ impl WasmEngine {
                 drop((sql, params));
                 let committed = !was_in_transaction && result.revision != previous_revision;
                 match wire::execute_result(&result, committed) {
+                    Ok(response) => Ok(response),
+                    Err(error) if !committed => Err(error),
+                    Err(error) => self.poison_after_commit(error),
+                }
+            }
+            wire::OP_EXEC_SQL => {
+                let sql = reader.string()?;
+                reader.finish()?;
+                let was_in_transaction = self.engine()?.in_transaction();
+                let previous_revision = self.engine()?.revision();
+                let results = self.engine_mut()?.exec_sql(&sql)?;
+                drop(sql);
+                let committed =
+                    !was_in_transaction && self.engine()?.revision() != previous_revision;
+                match wire::execute_results(&results, committed) {
                     Ok(response) => Ok(response),
                     Err(error) if !committed => Err(error),
                     Err(error) => self.poison_after_commit(error),

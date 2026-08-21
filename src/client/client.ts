@@ -3,8 +3,10 @@ import {
   type ApplyOutcome,
   type ChangeBatch,
   type JsonValue,
+  type QueryOptions,
   type QueryPlan,
   type QueryResult,
+  type Results,
   type Row,
   type SqlResult,
   type StorageOptions,
@@ -19,8 +21,10 @@ export interface ClientOptions {
   workerFactory?: () => WorkerLike;
   workerUrl?: string | URL;
   schemas?: TableSchema[];
-  storage?: StorageOptions;
+  dataDir?: DataDir;
 }
+
+export type DataDir = string;
 
 export interface TablesChangedEvent extends ApplyOutcome {}
 
@@ -30,30 +34,38 @@ export type SubscriptionOptions = {
 
 export interface Transaction {
   from<RowType extends object = Row>(table: string): QueryBuilder<RowType>;
-  query<RowType extends object = Row>(
+  query<RowType = Row>(
     sql: string,
     params?: JsonValue[],
-  ): Promise<QueryResult<RowType>>;
-  exec<RowType extends object = Row>(
-    sql: string,
-    params?: JsonValue[],
-  ): Promise<SqlResult<RowType>>;
+    options?: QueryOptions,
+  ): Promise<Results<RowType>>;
+  sql<RowType = Row>(
+    strings: TemplateStringsArray,
+    ...params: JsonValue[]
+  ): Promise<Results<RowType>>;
+  exec(sql: string, options?: QueryOptions): Promise<Results[]>;
+  rollback(): Promise<void>;
+  readonly closed: boolean;
 }
 
 export class Client implements QueryExecutor {
   readonly #rpc: WorkerRpc;
-  readonly #ready: Promise<void>;
+  readonly waitReady: Promise<void>;
   readonly #subscriptions = new Set<{
     tables?: Set<string>;
     listener(event: TablesChangedEvent): void;
   }>();
   #revision = 0;
+  #ready = false;
+  #closing = false;
   #closed = false;
   #closePromise: Promise<void> | undefined;
   #transactionTail: Promise<void> = Promise.resolve();
   #transactionActive = false;
 
   constructor(options: ClientOptions = {}) {
+    assertClientOptions(options);
+    const storage = storageFromDataDir(options.dataDir);
     const worker = createWorker(options);
     this.#rpc = new WorkerRpc(worker);
     this.#rpc.onEvent((event) => {
@@ -71,10 +83,10 @@ export class Client implements QueryExecutor {
         }
       }
     });
-    this.#ready = this.#rpc
+    this.waitReady = this.#rpc
       .request('init', {
         schemas: options.schemas ?? [],
-        storage: options.storage ?? {kind: 'memory'},
+        storage,
       })
       .then((result) => {
         if (!isInitResult(result)) {
@@ -86,12 +98,16 @@ export class Client implements QueryExecutor {
           throw error;
         }
         this.#revision = result.revision;
+        this.#ready = true;
       });
   }
 
-  /** Resolves after local memory or OPFS state is ready. */
-  ready(): Promise<void> {
-    return this.#ready;
+  get ready(): boolean {
+    return this.#ready && !this.#closing && !this.#closed;
+  }
+
+  get closed(): boolean {
+    return this.#closed;
   }
 
   from<RowType extends object = Row>(table: string): QueryBuilder<RowType> {
@@ -104,35 +120,45 @@ export class Client implements QueryExecutor {
     });
   }
 
-  async query<RowType extends object = Row>(
+  async query<RowType = Row>(
     sql: string,
     params: JsonValue[] = [],
-  ): Promise<QueryResult<RowType>> {
-    await this.#ready;
+    options?: QueryOptions,
+  ): Promise<Results<RowType>> {
+    await this.waitReady;
     this.#assertNoActiveTransaction();
-    const result = await this.#rpc.request('querySql', {sql, params});
+    assertQueryOptions(options);
+    const result = await this.#rpc.request('executeSql', {sql, params});
     this.#revision = Math.max(this.#revision, result.revision);
-    return result as QueryResult<RowType>;
+    return toResults<RowType>(result, options);
+  }
+
+  sql<RowType = Row>(
+    strings: TemplateStringsArray,
+    ...params: JsonValue[]
+  ): Promise<Results<RowType>> {
+    return this.query<RowType>(parameterize(strings, params), params);
   }
 
   async executePlan(plan: QueryPlan): Promise<QueryResult> {
-    await this.#ready;
+    await this.waitReady;
     this.#assertNoActiveTransaction();
     const result = await this.#rpc.request('query', {plan});
     this.#revision = Math.max(this.#revision, result.revision);
     return result;
   }
 
-  /** Executes one supported atomic SQL statement, read or write. */
-  async exec<RowType extends object = Row>(
+  /** Executes one or more SQL statements without parameters. */
+  async exec(
     sql: string,
-    params: JsonValue[] = [],
-  ): Promise<SqlResult<RowType>> {
-    await this.#ready;
+    options?: QueryOptions,
+  ): Promise<Results[]> {
+    await this.waitReady;
     this.#assertNoActiveTransaction();
-    const result = await this.#rpc.request('executeSql', {sql, params});
-    this.#revision = Math.max(this.#revision, result.revision);
-    return result as SqlResult<RowType>;
+    assertQueryOptions(options);
+    const results = await this.#rpc.request('execSql', {sql});
+    this.#noteResults(results);
+    return results.map((result) => toResults(result, options));
   }
 
   /**
@@ -157,16 +183,20 @@ export class Client implements QueryExecutor {
 
   /** Atomically replaces the complete contents and schema of a table. */
   async replaceTable(schema: TableSchema, rows: Row[]): Promise<ApplyOutcome> {
-    await this.#ready;
+    await this.waitReady;
     this.#assertNoActiveTransaction();
-    return this.#rpc.request('replaceTable', {schema, rows});
+    const outcome = await this.#rpc.request('replaceTable', {schema, rows});
+    this.#revision = Math.max(this.#revision, outcome.revision);
+    return outcome;
   }
 
   /** Atomically applies a batch of row upserts and deletes. */
   async applyBatch(batch: ChangeBatch): Promise<ApplyOutcome> {
-    await this.#ready;
+    await this.waitReady;
     this.#assertNoActiveTransaction();
-    return this.#rpc.request('applyBatch', {batch});
+    const outcome = await this.#rpc.request('applyBatch', {batch});
+    this.#revision = Math.max(this.#revision, outcome.revision);
+    return outcome;
   }
 
   subscribe(
@@ -186,18 +216,21 @@ export class Client implements QueryExecutor {
   }
 
   close(): Promise<void> {
-    if (!this.#closed) {
-      this.#closed = true;
+    if (this.#closePromise === undefined) {
+      this.#closing = true;
+      this.#closePromise = this.#closeOnce();
     }
-    this.#closePromise ??= this.#closeOnce();
     return this.#closePromise;
   }
 
   async #closeOnce(): Promise<void> {
     try {
-      await this.#ready;
+      await this.waitReady;
       await this.#rpc.request('close', undefined);
     } finally {
+      this.#ready = false;
+      this.#closing = false;
+      this.#closed = true;
       this.#subscriptions.clear();
       this.#rpc.dispose();
     }
@@ -206,8 +239,8 @@ export class Client implements QueryExecutor {
   async #runTransaction<Result>(
     callback: (transaction: Transaction) => Result | Promise<Result>,
   ): Promise<Result> {
-    await this.#ready;
-    if (this.#closed) {
+    await this.waitReady;
+    if (this.#closing || this.#closed) {
       throw clientError('CLIENT_CLOSED', 'The TinyGres client is closed');
     }
     const {transactionId} = await this.#rpc.request(
@@ -227,6 +260,10 @@ export class Client implements QueryExecutor {
       const result = await callback(transaction);
       transaction.seal();
       await transaction.settle();
+      if (transaction.rollbackCompleted) {
+        shouldRollback = false;
+        return result;
+      }
       const outcome = await this.#rpc.request('commitTransaction', {
         transactionId,
       });
@@ -235,7 +272,7 @@ export class Client implements QueryExecutor {
       return result;
     } catch (error) {
       transaction.seal();
-      if (shouldRollback) {
+      if (shouldRollback && !transaction.rollbackCompleted) {
         await this.#rpc
           .request('rollbackTransaction', {transactionId})
           .catch(() => undefined);
@@ -247,6 +284,9 @@ export class Client implements QueryExecutor {
   }
 
   #assertNoActiveTransaction(): void {
+    if (this.#closing || this.#closed) {
+      throw clientError('CLIENT_CLOSED', 'The TinyGres client is closed');
+    }
     if (this.#transactionActive) {
       throw clientError(
         'TRANSACTION_ACTIVE',
@@ -254,11 +294,20 @@ export class Client implements QueryExecutor {
       );
     }
   }
+
+  #noteResults(results: SqlResult[]): void {
+    for (const result of results) {
+      this.#revision = Math.max(this.#revision, result.revision);
+    }
+  }
 }
 
 class ClientTransaction implements Transaction, QueryExecutor {
   readonly #pending = new Set<Promise<unknown>>();
   #open = true;
+  #closing = false;
+  #rollbackCompleted = false;
+  #rollbackPromise: Promise<void> | undefined;
 
   constructor(
     readonly rpc: WorkerRpc,
@@ -274,24 +323,13 @@ class ClientTransaction implements Transaction, QueryExecutor {
     return new QueryBuilder<RowType>(this, {table, filters: []});
   }
 
-  query<RowType extends object = Row>(
+  query<RowType = Row>(
     sql: string,
     params: JsonValue[] = [],
-  ): Promise<QueryResult<RowType>> {
-    return this.#track(
-      this.rpc
-        .request('querySql', {sql, params, transactionId: this.transactionId})
-        .then((result) => {
-          this.noteRevision(result.revision);
-          return result as QueryResult<RowType>;
-        }),
-    );
-  }
-
-  exec<RowType extends object = Row>(
-    sql: string,
-    params: JsonValue[] = [],
-  ): Promise<SqlResult<RowType>> {
+    options?: QueryOptions,
+  ): Promise<Results<RowType>> {
+    this.#assertOpen();
+    assertQueryOptions(options);
     return this.#track(
       this.rpc
         .request('executeSql', {
@@ -301,12 +339,41 @@ class ClientTransaction implements Transaction, QueryExecutor {
         })
         .then((result) => {
           this.noteRevision(result.revision);
-          return result as SqlResult<RowType>;
+          return toResults<RowType>(result, options);
+        }),
+    );
+  }
+
+  sql<RowType = Row>(
+    strings: TemplateStringsArray,
+    ...params: JsonValue[]
+  ): Promise<Results<RowType>> {
+    return this.query<RowType>(parameterize(strings, params), params);
+  }
+
+  exec(
+    sql: string,
+    options?: QueryOptions,
+  ): Promise<Results[]> {
+    this.#assertOpen();
+    assertQueryOptions(options);
+    return this.#track(
+      this.rpc
+        .request('execSql', {
+          sql,
+          transactionId: this.transactionId,
+        })
+        .then((results) => {
+          for (const result of results) {
+            this.noteRevision(result.revision);
+          }
+          return results.map((result) => toResults(result, options));
         }),
     );
   }
 
   executePlan(plan: QueryPlan): Promise<QueryResult> {
+    this.#assertOpen();
     return this.#track(
       this.rpc
         .request('query', {plan, transactionId: this.transactionId})
@@ -321,10 +388,40 @@ class ClientTransaction implements Transaction, QueryExecutor {
     this.#open = false;
   }
 
+  get closed(): boolean {
+    return !this.#open;
+  }
+
+  get rollbackCompleted(): boolean {
+    return this.#rollbackCompleted;
+  }
+
+  rollback(): Promise<void> {
+    this.#assertOpen();
+    this.#closing = true;
+    const rollback = this.rpc
+      .request('rollbackTransaction', {
+        transactionId: this.transactionId,
+      })
+      .then(() => {
+        this.#rollbackCompleted = true;
+        this.#open = false;
+        this.#closing = false;
+      });
+    this.#rollbackPromise = rollback;
+    this.#pending.add(rollback);
+    void rollback.then(
+      () => this.#pending.delete(rollback),
+      () => this.#pending.delete(rollback),
+    );
+    return rollback;
+  }
+
   async settle(): Promise<void> {
     while (this.#pending.size > 0) {
       await Promise.all([...this.#pending]);
     }
+    await this.#rollbackPromise;
   }
 
   #track<Result>(promise: Promise<Result>): Promise<Result> {
@@ -338,7 +435,7 @@ class ClientTransaction implements Transaction, QueryExecutor {
   }
 
   #assertOpen(): void {
-    if (!this.#open) {
+    if (!this.#open || this.#closing) {
       throw clientError(
         'TRANSACTION_CLOSED',
         'The TinyGres transaction callback has already completed',
@@ -347,8 +444,43 @@ class ClientTransaction implements Transaction, QueryExecutor {
   }
 }
 
-export function create(options: ClientOptions = {}): Client {
-  return new Client(options);
+export function create(): Promise<Client>;
+export function create(options: ClientOptions): Promise<Client>;
+export function create(
+  dataDir: DataDir | undefined,
+  options?: ClientOptions,
+): Promise<Client>;
+export async function create(
+  dataDirOrOptions: DataDir | ClientOptions | undefined = {},
+  options?: ClientOptions,
+): Promise<Client> {
+  let resolvedOptions: ClientOptions;
+  if (typeof dataDirOrOptions === 'string') {
+    if (options?.dataDir !== undefined) {
+      throw new TypeError(
+        'Provide the TinyGres data directory either positionally or in options.dataDir, not both',
+      );
+    }
+    resolvedOptions = {...options, dataDir: dataDirOrOptions};
+  } else if (dataDirOrOptions === undefined) {
+    resolvedOptions = options ?? {};
+  } else {
+    if (options !== undefined) {
+      throw new TypeError(
+        'TinyGres options must be the first argument when no positional data directory is used',
+      );
+    }
+    resolvedOptions = dataDirOrOptions;
+  }
+
+  const client = new Client(resolvedOptions);
+  try {
+    await client.waitReady;
+    return client;
+  } catch (error) {
+    await client.close().catch(() => undefined);
+    throw error;
+  }
 }
 
 function createWorker(options: ClientOptions): WorkerLike {
@@ -395,6 +527,122 @@ function assertWorkerAvailable(): void {
 
 function clientError(code: string, message: string): ClientError {
   return new ClientError({code, message});
+}
+
+function assertClientOptions(options: ClientOptions): void {
+  const supported = new Set([
+    'dataDir',
+    'schemas',
+    'worker',
+    'workerFactory',
+    'workerUrl',
+  ]);
+  const prototype = isRecord(options)
+    ? Object.getPrototypeOf(options)
+    : undefined;
+  if (
+    !isRecord(options) ||
+    (prototype !== Object.prototype && prototype !== null) ||
+    Reflect.ownKeys(options).some(
+      (key) => typeof key !== 'string' || !supported.has(key),
+    )
+  ) {
+    throw new TypeError(
+      'TinyGres client options support only dataDir, schemas, worker, workerFactory, and workerUrl',
+    );
+  }
+}
+
+function storageFromDataDir(dataDir: DataDir | undefined): StorageOptions {
+  if (dataDir === undefined || dataDir === 'memory://') {
+    return {kind: 'memory'};
+  }
+  if (typeof dataDir !== 'string' || !dataDir.startsWith('opfs://')) {
+    throw new TypeError(
+      'TinyGres dataDir must be memory:// or opfs:// followed by a database name',
+    );
+  }
+  const name = dataDir.slice('opfs://'.length);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) {
+    throw new TypeError(
+      'A TinyGres OPFS database name must be 1-64 ASCII letters, numbers, dots, underscores, or hyphens, and start with a letter or number',
+    );
+  }
+  return {kind: 'opfs', name};
+}
+
+function parameterize(
+  strings: TemplateStringsArray,
+  params: readonly JsonValue[],
+): string {
+  if (!Array.isArray(strings) || strings.length !== params.length + 1) {
+    throw new TypeError('TinyGres sql must be used as a tagged template');
+  }
+  let sql = strings[0] ?? '';
+  for (let index = 0; index < params.length; index++) {
+    sql += `$${index + 1}${strings[index + 1] ?? ''}`;
+  }
+  return sql;
+}
+
+function toResults<RowType>(
+  result: SqlResult,
+  options?: QueryOptions,
+): Results<RowType> {
+  assertQueryOptions(options);
+  const rows =
+    options?.rowMode === 'array'
+      ? rowsAsArrays(result.rows, result.fields)
+      : result.rows;
+  return {
+    rows: rows as RowType[],
+    fields: result.fields,
+    affectedRows: affectedRows(result),
+    command: result.command,
+    ...(hasRowCount(result.command) ? {rowCount: result.rowCount} : {}),
+    revision: result.revision,
+    tables: result.tables,
+  };
+}
+
+function rowsAsArrays(
+  rows: Row[],
+  fields: SqlResult['fields'],
+): JsonValue[][] {
+  if (rows.length > 0 && fields.length === 0) {
+    throw clientError(
+      'ROW_METADATA_UNAVAILABLE',
+      'TinyGres cannot return array rows without field metadata',
+    );
+  }
+  return rows.map((row) => fields.map((field) => row[field.name] ?? null));
+}
+
+function affectedRows(result: SqlResult): number {
+  return /^(?:DELETE|INSERT|MERGE|UPDATE)$/.test(result.command)
+    ? result.rowCount
+    : 0;
+}
+
+function hasRowCount(command: string): boolean {
+  return /^(?:DELETE|INSERT|MERGE|SELECT|UPDATE)$/.test(command);
+}
+
+function assertQueryOptions(options: QueryOptions | undefined): void {
+  if (options === undefined) {
+    return;
+  }
+  if (
+    !isRecord(options) ||
+    Reflect.ownKeys(options).some((key) => key !== 'rowMode') ||
+    (options.rowMode !== undefined &&
+      options.rowMode !== 'array' &&
+      options.rowMode !== 'object')
+  ) {
+    throw new TypeError(
+      'TinyGres query options currently support only rowMode: object or array',
+    );
+  }
 }
 
 function isInitResult(value: unknown): value is {revision: number} {

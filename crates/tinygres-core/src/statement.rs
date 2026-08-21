@@ -14,8 +14,8 @@ use crate::storage::{
     validate_index_columns_for_schema, validate_index_definition_shape,
 };
 use crate::{
-    Change, ColumnDefinition, ColumnType, EngineError, Predicate, QueryPlan, Result, Row,
-    StorageReader, TableSchema, VisitControl, VisitOutcome,
+    Change, ColumnDefinition, ColumnType, EngineError, Predicate, QueryPlan, Result, ResultField,
+    Row, StorageReader, TableSchema, VisitControl, VisitOutcome,
 };
 
 const MAX_COLUMNS: usize = 256;
@@ -152,8 +152,8 @@ pub(crate) fn execute<S: StorageDriver>(
 ///
 /// Both the in-memory and paged engines use this path so validation, resource limits, affected-row
 /// selection, and `RETURNING` semantics cannot drift between their publication mechanisms.
-pub(crate) fn plan_dml<S: StorageReader>(
-    storage: &S,
+pub(crate) fn plan_dml(
+    storage: &dyn StorageReader,
     statement: &WriteStatement,
 ) -> Result<PlannedDml> {
     match statement {
@@ -196,6 +196,34 @@ pub(crate) fn plan_dml<S: StorageReader>(
     }
 }
 
+pub(crate) fn write_result_fields(
+    storage: &dyn StorageReader,
+    statement: &WriteStatement,
+    first_row: Option<&Row>,
+) -> Result<Vec<ResultField>> {
+    let (table, returning) = match statement {
+        WriteStatement::Insert {
+            table, returning, ..
+        }
+        | WriteStatement::Update {
+            table, returning, ..
+        }
+        | WriteStatement::Delete {
+            table, returning, ..
+        } => (table, returning.as_deref()),
+        _ => return Ok(vec![]),
+    };
+    let Some(returning) = returning else {
+        return Ok(vec![]);
+    };
+    let schema = storage.table_schema(table)?;
+    crate::query::projection_fields(
+        &schema,
+        (!returning.is_empty()).then_some(returning),
+        first_row,
+    )
+}
+
 #[cfg(test)]
 fn drop_table<S: StorageDriver>(
     storage: &mut S,
@@ -209,8 +237,8 @@ fn drop_table<S: StorageDriver>(
     Ok(outcome)
 }
 
-pub(crate) fn plan_drop_table<S: StorageReader>(
-    storage: &S,
+pub(crate) fn plan_drop_table(
+    storage: &dyn StorageReader,
     table: &str,
     if_exists: bool,
 ) -> Result<WriteOutcome> {
@@ -249,8 +277,8 @@ fn drop_index<S: StorageDriver>(
     Ok(outcome)
 }
 
-pub(crate) fn plan_drop_index<S: StorageReader>(
-    storage: &S,
+pub(crate) fn plan_drop_index(
+    storage: &dyn StorageReader,
     name: &str,
     if_exists: bool,
 ) -> Result<WriteOutcome> {
@@ -293,8 +321,8 @@ fn add_column<S: StorageDriver>(
     Ok(outcome)
 }
 
-pub(crate) fn plan_add_column<S: StorageReader>(
-    storage: &S,
+pub(crate) fn plan_add_column(
+    storage: &dyn StorageReader,
     table: &str,
     column: &ColumnDefinition,
     if_not_exists: bool,
@@ -340,8 +368,8 @@ fn create_index<S: StorageDriver>(
     Ok(outcome)
 }
 
-pub(crate) fn plan_create_index<S: StorageReader>(
-    storage: &S,
+pub(crate) fn plan_create_index(
+    storage: &dyn StorageReader,
     definition: &crate::IndexDefinition,
     if_not_exists: bool,
 ) -> Result<WriteOutcome> {
@@ -386,8 +414,8 @@ fn create_table<S: StorageDriver>(
     Ok(outcome)
 }
 
-pub(crate) fn plan_create_table<S: StorageReader>(
-    storage: &S,
+pub(crate) fn plan_create_table(
+    storage: &dyn StorageReader,
     schema: &TableSchema,
     if_not_exists: bool,
 ) -> Result<WriteOutcome> {
@@ -413,8 +441,8 @@ pub(crate) fn plan_create_table<S: StorageReader>(
     })
 }
 
-fn plan_insert<S: StorageReader>(
-    storage: &S,
+fn plan_insert(
+    storage: &dyn StorageReader,
     table: &str,
     columns: Option<&[String]>,
     value_rows: &[Vec<SqlValue>],
@@ -507,8 +535,8 @@ fn plan_insert<S: StorageReader>(
     })
 }
 
-fn plan_update<S: StorageReader>(
-    storage: &S,
+fn plan_update(
+    storage: &dyn StorageReader,
     table: &str,
     assignments: &[(String, SqlValue)],
     predicate: Option<&Predicate>,
@@ -695,8 +723,8 @@ fn plan_update<S: StorageReader>(
     })
 }
 
-fn plan_delete<S: StorageReader>(
-    storage: &S,
+fn plan_delete(
+    storage: &dyn StorageReader,
     table: &str,
     predicate: Option<&Predicate>,
     returning: Option<&[String]>,

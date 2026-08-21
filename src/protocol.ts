@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 4 as const;
+export const PROTOCOL_VERSION = 5 as const;
 export const MAX_QUERY_POSITION = 0xffff_ffff;
 
 export type JsonPrimitive = null | boolean | number | string;
@@ -7,6 +7,30 @@ export type JsonValue =
   | JsonValue[]
   | {[key: string]: JsonValue};
 export type Row = Record<string, JsonValue>;
+
+export type RowMode = 'array' | 'object';
+
+export interface QueryOptions {
+  rowMode?: RowMode;
+}
+
+export interface ResultField {
+  name: string;
+  dataTypeID: number;
+}
+
+/** The result returned by the public SQL API. */
+export interface Results<RowType = Row> {
+  rows: RowType[];
+  fields: ResultField[];
+  affectedRows?: number;
+  command?: string;
+  rowCount?: number;
+  /** TinyGres extension: the database revision observed by this statement. */
+  revision: number;
+  /** TinyGres extension: tables changed by this statement. */
+  tables: string[];
+}
 
 export interface TableSchema {
   name: string;
@@ -52,10 +76,12 @@ export interface ApplyOutcome {
 export interface QueryResult<RowType extends object = Row> {
   revision: number;
   rows: RowType[];
+  fields: ResultField[];
 }
 
 export interface SqlResult<RowType extends object = Row> {
   command: string;
+  fields: ResultField[];
   revision: number;
   rowCount: number;
   rows: RowType[];
@@ -93,13 +119,13 @@ export interface RpcMethods {
     request: {plan: QueryPlan; transactionId?: string};
     response: QueryResult;
   };
-  querySql: {
-    request: {sql: string; params: JsonValue[]; transactionId?: string};
-    response: QueryResult;
-  };
   executeSql: {
     request: {sql: string; params: JsonValue[]; transactionId?: string};
     response: SqlResult;
+  };
+  execSql: {
+    request: {sql: string; transactionId?: string};
+    response: SqlResult[];
   };
   beginTransaction: {
     request: undefined;
@@ -151,17 +177,30 @@ export type WorkerEvent = {
 };
 
 export function isWorkerResponse(value: unknown): value is WorkerResponse {
-  if (!isRecord(value) || value.v !== PROTOCOL_VERSION) {
+  if (
+    !isRecord(value) ||
+    value.v !== PROTOCOL_VERSION ||
+    !isSafeNonNegativeInteger(value.id) ||
+    Number(value.id) < 1
+  ) {
     return false;
   }
-  if (!Number.isSafeInteger(value.id) || typeof value.ok !== 'boolean') {
-    return false;
+  if (value.ok === true) {
+    return hasExactKeys(value, ['v', 'id', 'ok', 'result']);
   }
-  return value.ok ? 'result' in value : isSerializedError(value.error);
+  return (
+    value.ok === false &&
+    hasExactKeys(value, ['v', 'id', 'ok', 'error']) &&
+    isSerializedError(value.error)
+  );
 }
 
 export function isWorkerEvent(value: unknown): value is WorkerEvent {
-  if (!isRecord(value) || value.v !== PROTOCOL_VERSION) {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ['v', 'event', 'payload']) ||
+    value.v !== PROTOCOL_VERSION
+  ) {
     return false;
   }
   if (value.event === 'tablesChanged') {
@@ -170,9 +209,48 @@ export function isWorkerEvent(value: unknown): value is WorkerEvent {
   return false;
 }
 
+export function isRpcResult<Method extends RpcMethod>(
+  method: Method,
+  value: unknown,
+): value is RpcMethods[Method]['response'] {
+  switch (method) {
+    case 'init':
+      return (
+        isRecord(value) &&
+        hasExactKeys(value, ['revision']) &&
+        isSafeNonNegativeInteger(value.revision)
+      );
+    case 'defineTable':
+    case 'rollbackTransaction':
+    case 'close':
+      return value === undefined;
+    case 'replaceTable':
+    case 'applyBatch':
+    case 'commitTransaction':
+      return isApplyOutcome(value);
+    case 'query':
+      return isQueryResult(value);
+    case 'executeSql':
+      return isSqlResult(value);
+    case 'execSql':
+      return isDenseArray(value, isSqlResult);
+    case 'beginTransaction':
+      return (
+        isRecord(value) &&
+        hasExactKeys(value, ['transactionId']) &&
+        isTransactionId(value.transactionId)
+      );
+    default: {
+      const exhaustive: never = method;
+      return exhaustive;
+    }
+  }
+}
+
 export function isWorkerRequest(value: unknown): value is WorkerRequest {
   if (
     !isRecord(value) ||
+    !hasExactKeys(value, ['v', 'id', 'method', 'params']) ||
     value.v !== PROTOCOL_VERSION ||
     !Number.isSafeInteger(value.id) ||
     Number(value.id) < 1 ||
@@ -184,20 +262,29 @@ export function isWorkerRequest(value: unknown): value is WorkerRequest {
     case 'init':
       return (
         isRecord(value.params) &&
-        hasOnlyKeys(value.params, ['schemas', 'storage']) &&
+        hasExactKeys(value.params, ['schemas', 'storage']) &&
         isDenseArray(value.params.schemas, isTableSchema) &&
         isStorageOptions(value.params.storage)
       );
     case 'defineTable':
-      return isRecord(value.params) && isTableSchema(value.params.schema);
+      return (
+        isRecord(value.params) &&
+        hasExactKeys(value.params, ['schema']) &&
+        isTableSchema(value.params.schema)
+      );
     case 'replaceTable':
       return (
         isRecord(value.params) &&
+        hasExactKeys(value.params, ['schema', 'rows']) &&
         isTableSchema(value.params.schema) &&
         isDenseArray(value.params.rows, isRow)
       );
     case 'applyBatch':
-      return isRecord(value.params) && isChangeBatch(value.params.batch);
+      return (
+        isRecord(value.params) &&
+        hasExactKeys(value.params, ['batch']) &&
+        isChangeBatch(value.params.batch)
+      );
     case 'query':
       return (
         isRecord(value.params) &&
@@ -205,13 +292,19 @@ export function isWorkerRequest(value: unknown): value is WorkerRequest {
         isQueryPlan(value.params.plan) &&
         isOptionalTransactionId(value.params.transactionId)
       );
-    case 'querySql':
     case 'executeSql':
       return (
         isRecord(value.params) &&
         hasOnlyKeys(value.params, ['sql', 'params', 'transactionId']) &&
         typeof value.params.sql === 'string' &&
         isDenseArray(value.params.params, (param) => isJsonValue(param)) &&
+        isOptionalTransactionId(value.params.transactionId)
+      );
+    case 'execSql':
+      return (
+        isRecord(value.params) &&
+        hasOnlyKeys(value.params, ['sql', 'transactionId']) &&
+        typeof value.params.sql === 'string' &&
         isOptionalTransactionId(value.params.transactionId)
       );
     case 'beginTransaction':
@@ -252,18 +345,36 @@ function isTransactionId(value: unknown): value is string {
 }
 
 function isStorageOptions(value: unknown): value is StorageOptions {
-  return (
-    isRecord(value) &&
-    (value.kind === 'memory' ||
-      (value.kind === 'opfs' && typeof value.name === 'string'))
-  );
+  if (!isRecord(value)) {
+    return false;
+  }
+  return value.kind === 'memory'
+    ? hasExactKeys(value, ['kind'])
+    : value.kind === 'opfs' &&
+        hasExactKeys(value, ['kind', 'name']) &&
+        typeof value.name === 'string';
 }
 
 function hasOnlyKeys(
   value: Record<string, unknown>,
   allowedKeys: readonly string[],
 ): boolean {
-  return Object.keys(value).every((key) => allowedKeys.includes(key));
+  return Reflect.ownKeys(value).every(
+    (key) => typeof key === 'string' && allowedKeys.includes(key),
+  );
+}
+
+function hasExactKeys(
+  value: Record<string, unknown>,
+  expectedKeys: readonly string[],
+): boolean {
+  const keys = Reflect.ownKeys(value);
+  return (
+    keys.length === expectedKeys.length &&
+    keys.every(
+      (key) => typeof key === 'string' && expectedKeys.includes(key),
+    )
+  );
 }
 
 function isDenseArray<T>(
@@ -286,6 +397,9 @@ const MAX_PROTOCOL_ARRAY_ITEMS = 1_000_000;
 export function isSerializedError(value: unknown): value is SerializedError {
   return (
     isRecord(value) &&
+    hasOnlyKeys(value, ['code', 'message', 'details', 'retryable']) &&
+    Object.hasOwn(value, 'code') &&
+    Object.hasOwn(value, 'message') &&
     typeof value.code === 'string' &&
     typeof value.message === 'string' &&
     (value.details === undefined || isJsonValue(value.details)) &&
@@ -300,7 +414,8 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 function isApplyOutcome(value: unknown): value is ApplyOutcome {
   return (
     isRecord(value) &&
-    Number.isSafeInteger(value.revision) &&
+    hasExactKeys(value, ['revision', 'tables']) &&
+    isSafeNonNegativeInteger(value.revision) &&
     isDenseArray(
       value.tables,
       (table): table is string => typeof table === 'string',
@@ -311,6 +426,7 @@ function isApplyOutcome(value: unknown): value is ApplyOutcome {
 function isTableSchema(value: unknown): value is TableSchema {
   return (
     isRecord(value) &&
+    hasExactKeys(value, ['name', 'primaryKey']) &&
     typeof value.name === 'string' &&
     value.name.length > 0 &&
     isDenseArray(
@@ -324,14 +440,73 @@ function isTableSchema(value: unknown): value is TableSchema {
 
 function isRow(value: unknown): value is Row {
   return (
-    isRecord(value) && Object.values(value).every((cell) => isJsonValue(cell))
+    isJsonRecord(value) &&
+    Object.values(value).every((cell) => isJsonValue(cell))
+  );
+}
+
+function isResultField(value: unknown): value is ResultField {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, ['name', 'dataTypeID']) &&
+    typeof value.name === 'string' &&
+    isSafeNonNegativeInteger(value.dataTypeID) &&
+    Number(value.dataTypeID) <= MAX_QUERY_POSITION
+  );
+}
+
+function isQueryResult(value: unknown): value is QueryResult {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, ['revision', 'rows', 'fields']) &&
+    isSafeNonNegativeInteger(value.revision) &&
+    isDenseArray(value.rows, isRow) &&
+    isDenseArray(value.fields, isResultField)
+  );
+}
+
+function isSqlResult(value: unknown): value is SqlResult {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, [
+      'command',
+      'fields',
+      'revision',
+      'rowCount',
+      'rows',
+      'tables',
+    ]) &&
+    typeof value.command === 'string' &&
+    isDenseArray(value.fields, isResultField) &&
+    isSafeNonNegativeInteger(value.revision) &&
+    isSafeNonNegativeInteger(value.rowCount) &&
+    isDenseArray(value.rows, isRow) &&
+    isDenseArray(
+      value.tables,
+      (table): table is string => typeof table === 'string',
+    )
+  );
+}
+
+function isSafeNonNegativeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+function isJsonRecord(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return (
+    (prototype === Object.prototype || prototype === null) &&
+    Reflect.ownKeys(value).every((key) => typeof key === 'string')
   );
 }
 
 function isChangeBatch(value: unknown): value is ChangeBatch {
   return (
     isRecord(value) &&
-    hasOnlyKeys(value, ['changes']) &&
+    hasExactKeys(value, ['changes']) &&
     isDenseArray(value.changes, isChange)
   );
 }
@@ -341,8 +516,10 @@ function isChange(value: unknown): value is Change {
     return false;
   }
   return value.type === 'upsert'
-    ? isRow(value.row)
-    : value.type === 'delete' && isRow(value.key);
+    ? hasExactKeys(value, ['type', 'table', 'row']) && isRow(value.row)
+    : value.type === 'delete' &&
+        hasExactKeys(value, ['type', 'table', 'key']) &&
+        isRow(value.key);
 }
 
 function isQueryPlan(value: unknown): value is QueryPlan {
@@ -405,6 +582,7 @@ function isQueryPlan(value: unknown): value is QueryPlan {
     value.filters,
     (filter): filter is Filter =>
       isRecord(filter) &&
+      hasExactKeys(filter, ['column', 'operator', 'value']) &&
       typeof filter.column === 'string' &&
       FILTER_OPERATORS.has(filter.operator) &&
       isJsonValue(filter.value),
@@ -446,7 +624,7 @@ function isJsonValue(
     ? isDenseArray(value, (item): item is JsonValue =>
         isJsonValue(item, seen, depth + 1),
       )
-    : isRecord(value) &&
+    : isJsonRecord(value) &&
       Object.values(value).every((item) => isJsonValue(item, seen, depth + 1));
   seen.delete(value);
   return valid;

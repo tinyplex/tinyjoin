@@ -1,4 +1,5 @@
 import {
+  Client,
   create,
   type ChangeBatch,
   type TableSchema,
@@ -54,8 +55,7 @@ let invalidations = 0;
 let simulatedChanges = 0;
 
 async function boot(): Promise<void> {
-  const database = create({schemas: [postsSchema]});
-  await database.ready();
+  const database = await create({schemas: [postsSchema]});
   await database.replaceTable(postsSchema, initialPosts);
   await renderQuery(database);
 
@@ -138,10 +138,11 @@ async function boot(): Promise<void> {
 }
 
 async function pageTransactionDdlProbe(
-  database: ReturnType<typeof create>,
+  database: Awaited<ReturnType<typeof create>>,
 ): Promise<{
   committedRows: number;
   ddlCodes: string[];
+  rejectedScriptRows: number;
   revisionAfter: number;
   revisionBefore: number;
   stagedRows: number;
@@ -160,7 +161,7 @@ async function pageTransactionDdlProbe(
   let stagedRows = 0;
   try {
     await database.transaction(async (transaction) => {
-      await transaction.exec(
+      await transaction.query(
         'INSERT INTO page_tx_probe (id, note) VALUES ($1, $2)',
         [99, 'Staged before rejected DDL'],
       );
@@ -173,6 +174,9 @@ async function pageTransactionDdlProbe(
         'CREATE INDEX IF NOT EXISTS page_tx_note ON page_tx_probe (note)',
         'DROP INDEX IF EXISTS absent_page_tx_index',
         'ALTER TABLE page_tx_probe ADD COLUMN extra TEXT',
+        `INSERT INTO page_tx_probe (id, note)
+           VALUES (100, 'Must not stage before rejected DDL');
+         ALTER TABLE page_tx_probe ADD COLUMN rejected_extra TEXT`,
       ]) {
         try {
           await transaction.exec(sql);
@@ -186,6 +190,15 @@ async function pageTransactionDdlProbe(
           [99],
         )
       ).rows.length;
+      const rejectedScriptRows = (
+        await transaction.query(
+          'SELECT id FROM page_tx_probe WHERE id = $1',
+          [100],
+        )
+      ).rows.length;
+      if (rejectedScriptRows !== 0) {
+        throw new Error('Rejected transaction script staged its leading DML');
+      }
       throw Object.assign(new Error('Roll back the browser DDL probe'), {
         code: 'EXPECTED_TEST_ROLLBACK',
       });
@@ -202,6 +215,7 @@ async function pageTransactionDdlProbe(
   return {
     committedRows: after.rows.length,
     ddlCodes,
+    rejectedScriptRows: 0,
     revisionAfter: after.revision,
     revisionBefore: before.revision,
     stagedRows,
@@ -210,6 +224,8 @@ async function pageTransactionDdlProbe(
 
 async function writableDatabaseProbe(databaseName: string): Promise<{
   aggregateRows: Array<{done: boolean; task_count: number}>;
+  bootstrapCommands: Array<string | undefined>;
+  bootstrapRevisions: number[];
   committedRevision: number;
   insertRows: Array<{done: boolean; id: number; title: string}>;
   invalidations: Array<{revision: number; tables: string[]}>;
@@ -218,6 +234,8 @@ async function writableDatabaseProbe(databaseName: string): Promise<{
   reopenedRevision: number;
   reopenedRows: Array<{done: boolean; id: number; title: string}>;
   rollbackCode: string;
+  scriptFailureCode: string;
+  scriptTableCode: string;
   stagedRows: Array<{done: boolean; id: number; title: string}>;
 }> {
   const connection = openOpfsClient(databaseName, []);
@@ -226,37 +244,38 @@ async function writableDatabaseProbe(databaseName: string): Promise<{
     events.push(structuredClone(event));
   });
   try {
-    await connection.client.ready();
-    await connection.client.exec(`
+    await connection.client.waitReady;
+    const bootstrap = await connection.client.exec(`
       CREATE TABLE tasks (
         id INTEGER PRIMARY KEY,
         title TEXT NOT NULL,
         done BOOLEAN DEFAULT false,
         metadata JSON
-      )
+      );
+      CREATE UNIQUE INDEX tasks_title ON tasks (title);
+      ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;
+      INSERT INTO tasks (id, title, metadata) VALUES
+        (1, 'Ship writable SQL', NULL),
+        (2, 'Persist it', NULL)
+      RETURNING id, title, done;
+      SELECT id, title, done FROM tasks ORDER BY id;
     `);
-    await connection.client.exec(
-      'CREATE UNIQUE INDEX tasks_title ON tasks (title)',
-    );
-    await connection.client.exec(
-      'ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0',
-    );
-    const inserted = await connection.client.exec<{
+    if (bootstrap.length !== 5) {
+      throw new Error('Mixed bootstrap script returned the wrong result count');
+    }
+    const insertRows = bootstrap[3]!.rows as Array<{
       done: boolean;
       id: number;
       title: string;
-    }>(
-      'INSERT INTO tasks (id, title, metadata) VALUES ($1, $2, $3), ($4, $5, $6) RETURNING id, title, done',
-      [1, 'Ship writable SQL', {owner: 'worker'}, 2, 'Persist it', null],
-    );
+    }>;
 
     const stagedRows = await connection.client.transaction(
       async (transaction) => {
-        await transaction.exec(
+        await transaction.query(
           'UPDATE tasks SET done = true WHERE id = $1 RETURNING id',
           [1],
         );
-        await transaction.exec(
+        await transaction.query(
           'INSERT INTO tasks (id, title) VALUES ($1, $2)',
           [3, 'Rollback safely'],
         );
@@ -272,17 +291,34 @@ async function writableDatabaseProbe(databaseName: string): Promise<{
     let rollbackCode = '';
     try {
       await connection.client.transaction(async (transaction) => {
-        await transaction.exec(
+        await transaction.query(
           'UPDATE tasks SET title = $1 WHERE id = $2',
           ['must not persist', 1],
         );
-        await transaction.exec(
+        await transaction.query(
           'INSERT INTO tasks (id, title) VALUES ($1, $2)',
           [4, 'Persist it'],
         );
       });
     } catch (error) {
       rollbackCode = errorCode(error);
+    }
+
+    let scriptFailureCode = '';
+    try {
+      await connection.client.exec(`
+        UPDATE tasks SET title = 'must not persist' WHERE id = 1;
+        CREATE TABLE script_abort_probe (id INTEGER PRIMARY KEY);
+        INSERT INTO tasks (id, title) VALUES (5, 'Persist it');
+      `);
+    } catch (error) {
+      scriptFailureCode = errorCode(error);
+    }
+    let scriptTableCode = '';
+    try {
+      await connection.client.query('SELECT * FROM script_abort_probe');
+    } catch (error) {
+      scriptTableCode = errorCode(error);
     }
 
     const ordered = await connection.client.query<{
@@ -319,7 +355,7 @@ async function writableDatabaseProbe(databaseName: string): Promise<{
 
     const reopened = openOpfsClient(databaseName, []);
     try {
-      await reopened.client.ready();
+      await reopened.client.waitReady;
       const result = await reopened.client.query<{
         done: boolean;
         id: number;
@@ -331,14 +367,18 @@ async function writableDatabaseProbe(databaseName: string): Promise<{
       }>('SELECT id, priority FROM tasks ORDER BY id');
       return {
         aggregateRows: aggregateRows.rows,
+        bootstrapCommands: bootstrap.map((result) => result.command),
+        bootstrapRevisions: bootstrap.map((result) => result.revision),
         committedRevision,
-        insertRows: inserted.rows,
+        insertRows,
         invalidations: events,
         orderedRows: ordered.rows,
         reopenedRevision: result.revision,
         reopenedPriorities: priorities.rows,
         reopenedRows: result.rows.sort((left, right) => left.id - right.id),
         rollbackCode,
+        scriptFailureCode,
+        scriptTableCode,
         stagedRows,
       };
     } finally {
@@ -369,9 +409,8 @@ async function joinDatabaseProbe(): Promise<{
     tag_name: string;
   }>;
 }> {
-  const database = create();
+  const database = await create();
   try {
-    await database.ready();
     await database.exec(`
       CREATE TABLE authors (
         id INTEGER PRIMARY KEY,
@@ -386,11 +425,11 @@ async function joinDatabaseProbe(): Promise<{
         published BOOLEAN NOT NULL
       )
     `);
-    await database.exec(
+    await database.query(
       `INSERT INTO authors (id, name) VALUES
        (1, 'Ada'), (2, 'Linus'), (3, 'Grace')`,
     );
-    await database.exec(
+    await database.query(
       `INSERT INTO articles (id, author_id, title, published) VALUES
        (10, 1, 'Worker databases', true),
        (11, 1, 'A second article', false),
@@ -416,15 +455,15 @@ async function joinDatabaseProbe(): Promise<{
         PRIMARY KEY (post_id, tag_id)
       )
     `);
-    await database.exec(
+    await database.query(
       `INSERT INTO posts (id, title) VALUES
        (1, 'Worker databases'), (2, 'Local queries'), (3, 'Untagged')`,
     );
-    await database.exec(
+    await database.query(
       `INSERT INTO tags (id, name) VALUES
        (10, 'wasm'), (11, 'offline'), (12, 'unused')`,
     );
-    await database.exec(
+    await database.query(
       `INSERT INTO post_tags (post_id, tag_id) VALUES
        (1, 10), (1, 11), (2, 11)`,
     );
@@ -478,7 +517,7 @@ async function joinDatabaseProbe(): Promise<{
 }
 
 async function renderQuery(
-  database: ReturnType<typeof create>,
+  database: Awaited<ReturnType<typeof create>>,
 ): Promise<void> {
   const startedAt = performance.now();
   const result = await database.query<Post>(
@@ -557,7 +596,7 @@ async function persistenceProbe(
   let afterCrash: ReturnType<typeof openOpfsClient> | undefined;
   let conflicting: ReturnType<typeof openOpfsClient> | undefined;
   try {
-    await first.client.ready();
+    await first.client.waitReady;
     const commitStartedAt = performance.now();
     await first.client.replaceTable(postsSchema, rows);
     const initialCommitMs = performance.now() - commitStartedAt;
@@ -565,7 +604,7 @@ async function persistenceProbe(
     const competing = openOpfsClient(databaseName, []);
     let lockErrorCode = '';
     try {
-      await competing.client.ready();
+      await competing.client.waitReady;
     } catch (error) {
       lockErrorCode = errorCode(error);
     } finally {
@@ -573,7 +612,7 @@ async function persistenceProbe(
     }
 
     const independent = openOpfsClient(`${databaseName}-independent`, []);
-    await independent.client.ready();
+    await independent.client.waitReady;
     await independent.client.close();
 
     await first.client.close();
@@ -584,14 +623,14 @@ async function persistenceProbe(
     ]);
     let conflictErrorCode = '';
     try {
-      await conflicting.client.ready();
+      await conflicting.client.waitReady;
     } catch (error) {
       conflictErrorCode = errorCode(error);
     }
 
     const reopenStartedAt = performance.now();
     reopened = openOpfsClient(databaseName, []);
-    await reopened.client.ready();
+    await reopened.client.waitReady;
     conflicting.worker.terminate();
     conflicting = undefined;
     const gracefulReopenMs = performance.now() - reopenStartedAt;
@@ -654,10 +693,10 @@ function openOpfsClient(databaseName: string, schemas: TableSchema[]) {
     {name: `tinygres-${databaseName}`, type: 'module'},
   );
   return {
-    client: create({
+    client: new Client({
       worker,
       schemas,
-      storage: {kind: 'opfs', name: databaseName},
+      dataDir: `opfs://${databaseName}`,
     }),
     worker,
   };
@@ -669,7 +708,7 @@ async function reopenAfterTermination(databaseName: string) {
   while (performance.now() < deadline) {
     const connection = openOpfsClient(databaseName, []);
     try {
-      await connection.client.ready();
+      await connection.client.waitReady;
       return connection;
     } catch (error) {
       connection.worker.terminate();
@@ -711,7 +750,7 @@ async function writeBrowserRestartFixture(
     postsSchema,
     emptySchema,
   ]);
-  await browserRestartConnection.client.ready();
+  await browserRestartConnection.client.waitReady;
   const outcome = await browserRestartConnection.client.replaceTable(
     postsSchema,
     Array.from({length: rowCount}, (_, id) => ({
@@ -733,7 +772,7 @@ async function readBrowserRestartFixture(databaseName: string): Promise<{
 }> {
   const connection = openOpfsClient(databaseName, []);
   try {
-    await connection.client.ready();
+    await connection.client.waitReady;
     const posts = await connection.client.query('SELECT * FROM posts');
     const empty = await connection.client.query('SELECT * FROM empty_table');
     return {

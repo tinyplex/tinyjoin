@@ -1,5 +1,6 @@
 import {
   PROTOCOL_VERSION,
+  isRpcResult,
   isWorkerEvent,
   isWorkerResponse,
   type RpcMethod,
@@ -33,6 +34,7 @@ export interface WorkerLike {
 }
 
 type PendingRequest = {
+  method: RpcMethod;
   resolve(value: unknown): void;
   reject(error: unknown): void;
 };
@@ -73,7 +75,7 @@ export class WorkerRpc {
     } as WorkerRequest;
 
     return new Promise((resolve, reject) => {
-      this.#pending.set(id, {resolve, reject});
+      this.#pending.set(id, {method, resolve, reject});
       try {
         this.#worker.postMessage(request);
       } catch (error) {
@@ -131,10 +133,21 @@ export class WorkerRpc {
     if (!pending) {
       return;
     }
-    this.#pending.delete(event.data.id);
     if (event.data.ok) {
+      if (!isRpcResult(pending.method, event.data.result)) {
+        this.dispose(
+          new ClientError({
+            code: 'PROTOCOL_MISMATCH',
+            message:
+              'The TinyGres worker returned an invalid result for the requested operation',
+          }),
+        );
+        return;
+      }
+      this.#pending.delete(event.data.id);
       pending.resolve(event.data.result);
     } else {
+      this.#pending.delete(event.data.id);
       pending.reject(new ClientError(event.data.error));
     }
   };

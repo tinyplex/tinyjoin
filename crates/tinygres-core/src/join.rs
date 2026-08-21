@@ -11,7 +11,7 @@ use crate::query::{
 use crate::storage::StorageReader;
 use crate::{
     ColumnDefinition, ColumnType, EngineError, FilterOperator, NullOrder, OrderDirection,
-    Predicate, QueryResult, Result, Row, TableSchema, VisitControl, VisitOutcome,
+    Predicate, QueryResult, Result, ResultField, Row, TableSchema, VisitControl, VisitOutcome,
 };
 
 const MAX_PROJECTIONS: usize = 256;
@@ -134,7 +134,7 @@ pub(crate) fn parse_sql(sql: &str, params: &[Value]) -> Result<JoinPlan> {
     Parser::new(tokenize(sql)?, params).parse()
 }
 
-pub(crate) fn execute<S: StorageReader>(storage: &S, plan: &JoinPlan) -> Result<QueryResult> {
+pub(crate) fn execute(storage: &dyn StorageReader, plan: &JoinPlan) -> Result<QueryResult> {
     let mut relations = Vec::with_capacity(plan.joins.len() + 1);
     relations.push(Relation {
         schema: storage.table_schema(&plan.first.table)?,
@@ -146,7 +146,7 @@ pub(crate) fn execute<S: StorageReader>(storage: &S, plan: &JoinPlan) -> Result<
             source: join.source.clone(),
         });
     }
-    let conditions = validate_plan(plan, &relations)?;
+    let (conditions, fields) = validate_plan(plan, &relations)?;
 
     // LIMIT 0 remains a validation-only operation, matching the other SELECT
     // executors. Every join that can inspect a pair is preflighted below before
@@ -154,6 +154,7 @@ pub(crate) fn execute<S: StorageReader>(storage: &S, plan: &JoinPlan) -> Result<
     if plan.limit == Some(0) {
         return Ok(QueryResult {
             revision: storage.revision(),
+            fields,
             rows: Vec::new(),
         });
     }
@@ -179,6 +180,7 @@ pub(crate) fn execute<S: StorageReader>(storage: &S, plan: &JoinPlan) -> Result<
 
     Ok(QueryResult {
         revision: storage.revision(),
+        fields,
         rows,
     })
 }
@@ -212,8 +214,8 @@ fn preflight_candidate_extensions(plan: &JoinPlan, counts: &[usize]) -> Result<(
     Ok(())
 }
 
-fn execute_unordered<S: StorageReader>(
-    storage: &S,
+fn execute_unordered(
+    storage: &dyn StorageReader,
     plan: &JoinPlan,
     relations: &[Relation],
     conditions: &[Vec<ResolvedCondition>],
@@ -252,8 +254,8 @@ fn execute_unordered<S: StorageReader>(
     Ok(rows)
 }
 
-fn execute_ordered<S: StorageReader>(
-    storage: &S,
+fn execute_ordered(
+    storage: &dyn StorageReader,
     plan: &JoinPlan,
     relations: &[Relation],
     conditions: &[Vec<ResolvedCondition>],
@@ -304,8 +306,8 @@ fn execute_ordered<S: StorageReader>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn visit_joined_rows<S: StorageReader>(
-    storage: &S,
+fn visit_joined_rows(
+    storage: &dyn StorageReader,
     plan: &JoinPlan,
     relations: &[Relation],
     conditions: &[Vec<ResolvedCondition>],
@@ -345,6 +347,7 @@ fn visit_joined_rows<S: StorageReader>(
         let mut bindings = [None; MAX_JOIN_SOURCES];
         bindings[0] = Some(probe);
         if visit_extensions(
+            storage,
             0,
             plan,
             &build_tables,
@@ -373,6 +376,7 @@ fn visit_joined_rows<S: StorageReader>(
 
 #[allow(clippy::too_many_arguments)]
 fn visit_extensions<'a>(
+    storage: &dyn StorageReader,
     stage: usize,
     plan: &JoinPlan,
     build_tables: &'a [Vec<Row>],
@@ -389,10 +393,12 @@ fn visit_extensions<'a>(
     let mut matched = false;
     for build in &build_tables[stage] {
         count_join_pair(pairs)?;
+        storage.charge_work(1)?;
         bindings[source] = Some(build);
         if conditions_match(&conditions[stage], bindings)? {
             matched = true;
             if visit_extensions(
+                storage,
                 stage + 1,
                 plan,
                 build_tables,
@@ -411,6 +417,7 @@ fn visit_extensions<'a>(
     if plan.joins[stage].kind == JoinKind::Left && !matched {
         bindings[source] = None;
         if visit_extensions(
+            storage,
             stage + 1,
             plan,
             build_tables,
@@ -533,7 +540,10 @@ fn values_equal(data_type: ColumnType, left: &Value, right: &Value) -> bool {
     }
 }
 
-fn validate_plan(plan: &JoinPlan, relations: &[Relation]) -> Result<Vec<Vec<ResolvedCondition>>> {
+fn validate_plan(
+    plan: &JoinPlan,
+    relations: &[Relation],
+) -> Result<(Vec<Vec<ResolvedCondition>>, Vec<ResultField>)> {
     if relations
         .iter()
         .any(|relation| relation.schema.columns.is_empty())
@@ -565,14 +575,16 @@ fn validate_plan(plan: &JoinPlan, relations: &[Relation]) -> Result<Vec<Vec<Reso
         .collect::<Result<Vec<_>>>()?;
 
     let mut outputs = HashSet::new();
+    let mut fields = Vec::with_capacity(plan.projections.len());
     for projection in &plan.projections {
-        resolve_column(&projection.source, relations)?;
+        let (_, _, definition) = resolve_column(&projection.source, relations)?;
         if !outputs.insert(projection.output.as_str()) {
             return Err(EngineError::invalid_query(format!(
                 "SELECT produces output column `{}` more than once; use distinct AS aliases",
                 projection.output
             )));
         }
+        fields.push(ResultField::new(&projection.output, definition.data_type));
     }
     if let Some(predicate) = &plan.predicate {
         validate_join_predicate(predicate, relations)?;
@@ -600,7 +612,7 @@ fn validate_plan(plan: &JoinPlan, relations: &[Relation]) -> Result<Vec<Vec<Reso
             }
         }
     }
-    Ok(conditions)
+    Ok((conditions, fields))
 }
 
 fn validate_relation_shape(relation: &Relation) -> Result<()> {
@@ -2263,16 +2275,20 @@ mod tests {
                     .unwrap();
             }
         }
-        assert!(
-            engine
-                .query_sql(
-                    "SELECT l.id AS left_id FROM many_left l JOIN many_right r \
-                     ON l.join_key = r.join_key LIMIT 0",
-                    &[],
-                )
-                .unwrap()
-                .rows
-                .is_empty()
+        let zero = engine
+            .query_sql(
+                "SELECT l.id AS left_id FROM many_left l JOIN many_right r \
+                 ON l.join_key = r.join_key LIMIT 0",
+                &[],
+            )
+            .unwrap();
+        assert!(zero.rows.is_empty());
+        assert_eq!(
+            zero.fields,
+            vec![crate::ResultField::new(
+                "left_id",
+                crate::ColumnType::Integer
+            )]
         );
         let storage = engine.into_storage();
         let before = storage.visitor_counts();
