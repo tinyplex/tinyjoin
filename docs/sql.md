@@ -12,22 +12,21 @@ silently reinterpreted.
 
 ## JavaScript entry point
 
-SQL is the primary relational interface. The normal lifecycle has four
-calls:
+SQL is the primary relational interface. The normal lifecycle has four calls:
 
 ```ts
 import { create } from "tinygres";
 
-const db = create({ storage: { kind: "memory" } });
+const db = await create();
 
 await db.exec(`
   CREATE TABLE tasks (
     id INTEGER PRIMARY KEY,
     title TEXT NOT NULL,
     done BOOLEAN NOT NULL DEFAULT false
-  )
+  );
 `);
-await db.exec("INSERT INTO tasks (id, title) VALUES ($1, $2)", [
+await db.query("INSERT INTO tasks (id, title) VALUES ($1, $2)", [
   1,
   "Write the compatibility contract",
 ]);
@@ -40,24 +39,32 @@ const { rows } = await db.query<{ id: number; title: string }>(
 await db.close();
 ```
 
-`create()` starts opening the Worker-backed database and returns its client
-immediately. The first operation waits for initialization; `ready()` is
-available when opening needs to be observed separately.
+`await create()` opens the Worker-backed database and resolves after
+initialization. With no argument, or `memory://`, storage is ephemeral. A named
+`opfs://database-name` data directory opts into persistent browser storage.
+The client also exposes read-only `ready`, `waitReady`, and `closed`
+properties.
 
-`query()` executes one read-only `SELECT` and returns
-`{revision, rows}`. `exec()` executes exactly one supported read or write SQL
-statement and returns `{command, revision, rowCount, rows, tables}`; `rows`
-contains any `SELECT` or `RETURNING` result. Both methods accept
-JSON-compatible `$1` parameters.
+`query(sql, params?, options?)` executes one read or write statement with
+optional JSON-compatible `$1` parameters. `exec(sql, options?)` executes one or
+more statements without parameters as one implicit transaction and returns one
+result per statement. Both use `{rows, fields, affectedRows?, command?,
+rowCount?}` results; TinyGres adds `revision` and `tables`. `fields` contains
+ordered `{name, dataTypeID}` entries, including for empty typed results.
+`rowMode: "array"` returns values in that field order. The `sql` tagged template
+is a parameterizing form of `query()`. `rowMode` is the only query option
+implemented today; parser, serializer, notice, parameter-type, and blob
+options are rejected. The tag accepts parameter values only and does not
+provide raw-SQL, identifier, or nested-template helpers.
 `close()` is asynchronous and idempotent.
 
-Multi-statement atomicity uses `transaction(callback)`, not SQL transaction
+Interactive atomicity uses `transaction(callback)`, not SQL transaction
 statements:
 
 ```ts
 await db.transaction(async (tx) => {
-  await tx.exec("UPDATE tasks SET done = true WHERE id = $1", [1]);
-  await tx.exec("INSERT INTO tasks (id, title) VALUES ($1, $2)", [
+  await tx.query("UPDATE tasks SET done = true WHERE id = $1", [1]);
+  await tx.query("INSERT INTO tasks (id, title) VALUES ($1, $2)", [
     2,
     "Committed together",
   ]);
@@ -110,8 +117,11 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT` | No | Use the JavaScript callback transaction API. |
 | `COPY`, `TRUNCATE`, `EXPLAIN`, `VACUUM`, `ANALYZE` | No | No server maintenance or bulk-file SQL commands. |
 
-Exactly one statement is accepted, with one optional trailing semicolon.
-`exec()` is therefore not a migration-script or multi-statement parser.
+`query()` accepts exactly one statement, with one optional trailing semicolon.
+`exec()` splits only top-level semicolons: strings, quoted identifiers, line
+comments, nested block comments, and parentheses cannot accidentally terminate
+a statement. A script contains at most 256 statements and 1 MiB of SQL text;
+each statement retains the ordinary parser limits below.
 
 ## Predicates and expressions
 
@@ -235,10 +245,15 @@ table's references.
 
 ## Transactions and concurrency
 
-Each standalone write statement is atomic. A callback transaction stages
+Each `query()` write is atomic. A standalone `exec()` script runs its supported
+reads, DDL, and DML against one page candidate and publishes one durable
+generation only after every statement succeeds. A callback transaction stages
 `INSERT`, `UPDATE`, and `DELETE` statements, exposes those staged rows to reads
 through its transaction object, and publishes the complete result once.
-DDL must run as standalone statements.
+`transaction.exec()` may group DML and reads as an atomic savepoint within that
+staged transaction: a failure installs none of that script's changes. DDL is
+rejected before any statement in a transaction script runs and must use a
+standalone `query()` or `exec()` call.
 
 If a transaction statement fails, that statement installs no partial change,
 but the transaction is not put into PostgreSQL's aborted state. If the callback
@@ -256,8 +271,16 @@ TinyGres has no PostgreSQL wire protocol, SQLSTATE-compatible error protocol,
 server process, roles or grants, system catalogs, extensions, stored
 procedures, triggers, notifications, WAL, replication, point-in-time recovery,
 or PostgreSQL file-format compatibility. Rows and parameters are
-JSON-compatible JavaScript values; query results do not include PostgreSQL type
-OIDs or field metadata.
+JSON-compatible JavaScript values. Result fields use the closest stable
+PostgreSQL OID as metadata: boolean `16`, integer `20`, text `25`, JSON `114`,
+float `701`, and unknown/untyped `705`. This mapping does not add PostgreSQL
+storage widths, coercions, operators, parsers, or wire semantics.
+
+Programmatic schemas without a typed column catalog report `705` for explicit
+projection fields. For `SELECT *` and `RETURNING *`, TinyGres can derive those
+field names only from the first returned row; an empty star result from an
+untyped table therefore has `fields: []` and no field order for an array-row
+consumer. SQL tables have typed catalogs and do not have this exception.
 
 Persistence is TinyGres's own page format in memory or one browser OPFS file.
 It is not a PostgreSQL data directory.
@@ -278,6 +301,9 @@ rather than growing without bound.
 | Complete paged row / individual encoded JSON value | 1,048,576 bytes |
 | JSON nesting | 64 levels |
 | SQL text / tokens / parameters | 64 KiB / 4,096 / 1,024 |
+| `exec()` script text / statements | 1 MiB / 256 |
+| `exec()` row, index, scan, and join operations | 1,000,000 across the script |
+| `exec()` retained result work | 16 MiB across the script |
 | Predicate nodes / nesting / `IN` values | 256 / 32 / 1,024 |
 | Rows in one `INSERT ... VALUES` | 4,096 |
 | Explicit `LIMIT` / `OFFSET` / `OFFSET + LIMIT` | 100,000 / 4,294,967,295 / 4,294,967,295 |

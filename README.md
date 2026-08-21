@@ -74,9 +74,7 @@ type Task = {
   done: boolean;
 };
 
-const db = create({
-  storage: { kind: "opfs", name: "my-app-v1" },
-});
+const db = await create("opfs://my-app-v1");
 
 await db.exec(`
   CREATE TABLE tasks (
@@ -84,16 +82,13 @@ await db.exec(`
     title TEXT NOT NULL,
     done BOOLEAN NOT NULL DEFAULT false,
     metadata JSONB
-  )
+  );
+  CREATE INDEX tasks_done ON tasks (done);
+  CREATE UNIQUE INDEX tasks_title ON tasks (title);
+  ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;
 `);
 
-await db.exec("CREATE INDEX tasks_done ON tasks (done)");
-await db.exec("CREATE UNIQUE INDEX tasks_title ON tasks (title)");
-await db.exec(
-  "ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
-);
-
-const inserted = await db.exec<Task>(
+const inserted = await db.query<Task>(
   `INSERT INTO tasks (id, title, metadata)
    VALUES ($1, $2, $3)
    RETURNING *`,
@@ -101,8 +96,8 @@ const inserted = await db.exec<Task>(
 );
 
 await db.transaction(async (tx) => {
-  await tx.exec("UPDATE tasks SET done = true WHERE id = $1", [1]);
-  await tx.exec("INSERT INTO tasks (id, title) VALUES ($1, $2)", [
+  await tx.query("UPDATE tasks SET done = true WHERE id = $1", [1]);
+  await tx.query("INSERT INTO tasks (id, title) VALUES ($1, $2)", [
     2,
     "Survives the same atomic commit",
   ]);
@@ -130,38 +125,47 @@ unsubscribe();
 await db.close();
 ```
 
-Every standalone SQL statement is atomic. `transaction()` stages `INSERT`,
+`query()` executes one parameterized statement atomically. `exec()` executes
+one or more parameter-free statements as one implicit transaction: all reads,
+DDL, and DML in the script succeed and publish together, or none do.
+`transaction()` stages `INSERT`,
 `UPDATE`, and `DELETE` statements against an isolated candidate database,
 rolls them back when the callback rejects (including for an uncaught statement
 error), persists one complete commit to OPFS, and then emits one table-level
 invalidation. A caught statement error does not abort the transaction or erase
 earlier staged writes. Run DDL such as `CREATE`, `ALTER`, and `DROP` as
-standalone atomic statements. The transaction object must not escape its
-callback.
+standalone `query()` calls or an `exec()` script, outside the callback. The
+transaction object's `exec()` groups DML and reads as one savepoint: a failure
+installs none of that script's changes. The transaction object must not escape
+its callback. It also exposes `rollback()` and a read-only `closed` property.
 
 For callers that already hold complete JSON rows, `replaceTable(schema, rows)`
 atomically replaces one table and `applyBatch({changes})` atomically applies
 explicit `upsert` and `delete` operations. These are local database operations;
 they perform no I/O beyond the configured database storage.
 
-`create` starts opening the database in a dedicated module worker and returns
-the client immediately. `exec()`, `query()`, and the other async operations
-wait for initialization automatically. Call `ready()` only when an application
-needs to observe opening or initialization separately. It is safe
-to import during server rendering; the worker is only constructed when the
-function is called in a browser.
+`await create()` opens the database in a dedicated module worker and resolves
+only after initialization succeeds. Calling it with no data directory, or with
+`memory://`, creates an ephemeral database. The returned client also exposes
+the read-only `ready`, `waitReady`, and `closed` lifecycle properties. It is
+safe to import during server rendering; the worker is only constructed when
+`create()` is called in a browser.
 
-`query()` returns `{revision, rows}`. `exec()` accepts exactly one supported
-read or write statement and returns
-`{command, revision, rowCount, rows, tables}`, including any `SELECT` or
-`RETURNING` rows. These are TinyGres result objects rather than PostgreSQL wire
-results; see the [SQL compatibility contract](./docs/sql.md) for the exact
-dialect, type semantics, and limits.
+`query(sql, params?, options?)` returns one result for one read or write
+statement. `exec(sql, options?)` accepts no parameters and returns one result
+per statement. Results have the familiar `{rows, fields, affectedRows,
+command, rowCount}` shape; `revision` and `tables` are additive TinyGres
+metadata. `rowMode: "array"` is supported alongside the default object rows,
+and `sql` is a parameterizing tagged-template form of `query()`. `rowMode` is
+the only query option implemented today, and the tag accepts values rather
+than raw-SQL or identifier helpers. These are not PostgreSQL wire results; see
+the [SQL compatibility contract](./docs/sql.md) for the exact dialect, type
+semantics, OID mapping, and limits.
 
 For an application-owned worker, pass `worker`, `workerFactory`, or `workerUrl`:
 
 ```ts
-const db = create({
+const db = await create({
   workerFactory: () =>
     new Worker(new URL("./tinygres.worker.ts", import.meta.url), {
       name: "tinygres",
@@ -186,18 +190,15 @@ Memory remains the default. Opt into persistent browser storage by assigning a
 stable name to the database:
 
 ```ts
-const db = create({
+const db = await create("opfs://my-project-public-posts-v1", {
   schemas: [{ name: "posts", primaryKey: ["id"] }],
-  storage: { kind: "opfs", name: "my-project-public-posts-v1" },
 });
-
-await db.ready();
 ```
 
 Names must contain 1–64 ASCII letters, numbers, dots, underscores, or hyphens,
 and start with a letter or number.
 
-`ready()` opens the page database and validates or initializes its schemas. The
+`create()` opens the page database and validates or initializes its schemas. The
 page engine uses 4 KiB copy-on-write pages:
 candidate data and catalog pages are flushed before one checksummed metadata
 publication makes the new generation visible. A known pre-publication failure
@@ -267,7 +268,9 @@ statement-and-keyword matrix, predicate and type matrices, transaction and
 concurrency differences, unsupported feature families, and hard operational
 limits. The summary below describes the main implemented slice.
 
-TinyGres currently accepts one statement at a time. `SELECT` supports:
+`query()` accepts one statement at a time, while `exec()` accepts a bounded
+parameter-free script and runs it as one implicit transaction. `SELECT`
+supports:
 
 - one unqualified or two-part table name;
 - `*` or a list of simple column names;
@@ -374,10 +377,11 @@ uses JSON-compatible values. `NULL = NULL` does not match, following
 SQL null semantics.
 
 Aliases on ordinary non-aggregate, non-join projections, `HAVING`, aggregate
-`DISTINCT`/`FILTER`/window forms, subqueries, general expressions, multiple or
-non-equijoins, foreign keys, `ON CONFLICT`, sequences/generated IDs, type
-modifiers, and SQL `BEGIN` tokens are rejected explicitly; the error code
-depends on the form. `ALTER` is
+`DISTINCT`/`FILTER`/window forms, subqueries, general expressions, joins over
+more than eight table sources, non-equality `ON` conditions,
+`RIGHT`/`FULL`/`CROSS`/`NATURAL`/`USING` joins, foreign keys, `ON CONFLICT`,
+sequences/generated IDs, type modifiers, and SQL `BEGIN` tokens are rejected
+explicitly; the error code depends on the form. `ALTER` is
 currently limited to adding a column; renaming or removing columns is not
 implemented. This is an explicit compatibility boundary, not an accidental
 promise of full PostgreSQL behavior.
@@ -391,7 +395,7 @@ npm run test:rust       # native Rust engine tests
 npm run build           # assemble the complete publishable dist package
 npm run test:browser    # real browser Worker/WASM flow
 npm run test:package    # pack dist and install it in a clean Vite app
-npm run check:size      # hard 700 KiB page-native WASM gate
+npm run check:size      # hard 1 MiB page-native WASM gate
 ```
 
 The browser tests initialize the real module Worker, query, apply an atomic row
@@ -406,7 +410,7 @@ default worker and an application-owned worker. It covers memory and fresh OPFS
 write/reopen flows in both modes and installs the tarball rather than resolving
 TinyGres through a workspace link.
 
-The single page-native WASM artifact has a hard uncompressed limit of 700 KiB.
+The single page-native WASM artifact has a hard uncompressed limit of 1 MiB.
 The check is intentionally independent of gzip size so compression cannot hide
 startup and compilation cost.
 
