@@ -3,9 +3,10 @@ use std::cell::Cell;
 use serde_json::Value;
 
 use crate::{
-    ApplyOutcome, ChangeBatch, EngineError, ExecuteResult, PageDevice, PagedStorage, QueryPlan,
-    QueryResult, Result, StorageReader, TableSchema,
+    ApplyOutcome, ChangeBatch, EngineError, ExecuteResult, PageDevice, PagedStorage,
+    PreparedStatementId, QueryPlan, QueryResult, Result, StorageReader, TableSchema,
     paged_transaction::{PagedReadView, PagedTransaction},
+    prepared_statement::PreparedStatementRegistry,
     statement::{PlannedDml, Statement, WriteStatement},
 };
 
@@ -17,6 +18,7 @@ use crate::{
 pub struct PagedEngine<D: PageDevice> {
     storage: PagedStorage<D>,
     transaction: Option<PagedTransaction>,
+    prepared_statements: PreparedStatementRegistry,
 }
 
 impl<D: PageDevice> PagedEngine<D> {
@@ -24,6 +26,7 @@ impl<D: PageDevice> PagedEngine<D> {
         Self {
             storage,
             transaction: None,
+            prepared_statements: PreparedStatementRegistry::default(),
         }
     }
 
@@ -96,6 +99,31 @@ impl<D: PageDevice> PagedEngine<D> {
     /// advance the revision.
     pub fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<ExecuteResult> {
         let statement = crate::statement::parse(sql, params)?;
+        self.execute_parsed_statement(statement)
+    }
+
+    /// Parses and retains one reusable parameterized SQL statement for this engine session.
+    pub fn prepare_sql(&mut self, sql: &str) -> Result<PreparedStatementId> {
+        self.storage.ensure_readiness()?;
+        self.prepared_statements.prepare(sql)
+    }
+
+    /// Binds and executes a retained statement against the current catalog and transaction view.
+    pub fn execute_prepared(
+        &mut self,
+        id: PreparedStatementId,
+        params: &[Value],
+    ) -> Result<ExecuteResult> {
+        let statement = self.prepared_statements.bind(id, params)?;
+        self.execute_parsed_statement(statement)
+    }
+
+    /// Releases a retained statement. Closing an already closed issued ID is idempotent.
+    pub fn close_prepared(&mut self, id: PreparedStatementId) -> Result<()> {
+        self.prepared_statements.close(id)
+    }
+
+    fn execute_parsed_statement(&mut self, statement: Statement) -> Result<ExecuteResult> {
         if self.transaction.is_none() {
             return self
                 .storage

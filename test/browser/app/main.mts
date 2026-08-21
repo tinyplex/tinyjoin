@@ -230,6 +230,8 @@ async function writableDatabaseProbe(databaseName: string): Promise<{
   insertRows: Array<{done: boolean; id: number; title: string}>;
   invalidations: Array<{revision: number; tables: string[]}>;
   orderedRows: Array<{done: boolean; id: number; title: string}>;
+  preparedClosed: boolean;
+  preparedRows: Array<{done: boolean; id: number; title: string}>;
   reopenedPriorities: Array<{id: number; priority: number}>;
   reopenedRevision: number;
   reopenedRows: Array<{done: boolean; id: number; title: string}>;
@@ -268,6 +270,20 @@ async function writableDatabaseProbe(databaseName: string): Promise<{
       id: number;
       title: string;
     }>;
+    const taskById = await connection.client.prepare<{
+      done: boolean;
+      id: number;
+      title: string;
+    }>('SELECT id, title, done FROM tasks WHERE id = $1');
+    let preparedRows: Array<{done: boolean; id: number; title: string}> = [];
+    try {
+      preparedRows = [
+        ...(await taskById.execute([1])).rows,
+        ...(await taskById.execute([2])).rows,
+      ];
+    } finally {
+      await taskById.close();
+    }
 
     const stagedRows = await connection.client.transaction(
       async (transaction) => {
@@ -373,6 +389,8 @@ async function writableDatabaseProbe(databaseName: string): Promise<{
         insertRows,
         invalidations: events,
         orderedRows: ordered.rows,
+        preparedClosed: taskById.closed,
+        preparedRows,
         reopenedRevision: result.revision,
         reopenedPriorities: priorities.rows,
         reopenedRows: result.rows.sort((left, right) => left.id - right.id),

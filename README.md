@@ -14,6 +14,7 @@ The first proof of concept deliberately does a small number of things:
 - owns an in-memory or opt-in persistent database inside a dedicated Web Worker;
 - evaluates a documented subset of PostgreSQL-shaped SQL in Rust/WASM;
 - supports typed tables, atomic DDL/DML, and staged transactions;
+- prepares reusable reads and row mutations for repeated parameter binding;
 - persists the same page-native format in memory or one OPFS file;
 - applies explicit table replacements and row-change batches atomically; and
 - emits table-level invalidations so an application can re-query.
@@ -88,23 +89,29 @@ await db.exec(`
   ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;
 `);
 
-const inserted = await db.query<Task>(
+const insertTask = await db.prepare<Task>(
   `INSERT INTO tasks (id, title, metadata)
    VALUES ($1, $2, $3)
-   RETURNING *`,
-  [1, "Ship TinyGres", { priority: "high" }],
+   RETURNING id, title, done`,
 );
+const inserted = await insertTask.execute([
+  1,
+  "Ship TinyGres",
+  { priority: "high" },
+]);
 
 await db.transaction(async (tx) => {
   await tx.query("UPDATE tasks SET done = true WHERE id = $1", [1]);
-  await tx.query("INSERT INTO tasks (id, title) VALUES ($1, $2)", [
+  await tx.execute(insertTask, [
     2,
     "Survives the same atomic commit",
+    null,
   ]);
   // Queries inside the callback see staged rows. Other state is published only
   // after the callback and its outstanding operations complete successfully.
   console.log((await tx.query<Task>("SELECT * FROM tasks")).rows);
 });
+await insertTask.close();
 
 const summary = await db.query<{
   done: boolean;
@@ -139,6 +146,28 @@ transaction object's `exec()` groups DML and reads as one savepoint: a failure
 installs none of that script's changes. The transaction object must not escape
 its callback. It also exposes `rollback()` and a read-only `closed` property.
 
+`prepare<Row>(sql)` parses and retains exactly one `SELECT`, aggregate, join,
+`INSERT`, `UPDATE`, or `DELETE` statement in the Worker. The returned prepared
+statement's `execute(params?, options?)` method binds a new exact parameter list
+without reparsing the SQL and returns the same result shape as `query()`.
+Prepared DDL and scripts are rejected; keep DDL in standalone `query()` calls or
+parameter-free `exec()` scripts.
+
+A prepared statement executes against the live catalog and transaction view on
+every call. Compatible schema changes are transparent, while an incompatible
+change produces the ordinary current table, column, or type error without
+permanently invalidating the handle. Prepare handles before entering a callback
+transaction and use `tx.execute(statement, params?, options?)` inside it. Direct
+prepare, execute, and prepared-statement close operations are blocked while that
+client's transaction callback is active.
+
+Prepared statements belong to one open client and are neither persistent nor
+transferable to another client. `statement.close()` is asynchronous and
+idempotent; it seals the handle immediately and waits for its already-started
+executions before releasing Worker resources. `db.close()` closes every
+remaining handle. One client may retain at most 128 prepared statements and 8
+MiB of prepared-statement state at once.
+
 For callers that already hold complete JSON rows, `replaceTable(schema, rows)`
 atomically replaces one table and `applyBatch({changes})` atomically applies
 explicit `upsert` and `delete` operations. These are local database operations;
@@ -152,8 +181,10 @@ safe to import during server rendering; the worker is only constructed when
 `create()` is called in a browser.
 
 `query(sql, params?, options?)` returns one result for one read or write
-statement. `exec(sql, options?)` accepts no parameters and returns one result
-per statement. Results have the familiar `{rows, fields, affectedRows,
+statement. `prepare<Row>(sql)` returns a reusable statement whose
+`execute(params?, options?)` method has the same result contract.
+`exec(sql, options?)` accepts no parameters and returns one result per
+statement. Results have the familiar `{rows, fields, affectedRows,
 command, rowCount}` shape; `revision` and `tables` are additive TinyGres
 metadata. `rowMode: "array"` is supported alongside the default object rows,
 and `sql` is a parameterizing tagged-template form of `query()`. `rowMode` is
@@ -268,9 +299,9 @@ statement-and-keyword matrix, predicate and type matrices, transaction and
 concurrency differences, unsupported feature families, and hard operational
 limits. The summary below describes the main implemented slice.
 
-`query()` accepts one statement at a time, while `exec()` accepts a bounded
-parameter-free script and runs it as one implicit transaction. `SELECT`
-supports:
+`query()` accepts one statement at a time, `prepare()` retains one reusable read
+or row-mutation statement, and `exec()` accepts a bounded parameter-free script
+and runs it as one implicit transaction. `SELECT` supports:
 
 - one unqualified or two-part table name;
 - `*` or a list of simple column names;
@@ -398,17 +429,18 @@ npm run test:package    # pack dist and install it in a clean Vite app
 npm run check:size      # hard 1 MiB page-native WASM gate
 ```
 
-The browser tests initialize the real module Worker, query, apply an atomic row
-change, receive an invalidation, and re-query, plus exercise persistence through
-a real dedicated Worker and OPFS restart. The writable proof creates a typed
-table, inserts and updates inside a transaction, verifies rollback after a
-constraint failure, closes the Worker, and reopens the committed state.
+The browser tests initialize the real module Worker, query, prepare and reuse
+statements, apply atomic row changes, receive invalidations, and re-query, plus
+exercise persistence through a real dedicated Worker and OPFS restart. The
+writable proof creates a typed table, inserts and updates inside a transaction,
+verifies rollback after a constraint failure, closes the Worker, and reopens the
+committed state.
 
 The packed-package test separately proves SSR-safe import, declarations, a
 production Vite build, and real browser execution through both the packaged
-default worker and an application-owned worker. It covers memory and fresh OPFS
-write/reopen flows in both modes and installs the tarball rather than resolving
-TinyGres through a workspace link.
+default worker and an application-owned worker. It covers prepared reads and
+writes, memory and fresh OPFS write/reopen flows in both modes, and installs the
+tarball rather than resolving TinyGres through a workspace link.
 
 The single page-native WASM artifact has a hard uncompressed limit of 1 MiB.
 The check is intentionally independent of gzip size so compression cannot hide

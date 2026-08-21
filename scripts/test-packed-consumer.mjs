@@ -464,6 +464,7 @@ async function exercise(page, url) {
   const text = await waitForConsumerResult(page, 'packed consumer');
   const result = JSON.parse(text ?? 'null');
   if (
+    result.preparedClosed !== true ||
     result.initialRevision !== 2 ||
     result.initialTitle !== 'from packed insert' ||
     result.changedRevision !== 3 ||
@@ -488,7 +489,11 @@ async function exercisePersisted(page, url) {
   await page.goto(url);
   const text = await waitForConsumerResult(page, 'packed OPFS restart');
   const result = JSON.parse(text ?? 'null');
-  if (result.revision !== 3 || result.title !== 'from packed update') {
+  if (
+    result.preparedClosed !== true ||
+    result.revision !== 3 ||
+    result.title !== 'from packed update'
+  ) {
     throw new Error(`Unexpected packed OPFS restart result: ${text}`);
   }
   return result;

@@ -39,6 +39,11 @@ test('writes, transacts, rolls back, and reopens through Worker/WASM/OPFS', asyn
     {id: 3, title: 'Rollback safely', done: false},
     {id: 2, title: 'Persist it', done: false},
   ]);
+  expect(report.preparedRows).toEqual([
+    {id: 1, title: 'Ship writable SQL', done: false},
+    {id: 2, title: 'Persist it', done: false},
+  ]);
+  expect(report.preparedClosed).toBe(true);
   expect(report.committedRevision).toBe(2);
   expect(report.reopenedRevision).toBe(2);
   expect(report.reopenedPriorities).toEqual([

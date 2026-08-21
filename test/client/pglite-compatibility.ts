@@ -16,6 +16,7 @@ import {
   create,
   type ClientOptions,
   type JsonValue,
+  type PreparedStatement,
   type QueryOptions,
   type ResultField,
   type Results,
@@ -142,19 +143,31 @@ async function representativeUsage(): Promise<void> {
     'CREATE TABLE tasks (id INTEGER PRIMARY KEY); SELECT id FROM tasks;',
     {rowMode: 'object'},
   );
+  const prepared: PreparedStatement<{id: number}> = await transient.prepare(
+    'SELECT id FROM tasks WHERE id = $1',
+  );
+  const preparedResult = await prepared.execute([1]);
 
   const callbackResult = await transient.transaction(async (tx) => {
     const result = await tx.query<{id: number}>('SELECT id FROM tasks');
     const tagged = await tx.sql<{id: number}>`SELECT id FROM tasks`;
     const script = await tx.exec('SELECT id FROM tasks');
+    const preparedInTransaction = await tx.execute(prepared, [1]);
     await tx.rollback();
     const transactionClosed: boolean = tx.closed;
-    return {result, tagged, script, transactionClosed};
+    return {
+      result,
+      tagged,
+      script,
+      preparedInTransaction,
+      transactionClosed,
+    };
   });
 
   await transient.waitReady;
   const ready: boolean = transient.ready;
   const closed: boolean = transient.closed;
+  await prepared.close();
   await transient.close();
 
   void [
@@ -166,6 +179,7 @@ async function representativeUsage(): Promise<void> {
     arrayResult.rows,
     taggedResult.rows,
     scriptResults,
+    preparedResult.rows,
     callbackResult,
     ready,
     closed,

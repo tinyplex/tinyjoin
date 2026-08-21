@@ -3,6 +3,7 @@ import {describe, expect, it, vi} from 'vitest';
 import {
   Client,
   create,
+  type PreparedStatement,
   type Transaction,
 } from '../../src/client/client.ts';
 import {PROTOCOL_VERSION, type WorkerRequest} from '../../src/protocol.ts';
@@ -38,6 +39,8 @@ function writableWorker(): FakeWorker {
   const worker = new FakeWorker();
   let revision = 0;
   let nextTransactionId = 1;
+  let nextStatementId = 1;
+  const preparedSql = new Map<number, string>();
   worker.onPost = (message) => {
     queueMicrotask(() => {
       if (message.method === 'init') {
@@ -62,6 +65,30 @@ function writableWorker(): FakeWorker {
             : [],
           tables: writes ? ['posts'] : [],
         });
+      } else if (message.method === 'prepareSql') {
+        const statementId = nextStatementId++;
+        preparedSql.set(statementId, message.params.sql);
+        respondOk(worker, message, {statementId});
+      } else if (message.method === 'executePrepared') {
+        const command = sqlCommand(
+          preparedSql.get(message.params.statementId) ?? 'SELECT',
+        );
+        const writes = /^(?:DELETE|INSERT|UPDATE)$/.test(command);
+        if (writes && message.params.transactionId === undefined) {
+          revision += 1;
+        }
+        const isSelect = command === 'SELECT';
+        respondOk(worker, message, {
+          command,
+          fields: isSelect ? ID_FIELD : [],
+          revision,
+          rowCount: 1,
+          rows: isSelect ? [{id: message.params.params[0] ?? 1}] : [],
+          tables: writes ? ['posts'] : [],
+        });
+      } else if (message.method === 'closePrepared') {
+        preparedSql.delete(message.params.statementId);
+        respondOk(worker, message, undefined);
       } else if (message.method === 'execSql') {
         if (message.params.transactionId === undefined) {
           revision += 1;
@@ -319,6 +346,384 @@ describe('Client', () => {
       tables: [],
     });
     await client.close();
+  });
+
+  it('prepares reusable statements and closes them idempotently', async () => {
+    const worker = writableWorker();
+    const client = await create({worker});
+    const statement = await client.prepare<{id: number}>(
+      'SELECT id FROM posts WHERE id = $1',
+    );
+
+    expect(statement.closed).toBe(false);
+    expect(
+      (worker.posted[1] as Extract<WorkerRequest, {method: 'prepareSql'}>)
+        .params,
+    ).toEqual({sql: 'SELECT id FROM posts WHERE id = $1'});
+    await expect(statement.execute([7])).resolves.toMatchObject({
+      command: 'SELECT',
+      rows: [{id: 7}],
+      rowCount: 1,
+    });
+    expect(
+      (worker.posted[2] as Extract<WorkerRequest, {method: 'executePrepared'}>)
+        .params,
+    ).toEqual({statementId: 1, params: [7]});
+
+    const firstClose = statement.close();
+    const secondClose = statement.close();
+    expect(statement.closed).toBe(true);
+    expect(secondClose).toBe(firstClose);
+    await firstClose;
+    expect(
+      (worker.posted[3] as Extract<WorkerRequest, {method: 'closePrepared'}>)
+        .params,
+    ).toEqual({statementId: 1});
+    const requestCount = worker.posted.length;
+    await expect(statement.execute([8])).rejects.toMatchObject({
+      code: 'PREPARED_STATEMENT_CLOSED',
+    });
+    await statement.close();
+    expect(worker.posted).toHaveLength(requestCount);
+    await client.close();
+  });
+
+  it('allows prepared execution only through the active transaction object', async () => {
+    const worker = writableWorker();
+    const client = await create({worker});
+    const statement = await client.prepare(
+      'UPDATE posts SET title = $1 WHERE id = $2',
+    );
+
+    await client.transaction(async (transaction) => {
+      await expect(client.prepare('SELECT id FROM posts')).rejects.toMatchObject({
+        code: 'TRANSACTION_ACTIVE',
+      });
+      await expect(statement.execute(['direct', 1])).rejects.toMatchObject({
+        code: 'TRANSACTION_ACTIVE',
+      });
+      await expect(statement.close()).rejects.toMatchObject({
+        code: 'TRANSACTION_ACTIVE',
+      });
+      expect(statement.closed).toBe(false);
+      void transaction.execute(statement, ['transaction', 1]);
+    });
+
+    const methods = (worker.posted as WorkerRequest[]).map(
+      (request) => request.method,
+    );
+    expect(methods).toContain('executePrepared');
+    expect(methods.indexOf('executePrepared')).toBeLessThan(
+      methods.indexOf('commitTransaction'),
+    );
+    const execution = (worker.posted as WorkerRequest[]).find(
+      (request): request is Extract<WorkerRequest, {method: 'executePrepared'}> =>
+        request.method === 'executePrepared',
+    );
+    expect(execution?.params).toEqual({
+      statementId: 1,
+      params: ['transaction', 1],
+      transactionId: 'tx-1',
+    });
+    await statement.close();
+    await client.close();
+  });
+
+  it('keeps caught prepared failures inside the transaction callback recoverable', async () => {
+    const worker = writableWorker();
+    const originalOnPost = worker.onPost!;
+    worker.onPost = (message) => {
+      if (message.method !== 'executePrepared') {
+        originalOnPost(message);
+        return;
+      }
+      queueMicrotask(() =>
+        worker.respond({
+          v: PROTOCOL_VERSION,
+          id: message.id,
+          ok: false,
+          error: {code: 'BIND_ERROR', message: 'bad prepared parameters'},
+        }),
+      );
+    };
+    const client = await create({worker});
+    const statement = await client.prepare('UPDATE posts SET title = $1');
+
+    await client.transaction(async (transaction) => {
+      await expect(transaction.execute(statement, [1])).rejects.toMatchObject({
+        code: 'BIND_ERROR',
+      });
+      await transaction.query('SELECT id FROM posts');
+    });
+    expect(transactionMethods(worker)).toEqual([
+      'beginTransaction',
+      'executePrepared',
+      'executeSql',
+      'commitTransaction',
+    ]);
+    await statement.close();
+    await client.close();
+  });
+
+  it('orders statement close after in-flight execution', async () => {
+    const worker = new FakeWorker();
+    let execution:
+      | Extract<WorkerRequest, {method: 'executePrepared'}>
+      | undefined;
+    let statementClose:
+      | Extract<WorkerRequest, {method: 'closePrepared'}>
+      | undefined;
+    worker.onPost = (message) => {
+      if (message.method === 'init') {
+        queueMicrotask(() => respondOk(worker, message, {revision: 0}));
+      } else if (message.method === 'prepareSql') {
+        queueMicrotask(() => respondOk(worker, message, {statementId: 1}));
+      } else if (message.method === 'executePrepared') {
+        execution = message;
+      } else if (message.method === 'closePrepared') {
+        statementClose = message;
+      } else if (message.method === 'close') {
+        queueMicrotask(() => respondOk(worker, message, undefined));
+      }
+    };
+    const client = await create({worker});
+    const statement = await client.prepare<{id: number}>(
+      'SELECT id FROM posts WHERE id = $1',
+    );
+    const pending = statement.execute([4]);
+    await vi.waitFor(() => expect(execution).toBeDefined());
+
+    const firstClose = statement.close();
+    expect(statement.closed).toBe(true);
+    expect(statementClose).toBeUndefined();
+    respondOk(worker, execution!, {
+      command: 'SELECT',
+      fields: ID_FIELD,
+      revision: 0,
+      rowCount: 1,
+      rows: [{id: 4}],
+      tables: [],
+    });
+    await pending;
+    await vi.waitFor(() => expect(statementClose).toBeDefined());
+    respondOk(worker, statementClose!, undefined);
+    await firstClose;
+    await client.close();
+  });
+
+  it('finishes an accepted statement close before beginning a transaction', async () => {
+    const worker = new FakeWorker();
+    let execution:
+      | Extract<WorkerRequest, {method: 'executePrepared'}>
+      | undefined;
+    let statementClose:
+      | Extract<WorkerRequest, {method: 'closePrepared'}>
+      | undefined;
+    let begin:
+      | Extract<WorkerRequest, {method: 'beginTransaction'}>
+      | undefined;
+    let commit:
+      | Extract<WorkerRequest, {method: 'commitTransaction'}>
+      | undefined;
+    worker.onPost = (message) => {
+      if (message.method === 'init') {
+        queueMicrotask(() => respondOk(worker, message, {revision: 0}));
+      } else if (message.method === 'prepareSql') {
+        queueMicrotask(() => respondOk(worker, message, {statementId: 1}));
+      } else if (message.method === 'executePrepared') {
+        execution = message;
+      } else if (message.method === 'closePrepared') {
+        statementClose = message;
+      } else if (message.method === 'beginTransaction') {
+        begin = message;
+      } else if (message.method === 'commitTransaction') {
+        commit = message;
+      } else if (message.method === 'close') {
+        queueMicrotask(() => respondOk(worker, message, undefined));
+      }
+    };
+    const client = await create({worker});
+    const statement = await client.prepare('SELECT id FROM posts');
+    const executionPromise = statement.execute();
+    await vi.waitFor(() => expect(execution).toBeDefined());
+
+    const closePromise = statement.close();
+    const transactionPromise = client.transaction(() => undefined);
+    await new Promise<void>((resolve) => queueMicrotask(resolve));
+    expect(begin).toBeUndefined();
+
+    respondOk(worker, execution!, {
+      command: 'SELECT',
+      fields: ID_FIELD,
+      revision: 0,
+      rowCount: 1,
+      rows: [{id: 1}],
+      tables: [],
+    });
+    await executionPromise;
+    await vi.waitFor(() => expect(statementClose).toBeDefined());
+    expect(begin).toBeUndefined();
+
+    respondOk(worker, statementClose!, undefined);
+    await closePromise;
+    await vi.waitFor(() => expect(begin).toBeDefined());
+    respondOk(worker, begin!, {transactionId: 'tx-1'});
+    await vi.waitFor(() => expect(commit).toBeDefined());
+    respondOk(worker, commit!, {revision: 0, tables: []});
+    await transactionPromise;
+    expect(
+      (worker.posted as WorkerRequest[]).map((request) => request.method),
+    ).toEqual([
+      'init',
+      'prepareSql',
+      'executePrepared',
+      'closePrepared',
+      'beginTransaction',
+      'commitTransaction',
+    ]);
+    await client.close();
+  });
+
+  it('settles failed closes without weakening the transaction reservation', async () => {
+    const worker = new FakeWorker();
+    let nextStatementId = 1;
+    let failedClose:
+      | Extract<WorkerRequest, {method: 'closePrepared'}>
+      | undefined;
+    let begin:
+      | Extract<WorkerRequest, {method: 'beginTransaction'}>
+      | undefined;
+    let commit:
+      | Extract<WorkerRequest, {method: 'commitTransaction'}>
+      | undefined;
+    worker.onPost = (message) => {
+      if (message.method === 'init') {
+        queueMicrotask(() => respondOk(worker, message, {revision: 0}));
+      } else if (message.method === 'prepareSql') {
+        const statementId = nextStatementId++;
+        queueMicrotask(() => respondOk(worker, message, {statementId}));
+      } else if (
+        message.method === 'closePrepared' &&
+        message.params.statementId === 1
+      ) {
+        failedClose = message;
+      } else if (message.method === 'closePrepared') {
+        queueMicrotask(() => respondOk(worker, message, undefined));
+      } else if (message.method === 'beginTransaction') {
+        begin = message;
+      } else if (message.method === 'commitTransaction') {
+        commit = message;
+      } else if (message.method === 'close') {
+        queueMicrotask(() => respondOk(worker, message, undefined));
+      }
+    };
+    const client = await create({worker});
+    const first = await client.prepare('SELECT id FROM posts');
+    const second = await client.prepare('SELECT id FROM posts');
+
+    const closing = first.close();
+    const transaction = client.transaction(() => undefined);
+    await vi.waitFor(() => expect(failedClose).toBeDefined());
+    expect(begin).toBeUndefined();
+    worker.respond({
+      v: PROTOCOL_VERSION,
+      id: failedClose!.id,
+      ok: false,
+      error: {code: 'PREPARED_CLOSE_FAILED', message: 'close failed'},
+    });
+    await expect(closing).rejects.toMatchObject({
+      code: 'PREPARED_CLOSE_FAILED',
+    });
+
+    await vi.waitFor(() => expect(begin).toBeDefined());
+    await expect(second.close()).rejects.toMatchObject({
+      code: 'TRANSACTION_ACTIVE',
+    });
+    expect(second.closed).toBe(false);
+    respondOk(worker, begin!, {transactionId: 'tx-1'});
+    await vi.waitFor(() => expect(commit).toBeDefined());
+    respondOk(worker, commit!, {revision: 0, tables: []});
+    await transaction;
+
+    await second.close();
+    await client.close();
+  });
+
+  it('rejects forged, foreign, escaped, and client-closed statement use', async () => {
+    const firstWorker = writableWorker();
+    const secondWorker = writableWorker();
+    const firstClient = await create({worker: firstWorker});
+    const secondClient = await create({worker: secondWorker});
+    const statement = await firstClient.prepare('SELECT id FROM posts');
+    const forged = {
+      execute: vi.fn(),
+      close: vi.fn(),
+      closed: false,
+    } as unknown as PreparedStatement;
+    let escaped: Transaction | undefined;
+
+    await expect(
+      statement.execute.call(forged, []),
+    ).rejects.toMatchObject({code: 'INVALID_PREPARED_STATEMENT'});
+    await expect(statement.close.call(forged)).rejects.toMatchObject({
+      code: 'INVALID_PREPARED_STATEMENT',
+    });
+    await secondClient.transaction((transaction) => {
+      escaped = transaction;
+      expect(() => transaction.execute(statement)).toThrowError(
+        expect.objectContaining({code: 'PREPARED_STATEMENT_CLIENT_MISMATCH'}),
+      );
+      expect(() => transaction.execute(forged)).toThrowError(
+        expect.objectContaining({code: 'INVALID_PREPARED_STATEMENT'}),
+      );
+    });
+    expect(() => escaped!.execute(statement)).toThrowError(
+      expect.objectContaining({code: 'TRANSACTION_CLOSED'}),
+    );
+
+    const firstClose = firstClient.close();
+    expect(statement.closed).toBe(true);
+    await firstClose;
+    await expect(statement.execute()).rejects.toMatchObject({
+      code: 'CLIENT_CLOSED',
+    });
+    await expect(statement.close()).resolves.toBeUndefined();
+    expect(
+      (firstWorker.posted as WorkerRequest[]).some(
+        (request) => request.method === 'closePrepared',
+      ),
+    ).toBe(false);
+    await secondClient.close();
+  });
+
+  it('rejects a prepare result that races client close', async () => {
+    const worker = new FakeWorker();
+    let prepareRequest: Extract<WorkerRequest, {method: 'prepareSql'}> | undefined;
+    let closeRequest: Extract<WorkerRequest, {method: 'close'}> | undefined;
+    worker.onPost = (message) => {
+      if (message.method === 'init') {
+        queueMicrotask(() => respondOk(worker, message, {revision: 0}));
+      } else if (message.method === 'prepareSql') {
+        prepareRequest = message;
+      } else if (message.method === 'close') {
+        closeRequest = message;
+      }
+    };
+    const client = await create({worker});
+    const preparing = client.prepare('SELECT id FROM posts');
+    await vi.waitFor(() => expect(prepareRequest).toBeDefined());
+    const closing = client.close();
+    await vi.waitFor(() => expect(closeRequest).toBeDefined());
+
+    respondOk(worker, prepareRequest!, {statementId: 1});
+    await expect(preparing).rejects.toMatchObject({code: 'CLIENT_CLOSED'});
+    respondOk(worker, closeRequest!, undefined);
+    await closing;
+    expect(
+      (worker.posted as WorkerRequest[]).some(
+        (request) => request.method === 'closePrepared',
+      ),
+    ).toBe(false);
   });
 
   it('parameterizes sql tagged-template values without interpolation', async () => {
@@ -649,6 +1054,7 @@ function transactionMethods(worker: FakeWorker): string[] {
       [
         'beginTransaction',
         'executeSql',
+        'executePrepared',
         'commitTransaction',
         'rollbackTransaction',
       ].includes(message.method),

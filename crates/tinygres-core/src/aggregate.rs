@@ -116,6 +116,25 @@ pub(crate) fn parse_sql(sql: &str, params: &[Value]) -> Result<AggregatePlan> {
     Parser::new(tokenize(sql)?, params).parse()
 }
 
+pub(crate) fn bind_plan_parameters(
+    plan: &AggregatePlan,
+    params: &[Value],
+    limit_parameter: Option<usize>,
+    offset_parameter: Option<usize>,
+) -> Result<AggregatePlan> {
+    let mut plan = plan.clone();
+    crate::query::bind_predicate_parameters(plan.predicate.as_mut(), params)?;
+    if let Some(index) = limit_parameter {
+        plan.limit = Some(crate::query::bind_nonnegative_integer_parameter(
+            index, params,
+        )?);
+    }
+    if let Some(index) = offset_parameter {
+        plan.offset = crate::query::bind_nonnegative_integer_parameter(index, params)?;
+    }
+    Ok(plan)
+}
+
 pub(crate) fn execute(storage: &dyn StorageReader, plan: &AggregatePlan) -> Result<QueryResult> {
     let schema = storage.table_schema(&plan.table)?;
     validate_plan(plan, &schema)?;
@@ -1204,6 +1223,9 @@ impl<'a> Parser<'a> {
 
     fn parse_limit(&mut self) -> Result<usize> {
         let value = self.parse_value()?;
+        if crate::query::prepared_parameter_index(&value).is_some() {
+            return Ok(0);
+        }
         let Value::Number(number) = value else {
             return Err(EngineError::invalid_query(
                 "LIMIT and OFFSET must be non-negative integers",

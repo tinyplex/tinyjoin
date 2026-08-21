@@ -26,6 +26,7 @@ const MAX_DML_WORK_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DML_RESULT_BYTES: usize = 16 * 1024 * 1024;
 const DML_CHANGE_RETAINED_BYTES: usize = 96;
 
+#[derive(Clone, Debug)]
 pub(crate) enum Statement {
     Select(QueryPlan),
     Aggregate(crate::aggregate::AggregatePlan),
@@ -33,6 +34,7 @@ pub(crate) enum Statement {
     Write(WriteStatement),
 }
 
+#[derive(Clone, Debug)]
 pub(crate) enum WriteStatement {
     CreateTable {
         schema: TableSchema,

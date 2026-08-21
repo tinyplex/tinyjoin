@@ -19,7 +19,7 @@ const MAX_FILTERS: usize = 256;
 const MAX_PREDICATE_DEPTH: usize = 32;
 const MAX_IN_VALUES: usize = 1024;
 const MAX_ORDER_COLUMNS: usize = 32;
-const MAX_PARAMETERS: usize = 1024;
+pub(crate) const MAX_SQL_PARAMETERS: usize = 1024;
 const MAX_COMMENT_DEPTH: usize = 32;
 const MAX_RESULT_ROWS: usize = 100_000;
 const MAX_QUERY_RESULT_BYTES: usize = 16 * 1024 * 1024;
@@ -386,9 +386,13 @@ pub(crate) fn validate_sql_input(sql: &str, params: &[Value]) -> Result<()> {
             "SQL text exceeds the {MAX_SQL_BYTES}-byte limit"
         )));
     }
-    if params.len() > MAX_PARAMETERS {
+    validate_sql_parameters(params)
+}
+
+pub(crate) fn validate_sql_parameters(params: &[Value]) -> Result<()> {
+    if params.len() > MAX_SQL_PARAMETERS {
         return Err(EngineError::invalid_query(format!(
-            "A SQL query cannot receive more than {MAX_PARAMETERS} parameters"
+            "A SQL query cannot receive more than {MAX_SQL_PARAMETERS} parameters"
         )));
     }
     for value in params {
@@ -854,6 +858,9 @@ impl<'a> SqlParser<'a> {
 
     fn parse_limit(&mut self) -> Result<usize> {
         let value = self.parse_value()?;
+        if prepared_parameter_index(&value).is_some() {
+            return Ok(0);
+        }
         let Value::Number(number) = value else {
             return Err(EngineError::invalid_query(
                 "LIMIT must be a non-negative integer",
@@ -1306,6 +1313,14 @@ pub(crate) fn is_reserved_keyword(identifier: &str) -> bool {
 
 pub(crate) fn bind_parameter(index: &str, params: &[Value]) -> Result<Value> {
     let placeholder = format!("${index}");
+    let index = parameter_index(index)?;
+    params.get(index - 1).cloned().ok_or_else(|| {
+        EngineError::bind_error(format!("No value was provided for `{placeholder}`"))
+    })
+}
+
+pub(crate) fn parameter_index(index: &str) -> Result<usize> {
+    let placeholder = format!("${index}");
     let index = index.parse::<usize>().map_err(|_| {
         EngineError::bind_error(format!("Invalid parameter placeholder `{placeholder}`"))
     })?;
@@ -1314,9 +1329,97 @@ pub(crate) fn bind_parameter(index: &str, params: &[Value]) -> Result<Value> {
             "PostgreSQL parameter indexes start at $1",
         ));
     }
-    params.get(index - 1).cloned().ok_or_else(|| {
-        EngineError::bind_error(format!("No value was provided for `{placeholder}`"))
-    })
+    Ok(index)
+}
+
+const PREPARED_PARAMETER_KEY: &str = "\0tinygres:parameter";
+
+pub(crate) fn prepared_parameter_marker(index: usize) -> Value {
+    Value::Object(Map::from_iter([(
+        PREPARED_PARAMETER_KEY.to_owned(),
+        Value::Number((index as u64).into()),
+    )]))
+}
+
+pub(crate) fn prepared_parameter_index(value: &Value) -> Option<usize> {
+    let Value::Object(object) = value else {
+        return None;
+    };
+    if object.len() != 1 {
+        return None;
+    }
+    object
+        .get(PREPARED_PARAMETER_KEY)?
+        .as_u64()
+        .and_then(|index| usize::try_from(index).ok())
+        .filter(|index| *index != 0)
+}
+
+pub(crate) fn bind_query_plan_parameters(
+    plan: &QueryPlan,
+    params: &[Value],
+    limit_parameter: Option<usize>,
+    offset_parameter: Option<usize>,
+) -> Result<QueryPlan> {
+    let mut plan = plan.clone();
+    for filter in &mut plan.filters {
+        bind_prepared_value(&mut filter.value, params)?;
+    }
+    bind_predicate_parameters(plan.predicate.as_mut(), params)?;
+    if let Some(index) = limit_parameter {
+        plan.limit = Some(bind_nonnegative_integer_parameter(index, params)?);
+    }
+    if let Some(index) = offset_parameter {
+        plan.offset = bind_nonnegative_integer_parameter(index, params)?;
+    }
+    Ok(plan)
+}
+
+pub(crate) fn bind_predicate_parameters(
+    predicate: Option<&mut Predicate>,
+    params: &[Value],
+) -> Result<()> {
+    let Some(predicate) = predicate else {
+        return Ok(());
+    };
+    match predicate {
+        Predicate::Comparison { value, .. } => bind_prepared_value(value, params),
+        Predicate::In { values, .. } => {
+            for value in values {
+                bind_prepared_value(value, params)?;
+            }
+            Ok(())
+        }
+        Predicate::And { predicates } | Predicate::Or { predicates } => {
+            for predicate in predicates {
+                bind_predicate_parameters(Some(predicate), params)?;
+            }
+            Ok(())
+        }
+        Predicate::Not { predicate } => bind_predicate_parameters(Some(predicate), params),
+        Predicate::IsNull { .. } => Ok(()),
+    }
+}
+
+pub(crate) fn bind_prepared_value(value: &mut Value, params: &[Value]) -> Result<()> {
+    let Some(index) = prepared_parameter_index(value) else {
+        return Ok(());
+    };
+    *value = params.get(index - 1).cloned().ok_or_else(|| {
+        EngineError::new(
+            "INTERNAL_ERROR",
+            "Prepared statement parameter metadata is inconsistent",
+        )
+    })?;
+    Ok(())
+}
+
+pub(crate) fn bind_nonnegative_integer_parameter(index: usize, params: &[Value]) -> Result<usize> {
+    params
+        .get(index - 1)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| EngineError::invalid_query("LIMIT and OFFSET must be non-negative integers"))
 }
 
 pub(crate) fn matches_filters(row: &Row, filters: &[Filter], table: &str) -> Result<bool> {
@@ -2773,7 +2876,7 @@ mod tests {
         let too_long = "x".repeat(MAX_SQL_BYTES + 1);
         assert_eq!(parse_sql(&too_long, &[]).unwrap_err().code, "INVALID_QUERY");
 
-        let too_many_params = vec![Value::Null; MAX_PARAMETERS + 1];
+        let too_many_params = vec![Value::Null; MAX_SQL_PARAMETERS + 1];
         assert_eq!(
             parse_sql("SELECT * FROM posts", &too_many_params)
                 .unwrap_err()

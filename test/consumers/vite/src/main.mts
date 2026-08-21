@@ -38,15 +38,19 @@ async function run(
   persistence: string | null,
 ): Promise<void> {
   const database = await create(clientOptions);
+  const closeStatements: Array<() => Promise<void>> = [];
   let succeeded = false;
 
   try {
     if (persistence === 'read') {
-      const restored = await database.query<Post>(
+      const restoredById = await database.prepare<Post>(
         'SELECT id, title FROM posts WHERE id = $1',
-        [1],
       );
+      closeStatements.push(() => restoredById.close());
+      const restored = await restoredById.execute([1]);
+      await restoredById.close();
       resultElement.textContent = JSON.stringify({
+        preparedClosed: restoredById.closed,
         worker: workerMode,
         revision: restored.revision,
         title: restored.rows[0]?.title,
@@ -62,14 +66,22 @@ async function run(
         title TEXT NOT NULL
       )
     `);
-    await database.query('INSERT INTO posts (id, title) VALUES ($1, $2)', [
-      1,
-      'from packed insert',
-    ]);
-    const before = await database.query<Post>(
-      'SELECT id, title FROM posts WHERE id = $1',
-      [1],
+    const insertPost = await database.prepare(
+      'INSERT INTO posts (id, title) VALUES ($1, $2)',
     );
+    const postById = await database.prepare<Post>(
+      'SELECT id, title FROM posts WHERE id = $1',
+    );
+    const updatePost = await database.prepare(
+      'UPDATE posts SET title = $1 WHERE id = $2',
+    );
+    closeStatements.push(
+      () => insertPost.close(),
+      () => postById.close(),
+      () => updatePost.close(),
+    );
+    await insertPost.execute([1, 'from packed insert']);
+    const before = await postById.execute([1]);
 
     const invalidated = new Promise<{revision: number; title: string}>(
       (resolve, reject) => {
@@ -94,13 +106,17 @@ async function run(
       },
     );
 
-    await database.query('UPDATE posts SET title = $1 WHERE id = $2', [
-      'from packed update',
-      1,
-    ]);
+    await database.transaction((transaction) =>
+      transaction.execute(updatePost, ['from packed update', 1]),
+    );
     const after = await invalidated;
+    await insertPost.close();
+    await postById.close();
+    await updatePost.close();
 
     const payload = {
+      preparedClosed:
+        insertPost.closed && postById.closed && updatePost.closed,
       worker: workerMode,
       initialRevision: before.revision,
       initialTitle: before.rows[0]?.title,
@@ -111,7 +127,13 @@ async function run(
     body.dataset.worker = workerMode;
     succeeded = true;
   } finally {
-    await database.close();
+    try {
+      for (const closeStatement of closeStatements) {
+        await closeStatement();
+      }
+    } finally {
+      await database.close();
+    }
     if (succeeded) {
       body.dataset.closed = 'true';
       body.dataset.status = 'passed';

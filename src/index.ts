@@ -4,6 +4,7 @@ export type {
   TablesChangedEvent,
   ClientOptions,
   DataDir,
+  PreparedStatement,
   Transaction,
 } from './client/client.js';
 export {ClientError} from './client/error.js';

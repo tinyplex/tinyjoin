@@ -81,6 +81,24 @@ function mockEngine() {
         tables: [table],
       };
     }),
+    prepareSql: vi.fn(() => 1),
+    executePrepared: vi.fn((_statementId, params) => {
+      const table = 'posts';
+      if (transactionActive) {
+        transactionTables.add(table);
+      } else {
+        revision += 1;
+      }
+      return {
+        command: 'UPDATE',
+        fields: [],
+        revision,
+        rowCount: params.length,
+        rows: [],
+        tables: [table],
+      };
+    }),
+    closePrepared: vi.fn(),
     execSql: vi.fn(() => {
       const table = 'posts';
       if (transactionActive) {
@@ -415,6 +433,116 @@ describe('startWorker', () => {
       event: 'tablesChanged',
       payload: {revision: 2, tables: ['posts']},
     });
+  });
+
+  it('prepares, executes, and closes session statements with transaction-aware invalidation', async () => {
+    const scope = new FakeScope();
+    const engine = mockEngine();
+    startWorker({scope, durableEngineFactory: async () => engine});
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 1,
+      method: 'init',
+      params: {schemas: [], storage: {kind: 'memory'}},
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 1);
+    scope.posted.length = 0;
+
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 2,
+      method: 'prepareSql',
+      params: {sql: 'UPDATE posts SET title = $1'},
+    } satisfies WorkerRequest);
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 3,
+      method: 'executePrepared',
+      params: {statementId: 1, params: ['outside']},
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 3);
+    expect(engine.prepareSql).toHaveBeenCalledWith(
+      'UPDATE posts SET title = $1',
+    );
+    expect(engine.executePrepared).toHaveBeenCalledWith(1, ['outside']);
+    expect(scope.posted).toContainEqual({
+      v: PROTOCOL_VERSION,
+      event: 'tablesChanged',
+      payload: {revision: 1, tables: ['posts']},
+    });
+
+    scope.posted.length = 0;
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 4,
+      method: 'beginTransaction',
+      params: undefined,
+    } satisfies WorkerRequest);
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 5,
+      method: 'executePrepared',
+      params: {
+        statementId: 1,
+        params: ['inside'],
+        transactionId: 'tx-1',
+      },
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 2);
+    await new Promise<void>((resolve) => queueMicrotask(resolve));
+    expect(scope.posted.some((message) => 'event' in message)).toBe(false);
+
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 6,
+      method: 'prepareSql',
+      params: {sql: 'SELECT 1'},
+    } satisfies WorkerRequest);
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 7,
+      method: 'closePrepared',
+      params: {statementId: 1},
+    } satisfies WorkerRequest);
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 8,
+      method: 'commitTransaction',
+      params: {transactionId: 'tx-1'},
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 6);
+    expect(scope.posted).toContainEqual({
+      v: PROTOCOL_VERSION,
+      id: 6,
+      ok: false,
+      error: {
+        code: 'TRANSACTION_ACTIVE',
+        message: 'A TinyGres transaction is already active',
+      },
+    });
+    expect(scope.posted).toContainEqual({
+      v: PROTOCOL_VERSION,
+      id: 7,
+      ok: false,
+      error: {
+        code: 'TRANSACTION_ACTIVE',
+        message: 'A TinyGres transaction is already active',
+      },
+    });
+    expect(engine.closePrepared).not.toHaveBeenCalled();
+    expect(scope.posted).toContainEqual({
+      v: PROTOCOL_VERSION,
+      event: 'tablesChanged',
+      payload: {revision: 2, tables: ['posts']},
+    });
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 9,
+      method: 'closePrepared',
+      params: {statementId: 1},
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 7);
+    expect(engine.closePrepared).toHaveBeenCalledWith(1);
   });
 
   it('returns every exec result and emits one combined invalidation', async () => {

@@ -18,6 +18,7 @@ mod paged_transaction;
 mod pager;
 #[cfg(test)]
 mod prepared;
+mod prepared_statement;
 mod query;
 mod revision;
 #[cfg(test)]
@@ -58,6 +59,7 @@ pub use paged_storage::PagedStorage;
 pub use pager::{Pager, PagerWriteTransaction};
 #[cfg(test)]
 pub(crate) use prepared::PreparedCommit;
+pub use prepared_statement::PreparedStatementId;
 #[cfg(test)]
 pub(crate) use storage::InMemoryStorage;
 pub use storage::{StorageDriver, StorageReader, VisitControl, VisitOutcome};

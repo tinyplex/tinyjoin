@@ -134,6 +134,25 @@ pub(crate) fn parse_sql(sql: &str, params: &[Value]) -> Result<JoinPlan> {
     Parser::new(tokenize(sql)?, params).parse()
 }
 
+pub(crate) fn bind_plan_parameters(
+    plan: &JoinPlan,
+    params: &[Value],
+    limit_parameter: Option<usize>,
+    offset_parameter: Option<usize>,
+) -> Result<JoinPlan> {
+    let mut plan = plan.clone();
+    crate::query::bind_predicate_parameters(plan.predicate.as_mut(), params)?;
+    if let Some(index) = limit_parameter {
+        plan.limit = Some(crate::query::bind_nonnegative_integer_parameter(
+            index, params,
+        )?);
+    }
+    if let Some(index) = offset_parameter {
+        plan.offset = crate::query::bind_nonnegative_integer_parameter(index, params)?;
+    }
+    Ok(plan)
+}
+
 pub(crate) fn execute(storage: &dyn StorageReader, plan: &JoinPlan) -> Result<QueryResult> {
     let mut relations = Vec::with_capacity(plan.joins.len() + 1);
     relations.push(Relation {
@@ -1352,6 +1371,9 @@ impl<'a> Parser<'a> {
                 ));
             }
         };
+        if crate::query::prepared_parameter_index(&value).is_some() {
+            return Ok(0);
+        }
         value
             .as_u64()
             .and_then(|value| usize::try_from(value).ok())

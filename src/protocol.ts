@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 5 as const;
+export const PROTOCOL_VERSION = 6 as const;
 export const MAX_QUERY_POSITION = 0xffff_ffff;
 
 export type JsonPrimitive = null | boolean | number | string;
@@ -123,6 +123,22 @@ export interface RpcMethods {
     request: {sql: string; params: JsonValue[]; transactionId?: string};
     response: SqlResult;
   };
+  prepareSql: {
+    request: {sql: string};
+    response: {statementId: number};
+  };
+  executePrepared: {
+    request: {
+      statementId: number;
+      params: JsonValue[];
+      transactionId?: string;
+    };
+    response: SqlResult;
+  };
+  closePrepared: {
+    request: {statementId: number};
+    response: undefined;
+  };
   execSql: {
     request: {sql: string; transactionId?: string};
     response: SqlResult[];
@@ -221,6 +237,7 @@ export function isRpcResult<Method extends RpcMethod>(
         isSafeNonNegativeInteger(value.revision)
       );
     case 'defineTable':
+    case 'closePrepared':
     case 'rollbackTransaction':
     case 'close':
       return value === undefined;
@@ -231,7 +248,14 @@ export function isRpcResult<Method extends RpcMethod>(
     case 'query':
       return isQueryResult(value);
     case 'executeSql':
+    case 'executePrepared':
       return isSqlResult(value);
+    case 'prepareSql':
+      return (
+        isRecord(value) &&
+        hasExactKeys(value, ['statementId']) &&
+        isPreparedStatementId(value.statementId)
+      );
     case 'execSql':
       return isDenseArray(value, isSqlResult);
     case 'beginTransaction':
@@ -300,6 +324,30 @@ export function isWorkerRequest(value: unknown): value is WorkerRequest {
         isDenseArray(value.params.params, (param) => isJsonValue(param)) &&
         isOptionalTransactionId(value.params.transactionId)
       );
+    case 'prepareSql':
+      return (
+        isRecord(value.params) &&
+        hasExactKeys(value.params, ['sql']) &&
+        typeof value.params.sql === 'string'
+      );
+    case 'executePrepared':
+      return (
+        isRecord(value.params) &&
+        hasOnlyKeys(value.params, [
+          'statementId',
+          'params',
+          'transactionId',
+        ]) &&
+        isPreparedStatementId(value.params.statementId) &&
+        isDenseArray(value.params.params, (param) => isJsonValue(param)) &&
+        isOptionalTransactionId(value.params.transactionId)
+      );
+    case 'closePrepared':
+      return (
+        isRecord(value.params) &&
+        hasExactKeys(value.params, ['statementId']) &&
+        isPreparedStatementId(value.params.statementId)
+      );
     case 'execSql':
       return (
         isRecord(value.params) &&
@@ -342,6 +390,14 @@ function isOptionalTransactionId(value: unknown): boolean {
 
 function isTransactionId(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= 128;
+}
+
+function isPreparedStatementId(value: unknown): value is number {
+  return (
+    Number.isSafeInteger(value) &&
+    Number(value) > 0 &&
+    Number(value) <= MAX_QUERY_POSITION
+  );
 }
 
 function isStorageOptions(value: unknown): value is StorageOptions {

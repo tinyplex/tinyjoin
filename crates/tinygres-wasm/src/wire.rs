@@ -25,6 +25,9 @@ pub(crate) const OP_ROLLBACK: u32 = 9;
 pub(crate) const OP_IN_TRANSACTION: u32 = 10;
 pub(crate) const OP_REVISION: u32 = 11;
 pub(crate) const OP_CLOSE: u32 = 12;
+pub(crate) const OP_PREPARE_SQL: u32 = 13;
+pub(crate) const OP_EXECUTE_PREPARED: u32 = 14;
+pub(crate) const OP_CLOSE_PREPARED: u32 = 15;
 
 const JSON_NULL: u8 = 0;
 const JSON_FALSE: u8 = 1;
@@ -96,6 +99,12 @@ impl<'a> Reader<'a> {
 
     fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_le_bytes(*self.take_array()?))
+    }
+
+    pub(crate) fn prepared_statement_id(&mut self) -> Result<u32> {
+        // Zero and future IDs are decoded normally so the core registry can return its stable
+        // PREPARED_STATEMENT_NOT_FOUND error rather than a transport-layer error.
+        self.u32()
     }
 
     fn u64(&mut self) -> Result<u64> {
@@ -413,6 +422,13 @@ pub(crate) fn boolean(value: bool) -> Vec<u8> {
 
 pub(crate) fn unsigned(value: u64) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(11);
+    bytes.extend_from_slice(&[VERSION, SUCCESS, SAFE_RESPONSE]);
+    bytes.extend_from_slice(&value.to_le_bytes());
+    bytes
+}
+
+pub(crate) fn prepared_statement_id(value: u32) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(7);
     bytes.extend_from_slice(&[VERSION, SUCCESS, SAFE_RESPONSE]);
     bytes.extend_from_slice(&value.to_le_bytes());
     bytes
@@ -827,12 +843,69 @@ mod tests {
         assert_eq!(unit(false), [1, 0, 0]);
         assert_eq!(boolean(true), [1, 0, 0, 1]);
         assert_eq!(
+            prepared_statement_id(0x7856_3412),
+            [1, 0, 0, 0x12, 0x34, 0x56, 0x78]
+        );
+        assert_eq!(
             error(&EngineError::new("TEST", "message").with_retryable(false)),
             [
                 1, 1, 0, 4, 0, 0, 0, 84, 69, 83, 84, 7, 0, 0, 0, 109, 101, 115, 115, 97, 103, 101,
                 1,
             ]
         );
+    }
+
+    #[test]
+    fn prepared_statement_operations_are_dense_and_have_exact_wire_shapes() {
+        assert_eq!(
+            [OP_PREPARE_SQL, OP_EXECUTE_PREPARED, OP_CLOSE_PREPARED],
+            [13, 14, 15]
+        );
+
+        let prepare = [
+            VERSION, 8, 0, 0, 0, b'S', b'E', b'L', b'E', b'C', b'T', b' ', b'1',
+        ];
+        let mut reader = Reader::new(&prepare).unwrap();
+        assert_eq!(reader.string().unwrap(), "SELECT 1");
+        reader.finish().unwrap();
+
+        let execute = [
+            VERSION,
+            0x12,
+            0x34,
+            0x56,
+            0x78,
+            2,
+            0,
+            0,
+            0,
+            JSON_I64,
+            42,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            JSON_STRING,
+            3,
+            0,
+            0,
+            0,
+            b'A',
+            b'd',
+            b'a',
+        ];
+        let mut reader = Reader::new(&execute).unwrap();
+        assert_eq!(reader.prepared_statement_id().unwrap(), 0x7856_3412);
+        assert_eq!(reader.values(0).unwrap(), [json!(42), json!("Ada")]);
+        reader.finish().unwrap();
+
+        let close = [VERSION, 0x12, 0x34, 0x56, 0x78];
+        let mut reader = Reader::new(&close).unwrap();
+        assert_eq!(reader.prepared_statement_id().unwrap(), 0x7856_3412);
+        reader.finish().unwrap();
     }
 
     #[test]

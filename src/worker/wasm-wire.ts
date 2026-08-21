@@ -33,6 +33,9 @@ export const WASM_OPERATION = {
   inTransaction: 10,
   revision: 11,
   close: 12,
+  prepareSql: 13,
+  executePrepared: 14,
+  closePrepared: 15,
 } as const;
 
 const JSON_NULL = 0;
@@ -409,6 +412,26 @@ export function encodeExecuteSql(
   params: readonly JsonValue[],
 ): EncodedCall {
   return sqlCall(WASM_OPERATION.executeSql, true, sql, params);
+}
+
+export function encodePrepareSql(sql: string): EncodedCall {
+  return call(WASM_OPERATION.prepareSql, false, (sink) => sink.string(sql));
+}
+
+export function encodeExecutePrepared(
+  statementId: number,
+  params: readonly JsonValue[],
+): EncodedCall {
+  return call(WASM_OPERATION.executePrepared, true, (sink) => {
+    sink.u32(preparedStatementId(statementId));
+    writeJsonValues(sink, params, 0, 'SQL parameters');
+  });
+}
+
+export function encodeClosePrepared(statementId: number): EncodedCall {
+  return call(WASM_OPERATION.closePrepared, false, (sink) =>
+    sink.u32(preparedStatementId(statementId)),
+  );
 }
 
 export function encodeExecSql(sql: string): EncodedCall {
@@ -922,6 +945,19 @@ function queryPosition(value: unknown, label: string): number {
   return value;
 }
 
+function preparedStatementId(value: unknown): number {
+  if (
+    !numberIsSafeInteger(value) ||
+    Number(value) < 1 ||
+    Number(value) > MAX_U32
+  ) {
+    throw invalidBridgeValue(
+      'A prepared statement ID must be a nonzero unsigned 32-bit integer',
+    );
+  }
+  return Number(value);
+}
+
 function columnTypeTag(type: string): number {
   switch (type) {
     case 'boolean':
@@ -1308,6 +1344,21 @@ export function decodeRevisionResponse(
   return decodeResponse(value, (reader) => reader.safeNumber());
 }
 
+export function decodePreparedStatementIdResponse(
+  value: unknown,
+): DecodedResponse<number> {
+  return decodeResponse(value, (reader) => {
+    const statementId = reader.u32();
+    if (statementId === 0) {
+      throw new WasmWireDecodeError(
+        'WASM returned an invalid prepared statement ID',
+        reader.disposition,
+      );
+    }
+    return statementId;
+  });
+}
+
 export function decodeApplyOutcomeResponse(
   value: unknown,
 ): DecodedResponse<ApplyOutcome> {
@@ -1433,6 +1484,27 @@ export class BinaryWasmEngine implements WorkerEngine {
       encodeExecuteSql(sql, params),
       decodeSqlResultResponse,
     );
+  }
+
+  prepareSql(sql: string): number {
+    this.#assertCallable();
+    return this.#invoke(
+      encodePrepareSql(sql),
+      decodePreparedStatementIdResponse,
+    );
+  }
+
+  executePrepared(statementId: number, params: JsonValue[]): SqlResult {
+    this.#assertCallable();
+    return this.#invoke(
+      encodeExecutePrepared(statementId, params),
+      decodeSqlResultResponse,
+    );
+  }
+
+  closePrepared(statementId: number): void {
+    this.#assertCallable();
+    this.#invoke(encodeClosePrepared(statementId), decodeUnitResponse);
   }
 
   execSql(sql: string): SqlResult[] {

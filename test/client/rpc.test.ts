@@ -132,6 +132,11 @@ describe('WorkerRpc', () => {
     expect(isRpcResult('applyBatch', outcome)).toBe(true);
     expect(isRpcResult('query', queryResult)).toBe(true);
     expect(isRpcResult('executeSql', sqlResult(1, [{id: 1}]))).toBe(true);
+    expect(isRpcResult('prepareSql', {statementId: 1})).toBe(true);
+    expect(isRpcResult('executePrepared', sqlResult(1, [{id: 1}]))).toBe(
+      true,
+    );
+    expect(isRpcResult('closePrepared', undefined)).toBe(true);
     expect(isRpcResult('execSql', [sqlResult(1)])).toBe(true);
     expect(isRpcResult('beginTransaction', {transactionId: 'tx-1'})).toBe(
       true,
@@ -152,6 +157,11 @@ describe('WorkerRpc', () => {
         rowCount: Number.MAX_SAFE_INTEGER + 1,
       }),
     ).toBe(false);
+    expect(isRpcResult('prepareSql', {statementId: 0})).toBe(false);
+    expect(isRpcResult('prepareSql', {statementId: 1, extra: true})).toBe(
+      false,
+    );
+    expect(isRpcResult('closePrepared', null)).toBe(false);
     expect(isRpcResult('execSql', [sqlResult(-1)])).toBe(false);
     expect(
       isRpcResult('beginTransaction', {
@@ -247,6 +257,48 @@ describe('WorkerRpc', () => {
             ],
           },
         },
+      }),
+    ).toBe(false);
+
+    for (const request of [
+      {
+        v: PROTOCOL_VERSION,
+        id: 7,
+        method: 'prepareSql',
+        params: {sql: 'SELECT id FROM posts WHERE id = $1'},
+      },
+      {
+        v: PROTOCOL_VERSION,
+        id: 8,
+        method: 'executePrepared',
+        params: {statementId: 1, params: [1], transactionId: 'tx-1'},
+      },
+      {
+        v: PROTOCOL_VERSION,
+        id: 9,
+        method: 'closePrepared',
+        params: {statementId: 1},
+      },
+    ] as const) {
+      expect(isWorkerRequest(request)).toBe(true);
+      expect(
+        isWorkerRequest({...request, params: {...request.params, extra: true}}),
+      ).toBe(false);
+    }
+    expect(
+      isWorkerRequest({
+        v: PROTOCOL_VERSION,
+        id: 10,
+        method: 'executePrepared',
+        params: {statementId: 0, params: []},
+      }),
+    ).toBe(false);
+    expect(
+      isWorkerRequest({
+        v: PROTOCOL_VERSION,
+        id: 11,
+        method: 'executePrepared',
+        params: {statementId: 1, params: [1n]},
       }),
     ).toBe(false);
   });

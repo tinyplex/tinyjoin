@@ -14,16 +14,20 @@ import {
   WasmBridgeError,
   WasmWireDecodeError,
   decodeApplyOutcomeResponse,
+  decodePreparedStatementIdResponse,
   decodeQueryResultResponse,
   decodeRevisionResponse,
   decodeSqlResultsResponse,
   decodeUnitResponse,
   createBinaryWasmEngine,
   encodeApplyBatch,
+  encodeClosePrepared,
   encodeDefineTables,
   encodeExecuteSql,
+  encodeExecutePrepared,
   encodeExecSql,
   encodeQuery,
+  encodePrepareSql,
   encodeReplaceSnapshot,
   normalizeWasmConstructorError,
   type RawBinaryWasmEngine,
@@ -290,6 +294,9 @@ describe('binary WASM request codec', () => {
       inTransaction: 10,
       revision: 11,
       close: 12,
+      prepareSql: 13,
+      executePrepared: 14,
+      closePrepared: 15,
     });
   });
 
@@ -396,6 +403,25 @@ describe('binary WASM request codec', () => {
       .done();
     expect(sql.payload).toEqual(expectedSql);
 
+    const prepared = encodePrepareSql('SELECT $1');
+    expect(prepared.operation).toBe(WASM_OPERATION.prepareSql);
+    expect(prepared.mayPublish).toBe(false);
+    expect(prepared.payload).toEqual(
+      new Bytes().u8(VERSION).string('SELECT $1').done(),
+    );
+
+    const execution = encodeExecutePrepared(7, [1, 'two']);
+    expect(execution.operation).toBe(WASM_OPERATION.executePrepared);
+    expect(execution.mayPublish).toBe(true);
+    expect(execution.payload).toEqual(
+      new Bytes().u8(VERSION).u32(7).u32(2).json(1).json('two').done(),
+    );
+
+    const close = encodeClosePrepared(7);
+    expect(close.operation).toBe(WASM_OPERATION.closePrepared);
+    expect(close.mayPublish).toBe(false);
+    expect(close.payload).toEqual(new Bytes().u8(VERSION).u32(7).done());
+
     const script = encodeExecSql('CREATE TABLE items; SELECT * FROM items');
     expect(script.payload).toEqual(
       new Bytes()
@@ -438,6 +464,14 @@ describe('binary WASM request codec', () => {
     ).toThrow(
       expect.objectContaining({code: 'RESOURCE_LIMIT'}),
     );
+    for (const invalidId of [0, -1, 1.5, 0x1_0000_0000]) {
+      expect(() => encodeExecutePrepared(invalidId, [])).toThrow(
+        expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}),
+      );
+      expect(() => encodeClosePrepared(invalidId)).toThrow(
+        expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}),
+      );
+    }
   });
 
   it(
@@ -543,6 +577,17 @@ describe('binary WASM response codec', () => {
       decodeRevisionResponse(
         success(SAFE, (bytes) => bytes.u64(maximumSafe + 1n)),
       ),
+    ).toThrow(expect.objectContaining({code: 'BRIDGE_SERIALIZATION_ERROR'}));
+  });
+
+  it('decodes only nonzero prepared statement IDs', () => {
+    expect(
+      decodePreparedStatementIdResponse(
+        success(SAFE, (bytes) => bytes.u32(0xffff_ffff)),
+      ).value,
+    ).toBe(0xffff_ffff);
+    expect(() =>
+      decodePreparedStatementIdResponse(success(SAFE, (bytes) => bytes.u32(0))),
     ).toThrow(expect.objectContaining({code: 'BRIDGE_SERIALIZATION_ERROR'}));
   });
 
@@ -809,6 +854,26 @@ describe('binary WorkerEngine adapter', () => {
     raw.response = success(SAFE, (bytes) => bytes.u32(0));
     expect(engine.execSql('SELECT 1; SELECT 2')).toEqual([]);
     expect(raw.calls.at(-1)?.operation).toBe(WASM_OPERATION.execSql);
+
+    raw.response = success(SAFE, (bytes) => bytes.u32(9));
+    expect(engine.prepareSql('SELECT $1')).toBe(9);
+    expect(raw.calls.at(-1)?.operation).toBe(WASM_OPERATION.prepareSql);
+
+    raw.response = success(SAFE, (bytes) =>
+      bytes
+        .string('SELECT')
+        .u64(3n)
+        .u64(1n)
+        .fields([{name: 'id', dataTypeID: 20}])
+        .rows([{id: 3}])
+        .strings([]),
+    );
+    expect(engine.executePrepared(9, [3]).rows).toEqual([{id: 3}]);
+    expect(raw.calls.at(-1)?.operation).toBe(WASM_OPERATION.executePrepared);
+
+    raw.response = success(SAFE);
+    engine.closePrepared(9);
+    expect(raw.calls.at(-1)?.operation).toBe(WASM_OPERATION.closePrepared);
   });
 
   it('does not poison a potential mutation when a trusted SAFE payload is malformed', () => {

@@ -115,6 +115,34 @@ impl WasmEngine {
                     Err(error) => self.poison_after_commit(error),
                 }
             }
+            wire::OP_PREPARE_SQL => {
+                let sql = reader.string()?;
+                reader.finish()?;
+                let id = self.engine_mut()?.prepare_sql(&sql)?;
+                drop(sql);
+                Ok(wire::prepared_statement_id(id))
+            }
+            wire::OP_EXECUTE_PREPARED => {
+                let id = reader.prepared_statement_id()?;
+                let params = reader.values(0)?;
+                reader.finish()?;
+                let was_in_transaction = self.engine()?.in_transaction();
+                let previous_revision = self.engine()?.revision();
+                let result = self.engine_mut()?.execute_prepared(id, &params)?;
+                drop(params);
+                let committed = !was_in_transaction && result.revision != previous_revision;
+                match wire::execute_result(&result, committed) {
+                    Ok(response) => Ok(response),
+                    Err(error) if !committed => Err(error),
+                    Err(error) => self.poison_after_commit(error),
+                }
+            }
+            wire::OP_CLOSE_PREPARED => {
+                let id = reader.prepared_statement_id()?;
+                reader.finish()?;
+                self.engine_mut()?.close_prepared(id)?;
+                Ok(wire::unit(false))
+            }
             wire::OP_BEGIN => {
                 reader.finish()?;
                 self.engine_mut()?.begin_transaction()?;

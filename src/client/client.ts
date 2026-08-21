@@ -32,6 +32,92 @@ export type SubscriptionOptions = {
   tables?: string[];
 };
 
+export interface PreparedStatement<RowType = Row> {
+  execute(
+    params?: JsonValue[],
+    options?: QueryOptions,
+  ): Promise<Results<RowType>>;
+  close(): Promise<void>;
+  readonly closed: boolean;
+}
+
+type PreparedStatementState = {
+  readonly owner: object;
+  readonly statementId: number;
+  readonly inFlight: Set<Promise<unknown>>;
+  readonly assertDirectOperationAllowed: () => void;
+  readonly assertClientOpen: () => void;
+  readonly executeDirect: (
+    params: JsonValue[],
+    options?: QueryOptions,
+  ) => Promise<Results<unknown>>;
+  readonly closeRemote: () => Promise<void>;
+  readonly trackClose: (close: Promise<void>) => void;
+  readonly unregister: () => void;
+  closed: boolean;
+  clientClosed: boolean;
+  closePromise?: Promise<void>;
+};
+
+const preparedStatementStates = new WeakMap<object, PreparedStatementState>();
+
+class ClientPreparedStatement<RowType> implements PreparedStatement<RowType> {
+  constructor(state: PreparedStatementState) {
+    preparedStatementStates.set(this, state);
+  }
+
+  execute(
+    params: JsonValue[] = [],
+    options?: QueryOptions,
+  ): Promise<Results<RowType>> {
+    try {
+      const state = preparedStatementState(this);
+      state.assertClientOpen();
+      assertPreparedStatementOpen(state);
+      state.assertDirectOperationAllowed();
+      assertQueryOptions(options);
+      return trackPreparedExecution(
+        state,
+        state.executeDirect(params, options) as Promise<Results<RowType>>,
+      );
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  close(): Promise<void> {
+    let state: PreparedStatementState;
+    try {
+      state = preparedStatementState(this);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (state.closed) {
+      return state.closePromise ?? Promise.resolve();
+    }
+    try {
+      state.assertDirectOperationAllowed();
+    } catch (error) {
+      return Promise.reject(error);
+    }
+
+    state.closed = true;
+    const pending = [...state.inFlight];
+    state.closePromise = (async () => {
+      await Promise.allSettled(pending);
+      if (!state.clientClosed) {
+        await state.closeRemote();
+      }
+    })().finally(state.unregister);
+    state.trackClose(state.closePromise);
+    return state.closePromise;
+  }
+
+  get closed(): boolean {
+    return preparedStatementState(this).closed;
+  }
+}
+
 export interface Transaction {
   from<RowType extends object = Row>(table: string): QueryBuilder<RowType>;
   query<RowType = Row>(
@@ -44,12 +130,19 @@ export interface Transaction {
     ...params: JsonValue[]
   ): Promise<Results<RowType>>;
   exec(sql: string, options?: QueryOptions): Promise<Results[]>;
+  execute<RowType = Row>(
+    statement: PreparedStatement<RowType>,
+    params?: JsonValue[],
+    options?: QueryOptions,
+  ): Promise<Results<RowType>>;
   rollback(): Promise<void>;
   readonly closed: boolean;
 }
 
 export class Client implements QueryExecutor {
   readonly #rpc: WorkerRpc;
+  readonly #preparedOwner = {};
+  readonly #preparedStatements = new Set<PreparedStatementState>();
   readonly waitReady: Promise<void>;
   readonly #subscriptions = new Set<{
     tables?: Set<string>;
@@ -60,6 +153,8 @@ export class Client implements QueryExecutor {
   #closing = false;
   #closed = false;
   #closePromise: Promise<void> | undefined;
+  #preparedCloseGeneration = 0;
+  #preparedCloseTail: Promise<void> = Promise.resolve();
   #transactionTail: Promise<void> = Promise.resolve();
   #transactionActive = false;
 
@@ -140,6 +235,33 @@ export class Client implements QueryExecutor {
     return this.query<RowType>(parameterize(strings, params), params);
   }
 
+  async prepare<RowType = Row>(
+    sql: string,
+  ): Promise<PreparedStatement<RowType>> {
+    await this.waitReady;
+    this.#assertNoActiveTransaction();
+    const {statementId} = await this.#rpc.request('prepareSql', {sql});
+    this.#assertOpen();
+
+    let state!: PreparedStatementState;
+    state = {
+      owner: this.#preparedOwner,
+      statementId,
+      inFlight: new Set(),
+      assertDirectOperationAllowed: () => this.#assertNoActiveTransaction(),
+      assertClientOpen: () => this.#assertOpen(),
+      executeDirect: (params, options) =>
+        this.#executePrepared<unknown>(statementId, params, options),
+      closeRemote: () => this.#closePrepared(statementId),
+      trackClose: (close) => this.#trackPreparedClose(close),
+      unregister: () => this.#preparedStatements.delete(state),
+      closed: false,
+      clientClosed: false,
+    };
+    this.#preparedStatements.add(state);
+    return new ClientPreparedStatement<RowType>(state);
+  }
+
   async executePlan(plan: QueryPlan): Promise<QueryResult> {
     await this.waitReady;
     this.#assertNoActiveTransaction();
@@ -218,6 +340,11 @@ export class Client implements QueryExecutor {
   close(): Promise<void> {
     if (this.#closePromise === undefined) {
       this.#closing = true;
+      for (const statement of this.#preparedStatements) {
+        statement.closed = true;
+        statement.clientClosed = true;
+      }
+      this.#preparedStatements.clear();
       this.#closePromise = this.#closeOnce();
     }
     return this.#closePromise;
@@ -240,17 +367,11 @@ export class Client implements QueryExecutor {
     callback: (transaction: Transaction) => Result | Promise<Result>,
   ): Promise<Result> {
     await this.waitReady;
-    if (this.#closing || this.#closed) {
-      throw clientError('CLIENT_CLOSED', 'The TinyGres client is closed');
-    }
-    const {transactionId} = await this.#rpc.request(
-      'beginTransaction',
-      undefined,
-    );
-    this.#transactionActive = true;
+    const {transactionId} = await this.#beginTransactionAfterPreparedCloses();
     const transaction = new ClientTransaction(
       this.#rpc,
       transactionId,
+      this.#preparedOwner,
       (revision) => {
         this.#revision = Math.max(this.#revision, revision);
       },
@@ -283,16 +404,79 @@ export class Client implements QueryExecutor {
     }
   }
 
-  #assertNoActiveTransaction(): void {
-    if (this.#closing || this.#closed) {
-      throw clientError('CLIENT_CLOSED', 'The TinyGres client is closed');
+  async #beginTransactionAfterPreparedCloses(): Promise<{
+    transactionId: string;
+  }> {
+    while (true) {
+      this.#assertOpen();
+      const generation = this.#preparedCloseGeneration;
+      const tail = this.#preparedCloseTail;
+      await tail;
+      if (
+        generation !== this.#preparedCloseGeneration ||
+        tail !== this.#preparedCloseTail
+      ) {
+        continue;
+      }
+
+      // Reserve the client before dispatching BEGIN. The generation check and
+      // reservation are synchronous, so a new prepared close cannot slip
+      // between the drained barrier and the Worker request.
+      this.#assertOpen();
+      this.#transactionActive = true;
+      try {
+        return await this.#rpc.request('beginTransaction', undefined);
+      } catch (error) {
+        this.#transactionActive = false;
+        throw error;
+      }
     }
+  }
+
+  #trackPreparedClose(close: Promise<void>): void {
+    const previous = this.#preparedCloseTail;
+    this.#preparedCloseGeneration += 1;
+    this.#preparedCloseTail = Promise.allSettled([previous, close]).then(
+      () => undefined,
+    );
+  }
+
+  #assertNoActiveTransaction(): void {
+    this.#assertOpen();
     if (this.#transactionActive) {
       throw clientError(
         'TRANSACTION_ACTIVE',
         'Use the transaction object while a TinyGres transaction is active',
       );
     }
+  }
+
+  #assertOpen(): void {
+    if (this.#closing || this.#closed) {
+      throw clientError('CLIENT_CLOSED', 'The TinyGres client is closed');
+    }
+  }
+
+  async #executePrepared<RowType>(
+    statementId: number,
+    params: JsonValue[],
+    options?: QueryOptions,
+  ): Promise<Results<RowType>> {
+    await this.waitReady;
+    this.#assertNoActiveTransaction();
+    const result = await this.#rpc.request('executePrepared', {
+      statementId,
+      params,
+    });
+    this.#revision = Math.max(this.#revision, result.revision);
+    return toResults<RowType>(result, options);
+  }
+
+  async #closePrepared(statementId: number): Promise<void> {
+    if (this.#closing || this.#closed) {
+      return;
+    }
+    await this.#rpc.request('closePrepared', {statementId});
   }
 
   #noteResults(results: SqlResult[]): void {
@@ -312,6 +496,7 @@ class ClientTransaction implements Transaction, QueryExecutor {
   constructor(
     readonly rpc: WorkerRpc,
     readonly transactionId: string,
+    readonly preparedOwner: object,
     readonly noteRevision: (revision: number) => void,
   ) {}
 
@@ -370,6 +555,37 @@ class ClientTransaction implements Transaction, QueryExecutor {
           return results.map((result) => toResults(result, options));
         }),
     );
+  }
+
+  execute<RowType = Row>(
+    statement: PreparedStatement<RowType>,
+    params: JsonValue[] = [],
+    options?: QueryOptions,
+  ): Promise<Results<RowType>> {
+    this.#assertOpen();
+    const state = preparedStatementState(statement);
+    if (state.owner !== this.preparedOwner) {
+      throw clientError(
+        'PREPARED_STATEMENT_CLIENT_MISMATCH',
+        'The prepared statement belongs to a different TinyGres client',
+      );
+    }
+    state.assertClientOpen();
+    assertPreparedStatementOpen(state);
+    assertQueryOptions(options);
+    const operation = this.#track(
+      this.rpc
+        .request('executePrepared', {
+          statementId: state.statementId,
+          params,
+          transactionId: this.transactionId,
+        })
+        .then((result) => {
+          this.noteRevision(result.revision);
+          return toResults<RowType>(result, options);
+        }),
+    );
+    return trackPreparedExecution(state, operation);
   }
 
   executePlan(plan: QueryPlan): Promise<QueryResult> {
@@ -527,6 +743,41 @@ function assertWorkerAvailable(): void {
 
 function clientError(code: string, message: string): ClientError {
   return new ClientError({code, message});
+}
+
+function preparedStatementState(value: unknown): PreparedStatementState {
+  const state =
+    typeof value === 'object' && value !== null
+      ? preparedStatementStates.get(value)
+      : undefined;
+  if (!state) {
+    throw clientError(
+      'INVALID_PREPARED_STATEMENT',
+      'The value is not a TinyGres prepared statement',
+    );
+  }
+  return state;
+}
+
+function assertPreparedStatementOpen(state: PreparedStatementState): void {
+  if (state.closed) {
+    throw clientError(
+      'PREPARED_STATEMENT_CLOSED',
+      'The TinyGres prepared statement is closed',
+    );
+  }
+}
+
+function trackPreparedExecution<Result>(
+  state: PreparedStatementState,
+  operation: Promise<Result>,
+): Promise<Result> {
+  state.inFlight.add(operation);
+  void operation.then(
+    () => state.inFlight.delete(operation),
+    () => state.inFlight.delete(operation),
+  );
+  return operation;
 }
 
 function assertClientOptions(options: ClientOptions): void {

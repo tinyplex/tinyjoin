@@ -277,6 +277,24 @@ async function handleRequest(
       }
       return result;
     }
+    case 'prepareSql':
+      assertNoTransaction(transaction.activeId);
+      return {statementId: engine.prepareSql(request.params.sql)};
+    case 'executePrepared': {
+      assertTransactionId(transaction.activeId, request.params.transactionId);
+      const result = engine.executePrepared(
+        request.params.statementId,
+        request.params.params,
+      );
+      if (transaction.activeId === undefined && result.tables.length > 0) {
+        emitInvalidation({revision: result.revision, tables: result.tables});
+      }
+      return result;
+    }
+    case 'closePrepared':
+      assertNoTransaction(transaction.activeId);
+      engine.closePrepared(request.params.statementId);
+      return undefined;
     case 'execSql': {
       assertTransactionId(transaction.activeId, request.params.transactionId);
       const results = engine.execSql(request.params.sql);

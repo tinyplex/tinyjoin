@@ -19,6 +19,9 @@ export interface WorkerEngine {
   applyBatch(batch: ChangeBatch): ApplyOutcome;
   query(plan: QueryPlan): QueryResult;
   executeSql(sql: string, params: JsonValue[]): SqlResult;
+  prepareSql(sql: string): number;
+  executePrepared(statementId: number, params: JsonValue[]): SqlResult;
+  closePrepared(statementId: number): void;
   execSql(sql: string): SqlResult[];
   beginTransaction(): void;
   commitTransaction(): ApplyOutcome;
