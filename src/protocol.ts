@@ -103,10 +103,6 @@ export interface RpcMethods {
     };
     response: {revision: number};
   };
-  defineTable: {
-    request: {schema: TableSchema};
-    response: undefined;
-  };
   replaceTable: {
     request: {schema: TableSchema; rows: Row[]};
     response: ApplyOutcome;
@@ -236,7 +232,6 @@ export function isRpcResult<Method extends RpcMethod>(
         hasExactKeys(value, ['revision']) &&
         isSafeNonNegativeInteger(value.revision)
       );
-    case 'defineTable':
     case 'closePrepared':
     case 'rollbackTransaction':
     case 'close':
@@ -271,6 +266,56 @@ export function isRpcResult<Method extends RpcMethod>(
   }
 }
 
+/**
+ * Checks only the fixed result envelope produced by TinyGres's bundled Worker.
+ * The Worker has already validated the complete WASM result before posting it;
+ * avoiding another walk here keeps large row sets off the UI thread's hot path.
+ */
+export function isRpcResultHeader<Method extends RpcMethod>(
+  method: Method,
+  value: unknown,
+): value is RpcMethods[Method]['response'] {
+  switch (method) {
+    case 'init':
+      return (
+        isRecord(value) &&
+        hasExactKeys(value, ['revision']) &&
+        isSafeNonNegativeInteger(value.revision)
+      );
+    case 'closePrepared':
+    case 'rollbackTransaction':
+    case 'close':
+      return value === undefined;
+    case 'replaceTable':
+    case 'applyBatch':
+    case 'commitTransaction':
+      return isApplyOutcome(value);
+    case 'query':
+      return isQueryResultHeader(value);
+    case 'executeSql':
+    case 'executePrepared':
+      return isSqlResultHeader(value);
+    case 'prepareSql':
+      return (
+        isRecord(value) &&
+        hasExactKeys(value, ['statementId']) &&
+        isPreparedStatementId(value.statementId)
+      );
+    case 'execSql':
+      return Array.isArray(value) && value.every(isSqlResultHeader);
+    case 'beginTransaction':
+      return (
+        isRecord(value) &&
+        hasExactKeys(value, ['transactionId']) &&
+        isTransactionId(value.transactionId)
+      );
+    default: {
+      const exhaustive: never = method;
+      return exhaustive;
+    }
+  }
+}
+
 export function isWorkerRequest(value: unknown): value is WorkerRequest {
   if (
     !isRecord(value) ||
@@ -289,12 +334,6 @@ export function isWorkerRequest(value: unknown): value is WorkerRequest {
         hasExactKeys(value.params, ['schemas', 'storage']) &&
         isDenseArray(value.params.schemas, isTableSchema) &&
         isStorageOptions(value.params.storage)
-      );
-    case 'defineTable':
-      return (
-        isRecord(value.params) &&
-        hasExactKeys(value.params, ['schema']) &&
-        isTableSchema(value.params.schema)
       );
     case 'replaceTable':
       return (
@@ -521,6 +560,16 @@ function isQueryResult(value: unknown): value is QueryResult {
   );
 }
 
+function isQueryResultHeader(value: unknown): value is QueryResult {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, ['revision', 'rows', 'fields']) &&
+    isSafeNonNegativeInteger(value.revision) &&
+    Array.isArray(value.rows) &&
+    Array.isArray(value.fields)
+  );
+}
+
 function isSqlResult(value: unknown): value is SqlResult {
   return (
     isRecord(value) &&
@@ -537,6 +586,29 @@ function isSqlResult(value: unknown): value is SqlResult {
     isSafeNonNegativeInteger(value.revision) &&
     isSafeNonNegativeInteger(value.rowCount) &&
     isDenseArray(value.rows, isRow) &&
+    isDenseArray(
+      value.tables,
+      (table): table is string => typeof table === 'string',
+    )
+  );
+}
+
+function isSqlResultHeader(value: unknown): value is SqlResult {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, [
+      'command',
+      'fields',
+      'revision',
+      'rowCount',
+      'rows',
+      'tables',
+    ]) &&
+    typeof value.command === 'string' &&
+    Array.isArray(value.fields) &&
+    isSafeNonNegativeInteger(value.revision) &&
+    isSafeNonNegativeInteger(value.rowCount) &&
+    Array.isArray(value.rows) &&
     isDenseArray(
       value.tables,
       (table): table is string => typeof table === 'string',

@@ -1,7 +1,6 @@
 mod page_device;
-mod wire;
+mod structured;
 
-use js_sys::Uint8Array;
 use tinygres_core::{EngineError, PagedEngine};
 use wasm_bindgen::prelude::*;
 
@@ -17,162 +16,158 @@ pub struct WasmEngine {
 impl WasmEngine {
     #[wasm_bindgen(constructor)]
     pub fn new(device: JsValue) -> std::result::Result<WasmEngine, JsValue> {
-        let device = WasmPageDevice::new(device).map_err(constructor_error)?;
-        let engine = PagedEngine::open(device).map_err(constructor_error)?;
+        let device = WasmPageDevice::new(device).map_err(structured::constructor_error)?;
+        let engine = PagedEngine::open(device).map_err(structured::constructor_error)?;
         Ok(Self {
             engine: Some(engine),
             poisoned: false,
         })
     }
 
-    /// Executes one versioned binary request and always returns a binary success/error envelope.
-    pub fn call(&mut self, operation: u32, payload: &[u8]) -> Vec<u8> {
-        match self.call_inner(operation, payload) {
-            Ok(response) => response,
+    /// Executes one versioned structured-clone request.
+    #[wasm_bindgen(js_name = callStructured)]
+    pub fn call_structured(
+        &mut self,
+        bridge_version: u32,
+        operation: u32,
+        payload: JsValue,
+    ) -> std::result::Result<JsValue, JsValue> {
+        match self.call_structured_inner(bridge_version, operation, payload) {
+            Ok(response) => Ok(response),
             Err(error) => {
                 if fatal_storage_error(&error) {
                     self.poison_and_close();
                 }
-                wire::error(&error)
+                structured::error(&error)
             }
         }
     }
 }
 
 impl WasmEngine {
-    fn call_inner(&mut self, operation: u32, payload: &[u8]) -> tinygres_core::Result<Vec<u8>> {
-        if operation == wire::OP_CLOSE {
-            let reader = wire::Reader::new(payload)?;
-            reader.finish()?;
+    fn call_structured_inner(
+        &mut self,
+        bridge_version: u32,
+        operation: u32,
+        payload: JsValue,
+    ) -> tinygres_core::Result<JsValue> {
+        if bridge_version != structured::VERSION {
+            return Err(EngineError::new(
+                "INVALID_BRIDGE_VALUE",
+                "Invalid structured bridge request",
+            ));
+        }
+        if operation == structured::OP_CLOSE {
+            structured::unit_payload(&payload)?;
             let result = match self.engine.take() {
-                Some(engine) => engine.into_device().close().map(|()| wire::unit(false)),
-                None => Ok(wire::unit(false)),
+                Some(engine) => engine
+                    .into_device()
+                    .close()
+                    .and_then(|()| structured::unit(false)),
+                None => structured::unit(false),
             };
             self.poisoned = false;
             return result;
         }
         self.ensure_available()?;
-        let mut reader = wire::Reader::new(payload)?;
         match operation {
-            wire::OP_DEFINE_TABLES => {
-                let schemas = reader.schemas()?;
-                reader.finish()?;
+            structured::OP_DEFINE_TABLES => {
+                let schemas: Vec<structured::BridgeTableSchema> = structured::decode(payload)?;
+                let schemas = schemas.into_iter().map(Into::into).collect();
                 let committed = self.engine_mut()?.define_tables_with_publication(schemas)?;
-                Ok(wire::unit(committed))
+                self.encode_committed(structured::unit(committed), committed)
             }
-            wire::OP_REPLACE_SNAPSHOT => {
-                let schema = reader.schema()?;
-                let rows = reader.rows()?;
-                reader.finish()?;
+            structured::OP_REPLACE_SNAPSHOT => {
+                let request: structured::ReplaceSnapshotRequest = structured::decode(payload)?;
                 let previous_revision = self.engine()?.revision();
-                let outcome = self.engine_mut()?.replace_table_snapshot(schema, rows)?;
+                let outcome = self
+                    .engine_mut()?
+                    .replace_table_snapshot(request.schema.into(), request.rows)?;
                 let committed = outcome.revision != previous_revision;
-                self.encode_committed(wire::apply_outcome(&outcome, committed), committed)
+                self.encode_committed(structured::apply_outcome(&outcome, committed), committed)
             }
-            wire::OP_APPLY_BATCH => {
-                let batch = reader.batch()?;
-                reader.finish()?;
+            structured::OP_APPLY_BATCH => {
+                let batch = structured::decode(payload)?;
                 let previous_revision = self.engine()?.revision();
                 let outcome = self.engine_mut()?.apply_batch(&batch)?;
-                drop(batch);
                 let committed = outcome.revision != previous_revision;
-                self.encode_committed(wire::apply_outcome(&outcome, committed), committed)
+                self.encode_committed(structured::apply_outcome(&outcome, committed), committed)
             }
-            wire::OP_QUERY => {
-                let plan = reader.query()?;
-                reader.finish()?;
+            structured::OP_QUERY => {
+                let plan: structured::BridgeQueryPlan = structured::decode(payload)?;
+                let plan = plan.into();
                 let result = self.engine()?.query(&plan)?;
-                drop(plan);
-                wire::query_result(&result, false)
+                structured::query_result(&result)
             }
-            wire::OP_EXECUTE_SQL => {
-                let sql = reader.string()?;
-                let params = reader.values(0)?;
-                reader.finish()?;
+            structured::OP_EXECUTE_SQL => {
+                let request: structured::ExecuteSqlRequest = structured::decode(payload)?;
                 let was_in_transaction = self.engine()?.in_transaction();
                 let previous_revision = self.engine()?.revision();
-                let result = self.engine_mut()?.execute_sql(&sql, &params)?;
-                drop((sql, params));
+                let result = self
+                    .engine_mut()?
+                    .execute_sql(&request.sql, &request.params)?;
                 let committed = !was_in_transaction && result.revision != previous_revision;
-                match wire::execute_result(&result, committed) {
-                    Ok(response) => Ok(response),
-                    Err(error) if !committed => Err(error),
-                    Err(error) => self.poison_after_commit(error),
-                }
+                self.encode_committed(structured::execute_result(&result, committed), committed)
             }
-            wire::OP_EXEC_SQL => {
-                let sql = reader.string()?;
-                reader.finish()?;
+            structured::OP_EXEC_SQL => {
+                let sql: String = structured::decode(payload)?;
                 let was_in_transaction = self.engine()?.in_transaction();
                 let previous_revision = self.engine()?.revision();
                 let results = self.engine_mut()?.exec_sql(&sql)?;
-                drop(sql);
                 let committed =
                     !was_in_transaction && self.engine()?.revision() != previous_revision;
-                match wire::execute_results(&results, committed) {
-                    Ok(response) => Ok(response),
-                    Err(error) if !committed => Err(error),
-                    Err(error) => self.poison_after_commit(error),
-                }
+                self.encode_committed(structured::execute_results(&results, committed), committed)
             }
-            wire::OP_PREPARE_SQL => {
-                let sql = reader.string()?;
-                reader.finish()?;
+            structured::OP_PREPARE_SQL => {
+                let sql: String = structured::decode(payload)?;
                 let id = self.engine_mut()?.prepare_sql(&sql)?;
-                drop(sql);
-                Ok(wire::prepared_statement_id(id))
+                structured::prepared_statement_id(id)
             }
-            wire::OP_EXECUTE_PREPARED => {
-                let id = reader.prepared_statement_id()?;
-                let params = reader.values(0)?;
-                reader.finish()?;
+            structured::OP_EXECUTE_PREPARED => {
+                let request: structured::ExecutePreparedRequest = structured::decode(payload)?;
                 let was_in_transaction = self.engine()?.in_transaction();
                 let previous_revision = self.engine()?.revision();
-                let result = self.engine_mut()?.execute_prepared(id, &params)?;
-                drop(params);
+                let result = self
+                    .engine_mut()?
+                    .execute_prepared(request.statement_id, &request.params)?;
                 let committed = !was_in_transaction && result.revision != previous_revision;
-                match wire::execute_result(&result, committed) {
-                    Ok(response) => Ok(response),
-                    Err(error) if !committed => Err(error),
-                    Err(error) => self.poison_after_commit(error),
-                }
+                self.encode_committed(structured::execute_result(&result, committed), committed)
             }
-            wire::OP_CLOSE_PREPARED => {
-                let id = reader.prepared_statement_id()?;
-                reader.finish()?;
+            structured::OP_CLOSE_PREPARED => {
+                let id: u32 = structured::decode(payload)?;
                 self.engine_mut()?.close_prepared(id)?;
-                Ok(wire::unit(false))
+                structured::unit(false)
             }
-            wire::OP_BEGIN => {
-                reader.finish()?;
+            structured::OP_BEGIN => {
+                structured::unit_payload(&payload)?;
                 self.engine_mut()?.begin_transaction()?;
-                Ok(wire::unit(false))
+                structured::unit(false)
             }
-            wire::OP_COMMIT => {
-                reader.finish()?;
+            structured::OP_COMMIT => {
+                structured::unit_payload(&payload)?;
                 let previous_revision = self.engine()?.revision();
                 let outcome = self.engine_mut()?.commit_transaction()?;
                 let committed = outcome.revision != previous_revision;
-                self.encode_committed(wire::apply_outcome(&outcome, committed), committed)
+                self.encode_committed(structured::apply_outcome(&outcome, committed), committed)
             }
-            wire::OP_ROLLBACK => {
-                reader.finish()?;
+            structured::OP_ROLLBACK => {
+                structured::unit_payload(&payload)?;
                 self.engine_mut()?.rollback_transaction()?;
-                Ok(wire::unit(false))
+                structured::unit(false)
             }
-            wire::OP_IN_TRANSACTION => {
-                reader.finish()?;
-                Ok(wire::boolean(self.engine()?.in_transaction()))
+            structured::OP_IN_TRANSACTION => {
+                structured::unit_payload(&payload)?;
+                structured::boolean(self.engine()?.in_transaction())
             }
-            wire::OP_REVISION => {
-                reader.finish()?;
+            structured::OP_REVISION => {
+                structured::unit_payload(&payload)?;
                 let revision = self.engine()?.revision();
                 self.engine()?.ensure_readiness()?;
-                Ok(wire::unsigned(revision))
+                structured::unsigned(revision)
             }
             _ => Err(EngineError::new(
                 "INVALID_BRIDGE_VALUE",
-                "Invalid binary bridge request",
+                "Invalid structured bridge request",
             )),
         }
     }
@@ -204,11 +199,11 @@ impl WasmEngine {
         Ok(self.engine.as_mut().expect("availability checked"))
     }
 
-    fn encode_committed(
+    fn encode_committed<T>(
         &mut self,
-        encoded: tinygres_core::Result<Vec<u8>>,
+        encoded: tinygres_core::Result<T>,
         committed: bool,
-    ) -> tinygres_core::Result<Vec<u8>> {
+    ) -> tinygres_core::Result<T> {
         match encoded {
             Ok(response) => Ok(response),
             Err(error) if committed => self.poison_after_commit(error),
@@ -216,7 +211,7 @@ impl WasmEngine {
         }
     }
 
-    fn poison_after_commit(&mut self, error: EngineError) -> tinygres_core::Result<Vec<u8>> {
+    fn poison_after_commit<T>(&mut self, error: EngineError) -> tinygres_core::Result<T> {
         self.poison_and_close();
         Err(EngineError::new(
             "STORAGE_COMMIT_OUTCOME_UNKNOWN",
@@ -241,10 +236,6 @@ fn fatal_storage_error(error: &EngineError) -> bool {
         error.code.as_str(),
         "RECOVERY_REQUIRED" | "STORAGE_COMMIT_OUTCOME_UNKNOWN" | "STORAGE_ENGINE_POISONED"
     )
-}
-
-fn constructor_error(error: EngineError) -> JsValue {
-    Uint8Array::from(wire::error(&error).as_slice()).into()
 }
 
 #[cfg(test)]

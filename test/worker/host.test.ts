@@ -55,7 +55,6 @@ function mockEngine() {
     tables: [table],
   });
   const engine: WorkerEngine = {
-    defineTable: vi.fn(),
     defineTables: vi.fn(),
     replaceTableSnapshot: vi.fn((schema) => outcome(schema.name)),
     applyBatch: vi.fn((batch) => outcome(batch.changes[0]?.table ?? 'none')),

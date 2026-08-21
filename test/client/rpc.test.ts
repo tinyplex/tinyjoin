@@ -4,6 +4,7 @@ import {WorkerRpc} from '../../src/client/rpc.ts';
 import {
   PROTOCOL_VERSION,
   isRpcResult,
+  isRpcResultHeader,
   isWorkerRequest,
   type WorkerRequest,
 } from '../../src/protocol.ts';
@@ -118,6 +119,31 @@ describe('WorkerRpc', () => {
     expect(worker.terminated).toBe(true);
   });
 
+  it('checks only fixed metadata for a trusted bundled Worker result', async () => {
+    const worker = new FakeWorker();
+    const rpc = new WorkerRpc(worker, 'header');
+    const request = rpc.request('executeSql', {sql: 'SELECT id FROM posts', params: []});
+    const [message] = worker.posted as WorkerRequest[];
+    const row = {};
+    Object.defineProperty(row, 'id', {
+      enumerable: true,
+      get() {
+        throw new Error('The client revisited a trusted result cell');
+      },
+    });
+    const result = sqlResult(1, [row as {id: number}]);
+
+    worker.respond({
+      v: PROTOCOL_VERSION,
+      id: message!.id,
+      ok: true,
+      result,
+    });
+
+    await expect(request).resolves.toBe(result);
+    expect(worker.terminated).toBe(false);
+  });
+
   it('validates every method-specific success shape', () => {
     const outcome = {revision: 1, tables: ['posts']};
     const queryResult = {
@@ -127,7 +153,6 @@ describe('WorkerRpc', () => {
     };
 
     expect(isRpcResult('init', {revision: 0})).toBe(true);
-    expect(isRpcResult('defineTable', undefined)).toBe(true);
     expect(isRpcResult('replaceTable', outcome)).toBe(true);
     expect(isRpcResult('applyBatch', outcome)).toBe(true);
     expect(isRpcResult('query', queryResult)).toBe(true);
@@ -146,7 +171,6 @@ describe('WorkerRpc', () => {
     expect(isRpcResult('close', undefined)).toBe(true);
 
     expect(isRpcResult('init', {revision: -1})).toBe(false);
-    expect(isRpcResult('defineTable', null)).toBe(false);
     expect(isRpcResult('replaceTable', {...outcome, extra: true})).toBe(false);
     expect(
       isRpcResult('query', {...queryResult, rows: [{created: new Date()}]}),
@@ -171,6 +195,19 @@ describe('WorkerRpc', () => {
     ).toBe(false);
     expect(isRpcResult('rollbackTransaction', {})).toBe(false);
     expect(isRpcResult('close', null)).toBe(false);
+
+    expect(
+      isRpcResultHeader('query', {
+        ...queryResult,
+        rows: [{created: new Date()}],
+      }),
+    ).toBe(true);
+    expect(
+      isRpcResultHeader('executeSql', {
+        ...sqlResult(1),
+        rows: 'not-an-array',
+      }),
+    ).toBe(false);
   });
 
   it('rejects extra request envelope and parameter keys', () => {
@@ -185,18 +222,12 @@ describe('WorkerRpc', () => {
       {
         v: PROTOCOL_VERSION,
         id: 2,
-        method: 'defineTable',
-        params: {schema},
-      },
-      {
-        v: PROTOCOL_VERSION,
-        id: 3,
         method: 'replaceTable',
         params: {schema, rows: []},
       },
       {
         v: PROTOCOL_VERSION,
-        id: 4,
+        id: 3,
         method: 'applyBatch',
         params: {batch: {changes: []}},
       },

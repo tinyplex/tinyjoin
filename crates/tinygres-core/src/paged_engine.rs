@@ -49,7 +49,7 @@ impl<D: PageDevice> PagedEngine<D> {
 
     /// Defines initialization schemas and reports whether one pager generation was published.
     ///
-    /// The binary worker bridge uses this to distinguish catalog durability from a true no-op;
+    /// The worker bridge uses this to distinguish catalog durability from a true no-op;
     /// schema initialization itself intentionally does not advance the database revision.
     #[doc(hidden)]
     pub fn define_tables_with_publication(&mut self, schemas: Vec<TableSchema>) -> Result<bool> {

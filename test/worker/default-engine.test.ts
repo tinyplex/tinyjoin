@@ -103,7 +103,6 @@ function initRequest(
 
 function mockEngine(): WorkerEngine {
   return {
-    defineTable: vi.fn(),
     defineTables: vi.fn(),
     replaceTableSnapshot: vi.fn(() => ({revision: 0, tables: []})),
     applyBatch: vi.fn(() => ({revision: 0, tables: []})),

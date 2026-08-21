@@ -1,10 +1,9 @@
-import type {TableSchema} from '../../../src/protocol.js';
+import type {JsonValue, TableSchema} from '../../../src/protocol.js';
 import type {PageDevice} from '../../../src/worker/page-device.js';
 import {
-  createBinaryWasmEngine,
-  type RawBinaryWasmEngineConstructor,
-  type WireTableSchema,
-} from '../../../src/worker/wasm-wire.js';
+  createStructuredWasmEngine,
+  type RawStructuredWasmEngineConstructor,
+} from '../../../src/worker/wasm-bridge.js';
 
 const PAGE_SIZE = 4096;
 const pagedWasmModule = new URL(
@@ -14,8 +13,17 @@ const pagedWasmModule = new URL(
 
 interface PagedWasmModule {
   default(): Promise<unknown>;
-  WasmEngine: RawBinaryWasmEngineConstructor;
+  WasmEngine: RawStructuredWasmEngineConstructor;
 }
+
+type TypedTableSchema = TableSchema & {
+  columns: Array<{
+    name: string;
+    dataType: 'boolean' | 'integer' | 'float' | 'text' | 'json';
+    nullable?: boolean;
+    default?: JsonValue;
+  }>;
+};
 
 interface SharedPages {
   readonly pages: Uint8Array[];
@@ -115,7 +123,7 @@ async function run(): Promise<{
   await wasm.default();
 
   const shared: SharedPages = {pages: [], closes: 0};
-  const schema: WireTableSchema = {
+  const schema: TypedTableSchema = {
     name: 'items',
     primaryKey: ['id'],
     columns: [
@@ -128,7 +136,7 @@ async function run(): Promise<{
       },
     ],
   };
-  const engine = createBinaryWasmEngine(
+  const engine = createStructuredWasmEngine(
     wasm.WasmEngine,
     new MemoryPageDevice(shared),
   );
@@ -154,7 +162,7 @@ async function run(): Promise<{
   const committedRevision = committed.revision;
   engine.close();
 
-  const reopened = createBinaryWasmEngine(
+  const reopened = createStructuredWasmEngine(
     wasm.WasmEngine,
     new MemoryPageDevice(shared),
   );

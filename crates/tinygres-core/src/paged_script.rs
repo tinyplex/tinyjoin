@@ -116,7 +116,8 @@ fn begin_candidate<'a, D: PageDevice>(
         indexes,
         mutated: false,
         operations: Cell::new(0),
-        // Binary OP_EXEC_SQL responses have a three-byte envelope and a u32 result count.
+        // Structured exec responses retain the canonical bridge's three-byte
+        // logical envelope and u32 result-count budget.
         result_bytes: 7,
     })
 }
@@ -848,14 +849,15 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
     }
 }
 
-/// Retains a conservative upper bound for the complete OP_EXEC_SQL binary response.
+/// Retains a conservative upper bound for the complete structured exec response.
 ///
-/// The wire uses at most 36 fixed bytes per result, eight bytes per field name, four bytes per
-/// table name, and the tagged binary JSON payload for each row. The storage-owned row estimate is
-/// strictly larger: it starts at 32 bytes, charges at least 64 bytes per map entry, doubles every
-/// key and value estimate, and the extra 64 below covers the row count/framing. Consequently this
-/// budget also bounds the wire's 16 MiB byte cap and one-million-node cap without serializing after
-/// a page generation has already committed.
+/// The canonical bridge budget uses at most 36 fixed logical bytes per result, eight bytes per
+/// field name, four bytes per table name, and a tagged JSON estimate for each row. The
+/// storage-owned row estimate is strictly larger: it starts at 32 bytes, charges at least 64 bytes
+/// per map entry, doubles every key and value estimate, and the extra 64 below covers the row
+/// count/framing. Consequently this also bounds the bridge's 16 MiB byte cap and
+/// one-million-node cap early enough to reject an oversized result before the page generation
+/// commits; the bridge materializes the already-bounded JavaScript result afterward.
 pub fn retain_result(result_bytes: &mut usize, result: &ExecuteResult) -> Result<()> {
     let mut bytes = result
         .command

@@ -244,10 +244,6 @@ async function handleRequest(
       assertNoTransaction(transaction.activeId);
       engine.defineTables(request.params.schemas);
       return {revision: engine.revision()};
-    case 'defineTable':
-      assertNoTransaction(transaction.activeId);
-      engine.defineTable(request.params.schema);
-      return undefined;
     case 'replaceTable': {
       assertNoTransaction(transaction.activeId);
       const outcome = engine.replaceTableSnapshot(

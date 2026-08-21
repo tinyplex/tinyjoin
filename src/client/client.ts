@@ -14,7 +14,11 @@ import {
 } from '../protocol.js';
 import {ClientError} from './error.js';
 import {QueryBuilder, type QueryExecutor} from './query-builder.js';
-import {WorkerRpc, type WorkerLike} from './rpc.js';
+import {
+  WorkerRpc,
+  type ResultValidation,
+  type WorkerLike,
+} from './rpc.js';
 
 export interface ClientOptions {
   worker?: WorkerLike;
@@ -162,7 +166,7 @@ export class Client implements QueryExecutor {
     assertClientOptions(options);
     const storage = storageFromDataDir(options.dataDir);
     const worker = createWorker(options);
-    this.#rpc = new WorkerRpc(worker);
+    this.#rpc = new WorkerRpc(worker.worker, worker.resultValidation);
     this.#rpc.onEvent((event) => {
       if (event.event === 'tablesChanged') {
         this.#revision = Math.max(this.#revision, event.payload.revision);
@@ -699,7 +703,10 @@ export async function create(
   }
 }
 
-function createWorker(options: ClientOptions): WorkerLike {
+function createWorker(options: ClientOptions): {
+  worker: WorkerLike;
+  resultValidation: ResultValidation;
+} {
   const selected = [
     options.worker,
     options.workerFactory,
@@ -711,13 +718,19 @@ function createWorker(options: ClientOptions): WorkerLike {
     );
   }
 
-  return (
-    options.worker ??
-    options.workerFactory?.() ??
-    (options.workerUrl
-      ? createUrlWorker(options.workerUrl)
-      : createDefaultWorker())
-  );
+  if (options.worker) {
+    return {worker: options.worker, resultValidation: 'full'};
+  }
+  if (options.workerFactory) {
+    return {worker: options.workerFactory(), resultValidation: 'full'};
+  }
+  if (options.workerUrl) {
+    return {
+      worker: createUrlWorker(options.workerUrl),
+      resultValidation: 'full',
+    };
+  }
+  return {worker: createDefaultWorker(), resultValidation: 'header'};
 }
 
 function createUrlWorker(url: string | URL): WorkerLike {

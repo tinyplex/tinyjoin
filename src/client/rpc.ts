@@ -1,6 +1,7 @@
 import {
   PROTOCOL_VERSION,
   isRpcResult,
+  isRpcResultHeader,
   isWorkerEvent,
   isWorkerResponse,
   type RpcMethod,
@@ -33,6 +34,8 @@ export interface WorkerLike {
   terminate?: () => void;
 }
 
+export type ResultValidation = 'full' | 'header';
+
 type PendingRequest = {
   method: RpcMethod;
   resolve(value: unknown): void;
@@ -43,11 +46,13 @@ export class WorkerRpc {
   readonly #worker: WorkerLike;
   readonly #pending = new Map<number, PendingRequest>();
   readonly #eventListeners = new Set<(event: WorkerEvent) => void>();
+  readonly #resultValidation: ResultValidation;
   #nextId = 1;
   #disposed = false;
 
-  constructor(worker: WorkerLike) {
+  constructor(worker: WorkerLike, resultValidation: ResultValidation = 'full') {
     this.#worker = worker;
+    this.#resultValidation = resultValidation;
     worker.addEventListener('message', this.#onMessage);
     worker.addEventListener('messageerror', this.#onMessageError);
     worker.addEventListener('error', this.#onError);
@@ -134,7 +139,11 @@ export class WorkerRpc {
       return;
     }
     if (event.data.ok) {
-      if (!isRpcResult(pending.method, event.data.result)) {
+      const validResult =
+        this.#resultValidation === 'full'
+          ? isRpcResult(pending.method, event.data.result)
+          : isRpcResultHeader(pending.method, event.data.result);
+      if (!validResult) {
         this.dispose(
           new ClientError({
             code: 'PROTOCOL_MISMATCH',

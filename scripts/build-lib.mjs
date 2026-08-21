@@ -106,7 +106,10 @@ async function buildOpfsRuntime() {
     [
       [/\bimport\s*\(/, 'a dynamic import'],
       [/tinygres_wasm(?:_bg)?/i, 'default WASM glue'],
-      [/WASM returned an invalid binary response/, 'the WASM wire adapter'],
+      [
+        /WASM returned an invalid structured response envelope/,
+        'the structured WASM adapter',
+      ],
     ],
   );
   const rawBytes = Buffer.byteLength(source);

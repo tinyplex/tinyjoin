@@ -5,7 +5,11 @@ declare module '*tinygres_wasm.js' {
 
   export class WasmEngine {
     constructor(device: import('../worker/page-device.js').PageDevice);
-    call(operation: number, payload: Uint8Array): Uint8Array;
+    callStructured(
+      bridgeVersion: number,
+      operation: number,
+      payload: unknown,
+    ): unknown;
     free(): void;
   }
 }

@@ -10,10 +10,9 @@ import type {
   TableSchema,
 } from '../protocol.js';
 import {MemoryPageDevice, type PageDevice} from './page-device.js';
-import {createBinaryWasmEngine} from './wasm-wire.js';
+import {createStructuredWasmEngine} from './wasm-bridge.js';
 
 export interface WorkerEngine {
-  defineTable(schema: TableSchema): void;
   defineTables(schemas: TableSchema[]): void;
   replaceTableSnapshot(schema: TableSchema, rows: Row[]): ApplyOutcome;
   applyBatch(batch: ChangeBatch): ApplyOutcome;
@@ -46,5 +45,5 @@ export async function createPageWasmEngine(
 ): Promise<WorkerEngine> {
   const wasm = await import('../wasm/tinygres_wasm.js');
   await wasm.default();
-  return createBinaryWasmEngine(wasm.WasmEngine, device);
+  return createStructuredWasmEngine(wasm.WasmEngine, device);
 }

@@ -401,7 +401,10 @@ async function assertConsumerPrivateRuntimeBoundary(files) {
       'an inlined runtime or WASM data URL',
     ],
     [/tinygres_wasm(?:_bg)?/i, 'default WASM glue'],
-    [/WASM returned an invalid binary response/, 'the WASM wire adapter'],
+    [
+      /WASM returned an invalid structured response envelope/,
+      'the structured WASM adapter',
+    ],
   ]) {
     if (pattern.test(opfsRuntimeSource)) {
       throw new Error(
