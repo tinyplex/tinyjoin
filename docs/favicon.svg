@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">TinyGres logo</title>
+  <desc id="desc">A compact database stack that also forms an abstract elephant face, with a wide trunk and two tusks.</desc>
+  <defs>
+    <clipPath id="icon-clip">
+      <rect x="64" y="64" width="896" height="896" rx="144" ry="144"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#icon-clip)" shape-rendering="geometricPrecision">
+    <!-- Strictly square, softly rounded silhouette. -->
+    <rect x="64" y="64" width="896" height="896" rx="144" ry="144" fill="#000000"/>
+
+    <!-- Accent database tier. Its two edges share the same elliptical curvature. -->
+    <path fill="#3718EC" d="
+      M 64 507
+      C 278 575, 746 575, 960 507
+      L 960 688
+      C 746 756, 278 756, 64 688
+      Z"/>
+
+    <!-- Second and third database-stack separators. -->
+    <path d="M 64 475 C 278 543, 746 543, 960 475"
+          fill="none" stroke="#FFFFFF" stroke-width="64" stroke-linecap="butt"/>
+    <path d="M 64 720 C 278 788, 746 788, 960 720"
+          fill="none" stroke="#FFFFFF" stroke-width="64" stroke-linecap="butt"/>
+
+    <!-- Opaque trunk core, covering the stack behind it. -->
+    <path fill="#000000" d="
+      M 372 245
+      L 652 245
+      L 652 824
+      C 652 894, 590 920, 512 920
+      C 434 920, 372 894, 372 824
+      Z"/>
+
+    <!-- Heavy tusks: mirrored, round-capped, and nested inside the lower corners. -->
+    <path d="M 372 772 C 354 824, 303 860, 235 866"
+          fill="none" stroke="#FFFFFF" stroke-width="80"
+          stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 652 772 C 670 824, 721 860, 789 866"
+          fill="none" stroke="#FFFFFF" stroke-width="80"
+          stroke-linecap="round" stroke-linejoin="round"/>
+
+    <!-- First database separator flowing continuously into the trunk outline. -->
+    <path d="
+      M 64 270
+      C 188 307, 286 325, 337 325
+      C 360 325, 372 344, 372 372
+      L 372 815
+      C 372 886, 430 924, 512 924
+      C 594 924, 652 886, 652 815
+      L 652 372
+      C 652 344, 664 325, 687 325
+      C 738 325, 836 307, 960 270"
+      fill="none" stroke="#FFFFFF" stroke-width="72"
+      stroke-linecap="butt" stroke-linejoin="round"/>
+  </g>
+</svg>

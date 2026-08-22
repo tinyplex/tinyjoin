@@ -6,6 +6,7 @@ const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const requiredFiles = [
   '.nojekyll',
   'CNAME',
+  'favicon.svg',
   'index.html',
   'api/index.html',
   'guides/index.html',
@@ -44,6 +45,13 @@ export async function checkDocs(
   const stylesheet = await readFile(resolve(docs, 'css/index.css'), 'utf8');
   if (!homepage.includes('<nav id="actions" aria-label="Get started">')) {
     errors.push('The homepage must contain its explicitly scoped action links');
+  }
+  if (
+    !homepage.includes(
+      '<link rel="icon" type="image/svg+xml" href="/favicon.svg">',
+    )
+  ) {
+    errors.push('The homepage must link to the generated SVG favicon');
   }
   if (/article#home\s*>\s*p\s*>\s*a/.test(stylesheet)) {
     errors.push('Homepage button styles must not target ordinary paragraphs');

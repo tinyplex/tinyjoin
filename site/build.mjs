@@ -238,6 +238,7 @@ const Page = () => {
       h('meta', {property: 'og:description', content: description}),
       h('meta', {property: 'og:url', content: canonical}),
       h('link', {rel: 'canonical', href: canonical}),
+      h('link', {rel: 'icon', type: 'image/svg+xml', href: '/favicon.svg'}),
       h('link', {rel: 'stylesheet', href: '/css/index.css'}),
       h('script', {src: '/js/site.js'}),
     ),
