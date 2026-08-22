@@ -1,6 +1,7 @@
 import {readFileSync} from 'node:fs';
 import {access} from 'node:fs/promises';
-import {resolve} from 'node:path';
+import {dirname, relative, resolve} from 'node:path';
+import {fileURLToPath} from 'node:url';
 
 import {createElement as h} from 'react';
 import {
@@ -39,6 +40,7 @@ const reflections = [
   'ClientError',
   '*',
 ];
+const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 const hideInheritedErrorMembers = (reflection) => {
   if (reflection.name !== 'ClientError' || reflection.children == null) {
@@ -166,6 +168,15 @@ const Home = ({page}) =>
     page.body ? h(Markdown, {markdown: page.body, html: true}) : null,
   );
 
+const MarkdownPage = () => {
+  const {summary, body} = usePageNode();
+  return h(Markdown, {
+    markdown: [summary, body].filter(Boolean).join('\n\n'),
+    html: true,
+    skipCode: true,
+  });
+};
+
 const Footer = () =>
   h(
     'footer',
@@ -268,7 +279,12 @@ const Page = () => {
   );
 };
 
-export const build = async (outDir = 'docs', typesDir = 'dist/@types') => {
+export const build = async (
+  outDir = 'docs',
+  typesDir = 'dist/@types',
+  publicMarkdownDir = repositoryRoot,
+  packageDir = resolve(typesDir, '..'),
+) => {
   const docs = createDocs('https://tinygres.org', outDir)
     .addJsFile('site/js/site.ts')
     .addLessFile('site/less/index.less')
@@ -293,10 +309,41 @@ export const build = async (outDir = 'docs', typesDir = 'dist/@types') => {
   docs
     .addPageForEachNode('/', Page)
     .addPageForNode('/api/', Page, 'all.html', true)
+    .addMarkdownForNode(
+      '/',
+      MarkdownPage,
+      getOutputPath(outDir, '/', resolve(publicMarkdownDir, 'README.md')),
+    )
+    .addMarkdownForNode(
+      '/guides/releases/',
+      MarkdownPage,
+      getOutputPath(
+        outDir,
+        '/guides/releases/',
+        resolve(publicMarkdownDir, 'releases.md'),
+      ),
+    )
+    .addMarkdownForNode(
+      '/',
+      MarkdownPage,
+      getOutputPath(outDir, '/', resolve(packageDir, 'README.md')),
+    )
+    .addMarkdownForNode(
+      '/guides/releases/',
+      MarkdownPage,
+      getOutputPath(
+        outDir,
+        '/guides/releases/',
+        resolve(packageDir, 'releases.md'),
+      ),
+    )
     .publish();
 
   await waitForFile(resolve(outDir, 'css/index.css'));
 };
+
+const getOutputPath = (outDir, nodeUrl, destination) =>
+  relative(resolve(outDir, `.${nodeUrl}`), destination);
 
 const waitForFile = async (file) => {
   for (let attempt = 0; attempt < 500; attempt++) {

@@ -37,6 +37,10 @@ export async function checkDocs(
   }
 
   const homepage = await readFile(resolve(docs, 'index.html'), 'utf8');
+  const releasePage = await readFile(
+    resolve(docs, 'guides/releases/index.html'),
+    'utf8',
+  );
   const stylesheet = await readFile(resolve(docs, 'css/index.css'), 'utf8');
   if (!homepage.includes('<nav id="actions" aria-label="Get started">')) {
     errors.push('The homepage must contain its explicitly scoped action links');
@@ -46,6 +50,14 @@ export async function checkDocs(
   }
   if (/article#home\s*>\s*hr\s*~/.test(stylesheet)) {
     errors.push('Homepage content after a divider must retain the paired grid');
+  }
+  for (const [name, html] of [
+    ['homepage', homepage],
+    ['release page', releasePage],
+  ]) {
+    if (/<a\b[^>]*href="https:\/\/tinygres\.org\//.test(html)) {
+      errors.push(`The ${name} must use root-relative internal links`);
+    }
   }
 
   if (checkPackageCopies) {
@@ -105,8 +117,8 @@ export async function checkDocs(
 
 async function checkMarkdownCopies(errors) {
   const markdownCopies = [
-    ['site/home/index.md', 'README.md', 'dist/README.md'],
-    ['site/guides/7_releases.md', 'releases.md', 'dist/releases.md'],
+    ['README.md', 'dist/README.md'],
+    ['releases.md', 'dist/releases.md'],
     ['site/guides/6_agents.md', 'AGENTS.md', 'dist/agents.md'],
   ];
   for (const paths of markdownCopies) {
@@ -118,6 +130,16 @@ async function checkMarkdownCopies(errors) {
         errors.push(`${path} is out of sync with ${paths[0]}`);
       }
     });
+  }
+
+  for (const path of ['README.md', 'releases.md']) {
+    const markdown = await readFile(resolve(root, path), 'utf8');
+    if (/(?:href|src)="\/|\]\(\//.test(markdown)) {
+      errors.push(`${path} must use absolute internal links`);
+    }
+    if (!markdown.includes('https://tinygres.org/')) {
+      errors.push(`${path} must contain an absolute tinygres.org link`);
+    }
   }
 }
 

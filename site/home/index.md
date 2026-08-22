@@ -10,9 +10,9 @@
 </section>
 
 <nav id="actions" aria-label="Get started">
-  <a class="start" href="https://tinygres.org/guides/getting-started/">Get started</a>
-  <a href="https://tinygres.org/demos/">Try the demos</a>
-  <a href="https://tinygres.org/api/">Read the API</a>
+  <a class="start" href="/guides/getting-started/">Get started</a>
+  <a href="/demos/">Try the demos</a>
+  <a href="/api/">Read the API</a>
 </nav>
 
 ---
@@ -87,14 +87,14 @@ await db.close();
 > PostgreSQL server, wire protocol, or replication client.
 >
 > Check the exact [SQL compatibility
-> contract](https://tinygres.org/guides/sql-compatibility/) before relying on
+> contract](/guides/sql-compatibility/) before relying on
 > unlisted PostgreSQL syntax or types.
 
 > ## Go deeper when you need to
 >
-> - Follow the [getting started guide](https://tinygres.org/guides/getting-started/).
-> - Browse the [API reference](https://tinygres.org/api/).
-> - Review the [release notes](https://tinygres.org/guides/releases/).
+> - Follow the [getting started guide](/guides/getting-started/).
+> - Browse the [API reference](/api/).
+> - Review the [release notes](/guides/releases/).
 > - Start an app with [create-tinygres](https://github.com/tinyplex/create-tinygres).
 > - Read the [source](https://github.com/tinyplex/tinygres).
 >

@@ -94,8 +94,12 @@ build. Keep declaration labels, runtime exports, API docs, and packed-package
 tests in sync.
 
 Documentation sources live in `site/`; `docs/` is generated output for
-tinygres.org. The homepage, release notes, and this guide also become Markdown
-files in the publishable package.
+tinygres.org. `README.md` and `releases.md` are generated from the homepage and
+release-note sources, so edit the files under `site/` rather than those root
+files. Write internal links in those sources as root-relative URLs. TinyDocs
+keeps them root-relative on the website and makes them absolute
+`https://tinygres.org/...` URLs in the generated Markdown. This guide also
+becomes `agents.md` in the publishable package.
 
 Useful validation commands are:
 

@@ -18,12 +18,33 @@ try {
     '{"name":"tinygres","private":true,"type":"module"}\n',
   );
   await buildDefinitions(root, temporaryDist);
-  await buildDocs(temporaryDocs, resolve(temporaryDist, '@types'));
+  await buildDocs(
+    temporaryDocs,
+    resolve(temporaryDist, '@types'),
+    temporaryRoot,
+    temporaryDist,
+  );
   await checkDocs(temporaryDocs, {checkPackageCopies: false});
   await assertDirectoriesEqual(resolve(root, 'docs'), temporaryDocs);
+  await assertFilesEqual(
+    resolve(root, 'README.md'),
+    resolve(temporaryRoot, 'README.md'),
+  );
+  await assertFilesEqual(
+    resolve(root, 'releases.md'),
+    resolve(temporaryRoot, 'releases.md'),
+  );
   console.log('Committed docs match a fresh TinyDocs build.');
 } finally {
   await rm(temporaryRoot, {force: true, recursive: true});
+}
+
+async function assertFilesEqual(committed, generated) {
+  if (!(await readFile(committed)).equals(await readFile(generated))) {
+    throw new Error(
+      `Committed ${relative(root, committed)} is stale. Run npm run build:docs.`,
+    );
+  }
 }
 
 async function assertDirectoriesEqual(committed, generated) {

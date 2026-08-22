@@ -64,13 +64,16 @@ await copyFile(
 );
 
 async function copyPublicMarkdown() {
+  await copyFile(
+    resolve(root, 'site/guides/6_agents.md'),
+    resolve(root, 'AGENTS.md'),
+  );
   const markdown = [
-    ['site/home/index.md', 'README.md', 'README.md'],
-    ['site/guides/7_releases.md', 'releases.md', 'releases.md'],
-    ['site/guides/6_agents.md', 'AGENTS.md', 'agents.md'],
+    ['README.md', 'README.md'],
+    ['releases.md', 'releases.md'],
+    ['AGENTS.md', 'agents.md'],
   ];
-  for (const [source, repositoryFile, packageFile] of markdown) {
-    await copyFile(resolve(root, source), resolve(root, repositoryFile));
+  for (const [source, packageFile] of markdown) {
     await copyFile(resolve(root, source), resolve(dist, packageFile));
   }
 }
