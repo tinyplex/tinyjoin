@@ -17,7 +17,7 @@ test('queries and invalidates through the real Worker/WASM engine', async ({
 
   await expect(page.getByTestId('state')).toHaveText('Ready');
   await expect(page.getByTestId('status')).toContainText(
-    'initial snapshot is queryable locally',
+    'initial SQL data is queryable locally',
   );
   await expect(page.getByTestId('revision')).toHaveText('1');
   await expect(page.locator('[data-post-id]')).toHaveCount(2);

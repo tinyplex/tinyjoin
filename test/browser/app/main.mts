@@ -102,7 +102,7 @@ async function boot(): Promise<void> {
   );
 
   stateElement.textContent = 'Ready';
-  statusElement.textContent = 'Ready. The initial snapshot is queryable locally.';
+  statusElement.textContent = 'Ready. The initial SQL data is queryable locally.';
   applyButton.disabled = false;
 }
 

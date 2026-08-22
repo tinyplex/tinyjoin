@@ -255,10 +255,7 @@ retain their independent 16 MiB logical bounds. Ordinary queries and writes
 therefore do not deserialize the complete database into WASM memory or copy it
 through `postMessage`.
 
-TinyGres writes only its page-native format. Earlier experimental
-checkpoint/journal and staged-migration layouts were never released and are not
-recognized or migrated. Use a new logical storage name, or clear experimental
-OPFS data, when moving a development app to this format.
+TinyGres writes a single page-native database format.
 
 ## SQL compatibility
 
@@ -401,7 +398,7 @@ npm run check:size      # hard 1 MiB page-native WASM gate
 ```
 
 The browser tests initialize the real module Worker, query, prepare and reuse
-statements, apply atomic row changes, receive invalidations, and re-query, plus
+statements, execute atomic SQL writes, receive invalidations, and re-query, plus
 exercise persistence through a real dedicated Worker and OPFS restart. The
 writable proof creates a typed table, inserts and updates inside a transaction,
 verifies rollback after a constraint failure, closes the Worker, and reopens the

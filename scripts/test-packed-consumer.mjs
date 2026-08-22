@@ -28,14 +28,24 @@ const appDirectory = resolve(generatedRoot, 'app');
 const port = 43_117;
 const baseUrl = `http://127.0.0.1:${port}`;
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+const arguments_ = process.argv.slice(2);
+if (arguments_.some((argument) => argument !== '--built')) {
+  throw new Error(`Unknown packed-consumer option: ${arguments_.join(' ')}`);
+}
+const useBuiltPackage = arguments_.includes('--built');
 const cleanupGeneratedRoot = () =>
   rmSync(generatedRoot, {force: true, recursive: true});
 
 process.once('exit', cleanupGeneratedRoot);
 await mkdir(packageDirectory, {recursive: true});
 
-// Build and pack the same clean dist directory that is published to npm.
-run(npm, ['run', 'build'], root);
+// Pack the same clean dist directory that is published to npm. Release checks
+// pass --built so their one already-verified WASM build is reused.
+if (useBuiltPackage) {
+  await requireWasmArtifacts(resolve(root, 'dist'));
+} else {
+  run(npm, ['run', 'build'], root);
+}
 await assertBuildLibRejectsMissingWasmArtifacts();
 const packOutput = run(
   npm,
@@ -273,73 +283,41 @@ function parsePackOutput(output) {
 
 function assertPackedFiles(packed) {
   const files = Array.isArray(packed.files)
-    ? packed.files.map((file) => file.path)
+    ? packed.files.map((file) => file.path).sort()
     : [];
-  for (const required of [
-    'package.json',
+  const expected = [
+    'LICENSE',
     'README.md',
+    'client/client.d.ts',
+    'client/client.js',
+    'client/error.d.ts',
+    'client/error.js',
+    'client/rpc.js',
     'docs/sql.md',
-    'index.js',
     'index.d.ts',
-    'worker/default-entry.js',
+    'package.json',
+    'index.js',
+    'protocol.d.ts',
+    'protocol.js',
     'wasm/tinygres_wasm.js',
     'wasm/tinygres_wasm_bg.wasm',
     'worker-opfs/tinygres_opfs_runtime.js',
+    'worker/default-entry.js',
+    'worker/engine.js',
+    'worker/host.js',
+    'worker/index.d.ts',
+    'worker/index.js',
     'worker/opfs-loader.js',
-  ]) {
-    if (!files.includes(required)) {
-      throw new Error(`Packed TinyGres is missing ${required}`);
-    }
-  }
-  const integrationFiles = files.filter(
-    (file) =>
-      file.startsWith('adapters/') ||
-      file === 'source-options.js' ||
-      file === 'source-options.d.ts' ||
-      file === 'worker/builtin-source.js' ||
-      file === 'worker/builtin-source.d.ts',
-  );
-  if (integrationFiles.length > 0) {
+    'worker/page-device.js',
+    'worker/storage-error.js',
+    'worker/wasm-bridge.js',
+    'worker/wasm-preflight.js',
+  ].sort();
+  const missing = expected.filter((file) => !files.includes(file));
+  const unexpected = files.filter((file) => !expected.includes(file));
+  if (missing.length > 0 || unexpected.length > 0) {
     throw new Error(
-      `Packed TinyGres contains integration modules: ${integrationFiles.join(', ')}`,
-    );
-  }
-  const nestedManifests = files.filter((file) =>
-    file.endsWith('/package.json'),
-  );
-  if (nestedManifests.length > 0) {
-    throw new Error(
-      `Packed TinyGres contains nested package manifests: ${nestedManifests.join(', ')}`,
-    );
-  }
-  for (const privateModule of ['opfs-engine', 'page-storage']) {
-    for (const extension of ['js', 'd.ts']) {
-      const path = `worker/${privateModule}.${extension}`;
-      if (files.includes(path)) {
-        throw new Error(
-          `Packed TinyGres exposes private storage implementation module ${path}`,
-        );
-      }
-    }
-  }
-  const packagedWasm = files.filter((file) => file.endsWith('.wasm'));
-  if (
-    packagedWasm.length !== 1 ||
-    packagedWasm[0] !== 'wasm/tinygres_wasm_bg.wasm'
-  ) {
-    throw new Error(
-      `Packed TinyGres must contain exactly its page WASM: ${packagedWasm.join(', ')}`,
-    );
-  }
-  const privateRuntimeAssets = files.filter((file) =>
-    file.startsWith('worker-'),
-  );
-  if (
-    privateRuntimeAssets.length !== 1 ||
-    privateRuntimeAssets[0] !== 'worker-opfs/tinygres_opfs_runtime.js'
-  ) {
-    throw new Error(
-      `Packed TinyGres must contain exactly its OPFS runtime: ${privateRuntimeAssets.join(', ')}`,
+      `Packed TinyGres file inventory changed:\nmissing: ${missing.join(', ') || '(none)'}\nunexpected: ${unexpected.join(', ') || '(none)'}`,
     );
   }
 }

@@ -26,7 +26,7 @@ if (compile.status !== 0) {
   process.exit(compile.status ?? 1);
 }
 
-await buildPrivateOpfsRuntime();
+await buildPrivateWorkerRuntime();
 await assertOpfsLoaderBoundary();
 
 const manifest = JSON.parse(
@@ -58,18 +58,32 @@ await copyFile(resolve(root, 'README.md'), resolve(dist, 'README.md'));
 await mkdir(resolve(dist, 'docs'), {recursive: true});
 await copyFile(resolve(root, 'docs/sql.md'), resolve(dist, 'docs/sql.md'));
 
-async function buildPrivateOpfsRuntime() {
+async function buildPrivateWorkerRuntime() {
   await buildOpfsRuntime();
 
-  // These page-storage modules are private build inputs. Only their
-  // self-contained runtime asset is published, so memory-only sessions do not
-  // pull OPFS code into their Worker bundle.
+  // Publish the JavaScript needed by the default Worker, but not declarations
+  // for its private implementation modules. The two OPFS source modules are
+  // bundled into the self-contained runtime asset instead of shipping twice.
   await Promise.all(
-    ['opfs-engine', 'page-storage'].flatMap((module) => [
-      rm(resolve(dist, `worker/${module}.js`), {force: true}),
+    [
+      'default-entry',
+      'engine',
+      'host',
+      'opfs-engine',
+      'opfs-loader',
+      'page-device',
+      'page-storage',
+      'storage-error',
+      'wasm-bridge',
+      'wasm-preflight',
+    ].flatMap((module) => [
       rm(resolve(dist, `worker/${module}.d.ts`), {force: true}),
+      ...(['opfs-engine', 'page-storage'].includes(module)
+        ? [rm(resolve(dist, `worker/${module}.js`), {force: true})]
+        : []),
     ]),
   );
+  await rm(resolve(dist, 'client/rpc.d.ts'), {force: true});
 }
 
 async function buildOpfsRuntime() {
