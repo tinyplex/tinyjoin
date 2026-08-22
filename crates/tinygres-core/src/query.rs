@@ -7,15 +7,15 @@ use crate::storage::{
     StorageReader, estimated_row_bytes, estimated_value_bytes, validate_json_value,
 };
 use crate::{
-    ColumnDefinition, ColumnType, EngineError, Filter, FilterOperator, NullOrder, OrderBy,
-    OrderDirection, Predicate, QueryPlan, QueryResult, Result, ResultField, Row, TableSchema,
+    ColumnDefinition, ColumnType, ComparisonOperator, EngineError, NullOrder, OrderBy,
+    OrderDirection, Predicate, QueryResult, Result, ResultField, Row, SelectPlan, TableDefinition,
     VisitControl, VisitOutcome,
 };
 
 const MAX_SQL_BYTES: usize = 64 * 1024;
 const MAX_SQL_TOKENS: usize = 4 * 1024;
 const MAX_PROJECTION_COLUMNS: usize = 256;
-const MAX_FILTERS: usize = 256;
+const MAX_PREDICATE_NODES: usize = 256;
 const MAX_PREDICATE_DEPTH: usize = 32;
 const MAX_IN_VALUES: usize = 1024;
 const MAX_ORDER_COLUMNS: usize = 32;
@@ -26,7 +26,7 @@ const MAX_QUERY_RESULT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SCAN_ROWS: usize = 1_000_000;
 const MAX_ORDERED_ROWS: usize = 100_000;
 
-pub(crate) fn execute(storage: &dyn StorageReader, plan: &QueryPlan) -> Result<QueryResult> {
+pub(crate) fn execute(storage: &dyn StorageReader, plan: &SelectPlan) -> Result<QueryResult> {
     if plan.table.trim().is_empty() {
         return Err(EngineError::invalid_query(
             "A query must name exactly one table",
@@ -46,11 +46,6 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &QueryPlan) -> Result<Q
             "A projection cannot contain more than {MAX_PROJECTION_COLUMNS} columns"
         )));
     }
-    if plan.filters.len() > MAX_FILTERS {
-        return Err(EngineError::invalid_query(format!(
-            "A query cannot contain more than {MAX_FILTERS} filters"
-        )));
-    }
     if plan.order_by.len() > MAX_ORDER_COLUMNS {
         return Err(EngineError::invalid_query(format!(
             "A query cannot order by more than {MAX_ORDER_COLUMNS} columns"
@@ -68,41 +63,35 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &QueryPlan) -> Result<Q
     }
 
     let schema = storage.table_schema(&plan.table)?;
-    if !schema.columns.is_empty() {
-        if let Some(columns) = &plan.columns {
-            for column in columns {
-                if !schema
-                    .columns
-                    .iter()
-                    .any(|definition| definition.name == *column)
-                {
-                    return Err(EngineError::column_not_found(column, &plan.table));
-                }
+    if let Some(columns) = &plan.columns {
+        for column in columns {
+            if !schema
+                .columns
+                .iter()
+                .any(|definition| definition.name == *column)
+            {
+                return Err(EngineError::column_not_found(column, &plan.table));
             }
         }
-        for filter in &plan.filters {
-            let definition = column_definition(&schema, &filter.column, &plan.table)?;
-            validate_comparison_value(definition, filter.operator, &filter.value, &plan.table)?;
-        }
-        if let Some(predicate) = &plan.predicate {
-            validate_predicate_columns(predicate, &schema, &plan.table)?;
-            validate_predicate_types(predicate, &schema, &plan.table)?;
-        }
-        for order in &plan.order_by {
-            let definition = column_definition(&schema, &order.column, &plan.table)?;
-            if definition.data_type == ColumnType::Json {
-                return Err(EngineError::type_mismatch(format!(
-                    "JSON column `{}` in `{}` cannot be ordered",
-                    order.column, plan.table
-                )));
-            }
+    }
+    if let Some(predicate) = &plan.predicate {
+        validate_predicate_columns(predicate, &schema, &plan.table)?;
+        validate_predicate_types(predicate, &schema, &plan.table)?;
+    }
+    for order in &plan.order_by {
+        let definition = column_definition(&schema, &order.column, &plan.table)?;
+        if definition.data_type == ColumnType::Json {
+            return Err(EngineError::type_mismatch(format!(
+                "JSON column `{}` in `{}` cannot be ordered",
+                order.column, plan.table
+            )));
         }
     }
 
     if plan.limit == Some(0) {
         return Ok(QueryResult {
             revision: storage.revision(),
-            fields: projection_fields(&schema, plan.columns.as_deref(), None)?,
+            fields: projection_fields(&schema, plan.columns.as_deref())?,
             rows: Vec::new(),
         });
     }
@@ -115,27 +104,15 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &QueryPlan) -> Result<Q
 
     Ok(QueryResult {
         revision: storage.revision(),
-        fields: projection_fields(&schema, plan.columns.as_deref(), rows.first())?,
+        fields: projection_fields(&schema, plan.columns.as_deref())?,
         rows,
     })
 }
 
-/// Describes an ordinary projection in SQL order. Programmatic schemas without
-/// a typed catalog retain UNKNOWN OIDs; their `*` names can only be learned
-/// from the first returned row.
 pub(crate) fn projection_fields(
-    schema: &TableSchema,
+    schema: &TableDefinition,
     columns: Option<&[String]>,
-    first_row: Option<&Row>,
 ) -> Result<Vec<ResultField>> {
-    if schema.columns.is_empty() {
-        let names = columns
-            .map(|columns| columns.iter().map(String::as_str).collect::<Vec<_>>())
-            .or_else(|| first_row.map(|row| row.keys().map(String::as_str).collect::<Vec<_>>()))
-            .unwrap_or_default();
-        return Ok(names.into_iter().map(ResultField::unknown).collect());
-    }
-
     match columns {
         Some(columns) => columns
             .iter()
@@ -154,8 +131,8 @@ pub(crate) fn projection_fields(
 
 fn execute_unordered(
     storage: &dyn StorageReader,
-    plan: &QueryPlan,
-    schema: &crate::TableSchema,
+    plan: &SelectPlan,
+    schema: &crate::TableDefinition,
 ) -> Result<Vec<Row>> {
     let mut scanned = 0_usize;
     let mut skipped_matches = 0_usize;
@@ -163,9 +140,7 @@ fn execute_unordered(
     let mut rows = Vec::new();
     visit_candidate_rows(storage, plan, schema, &mut |row| {
         count_scanned_row(&mut scanned)?;
-        if !matches_filters(row, &plan.filters, &plan.table)?
-            || !matches_predicate(row, plan.predicate.as_ref(), &plan.table)?
-        {
+        if !matches_predicate(row, plan.predicate.as_ref(), &plan.table)? {
             return Ok(VisitControl::Continue);
         }
         if skipped_matches < plan.offset {
@@ -197,17 +172,15 @@ fn execute_unordered(
 
 fn execute_ordered(
     storage: &dyn StorageReader,
-    plan: &QueryPlan,
-    schema: &crate::TableSchema,
+    plan: &SelectPlan,
+    schema: &crate::TableDefinition,
 ) -> Result<Vec<Row>> {
     let mut scanned = 0_usize;
     let mut ordered_bytes = 0_usize;
     let mut rows = Vec::new();
     visit_candidate_rows(storage, plan, schema, &mut |row| {
         count_scanned_row(&mut scanned)?;
-        if matches_filters(row, &plan.filters, &plan.table)?
-            && matches_predicate(row, plan.predicate.as_ref(), &plan.table)?
-        {
+        if matches_predicate(row, plan.predicate.as_ref(), &plan.table)? {
             if rows.len() == MAX_ORDERED_ROWS {
                 return Err(EngineError::new(
                     "QUERY_WORK_LIMIT_EXCEEDED",
@@ -257,8 +230,8 @@ fn execute_ordered(
 
 fn visit_candidate_rows(
     storage: &dyn StorageReader,
-    plan: &QueryPlan,
-    schema: &crate::TableSchema,
+    plan: &SelectPlan,
+    schema: &crate::TableDefinition,
     visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
 ) -> Result<VisitOutcome> {
     if let Some(key) = primary_key_lookup(plan, schema) {
@@ -277,15 +250,10 @@ fn visit_candidate_rows(
 
 fn secondary_index_key(
     storage: &dyn StorageReader,
-    plan: &QueryPlan,
-    schema: &crate::TableSchema,
+    plan: &SelectPlan,
+    schema: &crate::TableDefinition,
 ) -> Result<Option<(Vec<String>, Row)>> {
     let mut equalities = Map::new();
-    for filter in &plan.filters {
-        if filter.operator == FilterOperator::Eq && filter.value != Value::Null {
-            equalities.insert(filter.column.clone(), filter.value.clone());
-        }
-    }
     collect_guaranteed_equalities(plan.predicate.as_ref(), &mut equalities);
     for definition in storage.indexes_for_table(&plan.table)? {
         if definition.columns.iter().all(|column| {
@@ -375,7 +343,7 @@ fn result_bytes_limit_exceeded() -> EngineError {
     )
 }
 
-pub(crate) fn parse_sql(sql: &str, params: &[Value]) -> Result<QueryPlan> {
+pub(crate) fn parse_sql(sql: &str, params: &[Value]) -> Result<SelectPlan> {
     validate_sql_input(sql, params)?;
     SqlParser::new(tokenize(sql)?, params).parse()
 }
@@ -728,7 +696,7 @@ impl<'a> SqlParser<'a> {
         }
     }
 
-    fn parse(mut self) -> Result<QueryPlan> {
+    fn parse(mut self) -> Result<SelectPlan> {
         if !self.consume_keyword("select") {
             return Err(EngineError::unsupported_sql(
                 "Only read-only SELECT statements are supported",
@@ -771,10 +739,9 @@ impl<'a> SqlParser<'a> {
             return Err(unsupported_shape());
         }
 
-        Ok(QueryPlan {
+        Ok(SelectPlan {
             table,
             columns,
-            filters: Vec::new(),
             predicate,
             order_by,
             limit,
@@ -1064,12 +1031,12 @@ impl PredicateParser<'_> {
         }
 
         let operator = match self.next() {
-            Some(Token::Eq) => FilterOperator::Eq,
-            Some(Token::Neq) => FilterOperator::Neq,
-            Some(Token::Lt) => FilterOperator::Lt,
-            Some(Token::Lte) => FilterOperator::Lte,
-            Some(Token::Gt) => FilterOperator::Gt,
-            Some(Token::Gte) => FilterOperator::Gte,
+            Some(Token::Eq) => ComparisonOperator::Eq,
+            Some(Token::Neq) => ComparisonOperator::Neq,
+            Some(Token::Lt) => ComparisonOperator::Lt,
+            Some(Token::Lte) => ComparisonOperator::Lte,
+            Some(Token::Gt) => ComparisonOperator::Gt,
+            Some(Token::Gte) => ComparisonOperator::Gte,
             _ => return Err(unsupported_shape()),
         };
         let value = self.parse_value()?;
@@ -1171,9 +1138,9 @@ impl PredicateParser<'_> {
 
     fn node(&mut self, predicate: Predicate) -> Result<Predicate> {
         self.nodes += 1;
-        if self.nodes > MAX_FILTERS {
+        if self.nodes > MAX_PREDICATE_NODES {
             return Err(EngineError::invalid_query(format!(
-                "A query cannot contain more than {MAX_FILTERS} predicate nodes"
+                "A query cannot contain more than {MAX_PREDICATE_NODES} predicate nodes"
             )));
         }
         Ok(predicate)
@@ -1355,16 +1322,13 @@ pub(crate) fn prepared_parameter_index(value: &Value) -> Option<usize> {
         .filter(|index| *index != 0)
 }
 
-pub(crate) fn bind_query_plan_parameters(
-    plan: &QueryPlan,
+pub(crate) fn bind_select_plan_parameters(
+    plan: &SelectPlan,
     params: &[Value],
     limit_parameter: Option<usize>,
     offset_parameter: Option<usize>,
-) -> Result<QueryPlan> {
+) -> Result<SelectPlan> {
     let mut plan = plan.clone();
-    for filter in &mut plan.filters {
-        bind_prepared_value(&mut filter.value, params)?;
-    }
     bind_predicate_parameters(plan.predicate.as_mut(), params)?;
     if let Some(index) = limit_parameter {
         plan.limit = Some(bind_nonnegative_integer_parameter(index, params)?);
@@ -1422,25 +1386,6 @@ pub(crate) fn bind_nonnegative_integer_parameter(index: usize, params: &[Value])
         .ok_or_else(|| EngineError::invalid_query("LIMIT and OFFSET must be non-negative integers"))
 }
 
-pub(crate) fn matches_filters(row: &Row, filters: &[Filter], table: &str) -> Result<bool> {
-    for filter in filters {
-        let Some(actual) = row.get(&filter.column) else {
-            return Err(EngineError::column_not_found(&filter.column, table));
-        };
-        if evaluate_comparison(
-            actual,
-            &filter.value,
-            filter.operator,
-            table,
-            &filter.column,
-        )? != Truth::True
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 pub(crate) fn matches_predicate(
     row: &Row,
     predicate: Option<&Predicate>,
@@ -1490,7 +1435,7 @@ fn evaluate_predicate(row: &Row, predicate: &Predicate, table: &str) -> Result<T
                 .ok_or_else(|| EngineError::column_not_found(column, table))?;
             let mut unknown = false;
             for value in values {
-                match evaluate_comparison(actual, value, FilterOperator::Eq, table, column)? {
+                match evaluate_comparison(actual, value, ComparisonOperator::Eq, table, column)? {
                     Truth::True => return Ok(Truth::True),
                     Truth::Unknown => unknown = true,
                     Truth::False => {}
@@ -1539,16 +1484,16 @@ fn evaluate_predicate(row: &Row, predicate: &Predicate, table: &str) -> Result<T
 fn evaluate_comparison(
     left: &Value,
     right: &Value,
-    operator: FilterOperator,
+    operator: ComparisonOperator,
     table: &str,
     column: &str,
 ) -> Result<Truth> {
     if left == &Value::Null || right == &Value::Null {
         return Ok(Truth::Unknown);
     }
-    if matches!(operator, FilterOperator::Eq | FilterOperator::Neq) {
+    if matches!(operator, ComparisonOperator::Eq | ComparisonOperator::Neq) {
         let equal = values_equal(left, right, table, column)?;
-        let matched = if operator == FilterOperator::Eq {
+        let matched = if operator == ComparisonOperator::Eq {
             equal
         } else {
             !equal
@@ -1557,11 +1502,11 @@ fn evaluate_comparison(
     }
     let ordering = compare_values(left, right, table, column)?;
     let matched = match operator {
-        FilterOperator::Eq | FilterOperator::Neq => unreachable!("handled above"),
-        FilterOperator::Lt => ordering == Ordering::Less,
-        FilterOperator::Lte => ordering != Ordering::Greater,
-        FilterOperator::Gt => ordering == Ordering::Greater,
-        FilterOperator::Gte => ordering != Ordering::Less,
+        ComparisonOperator::Eq | ComparisonOperator::Neq => unreachable!("handled above"),
+        ComparisonOperator::Lt => ordering == Ordering::Less,
+        ComparisonOperator::Lte => ordering != Ordering::Greater,
+        ComparisonOperator::Gt => ordering == Ordering::Greater,
+        ComparisonOperator::Gte => ordering != Ordering::Less,
     };
     Ok(if matched { Truth::True } else { Truth::False })
 }
@@ -1698,9 +1643,9 @@ fn validate_predicate_complexity(predicate: Option<&Predicate>) -> Result<()> {
             )));
         }
         *nodes += 1;
-        if *nodes > MAX_FILTERS {
+        if *nodes > MAX_PREDICATE_NODES {
             return Err(EngineError::invalid_query(format!(
-                "A query cannot contain more than {MAX_FILTERS} predicate nodes"
+                "A query cannot contain more than {MAX_PREDICATE_NODES} predicate nodes"
             )));
         }
         match predicate {
@@ -1727,7 +1672,7 @@ fn validate_predicate_complexity(predicate: Option<&Predicate>) -> Result<()> {
 
 pub(crate) fn validate_predicate_columns(
     predicate: &Predicate,
-    schema: &crate::TableSchema,
+    schema: &crate::TableDefinition,
     table: &str,
 ) -> Result<()> {
     match predicate {
@@ -1751,7 +1696,7 @@ pub(crate) fn validate_predicate_columns(
 }
 
 fn column_definition<'a>(
-    schema: &'a crate::TableSchema,
+    schema: &'a crate::TableDefinition,
     column: &str,
     table: &str,
 ) -> Result<&'a ColumnDefinition> {
@@ -1764,7 +1709,7 @@ fn column_definition<'a>(
 
 pub(crate) fn validate_predicate_types(
     predicate: &Predicate,
-    schema: &crate::TableSchema,
+    schema: &crate::TableDefinition,
     table: &str,
 ) -> Result<()> {
     match predicate {
@@ -1781,7 +1726,7 @@ pub(crate) fn validate_predicate_types(
         Predicate::In { column, values } => {
             let definition = column_definition(schema, column, table)?;
             for value in values {
-                validate_comparison_value(definition, FilterOperator::Eq, value, table)?;
+                validate_comparison_value(definition, ComparisonOperator::Eq, value, table)?;
             }
             Ok(())
         }
@@ -1798,7 +1743,7 @@ pub(crate) fn validate_predicate_types(
 
 fn validate_comparison_value(
     definition: &ColumnDefinition,
-    operator: FilterOperator,
+    operator: ComparisonOperator,
     value: &Value,
     table: &str,
 ) -> Result<()> {
@@ -1809,7 +1754,7 @@ fn validate_comparison_value(
         ColumnType::Boolean => value.is_boolean(),
         ColumnType::Integer | ColumnType::Float => value.is_number(),
         ColumnType::Text => value.is_string(),
-        ColumnType::Json => matches!(operator, FilterOperator::Eq | FilterOperator::Neq),
+        ColumnType::Json => matches!(operator, ComparisonOperator::Eq | ComparisonOperator::Neq),
     };
     if compatible {
         Ok(())
@@ -1818,13 +1763,8 @@ fn validate_comparison_value(
     }
 }
 
-fn primary_key_lookup(plan: &QueryPlan, schema: &crate::TableSchema) -> Option<Row> {
+fn primary_key_lookup(plan: &SelectPlan, schema: &crate::TableDefinition) -> Option<Row> {
     let mut equalities = Map::new();
-    for filter in &plan.filters {
-        if filter.operator == FilterOperator::Eq && filter.value != Value::Null {
-            equalities.insert(filter.column.clone(), filter.value.clone());
-        }
-    }
     collect_guaranteed_equalities(plan.predicate.as_ref(), &mut equalities);
     schema
         .primary_key
@@ -1844,10 +1784,9 @@ fn primary_key_lookup(plan: &QueryPlan, schema: &crate::TableSchema) -> Option<R
 }
 
 /// A direct B-tree lookup must be semantically indistinguishable from scanning
-/// and evaluating the predicate. Untyped table schemas cannot prove that
-/// a lookup miss is not really an incompatible-type error. Floats likewise
-/// have multiple JSON encodings that compare numerically equal (`1`/`1.0`).
-fn exact_primary_key_value(schema: &crate::TableSchema, column: &str, value: &Value) -> bool {
+/// and evaluating the predicate. Floats have multiple JSON encodings that
+/// compare numerically equal (`1`/`1.0`), so they cannot use this shortcut.
+fn exact_primary_key_value(schema: &crate::TableDefinition, column: &str, value: &Value) -> bool {
     let Some(definition) = schema.columns.iter().find(|item| item.name == column) else {
         return false;
     };
@@ -1871,7 +1810,7 @@ fn collect_guaranteed_equalities(predicate: Option<&Predicate>, values: &mut Row
     match predicate {
         Some(Predicate::Comparison {
             column,
-            operator: FilterOperator::Eq,
+            operator: ComparisonOperator::Eq,
             value,
         }) if value != &Value::Null => {
             values.insert(column.clone(), value.clone());
@@ -1912,7 +1851,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::{ColumnDefinition, Engine, InMemoryStorage, IndexDefinition, TableSchema};
+    use crate::{ColumnDefinition, Engine, InMemoryStorage, IndexDefinition, TableDefinition};
 
     fn row(value: Value) -> Row {
         value
@@ -1924,52 +1863,32 @@ mod tests {
     fn engine() -> Engine<InMemoryStorage> {
         let mut engine = Engine::default();
         engine
-            .define_table(TableSchema {
-                name: "posts".to_owned(),
-                primary_key: vec!["id".to_owned()],
-                columns: vec![
-                    ColumnDefinition {
-                        name: "id".to_owned(),
-                        data_type: ColumnType::Integer,
-                        nullable: false,
-                        default: None,
-                    },
-                    ColumnDefinition {
-                        name: "title".to_owned(),
-                        data_type: ColumnType::Text,
-                        nullable: false,
-                        default: None,
-                    },
-                    ColumnDefinition {
-                        name: "user_id".to_owned(),
-                        data_type: ColumnType::Integer,
-                        nullable: true,
-                        default: None,
-                    },
-                    ColumnDefinition {
-                        name: "deleted".to_owned(),
-                        data_type: ColumnType::Boolean,
-                        nullable: true,
-                        default: None,
-                    },
-                ],
-            })
-            .unwrap();
-        engine
-            .replace_table(
-                "posts",
-                vec![
-                    row(json!({"id": 1, "title": "one", "user_id": 7, "deleted": null})),
-                    row(json!({"id": 2, "title": "two", "user_id": 8, "deleted": null})),
-                    row(json!({"id": 3, "title": "three", "user_id": 7, "deleted": true})),
-                ],
+            .execute_sql(
+                "CREATE TABLE posts (\
+                    id INTEGER PRIMARY KEY, \
+                    title TEXT NOT NULL, \
+                    user_id INTEGER, \
+                    deleted BOOLEAN\
+                )",
+                &[],
             )
             .unwrap();
         engine
+            .execute_sql(
+                "INSERT INTO posts (id, title, user_id, deleted) VALUES \
+                    (1, 'one', 7, NULL), \
+                    (2, 'two', 8, NULL), \
+                    (3, 'three', 7, true)",
+                &[],
+            )
+            .unwrap();
+        let storage = engine.into_storage();
+        storage.reset_counts();
+        Engine::new(storage)
     }
 
     struct VisitorOnlyStorage {
-        schema: TableSchema,
+        schema: TableDefinition,
         repeated_row: Row,
         repetitions: usize,
         table_rows: Vec<Row>,
@@ -1981,7 +1900,7 @@ mod tests {
     impl VisitorOnlyStorage {
         fn new(repeated_row: Row, repetitions: usize) -> Self {
             Self {
-                schema: TableSchema {
+                schema: TableDefinition {
                     name: "items".to_owned(),
                     primary_key: vec!["id".to_owned()],
                     columns: vec![
@@ -2115,7 +2034,7 @@ mod tests {
             panic!("simple queries must use visit_index")
         }
 
-        fn table_schema(&self, table: &str) -> Result<TableSchema> {
+        fn table_schema(&self, table: &str) -> Result<TableDefinition> {
             if table == self.schema.name {
                 Ok(self.schema.clone())
             } else {
@@ -2137,7 +2056,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(result.revision, 1);
+        assert_eq!(result.revision, 2);
         assert_eq!(
             result.fields,
             vec![
@@ -2169,7 +2088,7 @@ mod tests {
             .query_sql("SELECT * FROM posts LIMIT 0", &[])
             .unwrap();
 
-        assert_eq!(result.revision, 1);
+        assert_eq!(result.revision, 2);
         assert_eq!(
             result.fields,
             vec![
@@ -2181,50 +2100,6 @@ mod tests {
         );
         assert!(result.rows.is_empty());
         assert_eq!(database.into_storage().visitor_counts(), (0, 0));
-    }
-
-    #[test]
-    fn untyped_result_fields_are_unknown_and_star_uses_the_first_row_shape() {
-        let mut database = Engine::default();
-        for name in ["items", "empty"] {
-            database
-                .define_table(TableSchema {
-                    name: name.to_owned(),
-                    primary_key: vec!["id".to_owned()],
-                    columns: vec![],
-                })
-                .unwrap();
-        }
-        database
-            .replace_table(
-                "items",
-                vec![row(json!({"id": 1, "title": "one", "active": true}))],
-            )
-            .unwrap();
-
-        let explicit = database
-            .query_sql("SELECT title, id FROM items LIMIT 0", &[])
-            .unwrap();
-        assert_eq!(
-            explicit.fields,
-            vec![ResultField::unknown("title"), ResultField::unknown("id")]
-        );
-
-        let star = database.query_sql("SELECT * FROM items", &[]).unwrap();
-        assert_eq!(
-            star.fields,
-            star.rows[0]
-                .keys()
-                .map(ResultField::unknown)
-                .collect::<Vec<_>>()
-        );
-        assert!(
-            database
-                .query_sql("SELECT * FROM empty", &[])
-                .unwrap()
-                .fields
-                .is_empty()
-        );
     }
 
     #[test]
@@ -2694,49 +2569,10 @@ mod tests {
     fn rejects_unorderable_values_before_sorting() {
         let mut database = Engine::default();
         database
-            .define_table(TableSchema {
-                name: "untyped".to_owned(),
-                primary_key: vec!["id".to_owned()],
-                columns: vec![],
-            })
-            .unwrap();
-        database
-            .replace_table(
-                "untyped",
-                vec![
-                    row(json!({"id": 1, "value": "one"})),
-                    row(json!({"id": 2, "value": 2})),
-                ],
+            .execute_sql(
+                "CREATE TABLE documents (id INTEGER PRIMARY KEY, payload JSONB)",
+                &[],
             )
-            .unwrap();
-        assert_eq!(
-            database
-                .query_sql("SELECT id FROM untyped ORDER BY value", &[])
-                .unwrap_err()
-                .code,
-            "TYPE_MISMATCH"
-        );
-
-        let mut database = Engine::default();
-        database
-            .define_table(TableSchema {
-                name: "documents".to_owned(),
-                primary_key: vec!["id".to_owned()],
-                columns: vec![
-                    ColumnDefinition {
-                        name: "id".to_owned(),
-                        data_type: ColumnType::Integer,
-                        nullable: false,
-                        default: None,
-                    },
-                    ColumnDefinition {
-                        name: "payload".to_owned(),
-                        data_type: ColumnType::Json,
-                        nullable: true,
-                        default: None,
-                    },
-                ],
-            })
             .unwrap();
         assert_eq!(
             database
@@ -2775,10 +2611,9 @@ mod tests {
     fn folds_unquoted_identifiers_but_preserves_quoted_ones() {
         assert_eq!(
             parse_sql("SELECT ID FROM POSTS", &[]).unwrap(),
-            QueryPlan {
+            SelectPlan {
                 table: "posts".to_owned(),
                 columns: Some(vec!["id".to_owned()]),
-                filters: vec![],
                 predicate: None,
                 order_by: vec![],
                 limit: None,
@@ -2787,10 +2622,9 @@ mod tests {
         );
         assert_eq!(
             parse_sql("SELECT \"ID\" FROM \"Posts\"", &[]).unwrap(),
-            QueryPlan {
+            SelectPlan {
                 table: "Posts".to_owned(),
                 columns: Some(vec!["ID".to_owned()]),
-                filters: vec![],
                 predicate: None,
                 order_by: vec![],
                 limit: None,
@@ -2809,30 +2643,29 @@ mod tests {
                 &[json!(10)],
             )
             .unwrap(),
-            QueryPlan {
+            SelectPlan {
                 table: "public.posts".to_owned(),
                 columns: Some(vec!["display\"name".to_owned()]),
-                filters: vec![],
                 predicate: Some(Predicate::And {
                     predicates: vec![
                         Predicate::Comparison {
                             column: "title".to_owned(),
-                            operator: FilterOperator::Eq,
+                            operator: ComparisonOperator::Eq,
                             value: json!("James's post"),
                         },
                         Predicate::Comparison {
                             column: "published".to_owned(),
-                            operator: FilterOperator::Eq,
+                            operator: ComparisonOperator::Eq,
                             value: json!(true),
                         },
                         Predicate::Comparison {
                             column: "rating".to_owned(),
-                            operator: FilterOperator::Eq,
+                            operator: ComparisonOperator::Eq,
                             value: json!(-4.5),
                         },
                         Predicate::Comparison {
                             column: "removed".to_owned(),
-                            operator: FilterOperator::Eq,
+                            operator: ComparisonOperator::Eq,
                             value: Value::Null,
                         },
                     ],
@@ -2890,12 +2723,12 @@ mod tests {
             "INVALID_QUERY"
         );
 
-        let too_many_filters = format!(
+        let too_many_predicates = format!(
             "SELECT * FROM posts WHERE {}",
-            vec!["id = 1"; MAX_FILTERS + 1].join(" AND ")
+            vec!["id = 1"; MAX_PREDICATE_NODES + 1].join(" AND ")
         );
         assert_eq!(
-            parse_sql(&too_many_filters, &[]).unwrap_err().code,
+            parse_sql(&too_many_predicates, &[]).unwrap_err().code,
             "INVALID_QUERY"
         );
 
@@ -2908,31 +2741,6 @@ mod tests {
             parse_sql(&deeply_nested_comment, &[]).unwrap_err().code,
             "INVALID_QUERY"
         );
-    }
-
-    #[test]
-    fn applies_complexity_caps_to_structured_query_plans_too() {
-        let mut plan = QueryPlan {
-            table: "posts".to_owned(),
-            columns: Some(vec!["id".to_owned(); MAX_PROJECTION_COLUMNS + 1]),
-            filters: vec![],
-            predicate: None,
-            order_by: vec![],
-            limit: None,
-            offset: 0,
-        };
-        assert_eq!(engine().query(&plan).unwrap_err().code, "INVALID_QUERY");
-
-        plan.columns = None;
-        plan.filters = vec![
-            Filter {
-                column: "id".to_owned(),
-                operator: FilterOperator::Eq,
-                value: json!(1),
-            };
-            MAX_FILTERS + 1
-        ];
-        assert_eq!(engine().query(&plan).unwrap_err().code, "INVALID_QUERY");
     }
 
     #[test]

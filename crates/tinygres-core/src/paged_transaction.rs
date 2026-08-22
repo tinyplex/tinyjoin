@@ -4,8 +4,8 @@ use std::{
 };
 
 use crate::{
-    Change, EngineError, IndexDefinition, PageDevice, PagedStorage, Result, Row, StorageReader,
-    TableSchema, VisitControl, VisitOutcome, paged_codec::encode_primary_key,
+    EngineError, IndexDefinition, PageDevice, PagedStorage, Result, Row, RowChange, StorageReader,
+    TableDefinition, VisitControl, VisitOutcome, paged_codec::encode_primary_key,
     storage::estimated_row_bytes,
 };
 
@@ -54,7 +54,7 @@ impl PagedTransaction {
         self.touched_tables.clone()
     }
 
-    pub(crate) fn changes(&self) -> Vec<Change> {
+    pub(crate) fn changes(&self) -> Vec<RowChange> {
         changes_from_entries(self.entries.iter().flat_map(|(table, entries)| {
             entries.values().map(move |entry| (table.as_str(), entry))
         }))
@@ -64,25 +64,24 @@ impl PagedTransaction {
     pub(crate) fn stage<D: PageDevice>(
         &mut self,
         storage: &PagedStorage<D>,
-        changes: Vec<Change>,
+        changes: Vec<RowChange>,
     ) -> Result<()> {
         self.ensure_base_revision(storage)?;
         if changes.is_empty() {
             return Ok(());
         }
         // Detect collisions in the statement's original sequence before the overlay's canonical
-        // key map can collapse them. Direct change batches retain their documented last-write
-        // behavior; this stricter rule is specific to hidden SQL write-sets.
+        // key map can collapse them.
         storage.validate_sql_row_change_sequence(&changes)?;
 
         let mut patch = OverlayPatch::default();
         for change in changes {
             let (table, input, next) = match change {
-                Change::Upsert { table, row } => {
+                RowChange::Upsert { table, row } => {
                     let next = Some(row.clone());
                     (table, row, next)
                 }
-                Change::Delete { table, key } => (table, key, None),
+                RowChange::Delete { table, key } => (table, key, None),
             };
             let schema = storage.table_schema(&table)?;
             let key = primary_key_row(&schema, &input)?;
@@ -183,7 +182,7 @@ impl PagedTransaction {
         Ok(())
     }
 
-    fn candidate_changes(&self, patch: &OverlayPatch) -> Vec<Change> {
+    fn candidate_changes(&self, patch: &OverlayPatch) -> Vec<RowChange> {
         let existing = self.entries.iter().flat_map(|(table, entries)| {
             entries.iter().map(move |(encoded_key, entry)| {
                 let entry = patch
@@ -215,15 +214,15 @@ impl PagedTransaction {
 
 fn changes_from_entries<'a>(
     entries: impl Iterator<Item = (&'a str, &'a OverlayEntry)>,
-) -> Vec<Change> {
+) -> Vec<RowChange> {
     entries
         .filter(|(_, entry)| entry.base != entry.next)
         .map(|(table, entry)| match &entry.next {
-            Some(row) => Change::Upsert {
+            Some(row) => RowChange::Upsert {
                 table: table.to_owned(),
                 row: row.clone(),
             },
-            None => Change::Delete {
+            None => RowChange::Delete {
                 table: table.to_owned(),
                 key: entry.key.clone(),
             },
@@ -262,7 +261,7 @@ fn retain_entry(
     Ok(())
 }
 
-fn primary_key_row(schema: &TableSchema, row: &Row) -> Result<Row> {
+fn primary_key_row(schema: &TableDefinition, row: &Row) -> Result<Row> {
     schema
         .primary_key
         .iter()
@@ -465,7 +464,7 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
         }
     }
 
-    fn table_schema(&self, table: &str) -> Result<TableSchema> {
+    fn table_schema(&self, table: &str) -> Result<TableDefinition> {
         self.ensure_base_revision()?;
         self.storage.table_schema(table)
     }
@@ -481,42 +480,23 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::{ColumnDefinition, ColumnType, MemoryPageDevice};
+    use crate::MemoryPageDevice;
 
     fn row(value: Value) -> Row {
         value.as_object().unwrap().clone()
     }
 
     fn storage() -> PagedStorage<MemoryPageDevice> {
-        let schema = TableSchema {
-            name: "items".to_owned(),
-            primary_key: vec!["id".to_owned()],
-            columns: vec![
-                ColumnDefinition {
-                    name: "id".to_owned(),
-                    data_type: ColumnType::Integer,
-                    nullable: false,
-                    default: None,
-                },
-                ColumnDefinition {
-                    name: "name".to_owned(),
-                    data_type: ColumnType::Text,
-                    nullable: false,
-                    default: None,
-                },
-            ],
-        };
         let mut storage = PagedStorage::open(MemoryPageDevice::new(0).unwrap()).unwrap();
-        storage.define_table(schema.clone()).unwrap();
-        storage
-            .replace_table_snapshot(
-                schema,
-                vec![
-                    row(json!({"id": 1, "name": "one"})),
-                    row(json!({"id": 2, "name": "two"})),
-                ],
-            )
-            .unwrap();
+        let statements = [
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            "INSERT INTO items (id, name) VALUES (1, 'one'), (2, 'two')",
+        ]
+        .into_iter()
+        .map(|sql| crate::statement::parse(sql, &[]))
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+        storage.execute_script(statements).unwrap();
         storage
     }
 
@@ -528,15 +508,15 @@ mod tests {
             .stage(
                 &storage,
                 vec![
-                    Change::Delete {
+                    RowChange::Delete {
                         table: "items".to_owned(),
                         key: row(json!({"id": 1})),
                     },
-                    Change::Upsert {
+                    RowChange::Upsert {
                         table: "items".to_owned(),
                         row: row(json!({"id": 2, "name": "changed"})),
                     },
-                    Change::Upsert {
+                    RowChange::Upsert {
                         table: "items".to_owned(),
                         row: row(json!({"id": 3, "name": "three"})),
                     },
@@ -546,7 +526,7 @@ mod tests {
         transaction
             .stage(
                 &storage,
-                vec![Change::Delete {
+                vec![RowChange::Delete {
                     table: "items".to_owned(),
                     key: row(json!({"id": 3})),
                 }],
@@ -576,7 +556,7 @@ mod tests {
         let mut transaction = PagedTransaction::new(storage.revision());
         let payload = "x".repeat(900_000);
         let changes = (10..20)
-            .map(|id| Change::Upsert {
+            .map(|id| RowChange::Upsert {
                 table: "items".to_owned(),
                 row: row(json!({"id": id, "name": payload})),
             })

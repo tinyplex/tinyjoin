@@ -11,7 +11,7 @@ use crate::query::{
 use crate::storage::StorageReader;
 use crate::{
     ColumnDefinition, ColumnType, EngineError, NullOrder, OrderBy, OrderDirection, Predicate,
-    QueryResult, Result, ResultField, Row, TableSchema, VisitControl,
+    QueryResult, Result, ResultField, Row, TableDefinition, VisitControl,
 };
 
 const MAX_SELECT_ITEMS: usize = 256;
@@ -262,7 +262,7 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &AggregatePlan) -> Resu
     })
 }
 
-fn result_fields(plan: &AggregatePlan, schema: &TableSchema) -> Result<Vec<ResultField>> {
+fn result_fields(plan: &AggregatePlan, schema: &TableDefinition) -> Result<Vec<ResultField>> {
     plan.items
         .iter()
         .map(|item| {
@@ -288,7 +288,7 @@ fn result_fields(plan: &AggregatePlan, schema: &TableSchema) -> Result<Vec<Resul
 
 fn aggregate_argument_type(
     argument: &AggregateArgument,
-    schema: &TableSchema,
+    schema: &TableDefinition,
     table: &str,
 ) -> Result<ColumnType> {
     match argument {
@@ -301,13 +301,7 @@ fn aggregate_argument_type(
     }
 }
 
-fn validate_plan(plan: &AggregatePlan, schema: &TableSchema) -> Result<()> {
-    if schema.columns.is_empty() {
-        return Err(EngineError::unsupported_sql(format!(
-            "Aggregate queries require a typed table catalog for `{}`",
-            plan.table
-        )));
-    }
+fn validate_plan(plan: &AggregatePlan, schema: &TableDefinition) -> Result<()> {
     if let Some(predicate) = &plan.predicate {
         validate_predicate_columns(predicate, schema, &plan.table)?;
         validate_predicate_types(predicate, schema, &plan.table)?;
@@ -372,7 +366,7 @@ fn validate_plan(plan: &AggregatePlan, schema: &TableSchema) -> Result<()> {
 fn validate_aggregate(
     function: AggregateFunction,
     argument: &AggregateArgument,
-    schema: &TableSchema,
+    schema: &TableDefinition,
     table: &str,
 ) -> Result<()> {
     let AggregateArgument::Column(column) = argument else {
@@ -417,7 +411,7 @@ struct GroupState {
 impl GroupState {
     fn new(
         plan: &AggregatePlan,
-        schema: &TableSchema,
+        schema: &TableDefinition,
         representative: Option<&Row>,
     ) -> Result<Self> {
         let mut grouped_values = Map::new();
@@ -513,7 +507,7 @@ impl AggregateAccumulator {
     fn new(
         function: AggregateFunction,
         argument: &AggregateArgument,
-        schema: &TableSchema,
+        schema: &TableDefinition,
     ) -> Result<Self> {
         let column = match argument {
             AggregateArgument::Star => None,
@@ -730,7 +724,7 @@ fn non_null_value<'a>(row: &'a Row, column: &str) -> Option<&'a Value> {
 }
 
 fn ensure_group_key_input_budget(
-    schema: &TableSchema,
+    schema: &TableDefinition,
     columns: &[String],
     row: &Row,
 ) -> Result<()> {
@@ -898,7 +892,7 @@ fn integer_value(value: &Value) -> Result<i128> {
         .ok_or_else(|| EngineError::type_mismatch("Expected a typed integer value"))
 }
 
-fn group_key(schema: &TableSchema, columns: &[String], row: &Row) -> Result<String> {
+fn group_key(schema: &TableDefinition, columns: &[String], row: &Row) -> Result<String> {
     let mut parts = Vec::with_capacity(columns.len());
     for column in columns {
         let definition = column_definition(schema, column, &schema.name)?;
@@ -1004,7 +998,7 @@ fn compare_typed(data_type: ColumnType, left: &Value, right: &Value) -> Ordering
 }
 
 fn column_definition<'a>(
-    schema: &'a TableSchema,
+    schema: &'a TableDefinition,
     column: &str,
     table: &str,
 ) -> Result<&'a ColumnDefinition> {
@@ -1359,13 +1353,27 @@ fn normalize_identifier(value: String, quoted: bool) -> Result<String> {
 mod tests {
     use serde_json::{Value, json};
 
-    use crate::{Engine, Row, StorageReader, TableSchema};
+    use crate::{Engine, Row, RowChange, StorageDriver, StorageReader};
 
     fn row(value: Value) -> Row {
         value
             .as_object()
             .expect("test row must be an object")
             .clone()
+    }
+
+    fn seed_rows(engine: &mut Engine, table: &str, rows: Vec<Row>) {
+        let mut storage = std::mem::take(engine).into_storage();
+        for row in rows {
+            storage
+                .apply_row_changes_unrevisioned(vec![RowChange::Upsert {
+                    table: table.to_owned(),
+                    row,
+                }])
+                .unwrap();
+        }
+        storage.advance_revision().unwrap();
+        *engine = Engine::new(storage);
     }
 
     fn sales() -> Engine {
@@ -1500,12 +1508,11 @@ mod tests {
                 &[],
             )
             .unwrap();
-        engine
-            .replace_table(
-                "large_values",
-                vec![row(json!({"id": 1, "group_name": huge, "value": "small"}))],
-            )
-            .unwrap();
+        seed_rows(
+            &mut engine,
+            "large_values",
+            vec![row(json!({"id": 1, "group_name": huge, "value": "small"}))],
+        );
         let result = engine
             .query_sql(
                 "SELECT group_name, COUNT(*) AS rows FROM large_values GROUP BY group_name",
@@ -1522,19 +1529,18 @@ mod tests {
                 &[],
             )
             .unwrap();
-        control_keys
-            .replace_table(
-                "control_keys",
-                (0..17)
-                    .map(|id| {
-                        row(json!({
-                            "id": id,
-                            "group_name": format!("{id}{controls}"),
-                        }))
-                    })
-                    .collect(),
-            )
-            .unwrap();
+        seed_rows(
+            &mut control_keys,
+            "control_keys",
+            (0..17)
+                .map(|id| {
+                    row(json!({
+                        "id": id,
+                        "group_name": format!("{id}{controls}"),
+                    }))
+                })
+                .collect(),
+        );
         assert_eq!(
             control_keys
                 .query_sql(
@@ -1553,22 +1559,21 @@ mod tests {
                 &[],
             )
             .unwrap();
-        extrema
-            .replace_table(
-                "extrema",
-                (0..17)
-                    .map(|id| {
-                        row(json!({
-                            "id": id,
-                            "value": format!(
-                                "{id}{}",
-                                "a".repeat(crate::storage::MAX_LOGICAL_ROW_BYTES - 256),
-                            ),
-                        }))
-                    })
-                    .collect(),
-            )
-            .unwrap();
+        seed_rows(
+            &mut extrema,
+            "extrema",
+            (0..17)
+                .map(|id| {
+                    row(json!({
+                        "id": id,
+                        "value": format!(
+                            "{id}{}",
+                            "a".repeat(crate::storage::MAX_LOGICAL_ROW_BYTES - 256),
+                        ),
+                    }))
+                })
+                .collect(),
+        );
         assert_eq!(
             extrema
                 .query_sql("SELECT MAX(value) AS largest FROM extrema", &[])
@@ -1741,22 +1746,6 @@ mod tests {
                 "query was `{sql}`"
             );
         }
-
-        let mut legacy = Engine::default();
-        legacy
-            .define_table(TableSchema {
-                name: "legacy".to_owned(),
-                primary_key: vec!["id".to_owned()],
-                columns: vec![],
-            })
-            .unwrap();
-        assert_eq!(
-            legacy
-                .query_sql("SELECT COUNT(*) AS rows FROM legacy", &[])
-                .unwrap_err()
-                .code,
-            "UNSUPPORTED_SQL"
-        );
     }
 
     #[test]

@@ -11,18 +11,13 @@ mod model;
 mod page;
 mod paged_codec;
 mod paged_engine;
-mod paged_schema;
 mod paged_script;
 mod paged_storage;
 mod paged_transaction;
 mod pager;
-#[cfg(test)]
-mod prepared;
 mod prepared_statement;
 mod query;
 mod revision;
-#[cfg(test)]
-mod snapshot;
 mod sql_script;
 mod statement;
 mod storage;
@@ -39,11 +34,10 @@ pub use device::{MemoryPageDevice, PageDevice};
 #[cfg(test)]
 pub(crate) use engine::Engine;
 pub use error::{EngineError, Result};
-pub use model::{
-    ApplyOutcome, Change, ChangeBatch, ColumnDefinition, ColumnType, ExecuteResult, Filter,
-    FilterOperator, IndexDefinition, NullOrder, OrderBy, OrderDirection, PG_OID_BOOLEAN,
-    PG_OID_FLOAT, PG_OID_INTEGER, PG_OID_JSON, PG_OID_TEXT, PG_OID_UNKNOWN, Predicate, QueryPlan,
-    QueryResult, ResultField, Row, TableSchema,
+pub use model::{ApplyOutcome, ExecuteResult, QueryResult, ResultField, Row};
+pub(crate) use model::{
+    ColumnDefinition, ColumnType, ComparisonOperator, IndexDefinition, NullOrder, OrderBy,
+    OrderDirection, Predicate, RowChange, SelectPlan, TableDefinition,
 };
 pub use page::{
     ALLOCATION_BITMAP_BYTES, AllocationBitmap, BITMAP_CHUNK_COUNT, BITMAP_PAGE_COUNT, BitmapSlot,
@@ -53,13 +47,11 @@ pub use page::{
     build_next_metadata, recover_metadata,
 };
 pub use paged_engine::PagedEngine;
-#[doc(hidden)]
-pub use paged_script::retain_result as retain_sql_script_result;
-pub use paged_storage::PagedStorage;
+pub(crate) use paged_storage::PagedStorage;
 pub use pager::{Pager, PagerWriteTransaction};
-#[cfg(test)]
-pub(crate) use prepared::PreparedCommit;
 pub use prepared_statement::PreparedStatementId;
 #[cfg(test)]
 pub(crate) use storage::InMemoryStorage;
-pub use storage::{StorageDriver, StorageReader, VisitControl, VisitOutcome};
+#[cfg(test)]
+pub(crate) use storage::StorageDriver;
+pub(crate) use storage::{StorageReader, VisitControl, VisitOutcome};

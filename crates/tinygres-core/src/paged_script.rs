@@ -4,8 +4,8 @@ use std::{
 };
 
 use crate::{
-    Btree, Change, EngineError, ExecuteResult, PageDevice, PageId, Pager, PagerWriteTransaction,
-    QueryResult, Result, Row, StorageReader, TreeId, VisitControl, VisitOutcome,
+    Btree, EngineError, ExecuteResult, PageDevice, PageId, Pager, PagerWriteTransaction,
+    QueryResult, Result, Row, RowChange, StorageReader, TreeId, VisitControl, VisitOutcome,
     paged_codec::{
         CATALOG_TREE_ID, CatalogHeader, CatalogIndexRecord, CatalogTableRecord,
         MAX_CATALOG_INDEXES, MAX_CATALOG_TABLES, MAX_TREE_ID, encode_catalog_header_record,
@@ -21,8 +21,8 @@ use crate::{
     },
     statement::{PlannedDml, Statement, WriteStatement},
     storage::{
-        estimated_row_bytes, normalize_row, preflight_change_batch, preflight_row_write_set,
-        schema_with_added_column, validate_schema,
+        estimated_row_bytes, normalize_row, preflight_row_write_set, schema_with_added_column,
+        validate_schema,
     },
 };
 
@@ -78,18 +78,17 @@ pub(crate) fn execute<D: PageDevice>(
     finish_candidate(candidate, execution)
 }
 
-pub(crate) fn execute_changes<D: PageDevice>(
+pub(crate) fn execute_row_changes<D: PageDevice>(
     pager: &mut Pager<D>,
     base_revision: u64,
     next_tree_id: TreeId,
     tables: BTreeMap<String, PagedTable>,
     indexes: BTreeMap<String, PagedIndex>,
-    changes: &[Change],
-    change_batch: bool,
+    changes: &[RowChange],
 ) -> Result<ScriptPublication> {
     let mut candidate = begin_candidate(pager, base_revision, next_tree_id, tables, indexes)?;
     let execution = (|| {
-        candidate.apply_changes(changes, change_batch)?;
+        candidate.apply_changes(changes)?;
         candidate.mutated = true;
         Ok(vec![])
     })();
@@ -241,13 +240,13 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             | WriteStatement::Delete { .. } => {
                 let PlannedDml { outcome, changes } = crate::statement::plan_dml(self, statement)?;
                 if outcome.mutated {
-                    self.apply_changes(&changes, false)?;
+                    self.apply_changes(&changes)?;
                 }
                 outcome
             }
         };
 
-        let fields = crate::statement::write_result_fields(self, statement, outcome.rows.first())?;
+        let fields = crate::statement::write_result_fields(self, statement)?;
         if outcome.mutated {
             self.mutated = true;
         }
@@ -443,7 +442,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         Ok(())
     }
 
-    fn apply_changes(&mut self, input_changes: &[Change], change_batch: bool) -> Result<()> {
+    fn apply_changes(&mut self, input_changes: &[RowChange]) -> Result<()> {
         let schemas = self
             .tables
             .iter()
@@ -454,14 +453,10 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             .values()
             .map(|index| &index.definition)
             .collect::<Vec<_>>();
-        if change_batch {
-            preflight_change_batch(input_changes, &schemas, &definitions)?;
-        } else {
-            preflight_row_write_set(input_changes, &schemas, &definitions)?;
-        }
+        preflight_row_write_set(input_changes, &schemas, &definitions)?;
         for change in input_changes {
             let table = match change {
-                Change::Upsert { table, .. } | Change::Delete { table, .. } => table,
+                RowChange::Upsert { table, .. } | RowChange::Delete { table, .. } => table,
             };
             let index_count = self
                 .indexes
@@ -476,8 +471,8 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         let mut changes = BTreeMap::<String, BTreeMap<Vec<u8>, ScriptRowChange>>::new();
         for change in input_changes {
             let (table_name, input, is_delete) = match change {
-                Change::Upsert { table, row } => (table, row, false),
-                Change::Delete { table, key } => (table, key, true),
+                RowChange::Upsert { table, row } => (table, row, false),
+                RowChange::Delete { table, key } => (table, key, true),
             };
             let table = self
                 .tables
@@ -489,8 +484,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 normalize_row(&table.schema, input.clone())?
             };
             let key = encode_primary_key(&table.schema, &row)?;
-            if !change_batch
-                && !is_delete
+            if !is_delete
                 && !duplicate_upserts
                     .entry(table_name.clone())
                     .or_default()
@@ -1062,7 +1056,7 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
         Ok(Some(VisitOutcome::Complete))
     }
 
-    fn table_schema(&self, table: &str) -> Result<crate::TableSchema> {
+    fn table_schema(&self, table: &str) -> Result<crate::TableDefinition> {
         self.tables
             .get(table)
             .map(|table| table.schema.clone())

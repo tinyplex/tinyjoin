@@ -4,15 +4,13 @@ use serde_json::Value;
 
 use crate::storage::StorageReader;
 use crate::{
-    ApplyOutcome, ChangeBatch, EngineError, ExecuteResult, InMemoryStorage, PreparedCommit,
-    QueryPlan, QueryResult, Result, Row, StorageDriver, TableSchema,
+    ApplyOutcome, EngineError, ExecuteResult, InMemoryStorage, QueryResult, Result, StorageDriver,
 };
 
 #[derive(Clone, Debug)]
-pub struct Engine<S = InMemoryStorage> {
+pub(crate) struct Engine<S = InMemoryStorage> {
     storage: S,
     transaction: Option<Transaction<S>>,
-    prepared: Option<PendingCommit<S>>,
 }
 
 #[derive(Clone, Debug)]
@@ -21,232 +19,27 @@ struct Transaction<S> {
     tables: BTreeSet<String>,
 }
 
-#[derive(Clone, Debug)]
-struct PendingCommit<S> {
-    commit: PreparedCommit,
-    storage: S,
-}
-
-#[derive(Clone, Debug)]
-pub struct Prepared<T> {
-    pub result: T,
-    pub commit: Option<PreparedCommit>,
-}
-
 impl Default for Engine<InMemoryStorage> {
     fn default() -> Self {
         Self::new(InMemoryStorage::default())
     }
 }
 
-impl Engine<InMemoryStorage> {
-    /// Encodes the complete engine state into a versioned, self-checking snapshot.
-    pub fn export_snapshot(&self) -> Result<Vec<u8>> {
-        self.storage.export_snapshot()
-    }
-
-    /// Atomically replaces the complete engine state from a validated snapshot.
-    pub fn import_snapshot(&mut self, bytes: &[u8]) -> Result<()> {
-        self.ensure_no_prepared()?;
-        self.ensure_no_transaction()?;
-        self.storage.import_snapshot(bytes)
-    }
-
-    pub fn prepare_define_tables(&mut self, schemas: Vec<TableSchema>) -> Result<Prepared<()>> {
-        self.ensure_can_prepare()?;
-        let mut candidate = self.storage.clone();
-        let existing = self.storage.table_names().collect::<BTreeSet<_>>();
-        let tables = schemas
-            .iter()
-            .filter(|schema| !existing.contains(schema.name.as_str()))
-            .map(|schema| schema.name.clone())
-            .collect::<Vec<_>>();
-        for schema in schemas {
-            candidate.define_table(schema)?;
-        }
-        let commit = self.stage_candidate(candidate, &tables)?;
-        Ok(Prepared { result: (), commit })
-    }
-
-    pub fn prepare_replace_table_snapshot(
-        &mut self,
-        schema: TableSchema,
-        rows: Vec<Row>,
-    ) -> Result<Prepared<ApplyOutcome>> {
-        self.ensure_can_prepare()?;
-        let mut candidate = self.storage.clone();
-        let result = candidate.replace_table_snapshot(schema, rows)?;
-        let commit = self.stage_candidate(candidate, &result.tables)?;
-        Ok(Prepared { result, commit })
-    }
-
-    pub fn prepare_apply_batch(&mut self, batch: &ChangeBatch) -> Result<Prepared<ApplyOutcome>> {
-        self.ensure_can_prepare()?;
-        let mut candidate = self.storage.clone();
-        let result = candidate.apply_batch(batch)?;
-        let commit = self.stage_candidate(candidate, &result.tables)?;
-        Ok(Prepared { result, commit })
-    }
-
-    pub fn install_prepared_commit(&mut self, bytes: &[u8]) -> Result<ApplyOutcome> {
-        let pending = self.prepared.as_ref().ok_or_else(|| {
-            EngineError::new("NO_PREPARED_COMMIT", "No prepared commit is pending")
-        })?;
-        if pending.commit.bytes() != bytes {
-            return Err(EngineError::new(
-                "PREPARED_COMMIT_MISMATCH",
-                "The installed bytes do not match the pending prepared commit",
-            ));
-        }
-        if self.storage.revision() != pending.commit.revision_before() {
-            return Err(EngineError::new(
-                "PREPARED_COMMIT_REVISION_MISMATCH",
-                "The database revision changed after the commit was prepared",
-            ));
-        }
-        let pending = self
-            .prepared
-            .take()
-            .expect("the pending commit was resolved above");
-        let outcome = ApplyOutcome {
-            revision: pending.commit.revision_after(),
-            tables: pending.commit.tables().to_vec(),
-        };
-        self.storage = pending.storage;
-        Ok(outcome)
-    }
-
-    pub fn abort_prepared_commit(&mut self) -> Result<()> {
-        self.prepared = None;
-        Ok(())
-    }
-
-    pub fn replay_commit(&mut self, bytes: &[u8]) -> Result<ApplyOutcome> {
-        self.ensure_can_prepare()?;
-        let (commit, payload) = PreparedCommit::decode(bytes)?;
-        let candidate = crate::prepared::apply_payload(&self.storage, &payload)?;
-        let canonical = PreparedCommit::from_states(&self.storage, &candidate, commit.tables())?
-            .ok_or_else(|| EngineError::new("INVALID_PREPARED_COMMIT", "Commit has no effect"))?;
-        if canonical.bytes() != bytes {
-            return Err(EngineError::new(
-                "INVALID_PREPARED_COMMIT",
-                "Prepared commit operations are not canonical for this database state",
-            ));
-        }
-        let outcome = ApplyOutcome {
-            revision: commit.revision_after(),
-            tables: commit.tables().to_vec(),
-        };
-        self.storage = candidate;
-        Ok(outcome)
-    }
-
-    pub fn prepare_execute_sql(
-        &mut self,
-        sql: &str,
-        params: &[Value],
-    ) -> Result<Prepared<ExecuteResult>> {
-        self.ensure_no_prepared()?;
-        if self.in_transaction() {
-            return Err(EngineError::transaction_active());
-        }
-        let mut candidate = Engine::new(self.storage.clone());
-        let result = candidate.execute_sql(sql, params)?;
-        let commit = self.stage_candidate(candidate.storage, &result.tables)?;
-        Ok(Prepared { result, commit })
-    }
-
-    pub fn prepare_commit_transaction(&mut self) -> Result<Prepared<ApplyOutcome>> {
-        self.ensure_no_prepared()?;
-        let mut candidate = self
-            .transaction
-            .as_ref()
-            .cloned()
-            .ok_or_else(EngineError::no_active_transaction)?;
-        if candidate.tables.is_empty() {
-            self.transaction = None;
-            return Ok(Prepared {
-                result: ApplyOutcome {
-                    revision: self.storage.revision(),
-                    tables: vec![],
-                },
-                commit: None,
-            });
-        }
-        let revision = candidate.storage.advance_revision()?;
-        let tables = candidate.tables.into_iter().collect::<Vec<_>>();
-        let commit = self.stage_candidate(candidate.storage, &tables)?;
-        self.transaction = None;
-        Ok(Prepared {
-            result: ApplyOutcome { revision, tables },
-            commit,
-        })
-    }
-
-    fn stage_candidate(
-        &mut self,
-        candidate: InMemoryStorage,
-        tables: &[String],
-    ) -> Result<Option<PreparedCommit>> {
-        let Some(commit) = PreparedCommit::from_states(&self.storage, &candidate, tables)? else {
-            return Ok(None);
-        };
-        self.prepared = Some(PendingCommit {
-            commit: commit.clone(),
-            storage: candidate,
-        });
-        Ok(Some(commit))
-    }
-}
-
 impl<S> Engine<S> {
-    pub fn new(storage: S) -> Self {
+    pub(crate) fn new(storage: S) -> Self {
         Self {
             storage,
             transaction: None,
-            prepared: None,
         }
-    }
-}
-
-impl<S: StorageDriver> Engine<S> {
-    pub fn define_table(&mut self, schema: TableSchema) -> Result<()> {
-        self.ensure_no_prepared()?;
-        self.ensure_no_transaction()?;
-        self.storage.define_table(schema)
-    }
-
-    pub fn replace_table_snapshot(
-        &mut self,
-        schema: TableSchema,
-        rows: Vec<Row>,
-    ) -> Result<ApplyOutcome> {
-        self.ensure_no_prepared()?;
-        self.ensure_no_transaction()?;
-        self.storage.replace_table_snapshot(schema, rows)
-    }
-
-    pub fn replace_table(&mut self, table: &str, rows: Vec<Row>) -> Result<ApplyOutcome> {
-        self.ensure_no_prepared()?;
-        self.ensure_no_transaction()?;
-        self.storage.replace_table(table, rows)
-    }
-
-    pub fn apply_batch(&mut self, batch: &ChangeBatch) -> Result<ApplyOutcome> {
-        self.ensure_no_prepared()?;
-        self.ensure_no_transaction()?;
-        self.storage.apply_batch(batch)
     }
 }
 
 impl<S: StorageReader> Engine<S> {
-    pub fn query(&self, plan: &QueryPlan) -> Result<QueryResult> {
-        crate::query::execute(self.read_storage(), plan)
-    }
-
-    pub fn query_sql(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
+    pub(crate) fn query_sql(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
         match crate::statement::parse(sql, params)? {
-            crate::statement::Statement::Select(plan) => self.query(&plan),
+            crate::statement::Statement::Select(plan) => {
+                crate::query::execute(self.read_storage(), &plan)
+            }
             crate::statement::Statement::Aggregate(plan) => {
                 crate::aggregate::execute(self.read_storage(), &plan)
             }
@@ -259,25 +52,24 @@ impl<S: StorageReader> Engine<S> {
         }
     }
 
-    pub fn revision(&self) -> u64 {
+    pub(crate) fn revision(&self) -> u64 {
         self.storage.revision()
     }
 }
 
 impl<S> Engine<S> {
-    pub fn in_transaction(&self) -> bool {
+    pub(crate) fn in_transaction(&self) -> bool {
         self.transaction.is_some()
     }
 
-    pub fn rollback_transaction(&mut self) -> Result<()> {
-        self.ensure_no_prepared()?;
+    pub(crate) fn rollback_transaction(&mut self) -> Result<()> {
         if self.transaction.take().is_none() {
             return Err(EngineError::no_active_transaction());
         }
         Ok(())
     }
 
-    pub fn into_storage(self) -> S {
+    pub(crate) fn into_storage(self) -> S {
         self.storage
     }
 
@@ -286,35 +78,10 @@ impl<S> Engine<S> {
             .as_ref()
             .map_or(&self.storage, |transaction| &transaction.storage)
     }
-
-    fn ensure_no_transaction(&self) -> Result<()> {
-        if self.in_transaction() {
-            Err(EngineError::transaction_active())
-        } else {
-            Ok(())
-        }
-    }
-
-    fn ensure_no_prepared(&self) -> Result<()> {
-        if self.prepared.is_some() {
-            Err(EngineError::new(
-                "PREPARED_COMMIT_PENDING",
-                "A prepared commit is already pending",
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn ensure_can_prepare(&self) -> Result<()> {
-        self.ensure_no_prepared()?;
-        self.ensure_no_transaction()
-    }
 }
 
 impl<S: StorageDriver + Clone> Engine<S> {
-    pub fn begin_transaction(&mut self) -> Result<()> {
-        self.ensure_no_prepared()?;
+    pub(crate) fn begin_transaction(&mut self) -> Result<()> {
         if self.in_transaction() {
             return Err(EngineError::transaction_active());
         }
@@ -325,8 +92,7 @@ impl<S: StorageDriver + Clone> Engine<S> {
         Ok(())
     }
 
-    pub fn commit_transaction(&mut self) -> Result<ApplyOutcome> {
-        self.ensure_no_prepared()?;
+    pub(crate) fn commit_transaction(&mut self) -> Result<ApplyOutcome> {
         let transaction = self
             .transaction
             .as_mut()
@@ -349,11 +115,10 @@ impl<S: StorageDriver + Clone> Engine<S> {
         Ok(ApplyOutcome { revision, tables })
     }
 
-    pub fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<ExecuteResult> {
-        self.ensure_no_prepared()?;
+    pub(crate) fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<ExecuteResult> {
         match crate::statement::parse(sql, params)? {
             crate::statement::Statement::Select(plan) => {
-                let result = self.query(&plan)?;
+                let result = crate::query::execute(self.read_storage(), &plan)?;
                 Ok(ExecuteResult {
                     command: "SELECT".to_owned(),
                     revision: result.revision,
@@ -389,11 +154,7 @@ impl<S: StorageDriver + Clone> Engine<S> {
                 if let Some(transaction) = &mut self.transaction {
                     let mut candidate = transaction.storage.clone();
                     let outcome = crate::statement::execute(&mut candidate, &statement)?;
-                    let fields = crate::statement::write_result_fields(
-                        &candidate,
-                        &statement,
-                        outcome.rows.first(),
-                    )?;
+                    let fields = crate::statement::write_result_fields(&candidate, &statement)?;
                     if outcome.mutated {
                         transaction.storage = candidate;
                         transaction.tables.extend(outcome.tables.iter().cloned());
@@ -409,11 +170,7 @@ impl<S: StorageDriver + Clone> Engine<S> {
                 } else {
                     let mut candidate = self.storage.clone();
                     let outcome = crate::statement::execute(&mut candidate, &statement)?;
-                    let fields = crate::statement::write_result_fields(
-                        &candidate,
-                        &statement,
-                        outcome.rows.first(),
-                    )?;
+                    let fields = crate::statement::write_result_fields(&candidate, &statement)?;
                     let revision = if outcome.mutated {
                         candidate.advance_revision()?
                     } else {
@@ -439,7 +196,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::Change;
+    use crate::Row;
 
     fn row(value: Value) -> Row {
         value
@@ -577,44 +334,6 @@ mod tests {
     }
 
     #[test]
-    fn untyped_returning_fields_use_unknown_and_empty_star_has_no_catalog_guess() {
-        let mut engine = Engine::default();
-        engine
-            .define_table(TableSchema {
-                name: "items".to_owned(),
-                primary_key: vec!["id".to_owned()],
-                columns: vec![],
-            })
-            .unwrap();
-
-        let inserted = engine
-            .execute_sql(
-                "INSERT INTO items (id, title) VALUES (1, 'one') RETURNING title, id",
-                &[],
-            )
-            .unwrap();
-        assert_eq!(
-            inserted.fields,
-            vec![
-                crate::ResultField::unknown("title"),
-                crate::ResultField::unknown("id"),
-            ]
-        );
-
-        let explicit = engine
-            .execute_sql("DELETE FROM items WHERE id = 2 RETURNING id", &[])
-            .unwrap();
-        assert_eq!(explicit.fields, vec![crate::ResultField::unknown("id")]);
-        assert!(explicit.rows.is_empty());
-
-        let star = engine
-            .execute_sql("DELETE FROM items WHERE id = 2 RETURNING *", &[])
-            .unwrap();
-        assert!(star.fields.is_empty());
-        assert!(star.rows.is_empty());
-    }
-
-    #[test]
     fn typed_integers_stay_lossless_across_the_javascript_boundary() {
         let mut engine = Engine::default();
         create_posts(&mut engine);
@@ -740,10 +459,9 @@ mod tests {
     }
 
     #[test]
-    fn explicit_transactions_publish_once_and_snapshots_stay_committed() {
+    fn explicit_transactions_publish_all_staged_sql_once() {
         let mut engine = Engine::default();
         create_posts(&mut engine);
-        let committed_snapshot = engine.export_snapshot().unwrap();
 
         engine.begin_transaction().unwrap();
         let insert = engine
@@ -759,20 +477,6 @@ mod tests {
             vec![row(json!({"title": "staged"}))]
         );
 
-        // Persistence must not observe an uncommitted transaction.
-        assert_eq!(engine.export_snapshot().unwrap(), committed_snapshot);
-        let mut restored = Engine::default();
-        restored
-            .import_snapshot(&engine.export_snapshot().unwrap())
-            .unwrap();
-        assert!(
-            restored
-                .query_sql("SELECT * FROM posts", &[])
-                .unwrap()
-                .rows
-                .is_empty()
-        );
-
         engine
             .execute_sql(
                 "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
@@ -785,11 +489,6 @@ mod tests {
                 &[],
             )
             .unwrap();
-        assert_eq!(
-            engine.replace_table("posts", vec![]).unwrap_err().code,
-            "TRANSACTION_ACTIVE"
-        );
-
         let committed = engine.commit_transaction().unwrap();
         assert_eq!(committed.revision, 2);
         assert_eq!(committed.tables, vec!["notes", "posts"]);
@@ -861,22 +560,19 @@ mod tests {
     }
 
     #[test]
-    fn typed_catalog_survives_snapshots_and_validates_empty_queries() {
+    fn typed_catalog_validates_empty_queries() {
         let mut engine = Engine::default();
         create_posts(&mut engine);
-        let bytes = engine.export_snapshot().unwrap();
-        let mut restored = Engine::default();
-        restored.import_snapshot(&bytes).unwrap();
 
         assert_eq!(
-            restored
+            engine
                 .query_sql("SELECT missing FROM posts", &[])
                 .unwrap_err()
                 .code,
             "COLUMN_NOT_FOUND"
         );
         assert_eq!(
-            restored
+            engine
                 .execute_sql("INSERT INTO posts (id, title) VALUES (1, 42)", &[])
                 .unwrap_err()
                 .code,
@@ -1013,11 +709,8 @@ mod tests {
             "CONSTRAINT_VIOLATION"
         );
 
-        let bytes = engine.export_snapshot().unwrap();
-        let mut restored = Engine::default();
-        restored.import_snapshot(&bytes).unwrap();
         assert_eq!(
-            restored
+            engine
                 .query_sql("SELECT priority FROM posts WHERE title = 'three'", &[])
                 .unwrap()
                 .rows,
@@ -1076,22 +769,6 @@ mod tests {
             "UNSUPPORTED_SQL"
         );
         assert_eq!(engine.revision(), revision);
-
-        let mut untyped = Engine::default();
-        untyped
-            .define_table(TableSchema {
-                name: "untyped".to_owned(),
-                primary_key: vec!["id".to_owned()],
-                columns: vec![],
-            })
-            .unwrap();
-        assert_eq!(
-            untyped
-                .execute_sql("ALTER TABLE untyped ADD COLUMN value TEXT", &[])
-                .unwrap_err()
-                .code,
-            "UNSUPPORTED_SQL"
-        );
 
         let mut empty = Engine::default();
         empty
@@ -1217,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn indexes_survive_snapshots_and_transaction_rollback() {
+    fn indexes_survive_transaction_rollback() {
         let mut engine = Engine::default();
         create_posts(&mut engine);
         engine
@@ -1236,88 +913,12 @@ mod tests {
             .execute_sql("CREATE INDEX posts_published ON posts (published)", &[])
             .unwrap();
 
-        let bytes = engine.export_snapshot().unwrap();
-        let mut restored = Engine::default();
-        restored.import_snapshot(&bytes).unwrap();
-        assert_eq!(restored.export_snapshot().unwrap(), bytes);
         assert_eq!(
-            restored
+            engine
                 .execute_sql("INSERT INTO posts (id, title) VALUES (2, 'one')", &[])
                 .unwrap_err()
                 .code,
             "CONSTRAINT_VIOLATION"
-        );
-    }
-
-    #[test]
-    fn batch_changes_rebuild_indexes_atomically() {
-        let mut engine = Engine::default();
-        create_posts(&mut engine);
-        engine
-            .execute_sql("CREATE UNIQUE INDEX posts_title ON posts (title)", &[])
-            .unwrap();
-        engine
-            .apply_batch(&ChangeBatch {
-                changes: vec![Change::Upsert {
-                    table: "posts".to_owned(),
-                    row: row(json!({
-                        "id": 1, "title": "kept", "published": false,
-                        "rating": null, "metadata": null
-                    })),
-                }],
-            })
-            .unwrap();
-        let revision = engine.revision();
-        let error = engine
-            .apply_batch(&ChangeBatch {
-                changes: vec![
-                    Change::Upsert {
-                        table: "posts".to_owned(),
-                        row: row(json!({
-                            "id": 2, "title": "other", "published": false,
-                            "rating": null, "metadata": null
-                        })),
-                    },
-                    Change::Upsert {
-                        table: "posts".to_owned(),
-                        row: row(json!({
-                            "id": 3, "title": "kept", "published": false,
-                            "rating": null, "metadata": null
-                        })),
-                    },
-                ],
-            })
-            .unwrap_err();
-        assert_eq!(error.code, "CONSTRAINT_VIOLATION");
-        assert_eq!(engine.revision(), revision);
-        assert_eq!(
-            engine.query_sql("SELECT id FROM posts", &[]).unwrap().rows,
-            vec![row(json!({"id": 1}))]
-        );
-
-        assert_eq!(
-            engine
-                .replace_table(
-                    "posts",
-                    vec![
-                        row(json!({
-                            "id": 2, "title": "same", "published": false,
-                            "rating": null, "metadata": null
-                        })),
-                        row(json!({
-                            "id": 3, "title": "same", "published": false,
-                            "rating": null, "metadata": null
-                        })),
-                    ],
-                )
-                .unwrap_err()
-                .code,
-            "CONSTRAINT_VIOLATION"
-        );
-        assert_eq!(engine.revision(), revision);
-        assert_eq!(
-            engine.query_sql("SELECT id FROM posts", &[]).unwrap().rows,
-            vec![row(json!({"id": 1}))]
         );
     }
 
@@ -1410,478 +1011,5 @@ mod tests {
             "TRANSACTION_ACTIVE"
         );
         engine.rollback_transaction().unwrap();
-    }
-
-    #[test]
-    fn prepared_sql_is_invisible_until_exact_install_and_abort_preserves_prior_state() {
-        let mut engine = Engine::default();
-        let prepared = engine
-            .prepare_execute_sql(
-                "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT)",
-                &[],
-            )
-            .unwrap();
-        let create_bytes = prepared.commit.unwrap().into_bytes();
-        assert_eq!(engine.revision(), 0);
-        assert_eq!(
-            engine
-                .query_sql("SELECT id FROM posts", &[])
-                .unwrap_err()
-                .code,
-            "TABLE_NOT_FOUND"
-        );
-        assert_eq!(
-            engine
-                .prepare_execute_sql("CREATE TABLE other (id INTEGER PRIMARY KEY)", &[])
-                .unwrap_err()
-                .code,
-            "PREPARED_COMMIT_PENDING"
-        );
-
-        let mut wrong = create_bytes.clone();
-        *wrong.last_mut().unwrap() ^= 1;
-        assert_eq!(
-            engine.install_prepared_commit(&wrong).unwrap_err().code,
-            "PREPARED_COMMIT_MISMATCH"
-        );
-        assert_eq!(engine.revision(), 0);
-        engine.abort_prepared_commit().unwrap();
-        assert_eq!(
-            engine
-                .query_sql("SELECT id FROM posts", &[])
-                .unwrap_err()
-                .code,
-            "TABLE_NOT_FOUND"
-        );
-
-        let prepared = engine
-            .prepare_execute_sql(
-                "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT)",
-                &[],
-            )
-            .unwrap();
-        let bytes = prepared.commit.unwrap().into_bytes();
-        let outcome = engine.install_prepared_commit(&bytes).unwrap();
-        assert_eq!(outcome.revision, 1);
-        assert_eq!(engine.revision(), 1);
-    }
-
-    #[test]
-    fn prepared_bytes_are_deterministic_small_row_deltas_and_replayable() {
-        let mut first = Engine::default();
-        first
-            .execute_sql(
-                "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT NOT NULL)",
-                &[],
-            )
-            .unwrap();
-        first
-            .execute_sql(
-                "INSERT INTO posts (id, title) VALUES (1, 'one'), (2, 'two')",
-                &[],
-            )
-            .unwrap();
-        let base = first.export_snapshot().unwrap();
-        let mut second = Engine::default();
-        second.import_snapshot(&base).unwrap();
-
-        let left = first
-            .prepare_execute_sql("UPDATE posts SET title = 'changed' WHERE id = 2", &[])
-            .unwrap()
-            .commit
-            .unwrap()
-            .into_bytes();
-        let right = second
-            .prepare_execute_sql("UPDATE posts SET title = 'changed' WHERE id = 2", &[])
-            .unwrap()
-            .commit
-            .unwrap()
-            .into_bytes();
-        assert_eq!(left, right);
-        assert!(left.len() < 512, "one-row delta was {} bytes", left.len());
-
-        first.abort_prepared_commit().unwrap();
-        let outcome = first.replay_commit(&left).unwrap();
-        assert_eq!(outcome.revision, 3);
-        assert_eq!(
-            first
-                .query_sql("SELECT title FROM posts WHERE id = 2", &[])
-                .unwrap()
-                .rows,
-            vec![row(json!({"title": "changed"}))]
-        );
-        assert_eq!(
-            first.replay_commit(&left).unwrap_err().code,
-            "PREPARED_COMMIT_REVISION_MISMATCH"
-        );
-    }
-
-    #[test]
-    fn prepared_transactions_coalesce_all_mutations_and_are_consumed_on_prepare() {
-        let mut engine = Engine::default();
-        create_posts(&mut engine);
-        engine.begin_transaction().unwrap();
-        engine
-            .execute_sql("INSERT INTO posts (id, title) VALUES (1, 'one')", &[])
-            .unwrap();
-        engine
-            .execute_sql("UPDATE posts SET published = true WHERE id = 1", &[])
-            .unwrap();
-
-        let prepared = engine.prepare_commit_transaction().unwrap();
-        assert!(!engine.in_transaction());
-        assert_eq!(engine.revision(), 1);
-        assert!(
-            engine
-                .query_sql("SELECT id FROM posts", &[])
-                .unwrap()
-                .rows
-                .is_empty()
-        );
-        let bytes = prepared.commit.unwrap().into_bytes();
-        assert!(!String::from_utf8_lossy(&bytes).contains("INSERT INTO"));
-        engine.install_prepared_commit(&bytes).unwrap();
-        assert_eq!(engine.revision(), 2);
-        assert_eq!(
-            engine
-                .query_sql("SELECT published FROM posts WHERE id = 1", &[])
-                .unwrap()
-                .rows,
-            vec![row(json!({"published": true}))]
-        );
-
-        engine.begin_transaction().unwrap();
-        let empty = engine.prepare_commit_transaction().unwrap();
-        assert!(empty.commit.is_none());
-        assert!(!engine.in_transaction());
-    }
-
-    #[test]
-    fn prepared_catalog_and_batch_mutations_replay_with_exact_revision_semantics() {
-        let schema = TableSchema {
-            name: "posts".to_owned(),
-            primary_key: vec!["id".to_owned()],
-            columns: vec![],
-        };
-        let mut primary = Engine::default();
-        let defined = primary.prepare_define_tables(vec![schema.clone()]).unwrap();
-        assert_eq!(defined.commit.as_ref().unwrap().revision_before(), 0);
-        assert_eq!(defined.commit.as_ref().unwrap().revision_after(), 0);
-        let define_bytes = defined.commit.unwrap().into_bytes();
-        primary.install_prepared_commit(&define_bytes).unwrap();
-        assert_eq!(primary.revision(), 0);
-
-        let batch = ChangeBatch {
-            changes: vec![Change::Upsert {
-                table: "posts".to_owned(),
-                row: row(json!({"id": 1, "title": "one"})),
-            }],
-        };
-        let applied = primary.prepare_apply_batch(&batch).unwrap();
-        assert_eq!(applied.result.revision, 1);
-        let batch_bytes = applied.commit.unwrap().into_bytes();
-        primary.install_prepared_commit(&batch_bytes).unwrap();
-        assert_eq!(primary.revision(), 1);
-
-        let mut restored = Engine::default();
-        restored.replay_commit(&define_bytes).unwrap();
-        restored.replay_commit(&batch_bytes).unwrap();
-        assert_eq!(restored.revision(), 1);
-        assert_eq!(
-            restored
-                .query(&QueryPlan {
-                    table: "posts".to_owned(),
-                    columns: None,
-                    filters: vec![],
-                    predicate: None,
-                    order_by: vec![],
-                    limit: None,
-                    offset: 0,
-                })
-                .unwrap()
-                .rows,
-            vec![row(json!({"id": 1, "title": "one"}))]
-        );
-    }
-
-    #[test]
-    fn prepared_schema_migration_replay_preserves_existing_indexes() {
-        let mut engine = Engine::default();
-        engine
-            .execute_sql(
-                "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT NOT NULL)",
-                &[],
-            )
-            .unwrap();
-        engine
-            .execute_sql("CREATE INDEX posts_title ON posts (title)", &[])
-            .unwrap();
-        engine
-            .execute_sql("INSERT INTO posts (id, title) VALUES (1, 'one')", &[])
-            .unwrap();
-        let base = engine.export_snapshot().unwrap();
-        let bytes = engine
-            .prepare_execute_sql("ALTER TABLE posts ADD COLUMN note TEXT", &[])
-            .unwrap()
-            .commit
-            .unwrap()
-            .into_bytes();
-        engine.abort_prepared_commit().unwrap();
-
-        let mut restored = Engine::default();
-        restored.import_snapshot(&base).unwrap();
-        restored.replay_commit(&bytes).unwrap();
-        assert_eq!(
-            restored
-                .into_storage()
-                .index_definition("posts_title")
-                .unwrap()
-                .columns,
-            vec!["title"]
-        );
-    }
-
-    #[test]
-    fn failed_prepare_and_corrupt_replay_preserve_prior_state() {
-        let mut engine = Engine::default();
-        create_posts(&mut engine);
-        let before = engine.export_snapshot().unwrap();
-        assert_eq!(
-            engine
-                .prepare_execute_sql("INSERT INTO posts (id, title) VALUES (1, 42)", &[])
-                .unwrap_err()
-                .code,
-            "TYPE_MISMATCH"
-        );
-        assert_eq!(engine.export_snapshot().unwrap(), before);
-
-        let prepared = engine
-            .prepare_execute_sql("INSERT INTO posts (id, title) VALUES (1, 'one')", &[])
-            .unwrap();
-        let mut corrupt = prepared.commit.unwrap().into_bytes();
-        engine.abort_prepared_commit().unwrap();
-        *corrupt.last_mut().unwrap() ^= 1;
-        assert_eq!(
-            engine.replay_commit(&corrupt).unwrap_err().code,
-            "INVALID_PREPARED_COMMIT"
-        );
-        assert_eq!(engine.export_snapshot().unwrap(), before);
-    }
-
-    #[test]
-    fn every_sql_mutation_prepares_installs_and_replays_the_same_state() {
-        fn apply(primary: &mut Engine, replayed: &mut Engine, sql: &str) -> Vec<u8> {
-            let prepared = primary.prepare_execute_sql(sql, &[]).unwrap();
-            let bytes = prepared.commit.unwrap().into_bytes();
-            primary.install_prepared_commit(&bytes).unwrap();
-            replayed.replay_commit(&bytes).unwrap();
-            assert_eq!(
-                primary.export_snapshot().unwrap(),
-                replayed.export_snapshot().unwrap()
-            );
-            bytes
-        }
-
-        let mut primary = Engine::default();
-        let mut replayed = Engine::default();
-        apply(
-            &mut primary,
-            &mut replayed,
-            "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT NOT NULL)",
-        );
-        apply(
-            &mut primary,
-            &mut replayed,
-            "INSERT INTO posts (id, title) VALUES (1, 'one'), (2, 'two')",
-        );
-        apply(
-            &mut primary,
-            &mut replayed,
-            "CREATE INDEX posts_title ON posts (title)",
-        );
-        apply(
-            &mut primary,
-            &mut replayed,
-            "UPDATE posts SET title = 'changed' WHERE id = 2",
-        );
-
-        // A matched write that produces the same row still preserves the
-        // existing revision/invalidation contract without inventing SQL redo.
-        let revision_only = apply(
-            &mut primary,
-            &mut replayed,
-            "UPDATE posts SET title = 'changed' WHERE id = 2",
-        );
-        assert!(String::from_utf8_lossy(&revision_only).contains("\"operations\":[]"));
-
-        apply(
-            &mut primary,
-            &mut replayed,
-            "DELETE FROM posts WHERE id = 1",
-        );
-        apply(
-            &mut primary,
-            &mut replayed,
-            "ALTER TABLE posts ADD COLUMN note TEXT",
-        );
-        apply(&mut primary, &mut replayed, "DROP INDEX posts_title");
-        apply(&mut primary, &mut replayed, "DROP TABLE posts");
-    }
-
-    #[test]
-    fn replacement_and_batch_deltas_install_and_replay_atomically() {
-        let schema = TableSchema {
-            name: "posts".to_owned(),
-            primary_key: vec!["id".to_owned()],
-            columns: vec![],
-        };
-        let mut primary = Engine::default();
-        let mut replayed = Engine::default();
-
-        for rows in [
-            vec![
-                row(json!({"id": 1, "title": "one"})),
-                row(json!({"id": 2, "title": "two"})),
-            ],
-            vec![
-                row(json!({"id": 2, "title": "changed"})),
-                row(json!({"id": 3, "title": "three"})),
-            ],
-        ] {
-            let prepared = primary
-                .prepare_replace_table_snapshot(schema.clone(), rows)
-                .unwrap();
-            let bytes = prepared.commit.unwrap().into_bytes();
-            primary.install_prepared_commit(&bytes).unwrap();
-            replayed.replay_commit(&bytes).unwrap();
-            assert_eq!(
-                primary.export_snapshot().unwrap(),
-                replayed.export_snapshot().unwrap()
-            );
-        }
-
-        let batch = ChangeBatch {
-            changes: vec![
-                Change::Delete {
-                    table: "posts".to_owned(),
-                    key: row(json!({"id": 2})),
-                },
-                Change::Upsert {
-                    table: "posts".to_owned(),
-                    row: row(json!({"id": 4, "title": "four"})),
-                },
-            ],
-        };
-        let prepared = primary.prepare_apply_batch(&batch).unwrap();
-        let bytes = prepared.commit.unwrap().into_bytes();
-        primary.install_prepared_commit(&bytes).unwrap();
-        replayed.replay_commit(&bytes).unwrap();
-        assert_eq!(
-            primary.export_snapshot().unwrap(),
-            replayed.export_snapshot().unwrap()
-        );
-    }
-
-    #[test]
-    fn define_tables_is_atomic_and_abort_is_idempotent() {
-        let mut engine = Engine::default();
-        let error = engine
-            .prepare_define_tables(vec![
-                TableSchema {
-                    name: "would_have_existed".to_owned(),
-                    primary_key: vec!["id".to_owned()],
-                    columns: vec![],
-                },
-                TableSchema {
-                    name: "invalid".to_owned(),
-                    primary_key: vec![],
-                    columns: vec![],
-                },
-            ])
-            .unwrap_err();
-        assert_eq!(error.code, "INVALID_SCHEMA");
-        assert_eq!(
-            engine
-                .query_sql("SELECT id FROM would_have_existed", &[])
-                .unwrap_err()
-                .code,
-            "TABLE_NOT_FOUND"
-        );
-        engine.abort_prepared_commit().unwrap();
-        engine.abort_prepared_commit().unwrap();
-    }
-
-    #[test]
-    fn prepared_table_definitions_ignore_idempotent_existing_schemas() {
-        let existing = TableSchema {
-            name: "existing".to_owned(),
-            primary_key: vec!["id".to_owned()],
-            columns: vec![],
-        };
-        let added = TableSchema {
-            name: "added".to_owned(),
-            primary_key: vec!["id".to_owned()],
-            columns: vec![],
-        };
-        let mut primary = Engine::default();
-        primary.define_table(existing.clone()).unwrap();
-        let mut replayed = primary.clone();
-
-        let prepared = primary
-            .prepare_define_tables(vec![existing, added])
-            .unwrap();
-        let bytes = prepared.commit.unwrap().into_bytes();
-        let installed = primary.install_prepared_commit(&bytes).unwrap();
-        assert_eq!(installed.tables, vec!["added"]);
-        let replay_outcome = replayed.replay_commit(&bytes).unwrap();
-        assert_eq!(replay_outcome.tables, vec!["added"]);
-        assert_eq!(
-            primary.export_snapshot().unwrap(),
-            replayed.export_snapshot().unwrap()
-        );
-    }
-
-    #[test]
-    fn failed_transaction_prepare_retains_staged_work_for_explicit_rollback() {
-        let mut engine = Engine::default();
-        engine
-            .execute_sql(
-                "CREATE TABLE payloads (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
-                &[],
-            )
-            .unwrap();
-        engine.begin_transaction().unwrap();
-        let body = "x".repeat(1_000_000);
-        let rows = (0..18)
-            .map(|id| row(json!({"id": id, "body": body})))
-            .collect::<Vec<_>>();
-        let transaction = engine.transaction.as_mut().unwrap();
-        transaction
-            .storage
-            .replace_table_unrevisioned("payloads", rows)
-            .unwrap();
-        transaction.tables.insert("payloads".to_owned());
-
-        assert_eq!(
-            engine.prepare_commit_transaction().unwrap_err().code,
-            "PREPARED_COMMIT_TOO_LARGE"
-        );
-        assert!(engine.in_transaction());
-        assert_eq!(
-            engine
-                .query_sql("SELECT id FROM payloads", &[])
-                .unwrap()
-                .rows
-                .len(),
-            18
-        );
-        engine.rollback_transaction().unwrap();
-        assert!(
-            engine
-                .query_sql("SELECT id FROM payloads", &[])
-                .unwrap()
-                .rows
-                .is_empty()
-        );
     }
 }

@@ -559,7 +559,10 @@ mod tests {
             command: "SELECT".into(),
             revision: MAX_SAFE_INTEGER,
             row_count: 1,
-            fields: vec![ResultField::unknown("value")],
+            fields: vec![ResultField {
+                name: "value".into(),
+                data_type_id: 25,
+            }],
             rows: vec![Map::from_iter([("value".into(), json!([true, null, 1.5]))])],
             tables: vec![],
         };
@@ -608,7 +611,10 @@ mod tests {
             command: "SELECT".into(),
             revision: 7,
             row_count: 1,
-            fields: vec![ResultField::unknown("payload")],
+            fields: vec![ResultField {
+                name: "payload".into(),
+                data_type_id: 25,
+            }],
             rows: vec![Map::from_iter([(
                 "payload".into(),
                 json!({"nested": [true, null, 1.5, "value"]}),

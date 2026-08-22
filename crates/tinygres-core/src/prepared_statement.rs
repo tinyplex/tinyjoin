@@ -74,14 +74,14 @@ impl PreparedStatement {
         // parsed template or opening any mutation candidate.
         validate_sql_parameters(params)?;
         match &self.statement {
-            Statement::Select(plan) => {
-                Ok(Statement::Select(crate::query::bind_query_plan_parameters(
+            Statement::Select(plan) => Ok(Statement::Select(
+                crate::query::bind_select_plan_parameters(
                     plan,
                     params,
                     self.limit_parameter,
                     self.offset_parameter,
-                )?))
-            }
+                )?,
+            )),
             Statement::Aggregate(plan) => Ok(Statement::Aggregate(
                 crate::aggregate::bind_plan_parameters(
                     plan,

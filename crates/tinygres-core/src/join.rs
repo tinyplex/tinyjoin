@@ -10,8 +10,8 @@ use crate::query::{
 };
 use crate::storage::StorageReader;
 use crate::{
-    ColumnDefinition, ColumnType, EngineError, FilterOperator, NullOrder, OrderDirection,
-    Predicate, QueryResult, Result, ResultField, Row, TableSchema, VisitControl, VisitOutcome,
+    ColumnDefinition, ColumnType, ComparisonOperator, EngineError, NullOrder, OrderDirection,
+    Predicate, QueryResult, Result, ResultField, Row, TableDefinition, VisitControl, VisitOutcome,
 };
 
 const MAX_PROJECTIONS: usize = 256;
@@ -89,7 +89,7 @@ pub(crate) struct JoinPlan {
 #[derive(Clone)]
 struct Relation {
     source: Source,
-    schema: TableSchema,
+    schema: TableDefinition,
 }
 
 struct OrderedJoinedRow {
@@ -563,14 +563,6 @@ fn validate_plan(
     plan: &JoinPlan,
     relations: &[Relation],
 ) -> Result<(Vec<Vec<ResolvedCondition>>, Vec<ResultField>)> {
-    if relations
-        .iter()
-        .any(|relation| relation.schema.columns.is_empty())
-    {
-        return Err(EngineError::unsupported_sql(
-            "JOIN requires typed table catalogs on both sides",
-        ));
-    }
     let mut aliases = HashSet::new();
     for relation in relations {
         validate_relation_shape(relation)?;
@@ -668,7 +660,7 @@ fn validate_join_predicate(predicate: &Predicate, relations: &[Relation]) -> Res
             let reference = parse_column_ref_text(column);
             let (_, _, definition) = resolve_column(&reference, relations)?;
             for value in values {
-                validate_literal(definition, FilterOperator::Eq, value, column)?;
+                validate_literal(definition, ComparisonOperator::Eq, value, column)?;
             }
             Ok(())
         }
@@ -684,7 +676,7 @@ fn validate_join_predicate(predicate: &Predicate, relations: &[Relation]) -> Res
 
 fn validate_literal(
     definition: &ColumnDefinition,
-    operator: FilterOperator,
+    operator: ComparisonOperator,
     value: &Value,
     column: &str,
 ) -> Result<()> {
@@ -695,7 +687,7 @@ fn validate_literal(
         ColumnType::Boolean => value.is_boolean(),
         ColumnType::Integer | ColumnType::Float => value.is_number(),
         ColumnType::Text => value.is_string(),
-        ColumnType::Json => matches!(operator, FilterOperator::Eq | FilterOperator::Neq),
+        ColumnType::Json => matches!(operator, ComparisonOperator::Eq | ComparisonOperator::Neq),
     };
     if valid {
         Ok(())
@@ -1472,8 +1464,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::{
-        Engine, InMemoryStorage, IndexDefinition, Result, Row, StorageReader, TableSchema,
-        VisitControl, VisitOutcome,
+        Engine, InMemoryStorage, IndexDefinition, Result, Row, RowChange, StorageDriver,
+        StorageReader, TableDefinition, VisitControl, VisitOutcome,
     };
 
     #[derive(Clone, Copy)]
@@ -1540,7 +1532,7 @@ mod tests {
             self.inner.visit_index(table, columns, key, visitor)
         }
 
-        fn table_schema(&self, table: &str) -> Result<TableSchema> {
+        fn table_schema(&self, table: &str) -> Result<TableDefinition> {
             self.inner.table_schema(table)
         }
 
@@ -1554,6 +1546,20 @@ mod tests {
             .as_object()
             .expect("test row must be an object")
             .clone()
+    }
+
+    fn seed_rows(engine: &mut Engine, table: &str, rows: Vec<Row>) {
+        let mut storage = std::mem::take(engine).into_storage();
+        for row in rows {
+            storage
+                .apply_row_changes_unrevisioned(vec![RowChange::Upsert {
+                    table: table.to_owned(),
+                    row,
+                }])
+                .unwrap();
+        }
+        storage.advance_revision().unwrap();
+        *engine = Engine::new(storage);
     }
 
     fn database() -> Engine {
@@ -2161,24 +2167,6 @@ mod tests {
             );
         }
 
-        let mut legacy = Engine::default();
-        for name in ["a", "b"] {
-            legacy
-                .define_table(TableSchema {
-                    name: name.to_owned(),
-                    primary_key: vec!["id".to_owned()],
-                    columns: vec![],
-                })
-                .unwrap();
-        }
-        assert_eq!(
-            legacy
-                .query_sql("SELECT a.id AS a_id FROM a JOIN b ON a.id = b.id", &[])
-                .unwrap_err()
-                .code,
-            "UNSUPPORTED_SQL"
-        );
-
         assert_eq!(
             engine
                 .query_sql(
@@ -2378,20 +2366,19 @@ mod tests {
             .unwrap();
         let payload = "x".repeat(crate::storage::MAX_LOGICAL_ROW_BYTES - 256);
         for (table, count) in [("work_b", 5), ("work_c", 4)] {
-            engine
-                .replace_table(
-                    table,
-                    (0..count)
-                        .map(|id| {
-                            row(json!({
-                                "id": id + if table == "work_b" { 10 } else { 20 },
-                                "join_key": 1,
-                                "payload": payload,
-                            }))
-                        })
-                        .collect(),
-                )
-                .unwrap();
+            seed_rows(
+                &mut engine,
+                table,
+                (0..count)
+                    .map(|id| {
+                        row(json!({
+                            "id": id + if table == "work_b" { 10 } else { 20 },
+                            "join_key": 1,
+                            "payload": payload,
+                        }))
+                    })
+                    .collect(),
+            );
         }
         assert_eq!(
             engine
@@ -2444,30 +2431,26 @@ mod tests {
                     )
                     .unwrap();
             }
-            engine
-                .replace_table(
-                    "budget_left",
-                    left_payloads
-                        .into_iter()
-                        .enumerate()
-                        .map(|(id, payload)| {
-                            row(json!({"id": id, "join_key": 1, "payload": payload}))
-                        })
-                        .collect(),
-                )
-                .unwrap();
-            engine
-                .replace_table(
-                    "budget_right",
-                    right_payloads
-                        .into_iter()
-                        .enumerate()
-                        .map(|(id, payload)| {
-                            row(json!({"id": id + 100, "join_key": 1, "payload": payload}))
-                        })
-                        .collect(),
-                )
-                .unwrap();
+            seed_rows(
+                &mut engine,
+                "budget_left",
+                left_payloads
+                    .into_iter()
+                    .enumerate()
+                    .map(|(id, payload)| row(json!({"id": id, "join_key": 1, "payload": payload})))
+                    .collect(),
+            );
+            seed_rows(
+                &mut engine,
+                "budget_right",
+                right_payloads
+                    .into_iter()
+                    .enumerate()
+                    .map(|(id, payload)| {
+                        row(json!({"id": id + 100, "join_key": 1, "payload": payload}))
+                    })
+                    .collect(),
+            );
             engine
         }
 

@@ -5,7 +5,7 @@ pub type Row = Map<String, Value>;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub enum ColumnType {
+pub(crate) enum ColumnType {
     Boolean,
     Integer,
     Float,
@@ -16,15 +16,14 @@ pub enum ColumnType {
 // Stable PostgreSQL type OIDs used by the public SQL result metadata. These
 // describe TinyGres's five normalized runtime types, not the spelling used in
 // CREATE TABLE (for example, INTEGER and BIGINT normalize to the same type).
-pub const PG_OID_BOOLEAN: u32 = 16;
-pub const PG_OID_INTEGER: u32 = 20;
-pub const PG_OID_TEXT: u32 = 25;
-pub const PG_OID_JSON: u32 = 114;
-pub const PG_OID_FLOAT: u32 = 701;
-pub const PG_OID_UNKNOWN: u32 = 705;
+pub(crate) const PG_OID_BOOLEAN: u32 = 16;
+pub(crate) const PG_OID_INTEGER: u32 = 20;
+pub(crate) const PG_OID_TEXT: u32 = 25;
+pub(crate) const PG_OID_JSON: u32 = 114;
+pub(crate) const PG_OID_FLOAT: u32 = 701;
 
 impl ColumnType {
-    pub const fn postgres_oid(self) -> u32 {
+    pub(crate) const fn postgres_oid(self) -> u32 {
         match self {
             Self::Boolean => PG_OID_BOOLEAN,
             // TinyGres integers span JavaScript's safe-integer domain, which
@@ -47,73 +46,55 @@ pub struct ResultField {
 }
 
 impl ResultField {
-    pub fn new(name: impl Into<String>, data_type: ColumnType) -> Self {
+    pub(crate) fn new(name: impl Into<String>, data_type: ColumnType) -> Self {
         Self {
             name: name.into(),
             data_type_id: data_type.postgres_oid(),
         }
     }
-
-    pub fn unknown(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            data_type_id: PG_OID_UNKNOWN,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ColumnDefinition {
-    pub name: String,
-    pub data_type: ColumnType,
+pub(crate) struct ColumnDefinition {
+    pub(crate) name: String,
+    pub(crate) data_type: ColumnType,
     #[serde(default = "default_nullable")]
-    pub nullable: bool,
+    pub(crate) nullable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default: Option<Value>,
+    pub(crate) default: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TableSchema {
-    pub name: String,
-    pub primary_key: Vec<String>,
-    /// Empty when no typed column catalog is available. SQL-created tables always populate this
-    /// collection.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub columns: Vec<ColumnDefinition>,
+pub(crate) struct TableDefinition {
+    pub(crate) name: String,
+    pub(crate) primary_key: Vec<String>,
+    pub(crate) columns: Vec<ColumnDefinition>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct IndexDefinition {
-    pub name: String,
-    pub table: String,
-    pub columns: Vec<String>,
+pub(crate) struct IndexDefinition {
+    pub(crate) name: String,
+    pub(crate) table: String,
+    pub(crate) columns: Vec<String>,
     #[serde(default)]
-    pub unique: bool,
+    pub(crate) unique: bool,
 }
 
 fn default_nullable() -> bool {
     true
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ChangeBatch {
-    pub changes: Vec<Change>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", tag = "type")]
-pub enum Change {
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum RowChange {
     Upsert { table: String, row: Row },
     Delete { table: String, key: Row },
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum FilterOperator {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ComparisonOperator {
     Eq,
     Neq,
     Lt,
@@ -122,20 +103,11 @@ pub enum FilterOperator {
     Gte,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Filter {
-    pub column: String,
-    pub operator: FilterOperator,
-    pub value: Value,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", tag = "type")]
-pub enum Predicate {
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Predicate {
     Comparison {
         column: String,
-        operator: FilterOperator,
+        operator: ComparisonOperator,
         value: Value,
     },
     IsNull {
@@ -157,49 +129,34 @@ pub enum Predicate {
     },
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum OrderDirection {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OrderDirection {
     Asc,
     Desc,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum NullOrder {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NullOrder {
     Default,
     First,
     Last,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OrderBy {
-    pub column: String,
-    pub direction: OrderDirection,
-    pub nulls: NullOrder,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OrderBy {
+    pub(crate) column: String,
+    pub(crate) direction: OrderDirection,
+    pub(crate) nulls: NullOrder,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QueryPlan {
-    pub table: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub columns: Option<Vec<String>>,
-    #[serde(default)]
-    pub filters: Vec<Filter>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub predicate: Option<Predicate>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub order_by: Vec<OrderBy>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<usize>,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub offset: usize,
-}
-
-fn is_zero(value: &usize) -> bool {
-    *value == 0
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SelectPlan {
+    pub(crate) table: String,
+    pub(crate) columns: Option<Vec<String>>,
+    pub(crate) predicate: Option<Predicate>,
+    pub(crate) order_by: Vec<OrderBy>,
+    pub(crate) limit: Option<usize>,
+    pub(crate) offset: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -226,18 +183,4 @@ pub struct ExecuteResult {
     pub fields: Vec<ResultField>,
     pub rows: Vec<Row>,
     pub tables: Vec<String>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ChangeBatch;
-
-    #[test]
-    fn change_batches_reject_unknown_metadata() {
-        let error = serde_json::from_str::<ChangeBatch>(
-            r#"{"changes":[],"sourceId":"removed-integration"}"#,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("unknown field `sourceId`"));
-    }
 }

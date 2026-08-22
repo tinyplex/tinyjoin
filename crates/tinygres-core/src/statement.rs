@@ -14,8 +14,8 @@ use crate::storage::{
     validate_index_columns_for_schema, validate_index_definition_shape,
 };
 use crate::{
-    Change, ColumnDefinition, ColumnType, EngineError, Predicate, QueryPlan, Result, ResultField,
-    Row, StorageReader, TableSchema, VisitControl, VisitOutcome,
+    ColumnDefinition, ColumnType, EngineError, Predicate, Result, ResultField, Row, RowChange,
+    SelectPlan, StorageReader, TableDefinition, VisitControl, VisitOutcome,
 };
 
 const MAX_COLUMNS: usize = 256;
@@ -28,7 +28,7 @@ const DML_CHANGE_RETAINED_BYTES: usize = 96;
 
 #[derive(Clone, Debug)]
 pub(crate) enum Statement {
-    Select(QueryPlan),
+    Select(SelectPlan),
     Aggregate(crate::aggregate::AggregatePlan),
     Join(crate::join::JoinPlan),
     Write(WriteStatement),
@@ -37,7 +37,7 @@ pub(crate) enum Statement {
 #[derive(Clone, Debug)]
 pub(crate) enum WriteStatement {
     CreateTable {
-        schema: TableSchema,
+        schema: TableDefinition,
         if_not_exists: bool,
     },
     CreateIndex {
@@ -93,7 +93,7 @@ pub(crate) struct WriteOutcome {
 
 pub(crate) struct PlannedDml {
     pub outcome: WriteOutcome,
-    pub changes: Vec<Change>,
+    pub changes: Vec<RowChange>,
 }
 
 pub(crate) fn parse(sql: &str, params: &[Value]) -> Result<Statement> {
@@ -201,7 +201,6 @@ pub(crate) fn plan_dml(
 pub(crate) fn write_result_fields(
     storage: &dyn StorageReader,
     statement: &WriteStatement,
-    first_row: Option<&Row>,
 ) -> Result<Vec<ResultField>> {
     let (table, returning) = match statement {
         WriteStatement::Insert {
@@ -219,11 +218,7 @@ pub(crate) fn write_result_fields(
         return Ok(vec![]);
     };
     let schema = storage.table_schema(table)?;
-    crate::query::projection_fields(
-        &schema,
-        (!returning.is_empty()).then_some(returning),
-        first_row,
-    )
+    crate::query::projection_fields(&schema, (!returning.is_empty()).then_some(returning))
 }
 
 #[cfg(test)]
@@ -406,7 +401,7 @@ pub(crate) fn plan_create_index(
 #[cfg(test)]
 fn create_table<S: StorageDriver>(
     storage: &mut S,
-    schema: &TableSchema,
+    schema: &TableDefinition,
     if_not_exists: bool,
 ) -> Result<WriteOutcome> {
     let outcome = plan_create_table(storage, schema, if_not_exists)?;
@@ -418,7 +413,7 @@ fn create_table<S: StorageDriver>(
 
 pub(crate) fn plan_create_table(
     storage: &dyn StorageReader,
-    schema: &TableSchema,
+    schema: &TableDefinition,
     if_not_exists: bool,
 ) -> Result<WriteOutcome> {
     if storage.table_schema(&schema.name).is_ok() {
@@ -455,16 +450,11 @@ fn plan_insert(
         columns.is_none() && value_rows.len() == 1 && value_rows.first().is_some_and(Vec::is_empty);
     let columns = match columns {
         Some(columns) => columns.to_vec(),
-        None if !schema.columns.is_empty() => schema
+        None => schema
             .columns
             .iter()
             .map(|column| column.name.clone())
             .collect(),
-        None => {
-            return Err(EngineError::invalid_query(format!(
-                "INSERT into untyped table `{table}` must include a column list"
-            )));
-        }
     };
     validate_named_columns(&schema, &columns)?;
     validate_projection(&schema, returning)?;
@@ -518,7 +508,7 @@ fn plan_insert(
             result_bytes = retain_returned_row(result_bytes, &row, columns)?;
             returned.push(project_returning_row(&row, columns, table)?);
         }
-        changes.push(Change::Upsert {
+        changes.push(RowChange::Upsert {
             table: table.to_owned(),
             row,
         });
@@ -552,7 +542,7 @@ fn plan_update(
             .map(|(column, _)| column.clone())
             .collect::<Vec<_>>(),
     )?;
-    if let Some(predicate) = predicate.filter(|_| !schema.columns.is_empty()) {
+    if let Some(predicate) = predicate {
         validate_predicate_columns(predicate, &schema, table)?;
     }
     validate_projection(&schema, returning)?;
@@ -695,12 +685,12 @@ fn plan_update(
         let mut upserts = Vec::with_capacity(row_count);
         for update in updates {
             if update.old_key != update.new_key {
-                deletes.push(Change::Delete {
+                deletes.push(RowChange::Delete {
                     table: table.to_owned(),
                     key: update.old_primary_key,
                 });
             }
-            upserts.push(Change::Upsert {
+            upserts.push(RowChange::Upsert {
                 table: table.to_owned(),
                 row: update.new_row,
             });
@@ -732,7 +722,7 @@ fn plan_delete(
     returning: Option<&[String]>,
 ) -> Result<PlannedDml> {
     let schema = storage.table_schema(table)?;
-    if let Some(predicate) = predicate.filter(|_| !schema.columns.is_empty()) {
+    if let Some(predicate) = predicate {
         validate_predicate_columns(predicate, &schema, table)?;
     }
     validate_projection(&schema, returning)?;
@@ -779,7 +769,7 @@ fn plan_delete(
         }
         let key = primary_key_row(&schema, row)?;
         work_bytes = checked_dml_add(work_bytes, charge)?;
-        changes.push(Change::Delete {
+        changes.push(RowChange::Delete {
             table: table.to_owned(),
             key,
         });
@@ -802,7 +792,7 @@ fn plan_delete(
     })
 }
 
-fn validate_named_columns(schema: &TableSchema, columns: &[String]) -> Result<()> {
+fn validate_named_columns(schema: &TableDefinition, columns: &[String]) -> Result<()> {
     let mut names = HashSet::with_capacity(columns.len());
     for column in columns {
         if !names.insert(column) {
@@ -810,11 +800,10 @@ fn validate_named_columns(schema: &TableSchema, columns: &[String]) -> Result<()
                 "Column `{column}` is named more than once"
             )));
         }
-        if !schema.columns.is_empty()
-            && !schema
-                .columns
-                .iter()
-                .any(|definition| definition.name == *column)
+        if !schema
+            .columns
+            .iter()
+            .any(|definition| definition.name == *column)
         {
             return Err(EngineError::column_not_found(column, &schema.name));
         }
@@ -822,10 +811,7 @@ fn validate_named_columns(schema: &TableSchema, columns: &[String]) -> Result<()
     Ok(())
 }
 
-fn validate_projection(schema: &TableSchema, returning: Option<&[String]>) -> Result<()> {
-    if schema.columns.is_empty() {
-        return Ok(());
-    }
+fn validate_projection(schema: &TableDefinition, returning: Option<&[String]>) -> Result<()> {
     if let Some(columns) = returning {
         for column in columns {
             if !schema
@@ -840,12 +826,7 @@ fn validate_projection(schema: &TableSchema, returning: Option<&[String]>) -> Re
     Ok(())
 }
 
-fn column_default(schema: &TableSchema, name: &str) -> Result<Value> {
-    if schema.columns.is_empty() {
-        return Err(EngineError::unsupported_sql(
-            "DEFAULT requires a typed table catalog",
-        ));
-    }
+fn column_default(schema: &TableDefinition, name: &str) -> Result<Value> {
     schema
         .columns
         .iter()
@@ -854,7 +835,7 @@ fn column_default(schema: &TableSchema, name: &str) -> Result<Value> {
         .ok_or_else(|| EngineError::column_not_found(name, &schema.name))
 }
 
-fn primary_key_row(schema: &TableSchema, row: &Row) -> Result<Row> {
+fn primary_key_row(schema: &TableDefinition, row: &Row) -> Result<Row> {
     let mut key = Map::new();
     for column in &schema.primary_key {
         let value = row.get(column).ok_or_else(|| {
@@ -869,24 +850,12 @@ fn primary_key_row(schema: &TableSchema, row: &Row) -> Result<Row> {
 }
 
 fn prospective_insert_row_bytes(
-    schema: &TableSchema,
+    schema: &TableDefinition,
     columns: &[String],
     values: &[SqlValue],
     default_values: bool,
 ) -> Result<usize> {
     let mut bytes = 32usize;
-    if schema.columns.is_empty() {
-        for (column, value) in columns.iter().zip(values) {
-            let SqlValue::Value(value) = value else {
-                continue;
-            };
-            bytes = checked_dml_add(bytes, 64)?;
-            bytes = checked_dml_add(bytes, checked_dml_mul(column.len(), 2)?)?;
-            bytes = checked_dml_add(bytes, checked_dml_mul(estimated_value_bytes(value)?, 2)?)?;
-        }
-        return Ok(bytes);
-    }
-
     for definition in &schema.columns {
         let explicit = (!default_values)
             .then(|| {
@@ -1111,7 +1080,7 @@ impl<'a> MutationParser<'a> {
             }
         }
         Ok(WriteStatement::CreateTable {
-            schema: TableSchema {
+            schema: TableDefinition {
                 name,
                 primary_key,
                 columns,
@@ -1588,7 +1557,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::{ApplyOutcome, ChangeBatch, InMemoryStorage, IndexDefinition, StorageReader};
+    use crate::{InMemoryStorage, IndexDefinition, StorageReader};
 
     struct UnexpectedStopStorage {
         inner: InMemoryStorage,
@@ -1630,7 +1599,7 @@ mod tests {
             self.inner.visit_index(table, columns, key, visitor)
         }
 
-        fn table_schema(&self, table: &str) -> Result<TableSchema> {
+        fn table_schema(&self, table: &str) -> Result<TableDefinition> {
             self.inner.table_schema(table)
         }
 
@@ -1640,7 +1609,7 @@ mod tests {
     }
 
     impl StorageDriver for UnexpectedStopStorage {
-        fn define_table(&mut self, schema: TableSchema) -> Result<()> {
+        fn define_table(&mut self, schema: TableDefinition) -> Result<()> {
             self.mutation_calls += 1;
             self.inner.define_table(schema)
         }
@@ -1655,25 +1624,6 @@ mod tests {
             self.inner.add_column(table, column)
         }
 
-        fn replace_table_snapshot(
-            &mut self,
-            schema: TableSchema,
-            rows: Vec<Row>,
-        ) -> Result<ApplyOutcome> {
-            self.mutation_calls += 1;
-            self.inner.replace_table_snapshot(schema, rows)
-        }
-
-        fn replace_table(&mut self, table: &str, rows: Vec<Row>) -> Result<ApplyOutcome> {
-            self.mutation_calls += 1;
-            self.inner.replace_table(table, rows)
-        }
-
-        fn apply_batch(&mut self, batch: &ChangeBatch) -> Result<ApplyOutcome> {
-            self.mutation_calls += 1;
-            self.inner.apply_batch(batch)
-        }
-
         fn define_index(&mut self, definition: IndexDefinition) -> Result<()> {
             self.mutation_calls += 1;
             self.inner.define_index(definition)
@@ -1684,14 +1634,9 @@ mod tests {
             self.inner.drop_index(name)
         }
 
-        fn apply_row_changes_unrevisioned(&mut self, changes: Vec<Change>) -> Result<()> {
+        fn apply_row_changes_unrevisioned(&mut self, changes: Vec<RowChange>) -> Result<()> {
             self.mutation_calls += 1;
             self.inner.apply_row_changes_unrevisioned(changes)
-        }
-
-        fn replace_table_unrevisioned(&mut self, table: &str, rows: Vec<Row>) -> Result<()> {
-            self.mutation_calls += 1;
-            self.inner.replace_table_unrevisioned(table, rows)
         }
 
         fn advance_revision(&mut self) -> Result<u64> {
@@ -1707,6 +1652,18 @@ mod tests {
             .clone()
     }
 
+    fn seed_rows(storage: &mut InMemoryStorage, table: &str, rows: Vec<Row>) {
+        for row in rows {
+            storage
+                .apply_row_changes_unrevisioned(vec![RowChange::Upsert {
+                    table: table.to_owned(),
+                    row,
+                }])
+                .unwrap();
+        }
+        storage.advance_revision().unwrap();
+    }
+
     fn nested_json(depth: usize) -> Value {
         (0..depth).fold(Value::Null, |value, _| Value::Array(vec![value]))
     }
@@ -1714,7 +1671,7 @@ mod tests {
     fn storage() -> InMemoryStorage {
         let mut storage = InMemoryStorage::default();
         storage
-            .define_table(TableSchema {
+            .define_table(TableDefinition {
                 name: "items".to_owned(),
                 primary_key: vec!["id".to_owned()],
                 columns: vec![
@@ -1796,14 +1753,13 @@ mod tests {
     fn dml_work_and_returning_budgets_fail_before_cloning_large_visited_values() {
         let mut storage = storage();
         let huge = "x".repeat(crate::storage::MAX_LOGICAL_ROW_BYTES - 256);
-        storage
-            .replace_table(
-                "items",
-                (0..19)
-                    .map(|id| row(json!({"id": id, "value": huge})))
-                    .collect(),
-            )
-            .unwrap();
+        seed_rows(
+            &mut storage,
+            "items",
+            (0..19)
+                .map(|id| row(json!({"id": id, "value": huge})))
+                .collect(),
+        );
         let revision = storage.revision();
 
         let Statement::Write(update) = parse("UPDATE items SET id = 100", &[]).unwrap() else {
@@ -1843,9 +1799,11 @@ mod tests {
             "DELETE FROM items WHERE id = 1",
         ] {
             let mut inner = storage();
-            inner
-                .replace_table("items", vec![row(json!({"id": 1, "value": "unchanged"}))])
-                .unwrap();
+            seed_rows(
+                &mut inner,
+                "items",
+                vec![row(json!({"id": 1, "value": "unchanged"}))],
+            );
             let revision = inner.revision();
             let mut storage = UnexpectedStopStorage {
                 inner,
@@ -1875,7 +1833,7 @@ mod tests {
     fn deeply_nested_json_dml_fails_before_mutation() {
         let mut storage = InMemoryStorage::default();
         storage
-            .define_table(TableSchema {
+            .define_table(TableDefinition {
                 name: "documents".to_owned(),
                 primary_key: vec!["id".to_owned()],
                 columns: vec![

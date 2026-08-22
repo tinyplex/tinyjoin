@@ -774,7 +774,7 @@ describe('Client', () => {
     const client = await create({worker});
 
     await expect(
-      client.query('SELECT * FROM untyped', [], {rowMode: 'array'}),
+      client.query('SELECT * FROM missing_metadata', [], {rowMode: 'array'}),
     ).rejects.toMatchObject({code: 'ROW_METADATA_UNAVAILABLE'});
     await client.close();
   });

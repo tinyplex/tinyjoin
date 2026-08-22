@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::{
     ColumnType, EngineError, FIRST_DATA_PAGE_ID, IndexDefinition, MAX_PAGE_COUNT, PageId, Result,
-    Row, TableSchema,
+    Row, TableDefinition,
     btree::{MAX_BTREE_KEY_BYTES, MAX_BTREE_VALUE_BYTES, TreeId},
 };
 
@@ -24,7 +24,6 @@ const COMPONENT_INTEGER: u8 = 0x02;
 const COMPONENT_FLOAT: u8 = 0x03;
 const COMPONENT_TEXT: u8 = 0x04;
 const COMPONENT_JSON: u8 = 0x05;
-const COMPONENT_DYNAMIC_NUMBER: u8 = 0x06;
 
 const RECORD_VERSION: u8 = 1;
 const RECORD_FLAGS: u8 = 0;
@@ -47,7 +46,7 @@ pub(crate) struct CatalogHeader {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CatalogTableRecord {
-    pub schema: TableSchema,
+    pub schema: TableDefinition,
     pub tree_id: TreeId,
     pub root_page_id: Option<PageId>,
     pub row_count: u64,
@@ -74,7 +73,7 @@ pub(crate) enum CatalogKey {
 /// existing entry and its schema. Parsing the component framing avoids searching for the separator
 /// byte inside arbitrary text or JSON payloads.
 pub(crate) fn secondary_index_primary_key_for_definition<'a>(
-    schema: &TableSchema,
+    schema: &TableDefinition,
     definition: &IndexDefinition,
     entry: &'a [u8],
 ) -> Result<&'a [u8]> {
@@ -111,7 +110,7 @@ pub(crate) fn encode_canonical_json(value: &Value) -> Result<Vec<u8>> {
 }
 
 /// Encodes the complete primary-key tuple for a row or lookup object.
-pub(crate) fn encode_primary_key(schema: &TableSchema, row: &Row) -> Result<Vec<u8>> {
+pub(crate) fn encode_primary_key(schema: &TableDefinition, row: &Row) -> Result<Vec<u8>> {
     validate_schema_shape(schema)?;
     let key = encode_columns(schema, &schema.primary_key, row, NullPolicy::Reject)?
         .expect("rejecting nulls always returns a tuple");
@@ -124,7 +123,7 @@ pub(crate) fn encode_primary_key(schema: &TableSchema, row: &Row) -> Result<Vec<
 /// `None` follows PostgreSQL's default index semantics for a tuple containing SQL NULL: it is not
 /// represented in the index and cannot satisfy an equality lookup.
 pub(crate) fn encode_secondary_index_prefix(
-    schema: &TableSchema,
+    schema: &TableDefinition,
     definition: &IndexDefinition,
     row: &Row,
 ) -> Result<Option<Vec<u8>>> {
@@ -139,7 +138,7 @@ pub(crate) fn encode_secondary_index_prefix(
 
 /// Encodes one secondary-index entry as `indexed tuple || 0xff || primary-key tuple`.
 pub(crate) fn encode_secondary_index_entry_key(
-    schema: &TableSchema,
+    schema: &TableDefinition,
     definition: &IndexDefinition,
     row: &Row,
 ) -> Result<Option<Vec<u8>>> {
@@ -267,7 +266,7 @@ pub(crate) fn decode_catalog_table_record(key: &[u8], value: &[u8]) -> Result<Ca
         ));
     };
     let (tree_id, root_page_id, row_count, schema) =
-        decode_catalog_item_value::<TableSchema>(value, "table")?;
+        decode_catalog_item_value::<TableDefinition>(value, "table")?;
     if schema.name != name {
         return Err(storage_corrupt(format!(
             "Catalog table key `{name}` does not match schema name `{}`",
@@ -369,7 +368,7 @@ enum NullPolicy {
 }
 
 fn encode_columns(
-    schema: &TableSchema,
+    schema: &TableDefinition,
     columns: &[String],
     row: &Row,
     null_policy: NullPolicy,
@@ -403,25 +402,25 @@ fn encode_columns(
 
 fn encode_component(
     key: &mut Vec<u8>,
-    data_type: Option<ColumnType>,
+    data_type: ColumnType,
     value: &Value,
     table: &str,
     column: &str,
 ) -> Result<()> {
     match data_type {
-        Some(ColumnType::Boolean) => {
+        ColumnType::Boolean => {
             let value = value
                 .as_bool()
                 .ok_or_else(|| key_type_mismatch(table, column, "boolean"))?;
             append_component(key, COMPONENT_BOOLEAN, &[u8::from(value)])
         }
-        Some(ColumnType::Integer) => {
+        ColumnType::Integer => {
             let value =
                 safe_integer(value).ok_or_else(|| key_type_mismatch(table, column, "integer"))?;
             let sortable = (value as u64) ^ (1_u64 << 63);
             append_component(key, COMPONENT_INTEGER, &sortable.to_be_bytes())
         }
-        Some(ColumnType::Float) => {
+        ColumnType::Float => {
             let Value::Number(number) = value else {
                 return Err(key_type_mismatch(table, column, "float"));
             };
@@ -441,28 +440,13 @@ fn encode_component(
             };
             append_component(key, COMPONENT_FLOAT, &sortable.to_be_bytes())
         }
-        Some(ColumnType::Text) => {
+        ColumnType::Text => {
             let value = value
                 .as_str()
                 .ok_or_else(|| key_type_mismatch(table, column, "text"))?;
             append_component(key, COMPONENT_TEXT, value.as_bytes())
         }
-        Some(ColumnType::Json) => {
-            append_component(key, COMPONENT_JSON, &encode_canonical_json(value)?)
-        }
-        None => match value {
-            Value::Bool(value) => append_component(key, COMPONENT_BOOLEAN, &[u8::from(*value)]),
-            Value::Number(_) => append_component(
-                key,
-                COMPONENT_DYNAMIC_NUMBER,
-                &encode_canonical_json(value)?,
-            ),
-            Value::String(value) => append_component(key, COMPONENT_TEXT, value.as_bytes()),
-            Value::Array(_) | Value::Object(_) => {
-                append_component(key, COMPONENT_JSON, &encode_canonical_json(value)?)
-            }
-            Value::Null => unreachable!("null values are handled before component encoding"),
-        },
+        ColumnType::Json => append_component(key, COMPONENT_JSON, &encode_canonical_json(value)?),
     }
 }
 
@@ -483,12 +467,7 @@ fn component_end(key: &[u8], offset: usize) -> Result<usize> {
         .ok_or_else(|| storage_corrupt("A storage key component header is truncated"))?;
     if !matches!(
         key[offset],
-        COMPONENT_BOOLEAN
-            | COMPONENT_INTEGER
-            | COMPONENT_FLOAT
-            | COMPONENT_TEXT
-            | COMPONENT_JSON
-            | COMPONENT_DYNAMIC_NUMBER
+        COMPONENT_BOOLEAN | COMPONENT_INTEGER | COMPONENT_FLOAT | COMPONENT_TEXT | COMPONENT_JSON
     ) {
         return Err(storage_version(format!(
             "Storage key component tag {:#04x} is not supported",
@@ -503,7 +482,7 @@ fn component_end(key: &[u8], offset: usize) -> Result<usize> {
 }
 
 fn validate_tuple_prefix(
-    schema: &TableSchema,
+    schema: &TableDefinition,
     columns: &[String],
     key: &[u8],
     mut offset: usize,
@@ -517,28 +496,15 @@ fn validate_tuple_prefix(
     Ok(offset)
 }
 
-fn validate_encoded_component(
-    tag: u8,
-    payload: &[u8],
-    data_type: Option<ColumnType>,
-) -> Result<()> {
+fn validate_encoded_component(tag: u8, payload: &[u8], data_type: ColumnType) -> Result<()> {
     let valid = match data_type {
-        Some(ColumnType::Boolean) => tag == COMPONENT_BOOLEAN && matches!(payload, [0] | [1]),
-        Some(ColumnType::Integer) => tag == COMPONENT_INTEGER && payload.len() == 8,
-        Some(ColumnType::Float) => tag == COMPONENT_FLOAT && valid_encoded_float_component(payload),
-        Some(ColumnType::Text) => tag == COMPONENT_TEXT && std::str::from_utf8(payload).is_ok(),
-        Some(ColumnType::Json) => {
+        ColumnType::Boolean => tag == COMPONENT_BOOLEAN && matches!(payload, [0] | [1]),
+        ColumnType::Integer => tag == COMPONENT_INTEGER && payload.len() == 8,
+        ColumnType::Float => tag == COMPONENT_FLOAT && valid_encoded_float_component(payload),
+        ColumnType::Text => tag == COMPONENT_TEXT && std::str::from_utf8(payload).is_ok(),
+        ColumnType::Json => {
             tag == COMPONENT_JSON && decode_canonical_json(payload, "JSON key component").is_ok()
         }
-        None => match tag {
-            COMPONENT_BOOLEAN => matches!(payload, [0] | [1]),
-            COMPONENT_DYNAMIC_NUMBER => decode_canonical_json(payload, "number key component")
-                .is_ok_and(|value| value.is_number()),
-            COMPONENT_TEXT => std::str::from_utf8(payload).is_ok(),
-            COMPONENT_JSON => decode_canonical_json(payload, "JSON key component")
-                .is_ok_and(|value| value.is_array() || value.is_object()),
-            _ => false,
-        },
     };
     if valid {
         Ok(())
@@ -562,17 +528,13 @@ fn valid_encoded_float_component(payload: &[u8]) -> bool {
     value.is_finite() && (value != 0.0 || bits == 0)
 }
 
-fn schema_column_type(schema: &TableSchema, column: &str) -> Result<Option<ColumnType>> {
-    if schema.columns.is_empty() {
-        Ok(None)
-    } else {
-        schema
-            .columns
-            .iter()
-            .find(|definition| definition.name == column)
-            .map(|definition| Some(definition.data_type))
-            .ok_or_else(|| EngineError::column_not_found(column, &schema.name))
-    }
+fn schema_column_type(schema: &TableDefinition, column: &str) -> Result<ColumnType> {
+    schema
+        .columns
+        .iter()
+        .find(|definition| definition.name == column)
+        .map(|definition| definition.data_type)
+        .ok_or_else(|| EngineError::column_not_found(column, &schema.name))
 }
 
 fn safe_integer(value: &Value) -> Option<i64> {
@@ -588,7 +550,7 @@ fn safe_integer(value: &Value) -> Option<i64> {
         })
 }
 
-fn validate_index_identity(schema: &TableSchema, definition: &IndexDefinition) -> Result<()> {
+fn validate_index_identity(schema: &TableDefinition, definition: &IndexDefinition) -> Result<()> {
     validate_schema_shape(schema)?;
     if definition.table != schema.name {
         return Err(codec_argument(format!(
@@ -597,12 +559,6 @@ fn validate_index_identity(schema: &TableSchema, definition: &IndexDefinition) -
         )));
     }
     validate_index_shape(definition)?;
-    if schema.columns.is_empty() {
-        return Err(codec_argument(format!(
-            "Index `{}` requires a typed table catalog",
-            definition.name
-        )));
-    }
     for name in &definition.columns {
         let column = schema
             .columns
@@ -619,8 +575,14 @@ fn validate_index_identity(schema: &TableSchema, definition: &IndexDefinition) -
     Ok(())
 }
 
-fn validate_schema_shape(schema: &TableSchema) -> Result<()> {
+fn validate_schema_shape(schema: &TableDefinition) -> Result<()> {
     validate_catalog_name(&schema.name)?;
+    if schema.columns.is_empty() {
+        return Err(codec_argument(format!(
+            "Table `{}` must declare at least one column",
+            schema.name
+        )));
+    }
     if schema.primary_key.is_empty() {
         return Err(codec_argument(format!(
             "Table `{}` must declare a primary key",
@@ -671,16 +633,14 @@ fn validate_schema_shape(schema: &TableSchema) -> Result<()> {
             validate_catalog_default(schema, column, default)?;
         }
     }
-    if !schema.columns.is_empty()
-        && schema.primary_key.iter().any(|primary_key| {
-            !schema
-                .columns
-                .iter()
-                .any(|column| column.name == *primary_key)
-        })
-    {
+    if schema.primary_key.iter().any(|primary_key| {
+        !schema
+            .columns
+            .iter()
+            .any(|column| column.name == *primary_key)
+    }) {
         return Err(codec_argument(format!(
-            "Table `{}` has a primary-key column outside its typed catalog",
+            "Table `{}` has a primary-key column outside its catalog",
             schema.name
         )));
     }
@@ -688,7 +648,7 @@ fn validate_schema_shape(schema: &TableSchema) -> Result<()> {
 }
 
 fn validate_catalog_default(
-    schema: &TableSchema,
+    schema: &TableDefinition,
     column: &crate::ColumnDefinition,
     value: &Value,
 ) -> Result<()> {
@@ -1069,8 +1029,8 @@ mod tests {
         value.as_object().unwrap().clone()
     }
 
-    fn typed_schema(primary_key: Vec<&str>, columns: Vec<(&str, ColumnType)>) -> TableSchema {
-        TableSchema {
+    fn typed_schema(primary_key: Vec<&str>, columns: Vec<(&str, ColumnType)>) -> TableDefinition {
+        TableDefinition {
             name: "items".to_owned(),
             primary_key: primary_key.into_iter().map(str::to_owned).collect(),
             columns: columns
@@ -1108,7 +1068,7 @@ mod tests {
         }
     }
 
-    fn table_value_with_schema(schema: &TableSchema) -> Vec<u8> {
+    fn table_value_with_schema(schema: &TableDefinition) -> Vec<u8> {
         let (_, mut value) = encode_catalog_table_record(&table_record()).unwrap();
         let body = encode_canonical_json(&serde_json::to_value(schema).unwrap()).unwrap();
         value.truncate(CATALOG_ITEM_HEADER_BYTES);
@@ -1194,7 +1154,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_float_keys_follow_sql_equality_while_untyped_keys_keep_json_identity() {
+    fn float_keys_follow_sql_equality() {
         let float_schema = typed_schema(vec!["id"], vec![("id", ColumnType::Float)]);
         let integer = encode_primary_key(&float_schema, &row(json!({"id": 1}))).unwrap();
         let mut float_row = Row::new();
@@ -1219,16 +1179,6 @@ mod tests {
         let negative = encode_primary_key(&float_schema, &row(json!({"id": -2.0}))).unwrap();
         assert!(negative < positive_zero);
         assert!(positive_zero < float);
-
-        let untyped = TableSchema {
-            name: "untyped".to_owned(),
-            primary_key: vec!["id".to_owned()],
-            columns: vec![],
-        };
-        assert_ne!(
-            encode_primary_key(&untyped, &row(json!({"id": 1}))).unwrap(),
-            encode_primary_key(&untyped, &float_row).unwrap()
-        );
     }
 
     #[test]
@@ -1549,6 +1499,13 @@ mod tests {
 
     #[test]
     fn catalog_records_reject_invalid_schema_and_index_shapes() {
+        let mut table = table_record();
+        table.schema.columns.clear();
+        assert_eq!(
+            encode_catalog_table_record(&table).unwrap_err().code,
+            "INVALID_PAGED_ARGUMENT"
+        );
+
         let mut table = table_record();
         table.schema.primary_key.push("id".to_owned());
         assert_eq!(
