@@ -36,6 +36,18 @@ export async function checkDocs(
     errors.push('The generated CNAME must contain tinygres.org');
   }
 
+  const homepage = await readFile(resolve(docs, 'index.html'), 'utf8');
+  const stylesheet = await readFile(resolve(docs, 'css/index.css'), 'utf8');
+  if (!homepage.includes('<nav id="actions" aria-label="Get started">')) {
+    errors.push('The homepage must contain its explicitly scoped action links');
+  }
+  if (/article#home\s*>\s*p\s*>\s*a/.test(stylesheet)) {
+    errors.push('Homepage button styles must not target ordinary paragraphs');
+  }
+  if (/article#home\s*>\s*hr\s*~/.test(stylesheet)) {
+    errors.push('Homepage content after a divider must retain the paired grid');
+  }
+
   if (checkPackageCopies) {
     await checkMarkdownCopies(errors);
   }

@@ -19,8 +19,13 @@ body > main > article#home {
   padding: 2rem;
   z-index: 0;
 
+  p {
+    margin: 1rem 0 0;
+  }
+
   > .home-wordmark {
     color: @text2Color;
+    display: block;
     font-size: 3rem;
     font-weight: 800;
     margin: 0 auto;
@@ -34,11 +39,6 @@ body > main > article#home {
     span,
     em {
       position: relative;
-    }
-
-    em {
-      color: @accentColor;
-      font-style: normal;
     }
   }
 
@@ -54,38 +54,38 @@ body > main > article#home {
       margin: 0;
       text-align: center;
 
-      em {
-        color: @accentColor;
-        font-style: normal;
+      em,
+      span {
         white-space: nowrap;
       }
     }
 
     p {
-      margin: 1rem 0 0;
       text-align: center;
     }
   }
 
-  > p {
-    margin: 0;
+  > nav#actions {
+    display: grid;
+    gap: 1rem;
+    margin: 0 auto;
+    max-width: 16rem;
+    width: 100%;
 
     > a {
-      display: block;
-      font-size: 1.4rem;
-      color: @text2Color;
-      font-weight: 800;
       background: @back2Color;
       border: 1px solid @borderColor;
+      border-radius: 0.25rem;
+      color: @text2Color;
+      display: block;
+      font-size: 1.4rem;
+      font-weight: 800;
+      overflow: hidden;
       padding: 1rem;
       text-align: center;
-      border-radius: 0.25rem;
-      white-space: nowrap;
-      width: 16rem;
-      margin: -1rem auto;
       text-decoration: none;
-      overflow: hidden;
       text-overflow: ellipsis;
+      white-space: nowrap;
 
       &:hover {
         border-color: @accentColor;
@@ -98,21 +98,35 @@ body > main > article#home {
     }
   }
 
+  h1,
   h2,
   pre,
   .table {
+    margin-top: 0;
     height: fit-content;
   }
 
+  h2 {
+    font-size: 1.8rem;
+  }
+
+  em,
+  em a {
+    color: @accentColor;
+    font-style: normal;
+  }
+
   pre {
+    font-size: 0.94rem;
     box-shadow: @shadow;
   }
 
-  > hr,
-  > hr ~ * {
-    width: min(100%, 50rem);
-    margin-right: auto;
-    margin-left: auto;
+  img {
+    margin: 0 0 2rem;
+  }
+
+  .table {
+    box-shadow: @shadow;
   }
 }
 
@@ -128,6 +142,30 @@ body > main > article#home {
       font-size: 3.2rem;
       grid-column-end: span 2;
       grid-row: span 2;
+      max-width: 16rem;
+    }
+
+    > section,
+    > pre,
+    > img,
+    > embed,
+    > .table {
+      width: 100%;
+      grid-column-end: span 3;
+    }
+
+    > pre,
+    > img,
+    > .table {
+      margin: 0.3rem 0 0;
+    }
+
+    > section:nth-of-type(2n + 3) {
+      grid-column-start: 4;
+    }
+
+    > section:nth-of-type(2n + 2) {
+      text-align: right;
     }
 
     > section#hero {
@@ -141,17 +179,22 @@ body > main > article#home {
       }
     }
 
-    > p {
-      grid-column-end: span 2;
-
-      > a {
-        position: relative;
-        width: unset;
-      }
+    > nav#actions {
+      align-self: start;
+      gap: 1rem;
+      grid-column-end: span 4;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      margin: 0;
+      max-width: unset;
     }
 
-    > hr,
-    > hr ~ * {
+    > ul {
+      grid-column: 1 / 7;
+      column-count: 2;
+      column-gap: 6rem;
+    }
+
+    > hr {
       grid-column: 1 / 7;
     }
   }
