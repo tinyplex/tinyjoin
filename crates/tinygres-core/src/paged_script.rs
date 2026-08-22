@@ -852,7 +852,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
 /// count/framing. Consequently this also bounds the bridge's 16 MiB byte cap and
 /// one-million-node cap early enough to reject an oversized result before the page generation
 /// commits; the bridge materializes the already-bounded JavaScript result afterward.
-pub fn retain_result(result_bytes: &mut usize, result: &ExecuteResult) -> Result<()> {
+pub(crate) fn retain_result(result_bytes: &mut usize, result: &ExecuteResult) -> Result<()> {
     let mut bytes = result
         .command
         .len()

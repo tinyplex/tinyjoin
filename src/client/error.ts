@@ -13,17 +13,4 @@ export class ClientError extends Error {
       error.details === undefined ? undefined : structuredClone(error.details);
     this.retryable = error.retryable ?? false;
   }
-
-  static fromUnknown(
-    error: unknown,
-    code = 'UNKNOWN_ERROR',
-  ): ClientError {
-    if (error instanceof ClientError) {
-      return error;
-    }
-    if (error instanceof Error) {
-      return new ClientError({code, message: error.message});
-    }
-    return new ClientError({code, message: String(error)});
-  }
 }

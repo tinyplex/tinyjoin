@@ -1,3 +1,5 @@
+#![deny(unreachable_pub)]
+
 mod aggregate;
 mod btree;
 mod cache;
@@ -22,33 +24,32 @@ mod sql_script;
 mod statement;
 mod storage;
 
-pub use btree::{
-    Btree, BtreeCursor, MAX_BTREE_INLINE_ENTRY_BYTES, MAX_BTREE_INLINE_VALUE_BYTES,
-    MAX_BTREE_KEY_BYTES, MAX_BTREE_VALUE_BYTES, TreeId,
-};
-pub use cache::{
-    CandidateId, DEFAULT_PAGE_CACHE_BYTES, DEFAULT_PAGE_CACHE_PAGES, MAX_PAGE_CACHE_BYTES,
-    MAX_PAGE_CACHE_PAGES, PageCache,
-};
-pub use device::{MemoryPageDevice, PageDevice};
+pub(crate) use btree::{Btree, MAX_BTREE_KEY_BYTES, MAX_BTREE_VALUE_BYTES, TreeId};
+#[cfg(test)]
+pub(crate) use cache::MAX_PAGE_CACHE_BYTES;
+pub(crate) use cache::{CandidateId, DEFAULT_PAGE_CACHE_BYTES, PageCache};
+#[cfg(test)]
+pub(crate) use device::MemoryPageDevice;
+pub use device::PageDevice;
 #[cfg(test)]
 pub(crate) use engine::Engine;
 pub use error::{EngineError, Result};
-pub use model::{ApplyOutcome, ExecuteResult, QueryResult, ResultField, Row};
+pub use model::{ApplyOutcome, ExecuteResult, ResultField, Row};
 pub(crate) use model::{
     ColumnDefinition, ColumnType, ComparisonOperator, IndexDefinition, NullOrder, OrderBy,
-    OrderDirection, Predicate, RowChange, SelectPlan, TableDefinition,
+    OrderDirection, Predicate, QueryResult, RowChange, SelectPlan, TableDefinition,
 };
-pub use page::{
-    ALLOCATION_BITMAP_BYTES, AllocationBitmap, BITMAP_CHUNK_COUNT, BITMAP_PAGE_COUNT, BitmapSlot,
-    FIRST_DATA_PAGE_ID, MAX_DATABASE_BYTES, MAX_PAGE_COUNT, MAX_PAGE_PAYLOAD_SIZE,
-    MetadataPublicationStep, PAGE_HEADER_SIZE, PAGE_SIZE, Page, PageId, PageType, PendingMetadata,
-    RawMetadataSlot, RecoveredMetadata, SUPERBLOCK_PAGE_COUNT, Superblock, SuperblockSlot,
-    build_next_metadata, recover_metadata,
+#[cfg(test)]
+pub(crate) use page::BitmapSlot;
+pub(crate) use page::{
+    AllocationBitmap, FIRST_DATA_PAGE_ID, MAX_PAGE_PAYLOAD_SIZE, Page, PageType, RawMetadataSlot,
+    RecoveredMetadata, SUPERBLOCK_PAGE_COUNT, Superblock, SuperblockSlot, build_next_metadata,
+    recover_metadata,
 };
+pub use page::{MAX_PAGE_COUNT, PAGE_SIZE, PageId};
 pub use paged_engine::PagedEngine;
 pub(crate) use paged_storage::PagedStorage;
-pub use pager::{Pager, PagerWriteTransaction};
+pub(crate) use pager::{Pager, PagerWriteTransaction};
 pub use prepared_statement::PreparedStatementId;
 #[cfg(test)]
 pub(crate) use storage::InMemoryStorage;

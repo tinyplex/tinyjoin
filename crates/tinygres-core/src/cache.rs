@@ -23,12 +23,12 @@ macro_rules! storage_diagnostic {
     };
 }
 
-pub type CandidateId = u64;
+pub(crate) type CandidateId = u64;
 
-pub const DEFAULT_PAGE_CACHE_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_PAGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
-pub const DEFAULT_PAGE_CACHE_PAGES: usize = DEFAULT_PAGE_CACHE_BYTES / PAGE_SIZE;
-pub const MAX_PAGE_CACHE_PAGES: usize = MAX_PAGE_CACHE_BYTES / PAGE_SIZE;
+pub(crate) const DEFAULT_PAGE_CACHE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_PAGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
+#[cfg(test)]
+pub(crate) const DEFAULT_PAGE_CACHE_PAGES: usize = DEFAULT_PAGE_CACHE_BYTES / PAGE_SIZE;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum Owner {
@@ -52,7 +52,7 @@ struct Reservation {
 }
 
 #[derive(Debug)]
-pub struct PageCache<D: PageDevice> {
+pub(crate) struct PageCache<D: PageDevice> {
     device: D,
     entries: Vec<CacheEntry>,
     lookup: HashMap<(Owner, PageId), usize>,
@@ -66,11 +66,12 @@ pub struct PageCache<D: PageDevice> {
 }
 
 impl<D: PageDevice> PageCache<D> {
-    pub fn new(device: D) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn new(device: D) -> Result<Self> {
         Self::with_capacity(device, DEFAULT_PAGE_CACHE_BYTES)
     }
 
-    pub fn with_capacity(device: D, capacity_bytes: usize) -> Result<Self> {
+    pub(crate) fn with_capacity(device: D, capacity_bytes: usize) -> Result<Self> {
         if !(PAGE_SIZE..=MAX_PAGE_CACHE_BYTES).contains(&capacity_bytes)
             || !capacity_bytes.is_multiple_of(PAGE_SIZE)
         {
@@ -90,30 +91,34 @@ impl<D: PageDevice> PageCache<D> {
         })
     }
 
-    pub fn capacity_pages(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn capacity_pages(&self) -> usize {
         self.capacity
     }
 
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
-    pub fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    pub fn device(&self) -> &D {
+    #[cfg(test)]
+    pub(crate) fn device(&self) -> &D {
         &self.device
     }
 
-    pub fn read_page(&mut self, id: PageId) -> Result<&[u8; PAGE_SIZE]> {
+    pub(crate) fn read_page(&mut self, id: PageId) -> Result<&[u8; PAGE_SIZE]> {
         self.ensure_not_reserved(id)?;
         self.read_owned(Owner::Committed, id)
     }
 
     /// Reads a page ID allocated exclusively to this copy-on-write candidate.
     /// Shared committed page IDs must be read with [`Self::read_page`].
-    pub fn read_candidate_page(
+    pub(crate) fn read_candidate_page(
         &mut self,
         candidate: CandidateId,
         id: PageId,
@@ -138,7 +143,7 @@ impl<D: PageDevice> PageCache<D> {
     /// not make the physical page available to another candidate. The active allocation bitmap is
     /// consulted on every reservation so a candidate can never overwrite a page reachable from
     /// the committed superblock.
-    pub fn reserve_candidate_page(
+    pub(crate) fn reserve_candidate_page(
         &mut self,
         candidate: CandidateId,
         id: PageId,
@@ -188,7 +193,7 @@ impl<D: PageDevice> PageCache<D> {
         }
     }
 
-    pub fn write_candidate_page(
+    pub(crate) fn write_candidate_page(
         &mut self,
         candidate: CandidateId,
         id: PageId,
@@ -206,7 +211,11 @@ impl<D: PageDevice> PageCache<D> {
     /// Releases one page reserved by a candidate after its owner has proved that no candidate
     /// page references it. A previously-evicted write may remain as an unreachable physical
     /// orphan, but it is removed from the candidate's logical allocation set by the pager.
-    pub fn release_candidate_page(&mut self, candidate: CandidateId, id: PageId) -> Result<()> {
+    pub(crate) fn release_candidate_page(
+        &mut self,
+        candidate: CandidateId,
+        id: PageId,
+    ) -> Result<()> {
         self.ensure_reserved_by(candidate, id)?;
         self.reservations.remove(&id);
         self.entries
@@ -222,11 +231,11 @@ impl<D: PageDevice> PageCache<D> {
         Ok(())
     }
 
-    pub fn flush_candidate(&mut self, candidate: CandidateId) -> Result<()> {
+    pub(crate) fn flush_candidate(&mut self, candidate: CandidateId) -> Result<()> {
         self.flush_owner(Owner::Candidate(candidate))
     }
 
-    pub fn install_candidate(
+    pub(crate) fn install_candidate(
         &mut self,
         candidate: CandidateId,
         next_bitmap: &AllocationBitmap,
@@ -289,7 +298,7 @@ impl<D: PageDevice> PageCache<D> {
         Ok(())
     }
 
-    pub fn invalidate_candidate(&mut self, candidate: CandidateId) {
+    pub(crate) fn invalidate_candidate(&mut self, candidate: CandidateId) {
         self.unflushed_owners.remove(&Owner::Candidate(candidate));
         self.entries
             .retain(|entry| entry.owner != Owner::Candidate(candidate));
@@ -298,7 +307,8 @@ impl<D: PageDevice> PageCache<D> {
         self.rebuild_lookup();
     }
 
-    pub fn candidate_page_count(&self, candidate: CandidateId) -> usize {
+    #[cfg(test)]
+    pub(crate) fn candidate_page_count(&self, candidate: CandidateId) -> usize {
         self.reservations
             .iter()
             .filter(|(_, reservation)| reservation.candidate == candidate)

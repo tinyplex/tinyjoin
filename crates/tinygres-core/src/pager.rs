@@ -37,7 +37,7 @@ macro_rules! storage_diagnostic {
 /// writing the inactive allocation bitmap and superblock. A failure after the superblock write is
 /// attempted poisons the in-memory pager: callers must reopen the same device to discover whether
 /// the old or new root became durable.
-pub struct Pager<D: PageDevice> {
+pub(crate) struct Pager<D: PageDevice> {
     device: SharedPageDevice<D>,
     cache: PageCache<SharedPageDevice<D>>,
     active: RecoveredMetadata,
@@ -48,11 +48,11 @@ pub struct Pager<D: PageDevice> {
 }
 
 impl<D: PageDevice> Pager<D> {
-    pub fn open_or_create(device: D) -> Result<Self> {
+    pub(crate) fn open_or_create(device: D) -> Result<Self> {
         Self::with_cache_capacity(device, DEFAULT_PAGE_CACHE_BYTES)
     }
 
-    pub fn with_cache_capacity(device: D, cache_capacity_bytes: usize) -> Result<Self> {
+    pub(crate) fn with_cache_capacity(device: D, cache_capacity_bytes: usize) -> Result<Self> {
         // Constructing the cache first validates the requested bound before a new device is
         // mutated. The shared wrapper gives the pager direct metadata I/O while keeping all data
         // page I/O inside the cache.
@@ -100,31 +100,32 @@ impl<D: PageDevice> Pager<D> {
         })
     }
 
-    pub fn database_revision(&self) -> u64 {
+    pub(crate) fn database_revision(&self) -> u64 {
         self.active.superblock.database_revision
     }
 
-    pub fn generation(&self) -> u64 {
+    pub(crate) fn generation(&self) -> u64 {
         self.active.superblock.generation
     }
 
-    pub fn catalog_root_page_id(&self) -> Option<PageId> {
+    pub(crate) fn catalog_root_page_id(&self) -> Option<PageId> {
         self.active.superblock.catalog_root_page_id
     }
 
-    pub fn physical_page_count(&self) -> PageId {
+    #[cfg(test)]
+    pub(crate) fn physical_page_count(&self) -> PageId {
         self.device.page_count()
     }
 
-    pub fn is_recovery_required(&self) -> bool {
+    pub(crate) fn is_recovery_required(&self) -> bool {
         self.recovery_required
     }
 
-    pub fn active_metadata(&self) -> &RecoveredMetadata {
+    pub(crate) fn active_metadata(&self) -> &RecoveredMetadata {
         &self.active
     }
 
-    pub fn read_page(&mut self, id: PageId) -> Result<Page> {
+    pub(crate) fn read_page(&mut self, id: PageId) -> Result<Page> {
         self.ensure_usable()?;
         ensure_data_page(id)?;
         if !self.active.allocation_bitmap.is_allocated(id)? {
@@ -134,7 +135,7 @@ impl<D: PageDevice> Pager<D> {
         decode_expected_page(id, bytes)
     }
 
-    pub fn begin_write(&mut self) -> Result<PagerWriteTransaction<'_, D>> {
+    pub(crate) fn begin_write(&mut self) -> Result<PagerWriteTransaction<'_, D>> {
         self.ensure_usable()?;
         let candidate = self.next_candidate_id;
         self.next_candidate_id = self.next_candidate_id.checked_add(1).ok_or_else(|| {
@@ -158,7 +159,7 @@ impl<D: PageDevice> Pager<D> {
     ///
     /// This does not add a durability barrier. It is chiefly useful for closing a pager before
     /// transferring its device to another owner or reopening it after a simulated process exit.
-    pub fn into_device(self) -> D {
+    pub(crate) fn into_device(self) -> D {
         let Self {
             device,
             cache,
@@ -188,7 +189,7 @@ impl<D: PageDevice> Pager<D> {
 /// Dropping an uncommitted transaction abandons its cache reservations. Physical pages already
 /// written by eviction or dense-file extension remain harmless orphans because the active
 /// allocation bitmap cannot reach them.
-pub struct PagerWriteTransaction<'a, D: PageDevice> {
+pub(crate) struct PagerWriteTransaction<'a, D: PageDevice> {
     pager: &'a mut Pager<D>,
     candidate: CandidateId,
     next_bitmap: AllocationBitmap,
@@ -201,12 +202,12 @@ pub struct PagerWriteTransaction<'a, D: PageDevice> {
 }
 
 impl<D: PageDevice> PagerWriteTransaction<'_, D> {
-    pub fn candidate_id(&self) -> CandidateId {
+    pub(crate) fn candidate_id(&self) -> CandidateId {
         self.candidate
     }
 
     /// Returns the generation which this candidate will publish.
-    pub fn generation(&self) -> Result<u64> {
+    pub(crate) fn generation(&self) -> Result<u64> {
         self.ensure_open()?;
         self.pager
             .active
@@ -217,7 +218,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
     }
 
     /// Reports whether `id` was allocated by this write transaction.
-    pub fn owns_page(&self, id: PageId) -> bool {
+    pub(crate) fn owns_page(&self, id: PageId) -> bool {
         !self.finished && self.new_pages.contains(&id)
     }
 
@@ -251,7 +252,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
     /// they remain reachable from the currently active root. When allocation extends the physical
     /// file, a zero-filled placeholder is appended immediately so later cache eviction can write
     /// candidate pages in any order without violating a dense PageDevice contract.
-    pub fn allocate_page(&mut self) -> Result<PageId> {
+    pub(crate) fn allocate_page(&mut self) -> Result<PageId> {
         self.ensure_open()?;
         let start = self.next_allocation_page_id;
         let mut selected = None;
@@ -296,7 +297,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
         Ok(id)
     }
 
-    pub fn write_new_page(&mut self, page: &Page) -> Result<()> {
+    pub(crate) fn write_new_page(&mut self, page: &Page) -> Result<()> {
         self.ensure_open()?;
         if !self.new_pages.contains(&page.id) {
             return Err(pager_error(storage_diagnostic!(
@@ -312,7 +313,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
         Ok(())
     }
 
-    pub fn read_page(&mut self, id: PageId) -> Result<Page> {
+    pub(crate) fn read_page(&mut self, id: PageId) -> Result<Page> {
         self.ensure_open()?;
         ensure_data_page(id)?;
         if !self.next_bitmap.is_allocated(id)? {
@@ -333,7 +334,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
     /// Removes a page shared from the active generation from the candidate root.
     ///
     /// Newly allocated pages must instead be released with [`Self::release_new_page`].
-    pub fn free_shared_page(&mut self, id: PageId) -> Result<()> {
+    pub(crate) fn free_shared_page(&mut self, id: PageId) -> Result<()> {
         self.ensure_open()?;
         ensure_data_page(id)?;
         if self.new_pages.contains(&id) {
@@ -351,7 +352,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
     ///
     /// The caller must remove every candidate reference to the page first. Any bytes already
     /// written through cache eviction remain an unreachable physical orphan and are safe to reuse.
-    pub fn release_new_page(&mut self, id: PageId) -> Result<()> {
+    pub(crate) fn release_new_page(&mut self, id: PageId) -> Result<()> {
         self.ensure_open()?;
         ensure_data_page(id)?;
         if !self.new_pages.contains(&id) {
@@ -369,7 +370,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
         Ok(())
     }
 
-    pub fn abort(mut self) {
+    pub(crate) fn abort(mut self) {
         self.pager.cache.invalidate_candidate(self.candidate);
         self.finished = true;
     }
@@ -380,7 +381,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
     /// 2. write the inactive bitmap chunks and flush them;
     /// 3. write the inactive superblock and flush it;
     /// 4. install the candidate cache view and swap the in-memory active root.
-    pub fn commit(
+    pub(crate) fn commit(
         mut self,
         database_revision: u64,
         catalog_root_page_id: Option<PageId>,

@@ -38,8 +38,7 @@ impl ColumnType {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResultField {
     pub name: String,
     pub data_type_id: u32,
@@ -159,23 +158,20 @@ pub(crate) struct SelectPlan {
     pub(crate) offset: usize,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApplyOutcome {
     pub revision: u64,
     pub tables: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QueryResult {
-    pub revision: u64,
-    pub fields: Vec<ResultField>,
-    pub rows: Vec<Row>,
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct QueryResult {
+    pub(crate) revision: u64,
+    pub(crate) fields: Vec<ResultField>,
+    pub(crate) rows: Vec<Row>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecuteResult {
     pub command: String,
     pub revision: u64,

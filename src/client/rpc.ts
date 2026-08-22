@@ -9,30 +9,8 @@ import {
   type WorkerEvent,
   type WorkerRequest,
 } from '../protocol.js';
+import type {WorkerLike} from './client.js';
 import {ClientError} from './error.js';
-
-export interface WorkerLike {
-  postMessage(message: unknown): void;
-  addEventListener(
-    type: 'message',
-    listener: (event: MessageEvent<unknown>) => void,
-  ): void;
-  addEventListener(
-    type: 'messageerror',
-    listener: (event: MessageEvent<unknown>) => void,
-  ): void;
-  addEventListener(type: 'error', listener: (event: ErrorEvent) => void): void;
-  removeEventListener(
-    type: 'message',
-    listener: (event: MessageEvent<unknown>) => void,
-  ): void;
-  removeEventListener(
-    type: 'messageerror',
-    listener: (event: MessageEvent<unknown>) => void,
-  ): void;
-  removeEventListener(type: 'error', listener: (event: ErrorEvent) => void): void;
-  terminate?: () => void;
-}
 
 export type ResultValidation = 'full' | 'header';
 
@@ -85,14 +63,13 @@ export class WorkerRpc {
         this.#worker.postMessage(request);
       } catch (error) {
         this.#pending.delete(id);
-        reject(ClientError.fromUnknown(error, 'WORKER_POST_FAILED'));
+        reject(clientErrorFromUnknown(error, 'WORKER_POST_FAILED'));
       }
     }) as Promise<RpcMethods[Method]['response']>;
   }
 
-  onEvent(listener: (event: WorkerEvent) => void): () => void {
+  onEvent(listener: (event: WorkerEvent) => void): void {
     this.#eventListeners.add(listener);
-    return () => this.#eventListeners.delete(listener);
   }
 
   dispose(error?: ClientError): void {
@@ -178,4 +155,14 @@ export class WorkerRpc {
       }),
     );
   };
+}
+
+function clientErrorFromUnknown(error: unknown, code: string): ClientError {
+  if (error instanceof ClientError) {
+    return error;
+  }
+  return new ClientError({
+    code,
+    message: error instanceof Error ? error.message : String(error),
+  });
 }

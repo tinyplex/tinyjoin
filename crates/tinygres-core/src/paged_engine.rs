@@ -31,7 +31,8 @@ impl<D: PageDevice> PagedEngine<D> {
         })
     }
 
-    pub fn query_sql(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
+    #[cfg(test)]
+    pub(crate) fn query_sql(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
         match crate::statement::parse(sql, params)? {
             Statement::Select(plan) => crate::query::execute(&self.read_view(), &plan),
             Statement::Aggregate(plan) => crate::aggregate::execute(&self.read_view(), &plan),

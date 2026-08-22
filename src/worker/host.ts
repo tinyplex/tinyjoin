@@ -100,7 +100,7 @@ export function startWorker(
       }
 
       engine = await engineForRequest(request);
-      const result = await handleRequest(request, engine, emitInvalidation, {
+      const result = handleRequest(request, engine, emitInvalidation, {
         get activeId() {
           return activeTransactionId;
         },
@@ -233,12 +233,12 @@ export function startWorker(
   return {close};
 }
 
-async function handleRequest(
-  request: WorkerRequest,
+function handleRequest(
+  request: Exclude<WorkerRequest, {method: 'close'}>,
   engine: WorkerEngine,
   emitInvalidation: (outcome: ApplyOutcome) => void,
   transaction: HostTransactionState,
-): Promise<unknown> {
+): unknown {
   switch (request.method) {
     case 'init':
       assertNoTransaction(transaction.activeId);
@@ -327,8 +327,6 @@ async function handleRequest(
       transaction.clear(request.params.transactionId);
       return undefined;
     }
-    case 'close':
-      throw new Error('Close requests are handled before engine dispatch');
   }
 }
 

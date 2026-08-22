@@ -217,39 +217,13 @@ export function isRpcResultHeader<Method extends RpcMethod>(
   value: unknown,
 ): value is RpcMethods[Method]['response'] {
   switch (method) {
-    case 'init':
-      return (
-        isRecord(value) &&
-        hasExactKeys(value, ['revision']) &&
-        isSafeNonNegativeInteger(value.revision)
-      );
-    case 'closePrepared':
-    case 'rollbackTransaction':
-    case 'close':
-      return value === undefined;
-    case 'commitTransaction':
-      return isApplyOutcome(value);
     case 'executeSql':
     case 'executePrepared':
       return isSqlResultHeader(value);
-    case 'prepareSql':
-      return (
-        isRecord(value) &&
-        hasExactKeys(value, ['statementId']) &&
-        isPreparedStatementId(value.statementId)
-      );
     case 'execSql':
       return Array.isArray(value) && value.every(isSqlResultHeader);
-    case 'beginTransaction':
-      return (
-        isRecord(value) &&
-        hasExactKeys(value, ['transactionId']) &&
-        isTransactionId(value.transactionId)
-      );
-    default: {
-      const exhaustive: never = method;
-      return exhaustive;
-    }
+    default:
+      return isRpcResult(method, value);
   }
 }
 

@@ -26,12 +26,12 @@ macro_rules! storage_diagnostic {
     };
 }
 
-pub type TreeId = u64;
+pub(crate) type TreeId = u64;
 
-pub const MAX_BTREE_KEY_BYTES: usize = 1_024;
-pub const MAX_BTREE_INLINE_VALUE_BYTES: usize = 1_024;
-pub const MAX_BTREE_INLINE_ENTRY_BYTES: usize = 1_536;
-pub const MAX_BTREE_VALUE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_BTREE_KEY_BYTES: usize = 1_024;
+pub(crate) const MAX_BTREE_INLINE_VALUE_BYTES: usize = 1_024;
+pub(crate) const MAX_BTREE_INLINE_ENTRY_BYTES: usize = 1_536;
+pub(crate) const MAX_BTREE_VALUE_BYTES: usize = 1024 * 1024;
 
 const NODE_MAGIC: &[u8; 4] = b"TGBT";
 const NODE_FORMAT_VERSION: u16 = 1;
@@ -58,11 +58,11 @@ const MAX_OVERFLOW_PAGE_COUNT: usize = MAX_BTREE_VALUE_BYTES.div_ceil(MAX_OVERFL
 /// Keys and values are opaque bytes. SQL-aware sortable encodings belong to the storage layer
 /// above this primitive. Values up to one MiB are stored inline or in validated overflow chains.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Btree;
+pub(crate) struct Btree;
 
 impl Btree {
     /// Creates an empty leaf and returns its candidate root page ID.
-    pub fn create<D: PageDevice>(
+    pub(crate) fn create<D: PageDevice>(
         transaction: &mut PagerWriteTransaction<'_, D>,
         tree_id: TreeId,
     ) -> Result<PageId> {
@@ -85,7 +85,7 @@ impl Btree {
     }
 
     /// Looks up one exact key in a committed root.
-    pub fn get<D: PageDevice>(
+    pub(crate) fn get<D: PageDevice>(
         pager: &mut Pager<D>,
         root_page_id: PageId,
         tree_id: TreeId,
@@ -141,7 +141,7 @@ impl Btree {
     /// On error, the pager transaction is marked failed and must be aborted. Allocation or device
     /// failures may have left unreachable candidate pages which must not be published as part of
     /// another operation.
-    pub fn upsert<D: PageDevice>(
+    pub(crate) fn upsert<D: PageDevice>(
         transaction: &mut PagerWriteTransaction<'_, D>,
         root_page_id: PageId,
         tree_id: TreeId,
@@ -207,7 +207,7 @@ impl Btree {
     /// descendants are pruned; an internal page may retain one child and no separator, and an
     /// empty tree is represented by `None`. Separator keys are advanced when the first key in a
     /// right subtree changes. On error, the pager transaction is marked failed and must be aborted.
-    pub fn delete<D: PageDevice>(
+    pub(crate) fn delete<D: PageDevice>(
         transaction: &mut PagerWriteTransaction<'_, D>,
         root_page_id: PageId,
         tree_id: TreeId,
@@ -241,7 +241,7 @@ impl Btree {
     }
 
     /// Opens a detached cursor at the first key in a committed tree.
-    pub fn cursor<D: PageDevice>(
+    pub(crate) fn cursor<D: PageDevice>(
         pager: &mut Pager<D>,
         root_page_id: PageId,
         tree_id: TreeId,
@@ -254,7 +254,7 @@ impl Btree {
     /// The returned cursor owns bounded page IDs, traversal indexes, and one decoded leaf. It does
     /// not borrow the pager, so callers can release interior-mutability guards before invoking
     /// application visitors.
-    pub fn cursor_from<D: PageDevice>(
+    pub(crate) fn cursor_from<D: PageDevice>(
         pager: &mut Pager<D>,
         root_page_id: PageId,
         tree_id: TreeId,
@@ -270,7 +270,7 @@ impl Btree {
     /// it builds another without collecting the source rows. The cursor is tied to the exact
     /// transaction which opened it and must be advanced with
     /// [`BtreeCursor::next_in_transaction`].
-    pub fn cursor_in_transaction<D: PageDevice>(
+    pub(crate) fn cursor_in_transaction<D: PageDevice>(
         transaction: &mut PagerWriteTransaction<'_, D>,
         root_page_id: PageId,
         tree_id: TreeId,
@@ -279,7 +279,7 @@ impl Btree {
     }
 
     /// Opens a transaction cursor at the first key greater than or equal to `lower_bound`.
-    pub fn cursor_from_in_transaction<D: PageDevice>(
+    pub(crate) fn cursor_from_in_transaction<D: PageDevice>(
         transaction: &mut PagerWriteTransaction<'_, D>,
         root_page_id: PageId,
         tree_id: TreeId,
@@ -294,7 +294,7 @@ impl Btree {
     /// changed, so corruption cannot leave a partially reclaimed tree. The root may belong to the
     /// committed generation or to the current candidate. On error the transaction is failed and
     /// must be aborted, matching [`Self::upsert`] and [`Self::delete`].
-    pub fn reclaim<D: PageDevice>(
+    pub(crate) fn reclaim<D: PageDevice>(
         transaction: &mut PagerWriteTransaction<'_, D>,
         root_page_id: PageId,
         tree_id: TreeId,
@@ -395,7 +395,7 @@ fn open_cursor(
 
 /// Resumable forward cursor state which does not hold a pager borrow.
 #[derive(Clone, Debug)]
-pub struct BtreeCursor {
+pub(crate) struct BtreeCursor {
     tree_id: TreeId,
     root_page_id: PageId,
     view: CursorView,
@@ -409,20 +409,8 @@ pub struct BtreeCursor {
 }
 
 impl BtreeCursor {
-    pub fn tree_id(&self) -> TreeId {
-        self.tree_id
-    }
-
-    pub fn root_page_id(&self) -> PageId {
-        self.root_page_id
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.view.generation()
-    }
-
     /// Returns the next owned key/value pair, or `None` after the final leaf.
-    pub fn next<D: PageDevice>(
+    pub(crate) fn next<D: PageDevice>(
         &mut self,
         pager: &mut Pager<D>,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
@@ -431,7 +419,7 @@ impl BtreeCursor {
 
     /// Returns the next pair from a cursor opened by
     /// [`Btree::cursor_in_transaction`] or [`Btree::cursor_from_in_transaction`].
-    pub fn next_in_transaction<D: PageDevice>(
+    pub(crate) fn next_in_transaction<D: PageDevice>(
         &mut self,
         transaction: &mut PagerWriteTransaction<'_, D>,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {

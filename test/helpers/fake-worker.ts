@@ -3,7 +3,7 @@ import type {
   WorkerRequest,
   WorkerResponse,
 } from '../../src/protocol.ts';
-import type {WorkerLike} from '../../src/client/rpc.ts';
+import type {WorkerLike} from '../../src/client/client.ts';
 
 export class FakeWorker implements WorkerLike {
   readonly posted: unknown[] = [];

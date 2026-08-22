@@ -20,7 +20,6 @@ const MAX_U32 = 0xffff_ffff;
 // work and allocation independently of a particular JavaScript engine's RSS.
 const STRING_OVERHEAD = 12;
 const VECTOR_OVERHEAD = 12;
-const JS_VALUE_BYTES = 4;
 const RUST_VALUE_BYTES = 24;
 const RUST_MAP_ENTRY_OVERHEAD = 128;
 
@@ -52,7 +51,6 @@ interface PreflightSink {
   i64(value: bigint): void;
   f64(value: number): void;
   string(value: string): void;
-  finish(): number;
 }
 
 class PreflightBudget {
@@ -75,7 +73,7 @@ class PreflightBudget {
     this.retain(bytes + STRING_OVERHEAD);
   }
 
-  vector(length: number, elementBytes = JS_VALUE_BYTES): void {
+  vector(length: number, elementBytes: number): void {
     this.retain(length * elementBytes + VECTOR_OVERHEAD);
   }
 
@@ -136,10 +134,6 @@ class ModelSink implements PreflightSink {
     this.#add(bytes);
   }
 
-  finish(): number {
-    return this.#bytes;
-  }
-
   #add(bytes: number): void {
     const next = this.#bytes + bytes;
     if (!numberIsSafeInteger(next) || next > MAX_BYTES) {
@@ -150,9 +144,7 @@ class ModelSink implements PreflightSink {
 }
 
 function preflight(write: (sink: PreflightSink) => void): void {
-  const sink = new ModelSink();
-  write(sink);
-  sink.finish();
+  write(new ModelSink());
 }
 
 /** Validates and bounds a request once before passing it unchanged to WASM. */
@@ -194,7 +186,7 @@ function writeJsonValues(
   depth: number,
   label: string,
 ): void {
-  writeArray(sink, input, depth, label, RUST_VALUE_BYTES, (target, value) =>
+  writeArray(sink, input, label, RUST_VALUE_BYTES, (target, value) =>
     writeJsonValue(target, value, depth),
   );
 }
@@ -263,7 +255,6 @@ function writeJsonValue(
 function writeArray(
   sink: PreflightSink,
   input: unknown,
-  depth: number,
   label: string,
   retainedElementBytes: number,
   write: (sink: PreflightSink, value: unknown) => void,

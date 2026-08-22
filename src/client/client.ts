@@ -9,11 +9,30 @@ import {
   type StorageOptions,
 } from '../protocol.js';
 import {ClientError} from './error.js';
-import {
-  WorkerRpc,
-  type ResultValidation,
-  type WorkerLike,
-} from './rpc.js';
+import {WorkerRpc, type ResultValidation} from './rpc.js';
+
+export interface WorkerLike {
+  postMessage(message: unknown): void;
+  addEventListener(
+    type: 'message',
+    listener: (event: MessageEvent<unknown>) => void,
+  ): void;
+  addEventListener(
+    type: 'messageerror',
+    listener: (event: MessageEvent<unknown>) => void,
+  ): void;
+  addEventListener(type: 'error', listener: (event: ErrorEvent) => void): void;
+  removeEventListener(
+    type: 'message',
+    listener: (event: MessageEvent<unknown>) => void,
+  ): void;
+  removeEventListener(
+    type: 'messageerror',
+    listener: (event: MessageEvent<unknown>) => void,
+  ): void;
+  removeEventListener(type: 'error', listener: (event: ErrorEvent) => void): void;
+  terminate?: () => void;
+}
 
 export interface ClientOptions {
   worker?: WorkerLike;
@@ -180,14 +199,6 @@ export class Client {
         storage,
       })
       .then((result) => {
-        if (!isInitResult(result)) {
-          const error = clientError(
-            'PROTOCOL_MISMATCH',
-            'The TinyGres worker returned an invalid initialization result',
-          );
-          this.#rpc.dispose(error);
-          throw error;
-        }
         this.#revision = result.revision;
         this.#ready = true;
       });
@@ -788,7 +799,6 @@ function toResults<RowType>(
   result: SqlResult,
   options?: QueryOptions,
 ): Results<RowType> {
-  assertQueryOptions(options);
   const rows =
     options?.rowMode === 'array'
       ? rowsAsArrays(result.rows, result.fields)
@@ -818,13 +828,13 @@ function rowsAsArrays(
 }
 
 function affectedRows(result: SqlResult): number {
-  return /^(?:DELETE|INSERT|MERGE|UPDATE)$/.test(result.command)
+  return /^(?:DELETE|INSERT|UPDATE)$/.test(result.command)
     ? result.rowCount
     : 0;
 }
 
 function hasRowCount(command: string): boolean {
-  return /^(?:DELETE|INSERT|MERGE|SELECT|UPDATE)$/.test(command);
+  return /^(?:DELETE|INSERT|SELECT|UPDATE)$/.test(command);
 }
 
 function assertQueryOptions(options: QueryOptions | undefined): void {
@@ -842,14 +852,4 @@ function assertQueryOptions(options: QueryOptions | undefined): void {
       'TinyGres query options currently support only rowMode: object or array',
     );
   }
-}
-
-function isInitResult(value: unknown): value is {revision: number} {
-  return (
-    isRecord(value) &&
-    Object.hasOwn(value, 'revision') &&
-    Reflect.ownKeys(value).every((key) => key === 'revision') &&
-    Number.isSafeInteger(value.revision) &&
-    Number(value.revision) >= 0
-  );
 }

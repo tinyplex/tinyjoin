@@ -69,17 +69,6 @@ export interface RawStructuredWasmEngineConstructor {
   new (device: PageDevice): RawStructuredWasmEngine;
 }
 
-interface DecodedResponse<Result> {
-  readonly value: Result;
-  readonly disposition: StructuredResponseDisposition;
-}
-
-interface StructuredCall {
-  readonly operation: number;
-  readonly payload: unknown;
-  readonly mayPublish: boolean;
-}
-
 function guardWasmPageDevice(device: PageDevice): PageDevice {
   return Object.freeze({
     pageCount: () => inPageDeviceCallback(() => device.pageCount()),
@@ -147,7 +136,9 @@ export class StructuredWasmEngine implements WorkerEngine {
     this.#assertCallable();
     preflightExecuteSql(sql, params);
     return this.#invoke(
-      structuredCall(WASM_OPERATION.executeSql, {sql, params}, true),
+      WASM_OPERATION.executeSql,
+      {sql, params},
+      true,
       decodeSqlResultResponse,
     );
   }
@@ -156,7 +147,9 @@ export class StructuredWasmEngine implements WorkerEngine {
     this.#assertCallable();
     preflightPrepareSql(sql);
     return this.#invoke(
-      structuredCall(WASM_OPERATION.prepareSql, sql, false),
+      WASM_OPERATION.prepareSql,
+      sql,
+      false,
       decodePreparedStatementIdResponse,
     );
   }
@@ -165,11 +158,9 @@ export class StructuredWasmEngine implements WorkerEngine {
     this.#assertCallable();
     preflightExecutePrepared(statementId, params);
     return this.#invoke(
-      structuredCall(
-        WASM_OPERATION.executePrepared,
-        {statementId, params},
-        true,
-      ),
+      WASM_OPERATION.executePrepared,
+      {statementId, params},
+      true,
       decodeSqlResultResponse,
     );
   }
@@ -178,7 +169,9 @@ export class StructuredWasmEngine implements WorkerEngine {
     this.#assertCallable();
     preflightClosePrepared(statementId);
     this.#invoke(
-      structuredCall(WASM_OPERATION.closePrepared, statementId, false),
+      WASM_OPERATION.closePrepared,
+      statementId,
+      false,
       decodeUnitResponse,
     );
   }
@@ -187,7 +180,9 @@ export class StructuredWasmEngine implements WorkerEngine {
     this.#assertCallable();
     preflightExecSql(sql);
     return this.#invoke(
-      structuredCall(WASM_OPERATION.execSql, sql, true),
+      WASM_OPERATION.execSql,
+      sql,
+      true,
       decodeSqlResultsResponse,
     );
   }
@@ -195,7 +190,9 @@ export class StructuredWasmEngine implements WorkerEngine {
   beginTransaction(): void {
     this.#assertCallable();
     this.#invoke(
-      structuredCall(WASM_OPERATION.begin, undefined, false),
+      WASM_OPERATION.begin,
+      undefined,
+      false,
       decodeUnitResponse,
     );
   }
@@ -203,7 +200,9 @@ export class StructuredWasmEngine implements WorkerEngine {
   commitTransaction(): ApplyOutcome {
     this.#assertCallable();
     return this.#invoke(
-      structuredCall(WASM_OPERATION.commit, undefined, true),
+      WASM_OPERATION.commit,
+      undefined,
+      true,
       decodeApplyOutcomeResponse,
     );
   }
@@ -211,7 +210,9 @@ export class StructuredWasmEngine implements WorkerEngine {
   rollbackTransaction(): void {
     this.#assertCallable();
     this.#invoke(
-      structuredCall(WASM_OPERATION.rollback, undefined, false),
+      WASM_OPERATION.rollback,
+      undefined,
+      false,
       decodeUnitResponse,
     );
   }
@@ -219,7 +220,9 @@ export class StructuredWasmEngine implements WorkerEngine {
   inTransaction(): boolean {
     this.#assertCallable();
     return this.#invoke(
-      structuredCall(WASM_OPERATION.inTransaction, undefined, false),
+      WASM_OPERATION.inTransaction,
+      undefined,
+      false,
       decodeBooleanResponse,
     );
   }
@@ -227,7 +230,9 @@ export class StructuredWasmEngine implements WorkerEngine {
   revision(): number {
     this.#assertCallable();
     return this.#invoke(
-      structuredCall(WASM_OPERATION.revision, undefined, false),
+      WASM_OPERATION.revision,
+      undefined,
+      false,
       decodeRevisionResponse,
     );
   }
@@ -254,25 +259,27 @@ export class StructuredWasmEngine implements WorkerEngine {
   }
 
   #invoke<Result>(
-    request: StructuredCall,
-    decode: (value: unknown) => DecodedResponse<Result>,
+    operation: number,
+    payload: unknown,
+    mayPublish: boolean,
+    decode: (value: unknown) => Result,
   ): Result {
     this.#assertCallable();
     let response: unknown;
     try {
       response = this.#raw.callStructured(
         BRIDGE_VERSION,
-        request.operation,
-        request.payload,
+        operation,
+        payload,
       );
     } catch (error) {
-      if (request.mayPublish) {
+      if (mayPublish) {
         throw this.#poisonUnknown(error);
       }
       throw error;
     }
     try {
-      return decode(response).value;
+      return decode(response);
     } catch (error) {
       if (
         error instanceof WasmBridgeError &&
@@ -287,7 +294,7 @@ export class StructuredWasmEngine implements WorkerEngine {
           : undefined;
       if (
         disposition === 'durable' ||
-        (disposition === undefined && request.mayPublish)
+        (disposition === undefined && mayPublish)
       ) {
         throw this.#poisonUnknown(error);
       }
@@ -359,27 +366,19 @@ export class StructuredWasmEngine implements WorkerEngine {
   }
 }
 
-function structuredCall(
-  operation: number,
-  payload: unknown,
-  mayPublish: boolean,
-): StructuredCall {
-  return {operation, payload, mayPublish};
-}
-
-function decodeUnitResponse(value: unknown): DecodedResponse<void> {
+function decodeUnitResponse(value: unknown): void {
   return decodeResponse(value, 'unit result', (payload) =>
     payload === undefined ? undefined : INVALID_RESULT,
   );
 }
 
-function decodeBooleanResponse(value: unknown): DecodedResponse<boolean> {
+function decodeBooleanResponse(value: unknown): boolean {
   return decodeResponse(value, 'boolean result', (payload) =>
     typeof payload === 'boolean' ? payload : INVALID_RESULT,
   );
 }
 
-function decodeRevisionResponse(value: unknown): DecodedResponse<number> {
+function decodeRevisionResponse(value: unknown): number {
   return decodeResponse(value, 'revision', (payload) =>
     numberIsSafeInteger(payload) && Number(payload) >= 0
       ? Number(payload)
@@ -389,7 +388,7 @@ function decodeRevisionResponse(value: unknown): DecodedResponse<number> {
 
 function decodePreparedStatementIdResponse(
   value: unknown,
-): DecodedResponse<number> {
+): number {
   return decodeResponse(value, 'prepared statement ID', (payload) =>
     numberIsSafeInteger(payload) &&
     Number(payload) > 0 &&
@@ -401,13 +400,13 @@ function decodePreparedStatementIdResponse(
 
 function decodeApplyOutcomeResponse(
   value: unknown,
-): DecodedResponse<ApplyOutcome> {
+): ApplyOutcome {
   return decodeResponse(value, 'apply outcome', (payload) =>
     isRpcResult('commitTransaction', payload) ? payload : INVALID_RESULT,
   );
 }
 
-function decodeSqlResultResponse(value: unknown): DecodedResponse<SqlResult> {
+function decodeSqlResultResponse(value: unknown): SqlResult {
   return decodeResponse(value, 'SQL result', (payload) =>
     isRpcResult('executeSql', payload) ? payload : INVALID_RESULT,
   );
@@ -415,7 +414,7 @@ function decodeSqlResultResponse(value: unknown): DecodedResponse<SqlResult> {
 
 function decodeSqlResultsResponse(
   value: unknown,
-): DecodedResponse<SqlResult[]> {
+): SqlResult[] {
   return decodeResponse(value, 'SQL results', (payload) =>
     isRpcResult('execSql', payload) ? payload : INVALID_RESULT,
   );
@@ -427,7 +426,7 @@ function decodeResponse<Result>(
   value: unknown,
   label: string,
   decode: (payload: unknown) => Result | typeof INVALID_RESULT,
-): DecodedResponse<Result> {
+): Result {
   if (!isDenseEnvelope(value)) {
     throw new WasmStructuredDecodeError(
       'WASM returned an invalid structured response envelope',
@@ -476,7 +475,7 @@ function decodeResponse<Result>(
       disposition,
     );
   }
-  return {value: result, disposition};
+  return result;
 }
 
 function isDenseEnvelope(value: unknown): value is unknown[] {

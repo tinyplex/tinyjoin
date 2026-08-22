@@ -1,4 +1,6 @@
-use crate::{EngineError, MAX_PAGE_COUNT, PAGE_SIZE, PageId, Result};
+#[cfg(test)]
+use crate::{EngineError, MAX_PAGE_COUNT, PAGE_SIZE};
+use crate::{PageId, Result};
 
 /// Synchronous durable storage used by the copy-on-write pager.
 ///
@@ -21,13 +23,15 @@ pub trait PageDevice {
 }
 
 #[derive(Clone, Debug)]
-pub struct MemoryPageDevice {
+#[cfg(test)]
+pub(crate) struct MemoryPageDevice {
     pages: Vec<[u8; PAGE_SIZE]>,
     flush_count: u64,
 }
 
+#[cfg(test)]
 impl MemoryPageDevice {
-    pub fn new(page_count: PageId) -> Result<Self> {
+    pub(crate) fn new(page_count: PageId) -> Result<Self> {
         if page_count > MAX_PAGE_COUNT {
             return Err(device_error(format!(
                 "Memory page count {page_count} exceeds the {MAX_PAGE_COUNT}-page limit"
@@ -39,7 +43,7 @@ impl MemoryPageDevice {
         })
     }
 
-    pub fn page(&self, id: PageId) -> Result<&[u8; PAGE_SIZE]> {
+    pub(crate) fn page(&self, id: PageId) -> Result<&[u8; PAGE_SIZE]> {
         let page_count = self.page_count();
         if id >= page_count {
             return Err(out_of_range(id, page_count));
@@ -47,11 +51,12 @@ impl MemoryPageDevice {
         Ok(&self.pages[id as usize])
     }
 
-    pub fn flush_count(&self) -> u64 {
+    pub(crate) fn flush_count(&self) -> u64 {
         self.flush_count
     }
 }
 
+#[cfg(test)]
 impl PageDevice for MemoryPageDevice {
     fn page_count(&self) -> PageId {
         self.pages.len() as PageId
@@ -87,6 +92,7 @@ impl PageDevice for MemoryPageDevice {
     }
 }
 
+#[cfg(test)]
 fn validate_buffer(length: usize) -> Result<()> {
     if length != PAGE_SIZE {
         return Err(device_error(format!(
@@ -96,12 +102,14 @@ fn validate_buffer(length: usize) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn out_of_range(id: PageId, page_count: PageId) -> EngineError {
     device_error(format!(
         "Page ID {id} is outside a device containing {page_count} pages"
     ))
 }
 
+#[cfg(test)]
 fn device_error(message: impl Into<String>) -> EngineError {
     EngineError::new("PAGE_DEVICE_ERROR", message)
 }

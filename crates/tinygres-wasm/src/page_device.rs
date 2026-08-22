@@ -49,7 +49,7 @@ extern "C" {
 /// Reads and writes pass borrowed views of WebAssembly memory to JavaScript.
 /// The JavaScript method must consume each `Uint8Array` synchronously and must
 /// never retain it after returning.
-pub struct WasmPageDevice {
+pub(crate) struct WasmPageDevice {
     device: RawPageDevice,
     page_count: PageId,
     closed: bool,
@@ -57,7 +57,7 @@ pub struct WasmPageDevice {
 
 impl WasmPageDevice {
     /// Validates a JavaScript page device and captures its initial page count.
-    pub fn new(device: JsValue) -> Result<Self> {
+    pub(crate) fn new(device: JsValue) -> Result<Self> {
         let device = device.unchecked_into::<RawPageDevice>();
         let page_count = device
             .raw_page_count()
@@ -83,7 +83,7 @@ impl WasmPageDevice {
     ///
     /// Consuming `self` prevents further I/O. `Drop` still runs afterwards but
     /// the close call is issued exactly once.
-    pub fn close(mut self) -> Result<()> {
+    pub(crate) fn close(mut self) -> Result<()> {
         self.close_inner()
     }
 

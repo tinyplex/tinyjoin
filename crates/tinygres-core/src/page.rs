@@ -23,14 +23,13 @@ pub type PageId = u64;
 
 pub const PAGE_SIZE: usize = 4_096;
 pub const MAX_PAGE_COUNT: PageId = 65_536;
-pub const MAX_DATABASE_BYTES: u64 = MAX_PAGE_COUNT * PAGE_SIZE as u64;
-pub const PAGE_HEADER_SIZE: usize = 32;
-pub const MAX_PAGE_PAYLOAD_SIZE: usize = PAGE_SIZE - PAGE_HEADER_SIZE;
+pub(crate) const PAGE_HEADER_SIZE: usize = 32;
+pub(crate) const MAX_PAGE_PAYLOAD_SIZE: usize = PAGE_SIZE - PAGE_HEADER_SIZE;
 
-pub const SUPERBLOCK_PAGE_COUNT: usize = 2;
-pub const BITMAP_CHUNK_COUNT: usize = 3;
-pub const BITMAP_PAGE_COUNT: usize = BITMAP_CHUNK_COUNT * 2;
-pub const FIRST_DATA_PAGE_ID: PageId =
+pub(crate) const SUPERBLOCK_PAGE_COUNT: usize = 2;
+pub(crate) const BITMAP_CHUNK_COUNT: usize = 3;
+pub(crate) const BITMAP_PAGE_COUNT: usize = BITMAP_CHUNK_COUNT * 2;
+pub(crate) const FIRST_DATA_PAGE_ID: PageId =
     SUPERBLOCK_PAGE_COUNT as PageId + BITMAP_PAGE_COUNT as PageId;
 
 const PAGE_MAGIC: &[u8; 8] = b"TGRPAGE\0";
@@ -43,13 +42,13 @@ const SUPERBLOCK_FORMAT_VERSION: u16 = 1;
 const SUPERBLOCK_FLAGS: u16 = 0;
 const SUPERBLOCK_PAYLOAD_SIZE: usize = 96;
 
-pub const ALLOCATION_BITMAP_BYTES: usize = MAX_PAGE_COUNT as usize / 8;
+pub(crate) const ALLOCATION_BITMAP_BYTES: usize = MAX_PAGE_COUNT as usize / 8;
 const BITMAP_CHUNK_HEADER_SIZE: usize = 16;
 const MAX_BITMAP_CHUNK_BYTES: usize = MAX_PAGE_PAYLOAD_SIZE - BITMAP_CHUNK_HEADER_SIZE;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
-pub enum PageType {
+pub(crate) enum PageType {
     Superblock = 1,
     AllocationBitmap = 2,
     BtreeInternal = 3,
@@ -75,14 +74,14 @@ impl TryFrom<u8> for PageType {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Page {
+pub(crate) struct Page {
     pub id: PageId,
     pub page_type: PageType,
     pub payload: Vec<u8>,
 }
 
 impl Page {
-    pub fn new(id: PageId, page_type: PageType, payload: Vec<u8>) -> Result<Self> {
+    pub(crate) fn new(id: PageId, page_type: PageType, payload: Vec<u8>) -> Result<Self> {
         validate_page_id(id)?;
         if payload.len() > MAX_PAGE_PAYLOAD_SIZE {
             return Err(invalid_page(format!(
@@ -98,7 +97,7 @@ impl Page {
         })
     }
 
-    pub fn encode(&self) -> Result<[u8; PAGE_SIZE]> {
+    pub(crate) fn encode(&self) -> Result<[u8; PAGE_SIZE]> {
         validate_page_id(self.id)?;
         if self.payload.len() > MAX_PAGE_PAYLOAD_SIZE {
             return Err(invalid_page(format!(
@@ -122,7 +121,7 @@ impl Page {
         Ok(bytes)
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != PAGE_SIZE {
             return Err(invalid_page(storage_diagnostic!(
                 "A physical page must be exactly {PAGE_SIZE} bytes, not {}",
@@ -182,24 +181,24 @@ impl Page {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
-pub enum SuperblockSlot {
+pub(crate) enum SuperblockSlot {
     A = 0,
     B = 1,
 }
 
 impl SuperblockSlot {
-    pub const fn page_id(self) -> PageId {
+    pub(crate) const fn page_id(self) -> PageId {
         self as PageId
     }
 
-    pub const fn inactive(self) -> Self {
+    pub(crate) const fn inactive(self) -> Self {
         match self {
             Self::A => Self::B,
             Self::B => Self::A,
         }
     }
 
-    pub const fn bitmap_slot(self) -> BitmapSlot {
+    pub(crate) const fn bitmap_slot(self) -> BitmapSlot {
         match self {
             Self::A => BitmapSlot::A,
             Self::B => BitmapSlot::B,
@@ -223,20 +222,20 @@ impl TryFrom<u8> for SuperblockSlot {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
-pub enum BitmapSlot {
+pub(crate) enum BitmapSlot {
     A = 0,
     B = 1,
 }
 
 impl BitmapSlot {
-    pub const fn first_page_id(self) -> PageId {
+    pub(crate) const fn first_page_id(self) -> PageId {
         match self {
             Self::A => SUPERBLOCK_PAGE_COUNT as PageId,
             Self::B => SUPERBLOCK_PAGE_COUNT as PageId + BITMAP_CHUNK_COUNT as PageId,
         }
     }
 
-    pub const fn page_id(self, chunk: usize) -> PageId {
+    pub(crate) const fn page_id(self, chunk: usize) -> PageId {
         self.first_page_id() + chunk as PageId
     }
 }
@@ -256,7 +255,7 @@ impl TryFrom<u8> for BitmapSlot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Superblock {
+pub(crate) struct Superblock {
     pub slot: SuperblockSlot,
     pub generation: u64,
     pub database_revision: u64,
@@ -268,7 +267,7 @@ pub struct Superblock {
 }
 
 impl Superblock {
-    pub fn new(slot: SuperblockSlot) -> Self {
+    pub(crate) fn new(slot: SuperblockSlot) -> Self {
         let bitmap_slot = match slot {
             SuperblockSlot::A => BitmapSlot::A,
             SuperblockSlot::B => BitmapSlot::B,
@@ -285,7 +284,7 @@ impl Superblock {
         }
     }
 
-    pub fn encode_page(&self) -> Result<[u8; PAGE_SIZE]> {
+    pub(crate) fn encode_page(&self) -> Result<[u8; PAGE_SIZE]> {
         self.validate()?;
         let mut payload = vec![0; SUPERBLOCK_PAYLOAD_SIZE];
         payload[..8].copy_from_slice(SUPERBLOCK_MAGIC);
@@ -307,7 +306,7 @@ impl Superblock {
         Page::new(self.slot.page_id(), PageType::Superblock, payload)?.encode()
     }
 
-    pub fn decode_page(bytes: &[u8]) -> Result<Self> {
+    pub(crate) fn decode_page(bytes: &[u8]) -> Result<Self> {
         let page = Page::decode(bytes)?;
         if page.id >= SUPERBLOCK_PAGE_COUNT as PageId {
             return Err(invalid_page(storage_diagnostic!(
@@ -437,7 +436,7 @@ impl Superblock {
         Ok(())
     }
 
-    pub fn validate_bitmap(&self, bitmap: &AllocationBitmap) -> Result<()> {
+    pub(crate) fn validate_bitmap(&self, bitmap: &AllocationBitmap) -> Result<()> {
         if bitmap.slot() != self.bitmap_slot || bitmap.generation() != self.bitmap_generation {
             return Err(invalid_page(
                 "Superblock allocation bitmap slot or generation does not match",
@@ -467,14 +466,14 @@ impl Superblock {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AllocationBitmap {
+pub(crate) struct AllocationBitmap {
     generation: u64,
     slot: BitmapSlot,
     bits: Vec<u8>,
 }
 
 impl AllocationBitmap {
-    pub fn new(generation: u64, slot: BitmapSlot) -> Result<Self> {
+    pub(crate) fn new(generation: u64, slot: BitmapSlot) -> Result<Self> {
         if generation == 0 {
             return Err(invalid_page(
                 "Allocation bitmap generation must be non-zero",
@@ -491,22 +490,22 @@ impl AllocationBitmap {
         Ok(bitmap)
     }
 
-    pub fn generation(&self) -> u64 {
+    pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
 
-    pub fn slot(&self) -> BitmapSlot {
+    pub(crate) fn slot(&self) -> BitmapSlot {
         self.slot
     }
 
-    pub fn is_allocated(&self, id: PageId) -> Result<bool> {
+    pub(crate) fn is_allocated(&self, id: PageId) -> Result<bool> {
         validate_page_id(id)?;
         let byte = id as usize / 8;
         let bit = id as usize % 8;
         Ok(self.bits[byte] & (1 << bit) != 0)
     }
 
-    pub fn set_allocated(&mut self, id: PageId, allocated: bool) -> Result<()> {
+    pub(crate) fn set_allocated(&mut self, id: PageId, allocated: bool) -> Result<()> {
         validate_page_id(id)?;
         if id < FIRST_DATA_PAGE_ID && !allocated {
             return Err(invalid_page("Metadata pages cannot be deallocated"));
@@ -521,11 +520,11 @@ impl AllocationBitmap {
         Ok(())
     }
 
-    pub fn allocated_page_count(&self) -> u32 {
+    pub(crate) fn allocated_page_count(&self) -> u32 {
         self.bits.iter().map(|byte| byte.count_ones()).sum()
     }
 
-    pub fn encode_pages(&self) -> Result<Vec<[u8; PAGE_SIZE]>> {
+    pub(crate) fn encode_pages(&self) -> Result<Vec<[u8; PAGE_SIZE]>> {
         if self.generation == 0 {
             return Err(invalid_page(
                 "Allocation bitmap generation must be non-zero",
@@ -558,7 +557,8 @@ impl AllocationBitmap {
         Ok(pages)
     }
 
-    pub fn decode_pages(slot: BitmapSlot, pages: &[[u8; PAGE_SIZE]]) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn decode_pages(slot: BitmapSlot, pages: &[[u8; PAGE_SIZE]]) -> Result<Self> {
         let pages = pages.iter().map(|page| page.as_slice()).collect::<Vec<_>>();
         Self::decode_page_slices(slot, &pages)
     }
@@ -676,20 +676,23 @@ impl AllocationBitmap {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct RawMetadataSlot<'a> {
+pub(crate) struct RawMetadataSlot<'a> {
     pub superblock: Option<&'a [u8]>,
     pub bitmap_chunks: [Option<&'a [u8]>; BITMAP_CHUNK_COUNT],
 }
 
 impl<'a> RawMetadataSlot<'a> {
-    pub const fn empty() -> Self {
+    pub(crate) const fn empty() -> Self {
         Self {
             superblock: None,
             bitmap_chunks: [None; BITMAP_CHUNK_COUNT],
         }
     }
 
-    pub const fn new(superblock: &'a [u8], bitmap_chunks: [&'a [u8]; BITMAP_CHUNK_COUNT]) -> Self {
+    pub(crate) const fn new(
+        superblock: &'a [u8],
+        bitmap_chunks: [&'a [u8]; BITMAP_CHUNK_COUNT],
+    ) -> Self {
         Self {
             superblock: Some(superblock),
             bitmap_chunks: [
@@ -712,7 +715,7 @@ impl Default for RawMetadataSlot<'_> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RecoveredMetadata {
+pub(crate) struct RecoveredMetadata {
     pub superblock: Superblock,
     pub allocation_bitmap: AllocationBitmap,
 }
@@ -732,57 +735,12 @@ impl RecoveredMetadata {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PendingMetadata {
+pub(crate) struct PendingMetadata {
     pub superblock: Superblock,
     pub allocation_bitmap: AllocationBitmap,
 }
 
-impl PendingMetadata {
-    pub const fn publication_plan(&self) -> [MetadataPublicationStep; BITMAP_CHUNK_COUNT + 4] {
-        [
-            MetadataPublicationStep::WriteDataPages,
-            MetadataPublicationStep::WriteBitmapChunk {
-                slot: self.superblock.bitmap_slot,
-                chunk: 0,
-                page_id: self.superblock.bitmap_slot.page_id(0),
-            },
-            MetadataPublicationStep::WriteBitmapChunk {
-                slot: self.superblock.bitmap_slot,
-                chunk: 1,
-                page_id: self.superblock.bitmap_slot.page_id(1),
-            },
-            MetadataPublicationStep::WriteBitmapChunk {
-                slot: self.superblock.bitmap_slot,
-                chunk: 2,
-                page_id: self.superblock.bitmap_slot.page_id(2),
-            },
-            MetadataPublicationStep::FlushDataAndBitmap,
-            MetadataPublicationStep::WriteSuperblock {
-                slot: self.superblock.slot,
-                page_id: self.superblock.slot.page_id(),
-            },
-            MetadataPublicationStep::FlushSuperblock,
-        ]
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MetadataPublicationStep {
-    WriteDataPages,
-    WriteBitmapChunk {
-        slot: BitmapSlot,
-        chunk: usize,
-        page_id: PageId,
-    },
-    FlushDataAndBitmap,
-    WriteSuperblock {
-        slot: SuperblockSlot,
-        page_id: PageId,
-    },
-    FlushSuperblock,
-}
-
-pub fn recover_metadata(
+pub(crate) fn recover_metadata(
     slot_a: RawMetadataSlot<'_>,
     slot_b: RawMetadataSlot<'_>,
 ) -> Result<Option<RecoveredMetadata>> {
@@ -823,7 +781,7 @@ pub fn recover_metadata(
     }
 }
 
-pub fn build_next_metadata(
+pub(crate) fn build_next_metadata(
     active: &RecoveredMetadata,
     database_revision: u64,
     catalog_root_page_id: Option<PageId>,
@@ -1515,7 +1473,7 @@ mod tests {
     }
 
     #[test]
-    fn next_metadata_targets_the_inactive_pair_and_has_a_fixed_publication_order() {
+    fn next_metadata_targets_the_inactive_pair() {
         let active_bytes = encoded_metadata(SuperblockSlot::A, 8, 20, false);
         let active = recover_metadata(active_bytes.raw(), RawMetadataSlot::empty())
             .unwrap()
@@ -1537,33 +1495,6 @@ mod tests {
         assert_eq!(pending.allocation_bitmap.generation(), 9);
         assert_eq!(pending.allocation_bitmap.slot(), BitmapSlot::B);
         assert_eq!(pending.superblock.live_data_page_count, 2);
-        assert_eq!(
-            pending.publication_plan(),
-            [
-                MetadataPublicationStep::WriteDataPages,
-                MetadataPublicationStep::WriteBitmapChunk {
-                    slot: BitmapSlot::B,
-                    chunk: 0,
-                    page_id: 5,
-                },
-                MetadataPublicationStep::WriteBitmapChunk {
-                    slot: BitmapSlot::B,
-                    chunk: 1,
-                    page_id: 6,
-                },
-                MetadataPublicationStep::WriteBitmapChunk {
-                    slot: BitmapSlot::B,
-                    chunk: 2,
-                    page_id: 7,
-                },
-                MetadataPublicationStep::FlushDataAndBitmap,
-                MetadataPublicationStep::WriteSuperblock {
-                    slot: SuperblockSlot::B,
-                    page_id: 1,
-                },
-                MetadataPublicationStep::FlushSuperblock,
-            ]
-        );
     }
 
     #[test]

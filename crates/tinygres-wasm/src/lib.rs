@@ -1,10 +1,12 @@
+#![deny(unreachable_pub)]
+
 mod page_device;
 mod structured;
 
 use tinygres_core::{EngineError, PagedEngine};
 use wasm_bindgen::prelude::*;
 
-pub use page_device::WasmPageDevice;
+use page_device::WasmPageDevice;
 
 #[wasm_bindgen]
 pub struct WasmEngine {

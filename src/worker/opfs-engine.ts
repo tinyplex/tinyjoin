@@ -18,22 +18,13 @@ export async function createOpfsWasmEngine(
   const session = await (
     dependencies.createSession ?? createOpfsPageStorageSession
   )(name, provider);
-  let engine: WorkerEngine | undefined;
   try {
-    engine = await dependencies.createPageEngine(session.pageDevice);
-    return engine;
+    return await dependencies.createPageEngine(session.pageDevice);
   } catch (error) {
     try {
-      engine?.close();
+      session.close();
     } catch {
       // Preserve the page-engine construction failure.
-    }
-    if (engine === undefined) {
-      try {
-        session.close();
-      } catch {
-        // Preserve the page-engine construction failure.
-      }
     }
     throw error;
   }
