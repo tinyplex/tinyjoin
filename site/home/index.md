@@ -1,6 +1,21 @@
 # TinyGres
 
-A tiny, worker-first relational database for browser apps.
+<section id="hero">
+  <h2>
+    A tiny, worker-first <em>relational database</em> for browser apps.
+  </h2>
+  <p>
+    PostgreSQL-shaped SQL, running locally and away from the main thread.
+  </p>
+</section>
+
+<a class="start" href="https://tinygres.org/guides/getting-started/">Get started</a>
+
+<a href="https://tinygres.org/demos/">Try the demos</a>
+
+<a href="https://tinygres.org/api/">Read the API</a>
+
+---
 
 TinyGres gives an application a PostgreSQL-shaped SQL database without a
 database server. The engine runs away from the main thread in a dedicated

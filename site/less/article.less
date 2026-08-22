@@ -1,0 +1,50 @@
+body > main > article {
+  overflow: auto;
+  padding-bottom: 4rem;
+
+  ul {
+    padding-inline-start: 2rem;
+
+    li {
+      margin-bottom: 0.5rem;
+      list-style: none;
+
+      &:before {
+        width: 2rem;
+        margin-left: -2rem;
+        content: '\2022';
+        display: inline-block;
+        text-align: center;
+      }
+    }
+  }
+
+  img {
+    max-width: 100%;
+    display: block;
+    margin: 1rem auto;
+  }
+
+  .page-list {
+    margin-top: 2.5rem;
+
+    h2 {
+      display: inline;
+      font-size: 1.1rem;
+    }
+
+    p {
+      margin-top: 0.25rem;
+    }
+  }
+
+  .essential {
+    background-color: @accentColor;
+    color: @backColor;
+    padding: 0.25rem;
+    border-radius: 0.25rem;
+    font-size: 0.8rem;
+    display: inline-block;
+    line-height: normal;
+  }
+}

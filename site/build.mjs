@@ -1,4 +1,5 @@
 import {readFileSync} from 'node:fs';
+import {access} from 'node:fs/promises';
 import {resolve} from 'node:path';
 
 import {createElement as h} from 'react';
@@ -80,7 +81,7 @@ const PageContent = ({page}) => {
   const children = getSkippedChildren(page);
   return h(
     'section',
-    {className: 'page-content', id: page.url, 'data-id': page.id},
+    {className: 's1 page-content', id: page.url, 'data-id': page.id},
     h('h1', null, h(NodeName, {node: page})),
     page.summary ? h(Markdown, {markdown: page.summary, html: true}) : null,
     page.body ? h(Markdown, {markdown: page.body, html: true}) : null,
@@ -100,6 +101,96 @@ const PageContent = ({page}) => {
         ),
   );
 };
+
+const Wordmark = () => h('span', null, 'Tiny', h('em', null, 'Gres'));
+
+const Header = ({page}) => {
+  const currentSection = page.url.split('/')[1];
+  const sectionLink = (section, label) =>
+    h(
+      'a',
+      {
+        href: `/${section}/`,
+        'aria-current': currentSection === section ? 'page' : undefined,
+      },
+      label,
+    );
+
+  return h(
+    'header',
+    null,
+    h(
+      'a',
+      {
+        className: 'wordmark',
+        href: '/',
+        'aria-current': page.url === '/' ? 'page' : undefined,
+      },
+      h(Wordmark),
+    ),
+    h(
+      'nav',
+      {'aria-label': 'Primary'},
+      h(
+        'ul',
+        null,
+        h('li', null, sectionLink('guides', 'Guides')),
+        h('li', null, sectionLink('api', 'API')),
+        h('li', null, sectionLink('demos', 'Demos')),
+        h(
+          'li',
+          null,
+          h(
+            'a',
+            {href: 'https://github.com/tinyplex/tinygres'},
+            'GitHub',
+          ),
+        ),
+      ),
+    ),
+    h('button', {
+      id: 'dark',
+      className: 'auto',
+      type: 'button',
+      'aria-label': 'Color theme: automatic; activate for dark',
+    }),
+  );
+};
+
+const Home = ({page}) =>
+  h(
+    'article',
+    {id: 'home', tabIndex: -1},
+    h('h1', {className: 'home-wordmark'}, h(Wordmark)),
+    page.summary ? h(Markdown, {markdown: page.summary, html: true}) : null,
+    page.body ? h(Markdown, {markdown: page.body, html: true}) : null,
+  );
+
+const Footer = () =>
+  h(
+    'footer',
+    null,
+    h(
+      'nav',
+      null,
+      h(
+        'a',
+        {
+          id: 'gh',
+          href: 'https://github.com/tinyplex/tinygres',
+          target: '_blank',
+          rel: 'noreferrer',
+        },
+        'GitHub',
+      ),
+    ),
+    h(
+      'nav',
+      null,
+      h('a', {href: '/'}, 'TinyGres'),
+      ' · MIT licensed',
+    ),
+  );
 
 const Page = () => {
   const page = usePageNode();
@@ -136,70 +227,51 @@ const Page = () => {
       h('meta', {property: 'og:description', content: description}),
       h('meta', {property: 'og:url', content: canonical}),
       h('link', {rel: 'canonical', href: canonical}),
-      h('link', {rel: 'stylesheet', href: '/style.css'}),
+      h('link', {rel: 'stylesheet', href: '/css/index.css'}),
+      h('script', {src: '/js/site.js'}),
     ),
     h(
       'body',
-      {className: page === root ? 'home' : undefined},
+      null,
       h(
-        'header',
-        null,
-        h('a', {className: 'wordmark', href: '/'}, 'TinyGres'),
-        h(
-          'nav',
-          {'aria-label': 'Primary'},
-          h('a', {href: '/guides/'}, 'Guides'),
-          h('a', {href: '/api/'}, 'API'),
-          h('a', {href: '/demos/'}, 'Demos'),
-          h(
-            'a',
-            {href: 'https://github.com/tinyplex/tinygres'},
-            'GitHub',
-          ),
-        ),
+        'a',
+        {className: 'skip', href: page === root ? '#home' : '#content'},
+        'Skip to content',
       ),
+      h(Header, {page}),
       h(
-        'div',
-        {className: 'layout'},
-        h(
-          'aside',
-          null,
-          h(
-            'nav',
-            {'aria-label': 'Documentation'},
-            h('ul', null, h(NodeNavigation, {node: root})),
-          ),
-        ),
-        h(
-          'main',
-          null,
-          page === root
-            ? null
-            : h(
+        'main',
+        null,
+        page === root
+          ? h(Home, {page})
+          : [
+              h(
                 'nav',
-                {className: 'breadcrumbs', 'aria-label': 'Breadcrumbs'},
-                h('ul', null, h(NodeBreadcrumbs, {node: root})),
+                {key: 'navigation', 'aria-label': 'Documentation'},
+                h('ul', null, h(NodeNavigation, {node: root})),
               ),
-          h(PageContent, {page}),
-        ),
+              h(
+                'article',
+                {key: 'article', id: 'content', tabIndex: -1},
+                h(
+                  'nav',
+                  {className: 'breadcrumbs', 'aria-label': 'Breadcrumbs'},
+                  h('ul', null, h(NodeBreadcrumbs, {node: root})),
+                ),
+                h(PageContent, {page}),
+              ),
+              h('aside', {key: 'aside', 'aria-hidden': 'true'}),
+            ],
       ),
-      h(
-        'footer',
-        null,
-        h('span', null, 'TinyGres is MIT licensed.'),
-        h(
-          'a',
-          {href: 'https://github.com/tinyplex'},
-          'A TinyPlex project',
-        ),
-      ),
+      h(Footer),
     ),
   );
 };
 
 export const build = async (outDir = 'docs', typesDir = 'dist/@types') => {
   const docs = createDocs('https://tinygres.org', outDir)
-    .addFile('site/style.css', '')
+    .addJsFile('site/js/site.ts')
+    .addLessFile('site/less/index.less')
     .addDir('site/extras')
     .addReflectionTransform(hideInheritedErrorMembers)
     .addApiFile(resolve(typesDir, 'index.d.ts'))
@@ -222,6 +294,20 @@ export const build = async (outDir = 'docs', typesDir = 'dist/@types') => {
     .addPageForEachNode('/', Page)
     .addPageForNode('/api/', Page, 'all.html', true)
     .publish();
+
+  await waitForFile(resolve(outDir, 'css/index.css'));
+};
+
+const waitForFile = async (file) => {
+  for (let attempt = 0; attempt < 500; attempt++) {
+    try {
+      await access(file);
+      return;
+    } catch {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
+  }
+  throw new Error(`Timed out waiting for generated file: ${file}`);
 };
 
 if (process.argv[1] === new URL(import.meta.url).pathname) {

@@ -1,0 +1,123 @@
+html {
+  font-family:
+    Inter,
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    sans-serif;
+  text-rendering: optimizeLegibility;
+  font-weight: 400;
+  letter-spacing: 0;
+  line-height: 1.65;
+}
+
+code {
+  font-family: Inconsolata, 'SFMono-Regular', Consolas, monospace;
+  font-size: 0.98em;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  margin: 2.5rem 0 0.85rem;
+  font-weight: 720;
+  line-height: 1.2;
+  color: @text2Color;
+  clear: both;
+
+  a {
+    color: inherit;
+    font-weight: inherit !important;
+  }
+}
+
+h1 {
+  font-size: 2.25rem;
+  margin-top: 1rem;
+}
+
+h2 {
+  font-size: 1.9rem;
+}
+
+h3 {
+  font-size: 1.55rem;
+}
+
+h4 {
+  font-size: 1.35rem;
+}
+
+h5 {
+  font-size: 1.15rem;
+}
+
+h6 {
+  font-size: 1rem;
+}
+
+.s7 h6 {
+  font-size: 0.95rem;
+}
+
+.s8 h6 {
+  font-size: 0.9rem;
+}
+
+p {
+  margin: 1.15rem 0;
+  clear: both;
+}
+
+p code,
+article ul code {
+  background: @back2Color;
+  border: 1px solid @borderColor;
+  padding: 0.05em 0.3em;
+  border-radius: 0.25rem;
+  text-decoration-color: transparent;
+}
+
+.table {
+  margin: 1rem 0 2rem;
+  overflow: auto;
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+
+    &.fixed {
+      table-layout: fixed;
+    }
+
+    th,
+    td {
+      line-height: 1.6rem;
+      padding: 0.35rem 0.6rem;
+      vertical-align: top;
+
+      &.right {
+        text-align: right;
+      }
+    }
+
+    p {
+      margin: 0;
+    }
+
+    th {
+      font-weight: 720;
+      text-align: left;
+    }
+  }
+}
+
+iframe {
+  margin: 1rem 0 2rem;
+  width: 100%;
+  height: 24rem;
+}

@@ -1,0 +1,158 @@
+.glow() {
+  background: @glowColor;
+  border-radius: 50%;
+  content: '';
+  filter: blur(4rem);
+  height: 120%;
+  left: -10%;
+  position: absolute;
+  top: -10%;
+  width: 120%;
+  z-index: -1;
+}
+
+body > main > article#home {
+  display: grid;
+  grid-auto-rows: max-content;
+  grid-auto-flow: dense;
+  row-gap: 2rem;
+  padding: 2rem;
+  z-index: 0;
+
+  > .home-wordmark {
+    color: @text2Color;
+    font-size: 3rem;
+    font-weight: 800;
+    margin: 0 auto;
+    position: relative;
+    text-align: center;
+
+    &::before {
+      .glow();
+    }
+
+    span,
+    em {
+      position: relative;
+    }
+
+    em {
+      color: @accentColor;
+      font-style: normal;
+    }
+  }
+
+  > section#hero {
+    display: grid;
+    max-width: 40rem;
+    margin: auto;
+
+    h2 {
+      font-size: 3rem;
+      font-weight: 800;
+      line-height: 3.6rem;
+      margin: 0;
+      text-align: center;
+
+      em {
+        color: @accentColor;
+        font-style: normal;
+        white-space: nowrap;
+      }
+    }
+
+    p {
+      margin: 1rem 0 0;
+      text-align: center;
+    }
+  }
+
+  > p {
+    margin: 0;
+
+    > a {
+      display: block;
+      font-size: 1.4rem;
+      color: @text2Color;
+      font-weight: 800;
+      background: @back2Color;
+      border: 1px solid @borderColor;
+      padding: 1rem;
+      text-align: center;
+      border-radius: 0.25rem;
+      white-space: nowrap;
+      width: 16rem;
+      margin: -1rem auto;
+      text-decoration: none;
+      overflow: hidden;
+      text-overflow: ellipsis;
+
+      &:hover {
+        border-color: @accentColor;
+      }
+
+      &.start {
+        background: @accentColor;
+        color: @backColor;
+      }
+    }
+  }
+
+  h2,
+  pre,
+  .table {
+    height: fit-content;
+  }
+
+  pre {
+    box-shadow: @shadow;
+  }
+
+  > hr,
+  > hr ~ * {
+    width: min(100%, 50rem);
+    margin-right: auto;
+    margin-left: auto;
+  }
+}
+
+@media (min-width: 56rem) {
+  body > main > article#home {
+    grid-template-columns: repeat(6, 1fr);
+    padding: 4rem 8rem;
+    column-gap: 4rem;
+    row-gap: 3rem;
+
+    > .home-wordmark {
+      align-self: center;
+      font-size: 3.2rem;
+      grid-column-end: span 2;
+      grid-row: span 2;
+    }
+
+    > section#hero {
+      max-width: unset;
+      margin: unset;
+      grid-column-end: span 4;
+
+      h2,
+      p {
+        text-align: left;
+      }
+    }
+
+    > p {
+      grid-column-end: span 2;
+
+      > a {
+        position: relative;
+        width: unset;
+      }
+    }
+
+    > hr,
+    > hr ~ * {
+      grid-column: 1 / 7;
+    }
+  }
+}

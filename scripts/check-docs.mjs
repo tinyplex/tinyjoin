@@ -12,7 +12,8 @@ const requiredFiles = [
   'demos/index.html',
   'llms.txt',
   'llms-full.txt',
-  'style.css',
+  'css/index.css',
+  'js/site.js',
 ];
 
 export async function checkDocs(
@@ -48,7 +49,7 @@ export async function checkDocs(
       errors.push(`Malformed TinyDocs API autolink in ${sourcePath}`);
     }
 
-    for (const match of html.matchAll(/href="([^"]+)"/g)) {
+    for (const match of html.matchAll(/(?:href|src)="([^"]+)"/g)) {
       const href = match[1];
       if (
         href.startsWith('#') ||
