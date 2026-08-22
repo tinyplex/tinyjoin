@@ -1,0 +1,56 @@
+name: site
+
+on:
+  push:
+    branches: ['main']
+    paths:
+      - 'docs/**'
+      - 'site/**'
+      - 'src/@types/**'
+      - 'src/index.ts'
+      - 'src/worker/index.ts'
+      - 'scripts/build-definitions.mjs'
+      - 'scripts/check-docs.mjs'
+      - 'scripts/check-docs-fresh.mjs'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/site.yml'
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install documentation tools
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Check generated documentation
+        run: npm run check:docs:committed
+      - name: Setup Pages
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: docs
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5

@@ -1,0 +1,12 @@
+# TinyGres
+
+> TinyGres is a small PostgreSQL-shaped relational database that runs in a
+> dedicated browser Worker and stores data in memory or OPFS.
+
+- [Getting started](https://tinygres.org/guides/getting-started/)
+- [SQL compatibility](https://tinygres.org/guides/sql-compatibility/)
+- [API reference](https://tinygres.org/api/)
+- [Demos](https://tinygres.org/demos/)
+- [Release notes](https://tinygres.org/guides/releases/)
+- [Agent guide](https://tinygres.org/guides/agents-guide/)
+- [Repository](https://github.com/tinyplex/tinygres)

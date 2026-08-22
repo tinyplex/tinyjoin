@@ -274,7 +274,8 @@ export class Client {
 
   /**
    * Runs SQL against an isolated staged database and durably publishes all
-   * changes together when the callback succeeds.
+   * changes together when the callback succeeds, unless it explicitly rolls
+   * back.
    */
   transaction<Result>(
     callback: (transaction: Transaction) => Result | Promise<Result>,

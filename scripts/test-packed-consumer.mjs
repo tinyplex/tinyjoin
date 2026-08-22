@@ -23,6 +23,11 @@ const fixture = resolve(root, 'test/consumers/vite');
 const generatedRoot = await mkdtemp(
   join(tmpdir(), 'tinygres-packed-consumer-'),
 );
+const packageTestEnvironment = {
+  ...process.env,
+  npm_config_cache: resolve(generatedRoot, 'npm-cache'),
+  npm_config_update_notifier: 'false',
+};
 const packageDirectory = resolve(generatedRoot, 'package');
 const appDirectory = resolve(generatedRoot, 'app');
 const port = 43_117;
@@ -87,6 +92,11 @@ const installedManifest = JSON.parse(
 if (installedManifest.name !== 'tinygres') {
   throw new Error('The installed tarball is not the tinygres package');
 }
+if (installedManifest.types !== './@types/index.d.ts') {
+  throw new Error(
+    `The installed tarball has unexpected declarations: ${installedManifest.types}`,
+  );
+}
 for (const developmentField of ['private', 'scripts', 'devDependencies']) {
   if (developmentField in installedManifest) {
     throw new Error(
@@ -146,7 +156,7 @@ try {
     ],
     {
       cwd: appDirectory,
-      env: process.env,
+      env: packageTestEnvironment,
       stdio: ['ignore', 'pipe', 'pipe'],
     },
   );
@@ -225,7 +235,7 @@ function run(command, args, cwd) {
   const result = spawnSync(command, args, {
     cwd,
     encoding: 'utf8',
-    env: process.env,
+    env: packageTestEnvironment,
     maxBuffer: 20 * 1024 * 1024,
   });
   const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
@@ -286,26 +296,25 @@ function assertPackedFiles(packed) {
     ? packed.files.map((file) => file.path).sort()
     : [];
   const expected = [
+    '@types/index.d.ts',
+    '@types/worker/index.d.ts',
     'LICENSE',
     'README.md',
-    'client/client.d.ts',
+    'agents.md',
     'client/client.js',
-    'client/error.d.ts',
     'client/error.js',
     'client/rpc.js',
     'docs/sql.md',
-    'index.d.ts',
     'package.json',
     'index.js',
-    'protocol.d.ts',
     'protocol.js',
+    'releases.md',
     'wasm/tinygres_wasm.js',
     'wasm/tinygres_wasm_bg.wasm',
     'worker-opfs/tinygres_opfs_runtime.js',
     'worker/default-entry.js',
     'worker/engine.js',
     'worker/host.js',
-    'worker/index.d.ts',
     'worker/index.js',
     'worker/opfs-loader.js',
     'worker/page-device.js',

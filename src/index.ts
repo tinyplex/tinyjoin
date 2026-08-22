@@ -6,6 +6,7 @@ export type {
   DataDir,
   PreparedStatement,
   Transaction,
+  WorkerLike,
 } from './client/client.js';
 export {ClientError} from './client/error.js';
 export type {

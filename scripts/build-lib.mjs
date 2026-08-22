@@ -5,6 +5,7 @@ import {fileURLToPath} from 'node:url';
 
 import {build as viteBuild} from 'vite';
 
+import {buildDefinitions} from './build-definitions.mjs';
 import {requireWasmArtifacts} from './wasm-artifacts.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -28,6 +29,7 @@ if (compile.status !== 0) {
 
 await buildPrivateWorkerRuntime();
 await assertOpfsLoaderBoundary();
+await buildDefinitions(root, dist);
 
 const manifest = JSON.parse(
   await readFile(resolve(root, 'package.json'), 'utf8'),
@@ -36,14 +38,14 @@ delete manifest.private;
 delete manifest.scripts;
 delete manifest.devDependencies;
 
-manifest.types = './index.d.ts';
+manifest.types = './@types/index.d.ts';
 manifest.exports = {
   '.': {
-    types: './index.d.ts',
+    types: './@types/index.d.ts',
     import: './index.js',
   },
   './worker': {
-    types: './worker/index.d.ts',
+    types: './@types/worker/index.d.ts',
     import: './worker/index.js',
   },
   './package.json': './package.json',
@@ -54,9 +56,24 @@ await writeFile(
   `${JSON.stringify(manifest, null, 2)}\n`,
 );
 await copyFile(resolve(root, 'LICENSE'), resolve(dist, 'LICENSE'));
-await copyFile(resolve(root, 'README.md'), resolve(dist, 'README.md'));
+await copyPublicMarkdown();
 await mkdir(resolve(dist, 'docs'), {recursive: true});
-await copyFile(resolve(root, 'docs/sql.md'), resolve(dist, 'docs/sql.md'));
+await copyFile(
+  resolve(root, 'site/guides/3_sql_compatibility.md'),
+  resolve(dist, 'docs/sql.md'),
+);
+
+async function copyPublicMarkdown() {
+  const markdown = [
+    ['site/home/index.md', 'README.md', 'README.md'],
+    ['site/guides/7_releases.md', 'releases.md', 'releases.md'],
+    ['site/guides/6_agents.md', 'AGENTS.md', 'agents.md'],
+  ];
+  for (const [source, repositoryFile, packageFile] of markdown) {
+    await copyFile(resolve(root, source), resolve(root, repositoryFile));
+    await copyFile(resolve(root, source), resolve(dist, packageFile));
+  }
+}
 
 async function buildPrivateWorkerRuntime() {
   await buildOpfsRuntime();
@@ -83,7 +100,18 @@ async function buildPrivateWorkerRuntime() {
         : []),
     ]),
   );
-  await rm(resolve(dist, 'client/rpc.d.ts'), {force: true});
+  await Promise.all(
+    [
+      'index.d.ts',
+      'protocol.d.ts',
+      'client/client.d.ts',
+      'client/error.d.ts',
+      'client/rpc.d.ts',
+      'worker/index.d.ts',
+    ].map((declaration) =>
+      rm(resolve(dist, declaration), {force: true}),
+    ),
+  );
 }
 
 async function buildOpfsRuntime() {

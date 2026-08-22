@@ -1,4 +1,4 @@
-# TinyGres SQL compatibility
+# SQL compatibility
 
 TinyGres implements its own deliberately bounded, PostgreSQL-shaped SQL
 dialect. It is not PostgreSQL compiled to WebAssembly, a PostgreSQL server, or
@@ -39,26 +39,26 @@ const { rows } = await db.query<{ id: number; title: string }>(
 await db.close();
 ```
 
-`await create()` opens the Worker-backed database and resolves after
+Calling create() opens the Worker-backed database and resolves after
 initialization. With no argument, or `memory://`, storage is ephemeral. A named
 `opfs://database-name` data directory opts into persistent browser storage.
 The client also exposes read-only `ready`, `waitReady`, and `closed`
 properties.
 
-`query(sql, params?, options?)` executes one read or write statement with
-optional JSON-compatible `$1` parameters. `exec(sql, options?)` executes one or
+query(sql, params?, options?) executes one read or write statement with
+optional JSON-compatible `$1` parameters. exec(sql, options?) executes one or
 more statements without parameters as one implicit transaction and returns one
 result per statement. Both use `{rows, fields, affectedRows?, command?,
 rowCount?}` results; TinyGres adds `revision` and `tables`. `fields` contains
 ordered `{name, dataTypeID}` entries, including for empty typed results.
 `rowMode: "array"` returns values in that field order. The `sql` tagged template
-is a parameterizing form of `query()`. `rowMode` is the only query option
+is a parameterizing form of query(). `rowMode` is the only query option
 implemented today; parser, serializer, notice, parameter-type, and blob
 options are rejected. The tag accepts parameter values only and does not
 provide raw-SQL, identifier, or nested-template helpers.
-`close()` is asynchronous and idempotent.
+close() is asynchronous and idempotent.
 
-Interactive atomicity uses `transaction(callback)`, not SQL transaction
+Interactive atomicity uses transaction(callback), not SQL transaction
 statements:
 
 ```ts
@@ -101,17 +101,17 @@ await tasksByDone.close();
 await setTaskDone.close();
 ```
 
-`prepare<Row>(sql)` parses and retains one `SELECT`, aggregate, join, `INSERT`,
+prepare<Row>(sql) parses and retains one `SELECT`, aggregate, join, `INSERT`,
 `UPDATE`, or `DELETE` statement in the Worker. It rejects DDL, an empty string,
-and more than one statement. The returned `PreparedStatement<Row>` has
-`execute(params?, options?)`, asynchronous idempotent `close()`, and a read-only
-`closed` property. `execute()` returns the same `Results<Row>` shape as
-`query()` and accepts the same sole option, `rowMode`.
+and more than one statement. The returned PreparedStatement<Row> has
+execute(params?, options?), asynchronous idempotent close(), and a read-only
+`closed` property. execute() returns the same Results<Row> shape as
+query() and accepts the same sole option, `rowMode`.
 
 The prepared parameter count is the highest referenced `$n`. Every execution
 must provide exactly that many JSON-compatible values; a numbering gap still
 occupies a slot. Binding or execution failure leaves the handle open for a later
-valid execution. `exec()` remains parameter-free and is not a prepared-script
+valid execution. exec() remains parameter-free and is not a prepared-script
 API.
 
 Preparation retains parsed syntax and parameter positions, not a schema
@@ -122,20 +122,20 @@ ordinary current table, column, constraint, or type error and does not make the
 handle permanently stale. Consequently, `SELECT *` or `RETURNING *` can expose
 new fields after `ALTER TABLE ... ADD COLUMN`, including a new positional value
 in array row mode. Use an explicit projection when callers require a stable
-result shape. As with `query<Row>()`, the `Row` generic is a compile-time cast,
+result shape. As with query<Row>(), the Row generic is a compile-time cast,
 not runtime result validation.
 
 A prepared statement is session-local: it belongs to the client that created
 it, is not stored in OPFS, cannot be used by another client, and does not survive
-`db.close()` or a Worker restart. Prepare handles before entering a callback
+db.close() or a Worker restart. Prepare handles before entering a callback
 transaction. Inside the callback, use
-`tx.execute(statement, params?, options?)`; it accepts only an open statement
+tx.execute(statement, params?, options?); it accepts only an open statement
 from the same client and participates in the same staged commit or rollback as
-`tx.query()`. Direct `db.prepare()`, `statement.execute()`, and
-`statement.close()` calls are blocked while that client's transaction callback
+tx.query(). Direct db.prepare(), statement.execute(), and
+statement.close() calls are blocked while that client's transaction callback
 is active.
 
-Calling `statement.close()` seals it immediately, rejects new executions, waits
+Calling statement.close() seals it immediately, rejects new executions, waits
 for executions that already started, and then releases its Worker resources.
 Concurrent close calls share the same cleanup, and a cleanup failure does not
 reopen the handle. Closing the database seals and releases every remaining
@@ -181,13 +181,13 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 | `DELETE FROM ... [WHERE ...]` | Narrow | Optional `RETURNING`. No `DELETE ... USING`. |
 | `RETURNING` | Narrow | `*` or a list of plain columns; no expressions or aliases. |
 | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT` | No | Use the JavaScript callback transaction API. |
-| `PREPARE`, `EXECUTE`, `DEALLOCATE` | No | SQL-level named statements are not implemented. Use the session-local JavaScript `prepare()` handle and its `execute()`/`close()` methods. |
+| `PREPARE`, `EXECUTE`, `DEALLOCATE` | No | SQL-level named statements are not implemented. Use the session-local JavaScript prepare() handle and its execute()/close() methods. |
 | `COPY`, `TRUNCATE`, `EXPLAIN`, `VACUUM`, `ANALYZE` | No | No server maintenance or bulk-file SQL commands. |
 
-`query()` accepts exactly one statement, with one optional trailing semicolon.
-`prepare()` has the same one-statement and ordinary SQL text/token limits, but
+query() accepts exactly one statement, with one optional trailing semicolon.
+prepare() has the same one-statement and ordinary SQL text/token limits, but
 accepts only the read and row-mutation statement families listed above.
-`exec()` splits only top-level semicolons: strings, quoted identifiers, line
+exec() splits only top-level semicolons: strings, quoted identifiers, line
 comments, nested block comments, and parentheses cannot accidentally terminate
 a statement. A script contains at most 256 statements and 1 MiB of SQL text;
 each statement retains the ordinary parser limits below.
@@ -314,16 +314,16 @@ table's references.
 
 ## Transactions and concurrency
 
-Each `query()` or standalone prepared-statement write is atomic. A standalone
-`exec()` script runs its supported reads, DDL, and DML against one page candidate
+Each query() or standalone prepared-statement write is atomic. A standalone
+exec() script runs its supported reads, DDL, and DML against one page candidate
 and publishes one durable generation only after every statement succeeds. A
 callback transaction stages `INSERT`, `UPDATE`, and `DELETE` statements,
-including through `tx.execute()`, exposes those staged rows to reads through its
+including through tx.execute(), exposes those staged rows to reads through its
 transaction object, and publishes the complete result once.
-`transaction.exec()` may group DML and reads as an atomic savepoint within that
+transaction.exec() may group DML and reads as an atomic savepoint within that
 staged transaction: a failure installs none of that script's changes. DDL is
 rejected before any statement in a transaction script runs and must use a
-standalone `query()` or `exec()` call.
+standalone query() or exec() call.
 
 If a transaction statement fails, that statement installs no partial change,
 but the transaction is not put into PostgreSQL's aborted state. If the callback
@@ -371,9 +371,9 @@ rather than growing without bound.
 | JSON nesting | 64 levels |
 | SQL text / tokens / parameters | 64 KiB / 4,096 / 1,024 |
 | Open prepared statements / retained prepared state | 128 / 8 MiB per open database |
-| `exec()` script text / statements | 1 MiB / 256 |
-| `exec()` row, index, scan, and join operations | 1,000,000 across the script |
-| `exec()` retained result work | 16 MiB across the script |
+| exec() script text / statements | 1 MiB / 256 |
+| exec() row, index, scan, and join operations | 1,000,000 across the script |
+| exec() retained result work | 16 MiB across the script |
 | Predicate nodes / nesting / `IN` values | 256 / 32 / 1,024 |
 | Rows in one `INSERT ... VALUES` | 4,096 |
 | Explicit `LIMIT` / `OFFSET` / `OFFSET + LIMIT` | 100,000 / 4,294,967,295 / 4,294,967,295 |
