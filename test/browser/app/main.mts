@@ -1,9 +1,4 @@
-import {
-  Client,
-  create,
-  type ChangeBatch,
-  type TableSchema,
-} from '../../../dist/index.js';
+import {Client, create} from '../../../dist/index.js';
 
 type Post = {
   id: number;
@@ -11,32 +6,6 @@ type Post = {
   author: string;
   published: boolean;
 };
-
-const postsSchema = {
-  name: 'posts',
-  primaryKey: ['id'],
-} satisfies TableSchema;
-
-const initialPosts: Post[] = [
-  {
-    id: 1,
-    title: 'The worker owns the database',
-    author: 'Ada',
-    published: true,
-  },
-  {
-    id: 2,
-    title: 'Queries stay off the main thread',
-    author: 'Linus',
-    published: true,
-  },
-  {
-    id: 3,
-    title: 'Drafts remain filtered locally',
-    author: 'Grace',
-    published: false,
-  },
-];
 
 const stateElement = element<HTMLElement>('[data-testid="state"]');
 const revisionElement = element<HTMLElement>('[data-testid="revision"]');
@@ -55,8 +24,19 @@ let invalidations = 0;
 let simulatedChanges = 0;
 
 async function boot(): Promise<void> {
-  const database = await create({schemas: [postsSchema]});
-  await database.replaceTable(postsSchema, initialPosts);
+  const database = await create();
+  await database.exec(`
+    CREATE TABLE posts (
+      id INTEGER PRIMARY KEY,
+      title TEXT NOT NULL,
+      author TEXT NOT NULL,
+      published BOOLEAN NOT NULL
+    );
+    INSERT INTO posts (id, title, author, published) VALUES
+      (1, 'The worker owns the database', 'Ada', true),
+      (2, 'Queries stay off the main thread', 'Linus', true),
+      (3, 'Drafts remain filtered locally', 'Grace', false);
+  `);
   await renderQuery(database);
 
   const unsubscribe = database.subscribe({tables: ['posts']}, (event) => {
@@ -71,23 +51,12 @@ async function boot(): Promise<void> {
   applyButton.addEventListener('click', async () => {
     applyButton.disabled = true;
     simulatedChanges += 1;
-    const batch = {
-      changes: [
-        {
-          type: 'upsert',
-          table: 'posts',
-          row: {
-            id: 2,
-            title: `Worker invalidation #${simulatedChanges}`,
-            author: 'Linus',
-            published: true,
-          },
-        },
-      ],
-    } satisfies ChangeBatch;
 
     try {
-      await database.applyBatch(batch);
+      await database.query('UPDATE posts SET title = $1 WHERE id = $2', [
+        `Worker invalidation #${simulatedChanges}`,
+        2,
+      ]);
     } catch (error) {
       showError(error);
     } finally {
@@ -240,7 +209,7 @@ async function writableDatabaseProbe(databaseName: string): Promise<{
   scriptTableCode: string;
   stagedRows: Array<{done: boolean; id: number; title: string}>;
 }> {
-  const connection = openOpfsClient(databaseName, []);
+  const connection = openOpfsClient(databaseName);
   const events: Array<{revision: number; tables: string[]}> = [];
   const unsubscribe = connection.client.subscribe({}, (event) => {
     events.push(structuredClone(event));
@@ -347,16 +316,6 @@ async function writableDatabaseProbe(databaseName: string): Promise<{
        ORDER BY done DESC, id DESC LIMIT 2 OFFSET 1`,
       [1, 'missing'],
     );
-    const built = await connection.client
-      .from<{done: boolean; id: number; title: string}>('tasks')
-      .select('id, title, done')
-      .gte('id', 1)
-      .order('done', {ascending: false})
-      .order('id', {ascending: false})
-      .range(1, 2);
-    if (built.error || JSON.stringify(built.data) !== JSON.stringify(ordered.rows)) {
-      throw built.error ?? new Error('Structured query did not match SQL query');
-    }
     const aggregateRows = await connection.client.query<{
       done: boolean;
       task_count: number;
@@ -369,7 +328,7 @@ async function writableDatabaseProbe(databaseName: string): Promise<{
     unsubscribe();
     await connection.client.close();
 
-    const reopened = openOpfsClient(databaseName, []);
+    const reopened = openOpfsClient(databaseName);
     try {
       await reopened.client.waitReady;
       const result = await reopened.client.query<{
@@ -580,7 +539,6 @@ async function persistenceProbe(
   rowCount: number,
 ): Promise<{
   crashReopenMs: number;
-  conflictErrorCode: string;
   differentNameOpened: boolean;
   emptyTableRows: number;
   gracefulReopenMs: number;
@@ -594,10 +552,6 @@ async function persistenceProbe(
   if (!Number.isSafeInteger(rowCount) || rowCount < 1 || rowCount > 10_000) {
     throw new TypeError('Persistence row count must be between 1 and 10,000');
   }
-  const emptySchema = {
-    name: 'empty_table',
-    primaryKey: ['id'],
-  } satisfies TableSchema;
   const rows = Array.from({length: rowCount}, (_, id) => ({
     id,
     title: `Persisted post ${id}`,
@@ -606,20 +560,18 @@ async function persistenceProbe(
     body: `Bounded persistence fixture ${id} ${'x'.repeat(64)}`,
   }));
 
-  let first: ReturnType<typeof openOpfsClient> | undefined = openOpfsClient(
-    databaseName,
-    [postsSchema, emptySchema],
-  );
+  let first: ReturnType<typeof openOpfsClient> | undefined =
+    openOpfsClient(databaseName);
   let reopened: ReturnType<typeof openOpfsClient> | undefined;
   let afterCrash: ReturnType<typeof openOpfsClient> | undefined;
-  let conflicting: ReturnType<typeof openOpfsClient> | undefined;
   try {
     await first.client.waitReady;
+    await createPersistenceTables(first.client);
     const commitStartedAt = performance.now();
-    await first.client.replaceTable(postsSchema, rows);
+    await insertPersistencePosts(first.client, rows);
     const initialCommitMs = performance.now() - commitStartedAt;
 
-    const competing = openOpfsClient(databaseName, []);
+    const competing = openOpfsClient(databaseName);
     let lockErrorCode = '';
     try {
       await competing.client.waitReady;
@@ -629,28 +581,16 @@ async function persistenceProbe(
       competing.worker.terminate();
     }
 
-    const independent = openOpfsClient(`${databaseName}-independent`, []);
+    const independent = openOpfsClient(`${databaseName}-independent`);
     await independent.client.waitReady;
     await independent.client.close();
 
     await first.client.close();
     first = undefined;
 
-    conflicting = openOpfsClient(databaseName, [
-      {name: 'posts', primaryKey: ['slug']},
-    ]);
-    let conflictErrorCode = '';
-    try {
-      await conflicting.client.waitReady;
-    } catch (error) {
-      conflictErrorCode = errorCode(error);
-    }
-
     const reopenStartedAt = performance.now();
-    reopened = openOpfsClient(databaseName, []);
+    reopened = openOpfsClient(databaseName);
     await reopened.client.waitReady;
-    conflicting.worker.terminate();
-    conflicting = undefined;
     const gracefulReopenMs = performance.now() - reopenStartedAt;
     const restored = await reopened.client.query<{
       id: number;
@@ -659,15 +599,10 @@ async function persistenceProbe(
     const empty = await reopened.client.query('SELECT * FROM empty_table');
 
     const mutationStartedAt = performance.now();
-    await reopened.client.applyBatch({
-      changes: [
-        {
-          type: 'upsert',
-          table: 'posts',
-          row: {...rows[0]!, title: 'Persisted after forced termination'},
-        },
-      ],
-    });
+    await reopened.client.query('UPDATE posts SET title = $1 WHERE id = $2', [
+      'Persisted after forced termination',
+      rows[0]!.id,
+    ]);
     const mutationCommitMs = performance.now() - mutationStartedAt;
     reopened.worker.terminate();
     reopened = undefined;
@@ -682,7 +617,6 @@ async function persistenceProbe(
 
     const report = {
       crashReopenMs,
-      conflictErrorCode,
       differentNameOpened: true,
       emptyTableRows: empty.rows.length,
       gracefulReopenMs,
@@ -697,7 +631,7 @@ async function persistenceProbe(
     afterCrash = undefined;
     return report;
   } finally {
-    for (const connection of [first, reopened, afterCrash, conflicting]) {
+    for (const connection of [first, reopened, afterCrash]) {
       if (connection) {
         connection.worker.terminate();
       }
@@ -705,7 +639,52 @@ async function persistenceProbe(
   }
 }
 
-function openOpfsClient(databaseName: string, schemas: TableSchema[]) {
+async function createPersistenceTables(database: Client): Promise<void> {
+  await database.exec(`
+    CREATE TABLE posts (
+      id INTEGER PRIMARY KEY,
+      title TEXT NOT NULL,
+      author TEXT NOT NULL,
+      published BOOLEAN NOT NULL,
+      body TEXT NOT NULL
+    );
+    CREATE TABLE empty_table (
+      id INTEGER PRIMARY KEY
+    );
+  `);
+}
+
+async function insertPersistencePosts(
+  database: Client,
+  rows: ReadonlyArray<Post & {body: string}>,
+): Promise<void> {
+  const columnsPerRow = 5;
+  const rowsPerStatement = Math.floor(1_024 / columnsPerRow);
+  await database.transaction(async (transaction) => {
+    for (let start = 0; start < rows.length; start += rowsPerStatement) {
+      const chunk = rows.slice(start, start + rowsPerStatement);
+      const params = chunk.flatMap((row) => [
+        row.id,
+        row.title,
+        row.author,
+        row.published,
+        row.body,
+      ]);
+      const values = chunk
+        .map((_, index) => {
+          const first = index * columnsPerRow + 1;
+          return `($${first}, $${first + 1}, $${first + 2}, $${first + 3}, $${first + 4})`;
+        })
+        .join(', ');
+      await transaction.query(
+        `INSERT INTO posts (id, title, author, published, body) VALUES ${values}`,
+        params,
+      );
+    }
+  });
+}
+
+function openOpfsClient(databaseName: string) {
   const worker = new Worker(
     new URL('../../../dist/worker/default-entry.js', import.meta.url),
     {name: `tinygres-${databaseName}`, type: 'module'},
@@ -713,7 +692,6 @@ function openOpfsClient(databaseName: string, schemas: TableSchema[]) {
   return {
     client: new Client({
       worker,
-      schemas,
       dataDir: `opfs://${databaseName}`,
     }),
     worker,
@@ -724,7 +702,7 @@ async function reopenAfterTermination(databaseName: string) {
   const deadline = performance.now() + 3_000;
   let lastError: unknown;
   while (performance.now() < deadline) {
-    const connection = openOpfsClient(databaseName, []);
+    const connection = openOpfsClient(databaseName);
     try {
       await connection.client.waitReady;
       return connection;
@@ -760,27 +738,22 @@ async function writeBrowserRestartFixture(
   if (!Number.isSafeInteger(rowCount) || rowCount < 1 || rowCount > 10_000) {
     throw new TypeError('Browser restart row count must be between 1 and 10,000');
   }
-  const emptySchema = {
-    name: 'empty_table',
-    primaryKey: ['id'],
-  } satisfies TableSchema;
-  browserRestartConnection = openOpfsClient(databaseName, [
-    postsSchema,
-    emptySchema,
-  ]);
+  browserRestartConnection = openOpfsClient(databaseName);
   await browserRestartConnection.client.waitReady;
-  const outcome = await browserRestartConnection.client.replaceTable(
-    postsSchema,
+  await createPersistenceTables(browserRestartConnection.client);
+  await insertPersistencePosts(
+    browserRestartConnection.client,
     Array.from({length: rowCount}, (_, id) => ({
       id,
       title: `Browser restart post ${id}`,
       author: `Author ${id % 17}`,
       published: id % 2 === 0,
+      body: `Browser restart fixture ${id}`,
     })),
   );
   // Deliberately leave the Worker and sync handles open. The browser process
   // shutdown is responsible for releasing them before the next launch.
-  return {revision: outcome.revision};
+  return {revision: browserRestartConnection.client.getRevision()};
 }
 
 async function readBrowserRestartFixture(databaseName: string): Promise<{
@@ -788,7 +761,7 @@ async function readBrowserRestartFixture(databaseName: string): Promise<{
   revision: number;
   rowCount: number;
 }> {
-  const connection = openOpfsClient(databaseName, []);
+  const connection = openOpfsClient(databaseName);
   try {
     await connection.client.waitReady;
     const posts = await connection.client.query('SELECT * FROM posts');

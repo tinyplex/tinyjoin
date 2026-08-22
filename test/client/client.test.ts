@@ -10,10 +10,6 @@ import {PROTOCOL_VERSION, type WorkerRequest} from '../../src/protocol.ts';
 import {FakeWorker} from '../helpers/fake-worker.ts';
 
 const ID_FIELD = [{name: 'id', dataTypeID: 20}];
-const POST_FIELDS = [
-  {name: 'id', dataTypeID: 20},
-  {name: 'title', dataTypeID: 25},
-];
 
 function respondingWorker(): FakeWorker {
   const worker = new FakeWorker();
@@ -21,12 +17,6 @@ function respondingWorker(): FakeWorker {
     queueMicrotask(() => {
       if (message.method === 'init') {
         respondOk(worker, message, {revision: 0});
-      } else if (message.method === 'query') {
-        respondOk(worker, message, {
-          revision: 2,
-          rows: [{id: 1, title: 'hello'}],
-          fields: POST_FIELDS,
-        });
       } else if (message.method === 'close') {
         respondOk(worker, message, undefined);
       }
@@ -126,20 +116,8 @@ function writableWorker(): FakeWorker {
       } else if (message.method === 'commitTransaction') {
         revision += 1;
         respondOk(worker, message, {revision, tables: ['posts']});
-      } else if (
-        message.method === 'replaceTable' ||
-        message.method === 'applyBatch'
-      ) {
-        revision += 1;
-        respondOk(worker, message, {revision, tables: ['posts']});
       } else if (message.method === 'rollbackTransaction') {
         respondOk(worker, message, undefined);
-      } else if (message.method === 'query') {
-        respondOk(worker, message, {
-          revision,
-          rows: [{id: 1, title: 'hello'}],
-          fields: POST_FIELDS,
-        });
       } else if (message.method === 'close') {
         respondOk(worker, message, undefined);
       }
@@ -281,30 +259,6 @@ describe('Client', () => {
       expect(worker.terminated).toBe(true);
     },
   );
-
-  it('supports an awaitable fluent query chain', async () => {
-    const worker = respondingWorker();
-    const client = new Client({worker});
-
-    const response = await client
-      .from<{id: number; title: string}>('posts')
-      .select('id, title')
-      .eq('id', 1);
-
-    expect(response).toEqual({
-      data: [{id: 1, title: 'hello'}],
-      error: null,
-      revision: 2,
-    });
-    expect(
-      (worker.posted[1] as Extract<WorkerRequest, {method: 'query'}>).params
-        .plan,
-    ).toEqual({
-      table: 'posts',
-      columns: ['id', 'title'],
-      filters: [{column: 'id', operator: 'eq', value: 1}],
-    });
-  });
 
   it('uses query for parameterized reads and writes with SQL results', async () => {
     const worker = writableWorker();
@@ -783,23 +737,6 @@ describe('Client', () => {
     await client.close();
   });
 
-  it('tracks revisions returned by non-SQL bulk writes', async () => {
-    const worker = writableWorker();
-    const client = await create({worker});
-
-    await expect(
-      client.replaceTable({name: 'posts', primaryKey: ['id']}, [{id: 1}]),
-    ).resolves.toEqual({revision: 1, tables: ['posts']});
-    expect(client.getRevision()).toBe(1);
-    await expect(
-      client.applyBatch({
-        changes: [{type: 'delete', table: 'posts', key: {id: 1}}],
-      }),
-    ).resolves.toEqual({revision: 2, tables: ['posts']});
-    expect(client.getRevision()).toBe(2);
-    await client.close();
-  });
-
   it('rejects unsupported options before executing SQL', async () => {
     const worker = writableWorker();
     const client = await create({worker});
@@ -854,27 +791,26 @@ describe('Client', () => {
         'INSERT INTO posts (id) VALUES ($1)',
         [9],
       );
-      const selected = await transaction
-        .from<{id: number}>('posts')
-        .select('id')
-        .eq('id', 9);
+      const selected = await transaction.query<{id: number}>(
+        'SELECT id FROM posts WHERE id = $1',
+        [9],
+      );
       await pendingInsert;
-      return selected.data?.[0]?.id;
+      return selected.rows[0]?.id;
     });
 
-    expect(value).toBe(1);
+    expect(value).toBe(9);
     expect(escaped!.closed).toBe(true);
     const transactionRequests = (worker.posted as WorkerRequest[]).filter(
       (message) =>
         message.method === 'beginTransaction' ||
         message.method === 'executeSql' ||
-        message.method === 'query' ||
         message.method === 'commitTransaction',
     );
     expect(transactionRequests.map((message) => message.method)).toEqual([
       'beginTransaction',
       'executeSql',
-      'query',
+      'executeSql',
       'commitTransaction',
     ]);
     expect(

@@ -33,7 +33,6 @@ interface Window {
       rowCount: number,
     ): Promise<{
       crashReopenMs: number;
-      conflictErrorCode: string;
       differentNameOpened: boolean;
       emptyTableRows: number;
       gracefulReopenMs: number;

@@ -71,34 +71,6 @@ impl WasmEngine {
         }
         self.ensure_available()?;
         match operation {
-            structured::OP_DEFINE_TABLES => {
-                let schemas: Vec<structured::BridgeTableSchema> = structured::decode(payload)?;
-                let schemas = schemas.into_iter().map(Into::into).collect();
-                let committed = self.engine_mut()?.define_tables_with_publication(schemas)?;
-                self.encode_committed(structured::unit(committed), committed)
-            }
-            structured::OP_REPLACE_SNAPSHOT => {
-                let request: structured::ReplaceSnapshotRequest = structured::decode(payload)?;
-                let previous_revision = self.engine()?.revision();
-                let outcome = self
-                    .engine_mut()?
-                    .replace_table_snapshot(request.schema.into(), request.rows)?;
-                let committed = outcome.revision != previous_revision;
-                self.encode_committed(structured::apply_outcome(&outcome, committed), committed)
-            }
-            structured::OP_APPLY_BATCH => {
-                let batch = structured::decode(payload)?;
-                let previous_revision = self.engine()?.revision();
-                let outcome = self.engine_mut()?.apply_batch(&batch)?;
-                let committed = outcome.revision != previous_revision;
-                self.encode_committed(structured::apply_outcome(&outcome, committed), committed)
-            }
-            structured::OP_QUERY => {
-                let plan: structured::BridgeQueryPlan = structured::decode(payload)?;
-                let plan = plan.into();
-                let result = self.engine()?.query(&plan)?;
-                structured::query_result(&result)
-            }
             structured::OP_EXECUTE_SQL => {
                 let request: structured::ExecuteSqlRequest = structured::decode(payload)?;
                 let was_in_transaction = self.engine()?.in_transaction();

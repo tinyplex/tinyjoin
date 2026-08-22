@@ -1,14 +1,10 @@
 import {existsSync, readFileSync} from 'node:fs';
-import {pathToFileURL} from 'node:url';
 import {resolve} from 'node:path';
+import {pathToFileURL} from 'node:url';
 
 import {describe, expect, it} from 'vitest';
 
-import type {
-  JsonValue,
-  QueryPlan,
-  TableSchema,
-} from '../../src/protocol.js';
+import type {JsonValue} from '../../src/protocol.js';
 import type {PageDevice} from '../../src/worker/page-device.js';
 import {
   WASM_OPERATION,
@@ -17,6 +13,7 @@ import {
   type RawStructuredWasmEngineConstructor,
 } from '../../src/worker/wasm-bridge.js';
 
+const BRIDGE_VERSION = 2;
 const artifactDirectory =
   process.env.TINYGRES_PAGED_WASM_DIR ?? resolve('dist/wasm');
 const artifactModule = `${artifactDirectory}/tinygres_wasm.js`;
@@ -32,15 +29,6 @@ type StructuredCall = {
   operation: number;
   payload: unknown;
   response: unknown;
-};
-
-type TypedTableSchema = TableSchema & {
-  columns: Array<{
-    name: string;
-    dataType: 'boolean' | 'integer' | 'float' | 'text' | 'json';
-    nullable?: boolean;
-    default?: JsonValue;
-  }>;
 };
 
 class RecordingStructuredEngine implements RawStructuredWasmEngine {
@@ -107,45 +95,23 @@ const runIfArtifactExists =
     : describe.skip;
 
 runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
-  it('round-trips every direct structured operation against the real WASM artifact', async () => {
+  it('round-trips every SQL-first operation against the real WASM artifact', async () => {
     const wasm = await loadStructuredModule();
     const device = new MemoryPageDevice();
     const {engine, recording} = createRecordingEngine(wasm, device);
-    const schema: TypedTableSchema = {
-      name: 'items',
-      primaryKey: ['id'],
-      columns: [
-        {name: 'id', dataType: 'integer', nullable: false},
-        {
-          name: 'title',
-          dataType: 'text',
-          nullable: false,
-          default: 'typed-default',
-        },
-        {
-          name: 'payload',
-          dataType: 'json',
-          nullable: undefined,
-          default: undefined,
-        } as unknown as TypedTableSchema['columns'][number],
-      ],
-    };
-    const schemas = [
-      schema as TableSchema,
-      {
-        name: 'untyped_items',
-        primaryKey: ['id'],
-        columns: undefined,
-      } as unknown as TableSchema,
-    ];
 
-    engine.defineTables(schemas);
-    expectRequest(recording, WASM_OPERATION.defineTables).toBe(schemas);
-    expectDisposition(recording, WASM_OPERATION.defineTables, 'durable');
-
-    // Repeating an identical definition is a no-op and therefore SAFE.
-    engine.defineTables(schemas);
-    expectDisposition(recording, WASM_OPERATION.defineTables, 'safe');
+    const schemaSql = `CREATE TABLE items (
+      id INTEGER PRIMARY KEY,
+      title TEXT NOT NULL DEFAULT 'typed-default',
+      payload JSONB
+    )`;
+    const created = engine.execSql(schemaSql);
+    expectRequest(recording, WASM_OPERATION.execSql).toBe(schemaSql);
+    expect(created).toBe(
+      responsePayload(lastCall(recording, WASM_OPERATION.execSql)),
+    );
+    expect(created[0]?.command).toBe('CREATE TABLE');
+    expectDisposition(recording, WASM_OPERATION.execSql, 'durable');
 
     const protoValue = {
       ['__proto__']: 'data',
@@ -158,94 +124,58 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
       ],
     } satisfies JsonValue;
     expect(Object.hasOwn(protoValue, '__proto__')).toBe(true);
-    const batch = {
-      changes: [
-        {
-          type: 'upsert' as const,
-          table: 'items',
-          row: {id: 1, payload: protoValue},
-        },
-      ],
-    };
-    const applied = engine.applyBatch(batch);
-    const applyCall = lastCall(recording, WASM_OPERATION.applyBatch);
-    expect(applyCall.payload).toBe(batch);
-    expect(applied).toBe(responsePayload(applyCall));
-    expect(applied.tables).toEqual(['items']);
-    expectDisposition(recording, WASM_OPERATION.applyBatch, 'durable');
+    const insertParams = [1, protoValue] satisfies JsonValue[];
+    const inserted = engine.executeSql(
+      'INSERT INTO items (id, payload) VALUES ($1, $2)',
+      insertParams,
+    );
+    const insertCall = lastCall(recording, WASM_OPERATION.executeSql);
+    expect((insertCall.payload as {params: JsonValue[]}).params).toBe(
+      insertParams,
+    );
+    expect(inserted).toBe(responsePayload(insertCall));
+    expectDisposition(recording, WASM_OPERATION.executeSql, 'durable');
 
-    const plan: QueryPlan = {
-      table: 'items',
-      columns: ['id', 'title', 'payload'],
-      filters: [{column: 'id', operator: 'eq', value: 1}],
-      orderBy: [{column: 'id', direction: 'desc', nulls: 'last'}],
-      limit: 1,
-      offset: 0,
-    };
-    const planned = engine.query(plan);
-    const queryCall = lastCall(recording, WASM_OPERATION.query);
-    expect(queryCall.payload).toBe(plan);
-    expect(planned).toBe(responsePayload(queryCall));
-    expectDisposition(recording, WASM_OPERATION.query, 'safe');
-    expect(planned.fields).toEqual([
+    const selected = engine.executeSql(
+      'SELECT id, title, payload FROM items WHERE id = $1',
+      [1],
+    );
+    expectDisposition(recording, WASM_OPERATION.executeSql, 'safe');
+    expect(selected.fields).toEqual([
       {name: 'id', dataTypeID: 20},
       {name: 'title', dataTypeID: 25},
       {name: 'payload', dataTypeID: 114},
     ]);
-    const plannedRow = planned.rows[0]!;
-    const plannedPayload = plannedRow.payload as Record<string, JsonValue>;
-    expect(Object.getPrototypeOf(plannedRow)).toBeNull();
-    expect(Object.getPrototypeOf(plannedPayload)).toBeNull();
-    expect(Object.hasOwn(plannedPayload, '__proto__')).toBe(true);
-    expect(plannedPayload.__proto__).toBe('data');
-    expect(Object.is(plannedPayload.signedZero, -0)).toBe(false);
-    const nested = plannedPayload.nested as JsonValue[];
+    const selectedRow = selected.rows[0]!;
+    const selectedPayload = selectedRow.payload as Record<string, JsonValue>;
+    expect(Object.getPrototypeOf(selectedRow)).toBeNull();
+    expect(Object.getPrototypeOf(selectedPayload)).toBeNull();
+    expect(Object.hasOwn(selectedPayload, '__proto__')).toBe(true);
+    expect(selectedPayload.__proto__).toBe('data');
+    expect(Object.is(selectedPayload.signedZero, -0)).toBe(false);
+    const nested = selectedPayload.nested as JsonValue[];
     const nestedRecord = nested[3] as Record<string, JsonValue>;
     expect(Object.getPrototypeOf(nestedRecord)).toBeNull();
     expect(Object.hasOwn(nestedRecord, '__proto__')).toBe(true);
     expect(nestedRecord.__proto__).toBe('nested-data');
 
-    expect(
-      engine.query(
-        {
-          table: 'items',
-          filters: [],
-          columns: undefined,
-          orderBy: undefined,
-          limit: undefined,
-          offset: undefined,
-        } as unknown as QueryPlan,
-      ).rows,
-    ).toHaveLength(1);
-
     engine.beginTransaction();
     expectDisposition(recording, WASM_OPERATION.begin, 'safe');
     expect(engine.inTransaction()).toBe(true);
-    const stagedParams = [
+    engine.executeSql('INSERT INTO items (id, title) VALUES ($1, $2)', [
       2,
-      'staged',
-      {nested: [true, null, 1.25]},
-    ] satisfies JsonValue[];
-    const staged = engine.executeSql(
-      'INSERT INTO items (id, title, payload) VALUES ($1, $2, $3)',
-      stagedParams,
-    );
-    const stagedCall = lastCall(recording, WASM_OPERATION.executeSql);
-    expect((stagedCall.payload as {params: JsonValue[]}).params).toBe(
-      stagedParams,
-    );
-    expect(staged).toBe(responsePayload(stagedCall));
+      'rolled back',
+    ]);
     expectDisposition(recording, WASM_OPERATION.executeSql, 'safe');
-    expect(
-      engine.executeSql('SELECT * FROM items ORDER BY id', []).rows,
-    ).toHaveLength(2);
     engine.rollbackTransaction();
     expectDisposition(recording, WASM_OPERATION.rollback, 'safe');
-    expect(engine.executeSql('SELECT * FROM items', []).rows).toHaveLength(1);
+    expect(
+      engine.executeSql('SELECT id FROM items WHERE id = $1', [2]).rows,
+    ).toHaveLength(0);
 
     engine.beginTransaction();
     engine.executeSql('INSERT INTO items (id, title) VALUES ($1, $2)', [
-      4,
+      3,
       'committed',
     ]);
     const committed = engine.commitTransaction();
@@ -257,7 +187,7 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
     const statementId = engine.prepareSql(preparedSql);
     expect(statementId).toBeGreaterThan(0);
     expectRequest(recording, WASM_OPERATION.prepareSql).toBe(preparedSql);
-    const preparedParams = [4] satisfies JsonValue[];
+    const preparedParams = [3] satisfies JsonValue[];
     const prepared = engine.executePrepared(statementId, preparedParams);
     const preparedCall = lastCall(
       recording,
@@ -288,27 +218,6 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
     expect(scripted).toHaveLength(2);
     expectDisposition(recording, WASM_OPERATION.execSql, 'safe');
 
-    const replacementRows = [
-      {
-        id: 3,
-        title: 'snapshot',
-        payload: {['__proto__']: 'replacement', wide: ['ok', 3]},
-      },
-    ];
-    const replacement = engine.replaceTableSnapshot(
-      schema as TableSchema,
-      replacementRows,
-    );
-    const replacementCall = lastCall(
-      recording,
-      WASM_OPERATION.replaceSnapshot,
-    );
-    expect((replacementCall.payload as {rows: unknown}).rows).toBe(
-      replacementRows,
-    );
-    expect(replacement).toBe(responsePayload(replacementCall));
-    expectDisposition(recording, WASM_OPERATION.replaceSnapshot, 'durable');
-
     const sqlError = captureError(() =>
       engine.executeSql('SELECT * FROM missing_table', []),
     );
@@ -326,9 +235,16 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
       ),
     ).toHaveLength(1);
     expectDisposition(recording, WASM_OPERATION.close, 'safe');
+    expect(
+      recording.calls.every(
+        ({bridgeVersion}) => bridgeVersion === BRIDGE_VERSION,
+      ),
+    ).toBe(true);
 
     const callCount = recording.calls.length;
-    const closedError = captureError(() => engine.query(plan));
+    const closedError = captureError(() =>
+      engine.executeSql('SELECT id FROM items', []),
+    );
     expect(closedError).toMatchObject({code: 'ENGINE_CLOSED'});
     expect(recording.calls).toHaveLength(callCount);
   });
@@ -397,7 +313,7 @@ function expectDisposition(
 ): void {
   const expectedTag = expected === 'durable' ? 1 : 0;
   const response = lastCall(engine, operation).response as unknown[];
-  expect(response.slice(0, 3)).toEqual([1, 0, expectedTag]);
+  expect(response.slice(0, 3)).toEqual([BRIDGE_VERSION, 0, expectedTag]);
 }
 
 function expectFailureDisposition(
@@ -405,7 +321,7 @@ function expectFailureDisposition(
   operation: number,
 ): void {
   const response = lastCall(engine, operation).response as unknown[];
-  expect(response.slice(0, 3)).toEqual([1, 1, 0]);
+  expect(response.slice(0, 3)).toEqual([BRIDGE_VERSION, 1, 0]);
 }
 
 function captureError(operation: () => unknown): unknown {

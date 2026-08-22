@@ -3,7 +3,6 @@ import {describe, expect, it, vi} from 'vitest';
 import {
   PROTOCOL_VERSION,
   isWorkerRequest,
-  type ApplyOutcome,
   type WorkerEvent,
   type WorkerRequest,
   type WorkerResponse,
@@ -50,22 +49,10 @@ function mockEngine() {
   let revision = 0;
   let transactionActive = false;
   const transactionTables = new Set<string>();
-  const outcome = (table: string): ApplyOutcome => ({
-    revision: ++revision,
-    tables: [table],
-  });
   const engine: WorkerEngine = {
-    defineTables: vi.fn(),
-    replaceTableSnapshot: vi.fn((schema) => outcome(schema.name)),
-    applyBatch: vi.fn((batch) => outcome(batch.changes[0]?.table ?? 'none')),
-    query: vi.fn(() => ({
-      revision,
-      fields: [{name: 'id', dataTypeID: 20}],
-      rows: [{id: 1}],
-    })),
     executeSql: vi.fn((sql) => {
       const command = sql.trim().split(/\s+/, 1)[0]!.toUpperCase();
-      const table = 'posts';
+      const table = /\busers\b/i.test(sql) ? 'users' : 'posts';
       if (transactionActive) {
         transactionTables.add(table);
       } else {
@@ -142,7 +129,7 @@ function mockEngine() {
       transactionTables.clear();
     }),
     inTransaction: vi.fn(() => transactionActive),
-    revision: () => revision,
+    revision: vi.fn(() => revision),
     close: vi.fn(),
   };
   return engine;
@@ -155,14 +142,13 @@ async function waitForPosted(scope: FakeScope, count: number): Promise<void> {
 }
 
 describe('startWorker', () => {
-  it('rejects unknown configuration and batch metadata at the protocol boundary', () => {
+  it('rejects unknown initialization and SQL metadata at the protocol boundary', () => {
     expect(
       isWorkerRequest({
         v: PROTOCOL_VERSION,
         id: 1,
         method: 'init',
         params: {
-          schemas: [],
           storage: {kind: 'memory'},
           integration: {kind: 'unknown'},
         },
@@ -172,25 +158,26 @@ describe('startWorker', () => {
       isWorkerRequest({
         v: PROTOCOL_VERSION,
         id: 2,
-        method: 'applyBatch',
-        params: {batch: {changes: [], metadata: 'unknown'}},
+        method: 'executeSql',
+        params: {sql: 'SELECT 1', params: [], metadata: 'unknown'},
       }),
     ).toBe(false);
     expect(
       isWorkerRequest({
         v: PROTOCOL_VERSION,
         id: 3,
-        method: 'applyBatch',
-        params: {batch: {changes: []}},
+        method: 'executeSql',
+        params: {sql: 'SELECT 1', params: []},
       }),
     ).toBe(true);
   });
 
-  it('initializes schemas before acknowledging readiness', async () => {
+  it('checks engine readiness before acknowledging initialization', async () => {
     const scope = new FakeScope();
     const engine = mockEngine();
-    vi.mocked(engine.defineTables).mockImplementation(() => {
+    vi.spyOn(engine, 'revision').mockImplementation(() => {
       expect(scope.posted).toHaveLength(0);
+      return 7;
     });
     startWorker({
       scope,
@@ -202,24 +189,26 @@ describe('startWorker', () => {
       id: 99,
       method: 'init',
       params: {
-        schemas: [{name: 'posts', primaryKey: ['id']}],
         storage: {kind: 'opfs', name: 'schema-init'},
       },
     } satisfies WorkerRequest);
     await waitForPosted(scope, 1);
 
-    expect(engine.defineTables).toHaveBeenCalledWith([
-      {name: 'posts', primaryKey: ['id']},
-    ]);
-    expect(scope.posted[0]).toMatchObject({id: 99, ok: true});
+    expect(engine.revision).toHaveBeenCalledOnce();
+    expect(scope.posted[0]).toEqual({
+      v: PROTOCOL_VERSION,
+      id: 99,
+      ok: true,
+      result: {revision: 7},
+    });
   });
 
-  it('closes the engine when schema initialization fails', async () => {
+  it('closes the engine when its readiness check fails', async () => {
     const scope = new FakeScope();
     const engine = mockEngine();
-    vi.mocked(engine.defineTables).mockImplementation(() => {
-      throw Object.assign(new Error('schema conflict'), {
-        code: 'INVALID_SCHEMA',
+    vi.spyOn(engine, 'revision').mockImplementation(() => {
+      throw Object.assign(new Error('recovery required'), {
+        code: 'RECOVERY_REQUIRED',
       });
     });
     startWorker({
@@ -232,7 +221,6 @@ describe('startWorker', () => {
       id: 100,
       method: 'init',
       params: {
-        schemas: [{name: 'posts', primaryKey: ['slug']}],
         storage: {kind: 'opfs', name: 'pending-failure'},
       },
     } satisfies WorkerRequest);
@@ -243,7 +231,7 @@ describe('startWorker', () => {
       v: PROTOCOL_VERSION,
       id: 100,
       ok: false,
-      error: {code: 'INVALID_SCHEMA', message: 'schema conflict'},
+      error: {code: 'RECOVERY_REQUIRED', message: 'recovery required'},
     });
   });
 
@@ -256,31 +244,31 @@ describe('startWorker', () => {
       v: PROTOCOL_VERSION,
       id: 1,
       method: 'init',
-      params: {
-        schemas: [{name: 'posts', primaryKey: ['id']}],
-        storage: {kind: 'memory'},
-      },
+      params: {storage: {kind: 'memory'}},
     } satisfies WorkerRequest);
     scope.send({
       v: PROTOCOL_VERSION,
       id: 2,
-      method: 'query',
-      params: {plan: {table: 'posts', filters: []}},
+      method: 'executeSql',
+      params: {sql: 'INSERT INTO posts (id) VALUES ($1)', params: [1]},
     } satisfies WorkerRequest);
     await waitForPosted(scope, 2);
 
-    expect(engine.defineTables).toHaveBeenCalledWith([
-      {name: 'posts', primaryKey: ['id']},
-    ]);
-    expect(engine.query).toHaveBeenCalledWith({table: 'posts', filters: []});
+    expect(engine.executeSql).toHaveBeenCalledWith(
+      'INSERT INTO posts (id) VALUES ($1)',
+      [1],
+    );
     expect(scope.posted).toContainEqual({
       v: PROTOCOL_VERSION,
       id: 2,
       ok: true,
       result: {
-        revision: 0,
-        fields: [{name: 'id', dataTypeID: 20}],
-        rows: [{id: 1}],
+        command: 'INSERT',
+        fields: [],
+        revision: 1,
+        rowCount: 1,
+        rows: [],
+        tables: ['posts'],
       },
     });
   });
@@ -294,7 +282,7 @@ describe('startWorker', () => {
       v: PROTOCOL_VERSION,
       id: 1,
       method: 'init',
-      params: {schemas: [], storage: {kind: 'memory'}},
+      params: {storage: {kind: 'memory'}},
     } satisfies WorkerRequest);
     await waitForPosted(scope, 1);
     scope.posted.length = 0;
@@ -302,20 +290,14 @@ describe('startWorker', () => {
     scope.send({
       v: PROTOCOL_VERSION,
       id: 2,
-      method: 'replaceTable',
-      params: {
-        schema: {name: 'posts', primaryKey: ['id']},
-        rows: [],
-      },
+      method: 'executeSql',
+      params: {sql: 'UPDATE posts SET id = id', params: []},
     } satisfies WorkerRequest);
     scope.send({
       v: PROTOCOL_VERSION,
       id: 3,
-      method: 'replaceTable',
-      params: {
-        schema: {name: 'users', primaryKey: ['id']},
-        rows: [],
-      },
+      method: 'executeSql',
+      params: {sql: 'UPDATE users SET id = id', params: []},
     } satisfies WorkerRequest);
     await waitForPosted(scope, 3);
 
@@ -340,7 +322,7 @@ describe('startWorker', () => {
       v: PROTOCOL_VERSION,
       id: 1,
       method: 'init',
-      params: {schemas: [], storage: {kind: 'memory'}},
+      params: {storage: {kind: 'memory'}},
     } satisfies WorkerRequest);
     await waitForPosted(scope, 1);
     scope.posted.length = 0;
@@ -442,7 +424,7 @@ describe('startWorker', () => {
       v: PROTOCOL_VERSION,
       id: 1,
       method: 'init',
-      params: {schemas: [], storage: {kind: 'memory'}},
+      params: {storage: {kind: 'memory'}},
     } satisfies WorkerRequest);
     await waitForPosted(scope, 1);
     scope.posted.length = 0;
@@ -552,7 +534,7 @@ describe('startWorker', () => {
       v: PROTOCOL_VERSION,
       id: 1,
       method: 'init',
-      params: {schemas: [], storage: {kind: 'memory'}},
+      params: {storage: {kind: 'memory'}},
     } satisfies WorkerRequest);
     await waitForPosted(scope, 1);
     scope.posted.length = 0;
@@ -606,7 +588,7 @@ describe('startWorker', () => {
       v: PROTOCOL_VERSION,
       id: 1,
       method: 'init',
-      params: {schemas: [], storage: {kind: 'memory'}},
+      params: {storage: {kind: 'memory'}},
     } satisfies WorkerRequest);
     scope.send({
       v: PROTOCOL_VERSION,
@@ -656,7 +638,7 @@ describe('startWorker', () => {
       v: PROTOCOL_VERSION,
       id: 1,
       method: 'init',
-      params: {schemas: [], storage: {kind: 'memory'}},
+      params: {storage: {kind: 'memory'}},
     } satisfies WorkerRequest);
     scope.send({
       v: PROTOCOL_VERSION,
@@ -710,7 +692,7 @@ describe('startWorker', () => {
       v: PROTOCOL_VERSION,
       id: 1,
       method: 'init',
-      params: {schemas: [], storage: {kind: 'memory'}},
+      params: {storage: {kind: 'memory'}},
     } satisfies WorkerRequest);
     scope.send({
       v: PROTOCOL_VERSION,
@@ -752,7 +734,7 @@ describe('startWorker', () => {
     const engine = mockEngine();
     startWorker({scope, durableEngineFactory: async () => engine});
 
-    scope.send({v: 99, id: 8, method: 'query', params: {}});
+    scope.send({v: 99, id: 8, method: 'removedMethod', params: {}});
     await waitForPosted(scope, 1);
 
     expect(scope.posted[0]).toEqual({
@@ -764,7 +746,7 @@ describe('startWorker', () => {
         message: 'The worker received an invalid TinyGres protocol request',
       },
     });
-    expect(engine.query).not.toHaveBeenCalled();
+    expect(engine.executeSql).not.toHaveBeenCalled();
   });
 
   it('rejects well-shaped methods with unsafe parameters', async () => {
@@ -775,8 +757,8 @@ describe('startWorker', () => {
     scope.send({
       v: PROTOCOL_VERSION,
       id: 9,
-      method: 'replaceTable',
-      params: {table: 'posts', rows: [{id: 1n}]},
+      method: 'executeSql',
+      params: {sql: 'SELECT $1', params: [1n]},
     });
     await waitForPosted(scope, 1);
 
@@ -785,7 +767,7 @@ describe('startWorker', () => {
       ok: false,
       error: {code: 'PROTOCOL_MISMATCH'},
     });
-    expect(engine.replaceTableSnapshot).not.toHaveBeenCalled();
+    expect(engine.executeSql).not.toHaveBeenCalled();
   });
 
   it('fails explicit OPFS initialization instead of falling back to memory', async () => {
@@ -802,7 +784,6 @@ describe('startWorker', () => {
       id: 10,
       method: 'init',
       params: {
-        schemas: [{name: 'posts', primaryKey: ['id']}],
         storage: {kind: 'opfs', name: 'unit-test'},
       },
     } satisfies WorkerRequest);
@@ -830,7 +811,6 @@ describe('startWorker', () => {
       id: 10,
       method: 'init',
       params: {
-        schemas: [{name: 'posts', primaryKey: ['id']}],
         storage: {kind: 'opfs', name: 'factory-owned'},
       },
     } satisfies WorkerRequest);
@@ -846,37 +826,7 @@ describe('startWorker', () => {
       kind: 'opfs',
       name: 'factory-owned',
     });
-    expect(engine.defineTables).toHaveBeenCalledOnce();
-  });
-
-  it('makes a failed initialization terminal and releases its engine', async () => {
-    const scope = new FakeScope();
-    const engine = mockEngine();
-    vi.mocked(engine.defineTables).mockImplementation(() => {
-      throw Object.assign(new Error('schema conflict'), {
-        code: 'INVALID_SCHEMA',
-      });
-    });
-    startWorker({scope, durableEngineFactory: async () => engine});
-
-    scope.send({
-      v: PROTOCOL_VERSION,
-      id: 11,
-      method: 'init',
-      params: {
-        schemas: [{name: 'posts', primaryKey: ['slug']}],
-        storage: {kind: 'memory'},
-      },
-    } satisfies WorkerRequest);
-    await vi.waitFor(() => expect(scope.closed).toBe(true));
-
-    expect(scope.posted).toContainEqual({
-      v: PROTOCOL_VERSION,
-      id: 11,
-      ok: false,
-      error: {code: 'INVALID_SCHEMA', message: 'schema conflict'},
-    });
-    expect(engine.close).toHaveBeenCalledOnce();
+    expect(engine.revision).toHaveBeenCalledOnce();
   });
 
   it('releases the existing engine when a second init changes storage', async () => {
@@ -887,7 +837,7 @@ describe('startWorker', () => {
       v: PROTOCOL_VERSION,
       id: 1,
       method: 'init',
-      params: {schemas: [], storage: {kind: 'memory'}},
+      params: {storage: {kind: 'memory'}},
     } satisfies WorkerRequest);
     await waitForPosted(scope, 1);
 
@@ -896,7 +846,6 @@ describe('startWorker', () => {
       id: 2,
       method: 'init',
       params: {
-        schemas: [],
         storage: {kind: 'opfs', name: 'different-storage'},
       },
     } satisfies WorkerRequest);
@@ -936,7 +885,7 @@ describe('startWorker', () => {
       v: PROTOCOL_VERSION,
       id: 1,
       method: 'init',
-      params: {schemas: [], storage: {kind: 'memory'}},
+      params: {storage: {kind: 'memory'}},
     } satisfies WorkerRequest);
     await waitForPosted(scope, 1);
     scope.send({

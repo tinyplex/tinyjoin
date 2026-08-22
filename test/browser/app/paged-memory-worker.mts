@@ -1,4 +1,3 @@
-import type {JsonValue, TableSchema} from '../../../src/protocol.js';
 import type {PageDevice} from '../../../src/worker/page-device.js';
 import {
   createStructuredWasmEngine,
@@ -15,15 +14,6 @@ interface PagedWasmModule {
   default(): Promise<unknown>;
   WasmEngine: RawStructuredWasmEngineConstructor;
 }
-
-type TypedTableSchema = TableSchema & {
-  columns: Array<{
-    name: string;
-    dataType: 'boolean' | 'integer' | 'float' | 'text' | 'json';
-    nullable?: boolean;
-    default?: JsonValue;
-  }>;
-};
 
 interface SharedPages {
   readonly pages: Uint8Array[];
@@ -111,8 +101,8 @@ self.addEventListener('message', (event: MessageEvent<unknown>) => {
 
 async function run(): Promise<{
   closes: number;
+  bootstrapRevision: number;
   committedRevision: number;
-  defineRevision: number;
   pageCount: number;
   reopenedRevision: number;
   rows: unknown[];
@@ -123,28 +113,18 @@ async function run(): Promise<{
   await wasm.default();
 
   const shared: SharedPages = {pages: [], closes: 0};
-  const schema: TypedTableSchema = {
-    name: 'items',
-    primaryKey: ['id'],
-    columns: [
-      {name: 'id', dataType: 'integer', nullable: false},
-      {
-        name: 'title',
-        dataType: 'text',
-        nullable: false,
-        default: 'default title',
-      },
-    ],
-  };
   const engine = createStructuredWasmEngine(
     wasm.WasmEngine,
     new MemoryPageDevice(shared),
   );
-  engine.defineTables([schema as TableSchema]);
-  const defineRevision = engine.revision();
-  engine.applyBatch({
-    changes: [{type: 'upsert', table: 'items', row: {id: 1}}],
-  });
+  engine.execSql(`
+    CREATE TABLE items (
+      id INTEGER PRIMARY KEY,
+      title TEXT NOT NULL DEFAULT 'default title'
+    );
+    INSERT INTO items (id) VALUES (1);
+  `);
+  const bootstrapRevision = engine.revision();
 
   engine.beginTransaction();
   engine.executeSql('INSERT INTO items (id, title) VALUES ($1, $2)', [
@@ -166,20 +146,18 @@ async function run(): Promise<{
     wasm.WasmEngine,
     new MemoryPageDevice(shared),
   );
-  const result = reopened.query({
-    table: 'items',
-    columns: ['id', 'title'],
-    filters: [],
-    orderBy: [{column: 'id', direction: 'asc', nulls: 'default'}],
-  });
+  const result = reopened.executeSql(
+    'SELECT id, title FROM items ORDER BY id',
+    [],
+  );
   const reopenedRevision = reopened.revision();
   const pageCount = shared.pages.length;
   reopened.close();
 
   return {
+    bootstrapRevision,
     closes: shared.closes,
     committedRevision,
-    defineRevision,
     pageCount,
     reopenedRevision,
     rows: result.rows,

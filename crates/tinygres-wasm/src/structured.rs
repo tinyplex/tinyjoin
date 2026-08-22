@@ -3,29 +3,22 @@ use std::mem::size_of;
 use js_sys::{Array, Object, Reflect};
 use serde::Deserialize;
 use serde_json::{Map, Number, Value};
-use tinygres_core::{
-    ApplyOutcome, ColumnDefinition, ColumnType, EngineError, ExecuteResult, Filter, OrderBy,
-    QueryPlan, QueryResult, Result, ResultField, Row, TableSchema,
-};
+use tinygres_core::{ApplyOutcome, EngineError, ExecuteResult, Result, ResultField, Row};
 use wasm_bindgen::{JsCast, JsValue};
 
-pub(crate) const VERSION: u32 = 1;
+pub(crate) const VERSION: u32 = 2;
 
-pub(crate) const OP_DEFINE_TABLES: u32 = 1;
-pub(crate) const OP_REPLACE_SNAPSHOT: u32 = 2;
-pub(crate) const OP_APPLY_BATCH: u32 = 3;
-pub(crate) const OP_QUERY: u32 = 4;
-pub(crate) const OP_EXECUTE_SQL: u32 = 5;
-pub(crate) const OP_EXEC_SQL: u32 = 6;
-pub(crate) const OP_BEGIN: u32 = 7;
-pub(crate) const OP_COMMIT: u32 = 8;
-pub(crate) const OP_ROLLBACK: u32 = 9;
-pub(crate) const OP_IN_TRANSACTION: u32 = 10;
-pub(crate) const OP_REVISION: u32 = 11;
-pub(crate) const OP_CLOSE: u32 = 12;
-pub(crate) const OP_PREPARE_SQL: u32 = 13;
-pub(crate) const OP_EXECUTE_PREPARED: u32 = 14;
-pub(crate) const OP_CLOSE_PREPARED: u32 = 15;
+pub(crate) const OP_EXECUTE_SQL: u32 = 1;
+pub(crate) const OP_EXEC_SQL: u32 = 2;
+pub(crate) const OP_PREPARE_SQL: u32 = 3;
+pub(crate) const OP_EXECUTE_PREPARED: u32 = 4;
+pub(crate) const OP_CLOSE_PREPARED: u32 = 5;
+pub(crate) const OP_BEGIN: u32 = 6;
+pub(crate) const OP_COMMIT: u32 = 7;
+pub(crate) const OP_ROLLBACK: u32 = 8;
+pub(crate) const OP_IN_TRANSACTION: u32 = 9;
+pub(crate) const OP_REVISION: u32 = 10;
+pub(crate) const OP_CLOSE: u32 = 11;
 
 const SUCCESS: u32 = 0;
 const FAILURE: u32 = 1;
@@ -41,88 +34,6 @@ const STRING_OVERHEAD: usize = size_of::<String>();
 const JS_ARRAY_OVERHEAD: usize = 12;
 const JS_VALUE_BYTES: usize = 4;
 const JS_OBJECT_OVERHEAD: usize = 64;
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct BridgeColumnDefinition {
-    name: String,
-    data_type: ColumnType,
-    #[serde(default)]
-    nullable: Option<bool>,
-    #[serde(default)]
-    default: Option<Value>,
-}
-
-impl From<BridgeColumnDefinition> for ColumnDefinition {
-    fn from(column: BridgeColumnDefinition) -> Self {
-        Self {
-            name: column.name,
-            data_type: column.data_type,
-            nullable: column.nullable.unwrap_or(true),
-            default: column.default,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct BridgeTableSchema {
-    name: String,
-    primary_key: Vec<String>,
-    #[serde(default)]
-    columns: Option<Vec<BridgeColumnDefinition>>,
-}
-
-impl From<BridgeTableSchema> for TableSchema {
-    fn from(schema: BridgeTableSchema) -> Self {
-        Self {
-            name: schema.name,
-            primary_key: schema.primary_key,
-            columns: schema
-                .columns
-                .unwrap_or_default()
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct BridgeQueryPlan {
-    table: String,
-    #[serde(default)]
-    columns: Option<Vec<String>>,
-    filters: Vec<Filter>,
-    #[serde(default)]
-    order_by: Option<Vec<OrderBy>>,
-    #[serde(default)]
-    limit: Option<usize>,
-    #[serde(default)]
-    offset: Option<usize>,
-}
-
-impl From<BridgeQueryPlan> for QueryPlan {
-    fn from(plan: BridgeQueryPlan) -> Self {
-        Self {
-            table: plan.table,
-            columns: plan.columns,
-            filters: plan.filters,
-            predicate: None,
-            order_by: plan.order_by.unwrap_or_default(),
-            limit: plan.limit,
-            offset: plan.offset.unwrap_or_default(),
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ReplaceSnapshotRequest {
-    pub(crate) schema: BridgeTableSchema,
-    pub(crate) rows: Vec<Row>,
-}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -177,12 +88,6 @@ pub(crate) fn apply_outcome(outcome: &ApplyOutcome, committed: bool) -> Result<J
     let mut measure = Measure::default();
     measure.apply_outcome(outcome)?;
     success(committed, build_apply_outcome(outcome)?)
-}
-
-pub(crate) fn query_result(result: &QueryResult) -> Result<JsValue> {
-    let mut measure = Measure::default();
-    measure.query_result(result)?;
-    success(false, build_query_result(result)?)
 }
 
 pub(crate) fn execute_result(result: &ExecuteResult, committed: bool) -> Result<JsValue> {
@@ -287,19 +192,6 @@ fn build_apply_outcome(outcome: &ApplyOutcome) -> Result<JsValue> {
         &JsValue::from_f64(outcome.revision as f64),
     )?;
     set(&value, "tables", &build_strings(&outcome.tables)?.into())?;
-    Ok(value.into())
-}
-
-fn build_query_result(result: &QueryResult) -> Result<JsValue> {
-    safe_number(result.revision)?;
-    let value = record();
-    set(
-        &value,
-        "revision",
-        &JsValue::from_f64(result.revision as f64),
-    )?;
-    set(&value, "fields", &build_fields(&result.fields)?.into())?;
-    set(&value, "rows", &build_rows(&result.rows)?.into())?;
     Ok(value.into())
 }
 
@@ -579,14 +471,6 @@ impl Measure {
         self.strings(&outcome.tables)
     }
 
-    fn query_result(&mut self, result: &QueryResult) -> Result<()> {
-        safe_number(result.revision)?;
-        self.result_object(&["revision", "fields", "rows"])?;
-        self.raw(8)?;
-        self.fields(&result.fields)?;
-        self.rows(&result.rows)
-    }
-
     fn execute_result(&mut self, result: &ExecuteResult) -> Result<()> {
         safe_number(result.revision)?;
         let row_count = u64::try_from(result.row_count).map_err(|_| serialization())?;
@@ -650,59 +534,68 @@ mod tests {
 
     #[test]
     fn operation_numbers_are_dense_and_stable() {
+        assert_eq!(VERSION, 2);
         assert_eq!(
             [
-                OP_DEFINE_TABLES,
-                OP_REPLACE_SNAPSHOT,
-                OP_APPLY_BATCH,
-                OP_QUERY,
                 OP_EXECUTE_SQL,
                 OP_EXEC_SQL,
+                OP_PREPARE_SQL,
+                OP_EXECUTE_PREPARED,
+                OP_CLOSE_PREPARED,
                 OP_BEGIN,
                 OP_COMMIT,
                 OP_ROLLBACK,
                 OP_IN_TRANSACTION,
                 OP_REVISION,
                 OP_CLOSE,
-                OP_PREPARE_SQL,
-                OP_EXECUTE_PREPARED,
-                OP_CLOSE_PREPARED,
             ],
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
         );
     }
 
     #[test]
     fn output_measure_preserves_safe_numbers_depth_and_resource_bounds() {
-        let valid = QueryResult {
+        let valid = ExecuteResult {
+            command: "SELECT".into(),
             revision: MAX_SAFE_INTEGER,
+            row_count: 1,
             fields: vec![ResultField::unknown("value")],
             rows: vec![Map::from_iter([("value".into(), json!([true, null, 1.5]))])],
+            tables: vec![],
         };
         let mut measure = Measure::default();
-        measure.query_result(&valid).unwrap();
+        measure.execute_result(&valid).unwrap();
 
-        let invalid = QueryResult {
+        let invalid = ExecuteResult {
+            command: "SELECT".into(),
             revision: MAX_SAFE_INTEGER + 1,
+            row_count: 0,
             fields: vec![],
             rows: vec![],
+            tables: vec![],
         };
         assert_eq!(
-            Measure::default().query_result(&invalid).unwrap_err().code,
+            Measure::default()
+                .execute_result(&invalid)
+                .unwrap_err()
+                .code,
             "BRIDGE_SERIALIZATION_ERROR"
         );
 
-        let oversized = QueryResult {
+        let oversized = ExecuteResult {
+            command: "SELECT".into(),
             revision: 1,
+            row_count: 1,
             fields: vec![],
             rows: vec![Map::from_iter([(
                 "value".into(),
                 Value::String("x".repeat(MAX_BYTES)),
             )])],
+            tables: vec![],
         };
         assert_eq!(
             Measure::default()
-                .query_result(&oversized)
+                .execute_result(&oversized)
                 .unwrap_err()
                 .code,
             "RESOURCE_LIMIT"
@@ -744,75 +637,6 @@ mod tests {
                 "statementId": 7,
                 "params": [],
                 "extra": true,
-            }))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn bridge_dtos_normalize_nullish_optionals_without_weakening_shape_checks() {
-        // serde-wasm-bindgen presents both JavaScript `undefined` and `null`
-        // to Option fields as None. JSON null exercises that shared DTO path
-        // in a native test; the real-WASM bridge regression covers undefined.
-        let schema: TableSchema = serde_json::from_value::<BridgeTableSchema>(json!({
-            "name": "items",
-            "primaryKey": ["id"],
-            "columns": [{
-                "name": "payload",
-                "dataType": "json",
-                "nullable": null,
-                "default": null,
-            }],
-        }))
-        .unwrap()
-        .into();
-        assert_eq!(schema.columns.len(), 1);
-        assert!(schema.columns[0].nullable);
-        assert_eq!(schema.columns[0].default, None);
-
-        let untyped: TableSchema = serde_json::from_value::<BridgeTableSchema>(json!({
-            "name": "untyped",
-            "primaryKey": ["id"],
-            "columns": null,
-        }))
-        .unwrap()
-        .into();
-        assert!(untyped.columns.is_empty());
-
-        let plan: QueryPlan = serde_json::from_value::<BridgeQueryPlan>(json!({
-            "table": "items",
-            "columns": null,
-            "filters": [],
-            "orderBy": null,
-            "limit": null,
-            "offset": null,
-        }))
-        .unwrap()
-        .into();
-        assert_eq!(plan.columns, None);
-        assert!(plan.order_by.is_empty());
-        assert_eq!(plan.limit, None);
-        assert_eq!(plan.offset, 0);
-
-        assert!(
-            serde_json::from_value::<BridgeTableSchema>(json!({
-                "name": "items",
-                "primaryKey": ["id"],
-                "unknown": true,
-            }))
-            .is_err()
-        );
-        assert!(
-            serde_json::from_value::<BridgeQueryPlan>(json!({
-                "table": "items",
-            }))
-            .is_err()
-        );
-        assert!(
-            serde_json::from_value::<BridgeQueryPlan>(json!({
-                "table": "items",
-                "filters": [],
-                "unknown": true,
             }))
             .is_err()
         );

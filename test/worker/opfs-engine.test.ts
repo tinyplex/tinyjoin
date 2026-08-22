@@ -18,10 +18,6 @@ const pageDevice = {
 
 function engine(): WorkerEngine {
   return {
-    defineTables: vi.fn(),
-    replaceTableSnapshot: vi.fn(() => ({revision: 0, tables: []})),
-    applyBatch: vi.fn(() => ({revision: 0, tables: []})),
-    query: vi.fn(() => ({revision: 0, fields: [], rows: []})),
     executeSql: vi.fn(() => ({
       command: 'SELECT',
       fields: [],
@@ -78,7 +74,6 @@ describe('page-only OPFS engine', () => {
     expect(deps.createSession).toHaveBeenCalledWith('direct-pages', undefined);
     expect(deps.createPageEngine).toHaveBeenCalledWith(pageDevice);
     expect(result).toBe(selected);
-    expect(selected.defineTables).not.toHaveBeenCalled();
     expect(opened.close).not.toHaveBeenCalled();
   });
 

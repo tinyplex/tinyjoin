@@ -1,10 +1,4 @@
-import type {
-  ChangeBatch,
-  JsonValue,
-  QueryPlan,
-  Row,
-  TableSchema,
-} from '../protocol.js';
+import type {JsonValue} from '../protocol.js';
 
 const JSON_NULL = 0;
 const JSON_FALSE = 1;
@@ -28,12 +22,6 @@ const STRING_OVERHEAD = 12;
 const VECTOR_OVERHEAD = 12;
 const JS_VALUE_BYTES = 4;
 const RUST_VALUE_BYTES = 24;
-const RUST_TABLE_SCHEMA_BYTES = 36;
-const RUST_COLUMN_BYTES = 40;
-const RUST_ROW_BYTES = 12;
-const RUST_CHANGE_BYTES = 28;
-const RUST_FILTER_BYTES = 40;
-const RUST_ORDER_BYTES = 16;
 const RUST_MAP_ENTRY_OVERHEAD = 128;
 
 const arrayIsArray = Array.isArray;
@@ -42,21 +30,6 @@ const hasOwn = Object.hasOwn;
 const numberIsFinite = Number.isFinite;
 const numberIsSafeInteger = Number.isSafeInteger;
 const ownKeys = Reflect.ownKeys;
-
-type ColumnType = 'boolean' | 'integer' | 'float' | 'text' | 'json';
-
-interface BridgeColumnDefinition {
-  name: string;
-  dataType: ColumnType;
-  nullable?: boolean;
-  /** Missing, undefined, and null all mean no stored default. */
-  default?: JsonValue;
-}
-
-/** Hidden typed catalog shape accepted by SQL and table-replacement callers. */
-export type BridgeTableSchema = TableSchema & {
-  columns?: readonly BridgeColumnDefinition[];
-};
 
 export class WasmBridgeError extends Error {
   readonly code: string;
@@ -183,30 +156,6 @@ function preflight(write: (sink: PreflightSink) => void): void {
 }
 
 /** Validates and bounds a request once before passing it unchanged to WASM. */
-export function preflightDefineTables(schemas: readonly TableSchema[]): void {
-  preflight((sink) =>
-    writeSchemas(sink, schemas as readonly BridgeTableSchema[]),
-  );
-}
-
-export function preflightReplaceSnapshot(
-  schema: TableSchema,
-  rows: readonly Row[],
-): void {
-  preflight((sink) => {
-    writeSchema(sink, schema as BridgeTableSchema);
-    writeRows(sink, rows);
-  });
-}
-
-export function preflightApplyBatch(batch: ChangeBatch): void {
-  preflight((sink) => writeBatch(sink, batch));
-}
-
-export function preflightQuery(plan: QueryPlan): void {
-  preflight((sink) => writeQuery(sink, plan));
-}
-
 export function preflightExecuteSql(
   sql: string,
   params: readonly JsonValue[],
@@ -237,194 +186,6 @@ export function preflightClosePrepared(statementId: number): void {
 
 export function preflightExecSql(sql: string): void {
   preflight((sink) => sink.string(sql));
-}
-
-function writeSchemas(
-  sink: PreflightSink,
-  schemas: readonly BridgeTableSchema[],
-): void {
-  writeArray(
-    sink,
-    schemas,
-    0,
-    'table schemas',
-    RUST_TABLE_SCHEMA_BYTES,
-    (target, schema) => writeSchema(target, schema as BridgeTableSchema),
-  );
-}
-
-function writeSchema(sink: PreflightSink, input: BridgeTableSchema): void {
-  const schema = record(input, 'table schema');
-  sink.string(requiredString(schema, 'name', 'table schema'));
-  writeStringArray(
-    sink,
-    requiredField(schema, 'primaryKey', 'table schema'),
-    'table schema primary key',
-  );
-  const columns = optionalField(schema, 'columns');
-  writeArray(
-    sink,
-    columns === MISSING ? [] : columns,
-    0,
-    'table schema columns',
-    RUST_COLUMN_BYTES,
-    writeColumn,
-  );
-}
-
-function writeColumn(sink: PreflightSink, input: unknown): void {
-  const column = record(input, 'column definition');
-  sink.string(requiredString(column, 'name', 'column definition'));
-  const dataType = requiredString(column, 'dataType', 'column definition');
-  sink.u8(columnTypeTag(dataType));
-  const nullable = optionalField(column, 'nullable');
-  if (nullable !== MISSING && typeof nullable !== 'boolean') {
-    throw invalidBridgeValue('A column nullable flag must be boolean');
-  }
-  sink.u8(nullable === MISSING || nullable ? 1 : 0);
-  const defaultValue = optionalField(column, 'default');
-  if (defaultValue === MISSING || defaultValue === null) {
-    sink.u8(0);
-  } else {
-    sink.u8(1);
-    writeJsonValue(sink, defaultValue, 0);
-  }
-}
-
-function writeBatch(sink: PreflightSink, input: ChangeBatch): void {
-  const batch = record(input, 'change batch');
-  writeArray(
-    sink,
-    requiredField(batch, 'changes', 'change batch'),
-    0,
-    'changes',
-    RUST_CHANGE_BYTES,
-    writeChange,
-  );
-}
-
-function writeChange(sink: PreflightSink, input: unknown): void {
-  const change = record(input, 'change');
-  const type = requiredString(change, 'type', 'change');
-  const table = requiredString(change, 'table', 'change');
-  if (type === 'upsert') {
-    sink.u8(0);
-    sink.string(table);
-    writeRow(sink, requiredField(change, 'row', 'upsert change'), 0);
-  } else if (type === 'delete') {
-    sink.u8(1);
-    sink.string(table);
-    writeRow(sink, requiredField(change, 'key', 'delete change'), 0);
-  } else {
-    throw invalidBridgeValue('A change has an invalid type');
-  }
-}
-
-function writeQuery(sink: PreflightSink, input: QueryPlan): void {
-  const plan = record(input, 'query plan');
-  ensureOnlyFields(plan, [
-    'table',
-    'columns',
-    'filters',
-    'orderBy',
-    'limit',
-    'offset',
-  ]);
-  sink.string(requiredString(plan, 'table', 'query plan'));
-  const columns = optionalField(plan, 'columns');
-  if (columns === MISSING) {
-    sink.u8(0);
-  } else {
-    sink.u8(1);
-    writeStringArray(sink, columns, 'query projection');
-  }
-  writeArray(
-    sink,
-    requiredField(plan, 'filters', 'query plan'),
-    0,
-    'query filters',
-    RUST_FILTER_BYTES,
-    writeFilter,
-  );
-  const orderBy = optionalField(plan, 'orderBy');
-  writeArray(
-    sink,
-    orderBy === MISSING ? [] : orderBy,
-    0,
-    'query ordering',
-    RUST_ORDER_BYTES,
-    writeOrderBy,
-  );
-  const limit = optionalField(plan, 'limit');
-  if (limit === MISSING) {
-    sink.u8(0);
-  } else {
-    sink.u8(1);
-    sink.u32(queryPosition(limit, 'limit'));
-  }
-  const offsetValue = optionalField(plan, 'offset');
-  const offset =
-    offsetValue === MISSING ? 0 : queryPosition(offsetValue, 'offset');
-  sink.u32(offset);
-  if (limit !== MISSING && offset + Number(limit) > MAX_U32) {
-    throw invalidBridgeValue('Query OFFSET plus LIMIT exceeds u32');
-  }
-}
-
-function writeFilter(sink: PreflightSink, input: unknown): void {
-  const filter = record(input, 'query filter');
-  sink.string(requiredString(filter, 'column', 'query filter'));
-  sink.u8(
-    filterOperatorTag(requiredString(filter, 'operator', 'query filter')),
-  );
-  writeJsonValue(sink, requiredField(filter, 'value', 'query filter'), 0);
-}
-
-function writeOrderBy(sink: PreflightSink, input: unknown): void {
-  const order = record(input, 'query ordering');
-  ensureOnlyFields(order, ['column', 'direction', 'nulls']);
-  sink.string(requiredString(order, 'column', 'query ordering'));
-  const direction = requiredString(order, 'direction', 'query ordering');
-  sink.u8(
-    direction === 'asc'
-      ? 0
-      : direction === 'desc'
-        ? 1
-        : invalidTag('query direction'),
-  );
-  const nulls = requiredString(order, 'nulls', 'query ordering');
-  sink.u8(
-    nulls === 'default'
-      ? 0
-      : nulls === 'first'
-        ? 1
-        : nulls === 'last'
-          ? 2
-          : invalidTag('null ordering'),
-  );
-}
-
-function writeRows(sink: PreflightSink, rows: unknown): void {
-  writeArray(sink, rows, 0, 'rows', RUST_ROW_BYTES, (target, row) =>
-    writeRow(target, row, 0),
-  );
-}
-
-function writeRow(sink: PreflightSink, input: unknown, depth: number): void {
-  const row = record(input, 'row');
-  sink.budget.node(depth);
-  const count = enumerableDataCount(row);
-  writeCount(sink, count);
-  let visited = 0;
-  forEachEnumerableDataEntry(row, (key, value) => {
-    visited += 1;
-    sink.string(key);
-    sink.budget.retain(RUST_VALUE_BYTES + RUST_MAP_ENTRY_OVERHEAD);
-    writeJsonValue(sink, value, depth + 1);
-  });
-  if (visited !== count) {
-    throw invalidBridgeValue('A bridge object changed while it was inspected');
-  }
 }
 
 function writeJsonValues(
@@ -499,19 +260,6 @@ function writeJsonValue(
   }
 }
 
-function writeStringArray(
-  sink: PreflightSink,
-  input: unknown,
-  label: string,
-): void {
-  writeArray(sink, input, 0, label, STRING_OVERHEAD, (target, value) => {
-    if (typeof value !== 'string') {
-      throw invalidBridgeValue(`${label} must contain strings`);
-    }
-    target.string(value);
-  });
-}
-
 function writeArray(
   sink: PreflightSink,
   input: unknown,
@@ -539,13 +287,6 @@ function writeCount(sink: PreflightSink, count: number): void {
 }
 
 const MISSING = Symbol('missing');
-
-function record(value: unknown, label: string): Record<string, unknown> {
-  if (!isRecord(value)) {
-    throw invalidBridgeValue(`${label} must be an object`);
-  }
-  return value;
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !isArray(value);
@@ -576,38 +317,6 @@ function ownDataField(
     throw invalidBridgeValue('Bridge accessors are not supported');
   }
   return descriptor.value;
-}
-
-function requiredField(
-  value: Record<string, unknown>,
-  name: string,
-  label: string,
-): unknown {
-  const field = ownDataField(value, name);
-  if (field === MISSING || field === undefined) {
-    throw invalidBridgeValue(`${label}.${name} is required`);
-  }
-  return field;
-}
-
-function optionalField(
-  value: Record<string, unknown>,
-  name: string,
-): unknown | typeof MISSING {
-  const field = ownDataField(value, name);
-  return field === undefined ? MISSING : field;
-}
-
-function requiredString(
-  value: Record<string, unknown>,
-  name: string,
-  label: string,
-): string {
-  const field = requiredField(value, name, label);
-  if (typeof field !== 'string') {
-    throw invalidBridgeValue(`${label}.${name} must be a string`);
-  }
-  return field;
 }
 
 function enumerableDataCount(value: Record<string, unknown>): number {
@@ -655,17 +364,6 @@ function forEachEnumerableDataEntry(
   }
 }
 
-function ensureOnlyFields(
-  value: Record<string, unknown>,
-  allowed: readonly string[],
-): void {
-  forEachEnumerableDataEntry(value, (key) => {
-    if (!allowed.includes(key)) {
-      throw invalidBridgeValue('A bridge object contains an unknown field');
-    }
-  });
-}
-
 function denseArrayLength(value: unknown, label: string): number {
   if (!isArray(value)) {
     throw invalidBridgeValue(`${label} must be an array`);
@@ -700,20 +398,6 @@ function indexedDataValue(
   return item;
 }
 
-function queryPosition(value: unknown, label: string): number {
-  if (
-    typeof value !== 'number' ||
-    !numberIsSafeInteger(value) ||
-    value < 0 ||
-    value > MAX_U32
-  ) {
-    throw invalidBridgeValue(
-      `Query ${label} must be an unsigned 32-bit integer`,
-    );
-  }
-  return value;
-}
-
 function preparedStatementId(value: unknown): number {
   if (
     !numberIsSafeInteger(value) ||
@@ -725,46 +409,6 @@ function preparedStatementId(value: unknown): number {
     );
   }
   return Number(value);
-}
-
-function columnTypeTag(type: string): number {
-  switch (type) {
-    case 'boolean':
-      return 0;
-    case 'integer':
-      return 1;
-    case 'float':
-      return 2;
-    case 'text':
-      return 3;
-    case 'json':
-      return 4;
-    default:
-      return invalidTag('column type');
-  }
-}
-
-function filterOperatorTag(operator: string): number {
-  switch (operator) {
-    case 'eq':
-      return 0;
-    case 'neq':
-      return 1;
-    case 'lt':
-      return 2;
-    case 'lte':
-      return 3;
-    case 'gt':
-      return 4;
-    case 'gte':
-      return 5;
-    default:
-      return invalidTag('filter operator');
-  }
-}
-
-function invalidTag(label: string): never {
-  throw invalidBridgeValue(`Invalid ${label}`);
 }
 
 function assertUint(value: number, maximum: number): void {

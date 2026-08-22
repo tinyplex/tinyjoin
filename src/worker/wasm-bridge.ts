@@ -1,50 +1,37 @@
 import {
   isRpcResult,
   type ApplyOutcome,
-  type ChangeBatch,
   type JsonValue,
-  type QueryPlan,
-  type QueryResult,
-  type Row,
   type SqlResult,
-  type TableSchema,
 } from '../protocol.js';
 import type {WorkerEngine} from './engine.js';
 import type {PageDevice} from './page-device.js';
 import {
   WasmBridgeError,
-  preflightApplyBatch,
   preflightClosePrepared,
-  preflightDefineTables,
   preflightExecSql,
   preflightExecutePrepared,
   preflightExecuteSql,
   preflightPrepareSql,
-  preflightQuery,
-  preflightReplaceSnapshot,
 } from './wasm-preflight.js';
 
 export {WasmBridgeError} from './wasm-preflight.js';
 
 export const WASM_OPERATION = {
-  defineTables: 1,
-  replaceSnapshot: 2,
-  applyBatch: 3,
-  query: 4,
-  executeSql: 5,
-  execSql: 6,
-  begin: 7,
-  commit: 8,
-  rollback: 9,
-  inTransaction: 10,
-  revision: 11,
-  close: 12,
-  prepareSql: 13,
-  executePrepared: 14,
-  closePrepared: 15,
+  executeSql: 1,
+  execSql: 2,
+  prepareSql: 3,
+  executePrepared: 4,
+  closePrepared: 5,
+  begin: 6,
+  commit: 7,
+  rollback: 8,
+  inTransaction: 9,
+  revision: 10,
+  close: 11,
 } as const;
 
-const BRIDGE_VERSION = 1;
+const BRIDGE_VERSION = 2;
 const SUCCESS = 0;
 const FAILURE = 1;
 const SAFE_RESPONSE = 0;
@@ -154,42 +141,6 @@ export class StructuredWasmEngine implements WorkerEngine {
   constructor(raw: RawStructuredWasmEngine) {
     assertNotInPageDeviceCallback();
     this.#raw = raw;
-  }
-
-  defineTables(schemas: TableSchema[]): void {
-    this.#assertCallable();
-    preflightDefineTables(schemas);
-    this.#invoke(
-      structuredCall(WASM_OPERATION.defineTables, schemas, true),
-      decodeUnitResponse,
-    );
-  }
-
-  replaceTableSnapshot(schema: TableSchema, rows: Row[]): ApplyOutcome {
-    this.#assertCallable();
-    preflightReplaceSnapshot(schema, rows);
-    return this.#invoke(
-      structuredCall(WASM_OPERATION.replaceSnapshot, {schema, rows}, true),
-      decodeApplyOutcomeResponse,
-    );
-  }
-
-  applyBatch(batch: ChangeBatch): ApplyOutcome {
-    this.#assertCallable();
-    preflightApplyBatch(batch);
-    return this.#invoke(
-      structuredCall(WASM_OPERATION.applyBatch, batch, true),
-      decodeApplyOutcomeResponse,
-    );
-  }
-
-  query(plan: QueryPlan): QueryResult {
-    this.#assertCallable();
-    preflightQuery(plan);
-    return this.#invoke(
-      structuredCall(WASM_OPERATION.query, plan, false),
-      decodeQueryResultResponse,
-    );
   }
 
   executeSql(sql: string, params: JsonValue[]): SqlResult {
@@ -452,15 +403,7 @@ function decodeApplyOutcomeResponse(
   value: unknown,
 ): DecodedResponse<ApplyOutcome> {
   return decodeResponse(value, 'apply outcome', (payload) =>
-    isRpcResult('applyBatch', payload) ? payload : INVALID_RESULT,
-  );
-}
-
-function decodeQueryResultResponse(
-  value: unknown,
-): DecodedResponse<QueryResult> {
-  return decodeResponse(value, 'query result', (payload) =>
-    isRpcResult('query', payload) ? payload : INVALID_RESULT,
+    isRpcResult('commitTransaction', payload) ? payload : INVALID_RESULT,
   );
 }
 

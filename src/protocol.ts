@@ -1,5 +1,5 @@
-export const PROTOCOL_VERSION = 6 as const;
-export const MAX_QUERY_POSITION = 0xffff_ffff;
+export const PROTOCOL_VERSION = 7 as const;
+const MAX_U32 = 0xffff_ffff;
 
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue =
@@ -32,51 +32,11 @@ export interface Results<RowType = Row> {
   tables: string[];
 }
 
-export interface TableSchema {
-  name: string;
-  primaryKey: string[];
-}
-
 export type StorageOptions = {kind: 'memory'} | {kind: 'opfs'; name: string};
-
-export type Change =
-  | {type: 'upsert'; table: string; row: Row}
-  | {type: 'delete'; table: string; key: Row};
-
-export interface ChangeBatch {
-  changes: Change[];
-}
-
-export type Filter = {
-  column: string;
-  operator: 'eq' | 'neq' | 'lt' | 'lte' | 'gt' | 'gte';
-  value: JsonValue;
-};
-
-export interface QueryPlan {
-  table: string;
-  columns?: string[];
-  filters: Filter[];
-  orderBy?: OrderBy[];
-  limit?: number;
-  offset?: number;
-}
-
-export interface OrderBy {
-  column: string;
-  direction: 'asc' | 'desc';
-  nulls: 'default' | 'first' | 'last';
-}
 
 export interface ApplyOutcome {
   revision: number;
   tables: string[];
-}
-
-export interface QueryResult<RowType extends object = Row> {
-  revision: number;
-  rows: RowType[];
-  fields: ResultField[];
 }
 
 export interface SqlResult<RowType extends object = Row> {
@@ -97,23 +57,8 @@ export interface SerializedError {
 
 export interface RpcMethods {
   init: {
-    request: {
-      schemas: TableSchema[];
-      storage: StorageOptions;
-    };
+    request: {storage: StorageOptions};
     response: {revision: number};
-  };
-  replaceTable: {
-    request: {schema: TableSchema; rows: Row[]};
-    response: ApplyOutcome;
-  };
-  applyBatch: {
-    request: {batch: ChangeBatch};
-    response: ApplyOutcome;
-  };
-  query: {
-    request: {plan: QueryPlan; transactionId?: string};
-    response: QueryResult;
   };
   executeSql: {
     request: {sql: string; params: JsonValue[]; transactionId?: string};
@@ -236,12 +181,8 @@ export function isRpcResult<Method extends RpcMethod>(
     case 'rollbackTransaction':
     case 'close':
       return value === undefined;
-    case 'replaceTable':
-    case 'applyBatch':
     case 'commitTransaction':
       return isApplyOutcome(value);
-    case 'query':
-      return isQueryResult(value);
     case 'executeSql':
     case 'executePrepared':
       return isSqlResult(value);
@@ -286,12 +227,8 @@ export function isRpcResultHeader<Method extends RpcMethod>(
     case 'rollbackTransaction':
     case 'close':
       return value === undefined;
-    case 'replaceTable':
-    case 'applyBatch':
     case 'commitTransaction':
       return isApplyOutcome(value);
-    case 'query':
-      return isQueryResultHeader(value);
     case 'executeSql':
     case 'executePrepared':
       return isSqlResultHeader(value);
@@ -331,29 +268,8 @@ export function isWorkerRequest(value: unknown): value is WorkerRequest {
     case 'init':
       return (
         isRecord(value.params) &&
-        hasExactKeys(value.params, ['schemas', 'storage']) &&
-        isDenseArray(value.params.schemas, isTableSchema) &&
+        hasExactKeys(value.params, ['storage']) &&
         isStorageOptions(value.params.storage)
-      );
-    case 'replaceTable':
-      return (
-        isRecord(value.params) &&
-        hasExactKeys(value.params, ['schema', 'rows']) &&
-        isTableSchema(value.params.schema) &&
-        isDenseArray(value.params.rows, isRow)
-      );
-    case 'applyBatch':
-      return (
-        isRecord(value.params) &&
-        hasExactKeys(value.params, ['batch']) &&
-        isChangeBatch(value.params.batch)
-      );
-    case 'query':
-      return (
-        isRecord(value.params) &&
-        hasOnlyKeys(value.params, ['plan', 'transactionId']) &&
-        isQueryPlan(value.params.plan) &&
-        isOptionalTransactionId(value.params.transactionId)
       );
     case 'executeSql':
       return (
@@ -410,19 +326,6 @@ export function isWorkerRequest(value: unknown): value is WorkerRequest {
   }
 }
 
-function isOrderBy(value: unknown): value is OrderBy {
-  return (
-    isRecord(value) &&
-    hasOnlyKeys(value, ['column', 'direction', 'nulls']) &&
-    typeof value.column === 'string' &&
-    value.column.length > 0 &&
-    (value.direction === 'asc' || value.direction === 'desc') &&
-    (value.nulls === 'default' ||
-      value.nulls === 'first' ||
-      value.nulls === 'last')
-  );
-}
-
 function isOptionalTransactionId(value: unknown): boolean {
   return value === undefined || isTransactionId(value);
 }
@@ -435,7 +338,7 @@ function isPreparedStatementId(value: unknown): value is number {
   return (
     Number.isSafeInteger(value) &&
     Number(value) > 0 &&
-    Number(value) <= MAX_QUERY_POSITION
+    Number(value) <= MAX_U32
   );
 }
 
@@ -518,21 +421,6 @@ function isApplyOutcome(value: unknown): value is ApplyOutcome {
   );
 }
 
-function isTableSchema(value: unknown): value is TableSchema {
-  return (
-    isRecord(value) &&
-    hasExactKeys(value, ['name', 'primaryKey']) &&
-    typeof value.name === 'string' &&
-    value.name.length > 0 &&
-    isDenseArray(
-      value.primaryKey,
-      (column): column is string =>
-        typeof column === 'string' && column.length > 0,
-    ) &&
-    value.primaryKey.length > 0
-  );
-}
-
 function isRow(value: unknown): value is Row {
   return (
     isJsonRecord(value) &&
@@ -546,27 +434,7 @@ function isResultField(value: unknown): value is ResultField {
     hasExactKeys(value, ['name', 'dataTypeID']) &&
     typeof value.name === 'string' &&
     isSafeNonNegativeInteger(value.dataTypeID) &&
-    Number(value.dataTypeID) <= MAX_QUERY_POSITION
-  );
-}
-
-function isQueryResult(value: unknown): value is QueryResult {
-  return (
-    isRecord(value) &&
-    hasExactKeys(value, ['revision', 'rows', 'fields']) &&
-    isSafeNonNegativeInteger(value.revision) &&
-    isDenseArray(value.rows, isRow) &&
-    isDenseArray(value.fields, isResultField)
-  );
-}
-
-function isQueryResultHeader(value: unknown): value is QueryResult {
-  return (
-    isRecord(value) &&
-    hasExactKeys(value, ['revision', 'rows', 'fields']) &&
-    isSafeNonNegativeInteger(value.revision) &&
-    Array.isArray(value.rows) &&
-    Array.isArray(value.fields)
+    Number(value.dataTypeID) <= MAX_U32
   );
 }
 
@@ -630,101 +498,6 @@ function isJsonRecord(value: unknown): value is Record<string, unknown> {
     Reflect.ownKeys(value).every((key) => typeof key === 'string')
   );
 }
-
-function isChangeBatch(value: unknown): value is ChangeBatch {
-  return (
-    isRecord(value) &&
-    hasExactKeys(value, ['changes']) &&
-    isDenseArray(value.changes, isChange)
-  );
-}
-
-function isChange(value: unknown): value is Change {
-  if (!isRecord(value) || typeof value.table !== 'string') {
-    return false;
-  }
-  return value.type === 'upsert'
-    ? hasExactKeys(value, ['type', 'table', 'row']) && isRow(value.row)
-    : value.type === 'delete' &&
-        hasExactKeys(value, ['type', 'table', 'key']) &&
-        isRow(value.key);
-}
-
-function isQueryPlan(value: unknown): value is QueryPlan {
-  if (
-    !isRecord(value) ||
-    !hasOnlyKeys(value, [
-      'table',
-      'columns',
-      'filters',
-      'orderBy',
-      'limit',
-      'offset',
-    ]) ||
-    typeof value.table !== 'string' ||
-    !Array.isArray(value.filters)
-  ) {
-    return false;
-  }
-  if (
-    value.columns !== undefined &&
-    !isDenseArray(
-      value.columns,
-      (column): column is string => typeof column === 'string',
-    )
-  ) {
-    return false;
-  }
-  if (
-    value.limit !== undefined &&
-    (!Number.isSafeInteger(value.limit) ||
-      Number(value.limit) < 0 ||
-      Number(value.limit) > MAX_QUERY_POSITION)
-  ) {
-    return false;
-  }
-  if (
-    value.offset !== undefined &&
-    (!Number.isSafeInteger(value.offset) ||
-      Number(value.offset) < 0 ||
-      Number(value.offset) > MAX_QUERY_POSITION)
-  ) {
-    return false;
-  }
-  if (
-    value.offset !== undefined &&
-    value.limit !== undefined &&
-    Number(value.offset) + Number(value.limit) > MAX_QUERY_POSITION
-  ) {
-    return false;
-  }
-  if (
-    value.orderBy !== undefined &&
-    (!Array.isArray(value.orderBy) ||
-      value.orderBy.length > 32 ||
-      !isDenseArray(value.orderBy, isOrderBy))
-  ) {
-    return false;
-  }
-  return isDenseArray(
-    value.filters,
-    (filter): filter is Filter =>
-      isRecord(filter) &&
-      hasExactKeys(filter, ['column', 'operator', 'value']) &&
-      typeof filter.column === 'string' &&
-      FILTER_OPERATORS.has(filter.operator) &&
-      isJsonValue(filter.value),
-  );
-}
-
-const FILTER_OPERATORS = new Set<unknown>([
-  'eq',
-  'neq',
-  'lt',
-  'lte',
-  'gt',
-  'gte',
-]);
 
 function isJsonValue(
   value: unknown,

@@ -1,19 +1,14 @@
 import {
   isRecord,
   type ApplyOutcome,
-  type ChangeBatch,
   type JsonValue,
   type QueryOptions,
-  type QueryPlan,
-  type QueryResult,
   type Results,
   type Row,
   type SqlResult,
   type StorageOptions,
-  type TableSchema,
 } from '../protocol.js';
 import {ClientError} from './error.js';
-import {QueryBuilder, type QueryExecutor} from './query-builder.js';
 import {
   WorkerRpc,
   type ResultValidation,
@@ -24,7 +19,6 @@ export interface ClientOptions {
   worker?: WorkerLike;
   workerFactory?: () => WorkerLike;
   workerUrl?: string | URL;
-  schemas?: TableSchema[];
   dataDir?: DataDir;
 }
 
@@ -123,7 +117,6 @@ class ClientPreparedStatement<RowType> implements PreparedStatement<RowType> {
 }
 
 export interface Transaction {
-  from<RowType extends object = Row>(table: string): QueryBuilder<RowType>;
   query<RowType = Row>(
     sql: string,
     params?: JsonValue[],
@@ -143,7 +136,7 @@ export interface Transaction {
   readonly closed: boolean;
 }
 
-export class Client implements QueryExecutor {
+export class Client {
   readonly #rpc: WorkerRpc;
   readonly #preparedOwner = {};
   readonly #preparedStatements = new Set<PreparedStatementState>();
@@ -184,7 +177,6 @@ export class Client implements QueryExecutor {
     });
     this.waitReady = this.#rpc
       .request('init', {
-        schemas: options.schemas ?? [],
         storage,
       })
       .then((result) => {
@@ -207,16 +199,6 @@ export class Client implements QueryExecutor {
 
   get closed(): boolean {
     return this.#closed;
-  }
-
-  from<RowType extends object = Row>(table: string): QueryBuilder<RowType> {
-    if (!table.trim()) {
-      throw new TypeError('A table name cannot be empty');
-    }
-    return new QueryBuilder<RowType>(this, {
-      table,
-      filters: [],
-    });
   }
 
   async query<RowType = Row>(
@@ -266,14 +248,6 @@ export class Client implements QueryExecutor {
     return new ClientPreparedStatement<RowType>(state);
   }
 
-  async executePlan(plan: QueryPlan): Promise<QueryResult> {
-    await this.waitReady;
-    this.#assertNoActiveTransaction();
-    const result = await this.#rpc.request('query', {plan});
-    this.#revision = Math.max(this.#revision, result.revision);
-    return result;
-  }
-
   /** Executes one or more SQL statements without parameters. */
   async exec(
     sql: string,
@@ -305,24 +279,6 @@ export class Client implements QueryExecutor {
       () => undefined,
     );
     return run;
-  }
-
-  /** Atomically replaces the complete contents and schema of a table. */
-  async replaceTable(schema: TableSchema, rows: Row[]): Promise<ApplyOutcome> {
-    await this.waitReady;
-    this.#assertNoActiveTransaction();
-    const outcome = await this.#rpc.request('replaceTable', {schema, rows});
-    this.#revision = Math.max(this.#revision, outcome.revision);
-    return outcome;
-  }
-
-  /** Atomically applies a batch of row upserts and deletes. */
-  async applyBatch(batch: ChangeBatch): Promise<ApplyOutcome> {
-    await this.waitReady;
-    this.#assertNoActiveTransaction();
-    const outcome = await this.#rpc.request('applyBatch', {batch});
-    this.#revision = Math.max(this.#revision, outcome.revision);
-    return outcome;
   }
 
   subscribe(
@@ -490,7 +446,7 @@ export class Client implements QueryExecutor {
   }
 }
 
-class ClientTransaction implements Transaction, QueryExecutor {
+class ClientTransaction implements Transaction {
   readonly #pending = new Set<Promise<unknown>>();
   #open = true;
   #closing = false;
@@ -503,14 +459,6 @@ class ClientTransaction implements Transaction, QueryExecutor {
     readonly preparedOwner: object,
     readonly noteRevision: (revision: number) => void,
   ) {}
-
-  from<RowType extends object = Row>(table: string): QueryBuilder<RowType> {
-    this.#assertOpen();
-    if (!table.trim()) {
-      throw new TypeError('A table name cannot be empty');
-    }
-    return new QueryBuilder<RowType>(this, {table, filters: []});
-  }
 
   query<RowType = Row>(
     sql: string,
@@ -590,18 +538,6 @@ class ClientTransaction implements Transaction, QueryExecutor {
         }),
     );
     return trackPreparedExecution(state, operation);
-  }
-
-  executePlan(plan: QueryPlan): Promise<QueryResult> {
-    this.#assertOpen();
-    return this.#track(
-      this.rpc
-        .request('query', {plan, transactionId: this.transactionId})
-        .then((result) => {
-          this.noteRevision(result.revision);
-          return result;
-        }),
-    );
   }
 
   seal(): void {
@@ -796,7 +732,6 @@ function trackPreparedExecution<Result>(
 function assertClientOptions(options: ClientOptions): void {
   const supported = new Set([
     'dataDir',
-    'schemas',
     'worker',
     'workerFactory',
     'workerUrl',
@@ -812,7 +747,7 @@ function assertClientOptions(options: ClientOptions): void {
     )
   ) {
     throw new TypeError(
-      'TinyGres client options support only dataDir, schemas, worker, workerFactory, and workerUrl',
+      'TinyGres client options support only dataDir, worker, workerFactory, and workerUrl',
     );
   }
 }

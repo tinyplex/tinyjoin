@@ -16,7 +16,6 @@ The first proof of concept deliberately does a small number of things:
 - supports typed tables, atomic DDL/DML, and staged transactions;
 - prepares reusable reads and row mutations for repeated parameter binding;
 - persists the same page-native format in memory or one OPFS file;
-- applies explicit table replacements and row-change batches atomically; and
 - emits table-level invalidations so an application can re-query.
 
 ## Building from source
@@ -168,11 +167,6 @@ executions before releasing Worker resources. `db.close()` closes every
 remaining handle. One client may retain at most 128 prepared statements and 8
 MiB of prepared-statement state at once.
 
-For callers that already hold complete JSON rows, `replaceTable(schema, rows)`
-atomically replaces one table and `applyBatch({changes})` atomically applies
-explicit `upsert` and `delete` operations. These are local database operations;
-they perform no I/O beyond the configured database storage.
-
 `await create()` opens the database in a dedicated module worker and resolves
 only after initialization succeeds. Calling it with no data directory, or with
 `memory://`, creates an ephemeral database. The returned client also exposes
@@ -202,7 +196,6 @@ const db = await create({
       name: "tinygres",
       type: "module",
     }),
-  schemas: [{ name: "posts", primaryKey: ["id"] }],
 });
 ```
 
@@ -221,16 +214,14 @@ Memory remains the default. Opt into persistent browser storage by assigning a
 stable name to the database:
 
 ```ts
-const db = await create("opfs://my-project-public-posts-v1", {
-  schemas: [{ name: "posts", primaryKey: ["id"] }],
-});
+const db = await create("opfs://my-project-public-posts-v1");
 ```
 
 Names must contain 1–64 ASCII letters, numbers, dots, underscores, or hyphens,
 and start with a letter or number.
 
-`create()` opens the page database and validates or initializes its schemas. The
-page engine uses 4 KiB copy-on-write pages:
+`create()` opens the page database and its SQL catalog. The page engine uses
+4 KiB copy-on-write pages:
 candidate data and catalog pages are flushed before one checksummed metadata
 publication makes the new generation visible. A known pre-publication failure
 leaves the previous generation authoritative. An uncertain final publication
@@ -269,23 +260,6 @@ checkpoint/journal and staged-migration layouts were never released and are not
 recognized or migrated. Use a new logical storage name, or clear experimental
 OPFS data, when moving a development app to this format.
 
-## Fluent query builder
-
-The initial builder intentionally exposes only the implemented surface:
-
-```ts
-const { data, error } = await db
-  .from<Task>("tasks")
-  .select("id, title, done")
-  .eq("done", true)
-  .gte("priority", 2)
-  .order("id", { ascending: false })
-  .range(0, 19);
-```
-
-This syntax queries TinyGres directly and never makes a network request. Values
-are represented as JSON-compatible values.
-
 ## SQL compatibility
 
 TinyGres is intentionally much smaller than a full PostgreSQL implementation.
@@ -323,9 +297,6 @@ Raw SQL also supports a bounded single-table aggregate form:
 - simple group columns through `GROUP BY`, with explicit `AS` aliases;
 - the existing `WHERE` predicates before grouping; and
 - `ORDER BY` projected output names or aliases, followed by `LIMIT`/`OFFSET`.
-
-Aggregate queries require a typed catalog, so this first slice applies to
-SQL-created tables rather than untyped schemas that expose only column names.
 
 `COUNT(column)`, `SUM`, `AVG`, `MIN`, and `MAX` skip `NULL`. A global
 aggregate over no matching rows produces one row (`COUNT` is zero and the

@@ -1,22 +1,13 @@
 import type {
   ApplyOutcome,
-  ChangeBatch,
   JsonValue,
-  QueryPlan,
-  QueryResult,
-  Row,
   SqlResult,
   StorageOptions,
-  TableSchema,
 } from '../protocol.js';
 import {MemoryPageDevice, type PageDevice} from './page-device.js';
 import {createStructuredWasmEngine} from './wasm-bridge.js';
 
 export interface WorkerEngine {
-  defineTables(schemas: TableSchema[]): void;
-  replaceTableSnapshot(schema: TableSchema, rows: Row[]): ApplyOutcome;
-  applyBatch(batch: ChangeBatch): ApplyOutcome;
-  query(plan: QueryPlan): QueryResult;
   executeSql(sql: string, params: JsonValue[]): SqlResult;
   prepareSql(sql: string): number;
   executePrepared(statementId: number, params: JsonValue[]): SqlResult;

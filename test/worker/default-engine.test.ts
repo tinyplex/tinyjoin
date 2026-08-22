@@ -97,16 +97,12 @@ function initRequest(
     v: PROTOCOL_VERSION,
     id: 1,
     method: 'init',
-    params: {schemas: [], storage},
+    params: {storage},
   };
 }
 
 function mockEngine(): WorkerEngine {
   return {
-    defineTables: vi.fn(),
-    replaceTableSnapshot: vi.fn(() => ({revision: 0, tables: []})),
-    applyBatch: vi.fn(() => ({revision: 0, tables: []})),
-    query: vi.fn(() => ({revision: 0, fields: [], rows: []})),
     executeSql: vi.fn(() => ({
       command: 'SELECT',
       fields: [],

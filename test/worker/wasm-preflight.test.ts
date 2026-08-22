@@ -1,67 +1,21 @@
 import {describe, expect, it} from 'vitest';
 
-import type {
-  JsonValue,
-  QueryPlan,
-  Row,
-  TableSchema,
-} from '../../src/protocol.ts';
+import type {JsonValue} from '../../src/protocol.ts';
 import {
-  preflightApplyBatch,
   preflightClosePrepared,
-  preflightDefineTables,
   preflightExecSql,
   preflightExecutePrepared,
   preflightExecuteSql,
   preflightPrepareSql,
-  preflightQuery,
-  preflightReplaceSnapshot,
-  type BridgeTableSchema,
 } from '../../src/worker/wasm-preflight.ts';
 
-const schema: TableSchema = {name: 'items', primaryKey: ['id']};
-const query: QueryPlan = {
-  table: 'items',
-  columns: ['id', 'title'],
-  filters: [{column: 'id', operator: 'gte', value: 1}],
-  orderBy: [{column: 'id', direction: 'desc', nulls: 'last'}],
-  limit: 10,
-  offset: 2,
-};
-
 describe('WASM request preflight', () => {
-  it('accepts every structured request shape', () => {
-    const typed: BridgeTableSchema = {
-      name: 'typed',
-      primaryKey: ['id'],
-      columns: [
-        {name: 'id', dataType: 'integer', nullable: false},
-        {
-          name: 'payload',
-          dataType: 'json',
-          default: {enabled: true, threshold: 1.5},
-        },
-        {name: 'optional', dataType: 'text', default: null},
-      ],
-    };
-
-    expect(() => preflightDefineTables([typed])).not.toThrow();
+  it('accepts every SQL-first structured request shape', () => {
     expect(() =>
-      preflightReplaceSnapshot(schema, [
-        {id: 1, nested: {zero: -0, list: [true, null]}},
+      preflightExecuteSql('SELECT $1, $2', [
+        -0,
+        {nested: [true, null, 1.5, '\ud800']},
       ]),
-    ).not.toThrow();
-    expect(() =>
-      preflightApplyBatch({
-        changes: [
-          {type: 'upsert', table: 'items', row: {id: 2}},
-          {type: 'delete', table: 'items', key: {id: 1}},
-        ],
-      }),
-    ).not.toThrow();
-    expect(() => preflightQuery(query)).not.toThrow();
-    expect(() =>
-      preflightExecuteSql('SELECT $1, $2', [-0, '\ud800']),
     ).not.toThrow();
     expect(() => preflightPrepareSql('SELECT $1')).not.toThrow();
     expect(() => preflightExecutePrepared(7, [1, 'two'])).not.toThrow();
@@ -85,9 +39,9 @@ describe('WASM request preflight', () => {
         return 1;
       },
     });
-    expect(() => preflightReplaceSnapshot(schema, [accessor as Row])).toThrow(
-      expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}),
-    );
+    expect(() =>
+      preflightExecuteSql('SELECT $1', [accessor as JsonValue]),
+    ).toThrow(expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}));
     expect(getterCalls).toBe(0);
 
     const revoked = Proxy.revocable([], {});
@@ -138,39 +92,11 @@ describe('WASM request preflight', () => {
     );
   });
 
-  it('preserves missing/null defaults and rejects invalid optionals', () => {
-    const withNullDefault = {
-      name: 'typed',
-      primaryKey: ['id'],
-      columns: [{name: 'id', dataType: 'integer', default: null}],
-    } satisfies BridgeTableSchema;
-
-    expect(() => preflightDefineTables([withNullDefault])).not.toThrow();
-    expect(() =>
-      preflightQuery({...query, columns: null} as unknown as QueryPlan),
-    ).toThrow(expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}));
-    expect(() =>
-      preflightQuery({...query, unknown: true} as unknown as QueryPlan),
-    ).toThrow(expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}));
-  });
-
-  it('rejects invalid numeric and enum boundaries', () => {
+  it('rejects non-finite JSON numbers', () => {
     for (const value of [Number.NaN, Number.POSITIVE_INFINITY]) {
       expect(() => preflightExecuteSql('SELECT $1', [value])).toThrow(
         expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}),
       );
     }
-    expect(() => preflightQuery({...query, limit: 0x1_0000_0000})).toThrow(
-      expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}),
-    );
-    expect(() =>
-      preflightDefineTables([
-        {
-          name: 'items',
-          primaryKey: ['id'],
-          columns: [{name: 'id', dataType: 'uuid'}],
-        } as unknown as BridgeTableSchema,
-      ]),
-    ).toThrow(expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}));
   });
 });

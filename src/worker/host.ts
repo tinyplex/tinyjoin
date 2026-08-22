@@ -242,26 +242,7 @@ async function handleRequest(
   switch (request.method) {
     case 'init':
       assertNoTransaction(transaction.activeId);
-      engine.defineTables(request.params.schemas);
       return {revision: engine.revision()};
-    case 'replaceTable': {
-      assertNoTransaction(transaction.activeId);
-      const outcome = engine.replaceTableSnapshot(
-        request.params.schema,
-        request.params.rows,
-      );
-      emitInvalidation(outcome);
-      return outcome;
-    }
-    case 'applyBatch': {
-      assertNoTransaction(transaction.activeId);
-      const outcome = engine.applyBatch(request.params.batch);
-      emitInvalidation(outcome);
-      return outcome;
-    }
-    case 'query':
-      assertTransactionId(transaction.activeId, request.params.transactionId);
-      return engine.query(request.params.plan);
     case 'executeSql': {
       assertTransactionId(transaction.activeId, request.params.transactionId);
       const result = engine.executeSql(

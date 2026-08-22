@@ -71,10 +71,9 @@ await db.transaction(async (tx) => {
 });
 ```
 
-The package also exposes a fluent read builder, table replacement/change-batch
-operations, invalidation subscriptions, and Worker/storage configuration.
-Those are a small JavaScript control surface around the SQL-first engine, not
-additional SQL syntax.
+Invalidation subscriptions and Worker/storage configuration form the small
+JavaScript control surface around the SQL-first engine; relational reads,
+writes, and schema changes use SQL.
 
 ## Prepared statements
 
@@ -345,14 +344,8 @@ procedures, triggers, notifications, WAL, replication, point-in-time recovery,
 or PostgreSQL file-format compatibility. Rows and parameters are
 JSON-compatible JavaScript values. Result fields use the closest stable
 PostgreSQL OID as metadata: boolean `16`, integer `20`, text `25`, JSON `114`,
-float `701`, and unknown/untyped `705`. This mapping does not add PostgreSQL
-storage widths, coercions, operators, parsers, or wire semantics.
-
-Programmatic schemas without a typed column catalog report `705` for explicit
-projection fields. For `SELECT *` and `RETURNING *`, TinyGres can derive those
-field names only from the first returned row; an empty star result from an
-untyped table therefore has `fields: []` and no field order for an array-row
-consumer. SQL tables have typed catalogs and do not have this exception.
+and float `701`. This mapping does not add PostgreSQL storage widths,
+coercions, operators, parsers, or wire semantics.
 
 Persistence is TinyGres's own page format in memory or one browser OPFS file.
 It is not a PostgreSQL data directory.

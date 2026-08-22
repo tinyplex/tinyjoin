@@ -10,15 +10,15 @@ test('opens, writes, commits, and reopens the page-native WASM engine in a Worke
   const report = JSON.parse(
     (await page.getByTestId('report').textContent()) ?? 'null',
   ) as {
+    bootstrapRevision: number;
     closes: number;
     committedRevision: number;
-    defineRevision: number;
     pageCount: number;
     reopenedRevision: number;
     rows: Array<{id: number; title: string}>;
   };
 
-  expect(report.defineRevision).toBe(0);
+  expect(report.bootstrapRevision).toBe(1);
   expect(report.committedRevision).toBe(2);
   expect(report.reopenedRevision).toBe(2);
   expect(report.pageCount).toBeGreaterThanOrEqual(8);

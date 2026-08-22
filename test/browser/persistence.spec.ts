@@ -22,11 +22,10 @@ test('persists complete state across dedicated Worker restarts', async ({
   console.log(`TinyGres OPFS persistence: ${JSON.stringify(report)} ms`);
 
   expect(report.lockErrorCode).toBe('STORAGE_LOCKED');
-  expect(report.conflictErrorCode).toBe('INVALID_SCHEMA');
   expect(report.differentNameOpened).toBe(true);
   expect(report.rowCount).toBe(10_000);
   expect(report.emptyTableRows).toBe(0);
-  expect(report.revision).toBe(2);
+  expect(report.revision).toBe(3);
   expect(report.updatedTitle).toBe('Persisted after forced termination');
   for (const timing of [
     report.initialCommitMs,
@@ -58,7 +57,7 @@ test('rehydrates OPFS after a browser process restart', async ({}, testInfo) => 
           window.__tinygresTest!.writeBrowserRestartFixture(name, rows),
         {name: databaseName, rows: 1_024},
       ),
-    ).resolves.toEqual({revision: 1});
+    ).resolves.toEqual({revision: 2});
 
     await context.close();
     context = await chromium.launchPersistentContext(profile, {
@@ -73,7 +72,7 @@ test('rehydrates OPFS after a browser process restart', async ({}, testInfo) => 
       databaseName),
     ).resolves.toEqual({
       emptyTableRows: 0,
-      revision: 1,
+      revision: 2,
       rowCount: 1_024,
     });
   } finally {

@@ -1,10 +1,8 @@
 import {describe, expect, it} from 'vitest';
 
 import type {
-  QueryPlan,
   Row,
   SqlResult,
-  TableSchema,
 } from '../../src/protocol.ts';
 import type {PageDevice} from '../../src/worker/page-device.ts';
 import {
@@ -17,7 +15,7 @@ import {
   type RawStructuredWasmEngineConstructor,
 } from '../../src/worker/wasm-bridge.ts';
 
-const VERSION = 1;
+const VERSION = 2;
 const SUCCESS = 0;
 const FAILURE = 1;
 const SAFE = 0;
@@ -28,9 +26,6 @@ type RawCall = {
   operation: number;
   payload: unknown;
 };
-
-const query: QueryPlan = {table: 'items', filters: []};
-const schema: TableSchema = {name: 'items', primaryKey: ['id']};
 
 function success(payload: unknown = undefined, disposition = SAFE): unknown[] {
   return [VERSION, SUCCESS, disposition, payload];
@@ -51,14 +46,6 @@ function failure(
 
 function outcome(revision = 1, tables: string[] = ['items']) {
   return {revision, tables};
-}
-
-function queryResult(rows: Row[] = []): unknown {
-  return {
-    revision: 1,
-    fields: rows.length > 0 ? [{name: 'id', dataTypeID: 20}] : [],
-    rows,
-  };
 }
 
 function sqlResult(rows: Row[] = []): SqlResult {
@@ -103,21 +90,17 @@ class FakeRawEngine implements RawStructuredWasmEngine {
 describe('WASM engine bridge', () => {
   it('pins the private operation ABI densely', () => {
     expect(WASM_OPERATION).toEqual({
-      defineTables: 1,
-      replaceSnapshot: 2,
-      applyBatch: 3,
-      query: 4,
-      executeSql: 5,
-      execSql: 6,
-      begin: 7,
-      commit: 8,
-      rollback: 9,
-      inTransaction: 10,
-      revision: 11,
-      close: 12,
-      prepareSql: 13,
-      executePrepared: 14,
-      closePrepared: 15,
+      executeSql: 1,
+      execSql: 2,
+      prepareSql: 3,
+      executePrepared: 4,
+      closePrepared: 5,
+      begin: 6,
+      commit: 7,
+      rollback: 8,
+      inTransaction: 9,
+      revision: 10,
+      close: 11,
     });
   });
 
@@ -154,20 +137,9 @@ describe('WASM engine bridge', () => {
     raw.responseFor = ({operation}) => responseForOperation(operation);
     const engine = new StructuredWasmEngine(raw);
 
-    const schemas = [schema];
-    const replacementRows = [{id: 1}];
-    const batch = {
-      changes: [{type: 'upsert' as const, table: 'items', row: {id: 2}}],
-    };
     const params = [3, 'three'];
     const preparedParams = [4];
 
-    engine.defineTables(schemas);
-    expect(engine.replaceTableSnapshot(schema, replacementRows)).toEqual(
-      outcome(),
-    );
-    expect(engine.applyBatch(batch)).toEqual(outcome());
-    expect(engine.query(query)).toEqual(queryResult([{id: 1}]));
     expect(engine.executeSql('SELECT $1, $2', params)).toEqual(
       sqlResult([{id: 1}]),
     );
@@ -185,26 +157,6 @@ describe('WASM engine bridge', () => {
     engine.close();
 
     expect(raw.calls).toEqual([
-      {
-        bridgeVersion: VERSION,
-        operation: WASM_OPERATION.defineTables,
-        payload: schemas,
-      },
-      {
-        bridgeVersion: VERSION,
-        operation: WASM_OPERATION.replaceSnapshot,
-        payload: {schema, rows: replacementRows},
-      },
-      {
-        bridgeVersion: VERSION,
-        operation: WASM_OPERATION.applyBatch,
-        payload: batch,
-      },
-      {
-        bridgeVersion: VERSION,
-        operation: WASM_OPERATION.query,
-        payload: query,
-      },
       {
         bridgeVersion: VERSION,
         operation: WASM_OPERATION.executeSql,
@@ -266,11 +218,11 @@ describe('WASM engine bridge', () => {
 
   it('returns validated result graphs without rebuilding them', () => {
     const raw = new FakeRawEngine();
-    const result = queryResult([{id: 1}]);
+    const result = sqlResult([{id: 1}]);
     raw.response = success(result);
     const engine = new StructuredWasmEngine(raw);
 
-    expect(engine.query(query)).toBe(result);
+    expect(engine.executeSql('SELECT id FROM items', [])).toBe(result);
   });
 
   it('preflights structured requests before entering WASM', () => {
@@ -329,15 +281,15 @@ describe('WASM engine bridge', () => {
     }
   });
 
-  it('keeps malformed read results nonfatal', () => {
+  it('keeps malformed nonmutating control results nonfatal', () => {
     const raw = new FakeRawEngine();
     raw.response = [99, SUCCESS, SAFE, undefined];
     const engine = new StructuredWasmEngine(raw);
 
-    expect(() => engine.query(query)).toThrow(WasmStructuredDecodeError);
+    expect(() => engine.revision()).toThrow(WasmStructuredDecodeError);
     expect(raw.closeCalls).toBe(0);
-    raw.response = success(queryResult());
-    expect(engine.query(query)).toEqual(queryResult());
+    raw.response = success(3);
+    expect(engine.revision()).toBe(3);
   });
 
   it('closes immediately on fatal structured engine errors', () => {
@@ -350,7 +302,7 @@ describe('WASM engine bridge', () => {
       raw.response = failure(code, 'reopen', false);
       const engine = new StructuredWasmEngine(raw);
 
-      expect(() => engine.query(query)).toThrow(
+      expect(() => engine.revision()).toThrow(
         expect.objectContaining({code, retryable: false}),
       );
       expect(raw.closeCalls).toBe(1);
@@ -368,8 +320,8 @@ describe('WASM engine bridge', () => {
     const errors: unknown[] = [];
     firstDevice.callback = () => {
       for (const reenter of [
-        () => first.query(query),
-        () => second.query(query),
+        () => first.executeSql('SELECT id FROM items', []),
+        () => second.executeSql('SELECT id FROM items', []),
         () => first.close(),
         () => second.close(),
         () =>
@@ -389,7 +341,7 @@ describe('WASM engine bridge', () => {
 
     for (const transfer of ['read', 'write', 'flush'] as const) {
       firstRaw.transfer = transfer;
-      expect(first.query(query)).toEqual(queryResult());
+      expect(first.executeSql('SELECT id FROM items', [])).toEqual(sqlResult());
       expect(errors).toHaveLength(5);
       for (const error of errors) {
         expect(error).toEqual(
@@ -408,7 +360,7 @@ describe('WASM engine bridge', () => {
 
     // Rejected nested closes did not mutate either bridge lifecycle.
     firstDevice.callback = undefined;
-    expect(second.query(query)).toEqual(queryResult());
+    expect(second.executeSql('SELECT id FROM items', [])).toEqual(sqlResult());
     first.close();
     first.close();
     second.close();
@@ -421,14 +373,8 @@ describe('WASM engine bridge', () => {
 
 function responseForOperation(operation: number): unknown {
   switch (operation) {
-    case WASM_OPERATION.defineTables:
-      return success(undefined, DURABLE);
-    case WASM_OPERATION.replaceSnapshot:
-    case WASM_OPERATION.applyBatch:
     case WASM_OPERATION.commit:
       return success(outcome(), DURABLE);
-    case WASM_OPERATION.query:
-      return success(queryResult([{id: 1}]));
     case WASM_OPERATION.executeSql:
     case WASM_OPERATION.executePrepared:
       return success(sqlResult([{id: 1}]));
@@ -503,7 +449,7 @@ class CallbackRawEngine implements RawStructuredWasmEngine {
       this.device.close();
       return success();
     }
-    if (operation === WASM_OPERATION.query) {
+    if (operation === WASM_OPERATION.executeSql) {
       if (this.transfer === 'read') {
         const target = new Uint8Array(4096);
         this.device.readPage(0, 0, target);
@@ -513,7 +459,7 @@ class CallbackRawEngine implements RawStructuredWasmEngine {
       } else {
         this.device.flush();
       }
-      return success(queryResult());
+      return success(sqlResult());
     }
     return success(1);
   }

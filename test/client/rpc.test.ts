@@ -78,11 +78,12 @@ describe('WorkerRpc', () => {
     await expect(request).resolves.toEqual(sqlResult(3));
   });
 
-  it('rejects a malformed query success and terminates the worker', async () => {
+  it('rejects a malformed SQL query success and terminates the worker', async () => {
     const worker = new FakeWorker();
     const rpc = new WorkerRpc(worker);
-    const request = rpc.request('query', {
-      plan: {table: 'posts', filters: []},
+    const request = rpc.request('executeSql', {
+      sql: 'SELECT id FROM posts',
+      params: [],
     });
     const [message] = worker.posted as WorkerRequest[];
 
@@ -90,7 +91,7 @@ describe('WorkerRpc', () => {
       v: PROTOCOL_VERSION,
       id: message!.id,
       ok: true,
-      result: {revision: 0, fields: [], rows: [], extra: true},
+      result: {...sqlResult(0), extra: true},
     });
 
     await expect(request).rejects.toMatchObject({code: 'PROTOCOL_MISMATCH'});
@@ -146,16 +147,8 @@ describe('WorkerRpc', () => {
 
   it('validates every method-specific success shape', () => {
     const outcome = {revision: 1, tables: ['posts']};
-    const queryResult = {
-      revision: 1,
-      fields: [{name: 'id', dataTypeID: 20}],
-      rows: [{id: 1}],
-    };
 
     expect(isRpcResult('init', {revision: 0})).toBe(true);
-    expect(isRpcResult('replaceTable', outcome)).toBe(true);
-    expect(isRpcResult('applyBatch', outcome)).toBe(true);
-    expect(isRpcResult('query', queryResult)).toBe(true);
     expect(isRpcResult('executeSql', sqlResult(1, [{id: 1}]))).toBe(true);
     expect(isRpcResult('prepareSql', {statementId: 1})).toBe(true);
     expect(isRpcResult('executePrepared', sqlResult(1, [{id: 1}]))).toBe(
@@ -171,9 +164,11 @@ describe('WorkerRpc', () => {
     expect(isRpcResult('close', undefined)).toBe(true);
 
     expect(isRpcResult('init', {revision: -1})).toBe(false);
-    expect(isRpcResult('replaceTable', {...outcome, extra: true})).toBe(false);
     expect(
-      isRpcResult('query', {...queryResult, rows: [{created: new Date()}]}),
+      isRpcResult('executeSql', {
+        ...sqlResult(1),
+        rows: [{created: new Date()}],
+      }),
     ).toBe(false);
     expect(
       isRpcResult('executeSql', {
@@ -197,8 +192,8 @@ describe('WorkerRpc', () => {
     expect(isRpcResult('close', null)).toBe(false);
 
     expect(
-      isRpcResultHeader('query', {
-        ...queryResult,
+      isRpcResultHeader('executeSql', {
+        ...sqlResult(1),
         rows: [{created: new Date()}],
       }),
     ).toBe(true);
@@ -211,25 +206,18 @@ describe('WorkerRpc', () => {
   });
 
   it('rejects extra request envelope and parameter keys', () => {
-    const schema = {name: 'posts', primaryKey: ['id']};
     const requests = [
       {
         v: PROTOCOL_VERSION,
         id: 1,
         method: 'init',
-        params: {schemas: [], storage: {kind: 'memory'}},
+        params: {storage: {kind: 'memory'}},
       },
       {
         v: PROTOCOL_VERSION,
         id: 2,
-        method: 'replaceTable',
-        params: {schema, rows: []},
-      },
-      {
-        v: PROTOCOL_VERSION,
-        id: 3,
-        method: 'applyBatch',
-        params: {batch: {changes: []}},
+        method: 'executeSql',
+        params: {sql: 'SELECT id FROM posts', params: []},
       },
     ] as const;
 
@@ -247,50 +235,9 @@ describe('WorkerRpc', () => {
     expect(
       isWorkerRequest({
         ...requests[0],
-        params: {schemas: [], storage: {kind: 'memory', extra: true}},
+        params: {storage: {kind: 'memory', extra: true}},
       }),
     ).toBe(false);
-    expect(
-      isWorkerRequest({
-        ...requests[1],
-        params: {schema: {...schema, extra: true}},
-      }),
-    ).toBe(false);
-    expect(
-      isWorkerRequest({
-        v: PROTOCOL_VERSION,
-        id: 5,
-        method: 'applyBatch',
-        params: {
-          batch: {
-            changes: [
-              {
-                type: 'upsert',
-                table: 'posts',
-                row: {id: 1},
-                extra: true,
-              },
-            ],
-          },
-        },
-      }),
-    ).toBe(false);
-    expect(
-      isWorkerRequest({
-        v: PROTOCOL_VERSION,
-        id: 6,
-        method: 'query',
-        params: {
-          plan: {
-            table: 'posts',
-            filters: [
-              {column: 'id', operator: 'eq', value: 1, extra: true},
-            ],
-          },
-        },
-      }),
-    ).toBe(false);
-
     for (const request of [
       {
         v: PROTOCOL_VERSION,
