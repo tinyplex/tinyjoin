@@ -128,6 +128,7 @@ const Header = ({page}) => {
         href: '/',
         'aria-current': page.url === '/' ? 'page' : undefined,
       },
+      h('img', {src: '/favicon.svg', alt: 'TinyGres logo'}),
       h(Wordmark),
     ),
     h(
@@ -163,7 +164,16 @@ const Home = ({page}) =>
   h(
     'article',
     {id: 'home', tabIndex: -1},
-    h('h1', {className: 'home-wordmark'}, h(Wordmark)),
+    h(
+      'em',
+      null,
+      h('img', {
+        src: '/favicon.svg',
+        alt: 'Large TinyGres logo',
+        width: '100%',
+        height: '100%',
+      }),
+    ),
     page.summary ? h(Markdown, {markdown: page.summary, html: true}) : null,
     page.body ? h(Markdown, {markdown: page.body, html: true}) : null,
   );

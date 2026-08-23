@@ -1,60 +1,6 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
-  <title id="title">TinyGres logo</title>
-  <desc id="desc">A compact database stack that also forms an abstract elephant face, with a wide trunk and two tusks.</desc>
-  <defs>
-    <clipPath id="icon-clip">
-      <rect x="64" y="64" width="896" height="896" rx="144" ry="144"/>
-    </clipPath>
-  </defs>
-
-  <g clip-path="url(#icon-clip)" shape-rendering="geometricPrecision">
-    <!-- Strictly square, softly rounded silhouette. -->
-    <rect x="64" y="64" width="896" height="896" rx="144" ry="144" fill="#000000"/>
-
-    <!-- Accent database tier. Its two edges share the same elliptical curvature. -->
-    <path fill="#3718EC" d="
-      M 64 507
-      C 278 575, 746 575, 960 507
-      L 960 688
-      C 746 756, 278 756, 64 688
-      Z"/>
-
-    <!-- Second and third database-stack separators. -->
-    <path d="M 64 475 C 278 543, 746 543, 960 475"
-          fill="none" stroke="#FFFFFF" stroke-width="64" stroke-linecap="butt"/>
-    <path d="M 64 720 C 278 788, 746 788, 960 720"
-          fill="none" stroke="#FFFFFF" stroke-width="64" stroke-linecap="butt"/>
-
-    <!-- Opaque trunk core, covering the stack behind it. -->
-    <path fill="#000000" d="
-      M 372 245
-      L 652 245
-      L 652 824
-      C 652 894, 590 920, 512 920
-      C 434 920, 372 894, 372 824
-      Z"/>
-
-    <!-- Heavy tusks: mirrored, round-capped, and nested inside the lower corners. -->
-    <path d="M 372 772 C 354 824, 303 860, 235 866"
-          fill="none" stroke="#FFFFFF" stroke-width="80"
-          stroke-linecap="round" stroke-linejoin="round"/>
-    <path d="M 652 772 C 670 824, 721 860, 789 866"
-          fill="none" stroke="#FFFFFF" stroke-width="80"
-          stroke-linecap="round" stroke-linejoin="round"/>
-
-    <!-- First database separator flowing continuously into the trunk outline. -->
-    <path d="
-      M 64 270
-      C 188 307, 286 325, 337 325
-      C 360 325, 372 344, 372 372
-      L 372 815
-      C 372 886, 430 924, 512 924
-      C 594 924, 652 886, 652 815
-      L 652 372
-      C 652 344, 664 325, 687 325
-      C 738 325, 836 307, 960 270"
-      fill="none" stroke="#FFFFFF" stroke-width="72"
-      stroke-linecap="butt" stroke-linejoin="round"/>
-  </g>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-100 -100 1200 1200" stroke-linejoin="round" stroke="#fff" stroke-width="50">
+  <path d="M0 150a500 150 0 00223 125 100 100 0 0179 84l48 291v250a100 100 0 00100 100h100a100 100 0 00100-100V650l48-291a100 100 0 0179-84 500 150 0 00223-125A500 150 0 000 150z" fill="#336791" />
+  <path
+    d="M0 150a500 150 0 00223 125 100 100 0 0179 84 700 700 0 01-12.5 160A500 150 0 010 383zm0 233a500 150 0 00289.5 136A700 700 0 01206 738.5 500 150 0 010 617zm0 234a500 150 0 00206 121.5 700 700 0 01-81 81.5 500 500 0 00225-90v170a100 100 0 00100 100A500 150 0 010 850zm1000-467a500 150 0 01-223 125 100 100 0 00-79 84 700 700 0 0012.5 160A500 150 0 001000 383zm0 233a500 150 0 01-289.5 136A700 700 0 00794 738.5 500 150 0 001000 617zm0 234a500 150 0 01-206 121.5 700 700 0 0081 81.5 500 500 0 01-225-90v170a100 100 0 01-100 100 500 150 0 00450-150z" />
+  <path d="M350 730a500 500 0 01-225 90 700 700 0 00177-461l48 291zm300 0a500 500 0 00225 90 700 700 0 01-177-461l-48 291z" fill="#fff" />
 </svg>

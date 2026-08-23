@@ -53,11 +53,28 @@ export async function checkDocs(
   ) {
     errors.push('The homepage must link to the generated SVG favicon');
   }
+  if (
+    !homepage.includes(
+      '<a class="wordmark" href="/" aria-current="page"><img src="/favicon.svg" alt="TinyGres logo">',
+    )
+  ) {
+    errors.push('The header must show the TinyGres logo beside the wordmark');
+  }
+  if (
+    !homepage.includes(
+      '<em><img src="/favicon.svg" alt="Large TinyGres logo" width="100%" height="100%"></em><section id="hero">',
+    )
+  ) {
+    errors.push('The homepage must show the large TinyGres logo before its hero');
+  }
   if (/article#home\s*>\s*p\s*>\s*a/.test(stylesheet)) {
     errors.push('Homepage button styles must not target ordinary paragraphs');
   }
   if (/article#home\s*>\s*hr\s*~/.test(stylesheet)) {
     errors.push('Homepage content after a divider must retain the paired grid');
+  }
+  if (!stylesheet.includes('--accent:#336791')) {
+    errors.push('The site accent must match the final TinyGres logo');
   }
   for (const [name, html] of [
     ['homepage', homepage],
