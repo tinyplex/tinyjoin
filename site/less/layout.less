@@ -10,11 +10,10 @@ body {
   margin: 0;
 
   > header {
-    min-height: 5rem;
+    height: 5rem;
     display: flex;
     align-items: center;
     justify-content: space-between;
-    flex-wrap: wrap;
 
     > a {
       min-width: 15rem;
@@ -22,13 +21,10 @@ body {
     }
 
     > nav {
-      display: flex;
-      order: 3;
+      display: none;
       flex: 1;
-      flex-basis: 100%;
       max-width: 60rem;
-      margin: 0 1rem 0.65rem;
-      overflow-x: auto;
+      margin: 0;
     }
 
     > #dark {
@@ -99,15 +95,8 @@ body {
 }
 
 @media (min-width: 38rem) {
-  body > header {
-    flex-wrap: nowrap;
-
-    > nav {
-      order: initial;
-      flex-basis: auto;
-      margin: 0;
-      overflow: visible;
-    }
+  body > header > nav {
+    display: flex;
   }
 }
 

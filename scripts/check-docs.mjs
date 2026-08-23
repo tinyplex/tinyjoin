@@ -76,6 +76,16 @@ export async function checkDocs(
   if (!stylesheet.includes('--accent:#336791')) {
     errors.push('The site accent must match the final TinyGres logo');
   }
+  if (!/body>header>nav\{display:none/.test(stylesheet)) {
+    errors.push('The primary navigation must be hidden on mobile');
+  }
+  if (
+    !/@media \(min-width:38rem\)\{body>header>nav\{display:flex/.test(
+      stylesheet,
+    )
+  ) {
+    errors.push('The primary navigation must reappear at the desktop breakpoint');
+  }
   for (const [name, html] of [
     ['homepage', homepage],
     ['release page', releasePage],
