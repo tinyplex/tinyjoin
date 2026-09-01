@@ -1,17 +1,17 @@
 /**
- * The tinygres module provides a small PostgreSQL-shaped relational database
+ * The tinyjoin module provides a small PostgreSQL-shaped relational database
  * that runs in a dedicated browser Worker and stores data in memory or OPFS.
  *
  * Start with the create function. It constructs the Worker and loads the
  * WebAssembly engine, so applications do not need to manage either directly.
  * @packageDocumentation
- * @module tinygres
+ * @module tinyjoin
  * @since v0.0.5
  */
-/// tinygres
+/// tinyjoin
 
 /**
- * The JsonPrimitive type represents a scalar value accepted by TinyGres.
+ * The JsonPrimitive type represents a scalar value accepted by TinyJoin.
  * @category Data types
  * @since v0.0.5
  */
@@ -19,7 +19,7 @@
 
 /**
  * The JsonValue type represents a parameter or result value accepted by the
- * TinyGres JavaScript API.
+ * TinyJoin JavaScript API.
  * @category Data types
  * @since v0.0.5
  */
@@ -81,7 +81,7 @@
 
   /**
    * The dataTypeID property contains the closest stable PostgreSQL OID for the
-   * TinyGres runtime type.
+   * TinyJoin runtime type.
    * @category Result
    * @since v0.0.5
    */
@@ -159,7 +159,7 @@
 /// SerializedError
 {
   /**
-   * The code property identifies the TinyGres error family.
+   * The code property identifies the TinyJoin error family.
    * @category Error
    * @since v0.0.5
    */
@@ -258,7 +258,7 @@
  * The ClientOptions interface configures storage or an application-owned
  * Worker.
  *
- * The zero-boilerplate default constructs TinyGres's packaged module Worker.
+ * The zero-boilerplate default constructs TinyJoin's packaged module Worker.
  * Provide at most one of worker, workerFactory, or workerUrl.
  * @category Configuration
  * @since v0.0.5
@@ -424,7 +424,7 @@
 }
 
 /**
- * The Client class represents one open TinyGres database and its dedicated
+ * The Client class represents one open TinyJoin database and its dedicated
  * Worker.
  *
  * Prefer the async create function so initialization failures are reported
@@ -467,7 +467,7 @@
 
   /**
    * The query method executes exactly one parameterized SQL statement.
-   * @param sql A statement in the documented TinyGres SQL subset.
+   * @param sql A statement in the documented TinyJoin SQL subset.
    * @param params JSON-compatible values for `$1`, `$2`, and so on.
    * @param options Result-shape options.
    * @returns A Promise resolving to the statement results.
@@ -536,13 +536,13 @@
 }
 
 /**
- * The create function opens a TinyGres database in a dedicated Worker.
+ * The create function opens a TinyJoin database in a dedicated Worker.
  *
  * Calling it with no argument creates an ephemeral memory database. Pass a
  * stable `opfs://name` to persist the database in browser storage.
  * @example
  * ```ts
- * import {create} from 'tinygres';
+ * import {create} from 'tinyjoin';
  *
  * const db = await create('opfs://my-app');
  * await db.exec(`
@@ -561,7 +561,7 @@
 
 /**
  * The ClientError class extends JavaScript Error with a validated error
- * returned by the TinyGres Worker.
+ * returned by the TinyJoin Worker.
  * @category Errors
  * @since v0.0.5
  */
@@ -575,7 +575,7 @@
   /// ClientError.constructor
 
   /**
-   * The code property identifies the TinyGres error family.
+   * The code property identifies the TinyJoin error family.
    * @category Error
    * @since v0.0.5
    */

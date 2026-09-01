@@ -11,7 +11,7 @@
     "rustup",
     "shellenv",
     "tinycreate",
-    "tinygres",
+    "tinyjoin",
     "tlsv"
   ],
   "ignoreWords": [],

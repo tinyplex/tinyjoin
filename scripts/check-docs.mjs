@@ -32,9 +32,9 @@ export async function checkDocs(
   }
 
   if (
-    (await readFile(resolve(docs, 'CNAME'), 'utf8')).trim() !== 'tinygres.org'
+    (await readFile(resolve(docs, 'CNAME'), 'utf8')).trim() !== 'tinyjoin.org'
   ) {
-    errors.push('The generated CNAME must contain tinygres.org');
+    errors.push('The generated CNAME must contain tinyjoin.org');
   }
 
   const homepage = await readFile(resolve(docs, 'index.html'), 'utf8');
@@ -55,17 +55,17 @@ export async function checkDocs(
   }
   if (
     !homepage.includes(
-      '<a class="wordmark" href="/" aria-current="page"><img src="/favicon.svg" alt="TinyGres logo">',
+      '<a class="wordmark" href="/" aria-current="page"><img src="/favicon.svg" alt="TinyJoin logo"><span>Tiny<em>Join</em></span>',
     )
   ) {
-    errors.push('The header must show the TinyGres logo beside the wordmark');
+    errors.push('The header must show the TinyJoin logo beside the wordmark');
   }
   if (
     !homepage.includes(
-      '<em><img src="/favicon.svg" alt="Large TinyGres logo" width="100%" height="100%"></em><section id="hero">',
+      '<em><img src="/favicon.svg" alt="Large TinyJoin logo" width="100%" height="100%"></em><section id="hero">',
     )
   ) {
-    errors.push('The homepage must show the large TinyGres logo before its hero');
+    errors.push('The homepage must show the large TinyJoin logo before its hero');
   }
   if (/article#home\s*>\s*p\s*>\s*a/.test(stylesheet)) {
     errors.push('Homepage button styles must not target ordinary paragraphs');
@@ -74,7 +74,7 @@ export async function checkDocs(
     errors.push('Homepage content after a divider must retain the paired grid');
   }
   if (!stylesheet.includes('--accent:#336791')) {
-    errors.push('The site accent must match the final TinyGres logo');
+    errors.push('The site accent must match the final TinyJoin logo');
   }
   if (!/body>header>nav\{display:none/.test(stylesheet)) {
     errors.push('The primary navigation must be hidden on mobile');
@@ -90,7 +90,7 @@ export async function checkDocs(
     ['homepage', homepage],
     ['release page', releasePage],
   ]) {
-    if (/<a\b[^>]*href="https:\/\/tinygres\.org\//.test(html)) {
+    if (/<a\b[^>]*href="https:\/\/tinyjoin\.org\//.test(html)) {
       errors.push(`The ${name} must use root-relative internal links`);
     }
   }
@@ -120,7 +120,7 @@ export async function checkDocs(
         continue;
       }
 
-      const url = new URL(href, 'https://tinygres.org/');
+      const url = new URL(href, 'https://tinyjoin.org/');
       let target = decodeURIComponent(url.pathname).replace(/^\//, '');
       target = target === '' ? 'index.html' : target;
       if (target.endsWith('/')) {
@@ -172,8 +172,8 @@ async function checkMarkdownCopies(errors) {
     if (/(?:href|src)="\/|\]\(\//.test(markdown)) {
       errors.push(`${path} must use absolute internal links`);
     }
-    if (!markdown.includes('https://tinygres.org/')) {
-      errors.push(`${path} must contain an absolute tinygres.org link`);
+    if (!markdown.includes('https://tinyjoin.org/')) {
+      errors.push(`${path} must contain an absolute tinyjoin.org link`);
     }
   }
 }

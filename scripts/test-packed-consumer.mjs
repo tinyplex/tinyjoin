@@ -21,7 +21,7 @@ import {requireWasmArtifacts, wasmArtifacts} from './wasm-artifacts.mjs';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const fixture = resolve(root, 'test/consumers/vite');
 const generatedRoot = await mkdtemp(
-  join(tmpdir(), 'tinygres-packed-consumer-'),
+  join(tmpdir(), 'tinyjoin-packed-consumer-'),
 );
 const packageTestEnvironment = {
   ...process.env,
@@ -71,16 +71,16 @@ const tarball = resolve(packageDirectory, packed.filename);
 await cp(fixture, appDirectory, {recursive: true});
 const manifestPath = resolve(appDirectory, 'package.json');
 const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
-manifest.dependencies.tinygres = `file:${tarball}`;
+manifest.dependencies.tinyjoin = `file:${tarball}`;
 await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 
 run(npm, ['install', '--no-audit', '--no-fund'], appDirectory);
-const installedPackage = resolve(appDirectory, 'node_modules/tinygres');
+const installedPackage = resolve(appDirectory, 'node_modules/tinyjoin');
 const installedRealPath = await realpath(installedPackage);
 const nodeModulesRealPath = await realpath(
   resolve(appDirectory, 'node_modules'),
 );
-if (installedRealPath !== resolve(nodeModulesRealPath, 'tinygres')) {
+if (installedRealPath !== resolve(nodeModulesRealPath, 'tinyjoin')) {
   throw new Error(
     `Expected a packed install under node_modules, received ${installedRealPath}`,
   );
@@ -89,8 +89,8 @@ if (installedRealPath !== resolve(nodeModulesRealPath, 'tinygres')) {
 const installedManifest = JSON.parse(
   await readFile(resolve(installedPackage, 'package.json'), 'utf8'),
 );
-if (installedManifest.name !== 'tinygres') {
-  throw new Error('The installed tarball is not the tinygres package');
+if (installedManifest.name !== 'tinyjoin') {
+  throw new Error('The installed tarball is not the tinyjoin package');
 }
 if (installedManifest.types !== './@types/index.d.ts') {
   throw new Error(
@@ -100,7 +100,7 @@ if (installedManifest.types !== './@types/index.d.ts') {
 for (const developmentField of ['private', 'scripts', 'devDependencies']) {
   if (developmentField in installedManifest) {
     throw new Error(
-      `Published TinyGres manifest contains development field ${developmentField}`,
+      `Published TinyJoin manifest contains development field ${developmentField}`,
     );
   }
 }
@@ -109,7 +109,7 @@ if (
   Object.keys(installedManifest.dependencies).length > 0
 ) {
   throw new Error(
-    `Published TinyGres unexpectedly has runtime dependencies: ${Object.keys(installedManifest.dependencies).join(', ')}`,
+    `Published TinyJoin unexpectedly has runtime dependencies: ${Object.keys(installedManifest.dependencies).join(', ')}`,
   );
 }
 await assertInstalledOpfsLoader(installedPackage);
@@ -119,7 +119,7 @@ const ssrOutput = run(
   [
     '--input-type=module',
     '--eval',
-    "const pkg = await import('tinygres'); if (typeof pkg.create !== 'function') throw new Error('missing create export'); console.log('SSR_IMPORT_OK');",
+    "const pkg = await import('tinyjoin'); if (typeof pkg.create !== 'function') throw new Error('missing create export'); console.log('SSR_IMPORT_OK');",
   ],
   appDirectory,
 );
@@ -267,7 +267,7 @@ async function assertBuildLibRejectsMissingWasmArtifacts() {
     } catch (error) {
       if (
         error instanceof Error &&
-        error.message.includes('Missing TinyGres WASM artifacts')
+        error.message.includes('Missing TinyJoin WASM artifacts')
       ) {
         continue;
       }
@@ -309,9 +309,9 @@ function assertPackedFiles(packed) {
     'index.js',
     'protocol.js',
     'releases.md',
-    'wasm/tinygres_wasm.js',
-    'wasm/tinygres_wasm_bg.wasm',
-    'worker-opfs/tinygres_opfs_runtime.js',
+    'wasm/tinyjoin_wasm.js',
+    'wasm/tinyjoin_wasm_bg.wasm',
+    'worker-opfs/tinyjoin_opfs_runtime.js',
     'worker/default-entry.js',
     'worker/engine.js',
     'worker/host.js',
@@ -326,7 +326,7 @@ function assertPackedFiles(packed) {
   const unexpected = files.filter((file) => !expected.includes(file));
   if (missing.length > 0 || unexpected.length > 0) {
     throw new Error(
-      `Packed TinyGres file inventory changed:\nmissing: ${missing.join(', ') || '(none)'}\nunexpected: ${unexpected.join(', ') || '(none)'}`,
+      `Packed TinyJoin file inventory changed:\nmissing: ${missing.join(', ') || '(none)'}\nunexpected: ${unexpected.join(', ') || '(none)'}`,
     );
   }
 }
@@ -335,7 +335,7 @@ async function assertInstalledOpfsLoader(packageDirectory) {
   const path = resolve(packageDirectory, 'worker/opfs-loader.js');
   const source = await readFile(path, 'utf8');
   for (const marker of [
-    "'../worker-opfs/tinygres_opfs_runtime.js'",
+    "'../worker-opfs/tinyjoin_opfs_runtime.js'",
     '/* @vite-ignore */',
     '/* webpackIgnore: true */',
   ]) {
@@ -349,10 +349,10 @@ async function assertConsumerPrivateRuntimeBoundary(files) {
   const javascript = files.filter((file) => file.endsWith('.js'));
   const wasm = files.filter((file) => file.endsWith('.wasm'));
   const opfsRuntime = javascript.filter((file) =>
-    /tinygres_opfs_runtime(?:-[^/]*)?\.js$/.test(file),
+    /tinyjoin_opfs_runtime(?:-[^/]*)?\.js$/.test(file),
   );
   const pageWasm = wasm.filter((file) =>
-    /tinygres_wasm_bg(?:-[^/]*)?\.wasm$/.test(file),
+    /tinyjoin_wasm_bg(?:-[^/]*)?\.wasm$/.test(file),
   );
   if (opfsRuntime.length !== 1 || pageWasm.length !== 1 || wasm.length !== 1) {
     throw new Error(
@@ -362,10 +362,10 @@ async function assertConsumerPrivateRuntimeBoundary(files) {
 
   const opfsImplementationMarkers = [
     'createOpfsWasmEngine',
-    'Another TinyGres worker already has this OPFS database open',
+    'Another TinyJoin worker already has this OPFS database open',
   ];
   const privateOpfsImplementationMarkers = [
-    'Another TinyGres worker already has this OPFS database open',
+    'Another TinyJoin worker already has this OPFS database open',
   ];
   const opfsRuntimeSource = await readFile(opfsRuntime[0], 'utf8');
   if (Buffer.byteLength(opfsRuntimeSource) > 96 * 1024) {
@@ -387,7 +387,7 @@ async function assertConsumerPrivateRuntimeBoundary(files) {
       /data:(?:application\/wasm|text\/javascript)/i,
       'an inlined runtime or WASM data URL',
     ],
-    [/tinygres_wasm(?:_bg)?/i, 'default WASM glue'],
+    [/tinyjoin_wasm(?:_bg)?/i, 'default WASM glue'],
     [
       /WASM returned an invalid structured response envelope/,
       'the structured WASM adapter',
@@ -534,7 +534,7 @@ async function captureLazyRequests(requests, expected, exerciseRuntime) {
 }
 
 function isOpfsRuntimeRequest(url) {
-  return url.includes('tinygres_opfs_runtime') || url.includes('/worker-opfs/');
+  return url.includes('tinyjoin_opfs_runtime') || url.includes('/worker-opfs/');
 }
 
 async function stopServer(child) {

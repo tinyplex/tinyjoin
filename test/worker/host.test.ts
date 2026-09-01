@@ -498,7 +498,7 @@ describe('startWorker', () => {
       ok: false,
       error: {
         code: 'TRANSACTION_ACTIVE',
-        message: 'A TinyGres transaction is already active',
+        message: 'A TinyJoin transaction is already active',
       },
     });
     expect(scope.posted).toContainEqual({
@@ -507,7 +507,7 @@ describe('startWorker', () => {
       ok: false,
       error: {
         code: 'TRANSACTION_ACTIVE',
-        message: 'A TinyGres transaction is already active',
+        message: 'A TinyJoin transaction is already active',
       },
     });
     expect(engine.closePrepared).not.toHaveBeenCalled();
@@ -617,7 +617,7 @@ describe('startWorker', () => {
       ok: false,
       error: {
         code: 'TRANSACTION_ACTIVE',
-        message: 'Use the active TinyGres transaction for this operation',
+        message: 'Use the active TinyJoin transaction for this operation',
       },
     });
     expect(engine.executeSql).not.toHaveBeenCalled();
@@ -743,7 +743,7 @@ describe('startWorker', () => {
       ok: false,
       error: {
         code: 'PROTOCOL_MISMATCH',
-        message: 'The worker received an invalid TinyGres protocol request',
+        message: 'The worker received an invalid TinyJoin protocol request',
       },
     });
     expect(engine.executeSql).not.toHaveBeenCalled();
@@ -858,7 +858,7 @@ describe('startWorker', () => {
       error: {
         code: 'STORAGE_ALREADY_INITIALIZED',
         message:
-          'The TinyGres worker is already initialized with different storage',
+          'The TinyJoin worker is already initialized with different storage',
       },
     });
     expect(engine.close).toHaveBeenCalledOnce();

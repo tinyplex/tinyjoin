@@ -1,7 +1,7 @@
 import {existsSync, readFileSync} from 'node:fs';
 import {brotliCompressSync, constants, gzipSync} from 'node:zlib';
 
-const wasmPath = 'dist/wasm/tinygres_wasm_bg.wasm';
+const wasmPath = 'dist/wasm/tinyjoin_wasm_bg.wasm';
 const limit = 1024 * 1024;
 
 if (!existsSync(wasmPath)) {

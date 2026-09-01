@@ -1,4 +1,4 @@
-import {create, type ClientOptions} from 'tinygres';
+import {create, type ClientOptions} from 'tinyjoin';
 
 type Post = {
   id: number;
@@ -14,8 +14,8 @@ const databaseName = search.get('database');
 const options: ClientOptions =
   mode === 'app-local'
     ? {
-        worker: new Worker(new URL('./tinygres.worker.mts', import.meta.url), {
-          name: 'tinygres-packed-consumer',
+        worker: new Worker(new URL('./tinyjoin.worker.mts', import.meta.url), {
+          name: 'tinyjoin-packed-consumer',
           type: 'module',
         }),
       }

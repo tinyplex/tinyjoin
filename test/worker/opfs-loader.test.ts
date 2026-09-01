@@ -21,7 +21,7 @@ describe('private OPFS runtime loader', () => {
     expect(loadRuntime).toHaveBeenCalledOnce();
     const [url] = loadRuntime.mock.calls[0]!;
     expect(new URL(url).pathname).toMatch(
-      /\/worker-opfs\/tinygres_opfs_runtime\.js$/,
+      /\/worker-opfs\/tinyjoin_opfs_runtime\.js$/,
     );
     expect(createRuntimeEngine).toHaveBeenCalledWith(
       'loader-test',

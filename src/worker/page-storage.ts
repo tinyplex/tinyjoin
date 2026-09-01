@@ -6,7 +6,7 @@ import {
 import {assertDatabaseName, StorageError} from './storage-error.js';
 
 export const PAGE_DATABASE_FILE_NAME = 'database.pages';
-const STORAGE_DIRECTORY_NAME = 'tinygres-pages-v1';
+const STORAGE_DIRECTORY_NAME = 'tinyjoin-pages-v1';
 
 export interface OpfsPageStorageFileHandle {
   createSyncAccessHandle?: () => Promise<SyncPageAccessHandle>;
@@ -73,7 +73,7 @@ export async function createOpfsPageStorageSession(
     throw storageError(
       error,
       'OPFS_UNAVAILABLE',
-      'TinyGres could not open its OPFS page database',
+      'TinyJoin could not open its OPFS page database',
     );
   }
 }
@@ -101,7 +101,7 @@ async function openSyncHandle(
   if (typeof file.createSyncAccessHandle !== 'function') {
     throw new StorageError(
       'OPFS_UNAVAILABLE',
-      'TinyGres OPFS page storage requires synchronous access handles in a dedicated Worker',
+      'TinyJoin OPFS page storage requires synchronous access handles in a dedicated Worker',
     );
   }
   try {
@@ -110,7 +110,7 @@ async function openSyncHandle(
     throw storageError(
       error,
       'OPFS_UNAVAILABLE',
-      'TinyGres could not acquire its OPFS page database',
+      'TinyJoin could not acquire its OPFS page database',
     );
   }
 }
@@ -168,14 +168,14 @@ function storageError(
   if (name === 'NoModificationAllowedError') {
     return new StorageError(
       'STORAGE_LOCKED',
-      'Another TinyGres worker already has this OPFS database open',
+      'Another TinyJoin worker already has this OPFS database open',
       true,
     );
   }
   if (name === 'QuotaExceededError') {
     return new StorageError(
       'STORAGE_QUOTA_EXCEEDED',
-      'The browser has no space available for TinyGres OPFS page storage',
+      'The browser has no space available for TinyJoin OPFS page storage',
       true,
     );
   }

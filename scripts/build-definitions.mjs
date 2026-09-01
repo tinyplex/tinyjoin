@@ -38,14 +38,14 @@ export async function buildDefinitions(root, dist) {
         resolve(root, 'src', ...(module ? [module, 'index.ts'] : ['index.ts'])),
         'utf8',
       );
-      assertPublicExports(sourceEntrypoint, declaration, module || 'tinygres');
+      assertPublicExports(sourceEntrypoint, declaration, module || 'tinyjoin');
       const output = declaration.replace(
         TYPES_DOC_CODE_BLOCKS,
         (_, label, code) => {
           const block = blocks.get(label);
           if (block === undefined) {
             throw new Error(
-              `Missing public documentation label ${label} in ${module || 'tinygres'}`,
+              `Missing public documentation label ${label} in ${module || 'tinyjoin'}`,
             );
           }
           blocks.delete(label);
@@ -55,7 +55,7 @@ export async function buildDefinitions(root, dist) {
 
       if (blocks.size > 0) {
         throw new Error(
-          `Unused public documentation labels in ${module || 'tinygres'}: ${[
+          `Unused public documentation labels in ${module || 'tinyjoin'}: ${[
             ...blocks.keys(),
           ].join(', ')}`,
         );

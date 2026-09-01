@@ -4,9 +4,9 @@ test('measures warmed worker round-trip latency', async ({page}) => {
   await page.goto('/');
   await expect(page.getByTestId('state')).toHaveText('Ready');
 
-  await page.evaluate(() => window.__tinygresTest!.benchmark(25));
+  await page.evaluate(() => window.__tinyjoinTest!.benchmark(25));
   const samples = await page.evaluate(() =>
-    window.__tinygresTest!.benchmark(200),
+    window.__tinyjoinTest!.benchmark(200),
   );
   const sorted = [...samples].sort((left, right) => left - right);
   const report = {
@@ -20,7 +20,7 @@ test('measures warmed worker round-trip latency', async ({page}) => {
     body: JSON.stringify(report, null, 2),
     contentType: 'application/json',
   });
-  console.log(`TinyGres worker latency: ${JSON.stringify(report)} ms`);
+  console.log(`TinyJoin worker latency: ${JSON.stringify(report)} ms`);
 
   expect(samples).toHaveLength(200);
   expect(samples.every((sample) => Number.isFinite(sample) && sample >= 0)).toBe(

@@ -1,0 +1,29 @@
+[package]
+name = "tinyjoin-wasm"
+description = "WebAssembly bindings for the TinyJoin engine"
+edition.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+js-sys = "0.3"
+serde = {version = "1", features = ["derive"]}
+serde_json = {version = "1", default-features = false, features = ["alloc"]}
+serde-wasm-bindgen = "0.6"
+tinyjoin-core = {path = "../tinyjoin-core", features = ["compact-storage-diagnostics"]}
+wasm-bindgen = "0.2"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = [
+  "-Oz",
+  "--enable-bulk-memory",
+  "--enable-nontrapping-float-to-int",
+  "--enable-sign-ext",
+  "--enable-simd",
+]

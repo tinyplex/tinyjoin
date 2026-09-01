@@ -5,7 +5,7 @@ test('joins typed tables, including many-to-many, through the real Worker/WASM e
   await expect(page.getByTestId('state')).toHaveText('Ready');
 
   const report = await page.evaluate(() =>
-    window.__tinygresTest!.joinDatabaseProbe(),
+    window.__tinyjoinTest!.joinDatabaseProbe(),
   );
 
   expect(report.innerRows).toEqual([

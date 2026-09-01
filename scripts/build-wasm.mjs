@@ -45,7 +45,7 @@ if (!targetLibDir.ok || !existsSync(targetLibDir.output)) {
   const detected = sysroot.ok ? `\nDetected Rust sysroot: ${sysroot.output}` : '';
 
   console.error(`
-TinyGres cannot build WebAssembly because the ${target} standard library is
+TinyJoin cannot build WebAssembly because the ${target} standard library is
 not installed for the active Rust compiler.${detected}
 
 This repository uses rustup to install its pinned Rust version, Clippy,
@@ -83,11 +83,11 @@ Homebrew shell setup so rustup's proxies appear first in PATH.
 }
 
 const wasmPack = process.platform === 'win32' ? 'wasm-pack.cmd' : 'wasm-pack';
-const staging = await mkdtemp(join(tmpdir(), 'tinygres-wasm-'));
+const staging = await mkdtemp(join(tmpdir(), 'tinyjoin-wasm-'));
 const distWasm = resolve(root, 'dist/wasm');
 const cargoTargetDir = resolve(
   root,
-  'node_modules/.cache/tinygres/cargo-target',
+  'node_modules/.cache/tinyjoin/cargo-target',
 );
 const wasmRustFlags = [
   '-Ctarget-feature=+bulk-memory,+nontrapping-fptoint,+sign-ext,+mutable-globals,+simd128',
@@ -101,13 +101,13 @@ try {
     wasmPack,
     [
       'build',
-      'crates/tinygres-wasm',
+      'crates/tinyjoin-wasm',
       '--target',
       'web',
       '--out-dir',
       staging,
       '--out-name',
-      'tinygres_wasm',
+      'tinyjoin_wasm',
       '--release',
       '--no-pack',
     ],
@@ -131,10 +131,10 @@ try {
     const expected = new Set([
       '.gitignore',
       'snippets',
-      'tinygres_wasm.d.ts',
-      'tinygres_wasm.js',
-      'tinygres_wasm_bg.wasm',
-      'tinygres_wasm_bg.wasm.d.ts',
+      'tinyjoin_wasm.d.ts',
+      'tinyjoin_wasm.js',
+      'tinyjoin_wasm_bg.wasm',
+      'tinyjoin_wasm_bg.wasm.d.ts',
     ]);
     const unexpected = (await readdir(staging)).filter(
       (entry) => !expected.has(entry),
@@ -146,7 +146,7 @@ try {
     }
     await rm(distWasm, {force: true, recursive: true});
     await mkdir(distWasm, {recursive: true});
-    for (const file of ['tinygres_wasm.js', 'tinygres_wasm_bg.wasm']) {
+    for (const file of ['tinyjoin_wasm.js', 'tinyjoin_wasm_bg.wasm']) {
       await cp(resolve(staging, file), resolve(distWasm, file));
     }
     if (existsSync(resolve(staging, 'snippets'))) {

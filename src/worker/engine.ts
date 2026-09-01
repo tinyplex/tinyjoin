@@ -34,7 +34,7 @@ export async function createMemoryWasmEngine(): Promise<WorkerEngine> {
 export async function createPageWasmEngine(
   device: PageDevice,
 ): Promise<WorkerEngine> {
-  const wasm = await import('../wasm/tinygres_wasm.js');
+  const wasm = await import('../wasm/tinyjoin_wasm.js');
   await wasm.default();
   return createStructuredWasmEngine(wasm.WasmEngine, device);
 }

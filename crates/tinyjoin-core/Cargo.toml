@@ -1,0 +1,16 @@
+[package]
+name = "tinyjoin-core"
+description = "The native-testable storage and query core for TinyJoin"
+edition.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+compact-storage-diagnostics = []
+
+[dependencies]
+serde = {version = "1", features = ["derive"]}
+serde_json = {version = "1", default-features = false, features = ["alloc"]}

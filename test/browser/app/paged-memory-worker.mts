@@ -6,7 +6,7 @@ import {
 
 const PAGE_SIZE = 4096;
 const pagedWasmModule = new URL(
-  '../../../dist/wasm/tinygres_wasm.js',
+  '../../../dist/wasm/tinyjoin_wasm.js',
   import.meta.url,
 ).href;
 

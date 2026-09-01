@@ -2,7 +2,7 @@ const state = element<HTMLElement>('[data-testid="state"]');
 const report = element<HTMLElement>('[data-testid="report"]');
 const error = element<HTMLElement>('[data-testid="error"]');
 const worker = new Worker(new URL('./paged-memory-worker.mts', import.meta.url), {
-  name: 'tinygres-page-native-memory-proof',
+  name: 'tinyjoin-page-native-memory-proof',
   type: 'module',
 });
 

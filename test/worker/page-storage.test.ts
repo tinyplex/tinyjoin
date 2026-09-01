@@ -154,10 +154,10 @@ function memoryOpfs() {
     getDirectory: async () => root,
   };
   const database = async (name: string): Promise<MemoryDirectory> => {
-    const tinygres = await root.getDirectoryHandle('tinygres-pages-v1', {
+    const tinyjoin = await root.getDirectoryHandle('tinyjoin-pages-v1', {
       create: true,
     });
-    return tinygres.getDirectoryHandle(`db-${name}`, {create: true});
+    return tinyjoin.getDirectoryHandle(`db-${name}`, {create: true});
   };
   return {database, events, provider, root};
 }
@@ -168,7 +168,7 @@ describe('page-only OPFS storage', () => {
     const first = await createOpfsPageStorageSession('ships', opfs.provider);
 
     expect(opfs.events).toEqual([
-      'directory:tinygres-pages-v1:true',
+      'directory:tinyjoin-pages-v1:true',
       'directory:db-ships:true',
       `file:${PAGE_DATABASE_FILE_NAME}:true`,
       `open:${PAGE_DATABASE_FILE_NAME}`,

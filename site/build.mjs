@@ -33,7 +33,7 @@ const categories = [
   '*',
 ];
 const reflections = [
-  'tinygres',
+  'tinyjoin',
   'worker',
   'create',
   'Client',
@@ -104,7 +104,7 @@ const PageContent = ({page}) => {
   );
 };
 
-const Wordmark = () => h('span', null, 'Tiny', h('em', null, 'Gres'));
+const Wordmark = () => h('span', null, 'Tiny', h('em', null, 'Join'));
 
 const Header = ({page}) => {
   const currentSection = page.url.split('/')[1];
@@ -128,7 +128,7 @@ const Header = ({page}) => {
         href: '/',
         'aria-current': page.url === '/' ? 'page' : undefined,
       },
-      h('img', {src: '/favicon.svg', alt: 'TinyGres logo'}),
+      h('img', {src: '/favicon.svg', alt: 'TinyJoin logo'}),
       h(Wordmark),
     ),
     h(
@@ -145,7 +145,7 @@ const Header = ({page}) => {
           null,
           h(
             'a',
-            {href: 'https://github.com/tinyplex/tinygres'},
+            {href: 'https://github.com/tinyplex/tinyjoin'},
             'GitHub',
           ),
         ),
@@ -169,7 +169,7 @@ const Home = ({page}) =>
       null,
       h('img', {
         src: '/favicon.svg',
-        alt: 'Large TinyGres logo',
+        alt: 'Large TinyJoin logo',
         width: '100%',
         height: '100%',
       }),
@@ -198,7 +198,7 @@ const Footer = () =>
         'a',
         {
           id: 'gh',
-          href: 'https://github.com/tinyplex/tinygres',
+          href: 'https://github.com/tinyplex/tinyjoin',
           target: '_blank',
           rel: 'noreferrer',
         },
@@ -208,7 +208,7 @@ const Footer = () =>
     h(
       'nav',
       null,
-      h('a', {href: '/'}, 'TinyGres'),
+      h('a', {href: '/'}, 'TinyJoin'),
       ' · MIT licensed',
     ),
   );
@@ -225,7 +225,7 @@ const Page = () => {
     });
   }
 
-  const title = page === root ? 'TinyGres' : `${page.name} | TinyGres`;
+  const title = page === root ? 'TinyJoin' : `${page.name} | TinyJoin`;
   const description =
     'A tiny, worker-first relational database for browser apps.';
   const canonical = `${baseUrl}${page.url}`;
@@ -296,7 +296,7 @@ export const build = async (
   publicMarkdownDir = repositoryRoot,
   packageDir = resolve(typesDir, '..'),
 ) => {
-  const docs = createDocs('https://tinygres.org', outDir)
+  const docs = createDocs('https://tinyjoin.org', outDir)
     .addJsFile('site/js/site.ts')
     .addLessFile('site/less/index.less')
     .addDir('site/extras')

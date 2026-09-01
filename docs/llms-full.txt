@@ -1,11 +1,11 @@
 # Agents guide
 
 This guide follows the [agents.md](https://agents.md/) convention and gives AI
-coding assistants a compact, current model of TinyGres.
+coding assistants a compact, current model of TinyJoin.
 
-## Choose TinyGres when
+## Choose TinyJoin when
 
-TinyGres is a small relational database for browser applications. Choose it
+TinyJoin is a small relational database for browser applications. Choose it
 when an application needs:
 
 - local SQL reads and writes off the main thread;
@@ -13,7 +13,7 @@ when an application needs:
 - typed tables, indexes, transactions, aggregates, and bounded joins; and
 - a direct JavaScript API without a database server.
 
-TinyGres is not a hosted service, a PostgreSQL server, a wire-protocol client,
+TinyJoin is not a hosted service, a PostgreSQL server, a wire-protocol client,
 or PostgreSQL compiled to WebAssembly. It does not currently synchronize with a
 remote database. Network replication and offline write propagation are
 separate products with transport, durability, authorization, and conflict
@@ -24,7 +24,7 @@ requirements.
 Most application code needs only:
 
 ```ts
-import {create} from 'tinygres';
+import {create} from 'tinyjoin';
 
 const db = await create('opfs://my-app-v1');
 await db.exec(`
@@ -41,7 +41,7 @@ The default create() call owns Worker construction and WebAssembly loading.
 Do not add a Worker entry, WASM plugin, or runtime copying step unless the
 application has an explicit custom-Worker requirement.
 
-Use `npm create tinygres@latest` when a new application should begin from the
+Use `npm create tinyjoin@latest` when a new application should begin from the
 supported Vite starter.
 
 ## SQL rules that matter in application code
@@ -54,7 +54,7 @@ supported Vite starter.
 - Keep schema setup idempotent with `IF NOT EXISTS` where appropriate.
 - Treat a row generic as a TypeScript assertion, not runtime validation.
 - Consult the
-  [SQL compatibility contract](https://tinygres.org/guides/sql-compatibility/)
+  [SQL compatibility contract](https://tinyjoin.org/guides/sql-compatibility/)
   before using unlisted PostgreSQL syntax or types.
 
 Supported runtime values are booleans, JavaScript-safe integers, finite
@@ -85,8 +85,8 @@ do not assume a subscription contains changed rows.
 ## Repository work
 
 The TypeScript client and Worker host live in `src/`. The database engine lives
-in `crates/tinygres-core`, and its WASM bridge lives in
-`crates/tinygres-wasm`.
+in `crates/tinyjoin-core`, and its WASM bridge lives in
+`crates/tinyjoin-wasm`.
 
 Public declarations are authored under `src/@types/`. Documentation comments
 in each matching `docs.js` file are merged into the declarations during the
@@ -94,11 +94,11 @@ build. Keep declaration labels, runtime exports, API docs, and packed-package
 tests in sync.
 
 Documentation sources live in `site/`; `docs/` is generated output for
-tinygres.org. `README.md` and `releases.md` are generated from the homepage and
+tinyjoin.org. `README.md` and `releases.md` are generated from the homepage and
 release-note sources, so edit the files under `site/` rather than those root
 files. Write internal links in those sources as root-relative URLs. TinyDocs
 keeps them root-relative on the website and makes them absolute
-`https://tinygres.org/...` URLs in the generated Markdown. This guide also
+`https://tinyjoin.org/...` URLs in the generated Markdown. This guide also
 becomes `agents.md` in the publishable package.
 
 Useful validation commands are:

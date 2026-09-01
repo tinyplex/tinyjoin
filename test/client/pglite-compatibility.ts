@@ -4,7 +4,7 @@
  * The reference shapes below are pinned to @electric-sql/pglite 0.5.5:
  * https://github.com/electric-sql/pglite/blob/0ad290109d01edbcbcf11e2207a5ff2afc29c14c/packages/pglite/src/interface.ts
  *
- * This is intentionally not the whole PGlite interface. TinyGres accepts JSON
+ * This is intentionally not the whole PGlite interface. TinyJoin accepts JSON
  * parameters, supports only `rowMode` query options, and has no Postgres
  * protocol, extension, notification, or dump APIs. Keeping the compatible
  * subset here makes additions to that promise explicit without adding PGlite's
@@ -98,7 +98,7 @@ function assertStructuralCompatibility(
   const compatibleTransaction: PGlite055CoreTransaction = transaction;
   const compatibleCreate: PGliteShapedCreate = create;
 
-  // TinyGres supports immediate construction with the same lifecycle
+  // TinyJoin supports immediate construction with the same lifecycle
   // properties; its positional dataDir form deliberately lives on async
   // `create`, not `new`.
   const constructed = new Client();

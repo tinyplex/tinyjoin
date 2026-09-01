@@ -1,6 +1,6 @@
 # Custom Workers
 
-Most applications should use create(). It constructs TinyGres's packaged
+Most applications should use create(). It constructs TinyJoin's packaged
 module Worker and preserves the relative Worker, OPFS runtime, and WebAssembly
 assets during the supported Vite build path.
 
@@ -9,8 +9,8 @@ An application that needs to own the Worker can provide a factory:
 ```ts
 const db = await create({
   workerFactory: () =>
-    new Worker(new URL('./tinygres.worker.ts', import.meta.url), {
-      name: 'tinygres',
+    new Worker(new URL('./tinyjoin.worker.ts', import.meta.url), {
+      name: 'tinyjoin',
       type: 'module',
     }),
 });
@@ -19,7 +19,7 @@ const db = await create({
 The Worker entry starts the same standalone engine:
 
 ```ts
-import {startWorker} from 'tinygres/worker';
+import {startWorker} from 'tinyjoin/worker';
 
 startWorker();
 ```

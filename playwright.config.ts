@@ -6,7 +6,7 @@ const port = 4173;
 
 export default defineConfig({
   testDir: './test/browser',
-  outputDir: resolve(tmpdir(), 'tinygres-playwright-results'),
+  outputDir: resolve(tmpdir(), 'tinyjoin-playwright-results'),
   fullyParallel: true,
   forbidOnly: Boolean(process.env.CI),
   retries: process.env.CI ? 2 : 0,

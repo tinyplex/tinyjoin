@@ -1,4 +1,4 @@
-/// tinygres
+/// tinyjoin
 
 /// JsonPrimitive
 export type JsonPrimitive = null | boolean | number | string;

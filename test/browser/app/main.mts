@@ -1,4 +1,4 @@
-import {Client, create} from '../../../dist/index.js';
+import {Client, create} from 'tinyjoin';
 
 type Post = {
   id: number;
@@ -64,7 +64,7 @@ async function boot(): Promise<void> {
     }
   });
 
-  window.__tinygresTest = {
+  window.__tinyjoinTest = {
     async benchmark(iterations) {
       if (!Number.isSafeInteger(iterations) || iterations < 1) {
         throw new TypeError('Benchmark iterations must be a positive integer');
@@ -95,7 +95,7 @@ async function boot(): Promise<void> {
     'pagehide',
     () => {
       unsubscribe();
-      delete window.__tinygresTest;
+      delete window.__tinyjoinTest;
       void database.close();
     },
     {once: true},
@@ -687,7 +687,7 @@ async function insertPersistencePosts(
 function openOpfsClient(databaseName: string) {
   const worker = new Worker(
     new URL('../../../dist/worker/default-entry.js', import.meta.url),
-    {name: `tinygres-${databaseName}`, type: 'module'},
+    {name: `tinyjoin-${databaseName}`, type: 'module'},
   );
   return {
     client: new Client({

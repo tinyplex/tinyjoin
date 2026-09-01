@@ -131,7 +131,7 @@ export class OpfsPageDevice implements PageDevice {
       throw pageStorageError(
         error,
         'STORAGE_WRITE_FAILED',
-        'TinyGres could not flush database pages',
+        'TinyJoin could not flush database pages',
       );
     }
   }
@@ -147,7 +147,7 @@ export class OpfsPageDevice implements PageDevice {
       throw pageStorageError(
         error,
         'STORAGE_CLOSE_FAILED',
-        'TinyGres could not close its page device',
+        'TinyJoin could not close its page device',
       );
     }
   }
@@ -156,7 +156,7 @@ export class OpfsPageDevice implements PageDevice {
     if (this.#closed) {
       throw new StorageError(
         'STORAGE_CLOSED',
-        'The TinyGres page device is closed',
+        'The TinyJoin page device is closed',
       );
     }
   }
@@ -169,25 +169,25 @@ export class OpfsPageDevice implements PageDevice {
       throw pageStorageError(
         error,
         'STORAGE_READ_FAILED',
-        'TinyGres could not read the database page count',
+        'TinyJoin could not read the database page count',
       );
     }
     if (!Number.isSafeInteger(size) || size < 0) {
       throw new StorageError(
         'STORAGE_CORRUPT',
-        'The TinyGres page file has an invalid byte length',
+        'The TinyJoin page file has an invalid byte length',
       );
     }
     if (size > MAX_DATABASE_BYTES) {
       throw new StorageError(
         'STORAGE_DATABASE_TOO_LARGE',
-        `The TinyGres page file exceeds ${MAX_DATABASE_BYTES} bytes`,
+        `The TinyJoin page file exceeds ${MAX_DATABASE_BYTES} bytes`,
       );
     }
     if (size % PAGE_SIZE !== 0) {
       throw new StorageError(
         'STORAGE_CORRUPT',
-        'The TinyGres page file is not aligned to its page size',
+        'The TinyJoin page file is not aligned to its page size',
       );
     }
     return size / PAGE_SIZE;
@@ -201,19 +201,19 @@ export class OpfsPageDevice implements PageDevice {
       throw pageStorageError(
         error,
         'STORAGE_READ_FAILED',
-        'TinyGres could not read the database page count',
+        'TinyJoin could not read the database page count',
       );
     }
     if (!Number.isSafeInteger(size) || size < 0) {
       throw new StorageError(
         'STORAGE_CORRUPT',
-        'The TinyGres page file has an invalid byte length',
+        'The TinyJoin page file has an invalid byte length',
       );
     }
     if (size > MAX_DATABASE_BYTES) {
       throw new StorageError(
         'STORAGE_DATABASE_TOO_LARGE',
-        `The TinyGres page file exceeds ${MAX_DATABASE_BYTES} bytes`,
+        `The TinyJoin page file exceeds ${MAX_DATABASE_BYTES} bytes`,
       );
     }
     const alignedSize = size - (size % PAGE_SIZE);
@@ -227,7 +227,7 @@ export class OpfsPageDevice implements PageDevice {
       const mapped = pageStorageError(
         error,
         'STORAGE_WRITE_FAILED',
-        'TinyGres could not repair a torn trailing database page',
+        'TinyJoin could not repair a torn trailing database page',
       );
       throw new StorageError(
         'STORAGE_COMMIT_OUTCOME_UNKNOWN',
@@ -247,7 +247,7 @@ export class OpfsPageDevice implements PageDevice {
           : '';
       throw new StorageError(
         'STORAGE_COMMIT_OUTCOME_UNKNOWN',
-        `TinyGres could not roll back a failed page append${detail}`,
+        `TinyJoin could not roll back a failed page append${detail}`,
       );
     }
   }
@@ -309,7 +309,7 @@ export class MemoryPageDevice implements PageDevice {
     if (this.#closed) {
       throw new StorageError(
         'STORAGE_CLOSED',
-        'The TinyGres page device is closed',
+        'The TinyJoin page device is closed',
       );
     }
   }
@@ -335,7 +335,7 @@ function pageIdForWriteFromWords(low: number, high: number): number {
   if (low === MAX_PAGES) {
     throw new StorageError(
       'STORAGE_DATABASE_TOO_LARGE',
-      `The TinyGres database cannot exceed ${MAX_DATABASE_BYTES} bytes`,
+      `The TinyJoin database cannot exceed ${MAX_DATABASE_BYTES} bytes`,
     );
   }
   return low;
@@ -378,7 +378,7 @@ function readExactly(
       ) {
         throw new StorageError(
           'STORAGE_READ_FAILED',
-          'TinyGres received a short database page read with no progress',
+          'TinyJoin received a short database page read with no progress',
           true,
         );
       }
@@ -388,7 +388,7 @@ function readExactly(
     throw pageStorageError(
       error,
       'STORAGE_READ_FAILED',
-      'TinyGres could not read a database page',
+      'TinyJoin could not read a database page',
     );
   }
 }
@@ -409,7 +409,7 @@ function writeExactly(
       ) {
         throw new StorageError(
           'STORAGE_WRITE_FAILED',
-          'TinyGres received a short database page write with no progress',
+          'TinyJoin received a short database page write with no progress',
           true,
         );
       }
@@ -419,7 +419,7 @@ function writeExactly(
     throw pageStorageError(
       error,
       'STORAGE_WRITE_FAILED',
-      'TinyGres could not write a database page',
+      'TinyJoin could not write a database page',
     );
   }
 }
@@ -456,7 +456,7 @@ function writeExistingExactly(
       if (offset === 0) {
         throw new StorageError(
           'STORAGE_WRITE_FAILED',
-          'TinyGres received a short database page write with no progress',
+          'TinyJoin received a short database page write with no progress',
           true,
         );
       }
@@ -472,11 +472,11 @@ function unknownWriteOutcome(error: unknown): StorageError {
   const mapped = pageStorageError(
     error,
     'STORAGE_WRITE_FAILED',
-    'TinyGres could not write a database page',
+    'TinyJoin could not write a database page',
   );
   return new StorageError(
     'STORAGE_COMMIT_OUTCOME_UNKNOWN',
-    `TinyGres could not safely complete an in-place page write: ${mapped.message}`,
+    `TinyJoin could not safely complete an in-place page write: ${mapped.message}`,
   );
 }
 
@@ -505,7 +505,7 @@ function pageStorageError(
   if (name === 'QuotaExceededError') {
     return new StorageError(
       'STORAGE_QUOTA_EXCEEDED',
-      'The browser has no space available for TinyGres database pages',
+      'The browser has no space available for TinyJoin database pages',
       true,
     );
   }

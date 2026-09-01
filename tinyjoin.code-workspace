@@ -1,0 +1,21 @@
+{
+  "folders": [
+	{
+		"path": "."
+	},
+	{
+		"path": "../create-tinyjoin"
+	},
+	{
+		"path": "../synclets"
+	}
+],
+  "settings": {
+    "workbench.colorCustomizations": {
+      "statusBar.background": "#336791",
+      "statusBar.debuggingBackground": "#336791",
+      "statusBar.noFolderBackground": "#336791",
+      "statussBar.prominentBackground": "#336791"
+    }
+  }
+}

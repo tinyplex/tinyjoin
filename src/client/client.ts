@@ -281,7 +281,7 @@ export class Client {
     callback: (transaction: Transaction) => Result | Promise<Result>,
   ): Promise<Result> {
     if (typeof callback !== 'function') {
-      throw new TypeError('TinyGres transaction requires a callback');
+      throw new TypeError('TinyJoin transaction requires a callback');
     }
     const run = this.#transactionTail.then(() =>
       this.#runTransaction(callback),
@@ -418,14 +418,14 @@ export class Client {
     if (this.#transactionActive) {
       throw clientError(
         'TRANSACTION_ACTIVE',
-        'Use the transaction object while a TinyGres transaction is active',
+        'Use the transaction object while a TinyJoin transaction is active',
       );
     }
   }
 
   #assertOpen(): void {
     if (this.#closing || this.#closed) {
-      throw clientError('CLIENT_CLOSED', 'The TinyGres client is closed');
+      throw clientError('CLIENT_CLOSED', 'The TinyJoin client is closed');
     }
   }
 
@@ -531,7 +531,7 @@ class ClientTransaction implements Transaction {
     if (state.owner !== this.preparedOwner) {
       throw clientError(
         'PREPARED_STATEMENT_CLIENT_MISMATCH',
-        'The prepared statement belongs to a different TinyGres client',
+        'The prepared statement belongs to a different TinyJoin client',
       );
     }
     state.assertClientOpen();
@@ -606,7 +606,7 @@ class ClientTransaction implements Transaction {
     if (!this.#open || this.#closing) {
       throw clientError(
         'TRANSACTION_CLOSED',
-        'The TinyGres transaction callback has already completed',
+        'The TinyJoin transaction callback has already completed',
       );
     }
   }
@@ -626,7 +626,7 @@ export async function create(
   if (typeof dataDirOrOptions === 'string') {
     if (options?.dataDir !== undefined) {
       throw new TypeError(
-        'Provide the TinyGres data directory either positionally or in options.dataDir, not both',
+        'Provide the TinyJoin data directory either positionally or in options.dataDir, not both',
       );
     }
     resolvedOptions = {...options, dataDir: dataDirOrOptions};
@@ -635,7 +635,7 @@ export async function create(
   } else {
     if (options !== undefined) {
       throw new TypeError(
-        'TinyGres options must be the first argument when no positional data directory is used',
+        'TinyJoin options must be the first argument when no positional data directory is used',
       );
     }
     resolvedOptions = dataDirOrOptions;
@@ -662,7 +662,7 @@ function createWorker(options: ClientOptions): {
   ].filter((value) => value !== undefined);
   if (selected.length > 1) {
     throw new TypeError(
-      'Provide only one of worker, workerFactory, or workerUrl to TinyGres',
+      'Provide only one of worker, workerFactory, or workerUrl to TinyJoin',
     );
   }
 
@@ -683,13 +683,13 @@ function createWorker(options: ClientOptions): {
 
 function createUrlWorker(url: string | URL): WorkerLike {
   assertWorkerAvailable();
-  return new Worker(url, {name: 'tinygres', type: 'module'});
+  return new Worker(url, {name: 'tinyjoin', type: 'module'});
 }
 
 function createDefaultWorker(): WorkerLike {
   assertWorkerAvailable();
   return new Worker(new URL('../worker/default-entry.js', import.meta.url), {
-    name: 'tinygres',
+    name: 'tinyjoin',
     type: 'module',
   });
 }
@@ -697,7 +697,7 @@ function createDefaultWorker(): WorkerLike {
 function assertWorkerAvailable(): void {
   if (typeof Worker === 'undefined') {
     throw new Error(
-      'TinyGres requires a browser Worker. Importing is SSR-safe, but create the client in the browser or provide a Worker-like implementation.',
+      'TinyJoin requires a browser Worker. Importing is SSR-safe, but create the client in the browser or provide a Worker-like implementation.',
     );
   }
 }
@@ -714,7 +714,7 @@ function preparedStatementState(value: unknown): PreparedStatementState {
   if (!state) {
     throw clientError(
       'INVALID_PREPARED_STATEMENT',
-      'The value is not a TinyGres prepared statement',
+      'The value is not a TinyJoin prepared statement',
     );
   }
   return state;
@@ -724,7 +724,7 @@ function assertPreparedStatementOpen(state: PreparedStatementState): void {
   if (state.closed) {
     throw clientError(
       'PREPARED_STATEMENT_CLOSED',
-      'The TinyGres prepared statement is closed',
+      'The TinyJoin prepared statement is closed',
     );
   }
 }
@@ -759,7 +759,7 @@ function assertClientOptions(options: ClientOptions): void {
     )
   ) {
     throw new TypeError(
-      'TinyGres client options support only dataDir, worker, workerFactory, and workerUrl',
+      'TinyJoin client options support only dataDir, worker, workerFactory, and workerUrl',
     );
   }
 }
@@ -770,13 +770,13 @@ function storageFromDataDir(dataDir: DataDir | undefined): StorageOptions {
   }
   if (typeof dataDir !== 'string' || !dataDir.startsWith('opfs://')) {
     throw new TypeError(
-      'TinyGres dataDir must be memory:// or opfs:// followed by a database name',
+      'TinyJoin dataDir must be memory:// or opfs:// followed by a database name',
     );
   }
   const name = dataDir.slice('opfs://'.length);
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) {
     throw new TypeError(
-      'A TinyGres OPFS database name must be 1-64 ASCII letters, numbers, dots, underscores, or hyphens, and start with a letter or number',
+      'A TinyJoin OPFS database name must be 1-64 ASCII letters, numbers, dots, underscores, or hyphens, and start with a letter or number',
     );
   }
   return {kind: 'opfs', name};
@@ -787,7 +787,7 @@ function parameterize(
   params: readonly JsonValue[],
 ): string {
   if (!Array.isArray(strings) || strings.length !== params.length + 1) {
-    throw new TypeError('TinyGres sql must be used as a tagged template');
+    throw new TypeError('TinyJoin sql must be used as a tagged template');
   }
   let sql = strings[0] ?? '';
   for (let index = 0; index < params.length; index++) {
@@ -822,7 +822,7 @@ function rowsAsArrays(
   if (rows.length > 0 && fields.length === 0) {
     throw clientError(
       'ROW_METADATA_UNAVAILABLE',
-      'TinyGres cannot return array rows without field metadata',
+      'TinyJoin cannot return array rows without field metadata',
     );
   }
   return rows.map((row) => fields.map((field) => row[field.name] ?? null));
@@ -850,7 +850,7 @@ function assertQueryOptions(options: QueryOptions | undefined): void {
       options.rowMode !== 'object')
   ) {
     throw new TypeError(
-      'TinyGres query options currently support only rowMode: object or array',
+      'TinyJoin query options currently support only rowMode: object or array',
     );
   }
 }

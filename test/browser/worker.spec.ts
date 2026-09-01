@@ -10,7 +10,7 @@ test('queries and invalidates through the real Worker/WASM engine', async ({
     }
   });
   await page.route(
-    /\/worker-opfs\/tinygres_opfs_runtime\.js(?:\?.*)?$/,
+    /\/worker-opfs\/tinyjoin_opfs_runtime\.js(?:\?.*)?$/,
     (route) => route.abort(),
   );
   await page.goto('/');
@@ -47,7 +47,7 @@ test('rejects DDL in a page-native transaction without losing rollback', async (
   await expect(page.getByTestId('state')).toHaveText('Ready');
 
   await expect(
-    page.evaluate(() => window.__tinygresTest!.pageTransactionDdlProbe()),
+    page.evaluate(() => window.__tinyjoinTest!.pageTransactionDdlProbe()),
   ).resolves.toEqual({
     committedRows: 0,
     ddlCodes: Array(6).fill('UNSUPPORTED_SQL'),
@@ -59,5 +59,5 @@ test('rejects DDL in a page-native transaction without losing rollback', async (
 });
 
 function isOpfsRuntimeRequest(url: string): boolean {
-  return /\/worker-opfs\/tinygres_opfs_runtime\.js(?:\?.*)?$/.test(url);
+  return /\/worker-opfs\/tinyjoin_opfs_runtime\.js(?:\?.*)?$/.test(url);
 }

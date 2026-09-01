@@ -8,14 +8,14 @@ import {checkDocs, getFiles} from './check-docs.mjs';
 import {build as buildDocs} from '../site/build.mjs';
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
-const temporaryRoot = await mkdtemp(join(tmpdir(), 'tinygres-docs-'));
+const temporaryRoot = await mkdtemp(join(tmpdir(), 'tinyjoin-docs-'));
 const temporaryDist = resolve(temporaryRoot, 'dist');
 const temporaryDocs = resolve(temporaryRoot, 'docs');
 
 try {
   await writeFile(
     resolve(temporaryRoot, 'package.json'),
-    '{"name":"tinygres","private":true,"type":"module"}\n',
+    '{"name":"tinyjoin","private":true,"type":"module"}\n',
   );
   await buildDefinitions(root, temporaryDist);
   await buildDocs(

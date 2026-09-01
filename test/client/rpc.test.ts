@@ -35,7 +35,7 @@ describe('WorkerRpc', () => {
     await expect(second).resolves.toEqual(sqlResult(2, [{id: 2}]));
   });
 
-  it('turns structured worker failures into TinyGres errors', async () => {
+  it('turns structured worker failures into TinyJoin errors', async () => {
     const worker = new FakeWorker();
     const rpc = new WorkerRpc(worker);
     const request = rpc.request('executeSql', {sql: 'bad', params: []});

@@ -1,22 +1,22 @@
 # Getting started
 
-TinyGres is a relational database that runs locally in a browser. The normal
+TinyJoin is a relational database that runs locally in a browser. The normal
 setup is one import and one asynchronous call.
 
 ## Install
 
 ```sh
-npm install tinygres
+npm install tinyjoin
 ```
 
-TinyGres publishes JavaScript, TypeScript declarations, its Worker runtime, and
+TinyJoin publishes JavaScript, TypeScript declarations, its Worker runtime, and
 the WebAssembly engine together. An application does not need Rust tooling or a
 separate Worker plugin.
 
 ## Open a database
 
 ```ts
-import {create} from 'tinygres';
+import {create} from 'tinyjoin';
 
 const db = await create('opfs://my-app');
 ```
@@ -41,7 +41,7 @@ await db.exec(`
 ```
 
 exec() accepts a parameter-free script and commits all of it together. Use it
-for schema setup. TinyGres requires every SQL-created table to have a primary
+for schema setup. TinyJoin requires every SQL-created table to have a primary
 key.
 
 ## Write with parameters
@@ -53,7 +53,7 @@ await db.query('INSERT INTO notes (id, body) VALUES ($1, $2)', [
 ]);
 ```
 
-Keep application values in the parameter array. TinyGres parameters are
+Keep application values in the parameter array. TinyJoin parameters are
 one-based (`$1`, `$2`, and so on) and accept JSON-compatible values.
 
 ## Read typed rows

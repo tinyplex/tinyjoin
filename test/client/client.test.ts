@@ -928,7 +928,7 @@ describe('Client', () => {
       'second-end',
     ]);
     expect(() => client.transaction(undefined as never)).toThrowError(
-      'TinyGres transaction requires a callback',
+      'TinyJoin transaction requires a callback',
     );
     await client.close();
   });

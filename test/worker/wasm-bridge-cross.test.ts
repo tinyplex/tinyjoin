@@ -15,9 +15,9 @@ import {
 
 const BRIDGE_VERSION = 2;
 const artifactDirectory =
-  process.env.TINYGRES_PAGED_WASM_DIR ?? resolve('dist/wasm');
-const artifactModule = `${artifactDirectory}/tinygres_wasm.js`;
-const artifactWasm = `${artifactDirectory}/tinygres_wasm_bg.wasm`;
+  process.env.TINYJOIN_PAGED_WASM_DIR ?? resolve('dist/wasm');
+const artifactModule = `${artifactDirectory}/tinyjoin_wasm.js`;
+const artifactWasm = `${artifactDirectory}/tinyjoin_wasm_bg.wasm`;
 
 interface StructuredModule {
   default(options: {module_or_path: Uint8Array}): Promise<unknown>;

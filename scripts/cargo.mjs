@@ -9,7 +9,7 @@ const result = spawnSync('cargo', process.argv.slice(2), {
     ...process.env,
     CARGO_TARGET_DIR: resolve(
       root,
-      'node_modules/.cache/tinygres/cargo-target',
+      'node_modules/.cache/tinyjoin/cargo-target',
     ),
   },
   stdio: 'inherit',

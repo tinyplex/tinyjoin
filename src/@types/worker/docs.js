@@ -1,8 +1,8 @@
 /**
- * The worker module lets advanced applications start TinyGres inside a Worker
+ * The worker module lets advanced applications start TinyJoin inside a Worker
  * that they construct and bundle themselves.
  *
- * Most applications should use create from the main tinygres module, which
+ * Most applications should use create from the main tinyjoin module, which
  * constructs the packaged Worker automatically.
  * @packageDocumentation
  * @module worker
@@ -11,11 +11,11 @@
 /// worker
 
 /**
- * The startWorker function starts the TinyGres request host in the current
+ * The startWorker function starts the TinyJoin request host in the current
  * dedicated Worker.
  * @example
  * ```ts
- * import {startWorker} from 'tinygres/worker';
+ * import {startWorker} from 'tinyjoin/worker';
  *
  * startWorker();
  * ```

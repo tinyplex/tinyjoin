@@ -94,7 +94,7 @@ function assertNotInPageDeviceCallback(): void {
   if (insidePageDeviceCallback !== 0) {
     throw new WasmBridgeError(
       'ENGINE_REENTRANT_CALL',
-      'TinyGres cannot enter a WASM engine from a page-device callback',
+      'TinyJoin cannot enter a WASM engine from a page-device callback',
       false,
     );
   }
@@ -307,14 +307,14 @@ export class StructuredWasmEngine implements WorkerEngine {
     if (this.#state === 'poisoned') {
       throw new WasmBridgeError(
         'STORAGE_ENGINE_POISONED',
-        'The TinyGres engine cannot be used after an uncertain result',
+        'The TinyJoin engine cannot be used after an uncertain result',
         false,
       );
     }
     if (this.#state === 'closed') {
       throw new WasmBridgeError(
         'ENGINE_CLOSED',
-        'The TinyGres engine is closed',
+        'The TinyJoin engine is closed',
       );
     }
   }
@@ -335,7 +335,7 @@ export class StructuredWasmEngine implements WorkerEngine {
       error instanceof Error && error.message ? `: ${error.message}` : '';
     return new WasmBridgeError(
       'STORAGE_COMMIT_OUTCOME_UNKNOWN',
-      `TinyGres could not decode a result after a possible durable mutation${detail}`,
+      `TinyJoin could not decode a result after a possible durable mutation${detail}`,
       false,
     );
   }

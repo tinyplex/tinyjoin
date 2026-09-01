@@ -1,6 +1,6 @@
 # Transactions and changes
 
-Each TinyGres query is atomic. Use a callback transaction when several related
+Each TinyJoin query is atomic. Use a callback transaction when several related
 row mutations must commit together.
 
 ```ts
@@ -15,7 +15,7 @@ database work until its callback finishes; direct Client operations fail while
 it is active, and a later transaction() call waits its turn. Letting an error
 escape rolls the complete transaction back.
 
-TinyGres does not put a callback transaction into PostgreSQL's aborted state
+TinyJoin does not put a callback transaction into PostgreSQL's aborted state
 after a statement failure. If application code catches that failure, earlier
 staged writes may still commit. Call tx.rollback() or rethrow when the whole
 unit should be discarded.
@@ -39,5 +39,5 @@ The listener runs after a commit. Several statements in one transaction produce
 one committed revision and one table-level invalidation. Call the returned
 function to unsubscribe before closing the database.
 
-This explicit re-query model keeps TinyGres independent of UI frameworks and
+This explicit re-query model keeps TinyJoin independent of UI frameworks and
 lets an application choose its own caching or rendering policy.

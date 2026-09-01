@@ -1,6 +1,6 @@
 # SQL compatibility
 
-TinyGres implements its own deliberately bounded, PostgreSQL-shaped SQL
+TinyJoin implements its own deliberately bounded, PostgreSQL-shaped SQL
 dialect. It is not PostgreSQL compiled to WebAssembly, a PostgreSQL server, or
 a general PostgreSQL replacement. Familiar syntax is used where the smaller
 runtime can give it clear and deterministic semantics.
@@ -15,7 +15,7 @@ silently reinterpreted.
 SQL is the primary relational interface. The basic lifecycle has four calls:
 
 ```ts
-import { create } from "tinygres";
+import { create } from "tinyjoin";
 
 const db = await create();
 
@@ -49,7 +49,7 @@ query(sql, params?, options?) executes one read or write statement with
 optional JSON-compatible `$1` parameters. exec(sql, options?) executes one or
 more statements without parameters as one implicit transaction and returns one
 result per statement. Both use `{rows, fields, affectedRows?, command?,
-rowCount?}` results; TinyGres adds `revision` and `tables`. `fields` contains
+rowCount?}` results; TinyJoin adds `revision` and `tables`. `fields` contains
 ordered `{name, dataTypeID}` entries, including for empty typed results.
 `rowMode: "array"` returns values in that field order. The `sql` tagged template
 is a parameterizing form of query(). `rowMode` is the only query option
@@ -145,7 +145,7 @@ prepared-statement state may be retained by one open database.
 ## How to read the matrices
 
 - **Supported** means the exact form described here is implemented and tested.
-- **Narrow** means TinyGres implements a useful but intentionally smaller form
+- **Narrow** means TinyJoin implements a useful but intentionally smaller form
   than PostgreSQL.
 - **No** means the form is rejected.
 
@@ -153,7 +153,7 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 
 ## Statements and clauses
 
-| Keyword or form | Status | TinyGres form and boundary |
+| Keyword or form | Status | TinyJoin form and boundary |
 | --- | --- | --- |
 | `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or a left-deep join over two to eight typed table sources. A simple projection is `*` or plain column names. There is no `SELECT` without `FROM`. |
 | `WHERE` | Supported | Predicates described below, with SQL three-valued null logic. |
@@ -212,11 +212,11 @@ equality terms.
 
 ## Runtime types
 
-PostgreSQL type spellings map onto five TinyGres runtime types. The spelling
+PostgreSQL type spellings map onto five TinyJoin runtime types. The spelling
 does not import PostgreSQL's storage width, coercion, operator, or catalog
 semantics.
 
-| Accepted SQL spellings | TinyGres value | Important difference |
+| Accepted SQL spellings | TinyJoin value | Important difference |
 | --- | --- | --- |
 | `BOOLEAN`, `BOOL` | JavaScript boolean | No PostgreSQL coercions. |
 | `SMALLINT`, `INTEGER`, `INT`, `INT2`, `INT4`, `BIGINT`, `INT8` | One JavaScript-safe integer type | Range is -9,007,199,254,740,991 through 9,007,199,254,740,991. `SMALLINT`/`INTEGER` are wider and `BIGINT` is narrower than PostgreSQL. |
@@ -225,7 +225,7 @@ semantics.
 | `JSON`, `JSONB` | The same JSON-compatible value (scalar, array, or object) | No textual/binary distinction, JSON operators, casts, or JSON index type. |
 
 SQL `NULL` and a JSON scalar `null` are the same runtime value, including in a
-JSON column. TinyGres cannot distinguish them for `NOT NULL`, `IS NULL`,
+JSON column. TinyJoin cannot distinguish them for `NOT NULL`, `IS NULL`,
 aggregates, or defaults.
 
 There are no implicit PostgreSQL casts. Notable unavailable types include
@@ -239,7 +239,7 @@ serial/identity, enum/domain, and user-defined types. Type modifiers such as
   identifiers preserve case and use doubled quotes to escape a quote.
 - An unquoted identifier may begin with `_`, an ASCII letter, or any non-ASCII
   character. Later characters may additionally be ASCII digits or `$`.
-- TinyGres reserves these unquoted words case-insensitively: `SELECT`, `FROM`,
+- TinyJoin reserves these unquoted words case-insensitively: `SELECT`, `FROM`,
   `WHERE`, `AND`, `OR`, `IS`, `IN`, `LIMIT`, `OFFSET`, `ORDER`, `BY`, `ASC`,
   `DESC`, `NULLS`, `FIRST`, `LAST`, `NULL`, `TRUE`, `FALSE`, `CREATE`, `TABLE`,
   `IF`, `NOT`, `EXISTS`, `PRIMARY`, `KEY`, `DEFAULT`, `INSERT`, `INTO`,
@@ -252,13 +252,13 @@ serial/identity, enum/domain, and user-defined types. Type modifiers such as
   not supported.
 - A two-part table name such as `public.tasks` is accepted as one flat catalog
   key. It does **not** create or resolve a PostgreSQL schema. `tasks` and
-  `public.tasks` are different TinyGres table names.
+  `public.tasks` are different TinyJoin table names.
 - There is no `CREATE SCHEMA`, `search_path`, `information_schema`, or
   `pg_catalog`. Index names are global catalog keys.
 
 ## Constraints and indexes
 
-Every SQL-created table has a primary key. TinyGres currently implements:
+Every SQL-created table has a primary key. TinyJoin currently implements:
 
 - primary-key uniqueness and non-nullability;
 - column `NOT NULL`;
@@ -290,7 +290,7 @@ Unqualified columns are accepted only when exactly one source contains the
 name. Without `ORDER BY`, row order is not part of the contract.
 
 Join chains are evaluated as written, from left to right, by a bounded nested
-loop; TinyGres does not reorder or optimize them. Each `ON` equality must
+loop; TinyJoin does not reorder or optimize them. Each `ON` equality must
 connect its newly introduced source to one of the sources already in scope.
 Across the full chain, candidate-extension, retained-row, result-row, and byte
 budgets are global rather than resetting for each `JOIN`. Aggregates over joins
@@ -309,7 +309,7 @@ JOIN tags AS tag ON post_tag.tag_id = tag.id
 ORDER BY post_id, tag_name
 ```
 
-Foreign keys are not implemented, so TinyGres does not enforce the bridge
+Foreign keys are not implemented, so TinyJoin does not enforce the bridge
 table's references.
 
 ## Transactions and concurrency
@@ -338,7 +338,7 @@ isolation-level selection, savepoints, lock manager, or deadlock detection.
 
 ## PostgreSQL facilities that are not present
 
-TinyGres has no PostgreSQL wire protocol, SQLSTATE-compatible error protocol,
+TinyJoin has no PostgreSQL wire protocol, SQLSTATE-compatible error protocol,
 server process, roles or grants, system catalogs, extensions, stored
 procedures, triggers, notifications, WAL, replication, point-in-time recovery,
 or PostgreSQL file-format compatibility. Rows and parameters are
@@ -347,7 +347,7 @@ PostgreSQL OID as metadata: boolean `16`, integer `20`, text `25`, JSON `114`,
 and float `701`. This mapping does not add PostgreSQL storage widths,
 coercions, operators, parsers, or wire semantics.
 
-Persistence is TinyGres's own page format in memory or one browser OPFS file.
+Persistence is TinyJoin's own page format in memory or one browser OPFS file.
 It is not a PostgreSQL data directory.
 
 JavaScript prepared statements are Worker-owned parsed statements, not

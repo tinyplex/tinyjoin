@@ -1,4 +1,4 @@
-# TinyGres
+# TinyJoin
 
 <section id="hero">
   <h2>
@@ -19,12 +19,12 @@
 
 > ## Start small
 >
-> Install TinyGres, import create(), and open a database. The normal setup does
+> Install TinyJoin, import create(), and open a database. The normal setup does
 > not need Rust tooling, a Worker entry, a WASM plugin, or a runtime copying
 > step.
 
 ```sh
-npm install tinygres
+npm install tinyjoin
 ```
 
 > ## One import. No infrastructure setup.
@@ -34,7 +34,7 @@ npm install tinygres
 > create() with no argument for an ephemeral memory database.
 
 ```ts
-import {create} from 'tinygres';
+import {create} from 'tinyjoin';
 
 const db = await create('opfs://my-app');
 
@@ -48,7 +48,7 @@ await db.exec(`
 
 await db.query('INSERT INTO tasks (id, title) VALUES ($1, $2)', [
   crypto.randomUUID(),
-  'Try TinyGres',
+  'Try TinyJoin',
 ]);
 
 const {rows} = await db.query<{
@@ -70,19 +70,19 @@ await db.close();
 > - close() releases statements, storage, and the Worker.
 >
 > Results use the familiar `rows`, `fields`, `affectedRows`, `command`, and
-> `rowCount` shape. TinyGres also reports a database `revision` and changed
+> `rowCount` shape. TinyJoin also reports a database `revision` and changed
 > `tables`.
 
 > ## Local by default
 >
-> TinyGres contains no hosted service, credentials, analytics, or hidden network
+> TinyJoin contains no hosted service, credentials, analytics, or hidden network
 > path. Memory and OPFS use the same page-native database engine. Persistent
 > OPFS storage is single-writer and intended for reconstructable application
 > data; users can still clear or lose browser-managed storage.
 
 > ## Deliberately bounded
 >
-> **Important:** TinyGres is experimental. It implements a deliberately bounded
+> **Important:** TinyJoin is experimental. It implements a deliberately bounded
 > SQL and type subset; it is not PostgreSQL compiled to WebAssembly and has no
 > PostgreSQL server, wire protocol, or replication client.
 >
@@ -95,7 +95,7 @@ await db.close();
 > - Follow the [getting started guide](/guides/getting-started/).
 > - Browse the [API reference](/api/).
 > - Review the [release notes](/guides/releases/).
-> - Start an app with [create-tinygres](https://github.com/tinyplex/create-tinygres).
-> - Read the [source](https://github.com/tinyplex/tinygres).
+> - Start an app with [create-tinyjoin](https://github.com/tinyplex/create-tinyjoin).
+> - Read the [source](https://github.com/tinyplex/tinyjoin).
 >
-> TinyGres is MIT licensed.
+> TinyJoin is MIT licensed.

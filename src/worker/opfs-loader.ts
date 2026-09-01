@@ -16,7 +16,7 @@ interface OpfsRuntimeModule {
 type OpfsRuntimeLoader = (url: string) => Promise<OpfsRuntimeModule>;
 
 const runtimeUrl = new URL(
-  '../worker-opfs/tinygres_opfs_runtime.js',
+  '../worker-opfs/tinyjoin_opfs_runtime.js',
   import.meta.url,
 );
 

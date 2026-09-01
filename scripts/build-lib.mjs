@@ -120,7 +120,7 @@ async function buildPrivateWorkerRuntime() {
 async function buildOpfsRuntime() {
   const entry = resolve(dist, 'worker/opfs-engine.js');
   const outputDirectory = resolve(dist, 'worker-opfs');
-  const output = resolve(outputDirectory, 'tinygres_opfs_runtime.js');
+  const output = resolve(outputDirectory, 'tinyjoin_opfs_runtime.js');
 
   await viteBuild({
     build: {
@@ -129,7 +129,7 @@ async function buildOpfsRuntime() {
       emptyOutDir: true,
       lib: {
         entry,
-        fileName: () => 'tinygres_opfs_runtime.js',
+        fileName: () => 'tinyjoin_opfs_runtime.js',
         formats: ['es'],
       },
       minify: 'oxc',
@@ -146,11 +146,11 @@ async function buildOpfsRuntime() {
     'OPFS runtime',
     [
       'createOpfsWasmEngine',
-      'Another TinyGres worker already has this OPFS database open',
+      'Another TinyJoin worker already has this OPFS database open',
     ],
     [
       [/\bimport\s*\(/, 'a dynamic import'],
-      [/tinygres_wasm(?:_bg)?/i, 'default WASM glue'],
+      [/tinyjoin_wasm(?:_bg)?/i, 'default WASM glue'],
       [
         /WASM returned an invalid structured response envelope/,
         'the structured WASM adapter',
@@ -209,7 +209,7 @@ async function assertOpfsLoaderBoundary() {
   const path = resolve(dist, 'worker/opfs-loader.js');
   const source = await readFile(path, 'utf8');
   for (const marker of [
-    "'../worker-opfs/tinygres_opfs_runtime.js'",
+    "'../worker-opfs/tinyjoin_opfs_runtime.js'",
     '/* @vite-ignore */',
     '/* webpackIgnore: true */',
   ]) {

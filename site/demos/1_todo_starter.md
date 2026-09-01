@@ -1,10 +1,10 @@
 # Todo starter
 
-A useful first TinyGres app needs one table, one read query, and small
+A useful first TinyJoin app needs one table, one read query, and small
 parameterized mutations.
 
 ```ts
-import {create} from 'tinygres';
+import {create} from 'tinyjoin';
 
 type Todo = {
   id: string;
@@ -12,7 +12,7 @@ type Todo = {
   done: boolean;
 };
 
-const db = await create('opfs://tinygres-todos-v1');
+const db = await create('opfs://tinyjoin-todos-v1');
 
 await db.exec(`
   CREATE TABLE IF NOT EXISTS todos (

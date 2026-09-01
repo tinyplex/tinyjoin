@@ -26,9 +26,9 @@ export interface Results<RowType = Row> {
   affectedRows?: number;
   command?: string;
   rowCount?: number;
-  /** TinyGres extension: the database revision observed by this statement. */
+  /** TinyJoin extension: the database revision observed by this statement. */
   revision: number;
-  /** TinyGres extension: tables changed by this statement. */
+  /** TinyJoin extension: tables changed by this statement. */
   tables: string[];
 }
 
@@ -208,7 +208,7 @@ export function isRpcResult<Method extends RpcMethod>(
 }
 
 /**
- * Checks only the fixed result envelope produced by TinyGres's bundled Worker.
+ * Checks only the fixed result envelope produced by TinyJoin's bundled Worker.
  * The Worker has already validated the complete WASM result before posting it;
  * avoiding another walk here keeps large row sets off the UI thread's hot path.
  */

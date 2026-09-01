@@ -1,10 +1,22 @@
 {
-  "name": "tinygres",
+  "name": "tinyjoin",
   "version": "0.0.5",
   "author": "jamesgpearce",
   "private": true,
   "type": "module",
   "sideEffects": false,
+  "types": "./dist/@types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/@types/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./worker": {
+      "types": "./dist/@types/worker/index.d.ts",
+      "import": "./dist/worker/index.js"
+    },
+    "./package.json": "./package.json"
+  },
   "scripts": {
     "build": "node scripts/build.mjs",
     "build:docs": "npm run build && npm run build:docs:built",
@@ -38,9 +50,9 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/tinyplex/tinygres.git"
+    "url": "git+https://github.com/tinyplex/tinyjoin.git"
   },
-  "homepage": "https://tinygres.org",
+  "homepage": "https://tinyjoin.org",
   "license": "MIT",
   "description": "A tiny, worker-first relational database for browser apps.",
   "keywords": [

@@ -44,7 +44,7 @@ export class WorkerRpc {
       return Promise.reject(
         new ClientError({
           code: 'WORKER_TERMINATED',
-          message: 'The TinyGres worker has been closed',
+          message: 'The TinyJoin worker has been closed',
         }),
       );
     }
@@ -85,7 +85,7 @@ export class WorkerRpc {
       error ??
       new ClientError({
         code: 'WORKER_TERMINATED',
-        message: 'The TinyGres worker has been closed',
+        message: 'The TinyJoin worker has been closed',
       });
     for (const pending of this.#pending.values()) {
       pending.reject(reason);
@@ -105,7 +105,7 @@ export class WorkerRpc {
       this.dispose(
         new ClientError({
           code: 'PROTOCOL_MISMATCH',
-          message: 'The TinyGres worker sent an invalid protocol message',
+          message: 'The TinyJoin worker sent an invalid protocol message',
         }),
       );
       return;
@@ -125,7 +125,7 @@ export class WorkerRpc {
           new ClientError({
             code: 'PROTOCOL_MISMATCH',
             message:
-              'The TinyGres worker returned an invalid result for the requested operation',
+              'The TinyJoin worker returned an invalid result for the requested operation',
           }),
         );
         return;
@@ -142,7 +142,7 @@ export class WorkerRpc {
     this.dispose(
       new ClientError({
         code: 'WORKER_MESSAGE_ERROR',
-        message: 'The browser could not deserialize a TinyGres worker message',
+        message: 'The browser could not deserialize a TinyJoin worker message',
       }),
     );
   };
@@ -151,7 +151,7 @@ export class WorkerRpc {
     this.dispose(
       new ClientError({
         code: 'WORKER_ERROR',
-        message: event.message || 'The TinyGres worker crashed',
+        message: event.message || 'The TinyJoin worker crashed',
       }),
     );
   };

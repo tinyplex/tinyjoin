@@ -108,7 +108,7 @@ export function startWorker(
           if (activeTransactionId !== undefined) {
             throw workerError(
               'TRANSACTION_ACTIVE',
-              'A TinyGres transaction is already active',
+              'A TinyJoin transaction is already active',
             );
           }
           const id = `tx-${nextTransactionId++}`;
@@ -163,7 +163,7 @@ export function startWorker(
       ) {
         throw Object.assign(
           new Error(
-            'The TinyGres worker is already initialized with different storage',
+            'The TinyJoin worker is already initialized with different storage',
           ),
           {code: 'STORAGE_ALREADY_INITIALIZED'},
         );
@@ -180,7 +180,7 @@ export function startWorker(
     if (!enginePromise) {
       throw Object.assign(
         new Error(
-          'Initialize the TinyGres worker before sending other requests',
+          'Initialize the TinyJoin worker before sending other requests',
         ),
         {code: 'WORKER_NOT_INITIALIZED'},
       );
@@ -200,7 +200,7 @@ export function startWorker(
         ok: false,
         error: {
           code: 'PROTOCOL_MISMATCH',
-          message: 'The worker received an invalid TinyGres protocol request',
+          message: 'The worker received an invalid TinyJoin protocol request',
         },
       });
       return;
@@ -340,7 +340,7 @@ function assertNoTransaction(activeId: string | undefined): void {
   if (activeId !== undefined) {
     throw workerError(
       'TRANSACTION_ACTIVE',
-      'A TinyGres transaction is already active',
+      'A TinyJoin transaction is already active',
     );
   }
 }
@@ -355,13 +355,13 @@ function assertTransactionId(
   if (activeId === undefined) {
     throw workerError(
       'TRANSACTION_NOT_ACTIVE',
-      'The TinyGres transaction is no longer active',
+      'The TinyJoin transaction is no longer active',
     );
   }
   if (requestedId !== activeId) {
     throw workerError(
       'TRANSACTION_ACTIVE',
-      'Use the active TinyGres transaction for this operation',
+      'Use the active TinyJoin transaction for this operation',
     );
   }
 }

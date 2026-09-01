@@ -1,6 +1,6 @@
 # Storage and lifecycle
 
-TinyGres supports an ephemeral memory database and an opt-in persistent browser
+TinyJoin supports an ephemeral memory database and an opt-in persistent browser
 database. Both use the same Worker and page-native engine.
 
 ## Memory
@@ -25,7 +25,7 @@ and schema generation in it. A name is a namespace, not an encryption or
 access-control boundary.
 
 OPFS persistence requires a secure browser context and a dedicated Worker.
-TinyGres opens the database with an exclusive synchronous access handle. A
+TinyJoin opens the database with an exclusive synchronous access handle. A
 second Worker opening the same name fails rather than risking concurrent
 mutation; closing the first Client releases the lock.
 
@@ -37,7 +37,7 @@ locked, corrupt, or out of quota.
 OPFS is browser-managed storage. A user can clear it and a browser may evict
 best-effort storage under pressure. An application that needs stronger local
 retention can make a user-appropriate `navigator.storage.persist()` request.
-TinyGres does not make that product decision during startup.
+TinyJoin does not make that product decision during startup.
 
 ## Opening and closing
 
@@ -46,7 +46,7 @@ initialization succeeds. The returned Client also exposes `ready`, `waitReady`,
 and `closed` for code that constructs a Client directly.
 
 Call close() during application teardown. It seals prepared statements,
-closes storage, and terminates TinyGres's packaged Worker. Outstanding cleanup
+closes storage, and terminates TinyJoin's packaged Worker. Outstanding cleanup
 is shared by repeated calls.
 
 The current persistent database is bounded to 65,536 4 KiB pages (256 MiB).

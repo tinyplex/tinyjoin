@@ -1,5 +1,5 @@
 {
-  "name": "tinygres-packed-vite-consumer",
+  "name": "tinyjoin-packed-vite-consumer",
   "private": true,
   "version": "0.0.0",
   "type": "module",
@@ -9,7 +9,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "tinygres": "file:__TINYGRES_TARBALL__"
+    "tinyjoin": "file:__TINYJOIN_TARBALL__"
   },
   "devDependencies": {
     "typescript": "^7.0.2",

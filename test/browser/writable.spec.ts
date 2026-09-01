@@ -8,7 +8,7 @@ test('writes, transacts, rolls back, and reopens through Worker/WASM/OPFS', asyn
   const databaseName = `writable-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
 
   const report = await page.evaluate((name) =>
-    window.__tinygresTest!.writableDatabaseProbe(name), databaseName,
+    window.__tinyjoinTest!.writableDatabaseProbe(name), databaseName,
   );
 
   expect(report.aggregateRows).toEqual([

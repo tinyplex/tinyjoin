@@ -1,5 +1,5 @@
 interface Window {
-  __tinygresTest?: {
+  __tinyjoinTest?: {
     benchmark(iterations: number): Promise<number[]>;
     joinDatabaseProbe(): Promise<{
       innerRows: Array<{

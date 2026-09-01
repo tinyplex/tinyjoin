@@ -11,7 +11,7 @@ test('persists complete state across dedicated Worker restarts', async ({
   const databaseName = `playwright-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
 
   const report = await page.evaluate(
-    ({name, rows}) => window.__tinygresTest!.persistenceProbe(name, rows),
+    ({name, rows}) => window.__tinyjoinTest!.persistenceProbe(name, rows),
     {name: databaseName, rows: 10_000},
   );
 
@@ -19,7 +19,7 @@ test('persists complete state across dedicated Worker restarts', async ({
     body: JSON.stringify(report, null, 2),
     contentType: 'application/json',
   });
-  console.log(`TinyGres OPFS persistence: ${JSON.stringify(report)} ms`);
+  console.log(`TinyJoin OPFS persistence: ${JSON.stringify(report)} ms`);
 
   expect(report.lockErrorCode).toBe('STORAGE_LOCKED');
   expect(report.differentNameOpened).toBe(true);
@@ -42,7 +42,7 @@ test('rehydrates OPFS after a browser process restart', async ({}, testInfo) => 
   if (typeof baseURL !== 'string') {
     throw new TypeError('The browser restart test requires a string baseURL');
   }
-  const profile = await mkdtemp(join(tmpdir(), 'tinygres-profile-'));
+  const profile = await mkdtemp(join(tmpdir(), 'tinyjoin-profile-'));
   const databaseName = `browser-restart-${Date.now()}`;
   let context = await chromium.launchPersistentContext(profile, {
     headless: true,
@@ -54,7 +54,7 @@ test('rehydrates OPFS after a browser process restart', async ({}, testInfo) => 
     await expect(
       page.evaluate(
         ({name, rows}) =>
-          window.__tinygresTest!.writeBrowserRestartFixture(name, rows),
+          window.__tinyjoinTest!.writeBrowserRestartFixture(name, rows),
         {name: databaseName, rows: 1_024},
       ),
     ).resolves.toEqual({revision: 2});
@@ -68,7 +68,7 @@ test('rehydrates OPFS after a browser process restart', async ({}, testInfo) => 
     await expect(page.getByTestId('state')).toHaveText('Ready');
     await expect(
       page.evaluate((name) =>
-        window.__tinygresTest!.readBrowserRestartFixture(name),
+        window.__tinyjoinTest!.readBrowserRestartFixture(name),
       databaseName),
     ).resolves.toEqual({
       emptyTableRows: 0,
