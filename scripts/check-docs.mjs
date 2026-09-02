@@ -42,6 +42,7 @@ export async function checkDocs(
     resolve(docs, 'guides/releases/index.html'),
     'utf8',
   );
+  const favicon = await readFile(resolve(docs, 'favicon.svg'), 'utf8');
   const stylesheet = await readFile(resolve(docs, 'css/index.css'), 'utf8');
   if (!homepage.includes('<nav id="actions" aria-label="Get started">')) {
     errors.push('The homepage must contain its explicitly scoped action links');
@@ -73,7 +74,10 @@ export async function checkDocs(
   if (/article#home\s*>\s*hr\s*~/.test(stylesheet)) {
     errors.push('Homepage content after a divider must retain the paired grid');
   }
-  if (!stylesheet.includes('--accent:#336791')) {
+  if (!favicon.includes('fill="#7C3AED"')) {
+    errors.push('The generated favicon must use the TinyJoin purple');
+  }
+  if (!stylesheet.includes('--accent:#7c3aed')) {
     errors.push('The site accent must match the final TinyJoin logo');
   }
   if (!/body>header>nav\{display:none/.test(stylesheet)) {

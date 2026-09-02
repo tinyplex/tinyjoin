@@ -300,6 +300,8 @@ function assertPackedFiles(packed) {
     '@types/worker/index.d.ts',
     'LICENSE',
     'README.md',
+    'RUST_STANDARD_LIBRARY_NOTICES.html',
+    'THIRD_PARTY_NOTICES.txt',
     'agents.md',
     'client/client.js',
     'client/error.js',

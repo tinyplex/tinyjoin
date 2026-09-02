@@ -53,6 +53,9 @@
     "url": "git+https://github.com/tinyplex/tinyjoin.git"
   },
   "homepage": "https://tinyjoin.org",
+  "bugs": {
+    "url": "https://github.com/tinyplex/tinyjoin/issues"
+  },
   "license": "MIT",
   "description": "A tiny, worker-first relational database for browser apps.",
   "keywords": [

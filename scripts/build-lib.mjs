@@ -6,6 +6,10 @@ import {fileURLToPath} from 'node:url';
 import {build as viteBuild} from 'vite';
 
 import {buildDefinitions} from './build-definitions.mjs';
+import {
+  assertThirdPartyNotices,
+  thirdPartyNoticeFiles,
+} from './third-party-notices.mjs';
 import {requireWasmArtifacts} from './wasm-artifacts.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -16,6 +20,7 @@ try {
   console.error(error instanceof Error ? error.message : String(error));
   process.exit(1);
 }
+await assertThirdPartyNotices();
 
 const compiler = resolve(root, 'node_modules/typescript/bin/tsc');
 const compile = spawnSync(
@@ -56,6 +61,9 @@ await writeFile(
   `${JSON.stringify(manifest, null, 2)}\n`,
 );
 await copyFile(resolve(root, 'LICENSE'), resolve(dist, 'LICENSE'));
+for (const notice of thirdPartyNoticeFiles) {
+  await copyFile(resolve(root, notice), resolve(dist, notice));
+}
 await copyPublicMarkdown();
 await mkdir(resolve(dist, 'docs'), {recursive: true});
 await copyFile(
