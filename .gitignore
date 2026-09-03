@@ -4,3 +4,4 @@ target/
 *.tgz
 *.log
 .DS_Store
+*.code-workspace
