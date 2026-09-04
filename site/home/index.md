@@ -17,27 +17,48 @@
 
 ---
 
+> ## Your first _TinyJoin_ app
+>
+> Scaffold a complete local todo app - in TypeScript or JavaScript, with its
+> data saved across reloads! - in less than 60s. It needs no database server,
+> account, or credentials.
+
+```bash
+> npm create tinyjoin@latest
+
+🎉 Welcome to TinyJoin!
+
+📦 Creating your project...
+```
+
 > ## Start small
 >
-> Install TinyJoin, import create(), and open a database. The normal setup does
-> not need Rust tooling, a Worker entry, a WASM plugin, or a runtime copying
-> step.
+> Install TinyJoin. There is no server to run, no account to create, and no
+> native toolchain to set up.
 
 ```sh
 npm install tinyjoin
 ```
 
-> ## One import. No infrastructure setup.
+> ## Open a database
 >
-> create() owns Worker construction and WebAssembly loading. Use a stable
-> `opfs://name` when data should survive reloads in the same browser, or call
-> create() with no argument for an ephemeral memory database.
+> create() owns Worker construction and WebAssembly loading, and resolves once
+> the database is ready. Use a stable `opfs://name` when data should survive
+> reloads in the same browser, or call it with no argument for an ephemeral
+> memory database.
 
 ```ts
 import {create} from 'tinyjoin';
 
 const db = await create('opfs://my-app');
+```
 
+> ## Set up a schema
+>
+> exec() runs a parameter-free script as one implicit transaction, so schema
+> setup stays a single call that is safe to run again on every load.
+
+```ts
 await db.exec(`
   CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
@@ -45,33 +66,100 @@ await db.exec(`
     done BOOLEAN NOT NULL DEFAULT false
   )
 `);
-
-await db.query('INSERT INTO tasks (id, title) VALUES ($1, $2)', [
-  crypto.randomUUID(),
-  'Try TinyJoin',
-]);
-
-const {rows} = await db.query<{
-  id: string;
-  title: string;
-  done: boolean;
-}>('SELECT * FROM tasks ORDER BY id');
-
-await db.close();
 ```
 
-> ## A familiar, intentionally small API
+> ## Write with parameters
 >
-> - query() runs one parameterized read or write statement.
-> - exec() runs a parameter-free SQL script atomically.
-> - transaction() commits related row mutations together.
-> - prepare() retains a statement for repeated execution.
-> - subscribe() reports which tables changed so an app can re-query.
-> - close() releases statements, storage, and the Worker.
+> query() runs one read or write statement. Application values go in the `$n`
+> array and never reach the SQL text.
+
+```ts
+const id = crypto.randomUUID();
+
+await db.query(
+  'INSERT INTO tasks (id, title) VALUES ($1, $2)',
+  [id, 'Try TinyJoin'],
+);
+```
+
+> ## Or tag a template
+>
+> The sql tagged template is the same parameterized call in a shorter form. It
+> takes values only, so there is no way to interpolate raw SQL by accident.
+
+```ts
+const title = 'Written with a tag';
+
+await db.sql`
+  INSERT INTO tasks (id, title)
+  VALUES (${crypto.randomUUID()}, ${title})
+`;
+```
+
+> ## Read rows back
 >
 > Results use the familiar `rows`, `fields`, `affectedRows`, `command`, and
-> `rowCount` shape. TinyJoin also reports a database `revision` and changed
-> `tables`.
+> `rowCount` shape. The row type is yours to declare, and TinyJoin adds a
+> database `revision` and the `tables` a statement touched.
+
+```ts
+type Task = {id: string; title: string};
+
+const {rows} = await db.query<Task>(
+  'SELECT id, title FROM tasks ORDER BY title',
+);
+```
+
+> ## Commit related changes together
+>
+> transaction() stages its writes and publishes them once. Reads inside the
+> callback see the staged rows, and letting an error escape rolls the whole
+> thing back.
+
+```ts
+await db.transaction(async (tx) => {
+  await tx.query(
+    'UPDATE tasks SET done = $1 WHERE id = $2',
+    [true, id],
+  );
+  await tx.query(
+    'DELETE FROM tasks WHERE done = $1',
+    [true],
+  );
+});
+```
+
+> ## Re-run without re-parsing
+>
+> prepare() retains one parsed statement in the Worker. It resolves tables and
+> types against the current catalog on every execution, so a compatible schema
+> change does not make the handle stale.
+
+```ts
+const openTasks = await db.prepare<{
+  id: string;
+  title: string;
+}>('SELECT id, title FROM tasks WHERE done = $1');
+
+const {rows} = await openTasks.execute([false]);
+```
+
+> ## Let the view follow the data
+>
+> subscribe() reports which tables changed, so a UI can re-query instead of
+> being told what to redraw by every writer. close() then releases statements,
+> storage, and the Worker.
+
+```ts
+const unsubscribe = db.subscribe(
+  {tables: ['tasks']},
+  () => render(),
+);
+
+// Later
+unsubscribe();
+await db.close();
+```
 
 > ## Local by default
 >

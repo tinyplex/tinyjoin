@@ -1,0 +1,165 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="preload" as="image" href="/favicon.svg"><link rel="preload" as="font" href="/fonts/inter.woff2" type="font/woff2" crossorigin="anonymous"><link rel="preload" as="font" href="/fonts/inconsolata.woff2" type="font/woff2" crossorigin="anonymous"><title>Bank transactions | TinyJoin</title><meta name="description" content="A tiny, worker-first relational database for browser apps."><meta property="og:type" content="website"><meta property="og:title" content="Bank transactions | TinyJoin"><meta property="og:description" content="A tiny, worker-first relational database for browser apps."><meta property="og:url" content="https://tinyjoin.org/demos/bank-transactions/"><link rel="canonical" href="https://tinyjoin.org/demos/bank-transactions/"><link rel="icon" type="image/svg+xml" href="/favicon.svg"><link rel="stylesheet" href="/css/index.css"><script src="/js/site.js"></script></head><body><a class="skip" href="#content">Skip to content</a><header><a class="wordmark" href="/"><img src="/favicon.svg" alt="TinyJoin logo"><span>Tiny<em>Join</em></span></a><nav aria-label="Primary"><ul><li><a href="/guides/">Guides</a></li><li><a href="/demos/" aria-current="true">Demos</a></li><li><a href="/api/">API</a></li><li><a href="https://github.com/tinyplex/tinyjoin">GitHub</a></li></ul></nav><button id="dark" class="auto" type="button" aria-label="Color theme: automatic; activate for dark"></button></header><main><nav aria-label="Documentation"><ul><li id="root" class="parent open"><span></span><a href="/" aria-current="true">TinyJoin</a><ul><li id="G" class="parent"><span></span><a href="/guides/">Guides</a></li><li id="D" class="parent open"><span></span><a href="/demos/" aria-current="true">Demos</a><ul><li id="T2"><span></span><a href="/demos/todo-starter/">Todo starter</a></li><li id="B" class="current"><span></span><a href="/demos/bank-transactions/" aria-current="page">Bank transactions</a></li></ul></li><li id="api" class="parent"><span></span><a href="/api/">API</a></li></ul></li></ul></nav><article id="content" tabindex="-1"><nav class="breadcrumbs" aria-label="Breadcrumbs"><ul><li><a href="/" aria-current="true">TinyJoin</a></li><li><a href="/demos/" aria-current="true">Demos</a></li><li><a href="/demos/bank-transactions/" aria-current="page">Bank transactions</a></li></ul></nav><section class="s1" id="/demos/bank-transactions/" data-id="B"><h1>Bank transactions</h1><iframe srcdoc="&lt;html&gt;&lt;head&gt;&lt;script type=&quot;importmap&quot;&gt;{&quot;imports&quot;: {&quot;tinyjoin&quot;: &quot;/lib/index.js&quot;}}&lt;/script&gt;&lt;style&gt;@font-face{font-family:Inter;src:url(/fonts/inter.woff2) format(&#x27;woff2&#x27;);font-display:swap}body{font-family:Inter,sans-serif;letter-spacing:-.04rem;margin:0;min-height:100vh;padding:1rem}body *{box-sizing:border-box;outline-color:#7c3aed}#accounts{list-style:none;margin:0;padding:0}#accounts li{align-items:center;background:#fff;border:1px solid #ccc;display:flex;justify-content:space-between;margin-bottom:.5rem;padding:.5rem}#accounts li b{font-variant-numeric:tabular-nums}#buttons{display:flex;gap:.5rem;margin-top:1rem}button{background:#7c3aed;border:1px solid #7c3aed;color:#fff;cursor:pointer;font:inherit;letter-spacing:inherit;padding:.5rem 1rem}#overdraw{background:#fff;border:1px solid #ccc;color:inherit}#status{color:#666}#status.failed{color:#a0382e}&lt;/style&gt;&lt;/head&gt;&lt;body&gt;&lt;main&gt;&lt;ul id=&quot;accounts&quot;&gt;&lt;/ul&gt;&lt;div id=&quot;buttons&quot;&gt;&lt;button id=&quot;transfer&quot;&gt;Transfer 25&lt;/button&gt; &lt;button id=&quot;overdraw&quot;&gt;Transfer 500&lt;/button&gt;&lt;/div&gt;&lt;p id=&quot;status&quot;&gt;Ready.&lt;/p&gt;&lt;/main&gt;&lt;/body&gt;&lt;script type=&quot;module&quot;&gt;import{create as d}from&quot;tinyjoin&quot;;const n=await d(&quot;memory://&quot;);await n.exec(`
+  CREATE TABLE accounts (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    balance INTEGER NOT NULL DEFAULT 0
+  )
+`),await n.query(&quot;INSERT INTO accounts (id, name, balance) VALUES ($1, $2, $3), ($4, $5, $6)&quot;,[&quot;sender&quot;,&quot;Ada&quot;,100,&quot;recipient&quot;,&quot;Grace&quot;,100]);const m=async e=&gt;{await n.transaction(async t=&gt;{const{rows:o}=await t.query(&quot;SELECT id, balance FROM accounts ORDER BY id&quot;),a=Object.fromEntries(o.map(({id:c,balance:s})=&gt;[c,s]));if(a.sender&lt;e)throw new Error(`Ada cannot afford ${e}`);await t.query(&quot;UPDATE accounts SET balance = $1 WHERE id = $2&quot;,[a.sender-e,&quot;sender&quot;]),await t.query(&quot;UPDATE accounts SET balance = $1 WHERE id = $2&quot;,[a.recipient+e,&quot;recipient&quot;])})},r=document.getElementById(&quot;status&quot;),E=async e=&gt;{try{await m(e),r.textContent=`Transferred ${e}.`,r.className=&quot;&quot;}catch(t){r.textContent=`${t.message}. Both balances are unchanged.`,r.className=&quot;failed&quot;}};document.getElementById(&quot;transfer&quot;).onclick=()=&gt;E(25),document.getElementById(&quot;overdraw&quot;).onclick=()=&gt;E(500);const l=document.getElementById(&quot;accounts&quot;),i=async()=&gt;{const{rows:e}=await n.query(&quot;SELECT name, balance FROM accounts ORDER BY name&quot;);l.replaceChildren(...e.map(({name:t,balance:o})=&gt;{const a=document.createElement(&quot;li&quot;),c=document.createElement(&quot;span&quot;);c.textContent=t;const s=document.createElement(&quot;b&quot;);return s.textContent=o,a.append(c,s),a}))};n.subscribe({tables:[&quot;accounts&quot;]},i),await i();&lt;/script&gt;&lt;/html&gt;"></iframe><p>Callback transactions group related parameterized mutations, so a failure part way through leaves nothing behind. The demo above moves money between two accounts; the second button deliberately fails, and you can watch the balances stay exactly where they were.</p><p>First, since the demo runs in a browser, register an import alias for TinyJoin. The site serves its own copy, because a Worker cannot be constructed from a cross-origin script:</p><pre><code><span class="tag"><span class="tag"><span class="punctuation">&lt;</span>script</span> <span class="attr-name">type</span><span class="attr-value"><span class="punctuation">=</span><span class="punctuation">"</span>importmap<span class="punctuation">"</span></span><span class="punctuation">></span></span><span class="script"><span class="language-javascript">
+  <span class="punctuation">{</span><span class="string-property">"imports"</span><span class="operator">:</span> <span class="punctuation">{</span><span class="string-property">"tinyjoin"</span><span class="operator">:</span> <span class="string">"/lib/index.js"</span><span class="punctuation">}</span><span class="punctuation">}</span>
+</span></span><span class="tag"><span class="tag"><span class="punctuation">&lt;/</span>script</span><span class="punctuation">></span></span>
+</code></pre><p>Two accounts and a running log:</p><pre><code><span class="tag"><span class="tag"><span class="punctuation">&lt;</span>main</span><span class="punctuation">></span></span>
+  <span class="tag"><span class="tag"><span class="punctuation">&lt;</span>ul</span> <span class="attr-name">id</span><span class="attr-value"><span class="punctuation">=</span><span class="punctuation">"</span>accounts<span class="punctuation">"</span></span><span class="punctuation">></span></span><span class="tag"><span class="tag"><span class="punctuation">&lt;/</span>ul</span><span class="punctuation">></span></span>
+  <span class="tag"><span class="tag"><span class="punctuation">&lt;</span>div</span> <span class="attr-name">id</span><span class="attr-value"><span class="punctuation">=</span><span class="punctuation">"</span>buttons<span class="punctuation">"</span></span><span class="punctuation">></span></span>
+    <span class="tag"><span class="tag"><span class="punctuation">&lt;</span>button</span> <span class="attr-name">id</span><span class="attr-value"><span class="punctuation">=</span><span class="punctuation">"</span>transfer<span class="punctuation">"</span></span><span class="punctuation">></span></span>Transfer 25<span class="tag"><span class="tag"><span class="punctuation">&lt;/</span>button</span><span class="punctuation">></span></span>
+    <span class="tag"><span class="tag"><span class="punctuation">&lt;</span>button</span> <span class="attr-name">id</span><span class="attr-value"><span class="punctuation">=</span><span class="punctuation">"</span>overdraw<span class="punctuation">"</span></span><span class="punctuation">></span></span>Transfer 500<span class="tag"><span class="tag"><span class="punctuation">&lt;/</span>button</span><span class="punctuation">></span></span>
+  <span class="tag"><span class="tag"><span class="punctuation">&lt;/</span>div</span><span class="punctuation">></span></span>
+  <span class="tag"><span class="tag"><span class="punctuation">&lt;</span>p</span> <span class="attr-name">id</span><span class="attr-value"><span class="punctuation">=</span><span class="punctuation">"</span>status<span class="punctuation">"</span></span><span class="punctuation">></span></span>Ready.<span class="tag"><span class="tag"><span class="punctuation">&lt;/</span>p</span><span class="punctuation">></span></span>
+<span class="tag"><span class="tag"><span class="punctuation">&lt;/</span>main</span><span class="punctuation">></span></span>
+</code></pre><p>The table is small, and both accounts start with a balance:</p><pre><code><span class="keyword">import</span> <span class="punctuation">{</span>create<span class="punctuation">}</span> <span class="keyword">from</span> <span class="string">'tinyjoin'</span><span class="punctuation">;</span>
+
+<span class="keyword">const</span> db <span class="operator">=</span> <span class="keyword">await</span> <span class="function"><a href="/api/tinyjoin/functions/lifecycle/create/">create</a></span><span class="punctuation">(</span><span class="string">'memory://'</span><span class="punctuation">)</span><span class="punctuation">;</span>
+
+<span class="keyword">await</span> db<span class="punctuation">.</span><span class="function"><a href="/api/tinyjoin/classes/lifecycle/client/methods/sql/exec/">exec</a></span><span class="punctuation">(</span><span class="template-string"><span class="template-punctuation">`</span><span class="string">
+  CREATE TABLE accounts (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    balance INTEGER NOT NULL DEFAULT 0
+  )
+</span><span class="template-punctuation">`</span></span><span class="punctuation">)</span><span class="punctuation">;</span>
+
+<span class="keyword">await</span> db<span class="punctuation">.</span><span class="function"><a href="/api/tinyjoin/classes/lifecycle/client/methods/sql/query/">query</a></span><span class="punctuation">(</span>
+  <span class="string">'INSERT INTO accounts (id, name, balance) VALUES ($1, $2, $3), ($4, $5, $6)'</span><span class="punctuation">,</span>
+  <span class="punctuation">[</span><span class="string">'sender'</span><span class="punctuation">,</span> <span class="string">'Ada'</span><span class="punctuation">,</span> <span class="number">100</span><span class="punctuation">,</span> <span class="string">'recipient'</span><span class="punctuation">,</span> <span class="string">'Grace'</span><span class="punctuation">,</span> <span class="number">100</span><span class="punctuation">]</span><span class="punctuation">,</span>
+<span class="punctuation">)</span><span class="punctuation">;</span>
+</code></pre><p>A transfer is two updates that must both happen, or neither. <a href="/api/tinyjoin/classes/lifecycle/client/methods/transactions/transaction/"><code>transaction</code></a>() stages them and publishes them once, and reads through the transaction object see the staged rows before the commit:</p><pre><code><span class="keyword">const</span> <span class="function-variable">transfer</span> <span class="operator">=</span> <span class="keyword">async</span> <span class="punctuation">(</span><span class="parameter">amount</span><span class="punctuation">)</span> <span class="operator">=></span> <span class="punctuation">{</span>
+  <span class="keyword">await</span> db<span class="punctuation">.</span><span class="function"><a href="/api/tinyjoin/classes/lifecycle/client/methods/transactions/transaction/">transaction</a></span><span class="punctuation">(</span><span class="keyword">async</span> <span class="punctuation">(</span><span class="parameter">tx</span><span class="punctuation">)</span> <span class="operator">=></span> <span class="punctuation">{</span>
+    <span class="keyword">const</span> <span class="punctuation">{</span>rows<span class="punctuation">}</span> <span class="operator">=</span> <span class="keyword">await</span> tx<span class="punctuation">.</span><span class="function"><a href="/api/tinyjoin/classes/lifecycle/client/methods/sql/query/">query</a></span><span class="punctuation">(</span>
+      <span class="string">'SELECT id, balance FROM accounts ORDER BY id'</span><span class="punctuation">,</span>
+    <span class="punctuation">)</span><span class="punctuation">;</span>
+    <span class="keyword">const</span> balances <span class="operator">=</span> Object<span class="punctuation">.</span><span class="function">fromEntries</span><span class="punctuation">(</span>
+      rows<span class="punctuation">.</span><span class="function">map</span><span class="punctuation">(</span><span class="punctuation">(</span><span class="parameter"><span class="punctuation">{</span>id<span class="punctuation">,</span> balance<span class="punctuation">}</span></span><span class="punctuation">)</span> <span class="operator">=></span> <span class="punctuation">[</span>id<span class="punctuation">,</span> balance<span class="punctuation">]</span><span class="punctuation">)</span><span class="punctuation">,</span>
+    <span class="punctuation">)</span><span class="punctuation">;</span>
+
+    <span class="keyword">if</span> <span class="punctuation">(</span>balances<span class="punctuation">.</span>sender <span class="operator">&lt;</span> amount<span class="punctuation">)</span> <span class="punctuation">{</span>
+      <span class="keyword">throw</span> <span class="keyword">new</span> <span class="class-name">Error</span><span class="punctuation">(</span><span class="template-string"><span class="template-punctuation">`</span><span class="string">Ada cannot afford </span><span class="interpolation"><span class="interpolation-punctuation">${</span>amount<span class="interpolation-punctuation">}</span></span><span class="template-punctuation">`</span></span><span class="punctuation">)</span><span class="punctuation">;</span>
+    <span class="punctuation">}</span>
+
+    <span class="keyword">await</span> tx<span class="punctuation">.</span><span class="function"><a href="/api/tinyjoin/classes/lifecycle/client/methods/sql/query/">query</a></span><span class="punctuation">(</span><span class="string">'UPDATE accounts SET balance = $1 WHERE id = $2'</span><span class="punctuation">,</span> <span class="punctuation">[</span>
+      balances<span class="punctuation">.</span>sender <span class="operator">-</span> amount<span class="punctuation">,</span>
+      <span class="string">'sender'</span><span class="punctuation">,</span>
+    <span class="punctuation">]</span><span class="punctuation">)</span><span class="punctuation">;</span>
+    <span class="keyword">await</span> tx<span class="punctuation">.</span><span class="function"><a href="/api/tinyjoin/classes/lifecycle/client/methods/sql/query/">query</a></span><span class="punctuation">(</span><span class="string">'UPDATE accounts SET balance = $1 WHERE id = $2'</span><span class="punctuation">,</span> <span class="punctuation">[</span>
+      balances<span class="punctuation">.</span>recipient <span class="operator">+</span> amount<span class="punctuation">,</span>
+      <span class="string">'recipient'</span><span class="punctuation">,</span>
+    <span class="punctuation">]</span><span class="punctuation">)</span><span class="punctuation">;</span>
+  <span class="punctuation">}</span><span class="punctuation">)</span><span class="punctuation">;</span>
+<span class="punctuation">}</span><span class="punctuation">;</span>
+</code></pre><p>Letting the error escape the callback rolls the transaction back. Nothing the callback had already staged is installed, so the first <code>UPDATE</code> never becomes visible even though it ran:</p><pre><code><span class="keyword">const</span> status <span class="operator">=</span> document<span class="punctuation">.</span><span class="function">getElementById</span><span class="punctuation">(</span><span class="string">'status'</span><span class="punctuation">)</span><span class="punctuation">;</span>
+
+<span class="keyword">const</span> <span class="function-variable">attempt</span> <span class="operator">=</span> <span class="keyword">async</span> <span class="punctuation">(</span><span class="parameter">amount</span><span class="punctuation">)</span> <span class="operator">=></span> <span class="punctuation">{</span>
+  <span class="keyword">try</span> <span class="punctuation">{</span>
+    <span class="keyword">await</span> <span class="function">transfer</span><span class="punctuation">(</span>amount<span class="punctuation">)</span><span class="punctuation">;</span>
+    status<span class="punctuation">.</span>textContent <span class="operator">=</span> <span class="template-string"><span class="template-punctuation">`</span><span class="string">Transferred </span><span class="interpolation"><span class="interpolation-punctuation">${</span>amount<span class="interpolation-punctuation">}</span></span><span class="string">.</span><span class="template-punctuation">`</span></span><span class="punctuation">;</span>
+    status<span class="punctuation">.</span>className <span class="operator">=</span> <span class="string">''</span><span class="punctuation">;</span>
+  <span class="punctuation">}</span> <span class="keyword">catch</span> <span class="punctuation">(</span>error<span class="punctuation">)</span> <span class="punctuation">{</span>
+    status<span class="punctuation">.</span>textContent <span class="operator">=</span> <span class="template-string"><span class="template-punctuation">`</span><span class="interpolation"><span class="interpolation-punctuation">${</span>error<span class="punctuation">.</span>message<span class="interpolation-punctuation">}</span></span><span class="string">. Both balances are unchanged.</span><span class="template-punctuation">`</span></span><span class="punctuation">;</span>
+    status<span class="punctuation">.</span>className <span class="operator">=</span> <span class="string">'failed'</span><span class="punctuation">;</span>
+  <span class="punctuation">}</span>
+<span class="punctuation">}</span><span class="punctuation">;</span>
+
+document<span class="punctuation">.</span><span class="function">getElementById</span><span class="punctuation">(</span><span class="string">'transfer'</span><span class="punctuation">)</span><span class="punctuation">.</span><span class="function-variable">onclick</span> <span class="operator">=</span> <span class="punctuation">(</span><span class="punctuation">)</span> <span class="operator">=></span> <span class="function">attempt</span><span class="punctuation">(</span><span class="number">25</span><span class="punctuation">)</span><span class="punctuation">;</span>
+document<span class="punctuation">.</span><span class="function">getElementById</span><span class="punctuation">(</span><span class="string">'overdraw'</span><span class="punctuation">)</span><span class="punctuation">.</span><span class="function-variable">onclick</span> <span class="operator">=</span> <span class="punctuation">(</span><span class="punctuation">)</span> <span class="operator">=></span> <span class="function">attempt</span><span class="punctuation">(</span><span class="number">500</span><span class="punctuation">)</span><span class="punctuation">;</span>
+</code></pre><p>The rest is the same shape as any other TinyJoin app: one query to read, and a subscription so the view follows the data:</p><pre><code><span class="keyword">const</span> accounts <span class="operator">=</span> document<span class="punctuation">.</span><span class="function">getElementById</span><span class="punctuation">(</span><span class="string">'accounts'</span><span class="punctuation">)</span><span class="punctuation">;</span>
+
+<span class="keyword">const</span> <span class="function-variable">render</span> <span class="operator">=</span> <span class="keyword">async</span> <span class="punctuation">(</span><span class="punctuation">)</span> <span class="operator">=></span> <span class="punctuation">{</span>
+  <span class="keyword">const</span> <span class="punctuation">{</span>rows<span class="punctuation">}</span> <span class="operator">=</span> <span class="keyword">await</span> db<span class="punctuation">.</span><span class="function"><a href="/api/tinyjoin/classes/lifecycle/client/methods/sql/query/">query</a></span><span class="punctuation">(</span>
+    <span class="string">'SELECT name, balance FROM accounts ORDER BY name'</span><span class="punctuation">,</span>
+  <span class="punctuation">)</span><span class="punctuation">;</span>
+  accounts<span class="punctuation">.</span><span class="function">replaceChildren</span><span class="punctuation">(</span>
+    <span class="operator">...</span>rows<span class="punctuation">.</span><span class="function">map</span><span class="punctuation">(</span><span class="punctuation">(</span><span class="parameter"><span class="punctuation">{</span>name<span class="punctuation">,</span> balance<span class="punctuation">}</span></span><span class="punctuation">)</span> <span class="operator">=></span> <span class="punctuation">{</span>
+      <span class="keyword">const</span> item <span class="operator">=</span> document<span class="punctuation">.</span><span class="function">createElement</span><span class="punctuation">(</span><span class="string">'li'</span><span class="punctuation">)</span><span class="punctuation">;</span>
+      <span class="keyword">const</span> who <span class="operator">=</span> document<span class="punctuation">.</span><span class="function">createElement</span><span class="punctuation">(</span><span class="string">'span'</span><span class="punctuation">)</span><span class="punctuation">;</span>
+      who<span class="punctuation">.</span>textContent <span class="operator">=</span> name<span class="punctuation">;</span>
+      <span class="keyword">const</span> amount <span class="operator">=</span> document<span class="punctuation">.</span><span class="function">createElement</span><span class="punctuation">(</span><span class="string">'b'</span><span class="punctuation">)</span><span class="punctuation">;</span>
+      amount<span class="punctuation">.</span>textContent <span class="operator">=</span> balance<span class="punctuation">;</span>
+      item<span class="punctuation">.</span><span class="function">append</span><span class="punctuation">(</span>who<span class="punctuation">,</span> amount<span class="punctuation">)</span><span class="punctuation">;</span>
+      <span class="keyword">return</span> item<span class="punctuation">;</span>
+    <span class="punctuation">}</span><span class="punctuation">)</span><span class="punctuation">,</span>
+  <span class="punctuation">)</span><span class="punctuation">;</span>
+<span class="punctuation">}</span><span class="punctuation">;</span>
+
+db<span class="punctuation">.</span><span class="function"><a href="/api/tinyjoin/classes/lifecycle/client/methods/subscriptions/subscribe/">subscribe</a></span><span class="punctuation">(</span><span class="punctuation">{</span><span class="literal-property">tables</span><span class="operator">:</span> <span class="punctuation">[</span><span class="string">'accounts'</span><span class="punctuation">]</span><span class="punctuation">}</span><span class="punctuation">,</span> render<span class="punctuation">)</span><span class="punctuation">;</span>
+<span class="keyword">await</span> <span class="function">render</span><span class="punctuation">(</span><span class="punctuation">)</span><span class="punctuation">;</span>
+</code></pre><p>A little styling, and the demo is complete:</p><pre><code><span class="atrule">@font-face</span> <span class="punctuation">{</span>
+  <span class="property">font-family</span><span class="punctuation">:</span> Inter<span class="punctuation">;</span>
+  <span class="property">src</span><span class="punctuation">:</span> <span class="url"><span class="function">url</span><span class="punctuation">(</span>/fonts/inter.woff2<span class="punctuation">)</span></span> <span class="function">format</span><span class="punctuation">(</span><span class="string">'woff2'</span><span class="punctuation">)</span><span class="punctuation">;</span>
+  <span class="property">font-display</span><span class="punctuation">:</span> swap<span class="punctuation">;</span>
+<span class="punctuation">}</span>
+
+<span class="variable">@accentColor<span class="punctuation">:</span></span> #7c3aed<span class="punctuation">;</span>
+<span class="variable">@spacing<span class="punctuation">:</span></span> 0.5rem<span class="punctuation">;</span>
+<span class="variable">@border<span class="punctuation">:</span></span> 1px solid #ccc<span class="punctuation">;</span>
+
+<span class="selector">body</span> <span class="punctuation">{</span>
+  <span class="property">font-family</span><span class="punctuation">:</span> Inter<span class="punctuation">,</span> sans<span class="operator">-</span>serif<span class="punctuation">;</span>
+  <span class="property">letter-spacing</span><span class="punctuation">:</span> <span class="operator">-</span>0.04rem<span class="punctuation">;</span>
+  <span class="property">margin</span><span class="punctuation">:</span> 0<span class="punctuation">;</span>
+  <span class="property">min-height</span><span class="punctuation">:</span> 100vh<span class="punctuation">;</span>
+  <span class="property">padding</span><span class="punctuation">:</span> <span class="variable">@spacing</span> <span class="operator">*</span> 2<span class="punctuation">;</span>
+
+  <span class="selector">*</span> <span class="punctuation">{</span>
+    <span class="property">box-sizing</span><span class="punctuation">:</span> border<span class="operator">-</span>box<span class="punctuation">;</span>
+    <span class="property">outline-color</span><span class="punctuation">:</span> <span class="variable">@accentColor</span><span class="punctuation">;</span>
+  <span class="punctuation">}</span>
+<span class="punctuation">}</span>
+
+<span class="selector">#accounts</span> <span class="punctuation">{</span>
+  <span class="property">list-style</span><span class="punctuation">:</span> none<span class="punctuation">;</span>
+  <span class="property">margin</span><span class="punctuation">:</span> 0<span class="punctuation">;</span>
+  <span class="property">padding</span><span class="punctuation">:</span> 0<span class="punctuation">;</span>
+
+  <span class="selector">li</span> <span class="punctuation">{</span>
+    <span class="property">align-items</span><span class="punctuation">:</span> center<span class="punctuation">;</span>
+    <span class="property">background</span><span class="punctuation">:</span> #fff<span class="punctuation">;</span>
+    <span class="property">border</span><span class="punctuation">:</span> <span class="variable">@border</span><span class="punctuation">;</span>
+    <span class="property">display</span><span class="punctuation">:</span> flex<span class="punctuation">;</span>
+    <span class="property">justify-content</span><span class="punctuation">:</span> space<span class="operator">-</span>between<span class="punctuation">;</span>
+    <span class="property">margin-bottom</span><span class="punctuation">:</span> <span class="variable">@spacing</span><span class="punctuation">;</span>
+    <span class="property">padding</span><span class="punctuation">:</span> <span class="variable">@spacing</span><span class="punctuation">;</span>
+
+    <span class="selector">b</span> <span class="punctuation">{</span>
+      <span class="property">font-variant-numeric</span><span class="punctuation">:</span> tabular<span class="operator">-</span>nums<span class="punctuation">;</span>
+    <span class="punctuation">}</span>
+  <span class="punctuation">}</span>
+<span class="punctuation">}</span>
+
+<span class="selector">#buttons</span> <span class="punctuation">{</span>
+  <span class="property">display</span><span class="punctuation">:</span> flex<span class="punctuation">;</span>
+  <span class="property">gap</span><span class="punctuation">:</span> <span class="variable">@spacing</span><span class="punctuation">;</span>
+  <span class="property">margin-top</span><span class="punctuation">:</span> <span class="variable">@spacing</span> <span class="operator">*</span> 2<span class="punctuation">;</span>
+<span class="punctuation">}</span>
+
+<span class="selector">button</span> <span class="punctuation">{</span>
+  <span class="property">background</span><span class="punctuation">:</span> <span class="variable">@accentColor</span><span class="punctuation">;</span>
+  <span class="property">border</span><span class="punctuation">:</span> 1px solid <span class="variable">@accentColor</span><span class="punctuation">;</span>
+  <span class="property">color</span><span class="punctuation">:</span> #fff<span class="punctuation">;</span>
+  <span class="property">cursor</span><span class="punctuation">:</span> pointer<span class="punctuation">;</span>
+  <span class="property">font</span><span class="punctuation">:</span> inherit<span class="punctuation">;</span>
+  <span class="property">letter-spacing</span><span class="punctuation">:</span> inherit<span class="punctuation">;</span>
+  <span class="property">padding</span><span class="punctuation">:</span> <span class="variable">@spacing</span> <span class="variable">@spacing</span> <span class="operator">*</span> 2<span class="punctuation">;</span>
+<span class="punctuation">}</span>
+
+<span class="selector">#overdraw</span> <span class="punctuation">{</span>
+  <span class="property">background</span><span class="punctuation">:</span> #fff<span class="punctuation">;</span>
+  <span class="property">border</span><span class="punctuation">:</span> <span class="variable">@border</span><span class="punctuation">;</span>
+  <span class="property">color</span><span class="punctuation">:</span> inherit<span class="punctuation">;</span>
+<span class="punctuation">}</span>
+
+<span class="selector">#status</span> <span class="punctuation">{</span>
+  <span class="property">color</span><span class="punctuation">:</span> #666<span class="punctuation">;</span>
+
+  <span class="selector">&amp;.failed</span> <span class="punctuation">{</span>
+    <span class="property">color</span><span class="punctuation">:</span> #a0382e<span class="punctuation">;</span>
+  <span class="punctuation">}</span>
+<span class="punctuation">}</span>
+</code></pre></section></article><aside aria-hidden="true"></aside></main><footer><nav><a id="gh" href="https://github.com/tinyplex/tinyjoin" target="_blank" rel="noreferrer">GitHub</a></nav><nav><a href="/">TinyJoin</a> · MIT licensed</nav></footer></body></html>

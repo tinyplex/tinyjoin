@@ -20,7 +20,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "build:docs": "npm run build && npm run build:docs:built",
-    "build:docs:built": "node site/build.mjs",
+    "build:docs:built": "node scripts/build-docs.mjs",
     "build:lib": "node scripts/build-lib.mjs",
     "build:wasm": "node scripts/build-wasm.mjs",
     "cargo": "node scripts/cargo.mjs",
@@ -28,7 +28,8 @@
     "check:docs": "npm run build:docs && npm run check:docs:built",
     "check:docs:built": "node scripts/check-docs.mjs",
     "check:docs:committed": "node scripts/check-docs-fresh.mjs",
-    "check:release": "npm run check:docs:committed && npm run check:source && npm run build && npm run build:docs:built && npm run check:docs:built && npm run test:wasm:contract && npm run check:size && npm run test:browser:built && npm run test:package:built",
+    "check:demo-runtime": "node scripts/check-demo-runtime.mjs",
+    "check:release": "npm run check:docs:committed && npm run check:source && npm run build && npm run build:docs:built && npm run check:docs:built && npm run check:demo-runtime && npm run test:wasm:contract && npm run check:size && npm run test:browser:built && npm run test:package:built",
     "check:source": "npm run typecheck && npm test",
     "check:size": "node scripts/check-size.mjs",
     "prePublishPackage": "npm i && npm run check:release",
@@ -45,7 +46,7 @@
     "test:wasm": "npm run build:wasm && npm run test:wasm:built",
     "test:wasm:built": "npm run test:wasm:contract && playwright test test/browser/paged-memory.spec.ts",
     "test:wasm:contract": "vitest run test/worker/wasm-bridge-cross.test.ts",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p site/tsconfig.json",
     "typecheck:browser": "tsc --noEmit -p test/browser/app/tsconfig.json"
   },
   "repository": {
@@ -69,10 +70,11 @@
   "devDependencies": {
     "@playwright/test": "^1.62.1",
     "@types/node": "^26.2.0",
+    "esbuild": "^0.28.2",
     "less": "^4.9.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
-    "tinydocs": "^0.1.72",
+    "tinydocs": "^0.1.73",
     "typescript": "^7.0.2",
     "vite": "^8.2.1",
     "vitest": "^4.1.10",

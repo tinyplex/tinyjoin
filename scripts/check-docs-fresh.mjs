@@ -5,7 +5,7 @@ import {fileURLToPath} from 'node:url';
 
 import {buildDefinitions} from './build-definitions.mjs';
 import {checkDocs, getFiles} from './check-docs.mjs';
-import {build as buildDocs} from '../site/build.mjs';
+import {withSiteBuild} from './build-site.mjs';
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const temporaryRoot = await mkdtemp(join(tmpdir(), 'tinyjoin-docs-'));
@@ -18,11 +18,13 @@ try {
     '{"name":"tinyjoin","private":true,"type":"module"}\n',
   );
   await buildDefinitions(root, temporaryDist);
-  await buildDocs(
-    temporaryDocs,
-    resolve(temporaryDist, '@types'),
-    temporaryRoot,
-    temporaryDist,
+  await withSiteBuild((buildDocs) =>
+    buildDocs(
+      temporaryDocs,
+      resolve(temporaryDist, '@types'),
+      temporaryRoot,
+      temporaryDist,
+    ),
   );
   await checkDocs(temporaryDocs, {checkPackageCopies: false});
   await assertDirectoriesEqual(resolve(root, 'docs'), temporaryDocs);
@@ -48,13 +50,18 @@ async function assertFilesEqual(committed, generated) {
 }
 
 async function assertDirectoriesEqual(committed, generated) {
+  const isRuntime = (path) => path === 'lib' || path.startsWith('lib/');
   const committedFiles = await getFiles(committed);
   const generatedFiles = await getFiles(generated);
   const committedByPath = new Map(
-    committedFiles.map((file) => [relative(committed, file), file]),
+    committedFiles
+      .map((file) => [relative(committed, file), file])
+      .filter(([path]) => !isRuntime(path)),
   );
   const generatedByPath = new Map(
-    generatedFiles.map((file) => [relative(generated, file), file]),
+    generatedFiles
+      .map((file) => [relative(generated, file), file])
+      .filter(([path]) => !isRuntime(path)),
   );
   const missing = [...generatedByPath.keys()].filter(
     (path) => !committedByPath.has(path),
