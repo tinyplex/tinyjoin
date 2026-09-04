@@ -1,14 +1,8 @@
-import {
-  NodeBreadcrumbs,
-  NodeNavigation,
-  NodeSection,
-  useBaseUrl,
-  usePageNode,
-  useRootNode,
-} from 'tinydocs';
+import {useBaseUrl, usePageNode, useRootNode} from 'tinydocs';
 import {Footer} from './Footer.tsx';
 import {Header} from './Header.tsx';
 import {Home} from './Home.tsx';
+import {MainInner} from './MainInner.tsx';
 
 const DESCRIPTION =
   'A tiny, worker-first relational database for browser apps.';
@@ -88,26 +82,7 @@ export const Page = () => {
         </a>
         <Header />
         <main>
-          {isHome ? (
-            <Home node={node} />
-          ) : (
-            <>
-              <nav aria-label="Documentation">
-                <ul>
-                  <NodeNavigation node={root} />
-                </ul>
-              </nav>
-              <article id="content" tabIndex={-1}>
-                <nav className="breadcrumbs" aria-label="Breadcrumbs">
-                  <ul>
-                    <NodeBreadcrumbs node={root} />
-                  </ul>
-                </nav>
-                <NodeSection node={node} />
-              </article>
-              <aside aria-hidden="true" />
-            </>
-          )}
+          {isHome ? <Home node={node} /> : <MainInner />}
         </main>
         <Footer />
       </body>

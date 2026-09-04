@@ -1,3 +1,6 @@
+import {navLoad} from './nav.ts';
+import {searchLoad} from './search.ts';
+
 const DARK = 'dark';
 const LIGHT = 'light';
 const AUTO = 'auto';
@@ -68,6 +71,8 @@ window.addEventListener('DOMContentLoaded', () => {
   const toggle = document.querySelector<HTMLButtonElement>('#dark');
   toggle?.addEventListener('click', cycleTheme);
 
+  searchLoad();
+  navLoad();
   updateTheme();
 });
 

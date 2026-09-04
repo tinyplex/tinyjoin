@@ -1,9 +1,11 @@
-import {existsSync, readFileSync} from 'node:fs';
+import {existsSync, readFileSync, writeFileSync} from 'node:fs';
 import {access, cp, mkdir} from 'node:fs/promises';
 import {dirname, relative, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
+import type {Docs} from 'tinydocs';
 import {createDocs, getSorter} from 'tinydocs';
+import {MainInner} from './ui/MainInner.tsx';
 import {MarkdownPage} from './ui/MarkdownPage.tsx';
 import {Page} from './ui/Page.tsx';
 
@@ -105,6 +107,7 @@ export const build = async (
 
   docs
     .addPageForEachNode('/', Page)
+    .addPageForEachNode('/', MainInner, 'main.html')
     .addPageForNode('/api/', Page, 'all.html', true)
     .addMarkdownForNode(
       '/',
@@ -137,7 +140,22 @@ export const build = async (
     .publish();
 
   await waitForFile(resolve(outDir, 'css/index.css'));
+  writeSearchIndex(docs, outDir);
   await copyRuntime(outDir, packageDir);
+};
+
+const writeSearchIndex = (docs: Docs, outDir: string): void => {
+  const pages: {u: string; n: string; s: string}[] = [];
+  docs.forEachNode((node) => {
+    const summary = (node.summary ?? '')
+      .replaceAll(/<[^>]*>/g, '')
+      .replaceAll(/\s+/g, ' ')
+      .trim();
+    if (node.publish && node.url !== '/' && summary && !summary.startsWith('->')) {
+      pages.push({u: node.url, n: node.name, s: summary});
+    }
+  });
+  writeFileSync(resolve(outDir, 'pages.json'), JSON.stringify(pages), 'utf-8');
 };
 
 const copyRuntime = async (
