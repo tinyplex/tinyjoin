@@ -17,6 +17,20 @@
 
 ---
 
+> ## Small enough to not worry about
+>
+> The whole database - the main-thread client, the Worker host, and the
+> WebAssembly engine - is {{sizes.total.gzip}} gzipped, and only
+> {{sizes.client.gzip}} of that ever runs on the UI thread. A build gate keeps
+> the engine itself under 1 MiB uncompressed.
+
+| Component      |                     gzip |
+| -------------- | -----------------------: |
+| Main JS        |    {{sizes.client.gzip}} |
+| Worker JS      |    {{sizes.worker.gzip}} |
+| Engine WASM    |      {{sizes.wasm.gzip}} |
+| **Everything** | **{{sizes.total.gzip}}** |
+
 > ## Your first _TinyJoin_ app
 >
 > Scaffold a complete local todo app in JS or TS - and with its relational data
@@ -38,36 +52,6 @@
 ```sh
 npm install tinyjoin
 ```
-
-> ## Small enough to not worry about
->
-> The whole database - the main-thread client, the Worker host, and the
-> WebAssembly engine - is {{sizes.total.gzip}} gzipped, and only
-> {{sizes.client.gzip}} of that ever runs on the main thread. A build gate keeps
-> the engine itself under 1 MiB uncompressed.
-
-| Downloaded         |                     gzip |
-| ------------------ | -----------------------: |
-| WebAssembly engine |      {{sizes.wasm.gzip}} |
-| Worker JavaScript  |    {{sizes.worker.gzip}} |
-| Main-thread client |    {{sizes.client.gzip}} |
-| **Everything**     | **{{sizes.total.gzip}}** |
-
-> ## Worker-native, not worker-wrapped
->
-> create() constructs the dedicated module Worker and loads WebAssembly itself.
-> SQL is parsed, planned, and executed in there, so the main thread only posts a
-> message and awaits a Promise. Persistence uses an OPFS synchronous access
-> handle inside that Worker rather than `SharedArrayBuffer`, so a page does not
-> have to be cross-origin isolated to store anything.
-
-| Setup                           | Required |
-| ------------------------------- | -------: |
-| `npm install tinyjoin`          |      Yes |
-| Cross-origin isolation headers  |       No |
-| A bundler WebAssembly plugin    |       No |
-| A Worker entry file of your own |       No |
-| A runtime asset copying step    |       No |
 
 > ## Open a database
 >
