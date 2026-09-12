@@ -50,7 +50,6 @@ const addSizeReplacers = (docs: Docs): Docs => {
 const RUNTIME_FILES = [
   'index.js',
   'protocol.js',
-  'client',
   'worker',
   'wasm',
   'worker-opfs',

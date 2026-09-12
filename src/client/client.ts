@@ -1,3 +1,4 @@
+import {defaultWorkerUrl} from '../default-worker.js';
 import {
   isRecord,
   type ApplyOutcome,
@@ -688,10 +689,7 @@ function createUrlWorker(url: string | URL): WorkerLike {
 
 function createDefaultWorker(): WorkerLike {
   assertWorkerAvailable();
-  return new Worker(new URL('../worker/default-entry.js', import.meta.url), {
-    name: 'tinyjoin',
-    type: 'module',
-  });
+  return new Worker(defaultWorkerUrl(), {name: 'tinyjoin', type: 'module'});
 }
 
 function assertWorkerAvailable(): void {

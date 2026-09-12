@@ -11,7 +11,6 @@ const built = resolve(root, 'dist');
 const RUNTIME_FILES = [
   'index.js',
   'protocol.js',
-  'client',
   'worker',
   'wasm',
   'worker-opfs',

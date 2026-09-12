@@ -1,8 +1,17 @@
-import {copyFile, mkdir, readFile, rm, writeFile} from 'node:fs/promises';
+import {
+  copyFile,
+  mkdir,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import {spawnSync} from 'node:child_process';
-import {dirname, resolve} from 'node:path';
+import {basename, dirname, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
+import {build as esbuildBuild} from 'esbuild';
+import {minify} from 'terser';
 import {build as viteBuild} from 'vite';
 
 import {buildDefinitions} from './build-definitions.mjs';
@@ -15,6 +24,56 @@ import {requireWasmArtifacts} from './wasm-artifacts.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const dist = resolve(root, 'dist');
+
+// The runtime is published as two bundles that share protocol.js: the
+// main-thread client, and the Worker host. Bundling lets the minifier rename
+// everything that is not public API, and leaves the OPFS page device out of a
+// Worker that only ever opens a memory database.
+const RUNTIME_BUNDLES = [
+  {entry: 'index.js', shared: {'protocol.js': './protocol.js'}},
+  {
+    entry: 'worker/index.js',
+    shared: {
+      'protocol.js': '../protocol.js',
+      // The WASM glue resolves its own .wasm sibling, so it stays in wasm/.
+      'tinyjoin_wasm.js': '../wasm/tinyjoin_wasm.js',
+    },
+  },
+];
+
+// Every file a browser downloads. tsc emits one module per source file; each
+// one that is not listed here is inside a bundle by the time they are pruned.
+const RUNTIME_FILES = [
+  'index.js',
+  'protocol.js',
+  'wasm/tinyjoin_wasm.js',
+  'worker-opfs/tinyjoin_opfs_runtime.js',
+  'worker/default-entry.js',
+  'worker/index.js',
+];
+
+// Terser settings shared by every published file. Mangling top-level names is
+// safe because each file is a module, so only its exports are observable.
+const TERSER_OPTIONS = {
+  compress: {passes: 3},
+  ecma: 2022,
+  format: {
+    // An application's own bundler reads these from the dynamic import that
+    // loads the OPFS runtime, and must still find them after minification.
+    comments: (_node, {value}) => /@vite-ignore|webpackIgnore/.test(value),
+  },
+  mangle: true,
+  module: true,
+};
+
+// The Worker must reach the private OPFS runtime through a bundler-ignored
+// dynamic import, so that an application build does not pull page storage into
+// the Worker entry. Quoting is the minifier's choice, not ours.
+const OPFS_LOADER_MARKERS = [
+  /(['"])\.\.\/worker-opfs\/tinyjoin_opfs_runtime\.js\1/,
+  /@vite-ignore/,
+  /webpackIgnore:\s*true/,
+];
 try {
   await requireWasmArtifacts(dist);
 } catch (error) {
@@ -34,6 +93,8 @@ if (compile.status !== 0) {
 }
 
 await buildPrivateWorkerRuntime();
+await bundleRuntime();
+await minifyRuntime();
 await assertOpfsLoaderBoundary();
 await buildDefinitions(root, dist);
 
@@ -93,41 +154,84 @@ async function copyPublicMarkdown() {
 
 async function buildPrivateWorkerRuntime() {
   await buildOpfsRuntime();
+}
 
-  // Publish the JavaScript needed by the default Worker, but not declarations
-  // for its private implementation modules. The two OPFS source modules are
-  // bundled into the self-contained runtime asset instead of shipping twice.
-  await Promise.all(
-    [
-      'default-entry',
-      'engine',
-      'host',
-      'opfs-engine',
-      'opfs-loader',
-      'page-device',
-      'page-storage',
-      'storage-error',
-      'wasm-bridge',
-      'wasm-preflight',
-    ].flatMap((module) => [
-      rm(resolve(dist, `worker/${module}.d.ts`), {force: true}),
-      ...(['opfs-engine', 'page-storage'].includes(module)
-        ? [rm(resolve(dist, `worker/${module}.js`), {force: true})]
-        : []),
-    ]),
+async function bundleRuntime() {
+  for (const {entry, shared} of RUNTIME_BUNDLES) {
+    const path = resolve(dist, entry);
+    const {outputFiles} = await esbuildBuild({
+      bundle: true,
+      entryPoints: [path],
+      format: 'esm',
+      plugins: [shareModules(shared)],
+      target: 'es2022',
+      write: false,
+    });
+    await writeFile(path, outputFiles[0].text);
+  }
+  await pruneBundledModules();
+}
+
+// esbuild keeps an external import exactly as the module that imported it wrote
+// it, but a bundle sits at its entry's depth rather than that module's. Give
+// each shared module the specifier the bundle itself needs.
+function shareModules(shared) {
+  return {
+    name: 'tinyjoin-shared-modules',
+    setup: (build) =>
+      build.onResolve({filter: /\.js$/}, ({path}) => {
+        const specifier = shared[basename(path)];
+        return specifier === undefined ? null : {external: true, path: specifier};
+      }),
+  };
+}
+
+// Publish the bundles and the modules they share, but neither the private
+// implementation modules now inside them nor the declarations tsc wrote beside
+// them: the published types come from src/@types instead.
+async function pruneBundledModules() {
+  for (const path of await listFiles(dist)) {
+    if (
+      path.endsWith('.d.ts') ||
+      (path.endsWith('.js') && !RUNTIME_FILES.includes(path))
+    ) {
+      await rm(resolve(dist, path));
+    }
+  }
+  await pruneEmptyDirectories(dist);
+}
+
+async function minifyRuntime() {
+  for (const file of RUNTIME_FILES) {
+    const path = resolve(dist, file);
+    const {code} = await minify(await readFile(path, 'utf8'), TERSER_OPTIONS);
+    await writeFile(path, code);
+  }
+}
+
+async function listFiles(directory, prefix = '') {
+  const entries = await readdir(resolve(directory, prefix), {
+    withFileTypes: true,
+  });
+  const files = await Promise.all(
+    entries.map((entry) => {
+      const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
+      return entry.isDirectory() ? listFiles(directory, path) : [path];
+    }),
   );
-  await Promise.all(
-    [
-      'index.d.ts',
-      'protocol.d.ts',
-      'client/client.d.ts',
-      'client/error.d.ts',
-      'client/rpc.d.ts',
-      'worker/index.d.ts',
-    ].map((declaration) =>
-      rm(resolve(dist, declaration), {force: true}),
-    ),
-  );
+  return files.flat();
+}
+
+async function pruneEmptyDirectories(directory) {
+  for (const entry of await readdir(directory, {withFileTypes: true})) {
+    if (entry.isDirectory()) {
+      const child = resolve(directory, entry.name);
+      await pruneEmptyDirectories(child);
+      if ((await readdir(child)).length === 0) {
+        await rm(child, {recursive: true});
+      }
+    }
+  }
 }
 
 async function buildOpfsRuntime() {
@@ -219,15 +323,11 @@ function assertSelfContainedRuntime(
 }
 
 async function assertOpfsLoaderBoundary() {
-  const path = resolve(dist, 'worker/opfs-loader.js');
+  const path = resolve(dist, 'worker/index.js');
   const source = await readFile(path, 'utf8');
-  for (const marker of [
-    "'../worker-opfs/tinyjoin_opfs_runtime.js'",
-    '/* @vite-ignore */',
-    '/* webpackIgnore: true */',
-  ]) {
-    if (!source.includes(marker)) {
-      throw new Error(`OPFS loader is missing ${marker}: ${path}`);
+  for (const marker of OPFS_LOADER_MARKERS) {
+    if (!marker.test(source)) {
+      throw new Error(`OPFS loader is missing ${marker.source}: ${path}`);
     }
   }
 }

@@ -303,9 +303,6 @@ function assertPackedFiles(packed) {
     'RUST_STANDARD_LIBRARY_NOTICES.html',
     'THIRD_PARTY_NOTICES.txt',
     'agents.md',
-    'client/client.js',
-    'client/error.js',
-    'client/rpc.js',
     'docs/sql.md',
     'package.json',
     'index.js',
@@ -315,14 +312,7 @@ function assertPackedFiles(packed) {
     'wasm/tinyjoin_wasm_bg.wasm',
     'worker-opfs/tinyjoin_opfs_runtime.js',
     'worker/default-entry.js',
-    'worker/engine.js',
-    'worker/host.js',
     'worker/index.js',
-    'worker/opfs-loader.js',
-    'worker/page-device.js',
-    'worker/storage-error.js',
-    'worker/wasm-bridge.js',
-    'worker/wasm-preflight.js',
   ].sort();
   const missing = expected.filter((file) => !files.includes(file));
   const unexpected = files.filter((file) => !expected.includes(file));
@@ -334,15 +324,17 @@ function assertPackedFiles(packed) {
 }
 
 async function assertInstalledOpfsLoader(packageDirectory) {
-  const path = resolve(packageDirectory, 'worker/opfs-loader.js');
+  // The Worker bundle carries the loader, and its quoting is the minifier's
+  // choice. An application's own bundler still has to find the ignore hints.
+  const path = resolve(packageDirectory, 'worker/index.js');
   const source = await readFile(path, 'utf8');
   for (const marker of [
-    "'../worker-opfs/tinyjoin_opfs_runtime.js'",
-    '/* @vite-ignore */',
-    '/* webpackIgnore: true */',
+    /(['"])\.\.\/worker-opfs\/tinyjoin_opfs_runtime\.js\1/,
+    /@vite-ignore/,
+    /webpackIgnore:\s*true/,
   ]) {
-    if (!source.includes(marker)) {
-      throw new Error(`Packed OPFS loader is missing ${marker}: ${path}`);
+    if (!marker.test(source)) {
+      throw new Error(`Packed OPFS loader is missing ${marker.source}: ${path}`);
     }
   }
 }

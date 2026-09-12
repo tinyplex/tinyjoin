@@ -1,3 +1,3 @@
-import {startWorker} from './host.js';
+import {startWorker} from './index.js';
 
 startWorker();

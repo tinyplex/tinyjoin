@@ -15,13 +15,7 @@ export const sizesFile = resolve(root, 'site/data/sizes.json');
 // main-thread client that also has to fetch it, so the groups sum to the total.
 const GROUPS = [
   ['wasm', (path) => path.endsWith('.wasm')],
-  [
-    'client',
-    (path) =>
-      path === 'index.js' ||
-      path === 'protocol.js' ||
-      path.startsWith('client/'),
-  ],
+  ['client', (path) => path === 'index.js' || path === 'protocol.js'],
   ['worker', () => true],
 ];
 
