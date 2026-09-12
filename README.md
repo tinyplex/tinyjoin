@@ -1,4 +1,4 @@
-<section id="hero"><h2 id="a-tiny-worker-first-relational-database-for-browser-apps">A tiny, worker-first <em>relational database</em> for browser apps.</h2><p>PostgreSQL-shaped SQL, running locally and away from the main thread.</p></section><nav id="actions" aria-label="Get started"><a class="start" href="https://tinyjoin.org/guides/getting-started/">Get started</a> <a href="https://tinyjoin.org/demos/">Try the demos</a> <a href="https://tinyjoin.org/api/">Read the API</a></nav><hr><section><h2 id="your-first-tinyjoin-app">Your first <em>TinyJoin</em> app</h2><p>Scaffold a complete local todo app - in TypeScript or JavaScript, with its data saved across reloads! - in less than 60s. It needs no database server, account, or credentials.</p></section>
+<section id="hero"><h2 id="a-tiny-worker-first-relational-database-for-browser-apps">A tiny, worker-first <em>relational database</em> for browser apps.</h2><p>PostgreSQL-shaped SQL, running locally and away from the main thread.</p></section><nav id="actions" aria-label="Get started"><a class="start" href="https://tinyjoin.org/guides/getting-started/">Get started</a> <a href="https://tinyjoin.org/demos/">Try the demos</a> <a href="https://tinyjoin.org/api/">Read the API</a></nav><hr><section><h2 id="your-first-tinyjoin-app">Your first <em>TinyJoin</em> app</h2><p>Scaffold a complete local todo app in JS or TS - and with its relational data saved in TinyJoin across reloads - in less than 60s.</p></section>
 
 ```bash
 > npm create tinyjoin@latest
@@ -8,13 +8,13 @@
 📦 Creating your project...
 ```
 
-<section><h2 id="start-small">Start small</h2><p>Install TinyJoin. There is no server to run, no account to create, and no native toolchain to set up.</p></section>
+<section><h2 id="start-small">Start small</h2><p>Install TinyJoin. There are no runtime dependencies, no servers to run, no accounts to create, and no native toolchains to set up.</p></section>
 
 ```sh
 npm install tinyjoin
 ```
 
-<section><h2 id="open-a-database">Open a database</h2><p><a href="https://tinyjoin.org/api/tinyjoin/functions/lifecycle/create/"><code>create</code></a>() owns Worker construction and WebAssembly loading, and resolves once the database is ready. Use a stable <code>opfs://name</code> when data should survive reloads in the same browser, or call it with no argument for an ephemeral memory database.</p></section>
+<section><h2 id="open-a-database">Open a database</h2><p><a href="https://tinyjoin.org/api/the-essentials/using-a-database/create/"><code>create</code></a>() owns Worker construction and WebAssembly loading, and resolves once the database is ready. Use <code>opfs://[name]</code> when data should survive reloads in the same browser, or call it with no argument for ephemeral in-memory storage.</p></section>
 
 ```ts
 import {create} from 'tinyjoin';
@@ -22,7 +22,7 @@ import {create} from 'tinyjoin';
 const db = await create('opfs://my-app');
 ```
 
-<section><h2 id="set-up-a-schema">Set up a schema</h2><p><a href="https://tinyjoin.org/api/tinyjoin/classes/lifecycle/client/methods/sql/exec/"><code>exec</code></a>() runs a parameter-free script as one implicit transaction, so schema setup stays a single call that is safe to run again on every load.</p></section>
+<section><h2 id="set-up-a-schema">Set up a schema</h2><p><a href="https://tinyjoin.org/api/the-essentials/using-a-database/exec/"><code>exec</code></a>() runs a parameter-free script as one implicit transaction, so schema setup stays a single call that is safe to run again on every load.</p></section>
 
 ```ts
 await db.exec(`
@@ -34,7 +34,7 @@ await db.exec(`
 `);
 ```
 
-<section><h2 id="write-with-parameters">Write with parameters</h2><p><a href="https://tinyjoin.org/api/tinyjoin/classes/lifecycle/client/methods/sql/query/"><code>query</code></a>() runs one read or write statement. Application values go in the <code>$n</code> array and never reach the SQL text.</p></section>
+<section><h2 id="write-with-parameters">Write with parameters</h2><p><a href="https://tinyjoin.org/api/the-essentials/using-a-database/query/"><code>query</code></a>() runs one read or write statement. Application values go in the <code>$n</code> array and never reach the SQL text.</p></section>
 
 ```ts
 const id = crypto.randomUUID();
@@ -66,7 +66,7 @@ const {rows} = await db.query<Task>(
 );
 ```
 
-<section><h2 id="commit-related-changes-together">Commit related changes together</h2><p><a href="https://tinyjoin.org/api/tinyjoin/classes/lifecycle/client/methods/transactions/transaction/"><code>transaction</code></a>() stages its writes and publishes them once. Reads inside the callback see the staged rows, and letting an error escape rolls the whole thing back.</p></section>
+<section><h2 id="commit-related-changes-together">Commit related changes together</h2><p><a href="https://tinyjoin.org/api/the-essentials/using-a-database/transaction/"><code>transaction</code></a>() stages its writes and publishes them once. Reads inside the callback see the staged rows, and letting an error escape rolls the whole thing back.</p></section>
 
 ```ts
 await db.transaction(async (tx) => {

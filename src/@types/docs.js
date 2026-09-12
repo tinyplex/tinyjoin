@@ -472,6 +472,7 @@
    * @param options Result-shape options.
    * @returns A Promise resolving to the statement results.
    * @category SQL
+   * @essential Using a database
    * @since v0.0.5
    */
   /// Client.query
@@ -482,6 +483,7 @@
    * Interpolated values become `$n` parameters. It does not interpolate raw
    * identifiers or SQL fragments.
    * @category SQL
+   * @essential Using a database
    * @since v0.0.5
    */
   /// Client.sql
@@ -498,6 +500,7 @@
    * The exec method runs one or more parameter-free statements as one implicit
    * transaction.
    * @category SQL
+   * @essential Using a database
    * @since v0.0.5
    */
   /// Client.exec
@@ -506,6 +509,7 @@
    * The transaction method stages row mutations and publishes them together
    * when the callback succeeds, unless it explicitly rolls back.
    * @category Transactions
+   * @essential Using a database
    * @since v0.0.5
    */
   /// Client.transaction
@@ -555,6 +559,7 @@
  * await db.close();
  * ```
  * @category Lifecycle
+ * @essential Using a database
  * @since v0.0.5
  */
 /// create

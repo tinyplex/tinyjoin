@@ -1,9 +1,8 @@
 import {existsSync, readFileSync, writeFileSync} from 'node:fs';
 import {access, cp, mkdir} from 'node:fs/promises';
-import {dirname, relative, resolve} from 'node:path';
-import {fileURLToPath} from 'node:url';
+import {relative, resolve} from 'node:path';
 
-import type {Docs} from 'tinydocs';
+import type {Docs, Node} from 'tinydocs';
 import {createDocs, getSorter} from 'tinydocs';
 import {MainInner} from './ui/MainInner.tsx';
 import {MarkdownPage} from './ui/MarkdownPage.tsx';
@@ -40,7 +39,20 @@ const RUNTIME_FILES = [
   'worker-opfs',
 ];
 
-const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+// This module is bundled into a temporary directory before it runs, so the
+// repository root comes from the working directory, like every other path here.
+const repositoryRoot = process.cwd();
+
+// TinyDocs groups @essential members under the text of their tag. There is only
+// one such group, so give it empty markdown, which makes TinyDocs skip it and
+// list its members directly under The Essentials, as it does any lone child.
+const collapseLoneEssentialGroup = (node: Node): void => {
+  if (node.name === 'The Essentials' && node.children.length === 1) {
+    const [group] = node.children;
+    group.summary = '';
+    group.body = '';
+  }
+};
 
 const hideInheritedErrorMembers = (reflection: any): void => {
   if (reflection.name !== 'ClientError' || reflection.children == null) {
@@ -89,6 +101,7 @@ export const build = async (
     .addDir('site/fonts', 'fonts')
     .addDir('site/extras')
     .addReflectionTransform(hideInheritedErrorMembers)
+    .addNodeTransform(collapseLoneEssentialGroup)
     .addApiFile(resolve(typesDir, 'index.d.ts'))
     .addApiFile(resolve(typesDir, 'worker/index.d.ts'))
     .addRootMarkdownFile('site/home/index.md')

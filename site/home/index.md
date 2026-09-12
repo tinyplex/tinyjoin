@@ -19,9 +19,8 @@
 
 > ## Your first _TinyJoin_ app
 >
-> Scaffold a complete local todo app - in TypeScript or JavaScript, with its
-> data saved across reloads! - in less than 60s. It needs no database server,
-> account, or credentials.
+> Scaffold a complete local todo app in JS or TS - and with its relational data
+> saved in TinyJoin across reloads - in less than 60s.
 
 ```bash
 > npm create tinyjoin@latest
@@ -33,8 +32,8 @@
 
 > ## Start small
 >
-> Install TinyJoin. There is no server to run, no account to create, and no
-> native toolchain to set up.
+> Install TinyJoin. There are no runtime dependencies, no servers to run, no
+> accounts to create, and no native toolchains to set up.
 
 ```sh
 npm install tinyjoin
@@ -43,9 +42,8 @@ npm install tinyjoin
 > ## Open a database
 >
 > create() owns Worker construction and WebAssembly loading, and resolves once
-> the database is ready. Use a stable `opfs://name` when data should survive
-> reloads in the same browser, or call it with no argument for an ephemeral
-> memory database.
+> the database is ready. Use `opfs://[name]` when data should survive reloads in
+> the same browser, or call it with no argument for ephemeral in-memory storage.
 
 ```ts
 import {create} from 'tinyjoin';
