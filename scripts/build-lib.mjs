@@ -10,6 +10,7 @@ import {
   assertThirdPartyNotices,
   thirdPartyNoticeFiles,
 } from './third-party-notices.mjs';
+import {writeSizes} from './sizes.mjs';
 import {requireWasmArtifacts} from './wasm-artifacts.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -71,9 +72,13 @@ await copyFile(
   resolve(dist, 'docs/sql.md'),
 );
 
+// Measure the built runtime into committed metadata, which the site reads to
+// fill in the download sizes it publishes.
+await writeSizes(dist);
+
 async function copyPublicMarkdown() {
   await copyFile(
-    resolve(root, 'site/guides/6_agents.md'),
+    resolve(root, 'site/guides/7_agents.md'),
     resolve(root, 'AGENTS.md'),
   );
   const markdown = [

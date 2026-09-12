@@ -39,6 +39,36 @@
 npm install tinyjoin
 ```
 
+> ## Small enough to not worry about
+>
+> The whole database - the main-thread client, the Worker host, and the
+> WebAssembly engine - is {{sizes.total.gzip}} gzipped, and only
+> {{sizes.client.gzip}} of that ever runs on the main thread. A build gate keeps
+> the engine itself under 1 MiB uncompressed.
+
+| Downloaded         |                     gzip |
+| ------------------ | -----------------------: |
+| WebAssembly engine |      {{sizes.wasm.gzip}} |
+| Worker JavaScript  |    {{sizes.worker.gzip}} |
+| Main-thread client |    {{sizes.client.gzip}} |
+| **Everything**     | **{{sizes.total.gzip}}** |
+
+> ## Worker-native, not worker-wrapped
+>
+> create() constructs the dedicated module Worker and loads WebAssembly itself.
+> SQL is parsed, planned, and executed in there, so the main thread only posts a
+> message and awaits a Promise. Persistence uses an OPFS synchronous access
+> handle inside that Worker rather than `SharedArrayBuffer`, so a page does not
+> have to be cross-origin isolated to store anything.
+
+| Setup                           | Required |
+| ------------------------------- | -------: |
+| `npm install tinyjoin`          |      Yes |
+| Cross-origin isolation headers  |       No |
+| A bundler WebAssembly plugin    |       No |
+| A Worker entry file of your own |       No |
+| A runtime asset copying step    |       No |
+
 > ## Open a database
 >
 > create() owns Worker construction and WebAssembly loading, and resolves once
@@ -173,13 +203,16 @@ await db.close();
 > PostgreSQL server, wire protocol, or replication client.
 >
 > Check the exact [SQL compatibility
-> contract](/guides/sql-compatibility/) before relying on
-> unlisted PostgreSQL syntax or types.
+> contract](/guides/sql-compatibility/) before relying on unlisted PostgreSQL
+> syntax or types, and read the [caveats](/guides/caveats/) - experimental
+> status, single-tab persistence, browser support, and the projects to reach
+> for instead - before committing to it.
 
 > ## Go deeper when you need to
 >
 > - Follow the [getting started guide](/guides/getting-started/).
 > - Browse the [API reference](/api/).
+> - Understand the [caveats](/guides/caveats/).
 > - Review the [release notes](/guides/releases/).
 > - Start an app with [create-tinyjoin](https://github.com/tinyplex/create-tinyjoin).
 > - Read the [source](https://github.com/tinyplex/tinyjoin).

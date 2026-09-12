@@ -5,6 +5,7 @@
 
 - [Getting started](https://tinyjoin.org/guides/getting-started/)
 - [SQL compatibility](https://tinyjoin.org/guides/sql-compatibility/)
+- [Caveats](https://tinyjoin.org/guides/caveats/)
 - [API reference](https://tinyjoin.org/api/)
 - [Demos](https://tinyjoin.org/demos/)
 - [Release notes](https://tinyjoin.org/guides/releases/)

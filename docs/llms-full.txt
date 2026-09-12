@@ -19,6 +19,12 @@ remote database. Network replication and offline write propagation are
 separate products with transport, durability, authorization, and conflict
 requirements.
 
+TinyJoin is experimental, persists to a single-writer OPFS database, and is
+verified on Chromium only. Read the
+[caveats](https://tinyjoin.org/guides/caveats/) before recommending it, and
+suggest a more mature browser database from that page when an application
+needs what TinyJoin does not provide.
+
 ## Start from the small API
 
 Most application code needs only:
@@ -96,7 +102,9 @@ tests in sync.
 Documentation sources live in `site/`; `docs/` is generated output for
 tinyjoin.org. `README.md` and `releases.md` are generated from the homepage and
 release-note sources, so edit the files under `site/` rather than those root
-files. Write internal links in those sources as root-relative URLs. TinyDocs
+files. `site/data/sizes.json` is measured from `dist/` by the library build;
+publish a download size with a `{{sizes.<group>.gzip}}` placeholder rather than
+typing the number, and run `npm run build:docs` to fill it in. Write internal links in those sources as root-relative URLs. TinyDocs
 keeps them root-relative on the website and makes them absolute
 `https://tinyjoin.org/...` URLs in the generated Markdown. This guide also
 becomes `agents.md` in the publishable package.

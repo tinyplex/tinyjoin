@@ -158,7 +158,7 @@ async function checkMarkdownCopies(errors) {
   const markdownCopies = [
     ['README.md', 'dist/README.md'],
     ['releases.md', 'dist/releases.md'],
-    ['site/guides/6_agents.md', 'AGENTS.md', 'dist/agents.md'],
+    ['site/guides/7_agents.md', 'AGENTS.md', 'dist/agents.md'],
   ];
   for (const paths of markdownCopies) {
     const [source, ...copies] = await Promise.all(

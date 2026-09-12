@@ -30,6 +30,23 @@ const REFLECTIONS = [
   '*',
 ];
 
+// Download sizes are measured from the built runtime into site/data/sizes.json
+// during npm run build, and substituted into the markdown that publishes them.
+// Reading committed metadata, rather than dist, keeps this build hermetic for
+// the documentation freshness check and the site workflow.
+type Sizes = {[group: string]: {raw: number; gzip: number; gzipLabel: string}};
+
+const addSizeReplacers = (docs: Docs): Docs => {
+  const sizes: Sizes = JSON.parse(readFileSync('site/data/sizes.json', 'utf8'));
+  for (const [group, {gzipLabel}] of Object.entries(sizes)) {
+    docs.addReplacer(
+      new RegExp(`\\{\\{sizes\\.${group}\\.gzip\\}\\}`, 'g'),
+      gzipLabel,
+    );
+  }
+  return docs;
+};
+
 const RUNTIME_FILES = [
   'index.js',
   'protocol.js',
@@ -108,9 +125,11 @@ export const build = async (
     .addMarkdownDir('site/guides')
     .addMarkdownDir('site/demos', true)
     .addStringFile(
-      readFileSync('site/guides/6_agents.md', 'utf8'),
+      readFileSync('site/guides/7_agents.md', 'utf8'),
       'llms-full.txt',
     );
+
+  addSizeReplacers(docs);
 
   await docs.generateNodes({
     group: getSorter(GROUPS),
