@@ -1,6 +1,6 @@
 import {describe, expect, it, vi} from 'vitest';
 
-import {WorkerRpc} from '../../src/client/rpc.ts';
+import {createWorkerRpc} from '../../src/client/rpc.ts';
 import {
   PROTOCOL_VERSION,
   isRpcResult,
@@ -13,7 +13,7 @@ import {FakeWorker} from '../helpers/fake-worker.ts';
 describe('WorkerRpc', () => {
   it('matches out-of-order responses to their requests', async () => {
     const worker = new FakeWorker();
-    const rpc = new WorkerRpc(worker);
+    const rpc = createWorkerRpc(worker);
     const first = rpc.request('executeSql', {sql: 'first', params: []});
     const second = rpc.request('executeSql', {sql: 'second', params: []});
     const [firstRequest, secondRequest] = worker.posted as WorkerRequest[];
@@ -37,7 +37,7 @@ describe('WorkerRpc', () => {
 
   it('turns structured worker failures into TinyJoin errors', async () => {
     const worker = new FakeWorker();
-    const rpc = new WorkerRpc(worker);
+    const rpc = createWorkerRpc(worker);
     const request = rpc.request('executeSql', {sql: 'bad', params: []});
     const [message] = worker.posted as WorkerRequest[];
 
@@ -56,7 +56,7 @@ describe('WorkerRpc', () => {
 
   it('delivers events without consuming pending responses', async () => {
     const worker = new FakeWorker();
-    const rpc = new WorkerRpc(worker);
+    const rpc = createWorkerRpc(worker);
     const listener = vi.fn();
     rpc.onEvent(listener);
     const request = rpc.request('executeSql', {sql: 'select', params: []});
@@ -80,7 +80,7 @@ describe('WorkerRpc', () => {
 
   it('rejects a malformed SQL query success and terminates the worker', async () => {
     const worker = new FakeWorker();
-    const rpc = new WorkerRpc(worker);
+    const rpc = createWorkerRpc(worker);
     const request = rpc.request('executeSql', {
       sql: 'SELECT id FROM posts',
       params: [],
@@ -100,7 +100,7 @@ describe('WorkerRpc', () => {
 
   it('rejects malformed exec result metadata and terminates the worker', async () => {
     const worker = new FakeWorker();
-    const rpc = new WorkerRpc(worker);
+    const rpc = createWorkerRpc(worker);
     const request = rpc.request('execSql', {sql: 'SELECT id FROM posts'});
     const [message] = worker.posted as WorkerRequest[];
 
@@ -122,7 +122,7 @@ describe('WorkerRpc', () => {
 
   it('checks only fixed metadata for a trusted bundled Worker result', async () => {
     const worker = new FakeWorker();
-    const rpc = new WorkerRpc(worker, 'header');
+    const rpc = createWorkerRpc(worker, 'header');
     const request = rpc.request('executeSql', {sql: 'SELECT id FROM posts', params: []});
     const [message] = worker.posted as WorkerRequest[];
     const row = {};
@@ -283,7 +283,7 @@ describe('WorkerRpc', () => {
 
   it('rejects every pending request after a protocol mismatch', async () => {
     const worker = new FakeWorker();
-    const rpc = new WorkerRpc(worker);
+    const rpc = createWorkerRpc(worker);
     const request = rpc.request('executeSql', {sql: 'select', params: []});
 
     worker.emitInvalidMessage({v: 999, id: 1, ok: true, result: []});
@@ -294,7 +294,7 @@ describe('WorkerRpc', () => {
 
   it('rejects pending work when the worker crashes', async () => {
     const worker = new FakeWorker();
-    const rpc = new WorkerRpc(worker);
+    const rpc = createWorkerRpc(worker);
     const request = rpc.request('executeSql', {sql: 'select', params: []});
 
     worker.emitError('boom');

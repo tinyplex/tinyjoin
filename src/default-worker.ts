@@ -1,10 +1,34 @@
+import type {WorkerLike} from './client/client.js';
+
+const assertWorkerAvailable = (): void => {
+  if (typeof Worker === 'undefined') {
+    throw new Error(
+      'TinyJoin requires a browser Worker. Importing is SSR-safe, but create the client in the browser or provide a Worker-like implementation.',
+    );
+  }
+};
+
+/** Constructs a Worker from a URL the application supplied. */
+export const createUrlWorker = (url: string | URL): WorkerLike => {
+  assertWorkerAvailable();
+  return new Worker(url, {name: 'tinyjoin', type: 'module'});
+};
+
 /**
- * Resolves the default Worker entry that create() constructs when the
- * application does not supply a Worker of its own.
+ * Constructs the Worker that TinyJoin ships.
  *
- * This lives beside the package entry point rather than in the client, because
- * the published client is one bundle at this depth: keeping the URL here makes
- * the relative path correct in the source tree and in the bundle alike.
+ * Both the shape and the location of this call matter. An application's bundler
+ * recognizes `new Worker(new URL('...', import.meta.url), {type: 'module'})`
+ * literally, and only emits a Worker entry when it sees that exact pattern
+ * spelled out, so none of it may move into a variable. The specifier is
+ * resolved against this module, which lives at the root of the package for
+ * that reason: the published client is one bundle at this same depth, so the
+ * relative path is correct in the source tree and in the bundle alike.
  */
-export const defaultWorkerUrl = (): URL =>
-  new URL('./worker/default-entry.js', import.meta.url);
+export const createDefaultWorker = (): WorkerLike => {
+  assertWorkerAvailable();
+  return new Worker(new URL('./worker/default-entry.js', import.meta.url), {
+    name: 'tinyjoin',
+    type: 'module',
+  });
+};

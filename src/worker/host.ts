@@ -1,6 +1,12 @@
 import {
-  PROTOCOL_VERSION,
+  asCodedError,
   isRecord,
+  isSafeInteger,
+  isUndefined,
+  mathMax,
+} from '../common.js';
+import {
+  PROTOCOL_VERSION,
   isWorkerRequest,
   type ApplyOutcome,
   type SerializedError,
@@ -39,9 +45,18 @@ export interface WorkerController {
   close(): Promise<void>;
 }
 
-export function startWorker(
+const TRANSACTION_ACTIVE = 'TRANSACTION_ACTIVE';
+const ALREADY_ACTIVE = 'A TinyJoin transaction is already active';
+const OPERATION_FAILED = 'WORKER_OPERATION_FAILED';
+
+/**
+ * Serves one dedicated Worker: it owns the engine, serializes every request
+ * against it, and owns the single transaction token that the client's
+ * transaction API is checked against.
+ */
+export const startWorker = (
   options: StartWorkerOptions = {},
-): WorkerController {
+): WorkerController => {
   const scope = options.scope ?? (globalThis as unknown as WorkerScope);
   let enginePromise: Promise<WorkerEngine> | undefined;
   let configuredStorage: StorageOptions | undefined;
@@ -54,8 +69,11 @@ export function startWorker(
   let nextTransactionId = 1;
   let requestTail: Promise<void> = Promise.resolve();
 
+  const respondWith = (message: WorkerResponse): void =>
+    scope.postMessage(message);
+
   const emitInvalidation = (outcome: ApplyOutcome): void => {
-    pendingRevision = Math.max(pendingRevision, outcome.revision);
+    pendingRevision = mathMax(pendingRevision, outcome.revision);
     for (const table of outcome.tables) {
       pendingTables.add(table);
     }
@@ -83,13 +101,178 @@ export function startWorker(
     }, 0);
   };
 
+  // Publishes an outcome only outside a transaction: staged changes become
+  // visible when the transaction commits, not as each statement runs.
+  const emitUnlessInTransaction = (outcome: ApplyOutcome): void => {
+    if (isUndefined(activeTransactionId) && outcome.tables.length > 0) {
+      emitInvalidation(outcome);
+    }
+  };
+
+  const assertNoTransaction = (): void => {
+    if (!isUndefined(activeTransactionId)) {
+      throw workerError(TRANSACTION_ACTIVE, ALREADY_ACTIVE);
+    }
+  };
+
+  const assertTransactionId = (requestedId: string | undefined): void => {
+    if (isUndefined(activeTransactionId)) {
+      if (!isUndefined(requestedId)) {
+        throw workerError(
+          'TRANSACTION_NOT_ACTIVE',
+          'The TinyJoin transaction is no longer active',
+        );
+      }
+      return;
+    }
+    if (requestedId !== activeTransactionId) {
+      throw workerError(
+        TRANSACTION_ACTIVE,
+        'Use the active TinyJoin transaction for this operation',
+      );
+    }
+  };
+
+  const clearTransaction = (requestedId: string): void => {
+    assertTransactionId(requestedId);
+    activeTransactionId = undefined;
+  };
+
+  const handleRequest = (
+    request: Exclude<WorkerRequest, {method: 'close'}>,
+    engine: WorkerEngine,
+  ): unknown => {
+    switch (request.method) {
+      case 'init':
+        assertNoTransaction();
+        return {revision: engine.revision()};
+
+      case 'executeSql': {
+        assertTransactionId(request.params.transactionId);
+        const result = engine.executeSql(
+          request.params.sql,
+          request.params.params,
+        );
+        emitUnlessInTransaction(result);
+        return result;
+      }
+
+      case 'prepareSql':
+        assertNoTransaction();
+        return {statementId: engine.prepareSql(request.params.sql)};
+
+      case 'executePrepared': {
+        assertTransactionId(request.params.transactionId);
+        const result = engine.executePrepared(
+          request.params.statementId,
+          request.params.params,
+        );
+        emitUnlessInTransaction(result);
+        return result;
+      }
+
+      case 'closePrepared':
+        assertNoTransaction();
+        engine.closePrepared(request.params.statementId);
+        return undefined;
+
+      case 'execSql': {
+        assertTransactionId(request.params.transactionId);
+        const results = engine.execSql(request.params.sql);
+        emitUnlessInTransaction({
+          revision: mathMax(...results.map((result) => result.revision), 0),
+          tables: [...new Set(results.flatMap((result) => result.tables))],
+        });
+        return results;
+      }
+
+      case 'beginTransaction':
+        assertNoTransaction();
+        engine.beginTransaction();
+        activeTransactionId = `tx-${nextTransactionId++}`;
+        return {transactionId: activeTransactionId};
+
+      case 'commitTransaction': {
+        assertTransactionId(request.params.transactionId);
+        try {
+          const outcome = engine.commitTransaction();
+          emitInvalidation(outcome);
+          clearTransaction(request.params.transactionId);
+          return outcome;
+        } catch (error) {
+          let cleanedUp = false;
+          try {
+            cleanedUp = !engine.inTransaction();
+            if (!cleanedUp) {
+              engine.rollbackTransaction();
+              cleanedUp = true;
+            }
+          } catch {
+            // Preserve the commit error. Keeping the token active lets the
+            // client retry rollback if the engine can recover on a later call.
+          }
+          if (cleanedUp) {
+            clearTransaction(request.params.transactionId);
+          }
+          throw error;
+        }
+      }
+
+      case 'rollbackTransaction':
+        assertTransactionId(request.params.transactionId);
+        engine.rollbackTransaction();
+        clearTransaction(request.params.transactionId);
+        return undefined;
+    }
+  };
+
+  const engineForRequest = (
+    request: Exclude<WorkerRequest, {method: 'close'}>,
+  ): Promise<WorkerEngine> => {
+    if (request.method === 'init') {
+      const storage = request.params.storage;
+      if (
+        !isUndefined(configuredStorage) &&
+        !sameStorage(configuredStorage, storage)
+      ) {
+        throw workerError(
+          'STORAGE_ALREADY_INITIALIZED',
+          'The TinyJoin worker is already initialized with different storage',
+        );
+      }
+      configuredStorage = storage;
+      enginePromise ??= (options.durableEngineFactory ?? createDefaultEngine)(
+        storage,
+      );
+      return enginePromise;
+    }
+    if (!enginePromise) {
+      throw workerError(
+        'WORKER_NOT_INITIALIZED',
+        'Initialize the TinyJoin worker before sending other requests',
+      );
+    }
+    return enginePromise;
+  };
+
+  const releaseResources = (engine?: WorkerEngine): Promise<void> => {
+    closingPromise ??= (async () => {
+      closed = true;
+      scope.removeEventListener('message', onMessage);
+      engine?.close();
+    })();
+    return closingPromise;
+  };
+
+  const settledEngine = async (): Promise<WorkerEngine | undefined> =>
+    enginePromise ? await enginePromise : undefined;
+
   const respond = async (request: WorkerRequest): Promise<void> => {
     let engine: WorkerEngine | undefined;
     try {
       if (request.method === 'close') {
-        engine = enginePromise ? await enginePromise : undefined;
-        await releaseResources(engine);
-        scope.postMessage({
+        await releaseResources(await settledEngine());
+        respondWith({
           v: PROTOCOL_VERSION,
           id: request.id,
           ok: true,
@@ -98,50 +281,26 @@ export function startWorker(
         queueMicrotask(() => scope.close());
         return;
       }
-
       engine = await engineForRequest(request);
-      const result = handleRequest(request, engine, emitInvalidation, {
-        get activeId() {
-          return activeTransactionId;
-        },
-        begin() {
-          if (activeTransactionId !== undefined) {
-            throw workerError(
-              'TRANSACTION_ACTIVE',
-              'A TinyJoin transaction is already active',
-            );
-          }
-          const id = `tx-${nextTransactionId++}`;
-          activeTransactionId = id;
-          return id;
-        },
-        clear(id) {
-          assertTransactionId(activeTransactionId, id);
-          activeTransactionId = undefined;
-        },
-      });
-      scope.postMessage({
+      respondWith({
         v: PROTOCOL_VERSION,
         id: request.id,
         ok: true,
-        result,
+        result: handleRequest(request, engine),
       });
     } catch (error) {
       if (request.method === 'init') {
-        if (!engine && enginePromise) {
-          try {
-            engine = await enginePromise;
-          } catch {
-            // Engine construction already closes partially opened resources.
-          }
-        }
+        // The database never opened, so release whatever it had taken. Neither
+        // the engine's own failure nor a cleanup failure may replace the error
+        // that explains why ready failed.
+        engine ??= await settledEngine().catch(() => undefined);
         try {
           await releaseResources(engine);
         } catch {
-          // Preserve the initialization error that explains why ready failed.
+          // Preserve the initialization error.
         }
       }
-      scope.postMessage({
+      respondWith({
         v: PROTOCOL_VERSION,
         id: request.id,
         ok: false,
@@ -153,50 +312,14 @@ export function startWorker(
     }
   };
 
-  const engineForRequest = async (
-    request: Exclude<WorkerRequest, {method: 'close'}>,
-  ): Promise<WorkerEngine> => {
-    if (request.method === 'init') {
-      if (
-        configuredStorage !== undefined &&
-        !sameStorage(configuredStorage, request.params.storage)
-      ) {
-        throw Object.assign(
-          new Error(
-            'The TinyJoin worker is already initialized with different storage',
-          ),
-          {code: 'STORAGE_ALREADY_INITIALIZED'},
-        );
-      }
-      if (!enginePromise) {
-        configuredStorage = request.params.storage;
-        enginePromise = createEngine(
-          request.params.storage,
-          options.durableEngineFactory,
-        );
-      }
-      return enginePromise;
-    }
-    if (!enginePromise) {
-      throw Object.assign(
-        new Error(
-          'Initialize the TinyJoin worker before sending other requests',
-        ),
-        {code: 'WORKER_NOT_INITIALIZED'},
-      );
-    }
-    return enginePromise;
-  };
-
   const onMessage = (event: MessageEvent<unknown>): void => {
     if (!isWorkerRequest(event.data)) {
-      const id =
-        isRecord(event.data) && Number.isSafeInteger(event.data.id)
-          ? Number(event.data.id)
-          : 0;
-      scope.postMessage({
+      respondWith({
         v: PROTOCOL_VERSION,
-        id,
+        id:
+          isRecord(event.data) && isSafeInteger(event.data.id)
+            ? event.data.id
+            : 0,
         ok: false,
         error: {
           code: 'PROTOCOL_MISMATCH',
@@ -209,207 +332,33 @@ export function startWorker(
     requestTail = requestTail.then(() => respond(request));
   };
 
-  const releaseResources = (
-    engine: WorkerEngine | undefined,
-  ): Promise<void> => {
-    closingPromise ??= (async () => {
-      closed = true;
-      scope.removeEventListener('message', onMessage);
-      engine?.close();
-    })();
-    return closingPromise;
-  };
-
-  const close = async (): Promise<void> => {
-    try {
-      const engine = enginePromise ? await enginePromise : undefined;
-      await releaseResources(engine);
-    } finally {
-      scope.close();
-    }
-  };
-
   scope.addEventListener('message', onMessage);
-  return {close};
-}
-
-function handleRequest(
-  request: Exclude<WorkerRequest, {method: 'close'}>,
-  engine: WorkerEngine,
-  emitInvalidation: (outcome: ApplyOutcome) => void,
-  transaction: HostTransactionState,
-): unknown {
-  switch (request.method) {
-    case 'init':
-      assertNoTransaction(transaction.activeId);
-      return {revision: engine.revision()};
-    case 'executeSql': {
-      assertTransactionId(transaction.activeId, request.params.transactionId);
-      const result = engine.executeSql(
-        request.params.sql,
-        request.params.params,
-      );
-      if (transaction.activeId === undefined && result.tables.length > 0) {
-        emitInvalidation({revision: result.revision, tables: result.tables});
-      }
-      return result;
-    }
-    case 'prepareSql':
-      assertNoTransaction(transaction.activeId);
-      return {statementId: engine.prepareSql(request.params.sql)};
-    case 'executePrepared': {
-      assertTransactionId(transaction.activeId, request.params.transactionId);
-      const result = engine.executePrepared(
-        request.params.statementId,
-        request.params.params,
-      );
-      if (transaction.activeId === undefined && result.tables.length > 0) {
-        emitInvalidation({revision: result.revision, tables: result.tables});
-      }
-      return result;
-    }
-    case 'closePrepared':
-      assertNoTransaction(transaction.activeId);
-      engine.closePrepared(request.params.statementId);
-      return undefined;
-    case 'execSql': {
-      assertTransactionId(transaction.activeId, request.params.transactionId);
-      const results = engine.execSql(request.params.sql);
-      if (transaction.activeId === undefined) {
-        const tables = [...new Set(results.flatMap((result) => result.tables))];
-        if (tables.length > 0) {
-          emitInvalidation({
-            revision: Math.max(...results.map((result) => result.revision)),
-            tables,
-          });
-        }
-      }
-      return results;
-    }
-    case 'beginTransaction': {
-      assertNoTransaction(transaction.activeId);
-      engine.beginTransaction();
+  return {
+    close: async (): Promise<void> => {
       try {
-        return {transactionId: transaction.begin()};
-      } catch (error) {
-        engine.rollbackTransaction();
-        throw error;
+        await releaseResources(await settledEngine());
+      } finally {
+        scope.close();
       }
-    }
-    case 'commitTransaction': {
-      assertTransactionId(transaction.activeId, request.params.transactionId);
-      try {
-        const outcome = engine.commitTransaction();
-        emitInvalidation(outcome);
-        transaction.clear(request.params.transactionId);
-        return outcome;
-      } catch (error) {
-        let cleanedUp = false;
-        try {
-          cleanedUp = !engine.inTransaction();
-          if (!cleanedUp) {
-            engine.rollbackTransaction();
-            cleanedUp = true;
-          }
-        } catch {
-          // Preserve the commit error. Keeping the token active lets the
-          // client retry rollback if the engine can recover on a later call.
-        }
-        if (cleanedUp) {
-          transaction.clear(request.params.transactionId);
-        }
-        throw error;
-      }
-    }
-    case 'rollbackTransaction': {
-      assertTransactionId(transaction.activeId, request.params.transactionId);
-      engine.rollbackTransaction();
-      transaction.clear(request.params.transactionId);
-      return undefined;
-    }
-  }
-}
+    },
+  };
+};
 
-interface HostTransactionState {
-  readonly activeId: string | undefined;
-  begin(): string;
-  clear(id: string): void;
-}
+const workerError = (code: string, message: string): Error =>
+  Object.assign(new Error(message), {code});
 
-function assertNoTransaction(activeId: string | undefined): void {
-  if (activeId !== undefined) {
-    throw workerError(
-      'TRANSACTION_ACTIVE',
-      'A TinyJoin transaction is already active',
-    );
-  }
-}
+const createDefaultEngine = (storage: StorageOptions): Promise<WorkerEngine> =>
+  storage.kind === 'memory'
+    ? createMemoryWasmEngine()
+    : createOpfsWasmEngine(storage.name);
 
-function assertTransactionId(
-  activeId: string | undefined,
-  requestedId: string | undefined,
-): void {
-  if (activeId === undefined && requestedId === undefined) {
-    return;
-  }
-  if (activeId === undefined) {
-    throw workerError(
-      'TRANSACTION_NOT_ACTIVE',
-      'The TinyJoin transaction is no longer active',
-    );
-  }
-  if (requestedId !== activeId) {
-    throw workerError(
-      'TRANSACTION_ACTIVE',
-      'Use the active TinyJoin transaction for this operation',
-    );
-  }
-}
+const sameStorage = (left: StorageOptions, right: StorageOptions): boolean =>
+  left.kind === right.kind &&
+  (left.kind === 'memory' ||
+    (right.kind === 'opfs' && left.name === right.name));
 
-function workerError(code: string, message: string): Error {
-  return Object.assign(new Error(message), {code});
-}
-
-async function createEngine(
-  storage: StorageOptions,
-  durableEngineFactory: WorkerEngineFactory | undefined,
-): Promise<WorkerEngine> {
-  return (durableEngineFactory ?? createDefaultEngine)(storage);
-}
-
-async function createDefaultEngine(
-  storage: StorageOptions,
-): Promise<WorkerEngine> {
-  if (storage.kind === 'memory') {
-    return createMemoryWasmEngine();
-  }
-  return createOpfsWasmEngine(storage.name);
-}
-
-function sameStorage(left: StorageOptions, right: StorageOptions): boolean {
-  return (
-    left.kind === right.kind &&
-    (left.kind === 'memory' ||
-      (right.kind === 'opfs' && left.name === right.name))
-  );
-}
-
-function serializeError(error: unknown): SerializedError {
-  if (
-    isRecord(error) &&
-    typeof error.code === 'string' &&
-    typeof error.message === 'string'
-  ) {
-    return {
-      code: error.code,
-      message: error.message,
-      ...(typeof error.retryable === 'boolean'
-        ? {retryable: error.retryable}
-        : {}),
-    };
-  }
-  if (error instanceof Error) {
-    return {code: 'WORKER_OPERATION_FAILED', message: error.message};
-  }
-  return {code: 'WORKER_OPERATION_FAILED', message: String(error)};
-}
+const serializeError = (error: unknown): SerializedError =>
+  asCodedError(error) ?? {
+    code: OPERATION_FAILED,
+    message: error instanceof Error ? error.message : String(error),
+  };

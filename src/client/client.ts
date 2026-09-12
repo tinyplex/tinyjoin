@@ -1,6 +1,14 @@
-import {defaultWorkerUrl} from '../default-worker.js';
 import {
+  isFunction,
   isRecord,
+  isString,
+  isUndefined,
+  mathMax,
+  objFreeze,
+  ownKeys,
+} from '../common.js';
+import {createDefaultWorker, createUrlWorker} from '../default-worker.js';
+import {
   type ApplyOutcome,
   type JsonValue,
   type QueryOptions,
@@ -9,8 +17,8 @@ import {
   type SqlResult,
   type StorageOptions,
 } from '../protocol.js';
-import {ClientError} from './error.js';
-import {WorkerRpc, type ResultValidation} from './rpc.js';
+import {clientError} from './error.js';
+import {createWorkerRpc, type ResultValidation, type WorkerRpc} from './rpc.js';
 
 export interface WorkerLike {
   postMessage(message: unknown): void;
@@ -31,7 +39,10 @@ export interface WorkerLike {
     type: 'messageerror',
     listener: (event: MessageEvent<unknown>) => void,
   ): void;
-  removeEventListener(type: 'error', listener: (event: ErrorEvent) => void): void;
+  removeEventListener(
+    type: 'error',
+    listener: (event: ErrorEvent) => void,
+  ): void;
   terminate?: () => void;
 }
 
@@ -59,83 +70,6 @@ export interface PreparedStatement<RowType = Row> {
   readonly closed: boolean;
 }
 
-type PreparedStatementState = {
-  readonly owner: object;
-  readonly statementId: number;
-  readonly inFlight: Set<Promise<unknown>>;
-  readonly assertDirectOperationAllowed: () => void;
-  readonly assertClientOpen: () => void;
-  readonly executeDirect: (
-    params: JsonValue[],
-    options?: QueryOptions,
-  ) => Promise<Results<unknown>>;
-  readonly closeRemote: () => Promise<void>;
-  readonly trackClose: (close: Promise<void>) => void;
-  readonly unregister: () => void;
-  closed: boolean;
-  clientClosed: boolean;
-  closePromise?: Promise<void>;
-};
-
-const preparedStatementStates = new WeakMap<object, PreparedStatementState>();
-
-class ClientPreparedStatement<RowType> implements PreparedStatement<RowType> {
-  constructor(state: PreparedStatementState) {
-    preparedStatementStates.set(this, state);
-  }
-
-  execute(
-    params: JsonValue[] = [],
-    options?: QueryOptions,
-  ): Promise<Results<RowType>> {
-    try {
-      const state = preparedStatementState(this);
-      state.assertClientOpen();
-      assertPreparedStatementOpen(state);
-      state.assertDirectOperationAllowed();
-      assertQueryOptions(options);
-      return trackPreparedExecution(
-        state,
-        state.executeDirect(params, options) as Promise<Results<RowType>>,
-      );
-    } catch (error) {
-      return Promise.reject(error);
-    }
-  }
-
-  close(): Promise<void> {
-    let state: PreparedStatementState;
-    try {
-      state = preparedStatementState(this);
-    } catch (error) {
-      return Promise.reject(error);
-    }
-    if (state.closed) {
-      return state.closePromise ?? Promise.resolve();
-    }
-    try {
-      state.assertDirectOperationAllowed();
-    } catch (error) {
-      return Promise.reject(error);
-    }
-
-    state.closed = true;
-    const pending = [...state.inFlight];
-    state.closePromise = (async () => {
-      await Promise.allSettled(pending);
-      if (!state.clientClosed) {
-        await state.closeRemote();
-      }
-    })().finally(state.unregister);
-    state.trackClose(state.closePromise);
-    return state.closePromise;
-  }
-
-  get closed(): boolean {
-    return preparedStatementState(this).closed;
-  }
-}
-
 export interface Transaction {
   query<RowType = Row>(
     sql: string,
@@ -156,462 +90,566 @@ export interface Transaction {
   readonly closed: boolean;
 }
 
-export class Client {
-  readonly #rpc: WorkerRpc;
-  readonly #preparedOwner = {};
-  readonly #preparedStatements = new Set<PreparedStatementState>();
+export interface Client {
   readonly waitReady: Promise<void>;
-  readonly #subscriptions = new Set<{
-    tables?: Set<string>;
-    listener(event: TablesChangedEvent): void;
-  }>();
-  #revision = 0;
-  #ready = false;
-  #closing = false;
-  #closed = false;
-  #closePromise: Promise<void> | undefined;
-  #preparedCloseGeneration = 0;
-  #preparedCloseTail: Promise<void> = Promise.resolve();
-  #transactionTail: Promise<void> = Promise.resolve();
-  #transactionActive = false;
-
-  constructor(options: ClientOptions = {}) {
-    assertClientOptions(options);
-    const storage = storageFromDataDir(options.dataDir);
-    const worker = createWorker(options);
-    this.#rpc = new WorkerRpc(worker.worker, worker.resultValidation);
-    this.#rpc.onEvent((event) => {
-      if (event.event === 'tablesChanged') {
-        this.#revision = Math.max(this.#revision, event.payload.revision);
-        for (const subscription of this.#subscriptions) {
-          if (
-            !subscription.tables ||
-            event.payload.tables.some((table) =>
-              subscription.tables?.has(table),
-            )
-          ) {
-            subscription.listener(event.payload);
-          }
-        }
-      }
-    });
-    this.waitReady = this.#rpc
-      .request('init', {
-        storage,
-      })
-      .then((result) => {
-        this.#revision = result.revision;
-        this.#ready = true;
-      });
-  }
-
-  get ready(): boolean {
-    return this.#ready && !this.#closing && !this.#closed;
-  }
-
-  get closed(): boolean {
-    return this.#closed;
-  }
-
-  async query<RowType = Row>(
+  readonly ready: boolean;
+  readonly closed: boolean;
+  query<RowType = Row>(
     sql: string,
-    params: JsonValue[] = [],
+    params?: JsonValue[],
     options?: QueryOptions,
-  ): Promise<Results<RowType>> {
-    await this.waitReady;
-    this.#assertNoActiveTransaction();
-    assertQueryOptions(options);
-    const result = await this.#rpc.request('executeSql', {sql, params});
-    this.#revision = Math.max(this.#revision, result.revision);
-    return toResults<RowType>(result, options);
-  }
-
+  ): Promise<Results<RowType>>;
   sql<RowType = Row>(
     strings: TemplateStringsArray,
     ...params: JsonValue[]
-  ): Promise<Results<RowType>> {
-    return this.query<RowType>(parameterize(strings, params), params);
-  }
-
-  async prepare<RowType = Row>(
-    sql: string,
-  ): Promise<PreparedStatement<RowType>> {
-    await this.waitReady;
-    this.#assertNoActiveTransaction();
-    const {statementId} = await this.#rpc.request('prepareSql', {sql});
-    this.#assertOpen();
-
-    let state!: PreparedStatementState;
-    state = {
-      owner: this.#preparedOwner,
-      statementId,
-      inFlight: new Set(),
-      assertDirectOperationAllowed: () => this.#assertNoActiveTransaction(),
-      assertClientOpen: () => this.#assertOpen(),
-      executeDirect: (params, options) =>
-        this.#executePrepared<unknown>(statementId, params, options),
-      closeRemote: () => this.#closePrepared(statementId),
-      trackClose: (close) => this.#trackPreparedClose(close),
-      unregister: () => this.#preparedStatements.delete(state),
-      closed: false,
-      clientClosed: false,
-    };
-    this.#preparedStatements.add(state);
-    return new ClientPreparedStatement<RowType>(state);
-  }
-
-  /** Executes one or more SQL statements without parameters. */
-  async exec(
-    sql: string,
-    options?: QueryOptions,
-  ): Promise<Results[]> {
-    await this.waitReady;
-    this.#assertNoActiveTransaction();
-    assertQueryOptions(options);
-    const results = await this.#rpc.request('execSql', {sql});
-    this.#noteResults(results);
-    return results.map((result) => toResults(result, options));
-  }
-
-  /**
-   * Runs SQL against an isolated staged database and durably publishes all
-   * changes together when the callback succeeds, unless it explicitly rolls
-   * back.
-   */
+  ): Promise<Results<RowType>>;
+  prepare<RowType = Row>(sql: string): Promise<PreparedStatement<RowType>>;
+  exec(sql: string, options?: QueryOptions): Promise<Results[]>;
   transaction<Result>(
     callback: (transaction: Transaction) => Result | Promise<Result>,
-  ): Promise<Result> {
-    if (typeof callback !== 'function') {
-      throw new TypeError('TinyJoin transaction requires a callback');
-    }
-    const run = this.#transactionTail.then(() =>
-      this.#runTransaction(callback),
-    );
-    this.#transactionTail = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    return run;
-  }
-
+  ): Promise<Result>;
   subscribe(
     options: SubscriptionOptions,
     listener: (event: TablesChangedEvent) => void,
-  ): () => void {
-    const subscription = {
-      ...(options.tables ? {tables: new Set(options.tables)} : {}),
-      listener,
-    };
-    this.#subscriptions.add(subscription);
-    return () => this.#subscriptions.delete(subscription);
-  }
+  ): () => void;
+  getRevision(): number;
+  close(): Promise<void>;
+}
 
-  getRevision(): number {
-    return this.#revision;
-  }
+type PreparedStatementState = {
+  readonly owner: object;
+  readonly statementId: number;
+  readonly inFlight: Set<Promise<unknown>>;
+  readonly assertDirectOperationAllowed: () => void;
+  readonly assertClientOpen: () => void;
+  readonly executeDirect: (
+    params: JsonValue[],
+    options?: QueryOptions,
+  ) => Promise<Results<unknown>>;
+  readonly closeRemote: () => Promise<void>;
+  readonly trackClose: (close: Promise<void>) => void;
+  readonly unregister: () => void;
+  closed: boolean;
+  clientClosed: boolean;
+  closePromise?: Promise<void>;
+};
 
-  close(): Promise<void> {
-    if (this.#closePromise === undefined) {
-      this.#closing = true;
-      for (const statement of this.#preparedStatements) {
-        statement.closed = true;
-        statement.clientClosed = true;
+/** A transaction, alongside the controls only its own client may use. */
+type TransactionSession = {
+  readonly transaction: Transaction;
+  readonly seal: () => void;
+  readonly settle: () => Promise<void>;
+  readonly rolledBack: () => boolean;
+};
+
+type Subscription = {
+  readonly tables?: Set<string>;
+  readonly listener: (event: TablesChangedEvent) => void;
+};
+
+const SUPPORTED_OPTIONS = ['dataDir', 'worker', 'workerFactory', 'workerUrl'];
+const TRANSACTION_ACTIVE = 'TRANSACTION_ACTIVE';
+const OPFS_PREFIX = 'opfs://';
+const DATABASE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const ROW_COUNT_COMMANDS = /^(?:DELETE|INSERT|SELECT|UPDATE)$/;
+const AFFECTED_ROW_COMMANDS = /^(?:DELETE|INSERT|UPDATE)$/;
+
+// A prepared statement's state lives here rather than on the statement itself,
+// so that a transaction can recognize a statement belonging to its own client
+// without the statement exposing anything a page could reach or replace.
+const preparedStatementStates = new WeakMap<object, PreparedStatementState>();
+
+/**
+ * Opens a database on one dedicated Worker.
+ *
+ * Client stays a constructor, so that `new Client(...)` and `instanceof Client`
+ * keep working, but what it hands back is the frozen object createClient
+ * builds. Everything the client knows is a closure variable rather than a
+ * property: none of it reaches the published bundle as a name, and none of it
+ * can be read or overwritten from outside.
+ */
+export class Client {
+  constructor(options: ClientOptions = {}) {
+    return createClient(options);
+  }
+}
+
+const createClient = (options: ClientOptions): Client => {
+  assertClientOptions(options);
+  const storage = storageFromDataDir(options.dataDir);
+  const [worker, resultValidation] = createWorker(options);
+  const rpc = createWorkerRpc(worker, resultValidation);
+  const preparedOwner = {};
+  const preparedStatements = new Set<PreparedStatementState>();
+  const subscriptions = new Set<Subscription>();
+  let revision = 0;
+  let ready = false;
+  let closing = false;
+  let closed = false;
+  let closePromise: Promise<void> | undefined;
+  let preparedCloseGeneration = 0;
+  let preparedCloseTail: Promise<void> = Promise.resolve();
+  let transactionTail: Promise<void> = Promise.resolve();
+  let transactionActive = false;
+
+  const noteRevision = (next: number): void => {
+    revision = mathMax(revision, next);
+  };
+
+  const assertOpen = (): void => {
+    if (closing || closed) {
+      throw clientError('CLIENT_CLOSED', 'The TinyJoin client is closed');
+    }
+  };
+
+  const assertNoActiveTransaction = (): void => {
+    assertOpen();
+    if (transactionActive) {
+      throw clientError(
+        TRANSACTION_ACTIVE,
+        'Use the transaction object while a TinyJoin transaction is active',
+      );
+    }
+  };
+
+  // Every direct statement waits for the database to be ready, and refuses to
+  // run while a transaction owns the Worker.
+  const beginDirect = async (): Promise<void> => {
+    await waitReady;
+    assertNoActiveTransaction();
+  };
+
+  const executePrepared = async <RowType>(
+    statementId: number,
+    params: JsonValue[],
+    options?: QueryOptions,
+  ): Promise<Results<RowType>> => {
+    await beginDirect();
+    const result = await rpc.request('executePrepared', {statementId, params});
+    noteRevision(result.revision);
+    return toResults<RowType>(result, options);
+  };
+
+  const trackPreparedClose = (close: Promise<void>): void => {
+    const previous = preparedCloseTail;
+    preparedCloseGeneration += 1;
+    preparedCloseTail = Promise.allSettled([previous, close]).then(
+      () => undefined,
+    );
+  };
+
+  // Reserves the client for a transaction once no prepared close is in flight.
+  // The generation check and the reservation are synchronous, so a new prepared
+  // close cannot slip between the drained barrier and the Worker request.
+  const beginTransaction = async (): Promise<string> => {
+    while (true) {
+      assertOpen();
+      const generation = preparedCloseGeneration;
+      const tail = preparedCloseTail;
+      await tail;
+      if (
+        generation !== preparedCloseGeneration ||
+        tail !== preparedCloseTail
+      ) {
+        continue;
       }
-      this.#preparedStatements.clear();
-      this.#closePromise = this.#closeOnce();
+      assertOpen();
+      transactionActive = true;
+      try {
+        return (await rpc.request('beginTransaction', undefined)).transactionId;
+      } catch (error) {
+        transactionActive = false;
+        throw error;
+      }
     }
-    return this.#closePromise;
-  }
+  };
 
-  async #closeOnce(): Promise<void> {
-    try {
-      await this.waitReady;
-      await this.#rpc.request('close', undefined);
-    } finally {
-      this.#ready = false;
-      this.#closing = false;
-      this.#closed = true;
-      this.#subscriptions.clear();
-      this.#rpc.dispose();
-    }
-  }
-
-  async #runTransaction<Result>(
+  const runTransaction = async <Result>(
     callback: (transaction: Transaction) => Result | Promise<Result>,
-  ): Promise<Result> {
-    await this.waitReady;
-    const {transactionId} = await this.#beginTransactionAfterPreparedCloses();
-    const transaction = new ClientTransaction(
-      this.#rpc,
+  ): Promise<Result> => {
+    await waitReady;
+    const transactionId = await beginTransaction();
+    const session = createTransactionSession(
+      rpc,
       transactionId,
-      this.#preparedOwner,
-      (revision) => {
-        this.#revision = Math.max(this.#revision, revision);
-      },
+      preparedOwner,
+      noteRevision,
     );
     let shouldRollback = true;
     try {
-      const result = await callback(transaction);
-      transaction.seal();
-      await transaction.settle();
-      if (transaction.rollbackCompleted) {
-        shouldRollback = false;
+      const result = await callback(session.transaction);
+      session.seal();
+      await session.settle();
+      if (session.rolledBack()) {
         return result;
       }
-      const outcome = await this.#rpc.request('commitTransaction', {
-        transactionId,
-      });
+      const outcome = await rpc.request('commitTransaction', {transactionId});
       shouldRollback = false;
-      this.#revision = Math.max(this.#revision, outcome.revision);
+      noteRevision(outcome.revision);
       return result;
     } catch (error) {
-      transaction.seal();
-      if (shouldRollback && !transaction.rollbackCompleted) {
-        await this.#rpc
+      session.seal();
+      if (shouldRollback && !session.rolledBack()) {
+        await rpc
           .request('rollbackTransaction', {transactionId})
           .catch(() => undefined);
       }
       throw error;
     } finally {
-      this.#transactionActive = false;
+      transactionActive = false;
     }
-  }
+  };
 
-  async #beginTransactionAfterPreparedCloses(): Promise<{
-    transactionId: string;
-  }> {
-    while (true) {
-      this.#assertOpen();
-      const generation = this.#preparedCloseGeneration;
-      const tail = this.#preparedCloseTail;
-      await tail;
-      if (
-        generation !== this.#preparedCloseGeneration ||
-        tail !== this.#preparedCloseTail
-      ) {
-        continue;
-      }
+  const closeOnce = async (): Promise<void> => {
+    try {
+      await waitReady;
+      await rpc.request('close', undefined);
+    } finally {
+      ready = false;
+      closing = false;
+      closed = true;
+      subscriptions.clear();
+      rpc.dispose();
+    }
+  };
 
-      // Reserve the client before dispatching BEGIN. The generation check and
-      // reservation are synchronous, so a new prepared close cannot slip
-      // between the drained barrier and the Worker request.
-      this.#assertOpen();
-      this.#transactionActive = true;
-      try {
-        return await this.#rpc.request('beginTransaction', undefined);
-      } catch (error) {
-        this.#transactionActive = false;
-        throw error;
+  rpc.onEvent((event) => {
+    if (event.event === 'tablesChanged') {
+      noteRevision(event.payload.revision);
+      for (const subscription of subscriptions) {
+        if (
+          !subscription.tables ||
+          event.payload.tables.some((table) => subscription.tables?.has(table))
+        ) {
+          subscription.listener(event.payload);
+        }
       }
     }
-  }
+  });
 
-  #trackPreparedClose(close: Promise<void>): void {
-    const previous = this.#preparedCloseTail;
-    this.#preparedCloseGeneration += 1;
-    this.#preparedCloseTail = Promise.allSettled([previous, close]).then(
-      () => undefined,
-    );
-  }
+  const waitReady = rpc.request('init', {storage}).then((result) => {
+    revision = result.revision;
+    ready = true;
+  });
 
-  #assertNoActiveTransaction(): void {
-    this.#assertOpen();
-    if (this.#transactionActive) {
-      throw clientError(
-        'TRANSACTION_ACTIVE',
-        'Use the transaction object while a TinyJoin transaction is active',
-      );
-    }
-  }
+  const client: Client = {
+    waitReady,
 
-  #assertOpen(): void {
-    if (this.#closing || this.#closed) {
-      throw clientError('CLIENT_CLOSED', 'The TinyJoin client is closed');
-    }
-  }
+    get ready(): boolean {
+      return ready && !closing && !closed;
+    },
 
-  async #executePrepared<RowType>(
-    statementId: number,
-    params: JsonValue[],
-    options?: QueryOptions,
-  ): Promise<Results<RowType>> {
-    await this.waitReady;
-    this.#assertNoActiveTransaction();
-    const result = await this.#rpc.request('executePrepared', {
-      statementId,
-      params,
-    });
-    this.#revision = Math.max(this.#revision, result.revision);
-    return toResults<RowType>(result, options);
-  }
+    get closed(): boolean {
+      return closed;
+    },
 
-  async #closePrepared(statementId: number): Promise<void> {
-    if (this.#closing || this.#closed) {
-      return;
-    }
-    await this.#rpc.request('closePrepared', {statementId});
-  }
+    query: async <RowType = Row>(
+      sql: string,
+      params: JsonValue[] = [],
+      options?: QueryOptions,
+    ): Promise<Results<RowType>> => {
+      await beginDirect();
+      assertQueryOptions(options);
+      const result = await rpc.request('executeSql', {sql, params});
+      noteRevision(result.revision);
+      return toResults<RowType>(result, options);
+    },
 
-  #noteResults(results: SqlResult[]): void {
-    for (const result of results) {
-      this.#revision = Math.max(this.#revision, result.revision);
-    }
-  }
-}
+    sql: <RowType = Row>(
+      strings: TemplateStringsArray,
+      ...params: JsonValue[]
+    ): Promise<Results<RowType>> =>
+      client.query<RowType>(parameterize(strings, params), params),
 
-class ClientTransaction implements Transaction {
-  readonly #pending = new Set<Promise<unknown>>();
-  #open = true;
-  #closing = false;
-  #rollbackCompleted = false;
-  #rollbackPromise: Promise<void> | undefined;
+    prepare: async <RowType = Row>(
+      sql: string,
+    ): Promise<PreparedStatement<RowType>> => {
+      await beginDirect();
+      const {statementId} = await rpc.request('prepareSql', {sql});
+      assertOpen();
 
-  constructor(
-    readonly rpc: WorkerRpc,
-    readonly transactionId: string,
-    readonly preparedOwner: object,
-    readonly noteRevision: (revision: number) => void,
-  ) {}
-
-  query<RowType = Row>(
-    sql: string,
-    params: JsonValue[] = [],
-    options?: QueryOptions,
-  ): Promise<Results<RowType>> {
-    this.#assertOpen();
-    assertQueryOptions(options);
-    return this.#track(
-      this.rpc
-        .request('executeSql', {
-          sql,
-          params,
-          transactionId: this.transactionId,
-        })
-        .then((result) => {
-          this.noteRevision(result.revision);
-          return toResults<RowType>(result, options);
-        }),
-    );
-  }
-
-  sql<RowType = Row>(
-    strings: TemplateStringsArray,
-    ...params: JsonValue[]
-  ): Promise<Results<RowType>> {
-    return this.query<RowType>(parameterize(strings, params), params);
-  }
-
-  exec(
-    sql: string,
-    options?: QueryOptions,
-  ): Promise<Results[]> {
-    this.#assertOpen();
-    assertQueryOptions(options);
-    return this.#track(
-      this.rpc
-        .request('execSql', {
-          sql,
-          transactionId: this.transactionId,
-        })
-        .then((results) => {
-          for (const result of results) {
-            this.noteRevision(result.revision);
+      const state: PreparedStatementState = {
+        owner: preparedOwner,
+        statementId,
+        inFlight: new Set(),
+        assertDirectOperationAllowed: assertNoActiveTransaction,
+        assertClientOpen: assertOpen,
+        executeDirect: (params, options) =>
+          executePrepared<unknown>(statementId, params, options),
+        closeRemote: async () => {
+          if (!closing && !closed) {
+            await rpc.request('closePrepared', {statementId});
           }
-          return results.map((result) => toResults(result, options));
-        }),
-    );
-  }
+        },
+        trackClose: trackPreparedClose,
+        unregister: () => preparedStatements.delete(state),
+        closed: false,
+        clientClosed: false,
+      };
+      preparedStatements.add(state);
+      return createPreparedStatement<RowType>(state);
+    },
 
-  execute<RowType = Row>(
-    statement: PreparedStatement<RowType>,
-    params: JsonValue[] = [],
-    options?: QueryOptions,
-  ): Promise<Results<RowType>> {
-    this.#assertOpen();
-    const state = preparedStatementState(statement);
-    if (state.owner !== this.preparedOwner) {
-      throw clientError(
-        'PREPARED_STATEMENT_CLIENT_MISMATCH',
-        'The prepared statement belongs to a different TinyJoin client',
+    /** Executes one or more SQL statements without parameters. */
+    exec: async (sql: string, options?: QueryOptions): Promise<Results[]> => {
+      await beginDirect();
+      assertQueryOptions(options);
+      const results = await rpc.request('execSql', {sql});
+      for (const result of results) {
+        noteRevision(result.revision);
+      }
+      return results.map((result) => toResults(result, options));
+    },
+
+    /**
+     * Runs SQL against an isolated staged database and durably publishes all
+     * changes together when the callback succeeds, unless it explicitly rolls
+     * back.
+     */
+    transaction: <Result>(
+      callback: (transaction: Transaction) => Result | Promise<Result>,
+    ): Promise<Result> => {
+      if (!isFunction(callback)) {
+        throw new TypeError('TinyJoin transaction requires a callback');
+      }
+      const run = transactionTail.then(() => runTransaction(callback));
+      transactionTail = run.then(
+        () => undefined,
+        () => undefined,
       );
-    }
-    state.assertClientOpen();
-    assertPreparedStatementOpen(state);
-    assertQueryOptions(options);
-    const operation = this.#track(
-      this.rpc
-        .request('executePrepared', {
-          statementId: state.statementId,
-          params,
-          transactionId: this.transactionId,
-        })
-        .then((result) => {
-          this.noteRevision(result.revision);
-          return toResults<RowType>(result, options);
-        }),
-    );
-    return trackPreparedExecution(state, operation);
-  }
+      return run;
+    },
 
-  seal(): void {
-    this.#open = false;
-  }
+    subscribe: (
+      options: SubscriptionOptions,
+      listener: (event: TablesChangedEvent) => void,
+    ): (() => void) => {
+      const subscription: Subscription = {
+        ...(options.tables ? {tables: new Set(options.tables)} : {}),
+        listener,
+      };
+      subscriptions.add(subscription);
+      return () => subscriptions.delete(subscription);
+    },
 
-  get closed(): boolean {
-    return !this.#open;
-  }
+    getRevision: (): number => revision,
 
-  get rollbackCompleted(): boolean {
-    return this.#rollbackCompleted;
-  }
+    close: (): Promise<void> => {
+      if (isUndefined(closePromise)) {
+        closing = true;
+        for (const statement of preparedStatements) {
+          statement.closed = true;
+          statement.clientClosed = true;
+        }
+        preparedStatements.clear();
+        closePromise = closeOnce();
+      }
+      return closePromise;
+    },
+  };
 
-  rollback(): Promise<void> {
-    this.#assertOpen();
-    this.#closing = true;
-    const rollback = this.rpc
-      .request('rollbackTransaction', {
-        transactionId: this.transactionId,
-      })
-      .then(() => {
-        this.#rollbackCompleted = true;
-        this.#open = false;
-        this.#closing = false;
-      });
-    this.#rollbackPromise = rollback;
-    this.#pending.add(rollback);
-    void rollback.then(
-      () => this.#pending.delete(rollback),
-      () => this.#pending.delete(rollback),
-    );
-    return rollback;
-  }
+  return objFreeze(Object.setPrototypeOf(client, Client.prototype) as Client);
+};
 
-  async settle(): Promise<void> {
-    while (this.#pending.size > 0) {
-      await Promise.all([...this.#pending]);
-    }
-    await this.#rollbackPromise;
-  }
+const createPreparedStatement = <RowType>(
+  state: PreparedStatementState,
+): PreparedStatement<RowType> => {
+  const statement = objFreeze({
+    execute: (
+      params: JsonValue[] = [],
+      options?: QueryOptions,
+    ): Promise<Results<RowType>> => {
+      try {
+        state.assertClientOpen();
+        assertPreparedStatementOpen(state);
+        state.assertDirectOperationAllowed();
+        assertQueryOptions(options);
+        return trackPreparedExecution(
+          state,
+          state.executeDirect(params, options) as Promise<Results<RowType>>,
+        );
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    },
 
-  #track<Result>(promise: Promise<Result>): Promise<Result> {
-    this.#assertOpen();
-    this.#pending.add(promise);
-    void promise.then(
-      () => this.#pending.delete(promise),
-      () => this.#pending.delete(promise),
-    );
-    return promise;
-  }
+    close: (): Promise<void> => {
+      if (state.closed) {
+        return state.closePromise ?? Promise.resolve();
+      }
+      try {
+        state.assertDirectOperationAllowed();
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      state.closed = true;
+      const pending = [...state.inFlight];
+      state.closePromise = (async () => {
+        await Promise.allSettled(pending);
+        if (!state.clientClosed) {
+          await state.closeRemote();
+        }
+      })().finally(state.unregister);
+      state.trackClose(state.closePromise);
+      return state.closePromise;
+    },
 
-  #assertOpen(): void {
-    if (!this.#open || this.#closing) {
+    get closed(): boolean {
+      return state.closed;
+    },
+  });
+  preparedStatementStates.set(statement, state);
+  return statement;
+};
+
+/**
+ * Builds the transaction handed to a callback, plus the three controls its
+ * client needs. Keeping those off the transaction object means a callback
+ * cannot seal or settle the transaction it is running inside.
+ */
+const createTransactionSession = (
+  rpc: WorkerRpc,
+  transactionId: string,
+  preparedOwner: object,
+  noteRevision: (revision: number) => void,
+): TransactionSession => {
+  const pending = new Set<Promise<unknown>>();
+  let open = true;
+  let closing = false;
+  let rolledBack = false;
+  let rollbackPromise: Promise<void> | undefined;
+
+  const assertOpen = (): void => {
+    if (!open || closing) {
       throw clientError(
         'TRANSACTION_CLOSED',
         'The TinyJoin transaction callback has already completed',
       );
     }
-  }
-}
+  };
+
+  const forget = (promise: Promise<unknown>): void => {
+    void promise.then(
+      () => pending.delete(promise),
+      () => pending.delete(promise),
+    );
+  };
+
+  const track = <Result>(promise: Promise<Result>): Promise<Result> => {
+    assertOpen();
+    pending.add(promise);
+    forget(promise);
+    return promise;
+  };
+
+  const transaction: Transaction = objFreeze({
+    query: <RowType = Row>(
+      sql: string,
+      params: JsonValue[] = [],
+      options?: QueryOptions,
+    ): Promise<Results<RowType>> => {
+      assertOpen();
+      assertQueryOptions(options);
+      return track(
+        rpc
+          .request('executeSql', {sql, params, transactionId})
+          .then((result) => {
+            noteRevision(result.revision);
+            return toResults<RowType>(result, options);
+          }),
+      );
+    },
+
+    sql: <RowType = Row>(
+      strings: TemplateStringsArray,
+      ...params: JsonValue[]
+    ): Promise<Results<RowType>> =>
+      transaction.query<RowType>(parameterize(strings, params), params),
+
+    exec: (sql: string, options?: QueryOptions): Promise<Results[]> => {
+      assertOpen();
+      assertQueryOptions(options);
+      return track(
+        rpc.request('execSql', {sql, transactionId}).then((results) => {
+          for (const result of results) {
+            noteRevision(result.revision);
+          }
+          return results.map((result) => toResults(result, options));
+        }),
+      );
+    },
+
+    execute: <RowType = Row>(
+      statement: PreparedStatement<RowType>,
+      params: JsonValue[] = [],
+      options?: QueryOptions,
+    ): Promise<Results<RowType>> => {
+      assertOpen();
+      const state = preparedStatementState(statement);
+      if (state.owner !== preparedOwner) {
+        throw clientError(
+          'PREPARED_STATEMENT_CLIENT_MISMATCH',
+          'The prepared statement belongs to a different TinyJoin client',
+        );
+      }
+      state.assertClientOpen();
+      assertPreparedStatementOpen(state);
+      assertQueryOptions(options);
+      return trackPreparedExecution(
+        state,
+        track(
+          rpc
+            .request('executePrepared', {
+              statementId: state.statementId,
+              params,
+              transactionId,
+            })
+            .then((result) => {
+              noteRevision(result.revision);
+              return toResults<RowType>(result, options);
+            }),
+        ),
+      );
+    },
+
+    rollback: (): Promise<void> => {
+      assertOpen();
+      closing = true;
+      const rollback = rpc
+        .request('rollbackTransaction', {transactionId})
+        .then(() => {
+          rolledBack = true;
+          open = false;
+          closing = false;
+        });
+      rollbackPromise = rollback;
+      pending.add(rollback);
+      forget(rollback);
+      return rollback;
+    },
+
+    get closed(): boolean {
+      return !open;
+    },
+  });
+
+  return {
+    transaction,
+
+    seal: (): void => {
+      open = false;
+    },
+
+    settle: async (): Promise<void> => {
+      while (pending.size > 0) {
+        await Promise.all([...pending]);
+      }
+      await rollbackPromise;
+    },
+
+    rolledBack: (): boolean => rolledBack,
+  };
+};
 
 export function create(): Promise<Client>;
 export function create(options: ClientOptions): Promise<Client>;
@@ -624,17 +662,17 @@ export async function create(
   options?: ClientOptions,
 ): Promise<Client> {
   let resolvedOptions: ClientOptions;
-  if (typeof dataDirOrOptions === 'string') {
-    if (options?.dataDir !== undefined) {
+  if (isString(dataDirOrOptions)) {
+    if (!isUndefined(options?.dataDir)) {
       throw new TypeError(
         'Provide the TinyJoin data directory either positionally or in options.dataDir, not both',
       );
     }
     resolvedOptions = {...options, dataDir: dataDirOrOptions};
-  } else if (dataDirOrOptions === undefined) {
+  } else if (isUndefined(dataDirOrOptions)) {
     resolvedOptions = options ?? {};
   } else {
-    if (options !== undefined) {
+    if (!isUndefined(options)) {
       throw new TypeError(
         'TinyJoin options must be the first argument when no positional data directory is used',
       );
@@ -652,138 +690,106 @@ export async function create(
   }
 }
 
-function createWorker(options: ClientOptions): {
-  worker: WorkerLike;
-  resultValidation: ResultValidation;
-} {
-  const selected = [
-    options.worker,
-    options.workerFactory,
-    options.workerUrl,
-  ].filter((value) => value !== undefined);
-  if (selected.length > 1) {
+// TinyJoin's own Worker has already validated every result it posts, so the
+// client only re-checks the envelope on that path. A Worker the application
+// supplied has made no such promise, and gets the full walk.
+const createWorker = (
+  options: ClientOptions,
+): [worker: WorkerLike, resultValidation: ResultValidation] => {
+  const {worker, workerFactory, workerUrl} = options;
+  if (
+    [worker, workerFactory, workerUrl].filter((value) => !isUndefined(value))
+      .length > 1
+  ) {
     throw new TypeError(
       'Provide only one of worker, workerFactory, or workerUrl to TinyJoin',
     );
   }
-
-  if (options.worker) {
-    return {worker: options.worker, resultValidation: 'full'};
+  if (worker) {
+    return [worker, 'full'];
   }
-  if (options.workerFactory) {
-    return {worker: options.workerFactory(), resultValidation: 'full'};
+  if (workerFactory) {
+    return [workerFactory(), 'full'];
   }
-  if (options.workerUrl) {
-    return {
-      worker: createUrlWorker(options.workerUrl),
-      resultValidation: 'full',
-    };
+  if (workerUrl) {
+    return [createUrlWorker(workerUrl), 'full'];
   }
-  return {worker: createDefaultWorker(), resultValidation: 'header'};
-}
+  return [createDefaultWorker(), 'header'];
+};
 
-function createUrlWorker(url: string | URL): WorkerLike {
-  assertWorkerAvailable();
-  return new Worker(url, {name: 'tinyjoin', type: 'module'});
-}
-
-function createDefaultWorker(): WorkerLike {
-  assertWorkerAvailable();
-  return new Worker(defaultWorkerUrl(), {name: 'tinyjoin', type: 'module'});
-}
-
-function assertWorkerAvailable(): void {
-  if (typeof Worker === 'undefined') {
-    throw new Error(
-      'TinyJoin requires a browser Worker. Importing is SSR-safe, but create the client in the browser or provide a Worker-like implementation.',
-    );
-  }
-}
-
-function clientError(code: string, message: string): ClientError {
-  return new ClientError({code, message});
-}
-
-function preparedStatementState(value: unknown): PreparedStatementState {
-  const state =
-    typeof value === 'object' && value !== null
-      ? preparedStatementStates.get(value)
-      : undefined;
-  if (!state) {
+const preparedStatementState = (value: unknown): PreparedStatementState => {
+  const state = isRecord(value)
+    ? preparedStatementStates.get(value)
+    : undefined;
+  if (isUndefined(state)) {
     throw clientError(
       'INVALID_PREPARED_STATEMENT',
       'The value is not a TinyJoin prepared statement',
     );
   }
   return state;
-}
+};
 
-function assertPreparedStatementOpen(state: PreparedStatementState): void {
+const assertPreparedStatementOpen = (state: PreparedStatementState): void => {
   if (state.closed) {
     throw clientError(
       'PREPARED_STATEMENT_CLOSED',
       'The TinyJoin prepared statement is closed',
     );
   }
-}
+};
 
-function trackPreparedExecution<Result>(
+const trackPreparedExecution = <Result>(
   state: PreparedStatementState,
   operation: Promise<Result>,
-): Promise<Result> {
+): Promise<Result> => {
   state.inFlight.add(operation);
   void operation.then(
     () => state.inFlight.delete(operation),
     () => state.inFlight.delete(operation),
   );
   return operation;
-}
+};
 
-function assertClientOptions(options: ClientOptions): void {
-  const supported = new Set([
-    'dataDir',
-    'worker',
-    'workerFactory',
-    'workerUrl',
-  ]);
+const assertClientOptions = (options: ClientOptions): void => {
   const prototype = isRecord(options)
     ? Object.getPrototypeOf(options)
     : undefined;
   if (
     !isRecord(options) ||
     (prototype !== Object.prototype && prototype !== null) ||
-    Reflect.ownKeys(options).some(
-      (key) => typeof key !== 'string' || !supported.has(key),
+    ownKeys(options).some(
+      (key) => !isString(key) || !SUPPORTED_OPTIONS.includes(key),
     )
   ) {
     throw new TypeError(
       'TinyJoin client options support only dataDir, worker, workerFactory, and workerUrl',
     );
   }
-}
+};
 
-function storageFromDataDir(dataDir: DataDir | undefined): StorageOptions {
-  if (dataDir === undefined || dataDir === 'memory://') {
+const storageFromDataDir = (dataDir: DataDir | undefined): StorageOptions => {
+  if (isUndefined(dataDir) || dataDir === 'memory://') {
     return {kind: 'memory'};
   }
-  if (typeof dataDir !== 'string' || !dataDir.startsWith('opfs://')) {
+  if (!isString(dataDir) || !dataDir.startsWith(OPFS_PREFIX)) {
     throw new TypeError(
       'TinyJoin dataDir must be memory:// or opfs:// followed by a database name',
     );
   }
-  const name = dataDir.slice('opfs://'.length);
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) {
+  const name = dataDir.slice(OPFS_PREFIX.length);
+  if (!DATABASE_NAME.test(name)) {
     throw new TypeError(
       'A TinyJoin OPFS database name must be 1-64 ASCII letters, numbers, dots, underscores, or hyphens, and start with a letter or number',
     );
   }
   return {kind: 'opfs', name};
-}
+};
 
-function parameterize(
+const parameterize = (
   strings: TemplateStringsArray,
   params: readonly JsonValue[],
-): string {
+): string => {
   if (!Array.isArray(strings) || strings.length !== params.length + 1) {
     throw new TypeError('TinyJoin sql must be used as a tagged template');
   }
@@ -792,31 +798,31 @@ function parameterize(
     sql += `$${index + 1}${strings[index + 1] ?? ''}`;
   }
   return sql;
-}
+};
 
-function toResults<RowType>(
+const toResults = <RowType>(
   result: SqlResult,
   options?: QueryOptions,
-): Results<RowType> {
-  const rows =
-    options?.rowMode === 'array'
-      ? rowsAsArrays(result.rows, result.fields)
-      : result.rows;
-  return {
-    rows: rows as RowType[],
-    fields: result.fields,
-    affectedRows: affectedRows(result),
-    command: result.command,
-    ...(hasRowCount(result.command) ? {rowCount: result.rowCount} : {}),
-    revision: result.revision,
-    tables: result.tables,
-  };
-}
+): Results<RowType> => ({
+  rows: (options?.rowMode === 'array'
+    ? rowsAsArrays(result.rows, result.fields)
+    : result.rows) as RowType[],
+  fields: result.fields,
+  affectedRows: AFFECTED_ROW_COMMANDS.test(result.command)
+    ? result.rowCount
+    : 0,
+  command: result.command,
+  ...(ROW_COUNT_COMMANDS.test(result.command)
+    ? {rowCount: result.rowCount}
+    : {}),
+  revision: result.revision,
+  tables: result.tables,
+});
 
-function rowsAsArrays(
+const rowsAsArrays = (
   rows: Row[],
   fields: SqlResult['fields'],
-): JsonValue[][] {
+): JsonValue[][] => {
   if (rows.length > 0 && fields.length === 0) {
     throw clientError(
       'ROW_METADATA_UNAVAILABLE',
@@ -824,26 +830,16 @@ function rowsAsArrays(
     );
   }
   return rows.map((row) => fields.map((field) => row[field.name] ?? null));
-}
+};
 
-function affectedRows(result: SqlResult): number {
-  return /^(?:DELETE|INSERT|UPDATE)$/.test(result.command)
-    ? result.rowCount
-    : 0;
-}
-
-function hasRowCount(command: string): boolean {
-  return /^(?:DELETE|INSERT|SELECT|UPDATE)$/.test(command);
-}
-
-function assertQueryOptions(options: QueryOptions | undefined): void {
-  if (options === undefined) {
+const assertQueryOptions = (options: QueryOptions | undefined): void => {
+  if (isUndefined(options)) {
     return;
   }
   if (
     !isRecord(options) ||
-    Reflect.ownKeys(options).some((key) => key !== 'rowMode') ||
-    (options.rowMode !== undefined &&
+    ownKeys(options).some((key) => key !== 'rowMode') ||
+    (!isUndefined(options.rowMode) &&
       options.rowMode !== 'array' &&
       options.rowMode !== 'object')
   ) {
@@ -851,4 +847,4 @@ function assertQueryOptions(options: QueryOptions | undefined): void {
       'TinyJoin query options currently support only rowMode: object or array',
     );
   }
-}
+};

@@ -616,11 +616,14 @@ describe('Client', () => {
     } as unknown as PreparedStatement;
     let escaped: Transaction | undefined;
 
-    await expect(
-      statement.execute.call(forged, []),
-    ).rejects.toMatchObject({code: 'INVALID_PREPARED_STATEMENT'});
-    await expect(statement.close.call(forged)).rejects.toMatchObject({
-      code: 'INVALID_PREPARED_STATEMENT',
+    // A statement's methods belong to their own statement rather than to
+    // whatever they are called on, so detaching one keeps working and a forged
+    // receiver cannot redirect it. A forged statement is rejected where one is
+    // accepted as an argument, which is what transaction.execute checks below.
+    const {execute} = statement;
+    await expect(execute()).resolves.toMatchObject({command: 'SELECT'});
+    await expect(execute.call(forged, [])).resolves.toMatchObject({
+      command: 'SELECT',
     });
     await secondClient.transaction((transaction) => {
       escaped = transaction;

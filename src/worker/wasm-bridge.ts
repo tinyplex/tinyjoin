@@ -1,4 +1,19 @@
 import {
+  arrayIsArray,
+  errorDetail,
+  isBoolean,
+  isCount,
+  isCountWithin,
+  isRecord,
+  isString,
+  isUndefined,
+  MAX_U32,
+  objFreeze,
+  objHasOwn,
+  ownKeys,
+  type CodedError,
+} from '../common.js';
+import {
   isRpcResult,
   type ApplyOutcome,
   type JsonValue,
@@ -36,11 +51,7 @@ const SUCCESS = 0;
 const FAILURE = 1;
 const SAFE_RESPONSE = 0;
 const DURABLE_RESPONSE = 1;
-const MAX_U32 = 0xffff_ffff;
-
-const arrayIsArray = Array.isArray;
-const hasOwn = Object.hasOwn;
-const numberIsSafeInteger = Number.isSafeInteger;
+const ENVELOPE_SLOTS = [0, 1, 2, 3];
 
 let insidePageDeviceCallback = 0;
 
@@ -69,214 +80,109 @@ export interface RawStructuredWasmEngineConstructor {
   new (device: PageDevice): RawStructuredWasmEngine;
 }
 
-function guardWasmPageDevice(device: PageDevice): PageDevice {
-  return Object.freeze({
-    pageCount: () => inPageDeviceCallback(() => device.pageCount()),
-    readPage: (low: number, high: number, target: Uint8Array) =>
-      inPageDeviceCallback(() => device.readPage(low, high, target)),
-    writePage: (low: number, high: number, source: Uint8Array) =>
-      inPageDeviceCallback(() => device.writePage(low, high, source)),
-    flush: () => inPageDeviceCallback(() => device.flush()),
-    close: () => inPageDeviceCallback(() => device.close()),
-  });
-}
-
-function inPageDeviceCallback<Result>(callback: () => Result): Result {
-  insidePageDeviceCallback += 1;
-  try {
-    return callback();
-  } finally {
-    insidePageDeviceCallback -= 1;
-  }
-}
-
-function assertNotInPageDeviceCallback(): void {
-  if (insidePageDeviceCallback !== 0) {
-    throw new WasmBridgeError(
-      'ENGINE_REENTRANT_CALL',
-      'TinyJoin cannot enter a WASM engine from a page-device callback',
-      false,
-    );
-  }
-}
-
 /** Opens the direct structured WASM bridge behind the shared page guard. */
-export function createStructuredWasmEngine(
+export const createStructuredWasmEngine = (
   RawEngine: RawStructuredWasmEngineConstructor,
   device: PageDevice,
-): StructuredWasmEngine {
+): WorkerEngine => {
   assertNotInPageDeviceCallback();
+  let raw: RawStructuredWasmEngine;
   try {
-    return new StructuredWasmEngine(new RawEngine(guardWasmPageDevice(device)));
+    raw = new RawEngine(guardWasmPageDevice(device));
   } catch (error) {
     throw normalizeWasmConstructorError(error);
   }
-}
+  return adaptStructuredWasmEngine(raw);
+};
 
 /** Normalizes the direct error payload thrown while opening the raw engine. */
-export function normalizeWasmConstructorError(error: unknown): unknown {
-  if (!isBridgeErrorPayload(error)) {
-    return error;
-  }
-  return new WasmBridgeError(error.code, error.message, error.retryable);
-}
+export const normalizeWasmConstructorError = (error: unknown): unknown =>
+  isBridgeErrorPayload(error)
+    ? new WasmBridgeError(error.code, error.message, error.retryable)
+    : error;
 
-/** WorkerEngine adapter that passes structured values directly into WASM. */
-export class StructuredWasmEngine implements WorkerEngine {
-  readonly #raw: RawStructuredWasmEngine;
-  #state: 'open' | 'poisoned' | 'closed' = 'open';
-  #rawReleased = false;
+/**
+ * Adapts a raw engine to WorkerEngine, passing structured values straight into
+ * WASM.
+ *
+ * The engine is a frozen object over closure state rather than a class: only
+ * the eleven operations are observable from outside, and the state machine that
+ * decides whether the next call is even allowed stays entirely private.
+ */
+export const adaptStructuredWasmEngine = (
+  raw: RawStructuredWasmEngine,
+): WorkerEngine => {
+  assertNotInPageDeviceCallback();
+  let state: 'open' | 'poisoned' | 'closed' = 'open';
+  let rawReleased = false;
 
-  constructor(raw: RawStructuredWasmEngine) {
-    assertNotInPageDeviceCallback();
-    this.#raw = raw;
-  }
+  const call = (operation: number, payload: unknown): unknown =>
+    raw.callStructured(BRIDGE_VERSION, operation, payload);
 
-  executeSql(sql: string, params: JsonValue[]): SqlResult {
-    this.#assertCallable();
-    preflightExecuteSql(sql, params);
-    return this.#invoke(
-      WASM_OPERATION.executeSql,
-      {sql, params},
-      true,
-      decodeSqlResultResponse,
-    );
-  }
-
-  prepareSql(sql: string): number {
-    this.#assertCallable();
-    preflightPrepareSql(sql);
-    return this.#invoke(
-      WASM_OPERATION.prepareSql,
-      sql,
-      false,
-      decodePreparedStatementIdResponse,
-    );
-  }
-
-  executePrepared(statementId: number, params: JsonValue[]): SqlResult {
-    this.#assertCallable();
-    preflightExecutePrepared(statementId, params);
-    return this.#invoke(
-      WASM_OPERATION.executePrepared,
-      {statementId, params},
-      true,
-      decodeSqlResultResponse,
-    );
-  }
-
-  closePrepared(statementId: number): void {
-    this.#assertCallable();
-    preflightClosePrepared(statementId);
-    this.#invoke(
-      WASM_OPERATION.closePrepared,
-      statementId,
-      false,
-      decodeUnitResponse,
-    );
-  }
-
-  execSql(sql: string): SqlResult[] {
-    this.#assertCallable();
-    preflightExecSql(sql);
-    return this.#invoke(
-      WASM_OPERATION.execSql,
-      sql,
-      true,
-      decodeSqlResultsResponse,
-    );
-  }
-
-  beginTransaction(): void {
-    this.#assertCallable();
-    this.#invoke(
-      WASM_OPERATION.begin,
-      undefined,
-      false,
-      decodeUnitResponse,
-    );
-  }
-
-  commitTransaction(): ApplyOutcome {
-    this.#assertCallable();
-    return this.#invoke(
-      WASM_OPERATION.commit,
-      undefined,
-      true,
-      decodeApplyOutcomeResponse,
-    );
-  }
-
-  rollbackTransaction(): void {
-    this.#assertCallable();
-    this.#invoke(
-      WASM_OPERATION.rollback,
-      undefined,
-      false,
-      decodeUnitResponse,
-    );
-  }
-
-  inTransaction(): boolean {
-    this.#assertCallable();
-    return this.#invoke(
-      WASM_OPERATION.inTransaction,
-      undefined,
-      false,
-      decodeBooleanResponse,
-    );
-  }
-
-  revision(): number {
-    this.#assertCallable();
-    return this.#invoke(
-      WASM_OPERATION.revision,
-      undefined,
-      false,
-      decodeRevisionResponse,
-    );
-  }
-
-  close(): void {
-    assertNotInPageDeviceCallback();
-    if (this.#state === 'closed') {
+  const releaseRaw = (): void => {
+    if (rawReleased) {
       return;
     }
-    const wasOpen = this.#state === 'open';
-    this.#state = 'closed';
+    rawReleased = true;
     try {
-      if (wasOpen) {
-        const response = this.#raw.callStructured(
-          BRIDGE_VERSION,
-          WASM_OPERATION.close,
-          undefined,
-        );
-        decodeUnitResponse(response);
-      }
-    } finally {
-      this.#releaseRaw();
+      raw.free?.();
+    } catch {
+      // The first uncertain/fatal/close result remains decisive.
     }
-  }
+  };
 
-  #invoke<Result>(
+  const closeRaw = (): void => {
+    if (state !== 'open') {
+      return;
+    }
+    state = 'poisoned';
+    try {
+      call(WASM_OPERATION.close, undefined);
+    } catch {
+      // The first uncertain/fatal result remains decisive.
+    }
+    releaseRaw();
+  };
+
+  const poisonUnknown = (error: unknown): WasmBridgeError => {
+    closeRaw();
+    return new WasmBridgeError(
+      'STORAGE_COMMIT_OUTCOME_UNKNOWN',
+      'TinyJoin could not decode a result after a possible durable mutation' +
+        errorDetail(error),
+      false,
+    );
+  };
+
+  const assertCallable = (): void => {
+    assertNotInPageDeviceCallback();
+    if (state === 'poisoned') {
+      throw new WasmBridgeError(
+        'STORAGE_ENGINE_POISONED',
+        'The TinyJoin engine cannot be used after an uncertain result',
+        false,
+      );
+    }
+    if (state === 'closed') {
+      throw new WasmBridgeError('ENGINE_CLOSED', 'The TinyJoin engine is closed');
+    }
+  };
+
+  // Callers assert first, so that a closed engine is reported before a request
+  // is measured. `mayPublish` marks the operations whose failure could have
+  // already changed durable state, and which therefore poison the engine when
+  // their outcome cannot be read back.
+  const invoke = <Result>(
     operation: number,
     payload: unknown,
     mayPublish: boolean,
     decode: (value: unknown) => Result,
-  ): Result {
-    this.#assertCallable();
+  ): Result => {
     let response: unknown;
     try {
-      response = this.#raw.callStructured(
-        BRIDGE_VERSION,
-        operation,
-        payload,
-      );
+      response = call(operation, payload);
     } catch (error) {
-      if (mayPublish) {
-        throw this.#poisonUnknown(error);
-      }
-      throw error;
+      throw mayPublish ? poisonUnknown(error) : error;
     }
     try {
       return decode(response);
@@ -285,241 +191,265 @@ export class StructuredWasmEngine implements WorkerEngine {
         error instanceof WasmBridgeError &&
         !(error instanceof WasmStructuredDecodeError)
       ) {
-        this.#closeOnFatalRemoteError(error);
+        if (FATAL_REMOTE_CODES.includes(error.code)) {
+          closeRaw();
+        }
         throw error;
       }
       const disposition =
         error instanceof WasmStructuredDecodeError
           ? error.disposition
           : undefined;
-      if (
-        disposition === 'durable' ||
-        (disposition === undefined && mayPublish)
-      ) {
-        throw this.#poisonUnknown(error);
-      }
-      throw error;
+      throw disposition === 'durable' ||
+        (isUndefined(disposition) && mayPublish)
+        ? poisonUnknown(error)
+        : error;
     }
-  }
+  };
 
-  #assertCallable(): void {
-    assertNotInPageDeviceCallback();
-    if (this.#state === 'poisoned') {
-      throw new WasmBridgeError(
-        'STORAGE_ENGINE_POISONED',
-        'The TinyJoin engine cannot be used after an uncertain result',
+  // Every operation asserts that the engine is still callable, measures its
+  // request, and then invokes.
+  return objFreeze({
+    executeSql: (sql: string, params: JsonValue[]): SqlResult => {
+      assertCallable();
+      preflightExecuteSql(sql, params);
+      return invoke(
+        WASM_OPERATION.executeSql,
+        {sql, params},
+        true,
+        decodeSqlResult,
+      );
+    },
+
+    prepareSql: (sql: string): number => {
+      assertCallable();
+      preflightPrepareSql(sql);
+      return invoke(
+        WASM_OPERATION.prepareSql,
+        sql,
         false,
+        decodePreparedStatementId,
       );
-    }
-    if (this.#state === 'closed') {
-      throw new WasmBridgeError(
-        'ENGINE_CLOSED',
-        'The TinyJoin engine is closed',
+    },
+
+    executePrepared: (statementId: number, params: JsonValue[]): SqlResult => {
+      assertCallable();
+      preflightExecutePrepared(statementId, params);
+      return invoke(
+        WASM_OPERATION.executePrepared,
+        {statementId, params},
+        true,
+        decodeSqlResult,
       );
-    }
-  }
+    },
 
-  #closeOnFatalRemoteError(error: WasmBridgeError): void {
-    if (
-      error.code === 'RECOVERY_REQUIRED' ||
-      error.code === 'STORAGE_COMMIT_OUTCOME_UNKNOWN' ||
-      error.code === 'STORAGE_ENGINE_POISONED'
-    ) {
-      this.#closeRaw();
-    }
-  }
+    closePrepared: (statementId: number): void => {
+      assertCallable();
+      preflightClosePrepared(statementId);
+      invoke(WASM_OPERATION.closePrepared, statementId, false, decodeUnit);
+    },
 
-  #poisonUnknown(error: unknown): WasmBridgeError {
-    this.#closeRaw();
-    const detail =
-      error instanceof Error && error.message ? `: ${error.message}` : '';
-    return new WasmBridgeError(
-      'STORAGE_COMMIT_OUTCOME_UNKNOWN',
-      `TinyJoin could not decode a result after a possible durable mutation${detail}`,
+    execSql: (sql: string): SqlResult[] => {
+      assertCallable();
+      preflightExecSql(sql);
+      return invoke(WASM_OPERATION.execSql, sql, true, decodeSqlResults);
+    },
+
+    beginTransaction: (): void => {
+      assertCallable();
+      invoke(WASM_OPERATION.begin, undefined, false, decodeUnit);
+    },
+
+    commitTransaction: (): ApplyOutcome => {
+      assertCallable();
+      return invoke(WASM_OPERATION.commit, undefined, true, decodeApplyOutcome);
+    },
+
+    rollbackTransaction: (): void => {
+      assertCallable();
+      invoke(WASM_OPERATION.rollback, undefined, false, decodeUnit);
+    },
+
+    inTransaction: (): boolean => {
+      assertCallable();
+      return invoke(
+        WASM_OPERATION.inTransaction,
+        undefined,
+        false,
+        decodeBoolean,
+      );
+    },
+
+    revision: (): number => {
+      assertCallable();
+      return invoke(WASM_OPERATION.revision, undefined, false, decodeRevision);
+    },
+
+    close: (): void => {
+      assertNotInPageDeviceCallback();
+      if (state === 'closed') {
+        return;
+      }
+      const wasOpen = state === 'open';
+      state = 'closed';
+      try {
+        if (wasOpen) {
+          decodeUnit(call(WASM_OPERATION.close, undefined));
+        }
+      } finally {
+        releaseRaw();
+      }
+    },
+  });
+};
+
+// A remote failure with one of these codes means the engine is already beyond
+// use, so the raw handle is closed rather than left for the next call.
+const FATAL_REMOTE_CODES = [
+  'RECOVERY_REQUIRED',
+  'STORAGE_COMMIT_OUTCOME_UNKNOWN',
+  'STORAGE_ENGINE_POISONED',
+];
+
+// WASM only ever sees a frozen device whose every method runs inside the
+// reentrancy guard, so that page storage cannot call back into the engine.
+const guardWasmPageDevice = (device: PageDevice): PageDevice =>
+  objFreeze({
+    pageCount: () => inPageDeviceCallback(() => device.pageCount()),
+    readPage: (low: number, high: number, target: Uint8Array) =>
+      inPageDeviceCallback(() => device.readPage(low, high, target)),
+    writePage: (low: number, high: number, source: Uint8Array) =>
+      inPageDeviceCallback(() => device.writePage(low, high, source)),
+    flush: () => inPageDeviceCallback(() => device.flush()),
+    close: () => inPageDeviceCallback(() => device.close()),
+  });
+
+const inPageDeviceCallback = <Result>(callback: () => Result): Result => {
+  insidePageDeviceCallback += 1;
+  try {
+    return callback();
+  } finally {
+    insidePageDeviceCallback -= 1;
+  }
+};
+
+const assertNotInPageDeviceCallback = (): void => {
+  if (insidePageDeviceCallback !== 0) {
+    throw new WasmBridgeError(
+      'ENGINE_REENTRANT_CALL',
+      'TinyJoin cannot enter a WASM engine from a page-device callback',
       false,
     );
   }
+};
 
-  #closeRaw(): void {
-    if (this.#state !== 'open') {
-      return;
+/**
+ * Reads one `[version, status, disposition, payload]` envelope. The disposition
+ * says whether a failure the bridge could not read might still have been
+ * published, which is what decides between an error and a poisoned engine.
+ */
+const decoder =
+  <Result>(label: string, isValid: (payload: unknown) => payload is Result) =>
+  (value: unknown): Result => {
+    if (!isDenseEnvelope(value)) {
+      throw invalidStructured('response envelope');
     }
-    this.#state = 'poisoned';
-    try {
-      this.#raw.callStructured(BRIDGE_VERSION, WASM_OPERATION.close, undefined);
-    } catch {
-      // The first uncertain/fatal result remains decisive.
-    }
-    this.#releaseRaw();
-  }
-
-  #releaseRaw(): void {
-    if (this.#rawReleased) {
-      return;
-    }
-    this.#rawReleased = true;
-    try {
-      this.#raw.free?.();
-    } catch {
-      // The first uncertain/fatal/close result remains decisive.
-    }
-  }
-}
-
-function decodeUnitResponse(value: unknown): void {
-  return decodeResponse(value, 'unit result', (payload) =>
-    payload === undefined ? undefined : INVALID_RESULT,
-  );
-}
-
-function decodeBooleanResponse(value: unknown): boolean {
-  return decodeResponse(value, 'boolean result', (payload) =>
-    typeof payload === 'boolean' ? payload : INVALID_RESULT,
-  );
-}
-
-function decodeRevisionResponse(value: unknown): number {
-  return decodeResponse(value, 'revision', (payload) =>
-    numberIsSafeInteger(payload) && Number(payload) >= 0
-      ? Number(payload)
-      : INVALID_RESULT,
-  );
-}
-
-function decodePreparedStatementIdResponse(
-  value: unknown,
-): number {
-  return decodeResponse(value, 'prepared statement ID', (payload) =>
-    numberIsSafeInteger(payload) &&
-    Number(payload) > 0 &&
-    Number(payload) <= MAX_U32
-      ? Number(payload)
-      : INVALID_RESULT,
-  );
-}
-
-function decodeApplyOutcomeResponse(
-  value: unknown,
-): ApplyOutcome {
-  return decodeResponse(value, 'apply outcome', (payload) =>
-    isRpcResult('commitTransaction', payload) ? payload : INVALID_RESULT,
-  );
-}
-
-function decodeSqlResultResponse(value: unknown): SqlResult {
-  return decodeResponse(value, 'SQL result', (payload) =>
-    isRpcResult('executeSql', payload) ? payload : INVALID_RESULT,
-  );
-}
-
-function decodeSqlResultsResponse(
-  value: unknown,
-): SqlResult[] {
-  return decodeResponse(value, 'SQL results', (payload) =>
-    isRpcResult('execSql', payload) ? payload : INVALID_RESULT,
-  );
-}
-
-const INVALID_RESULT = Symbol('invalid structured result');
-
-function decodeResponse<Result>(
-  value: unknown,
-  label: string,
-  decode: (payload: unknown) => Result | typeof INVALID_RESULT,
-): Result {
-  if (!isDenseEnvelope(value)) {
-    throw new WasmStructuredDecodeError(
-      'WASM returned an invalid structured response envelope',
-    );
-  }
-  if (value[0] !== BRIDGE_VERSION) {
-    throw new WasmStructuredDecodeError(
-      'WASM returned an unsupported structured bridge version',
-    );
-  }
-  const status = value[1];
-  if (status !== SUCCESS && status !== FAILURE) {
-    throw new WasmStructuredDecodeError(
-      'WASM returned an invalid structured response status',
-    );
-  }
-  const dispositionTag = value[2];
-  if (dispositionTag !== SAFE_RESPONSE && dispositionTag !== DURABLE_RESPONSE) {
-    throw new WasmStructuredDecodeError(
-      'WASM returned an invalid structured response disposition',
-    );
-  }
-  const disposition: StructuredResponseDisposition =
-    dispositionTag === DURABLE_RESPONSE ? 'durable' : 'safe';
-  const payload = value[3];
-  if (status === FAILURE) {
-    if (disposition !== 'safe') {
+    if (value[0] !== BRIDGE_VERSION) {
       throw new WasmStructuredDecodeError(
-        'WASM returned a durable structured failure envelope',
-        disposition,
+        'WASM returned an unsupported structured bridge version',
       );
     }
-    if (!isBridgeErrorPayload(payload)) {
-      throw new WasmStructuredDecodeError(
-        'WASM returned an invalid structured error',
-        disposition,
+    const status = value[1];
+    if (status !== SUCCESS && status !== FAILURE) {
+      throw invalidStructured('response status');
+    }
+    const dispositionTag = value[2];
+    if (
+      dispositionTag !== SAFE_RESPONSE &&
+      dispositionTag !== DURABLE_RESPONSE
+    ) {
+      throw invalidStructured('response disposition');
+    }
+    const disposition: StructuredResponseDisposition =
+      dispositionTag === DURABLE_RESPONSE ? 'durable' : 'safe';
+    const payload = value[3];
+    if (status === FAILURE) {
+      if (disposition !== 'safe') {
+        throw new WasmStructuredDecodeError(
+          'WASM returned a durable structured failure envelope',
+          disposition,
+        );
+      }
+      if (!isBridgeErrorPayload(payload)) {
+        throw invalidStructured('error', disposition);
+      }
+      throw new WasmBridgeError(
+        payload.code,
+        payload.message,
+        payload.retryable,
       );
     }
-    throw new WasmBridgeError(payload.code, payload.message, payload.retryable);
-  }
+    if (!isValid(payload)) {
+      throw invalidStructured(label, disposition);
+    }
+    return payload;
+  };
 
-  const result = decode(payload);
-  if (result === INVALID_RESULT) {
-    throw new WasmStructuredDecodeError(
-      `WASM returned an invalid structured ${label}`,
-      disposition,
-    );
-  }
-  return result;
-}
-
-function isDenseEnvelope(value: unknown): value is unknown[] {
-  return (
-    arrayIsArray(value) &&
-    value.length === 4 &&
-    hasOwn(value, 0) &&
-    hasOwn(value, 1) &&
-    hasOwn(value, 2) &&
-    hasOwn(value, 3)
+const invalidStructured = (
+  what: string,
+  disposition?: StructuredResponseDisposition,
+): WasmStructuredDecodeError =>
+  new WasmStructuredDecodeError(
+    `WASM returned an invalid structured ${what}`,
+    disposition,
   );
-}
 
-interface BridgeErrorPayload {
-  readonly code: string;
-  readonly message: string;
-  readonly retryable?: boolean;
-}
+const decodeUnit = decoder('unit result', isUndefined);
+const decodeBoolean = decoder('boolean result', isBoolean);
+const decodeRevision = decoder('revision', isCount);
+const decodePreparedStatementId = decoder(
+  'prepared statement ID',
+  (payload): payload is number => isCountWithin(payload, 1, MAX_U32),
+);
+const decodeApplyOutcome = decoder(
+  'apply outcome',
+  (payload): payload is ApplyOutcome => isRpcResult('commitTransaction', payload),
+);
+const decodeSqlResult = decoder(
+  'SQL result',
+  (payload): payload is SqlResult => isRpcResult('executeSql', payload),
+);
+const decodeSqlResults = decoder(
+  'SQL results',
+  (payload): payload is SqlResult[] => isRpcResult('execSql', payload),
+);
 
-function isBridgeErrorPayload(value: unknown): value is BridgeErrorPayload {
-  if (typeof value !== 'object' || value === null || arrayIsArray(value)) {
+const isDenseEnvelope = (value: unknown): value is unknown[] =>
+  arrayIsArray(value) &&
+  value.length === 4 &&
+  ENVELOPE_SLOTS.every((slot) => objHasOwn(value, slot));
+
+// A bridge error payload is exactly its code, message and optional retryable
+// flag: anything else is a result that WASM mislabelled as a failure.
+const isBridgeErrorPayload = (value: unknown): value is CodedError => {
+  if (!isRecord(value)) {
     return false;
   }
   let keys: (string | symbol)[];
   try {
-    keys = Reflect.ownKeys(value);
+    keys = ownKeys(value);
   } catch {
     return false;
   }
-  if (
-    keys.length < 2 ||
-    keys.length > 3 ||
-    !keys.every(
-      (key) => key === 'code' || key === 'message' || key === 'retryable',
-    )
-  ) {
-    return false;
-  }
-  const record = value as Record<string, unknown>;
   return (
-    hasOwn(record, 'code') &&
-    hasOwn(record, 'message') &&
-    typeof record.code === 'string' &&
-    typeof record.message === 'string' &&
-    (!hasOwn(record, 'retryable') || typeof record.retryable === 'boolean')
+    isCountWithin(keys.length, 2, 3) &&
+    keys.every((key) => BRIDGE_ERROR_KEYS.includes(key as string)) &&
+    objHasOwn(value, 'code') &&
+    objHasOwn(value, 'message') &&
+    isString(value.code) &&
+    isString(value.message) &&
+    (!objHasOwn(value, 'retryable') || isBoolean(value.retryable))
   );
-}
+};
+
+const BRIDGE_ERROR_KEYS = ['code', 'message', 'retryable'];

@@ -7,8 +7,8 @@ import type {
 import type {PageDevice} from '../../src/worker/page-device.ts';
 import {
   WASM_OPERATION,
-  StructuredWasmEngine,
   WasmStructuredDecodeError,
+  adaptStructuredWasmEngine,
   createStructuredWasmEngine,
   normalizeWasmConstructorError,
   type RawStructuredWasmEngine,
@@ -135,7 +135,7 @@ describe('WASM engine bridge', () => {
   it('passes the exact structured payload shapes through every operation', () => {
     const raw = new FakeRawEngine();
     raw.responseFor = ({operation}) => responseForOperation(operation);
-    const engine = new StructuredWasmEngine(raw);
+    const engine = adaptStructuredWasmEngine(raw);
 
     const params = [3, 'three'];
     const preparedParams = [4];
@@ -220,14 +220,14 @@ describe('WASM engine bridge', () => {
     const raw = new FakeRawEngine();
     const result = sqlResult([{id: 1}]);
     raw.response = success(result);
-    const engine = new StructuredWasmEngine(raw);
+    const engine = adaptStructuredWasmEngine(raw);
 
     expect(engine.executeSql('SELECT id FROM items', [])).toBe(result);
   });
 
   it('preflights structured requests before entering WASM', () => {
     const raw = new FakeRawEngine();
-    const engine = new StructuredWasmEngine(raw);
+    const engine = adaptStructuredWasmEngine(raw);
     const accessor = {} as {value?: number};
     Object.defineProperty(accessor, 'value', {
       enumerable: true,
@@ -242,7 +242,7 @@ describe('WASM engine bridge', () => {
 
   it('fully validates structured results while preserving SAFE failures', () => {
     const raw = new FakeRawEngine();
-    const engine = new StructuredWasmEngine(raw);
+    const engine = adaptStructuredWasmEngine(raw);
     raw.response = success({
       ...sqlResult(),
       rows: [{created: new Date()}],
@@ -263,7 +263,7 @@ describe('WASM engine bridge', () => {
     ]) {
       const raw = new FakeRawEngine();
       raw.response = response;
-      const engine = new StructuredWasmEngine(raw);
+      const engine = adaptStructuredWasmEngine(raw);
 
       expect(() =>
         engine.executeSql('INSERT INTO items VALUES (1)', []),
@@ -284,7 +284,7 @@ describe('WASM engine bridge', () => {
   it('keeps malformed nonmutating control results nonfatal', () => {
     const raw = new FakeRawEngine();
     raw.response = [99, SUCCESS, SAFE, undefined];
-    const engine = new StructuredWasmEngine(raw);
+    const engine = adaptStructuredWasmEngine(raw);
 
     expect(() => engine.revision()).toThrow(WasmStructuredDecodeError);
     expect(raw.closeCalls).toBe(0);
@@ -300,7 +300,7 @@ describe('WASM engine bridge', () => {
     ]) {
       const raw = new FakeRawEngine();
       raw.response = failure(code, 'reopen', false);
-      const engine = new StructuredWasmEngine(raw);
+      const engine = adaptStructuredWasmEngine(raw);
 
       expect(() => engine.revision()).toThrow(
         expect.objectContaining({code, retryable: false}),

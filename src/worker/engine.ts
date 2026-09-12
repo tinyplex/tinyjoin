@@ -4,7 +4,7 @@ import type {
   SqlResult,
   StorageOptions,
 } from '../protocol.js';
-import {MemoryPageDevice, type PageDevice} from './page-device.js';
+import {createMemoryPageDevice, type PageDevice} from './page-device.js';
 import {createStructuredWasmEngine} from './wasm-bridge.js';
 
 export interface WorkerEngine {
@@ -26,15 +26,14 @@ export type WorkerEngineFactory = (
 ) => Promise<WorkerEngine>;
 
 /** Opens the page-native default engine on an ephemeral in-memory page device. */
-export async function createMemoryWasmEngine(): Promise<WorkerEngine> {
-  return createPageWasmEngine(new MemoryPageDevice());
-}
+export const createMemoryWasmEngine = (): Promise<WorkerEngine> =>
+  createPageWasmEngine(createMemoryPageDevice());
 
 /** Opens the page-native engine on a caller-owned device transferred to WASM. */
-export async function createPageWasmEngine(
+export const createPageWasmEngine = async (
   device: PageDevice,
-): Promise<WorkerEngine> {
+): Promise<WorkerEngine> => {
   const wasm = await import('../wasm/tinyjoin_wasm.js');
   await wasm.default();
   return createStructuredWasmEngine(wasm.WasmEngine, device);
-}
+};

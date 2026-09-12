@@ -1,3 +1,4 @@
+import {isUndefined, objFreeze} from '../common.js';
 import {
   PROTOCOL_VERSION,
   isRpcResult,
@@ -10,9 +11,18 @@ import {
   type WorkerRequest,
 } from '../protocol.js';
 import type {WorkerLike} from './client.js';
-import {ClientError} from './error.js';
+import {ClientError, clientError} from './error.js';
 
 export type ResultValidation = 'full' | 'header';
+
+export interface WorkerRpc {
+  request<Method extends RpcMethod>(
+    method: Method,
+    params: RpcMethods[Method]['request'],
+  ): Promise<RpcMethods[Method]['response']>;
+  onEvent(listener: (event: WorkerEvent) => void): void;
+  dispose(error?: ClientError): void;
+}
 
 type PendingRequest = {
   method: RpcMethod;
@@ -20,149 +30,135 @@ type PendingRequest = {
   reject(error: unknown): void;
 };
 
-export class WorkerRpc {
-  readonly #worker: WorkerLike;
-  readonly #pending = new Map<number, PendingRequest>();
-  readonly #eventListeners = new Set<(event: WorkerEvent) => void>();
-  readonly #resultValidation: ResultValidation;
-  #nextId = 1;
-  #disposed = false;
+const TERMINATED = 'WORKER_TERMINATED';
+const TERMINATED_MESSAGE = 'The TinyJoin worker has been closed';
+const MISMATCH = 'PROTOCOL_MISMATCH';
 
-  constructor(worker: WorkerLike, resultValidation: ResultValidation = 'full') {
-    this.#worker = worker;
-    this.#resultValidation = resultValidation;
-    worker.addEventListener('message', this.#onMessage);
-    worker.addEventListener('messageerror', this.#onMessageError);
-    worker.addEventListener('error', this.#onError);
-  }
+/**
+ * Carries the RPC protocol over one Worker.
+ *
+ * Anything that makes the Worker untrustworthy - an unreadable message, an
+ * unexpected result, a crash - disposes the connection and rejects every
+ * request still in flight, rather than leaving a caller waiting forever.
+ */
+export const createWorkerRpc = (
+  worker: WorkerLike,
+  resultValidation: ResultValidation = 'full',
+): WorkerRpc => {
+  const pending = new Map<number, PendingRequest>();
+  const eventListeners = new Set<(event: WorkerEvent) => void>();
+  let nextId = 1;
+  let disposed = false;
 
-  request<Method extends RpcMethod>(
-    method: Method,
-    params: RpcMethods[Method]['request'],
-  ): Promise<RpcMethods[Method]['response']> {
-    if (this.#disposed) {
-      return Promise.reject(
-        new ClientError({
-          code: 'WORKER_TERMINATED',
-          message: 'The TinyJoin worker has been closed',
-        }),
-      );
-    }
-
-    const id = this.#nextId++;
-    const request = {
-      v: PROTOCOL_VERSION,
-      id,
-      method,
-      params,
-    } as WorkerRequest;
-
-    return new Promise((resolve, reject) => {
-      this.#pending.set(id, {method, resolve, reject});
-      try {
-        this.#worker.postMessage(request);
-      } catch (error) {
-        this.#pending.delete(id);
-        reject(clientErrorFromUnknown(error, 'WORKER_POST_FAILED'));
-      }
-    }) as Promise<RpcMethods[Method]['response']>;
-  }
-
-  onEvent(listener: (event: WorkerEvent) => void): void {
-    this.#eventListeners.add(listener);
-  }
-
-  dispose(error?: ClientError): void {
-    if (this.#disposed) {
+  const dispose = (error?: ClientError): void => {
+    if (disposed) {
       return;
     }
-    this.#disposed = true;
-    this.#worker.removeEventListener('message', this.#onMessage);
-    this.#worker.removeEventListener('messageerror', this.#onMessageError);
-    this.#worker.removeEventListener('error', this.#onError);
-    this.#worker.terminate?.();
-    const reason =
-      error ??
-      new ClientError({
-        code: 'WORKER_TERMINATED',
-        message: 'The TinyJoin worker has been closed',
-      });
-    for (const pending of this.#pending.values()) {
-      pending.reject(reason);
+    disposed = true;
+    worker.removeEventListener('message', onMessage);
+    worker.removeEventListener('messageerror', onMessageError);
+    worker.removeEventListener('error', onError);
+    worker.terminate?.();
+    const reason = error ?? clientError(TERMINATED, TERMINATED_MESSAGE);
+    for (const request of pending.values()) {
+      request.reject(reason);
     }
-    this.#pending.clear();
-    this.#eventListeners.clear();
-  }
+    pending.clear();
+    eventListeners.clear();
+  };
 
-  readonly #onMessage = (event: MessageEvent<unknown>): void => {
+  const onMessage = (event: MessageEvent<unknown>): void => {
     if (isWorkerEvent(event.data)) {
-      for (const listener of this.#eventListeners) {
+      for (const listener of eventListeners) {
         listener(event.data);
       }
       return;
     }
     if (!isWorkerResponse(event.data)) {
-      this.dispose(
-        new ClientError({
-          code: 'PROTOCOL_MISMATCH',
-          message: 'The TinyJoin worker sent an invalid protocol message',
-        }),
+      dispose(
+        clientError(
+          MISMATCH,
+          'The TinyJoin worker sent an invalid protocol message',
+        ),
       );
       return;
     }
-
-    const pending = this.#pending.get(event.data.id);
-    if (!pending) {
+    const request = pending.get(event.data.id);
+    if (isUndefined(request)) {
       return;
     }
-    if (event.data.ok) {
-      const validResult =
-        this.#resultValidation === 'full'
-          ? isRpcResult(pending.method, event.data.result)
-          : isRpcResultHeader(pending.method, event.data.result);
-      if (!validResult) {
-        this.dispose(
-          new ClientError({
-            code: 'PROTOCOL_MISMATCH',
-            message:
-              'The TinyJoin worker returned an invalid result for the requested operation',
-          }),
-        );
-        return;
-      }
-      this.#pending.delete(event.data.id);
-      pending.resolve(event.data.result);
-    } else {
-      this.#pending.delete(event.data.id);
-      pending.reject(new ClientError(event.data.error));
+    if (!event.data.ok) {
+      pending.delete(event.data.id);
+      request.reject(new ClientError(event.data.error));
+      return;
     }
+    const isValid =
+      resultValidation === 'full' ? isRpcResult : isRpcResultHeader;
+    if (!isValid(request.method, event.data.result)) {
+      dispose(
+        clientError(
+          MISMATCH,
+          'The TinyJoin worker returned an invalid result for the requested operation',
+        ),
+      );
+      return;
+    }
+    pending.delete(event.data.id);
+    request.resolve(event.data.result);
   };
 
-  readonly #onMessageError = (): void => {
-    this.dispose(
-      new ClientError({
-        code: 'WORKER_MESSAGE_ERROR',
-        message: 'The browser could not deserialize a TinyJoin worker message',
-      }),
+  const onMessageError = (): void =>
+    dispose(
+      clientError(
+        'WORKER_MESSAGE_ERROR',
+        'The browser could not deserialize a TinyJoin worker message',
+      ),
     );
-  };
 
-  readonly #onError = (event: ErrorEvent): void => {
-    this.dispose(
-      new ClientError({
-        code: 'WORKER_ERROR',
-        message: event.message || 'The TinyJoin worker crashed',
-      }),
+  const onError = (event: ErrorEvent): void =>
+    dispose(
+      clientError(
+        'WORKER_ERROR',
+        event.message || 'The TinyJoin worker crashed',
+      ),
     );
-  };
-}
 
-function clientErrorFromUnknown(error: unknown, code: string): ClientError {
-  if (error instanceof ClientError) {
-    return error;
-  }
-  return new ClientError({
-    code,
-    message: error instanceof Error ? error.message : String(error),
+  worker.addEventListener('message', onMessage);
+  worker.addEventListener('messageerror', onMessageError);
+  worker.addEventListener('error', onError);
+
+  return objFreeze({
+    request: <Method extends RpcMethod>(
+      method: Method,
+      params: RpcMethods[Method]['request'],
+    ): Promise<RpcMethods[Method]['response']> => {
+      if (disposed) {
+        return Promise.reject(clientError(TERMINATED, TERMINATED_MESSAGE));
+      }
+      const id = nextId++;
+      const message = {v: PROTOCOL_VERSION, id, method, params} as WorkerRequest;
+      return new Promise((resolve, reject) => {
+        pending.set(id, {method, resolve, reject});
+        try {
+          worker.postMessage(message);
+        } catch (error) {
+          pending.delete(id);
+          reject(
+            error instanceof ClientError
+              ? error
+              : clientError(
+                  'WORKER_POST_FAILED',
+                  error instanceof Error ? error.message : String(error),
+                ),
+          );
+        }
+      }) as Promise<RpcMethods[Method]['response']>;
+    },
+
+    onEvent: (listener: (event: WorkerEvent) => void): void => {
+      eventListeners.add(listener);
+    },
+
+    dispose,
   });
-}
+};

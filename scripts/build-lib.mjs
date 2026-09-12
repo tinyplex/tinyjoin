@@ -7,7 +7,7 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import {spawnSync} from 'node:child_process';
-import {basename, dirname, resolve} from 'node:path';
+import {basename, dirname, relative, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 import {build as esbuildBuild} from 'esbuild';
@@ -30,6 +30,8 @@ const dist = resolve(root, 'dist');
 // everything that is not public API, and leaves the OPFS page device out of a
 // Worker that only ever opens a memory database.
 const RUNTIME_BUNDLES = [
+  // Bundled first, so that both sides can then share it as one file.
+  {entry: 'protocol.js', shared: {}},
   {entry: 'index.js', shared: {'protocol.js': './protocol.js'}},
   {
     entry: 'worker/index.js',
@@ -66,6 +68,20 @@ const TERSER_OPTIONS = {
   module: true,
 };
 
+// Every reference a published file makes to a sibling has to name a published
+// file. A private module that is still imported rather than bundled resolves
+// during the build but not in a browser, which is a mistake worth failing on.
+const RUNTIME_REFERENCE =
+  /(?:\bfrom|\bimport|\bnew URL\s*\()\s*\(?\s*["'](\.[^"']+)["']/g;
+
+// An application's bundler only emits the default Worker when it can see this
+// exact shape in the client bundle, and only resolves it to the right file when
+// the bundle sits beside the worker directory.
+const DEFAULT_WORKER_MARKERS = [
+  /new Worker\(\s*new URL\(\s*(['"])\.\/worker\/default-entry\.js\1/,
+  /type:\s*(['"])module\1/,
+];
+
 // The Worker must reach the private OPFS runtime through a bundler-ignored
 // dynamic import, so that an application build does not pull page storage into
 // the Worker entry. Quoting is the minifier's choice, not ours.
@@ -95,7 +111,9 @@ if (compile.status !== 0) {
 await buildPrivateWorkerRuntime();
 await bundleRuntime();
 await minifyRuntime();
-await assertOpfsLoaderBoundary();
+await assertPublishedImports();
+await assertMarkers('index.js', DEFAULT_WORKER_MARKERS, 'default Worker');
+await assertMarkers('worker/index.js', OPFS_LOADER_MARKERS, 'OPFS loader');
 await buildDefinitions(root, dist);
 
 const manifest = JSON.parse(
@@ -199,6 +217,21 @@ async function pruneBundledModules() {
     }
   }
   await pruneEmptyDirectories(dist);
+}
+
+async function assertPublishedImports() {
+  for (const file of RUNTIME_FILES) {
+    const path = resolve(dist, file);
+    const source = await readFile(path, 'utf8');
+    for (const [, specifier] of source.matchAll(RUNTIME_REFERENCE)) {
+      const referenced = relative(dist, resolve(dirname(path), specifier));
+      if (!RUNTIME_FILES.includes(referenced)) {
+        throw new Error(
+          `${file} references ${specifier}, which the package does not publish`,
+        );
+      }
+    }
+  }
 }
 
 async function minifyRuntime() {
@@ -322,12 +355,12 @@ function assertSelfContainedRuntime(
   return source;
 }
 
-async function assertOpfsLoaderBoundary() {
-  const path = resolve(dist, 'worker/index.js');
+async function assertMarkers(file, markers, label) {
+  const path = resolve(dist, file);
   const source = await readFile(path, 'utf8');
-  for (const marker of OPFS_LOADER_MARKERS) {
+  for (const marker of markers) {
     if (!marker.test(source)) {
-      throw new Error(`OPFS loader is missing ${marker.source}: ${path}`);
+      throw new Error(`The ${label} is missing ${marker.source}: ${path}`);
     }
   }
 }

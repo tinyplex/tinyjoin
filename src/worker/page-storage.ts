@@ -1,5 +1,13 @@
 import {
-  OpfsPageDevice,
+  asCodedError,
+  errorDetail,
+  errorName,
+  isFunction,
+  isUndefined,
+  objFreeze,
+} from '../common.js';
+import {
+  createOpfsPageDevice,
   type PageDevice,
   type SyncPageAccessHandle,
 } from './page-device.js';
@@ -37,15 +45,25 @@ export interface OpfsPageStorageSession {
   close(): void;
 }
 
+const OPFS_UNAVAILABLE = 'OPFS_UNAVAILABLE';
+
+// The DOMException names a browser uses when OPFS is present but unusable, as
+// opposed to a failure that is worth retrying.
+const UNAVAILABLE_NAMES = [
+  'InvalidStateError',
+  'NotAllowedError',
+  'SecurityError',
+];
+
 /** Opens the one page file that is the complete persistent database. */
-export async function createOpfsPageStorageSession(
+export const createOpfsPageStorageSession = async (
   databaseName: string,
   provider?: OpfsPageStorageProvider,
-): Promise<OpfsPageStorageSession> {
+): Promise<OpfsPageStorageSession> => {
   assertDatabaseName(databaseName);
   const selectedProvider = provider ?? defaultOpfsProvider();
   let handle: SyncPageAccessHandle | undefined;
-  let device: OpfsPageDevice | undefined;
+  let pageDevice: PageDevice | undefined;
   try {
     const root = await selectedProvider.getDirectory();
     const storageDirectory = await root.getDirectoryHandle(
@@ -61,46 +79,35 @@ export async function createOpfsPageStorageSession(
       {create: true},
     );
     handle = await openSyncHandle(file);
-    device = new OpfsPageDevice(handle);
+    pageDevice = createOpfsPageDevice(handle);
     handle = undefined;
-    return new OpfsPageStorageSessionImpl(device);
+    let closed = false;
+    const device = pageDevice;
+    return objFreeze({
+      pageDevice: device,
+      close: (): void => {
+        if (!closed) {
+          closed = true;
+          device.close();
+        }
+      },
+    });
   } catch (error) {
-    if (device !== undefined) {
-      closePreserving(device);
-    } else if (handle !== undefined) {
-      closePreserving(handle);
-    }
+    closePreserving(pageDevice ?? handle);
     throw storageError(
       error,
-      'OPFS_UNAVAILABLE',
+      OPFS_UNAVAILABLE,
       'TinyJoin could not open its OPFS page database',
     );
   }
-}
+};
 
-class OpfsPageStorageSessionImpl implements OpfsPageStorageSession {
-  readonly pageDevice: PageDevice;
-  #closed = false;
-
-  constructor(pageDevice: PageDevice) {
-    this.pageDevice = pageDevice;
-  }
-
-  close(): void {
-    if (this.#closed) {
-      return;
-    }
-    this.#closed = true;
-    this.pageDevice.close();
-  }
-}
-
-async function openSyncHandle(
+const openSyncHandle = async (
   file: OpfsPageStorageFileHandle,
-): Promise<SyncPageAccessHandle> {
-  if (typeof file.createSyncAccessHandle !== 'function') {
+): Promise<SyncPageAccessHandle> => {
+  if (!isFunction(file.createSyncAccessHandle)) {
     throw new StorageError(
-      'OPFS_UNAVAILABLE',
+      OPFS_UNAVAILABLE,
       'TinyJoin OPFS page storage requires synchronous access handles in a dedicated Worker',
     );
   }
@@ -109,62 +116,46 @@ async function openSyncHandle(
   } catch (error) {
     throw storageError(
       error,
-      'OPFS_UNAVAILABLE',
+      OPFS_UNAVAILABLE,
       'TinyJoin could not acquire its OPFS page database',
     );
   }
-}
+};
 
-function closePreserving(closeable: {close(): void}): void {
+const closePreserving = (closeable: {close(): void} | undefined): void => {
   try {
-    closeable.close();
+    closeable?.close();
   } catch {
     // Preserve the failure that prevented the database from opening.
   }
-}
+};
 
-function defaultOpfsProvider(): OpfsPageStorageProvider {
+const defaultOpfsProvider = (): OpfsPageStorageProvider => {
   const storage = globalThis.navigator?.storage as
     | {getDirectory?: () => Promise<OpfsPageStorageDirectoryHandle>}
     | undefined;
-  if (typeof storage?.getDirectory !== 'function') {
+  if (!isFunction(storage?.getDirectory)) {
     throw new StorageError(
-      'OPFS_UNAVAILABLE',
+      OPFS_UNAVAILABLE,
       'Origin private file system storage is unavailable in this runtime',
     );
   }
   return {getDirectory: () => storage.getDirectory!()};
-}
+};
 
-function storageError(
+const storageError = (
   error: unknown,
   fallbackCode: string,
   fallbackMessage: string,
-): StorageError {
+): StorageError => {
   if (error instanceof StorageError) {
     return error;
   }
-  if (
-    typeof error === 'object' &&
-    error !== null &&
-    'code' in error &&
-    typeof error.code === 'string' &&
-    'message' in error &&
-    typeof error.message === 'string'
-  ) {
-    return new StorageError(
-      error.code,
-      error.message,
-      'retryable' in error && typeof error.retryable === 'boolean'
-        ? error.retryable
-        : false,
-    );
+  const coded = asCodedError(error);
+  if (!isUndefined(coded)) {
+    return new StorageError(coded.code, coded.message, coded.retryable ?? false);
   }
   const name = errorName(error);
-  const message =
-    error instanceof Error && error.message
-      ? `${fallbackMessage}: ${error.message}`
-      : fallbackMessage;
   if (name === 'NoModificationAllowedError') {
     return new StorageError(
       'STORAGE_LOCKED',
@@ -179,18 +170,8 @@ function storageError(
       true,
     );
   }
-  if (
-    name === 'InvalidStateError' ||
-    name === 'NotAllowedError' ||
-    name === 'SecurityError'
-  ) {
-    return new StorageError('OPFS_UNAVAILABLE', message);
-  }
-  return new StorageError(fallbackCode, message, true);
-}
-
-function errorName(error: unknown): string {
-  return typeof error === 'object' && error !== null && 'name' in error
-    ? String(error.name)
-    : '';
-}
+  const message = `${fallbackMessage}${errorDetail(error)}`;
+  return UNAVAILABLE_NAMES.includes(name)
+    ? new StorageError(OPFS_UNAVAILABLE, message)
+    : new StorageError(fallbackCode, message, true);
+};

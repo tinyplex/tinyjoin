@@ -1,5 +1,22 @@
+import {
+  arrayIsArray,
+  isBoolean,
+  isCount,
+  isCountWithin,
+  isFiniteNumber,
+  isNumber,
+  isObject,
+  isPlainRecord,
+  isRecord,
+  isString,
+  isUndefined,
+  MAX_U32,
+  objHasOwn,
+  objValues,
+  ownKeys,
+} from './common.js';
+
 export const PROTOCOL_VERSION = 7 as const;
-const MAX_U32 = 0xffff_ffff;
 
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue =
@@ -133,59 +150,139 @@ export type WorkerEvent = {
   payload: ApplyOutcome;
 };
 
-export function isWorkerResponse(value: unknown): value is WorkerResponse {
-  if (
-    !isRecord(value) ||
-    value.v !== PROTOCOL_VERSION ||
-    !isSafeNonNegativeInteger(value.id) ||
-    Number(value.id) < 1
-  ) {
+const MAX_ARRAY_ITEMS = 1_000_000;
+const MAX_TRANSACTION_ID_LENGTH = 128;
+const SQL_RESULT_KEYS = [
+  'command',
+  'fields',
+  'revision',
+  'rowCount',
+  'rows',
+  'tables',
+] as const;
+
+export const isWorkerResponse = (value: unknown): value is WorkerResponse =>
+  isEnvelope(value) &&
+  isRequestId(value.id) &&
+  (value.ok === true
+    ? hasExactKeys(value, ['v', 'id', 'ok', 'result'])
+    : value.ok === false &&
+      hasExactKeys(value, ['v', 'id', 'ok', 'error']) &&
+      isSerializedError(value.error));
+
+export const isWorkerEvent = (value: unknown): value is WorkerEvent =>
+  isEnvelope(value) &&
+  hasExactKeys(value, ['v', 'event', 'payload']) &&
+  value.event === 'tablesChanged' &&
+  isApplyOutcome(value.payload);
+
+export const isWorkerRequest = (value: unknown): value is WorkerRequest => {
+  if (!isEnvelope(value) || !isRequestId(value.id)) {
     return false;
   }
-  if (value.ok === true) {
-    return hasExactKeys(value, ['v', 'id', 'ok', 'result']);
-  }
-  return (
-    value.ok === false &&
-    hasExactKeys(value, ['v', 'id', 'ok', 'error']) &&
-    isSerializedError(value.error)
-  );
-}
-
-export function isWorkerEvent(value: unknown): value is WorkerEvent {
-  if (
-    !isRecord(value) ||
-    !hasExactKeys(value, ['v', 'event', 'payload']) ||
-    value.v !== PROTOCOL_VERSION
-  ) {
+  if (!hasExactKeys(value, ['v', 'id', 'method', 'params'])) {
     return false;
   }
-  if (value.event === 'tablesChanged') {
-    return isApplyOutcome(value.payload);
+  const params = value.params;
+  switch (value.method) {
+    case 'init':
+      return (
+        hasExactParams(params, ['storage']) && isStorageOptions(params.storage)
+      );
+    case 'executeSql':
+      return (
+        hasParams(params, ['sql', 'params', 'transactionId']) &&
+        isString(params.sql) &&
+        isJsonValues(params.params) &&
+        isOptionalTransactionId(params.transactionId)
+      );
+    case 'prepareSql':
+      return hasExactParams(params, ['sql']) && isString(params.sql);
+    case 'executePrepared':
+      return (
+        hasParams(params, ['statementId', 'params', 'transactionId']) &&
+        isPreparedStatementId(params.statementId) &&
+        isJsonValues(params.params) &&
+        isOptionalTransactionId(params.transactionId)
+      );
+    case 'closePrepared':
+      return (
+        hasExactParams(params, ['statementId']) &&
+        isPreparedStatementId(params.statementId)
+      );
+    case 'execSql':
+      return (
+        hasParams(params, ['sql', 'transactionId']) &&
+        isString(params.sql) &&
+        isOptionalTransactionId(params.transactionId)
+      );
+    case 'commitTransaction':
+    case 'rollbackTransaction':
+      return (
+        hasParams(params, ['transactionId']) &&
+        isTransactionId(params.transactionId)
+      );
+    case 'beginTransaction':
+    case 'close':
+      return isUndefined(params);
+    default:
+      return false;
   }
-  return false;
-}
+};
 
-export function isRpcResult<Method extends RpcMethod>(
+export const isRpcResult = <Method extends RpcMethod>(
   method: Method,
   value: unknown,
-): value is RpcMethods[Method]['response'] {
+): value is RpcMethods[Method]['response'] => isResult(method, value, true);
+
+/**
+ * Checks only the fixed result envelope produced by TinyJoin's bundled Worker.
+ * The Worker has already validated the complete WASM result before posting it;
+ * avoiding another walk here keeps large row sets off the UI thread's hot path.
+ */
+export const isRpcResultHeader = <Method extends RpcMethod>(
+  method: Method,
+  value: unknown,
+): value is RpcMethods[Method]['response'] => isResult(method, value, false);
+
+export const isSerializedError = (value: unknown): value is SerializedError =>
+  isRecord(value) &&
+  hasOnlyKeys(value, ['code', 'message', 'details', 'retryable']) &&
+  objHasOwn(value, 'code') &&
+  objHasOwn(value, 'message') &&
+  isString(value.code) &&
+  isString(value.message) &&
+  (isUndefined(value.details) || isJsonValue(value.details)) &&
+  (isUndefined(value.retryable) || isBoolean(value.retryable));
+
+// Each message carries the protocol version it was built for, so that a mixed
+// pair of client and Worker fails loudly rather than misreading each other.
+const isEnvelope = (value: unknown): value is Record<string, unknown> =>
+  isRecord(value) && value.v === PROTOCOL_VERSION;
+
+const isRequestId = (value: unknown): boolean => isCount(value) && value >= 1;
+
+const isResult = (
+  method: RpcMethod,
+  value: unknown,
+  deep: boolean,
+): boolean => {
   switch (method) {
     case 'init':
       return (
         isRecord(value) &&
         hasExactKeys(value, ['revision']) &&
-        isSafeNonNegativeInteger(value.revision)
+        isCount(value.revision)
       );
     case 'closePrepared':
     case 'rollbackTransaction':
     case 'close':
-      return value === undefined;
+      return isUndefined(value);
     case 'commitTransaction':
       return isApplyOutcome(value);
     case 'executeSql':
     case 'executePrepared':
-      return isSqlResult(value);
+      return isSqlResult(value, deep);
     case 'prepareSql':
       return (
         isRecord(value) &&
@@ -193,7 +290,9 @@ export function isRpcResult<Method extends RpcMethod>(
         isPreparedStatementId(value.statementId)
       );
     case 'execSql':
-      return isDenseArray(value, isSqlResult);
+      return deep
+        ? isDenseArray(value, (result) => isSqlResult(result, true))
+        : arrayIsArray(value) && value.every((result) => isSqlResult(result, false));
     case 'beginTransaction':
       return (
         isRecord(value) &&
@@ -205,302 +304,124 @@ export function isRpcResult<Method extends RpcMethod>(
       return exhaustive;
     }
   }
-}
+};
 
-/**
- * Checks only the fixed result envelope produced by TinyJoin's bundled Worker.
- * The Worker has already validated the complete WASM result before posting it;
- * avoiding another walk here keeps large row sets off the UI thread's hot path.
- */
-export function isRpcResultHeader<Method extends RpcMethod>(
-  method: Method,
+const hasParams = (
   value: unknown,
-): value is RpcMethods[Method]['response'] {
-  switch (method) {
-    case 'executeSql':
-    case 'executePrepared':
-      return isSqlResultHeader(value);
-    case 'execSql':
-      return Array.isArray(value) && value.every(isSqlResultHeader);
-    default:
-      return isRpcResult(method, value);
-  }
-}
+  allowedKeys: readonly string[],
+): value is Record<string, unknown> =>
+  isRecord(value) && hasOnlyKeys(value, allowedKeys);
 
-export function isWorkerRequest(value: unknown): value is WorkerRequest {
-  if (
-    !isRecord(value) ||
-    !hasExactKeys(value, ['v', 'id', 'method', 'params']) ||
-    value.v !== PROTOCOL_VERSION ||
-    !Number.isSafeInteger(value.id) ||
-    Number(value.id) < 1 ||
-    typeof value.method !== 'string'
-  ) {
-    return false;
-  }
-  switch (value.method) {
-    case 'init':
-      return (
-        isRecord(value.params) &&
-        hasExactKeys(value.params, ['storage']) &&
-        isStorageOptions(value.params.storage)
-      );
-    case 'executeSql':
-      return (
-        isRecord(value.params) &&
-        hasOnlyKeys(value.params, ['sql', 'params', 'transactionId']) &&
-        typeof value.params.sql === 'string' &&
-        isDenseArray(value.params.params, (param) => isJsonValue(param)) &&
-        isOptionalTransactionId(value.params.transactionId)
-      );
-    case 'prepareSql':
-      return (
-        isRecord(value.params) &&
-        hasExactKeys(value.params, ['sql']) &&
-        typeof value.params.sql === 'string'
-      );
-    case 'executePrepared':
-      return (
-        isRecord(value.params) &&
-        hasOnlyKeys(value.params, [
-          'statementId',
-          'params',
-          'transactionId',
-        ]) &&
-        isPreparedStatementId(value.params.statementId) &&
-        isDenseArray(value.params.params, (param) => isJsonValue(param)) &&
-        isOptionalTransactionId(value.params.transactionId)
-      );
-    case 'closePrepared':
-      return (
-        isRecord(value.params) &&
-        hasExactKeys(value.params, ['statementId']) &&
-        isPreparedStatementId(value.params.statementId)
-      );
-    case 'execSql':
-      return (
-        isRecord(value.params) &&
-        hasOnlyKeys(value.params, ['sql', 'transactionId']) &&
-        typeof value.params.sql === 'string' &&
-        isOptionalTransactionId(value.params.transactionId)
-      );
-    case 'beginTransaction':
-      return value.params === undefined;
-    case 'commitTransaction':
-    case 'rollbackTransaction':
-      return (
-        isRecord(value.params) &&
-        hasOnlyKeys(value.params, ['transactionId']) &&
-        isTransactionId(value.params.transactionId)
-      );
-    case 'close':
-      return value.params === undefined;
-    default:
-      return false;
-  }
-}
+const hasExactParams = (
+  value: unknown,
+  expectedKeys: readonly string[],
+): value is Record<string, unknown> =>
+  isRecord(value) && hasExactKeys(value, expectedKeys);
 
-function isOptionalTransactionId(value: unknown): boolean {
-  return value === undefined || isTransactionId(value);
-}
-
-function isTransactionId(value: unknown): value is string {
-  return typeof value === 'string' && value.length > 0 && value.length <= 128;
-}
-
-function isPreparedStatementId(value: unknown): value is number {
-  return (
-    Number.isSafeInteger(value) &&
-    Number(value) > 0 &&
-    Number(value) <= MAX_U32
-  );
-}
-
-function isStorageOptions(value: unknown): value is StorageOptions {
-  if (!isRecord(value)) {
-    return false;
-  }
-  return value.kind === 'memory'
-    ? hasExactKeys(value, ['kind'])
-    : value.kind === 'opfs' &&
-        hasExactKeys(value, ['kind', 'name']) &&
-        typeof value.name === 'string';
-}
-
-function hasOnlyKeys(
+const hasOnlyKeys = (
   value: Record<string, unknown>,
   allowedKeys: readonly string[],
-): boolean {
-  return Reflect.ownKeys(value).every(
-    (key) => typeof key === 'string' && allowedKeys.includes(key),
-  );
-}
+): boolean =>
+  ownKeys(value).every((key) => isString(key) && allowedKeys.includes(key));
 
-function hasExactKeys(
+const hasExactKeys = (
   value: Record<string, unknown>,
   expectedKeys: readonly string[],
-): boolean {
-  const keys = Reflect.ownKeys(value);
-  return (
-    keys.length === expectedKeys.length &&
-    keys.every(
-      (key) => typeof key === 'string' && expectedKeys.includes(key),
-    )
-  );
-}
+): boolean =>
+  ownKeys(value).length === expectedKeys.length &&
+  hasOnlyKeys(value, expectedKeys);
 
-function isDenseArray<T>(
+const isOptionalTransactionId = (value: unknown): boolean =>
+  isUndefined(value) || isTransactionId(value);
+
+const isTransactionId = (value: unknown): value is string =>
+  isString(value) && value.length > 0 && value.length <= MAX_TRANSACTION_ID_LENGTH;
+
+const isPreparedStatementId = (value: unknown): value is number =>
+  isCountWithin(value, 1, MAX_U32);
+
+const isStorageOptions = (value: unknown): value is StorageOptions =>
+  isRecord(value) &&
+  (value.kind === 'memory'
+    ? hasExactKeys(value, ['kind'])
+    : value.kind === 'opfs' &&
+      hasExactKeys(value, ['kind', 'name']) &&
+      isString(value.name));
+
+const isDenseArray = <Item>(
   value: unknown,
-  isItem: (item: unknown) => item is T,
-): value is T[] {
-  if (!Array.isArray(value) || value.length > MAX_PROTOCOL_ARRAY_ITEMS) {
+  isItem: (item: unknown) => boolean,
+): value is Item[] => {
+  if (!arrayIsArray(value) || value.length > MAX_ARRAY_ITEMS) {
     return false;
   }
   for (let index = 0; index < value.length; index++) {
-    if (!Object.hasOwn(value, index) || !isItem(value[index])) {
+    if (!objHasOwn(value, index) || !isItem(value[index])) {
       return false;
     }
   }
   return true;
-}
+};
 
-const MAX_PROTOCOL_ARRAY_ITEMS = 1_000_000;
+const isStrings = (value: unknown): value is string[] =>
+  isDenseArray(value, isString);
 
-export function isSerializedError(value: unknown): value is SerializedError {
-  return (
-    isRecord(value) &&
-    hasOnlyKeys(value, ['code', 'message', 'details', 'retryable']) &&
-    Object.hasOwn(value, 'code') &&
-    Object.hasOwn(value, 'message') &&
-    typeof value.code === 'string' &&
-    typeof value.message === 'string' &&
-    (value.details === undefined || isJsonValue(value.details)) &&
-    (value.retryable === undefined || typeof value.retryable === 'boolean')
-  );
-}
+const isJsonValues = (value: unknown): value is JsonValue[] =>
+  isDenseArray(value, (item) => isJsonValue(item));
 
-export function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
+const isApplyOutcome = (value: unknown): value is ApplyOutcome =>
+  isRecord(value) &&
+  hasExactKeys(value, ['revision', 'tables']) &&
+  isCount(value.revision) &&
+  isStrings(value.tables);
 
-function isApplyOutcome(value: unknown): value is ApplyOutcome {
-  return (
-    isRecord(value) &&
-    hasExactKeys(value, ['revision', 'tables']) &&
-    isSafeNonNegativeInteger(value.revision) &&
-    isDenseArray(
-      value.tables,
-      (table): table is string => typeof table === 'string',
-    )
-  );
-}
+const isRow = (value: unknown): value is Row =>
+  isPlainRecord(value) && objValues(value).every((cell) => isJsonValue(cell));
 
-function isRow(value: unknown): value is Row {
-  return (
-    isJsonRecord(value) &&
-    Object.values(value).every((cell) => isJsonValue(cell))
-  );
-}
+const isResultField = (value: unknown): value is ResultField =>
+  isRecord(value) &&
+  hasExactKeys(value, ['name', 'dataTypeID']) &&
+  isString(value.name) &&
+  isCountWithin(value.dataTypeID, 0, MAX_U32);
 
-function isResultField(value: unknown): value is ResultField {
-  return (
-    isRecord(value) &&
-    hasExactKeys(value, ['name', 'dataTypeID']) &&
-    typeof value.name === 'string' &&
-    isSafeNonNegativeInteger(value.dataTypeID) &&
-    Number(value.dataTypeID) <= MAX_U32
-  );
-}
+// `deep` walks every field and row. The header-only pass checks the envelope
+// and leaves the two large arrays to whoever produced them.
+const isSqlResult = (value: unknown, deep: boolean): value is SqlResult =>
+  isRecord(value) &&
+  hasExactKeys(value, SQL_RESULT_KEYS) &&
+  isString(value.command) &&
+  (deep
+    ? isDenseArray(value.fields, isResultField)
+    : arrayIsArray(value.fields)) &&
+  isCount(value.revision) &&
+  isCount(value.rowCount) &&
+  (deep ? isDenseArray(value.rows, isRow) : arrayIsArray(value.rows)) &&
+  isStrings(value.tables);
 
-function isSqlResult(value: unknown): value is SqlResult {
-  return (
-    isRecord(value) &&
-    hasExactKeys(value, [
-      'command',
-      'fields',
-      'revision',
-      'rowCount',
-      'rows',
-      'tables',
-    ]) &&
-    typeof value.command === 'string' &&
-    isDenseArray(value.fields, isResultField) &&
-    isSafeNonNegativeInteger(value.revision) &&
-    isSafeNonNegativeInteger(value.rowCount) &&
-    isDenseArray(value.rows, isRow) &&
-    isDenseArray(
-      value.tables,
-      (table): table is string => typeof table === 'string',
-    )
-  );
-}
-
-function isSqlResultHeader(value: unknown): value is SqlResult {
-  return (
-    isRecord(value) &&
-    hasExactKeys(value, [
-      'command',
-      'fields',
-      'revision',
-      'rowCount',
-      'rows',
-      'tables',
-    ]) &&
-    typeof value.command === 'string' &&
-    Array.isArray(value.fields) &&
-    isSafeNonNegativeInteger(value.revision) &&
-    isSafeNonNegativeInteger(value.rowCount) &&
-    Array.isArray(value.rows) &&
-    isDenseArray(
-      value.tables,
-      (table): table is string => typeof table === 'string',
-    )
-  );
-}
-
-function isSafeNonNegativeInteger(value: unknown): value is number {
-  return Number.isSafeInteger(value) && Number(value) >= 0;
-}
-
-function isJsonRecord(value: unknown): value is Record<string, unknown> {
-  if (!isRecord(value)) {
-    return false;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  return (
-    (prototype === Object.prototype || prototype === null) &&
-    Reflect.ownKeys(value).every((key) => typeof key === 'string')
-  );
-}
-
-function isJsonValue(
+const isJsonValue = (
   value: unknown,
   seen = new WeakSet<object>(),
   depth = 0,
-): value is JsonValue {
-  if (depth > 64) {
+): value is JsonValue => {
+  if (depth > MAX_JSON_DEPTH) {
     return false;
   }
-  if (
-    value === null ||
-    typeof value === 'boolean' ||
-    typeof value === 'string'
-  ) {
+  if (value === null || isBoolean(value) || isString(value)) {
     return true;
   }
-  if (typeof value === 'number') {
-    return Number.isFinite(value);
+  if (isNumber(value)) {
+    return isFiniteNumber(value);
   }
-  if (typeof value !== 'object' || seen.has(value)) {
+  if (!isObject(value) || seen.has(value)) {
     return false;
   }
   seen.add(value);
-  const valid = Array.isArray(value)
-    ? isDenseArray(value, (item): item is JsonValue =>
-        isJsonValue(item, seen, depth + 1),
-      )
-    : isJsonRecord(value) &&
-      Object.values(value).every((item) => isJsonValue(item, seen, depth + 1));
+  const valid = arrayIsArray(value)
+    ? isDenseArray(value, (item) => isJsonValue(item, seen, depth + 1))
+    : isPlainRecord(value) &&
+      objValues(value).every((item) => isJsonValue(item, seen, depth + 1));
   seen.delete(value);
   return valid;
-}
+};
+
+const MAX_JSON_DEPTH = 64;

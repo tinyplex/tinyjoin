@@ -21,18 +21,17 @@ const runtimeUrl = new URL(
 );
 
 /** Loads the private OPFS page-storage graph only for an explicit OPFS session. */
-export async function createOpfsWasmEngine(
+export const createOpfsWasmEngine = async (
   name: string,
   loadRuntime: OpfsRuntimeLoader = importOpfsRuntime,
-): Promise<WorkerEngine> {
+): Promise<WorkerEngine> => {
   const runtime = await loadRuntime(runtimeUrl.href);
   return runtime.createOpfsWasmEngine(name, undefined, {
     createPageEngine: createPageWasmEngine,
   });
-}
+};
 
-function importOpfsRuntime(url: string): Promise<OpfsRuntimeModule> {
-  return import(
+const importOpfsRuntime = (url: string): Promise<OpfsRuntimeModule> =>
+  import(
     /* @vite-ignore */ /* webpackIgnore: true */ url
   ) as Promise<OpfsRuntimeModule>;
-}

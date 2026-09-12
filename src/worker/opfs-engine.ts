@@ -10,11 +10,11 @@ export interface OpfsEngineDependencies {
 }
 
 /** Opens the default page engine directly on its single OPFS page file. */
-export async function createOpfsWasmEngine(
+export const createOpfsWasmEngine = async (
   name: string,
   provider: OpfsPageStorageProvider | undefined,
   dependencies: OpfsEngineDependencies,
-): Promise<WorkerEngine> {
+): Promise<WorkerEngine> => {
   const session = await (
     dependencies.createSession ?? createOpfsPageStorageSession
   )(name, provider);
@@ -28,4 +28,4 @@ export async function createOpfsWasmEngine(
     }
     throw error;
   }
-}
+};

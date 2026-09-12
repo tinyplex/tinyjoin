@@ -3,8 +3,8 @@ import {describe, expect, it} from 'vitest';
 import {
   MAX_DATABASE_BYTES,
   MAX_PAGES,
-  MemoryPageDevice,
-  OpfsPageDevice,
+  createMemoryPageDevice,
+  createOpfsPageDevice,
   PAGE_SIZE,
   type SyncPageAccessHandle,
 } from '../../src/worker/page-device.ts';
@@ -114,7 +114,7 @@ describe('page device bounds', () => {
 
   it('rejects invalid 64-bit page words before doing I/O', () => {
     const handle = new FakeSyncHandle();
-    const device = new OpfsPageDevice(handle);
+    const device = createOpfsPageDevice(handle);
     const target = page(0);
 
     for (const [low, high] of [
@@ -133,7 +133,7 @@ describe('page device bounds', () => {
 
   it('rejects page gaps and never grows beyond the configured cap', () => {
     const handle = new FakeSyncHandle();
-    const device = new OpfsPageDevice(handle);
+    const device = createOpfsPageDevice(handle);
 
     expect(() => device.writePage(1, 0, page(1))).toThrow(RangeError);
     expect(handle.writeCalls).toBe(0);
@@ -147,14 +147,14 @@ describe('page device bounds', () => {
     );
     expect(handle.size).toBe(MAX_DATABASE_BYTES);
 
-    const memory = new MemoryPageDevice();
+    const memory = createMemoryPageDevice();
     expect(() => memory.writePage(MAX_PAGES, 0, page(3))).toThrow(
       expect.objectContaining({code: 'STORAGE_DATABASE_TOO_LARGE'}),
     );
   });
 
   it('requires exact pages', () => {
-    const device = new MemoryPageDevice();
+    const device = createMemoryPageDevice();
     device.writePage(0, 0, page(0));
 
     expect(() => device.readPage(0, 0, new Uint8Array(PAGE_SIZE - 1))).toThrow(
@@ -168,7 +168,7 @@ describe('page device bounds', () => {
 
 describe('memory page device', () => {
   it('appends dense pages and owns input bytes', () => {
-    const device = new MemoryPageDevice();
+    const device = createMemoryPageDevice();
     const first = page(1);
     expect(device.writePage(0, 0, first)).toBe(PAGE_SIZE);
     first.fill(9);
@@ -185,7 +185,7 @@ describe('memory page device', () => {
   });
 
   it('rejects unallocated reads, page gaps, and use after close', () => {
-    const device = new MemoryPageDevice();
+    const device = createMemoryPageDevice();
     expect(() => device.readPage(0, 0, page(0))).toThrow(/not been allocated/);
     expect(() => device.writePage(1, 0, page(0))).toThrow(/cannot be written/);
     device.writePage(0, 0, page(1));
@@ -204,7 +204,7 @@ describe('memory page device', () => {
 describe('OPFS page device', () => {
   it('appends and overwrites pages through borrowed synchronous views', () => {
     const handle = new FakeSyncHandle();
-    const device = new OpfsPageDevice(handle);
+    const device = createOpfsPageDevice(handle);
     const source = page(3);
 
     expect(device.writePage(0, 0, source)).toBe(PAGE_SIZE);
@@ -223,7 +223,7 @@ describe('OPFS page device', () => {
     const handle = new FakeSyncHandle();
     handle.maxWrite = 7;
     handle.maxRead = 11;
-    const device = new OpfsPageDevice(handle);
+    const device = createOpfsPageDevice(handle);
     const source = new Uint8Array(PAGE_SIZE);
     for (let index = 0; index < source.length; index += 1) {
       source[index] = index % 251;
@@ -242,7 +242,7 @@ describe('OPFS page device', () => {
     const readHandle = new FakeSyncHandle();
     readHandle.size = PAGE_SIZE;
     readHandle.maxRead = 0;
-    const readDevice = new OpfsPageDevice(readHandle);
+    const readDevice = createOpfsPageDevice(readHandle);
     const target = page(6);
     expect(() => readDevice.readPage(0, 0, target)).toThrow(
       expect.objectContaining({code: 'STORAGE_READ_FAILED', retryable: true}),
@@ -251,7 +251,7 @@ describe('OPFS page device', () => {
 
     const writeHandle = new FakeSyncHandle();
     writeHandle.maxWrite = 0;
-    const writeDevice = new OpfsPageDevice(writeHandle);
+    const writeDevice = createOpfsPageDevice(writeHandle);
     expect(() => writeDevice.writePage(0, 0, page(1))).toThrow(
       expect.objectContaining({code: 'STORAGE_WRITE_FAILED', retryable: true}),
     );
@@ -268,7 +268,7 @@ describe('OPFS page device', () => {
     handle.failReadCall = 2;
     const target = page(7);
 
-    expect(() => new OpfsPageDevice(handle).readPage(0, 0, target)).toThrow(
+    expect(() => createOpfsPageDevice(handle).readPage(0, 0, target)).toThrow(
       expect.objectContaining({code: 'STORAGE_READ_FAILED'}),
     );
     expect(target[0]).toBe(1);
@@ -277,7 +277,7 @@ describe('OPFS page device', () => {
 
   it('marks a partly written existing-page overwrite outcome unknown', () => {
     const handle = new FakeSyncHandle();
-    const device = new OpfsPageDevice(handle);
+    const device = createOpfsPageDevice(handle);
     device.writePage(0, 0, page(1));
     handle.maxWrite = 17;
     handle.failWriteCall = handle.writeCalls + 2;
@@ -296,7 +296,7 @@ describe('OPFS page device', () => {
 
   it('truncates and flushes a partly written append before reporting failure', () => {
     const handle = new FakeSyncHandle();
-    const device = new OpfsPageDevice(handle);
+    const device = createOpfsPageDevice(handle);
     device.writePage(0, 0, page(1));
     handle.maxWrite = 17;
     handle.failWriteCall = handle.writeCalls + 2;
@@ -318,7 +318,7 @@ describe('OPFS page device', () => {
     handle.maxWrite = 17;
     handle.failWriteCall = 2;
     handle.truncateError = new Error('truncate failed');
-    const device = new OpfsPageDevice(handle);
+    const device = createOpfsPageDevice(handle);
 
     expect(() => device.writePage(0, 0, page(2))).toThrow(
       expect.objectContaining({code: 'STORAGE_COMMIT_OUTCOME_UNKNOWN'}),
@@ -331,7 +331,7 @@ describe('OPFS page device', () => {
     handle.maxWrite = 17;
     handle.failWriteCall = 2;
     handle.flushError = new Error('flush failed');
-    const device = new OpfsPageDevice(handle);
+    const device = createOpfsPageDevice(handle);
 
     expect(() => device.writePage(0, 0, page(2))).toThrow(
       expect.objectContaining({code: 'STORAGE_COMMIT_OUTCOME_UNKNOWN'}),
@@ -349,7 +349,7 @@ describe('OPFS page device', () => {
       'QuotaExceededError',
     );
     expect(() =>
-      new OpfsPageDevice(writeHandle).writePage(0, 0, page(1)),
+      createOpfsPageDevice(writeHandle).writePage(0, 0, page(1)),
     ).toThrow(
       expect.objectContaining({
         code: 'STORAGE_QUOTA_EXCEEDED',
@@ -360,7 +360,7 @@ describe('OPFS page device', () => {
     expect(writeHandle.flushCalls).toBe(1);
 
     const partialAppendHandle = new FakeSyncHandle();
-    const partialAppendDevice = new OpfsPageDevice(partialAppendHandle);
+    const partialAppendDevice = createOpfsPageDevice(partialAppendHandle);
     partialAppendDevice.writePage(0, 0, page(1));
     partialAppendHandle.maxWrite = 19;
     partialAppendHandle.failWriteCall = partialAppendHandle.writeCalls + 2;
@@ -379,7 +379,7 @@ describe('OPFS page device', () => {
     expect(partialAppendHandle.flushCalls).toBe(1);
 
     const overwriteHandle = new FakeSyncHandle();
-    const overwriteDevice = new OpfsPageDevice(overwriteHandle);
+    const overwriteDevice = createOpfsPageDevice(overwriteHandle);
     overwriteDevice.writePage(0, 0, page(1));
     overwriteHandle.failWriteCall = overwriteHandle.writeCalls + 1;
     overwriteHandle.writeError = new DOMException(
@@ -399,7 +399,7 @@ describe('OPFS page device', () => {
       'out of room',
       'QuotaExceededError',
     );
-    const device = new OpfsPageDevice(flushHandle);
+    const device = createOpfsPageDevice(flushHandle);
     expect(() => device.flush()).toThrow(
       expect.objectContaining({code: 'STORAGE_QUOTA_EXCEEDED'}),
     );
@@ -411,7 +411,7 @@ describe('OPFS page device', () => {
     for (let offset = PAGE_SIZE; offset < torn.size; offset += 1) {
       torn.bytes.set(offset, 9);
     }
-    const repaired = new OpfsPageDevice(torn);
+    const repaired = createOpfsPageDevice(torn);
     expect(repaired.pageCount()).toBe(1);
     expect(torn.size).toBe(PAGE_SIZE);
     expect(torn.truncateCalls).toBe(1);
@@ -419,14 +419,14 @@ describe('OPFS page device', () => {
 
     const oversized = new FakeSyncHandle();
     oversized.size = MAX_DATABASE_BYTES + PAGE_SIZE;
-    expect(() => new OpfsPageDevice(oversized)).toThrow(
+    expect(() => createOpfsPageDevice(oversized)).toThrow(
       expect.objectContaining({code: 'STORAGE_DATABASE_TOO_LARGE'}),
     );
     expect(oversized.closeCalls).toBe(1);
 
     const invalid = new FakeSyncHandle();
     invalid.size = Number.NaN;
-    expect(() => new OpfsPageDevice(invalid)).toThrow(
+    expect(() => createOpfsPageDevice(invalid)).toThrow(
       expect.objectContaining({code: 'STORAGE_CORRUPT'}),
     );
     expect(invalid.closeCalls).toBe(1);
@@ -436,7 +436,7 @@ describe('OPFS page device', () => {
     const truncateFailure = new FakeSyncHandle();
     truncateFailure.size = PAGE_SIZE + 1;
     truncateFailure.truncateError = new Error('truncate failed');
-    expect(() => new OpfsPageDevice(truncateFailure)).toThrow(
+    expect(() => createOpfsPageDevice(truncateFailure)).toThrow(
       expect.objectContaining({code: 'STORAGE_COMMIT_OUTCOME_UNKNOWN'}),
     );
     expect(truncateFailure.closeCalls).toBe(1);
@@ -444,7 +444,7 @@ describe('OPFS page device', () => {
     const flushFailure = new FakeSyncHandle();
     flushFailure.size = PAGE_SIZE + 1;
     flushFailure.flushError = new Error('flush failed');
-    expect(() => new OpfsPageDevice(flushFailure)).toThrow(
+    expect(() => createOpfsPageDevice(flushFailure)).toThrow(
       expect.objectContaining({code: 'STORAGE_COMMIT_OUTCOME_UNKNOWN'}),
     );
     expect(flushFailure.closeCalls).toBe(1);
@@ -453,7 +453,7 @@ describe('OPFS page device', () => {
   it('maps size and close failures, owns handles, and closes only once', () => {
     const sizeHandle = new FakeSyncHandle();
     sizeHandle.sizeError = new Error('broken metadata');
-    expect(() => new OpfsPageDevice(sizeHandle)).toThrow(
+    expect(() => createOpfsPageDevice(sizeHandle)).toThrow(
       expect.objectContaining({code: 'STORAGE_READ_FAILED', retryable: true}),
     );
     expect(sizeHandle.closeCalls).toBe(1);
@@ -461,7 +461,7 @@ describe('OPFS page device', () => {
     const failedOpen = new FakeSyncHandle();
     failedOpen.sizeError = new Error('original size failure');
     failedOpen.closeError = new Error('cleanup close failure');
-    expect(() => new OpfsPageDevice(failedOpen)).toThrow(
+    expect(() => createOpfsPageDevice(failedOpen)).toThrow(
       expect.objectContaining({
         code: 'STORAGE_READ_FAILED',
         message: expect.stringContaining('original size failure'),
@@ -471,7 +471,7 @@ describe('OPFS page device', () => {
 
     const closeHandle = new FakeSyncHandle();
     closeHandle.closeError = new Error('close failed');
-    const device = new OpfsPageDevice(closeHandle);
+    const device = createOpfsPageDevice(closeHandle);
     expect(() => device.close()).toThrow(
       expect.objectContaining({code: 'STORAGE_CLOSE_FAILED'}),
     );

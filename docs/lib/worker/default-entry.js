@@ -1,2 +1,1 @@
-import { startWorker } from './host.js';
-startWorker();
+import{startWorker as i}from"./index.js";i();
