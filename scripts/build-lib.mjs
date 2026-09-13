@@ -25,22 +25,28 @@ import {requireWasmArtifacts} from './wasm-artifacts.mjs';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const dist = resolve(root, 'dist');
 
-// The runtime is published as two bundles that share protocol.js: the
-// main-thread client, and the Worker host. Bundling lets the minifier rename
-// everything that is not public API, and leaves the OPFS page device out of a
-// Worker that only ever opens a memory database.
+const WORKER_SHARED = {
+  'protocol.js': '../protocol.js',
+  // The WASM glue resolves the engine binary against itself, so it stays beside
+  // it in wasm/ rather than being bundled in here.
+  'tinyjoin_wasm.js': '../wasm/tinyjoin_wasm.js',
+};
+
+// The runtime is published as bundles that share protocol.js: the main-thread
+// client, and the Worker host. Bundling lets the minifier rename everything that
+// is not public API, and leaves the OPFS page device out of a Worker that only
+// ever opens a memory database.
 const RUNTIME_BUNDLES = [
   // Bundled first, so that both sides can then share it as one file.
   {entry: 'protocol.js', shared: {}},
   {entry: 'index.js', shared: {'protocol.js': './protocol.js'}},
-  {
-    entry: 'worker/index.js',
-    shared: {
-      'protocol.js': '../protocol.js',
-      // The WASM glue resolves its own .wasm sibling, so it stays in wasm/.
-      'tinyjoin_wasm.js': '../wasm/tinyjoin_wasm.js',
-    },
-  },
+  {entry: 'worker/index.js', shared: WORKER_SHARED},
+  // The Worker the package ships is bundled a second time, with its startWorker
+  // call, rather than importing worker/index.js. The two are never both
+  // downloaded - an application either loads this entry or bundles the other
+  // one into a Worker of its own - so the duplicate costs nobody any bytes, and
+  // it saves the browser a round trip on a forty-five byte shim.
+  {entry: 'worker/default-entry.js', shared: WORKER_SHARED},
 ];
 
 // Every file a browser downloads. tsc emits one module per source file; each
@@ -113,7 +119,9 @@ await bundleRuntime();
 await minifyRuntime();
 await assertPublishedImports();
 await assertMarkers('index.js', DEFAULT_WORKER_MARKERS, 'default Worker');
-await assertMarkers('worker/index.js', OPFS_LOADER_MARKERS, 'OPFS loader');
+for (const entry of ['worker/index.js', 'worker/default-entry.js']) {
+  await assertMarkers(entry, OPFS_LOADER_MARKERS, 'OPFS loader');
+}
 await buildDefinitions(root, dist);
 
 const manifest = JSON.parse(
@@ -175,17 +183,23 @@ async function buildPrivateWorkerRuntime() {
 }
 
 async function bundleRuntime() {
+  // Every bundle is built from the modules tsc emitted, and only written once
+  // they all are: two of them share an entry, so writing as we went would build
+  // the second from the first one's output rather than from the source.
+  const bundled = [];
   for (const {entry, shared} of RUNTIME_BUNDLES) {
-    const path = resolve(dist, entry);
     const {outputFiles} = await esbuildBuild({
       bundle: true,
-      entryPoints: [path],
+      entryPoints: [resolve(dist, entry)],
       format: 'esm',
       plugins: [shareModules(shared)],
       target: 'es2022',
       write: false,
     });
-    await writeFile(path, outputFiles[0].text);
+    bundled.push([entry, outputFiles[0].text]);
+  }
+  for (const [entry, source] of bundled) {
+    await writeFile(resolve(dist, entry), source);
   }
   await pruneBundledModules();
 }

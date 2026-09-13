@@ -19,6 +19,11 @@ const GROUPS = [
   ['worker', () => true],
 ];
 
+// worker/index.js is the same bundle as worker/default-entry.js, for a Worker an
+// application writes itself and builds with its own bundler. No page ever
+// downloads both, so counting both would overstate what TinyJoin costs.
+const ALTERNATIVE_ENTRIES = ['worker/index.js'];
+
 export async function measureSizes(dist = resolve(root, 'dist')) {
   const totals = Object.fromEntries(
     [...GROUPS.map(([group]) => group), 'total'].map((group) => [
@@ -28,6 +33,9 @@ export async function measureSizes(dist = resolve(root, 'dist')) {
   );
 
   for (const path of await getRuntimeFiles(dist)) {
+    if (ALTERNATIVE_ENTRIES.includes(path)) {
+      continue;
+    }
     const contents = await readFile(resolve(dist, path));
     const group = GROUPS.find(([, matches]) => matches(path))[0];
     add(totals[group], contents);

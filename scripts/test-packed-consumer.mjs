@@ -326,7 +326,7 @@ function assertPackedFiles(packed) {
 async function assertInstalledOpfsLoader(packageDirectory) {
   // The Worker bundle carries the loader, and its quoting is the minifier's
   // choice. An application's own bundler still has to find the ignore hints.
-  const path = resolve(packageDirectory, 'worker/index.js');
+  const path = resolve(packageDirectory, 'worker/default-entry.js');
   const source = await readFile(path, 'utf8');
   for (const marker of [
     /(['"])\.\.\/worker-opfs\/tinyjoin_opfs_runtime\.js\1/,
