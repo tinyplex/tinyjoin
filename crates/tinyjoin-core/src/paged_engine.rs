@@ -31,6 +31,12 @@ impl<D: PageDevice> PagedEngine<D> {
         })
     }
 
+    /// The fingerprint of every row in this database.
+    #[cfg(test)]
+    pub(crate) fn database_hash(&self) -> u64 {
+        self.storage.database_hash()
+    }
+
     #[cfg(test)]
     pub(crate) fn query_sql(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
         match crate::statement::parse(sql, params)? {
@@ -409,6 +415,119 @@ mod tests {
             )
             .unwrap();
         engine.into_storage()
+    }
+
+    fn database_with(statements: &[&str]) -> PagedEngine<MemoryPageDevice> {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        for sql in statements {
+            engine.execute_sql(sql, &[]).unwrap();
+        }
+        engine
+    }
+
+    const LEDGER: &str = "CREATE TABLE ledger (id INTEGER PRIMARY KEY, note TEXT)";
+
+    #[test]
+    fn the_database_fingerprint_describes_the_rows_and_nothing_else() {
+        // Two databases which hold the same rows must agree, however the rows got there. This is
+        // the whole point of publishing the fingerprint: a comparison between two databases has to
+        // report a difference only when the data genuinely differs.
+        let together = database_with(&[
+            LEDGER,
+            "INSERT INTO ledger (id, note) VALUES (1, 'one'), (2, 'two'), (3, 'three')",
+        ]);
+        let separately = database_with(&[
+            LEDGER,
+            "INSERT INTO ledger (id, note) VALUES (3, 'three')",
+            "INSERT INTO ledger (id, note) VALUES (1, 'one')",
+            "INSERT INTO ledger (id, note) VALUES (2, 'two')",
+        ]);
+        assert_eq!(together.database_hash(), separately.database_hash());
+        assert_ne!(together.database_hash(), crate::hash::EMPTY_HASH);
+
+        // Reaching the same rows by a different route must also agree.
+        let corrected = database_with(&[
+            LEDGER,
+            "INSERT INTO ledger (id, note) VALUES (1, 'one'), (2, 'wrong'), (3, 'three')",
+            "UPDATE ledger SET note = 'two' WHERE id = 2",
+        ]);
+        assert_eq!(together.database_hash(), corrected.database_hash());
+
+        let different = database_with(&[
+            LEDGER,
+            "INSERT INTO ledger (id, note) VALUES (1, 'one'), (2, 'two'), (3, 'other')",
+        ]);
+        assert_ne!(together.database_hash(), different.database_hash());
+
+        let fewer = database_with(&[
+            LEDGER,
+            "INSERT INTO ledger (id, note) VALUES (1, 'one'), (2, 'two')",
+        ]);
+        assert_ne!(together.database_hash(), fewer.database_hash());
+    }
+
+    #[test]
+    fn the_database_fingerprint_binds_rows_to_the_table_holding_them() {
+        // Exchanging the contents of two tables leaves the same rows in the database. Combining
+        // table fingerprints without their names would report the two arrangements as identical.
+        let schema = [
+            "CREATE TABLE a (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE b (id INTEGER PRIMARY KEY)",
+        ];
+        let arranged = database_with(&[
+            schema[0],
+            schema[1],
+            "INSERT INTO a (id) VALUES (1)",
+            "INSERT INTO b (id) VALUES (2)",
+        ]);
+        let exchanged = database_with(&[
+            schema[0],
+            schema[1],
+            "INSERT INTO a (id) VALUES (2)",
+            "INSERT INTO b (id) VALUES (1)",
+        ]);
+        assert_ne!(arranged.database_hash(), exchanged.database_hash());
+    }
+
+    #[test]
+    fn the_database_fingerprint_covers_empty_tables_but_not_derived_structures() {
+        // A table which exists and holds no rows is a real difference from no table at all, so a
+        // table contributes its name even while it is empty.
+        let nothing = database_with(&[]);
+        assert_eq!(nothing.database_hash(), crate::hash::EMPTY_HASH);
+
+        let empty = database_with(&[LEDGER]);
+        assert_ne!(empty.database_hash(), crate::hash::EMPTY_HASH);
+
+        // Emptying a table must return it to exactly the state of one which never held rows;
+        // otherwise a fingerprint would carry a memory of deleted data forever.
+        let emptied = database_with(&[
+            LEDGER,
+            "INSERT INTO ledger (id, note) VALUES (1, 'one'), (2, 'two')",
+            "DELETE FROM ledger WHERE id > 0",
+        ]);
+        assert_eq!(emptied.database_hash(), empty.database_hash());
+
+        // A secondary index is derived from rows the fingerprint already covers, so building one
+        // must not register as a change to the data.
+        let plain = database_with(&[LEDGER, "INSERT INTO ledger (id, note) VALUES (1, 'one')"]);
+        let indexed = database_with(&[
+            LEDGER,
+            "INSERT INTO ledger (id, note) VALUES (1, 'one')",
+            "CREATE INDEX ledger_note ON ledger (note)",
+        ]);
+        assert_eq!(plain.database_hash(), indexed.database_hash());
+    }
+
+    #[test]
+    fn the_database_fingerprint_is_published_and_survives_reopening() {
+        let engine = database_with(&[
+            LEDGER,
+            "INSERT INTO ledger (id, note) VALUES (1, 'one'), (2, 'two')",
+        ]);
+        let published = engine.database_hash();
+        let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        assert_eq!(reopened.database_hash(), published);
     }
 
     /// Builds engine tests through the public SQL path.

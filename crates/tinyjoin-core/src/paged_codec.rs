@@ -30,7 +30,7 @@ const RECORD_FLAGS: u8 = 0;
 const RECORD_PREFIX_BYTES: usize = 4;
 const ROW_HEADER_BYTES: usize = 8;
 const CATALOG_HEADER_BYTES: usize = 20;
-const CATALOG_ITEM_HEADER_BYTES: usize = 32;
+const CATALOG_ITEM_HEADER_BYTES: usize = 40;
 const NO_PAGE_ID: PageId = u64::MAX;
 pub(crate) const MAX_TREE_ID: TreeId = u64::MAX - 1;
 const MAX_JSON_DEPTH: usize = 64;
@@ -50,6 +50,8 @@ pub(crate) struct CatalogTableRecord {
     pub tree_id: TreeId,
     pub root_page_id: Option<PageId>,
     pub row_count: u64,
+    /// The fingerprint of every row in this table, as reported by its B-tree root.
+    pub hash: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -249,6 +251,7 @@ pub(crate) fn encode_catalog_table_record(
         record.tree_id,
         record.root_page_id,
         record.row_count,
+        record.hash,
         &record.schema,
         "table schema",
     )?;
@@ -265,7 +268,7 @@ pub(crate) fn decode_catalog_table_record(key: &[u8], value: &[u8]) -> Result<Ca
             "A catalog table value must use a table key",
         ));
     };
-    let (tree_id, root_page_id, row_count, schema) =
+    let (tree_id, root_page_id, row_count, hash, schema) =
         decode_catalog_item_value::<TableDefinition>(value, "table")?;
     if schema.name != name {
         return Err(storage_corrupt(format!(
@@ -279,6 +282,7 @@ pub(crate) fn decode_catalog_table_record(key: &[u8], value: &[u8]) -> Result<Ca
         tree_id,
         root_page_id,
         row_count,
+        hash,
     })
 }
 
@@ -295,10 +299,13 @@ pub(crate) fn encode_catalog_index_record(
         "index",
     )?;
     let key = encode_catalog_key(CATALOG_INDEX_KEY, &record.definition.name)?;
+    // A secondary index is derived from the rows of its table, so it carries no fingerprint of
+    // its own; comparing the table's rows already covers everything the index represents.
     let value = encode_catalog_item_value(
         record.tree_id,
         record.root_page_id,
         record.entry_count,
+        crate::hash::EMPTY_HASH,
         &record.definition,
         "index definition",
     )?;
@@ -315,8 +322,13 @@ pub(crate) fn decode_catalog_index_record(key: &[u8], value: &[u8]) -> Result<Ca
             "A catalog index value must use an index key",
         ));
     };
-    let (tree_id, root_page_id, entry_count, definition) =
+    let (tree_id, root_page_id, entry_count, hash, definition) =
         decode_catalog_item_value::<IndexDefinition>(value, "index")?;
+    if hash != crate::hash::EMPTY_HASH {
+        return Err(storage_corrupt(
+            "A catalog index record must not carry a fingerprint",
+        ));
+    }
     if definition.name != name {
         return Err(storage_corrupt(format!(
             "Catalog index key `{name}` does not match definition name `{}`",
@@ -802,6 +814,7 @@ fn encode_catalog_item_value<T: Serialize>(
     tree_id: TreeId,
     root_page_id: Option<PageId>,
     count: u64,
+    hash: u64,
     model: &T,
     description: &str,
 ) -> Result<Vec<u8>> {
@@ -822,6 +835,7 @@ fn encode_catalog_item_value<T: Serialize>(
     value.extend_from_slice(&tree_id.to_le_bytes());
     value.extend_from_slice(&root_page_id.unwrap_or(NO_PAGE_ID).to_le_bytes());
     value.extend_from_slice(&count.to_le_bytes());
+    value.extend_from_slice(&hash.to_le_bytes());
     value.extend_from_slice(&(body.len() as u32).to_le_bytes());
     value.extend_from_slice(&body);
     Ok(value)
@@ -830,7 +844,7 @@ fn encode_catalog_item_value<T: Serialize>(
 fn decode_catalog_item_value<T: DeserializeOwned + Serialize>(
     value: &[u8],
     description: &str,
-) -> Result<(TreeId, Option<PageId>, u64, T)> {
+) -> Result<(TreeId, Option<PageId>, u64, u64, T)> {
     if value.len() < CATALOG_ITEM_HEADER_BYTES || value.len() > MAX_PAGED_VALUE_BYTES {
         return Err(storage_corrupt(format!(
             "An encoded catalog {description} has an invalid byte length"
@@ -843,9 +857,10 @@ fn decode_catalog_item_value<T: DeserializeOwned + Serialize>(
         page_id => Some(page_id),
     };
     let count = read_u64(value, 20);
+    let hash = read_u64(value, 28);
     validate_catalog_item(tree_id, root_page_id, count, description)
         .map_err(as_storage_corruption)?;
-    let body_length = read_u32(value, 28) as usize;
+    let body_length = read_u32(value, 36) as usize;
     if CATALOG_ITEM_HEADER_BYTES.checked_add(body_length) != Some(value.len()) {
         return Err(storage_corrupt(format!(
             "Catalog {description} length does not match its header"
@@ -868,7 +883,7 @@ fn decode_catalog_item_value<T: DeserializeOwned + Serialize>(
             "Catalog {description} JSON is not the canonical model representation"
         )));
     }
-    Ok((tree_id, root_page_id, count, model))
+    Ok((tree_id, root_page_id, count, hash, model))
 }
 
 fn append_record_prefix(bytes: &mut Vec<u8>) {
@@ -1051,6 +1066,7 @@ mod tests {
             tree_id: 2,
             root_page_id: Some(FIRST_DATA_PAGE_ID),
             row_count: 1,
+            hash: 0x0123_4567_89ab_cdef,
         }
     }
 

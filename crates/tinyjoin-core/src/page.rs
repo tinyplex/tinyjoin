@@ -38,7 +38,7 @@ const PAGE_FLAGS: u16 = 0;
 const PAGE_CRC_OFFSET: usize = 28;
 
 const SUPERBLOCK_MAGIC: &[u8; 8] = b"TGRSUPR\0";
-const SUPERBLOCK_FORMAT_VERSION: u16 = 1;
+const SUPERBLOCK_FORMAT_VERSION: u16 = 2;
 const SUPERBLOCK_FLAGS: u16 = 0;
 const SUPERBLOCK_PAYLOAD_SIZE: usize = 96;
 
@@ -259,6 +259,13 @@ pub(crate) struct Superblock {
     pub slot: SuperblockSlot,
     pub generation: u64,
     pub database_revision: u64,
+    /// The fingerprint of every row in every table.
+    ///
+    /// This is maintained so that two databases can be compared without reading either one, and
+    /// so that a comparison which differs can be narrowed to a table and then to a key range. It
+    /// is derived from the catalog and is not authoritative: a reader which distrusts it can
+    /// recompute it from the table fingerprints in the catalog.
+    pub database_hash: u64,
     pub bitmap_slot: BitmapSlot,
     pub bitmap_generation: u64,
     pub catalog_root_page_id: Option<PageId>,
@@ -276,6 +283,7 @@ impl Superblock {
             slot,
             generation: 1,
             database_revision: 0,
+            database_hash: crate::hash::EMPTY_HASH,
             bitmap_slot,
             bitmap_generation: 1,
             catalog_root_page_id: None,
@@ -294,8 +302,7 @@ impl Superblock {
         payload[16..24].copy_from_slice(&self.max_page_count.to_le_bytes());
         payload[24..32].copy_from_slice(&self.generation.to_le_bytes());
         payload[32..40].copy_from_slice(&self.database_revision.to_le_bytes());
-        // Bytes 40..48 are reserved for a future page-format field. They must remain zero until
-        // that field has a current, durable semantic and the format version advances.
+        payload[40..48].copy_from_slice(&self.database_hash.to_le_bytes());
         payload[48..56].copy_from_slice(&self.bitmap_generation.to_le_bytes());
         payload[56..64]
             .copy_from_slice(&self.catalog_root_page_id.unwrap_or(u64::MAX).to_le_bytes());
@@ -349,11 +356,7 @@ impl Superblock {
                 "Superblock maximum page count does not match this build",
             ));
         }
-        if payload[40..48]
-            .iter()
-            .chain(payload[72..].iter())
-            .any(|byte| *byte != 0)
-        {
+        if payload[72..].iter().any(|byte| *byte != 0) {
             return Err(invalid_page("Superblock reserved bytes must be zero"));
         }
         if read_u16(payload, 68) as usize != BITMAP_CHUNK_COUNT {
@@ -377,6 +380,7 @@ impl Superblock {
             slot,
             generation: read_u64(payload, 24),
             database_revision: read_u64(payload, 32),
+            database_hash: read_u64(payload, 40),
             bitmap_generation: read_u64(payload, 48),
             bitmap_slot: BitmapSlot::try_from(payload[71])?,
             catalog_root_page_id,
@@ -784,6 +788,7 @@ pub(crate) fn recover_metadata(
 pub(crate) fn build_next_metadata(
     active: &RecoveredMetadata,
     database_revision: u64,
+    database_hash: u64,
     catalog_root_page_id: Option<PageId>,
     allocation_bitmap: &AllocationBitmap,
 ) -> Result<PendingMetadata> {
@@ -813,6 +818,7 @@ pub(crate) fn build_next_metadata(
         slot,
         generation,
         database_revision,
+        database_hash,
         bitmap_slot,
         bitmap_generation: generation,
         catalog_root_page_id,
@@ -913,6 +919,7 @@ fn unsupported_page(message: impl Into<String>) -> EngineError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hash::EMPTY_HASH;
 
     struct EncodedMetadata {
         superblock: [u8; PAGE_SIZE],
@@ -951,6 +958,7 @@ mod tests {
             slot,
             generation,
             database_revision,
+            database_hash: EMPTY_HASH,
             bitmap_slot: slot.bitmap_slot(),
             bitmap_generation: generation,
             catalog_root_page_id: Some(FIRST_DATA_PAGE_ID),
@@ -1055,6 +1063,7 @@ mod tests {
             let mut expected = Superblock::new(slot);
             expected.generation = 8;
             expected.database_revision = 31;
+            expected.database_hash = 0xfeed_face_dead_beef;
             expected.bitmap_generation = 8;
             expected.catalog_root_page_id = Some(FIRST_DATA_PAGE_ID + 9);
             expected.live_data_page_count = 17;
@@ -1065,12 +1074,11 @@ mod tests {
         let expected = Superblock::new(SuperblockSlot::A);
         let page = expected.encode_page().unwrap();
         for (offset, value, code) in [
-            (8, 2, "UNSUPPORTED_PAGE"),
+            (8, 3, "UNSUPPORTED_PAGE"),
             (10, 1, "UNSUPPORTED_PAGE"),
             (12, 1, "UNSUPPORTED_PAGE"),
             (16, 1, "UNSUPPORTED_PAGE"),
             (24, 0, "INVALID_PAGE"),
-            (40, 1, "INVALID_PAGE"),
             (48, 2, "INVALID_PAGE"),
             (68, 2, "UNSUPPORTED_PAGE"),
             (70, 2, "INVALID_PAGE"),
@@ -1428,7 +1436,7 @@ mod tests {
         }
 
         let mut unsupported_superblock_payload = newer.superblock;
-        mutate_payload(&mut unsupported_superblock_payload, 8, 2);
+        mutate_payload(&mut unsupported_superblock_payload, 8, 3);
         let unsupported = RawMetadataSlot::new(
             &unsupported_superblock_payload,
             [
@@ -1485,6 +1493,7 @@ mod tests {
         let pending = build_next_metadata(
             &active,
             21,
+            EMPTY_HASH,
             Some(FIRST_DATA_PAGE_ID + 1),
             &allocation_bitmap,
         )
@@ -1507,6 +1516,7 @@ mod tests {
             build_next_metadata(
                 &active,
                 19,
+                EMPTY_HASH,
                 Some(FIRST_DATA_PAGE_ID),
                 &active.allocation_bitmap,
             )
@@ -1522,6 +1532,7 @@ mod tests {
             build_next_metadata(
                 &exhausted,
                 21,
+                EMPTY_HASH,
                 Some(FIRST_DATA_PAGE_ID),
                 &exhausted.allocation_bitmap,
             )

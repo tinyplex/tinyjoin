@@ -6,6 +6,7 @@ use std::{
 use crate::{
     Btree, EngineError, ExecuteResult, PageDevice, PageId, Pager, PagerWriteTransaction,
     QueryResult, Result, Row, RowChange, StorageReader, TreeId, VisitControl, VisitOutcome,
+    hash::{EMPTY_HASH, combine, identify},
     paged_codec::{
         CATALOG_TREE_ID, CatalogHeader, CatalogIndexRecord, CatalogTableRecord,
         MAX_CATALOG_INDEXES, MAX_CATALOG_TABLES, MAX_TREE_ID, encode_catalog_header_record,
@@ -25,6 +26,12 @@ use crate::{
         validate_schema,
     },
 };
+
+/// The catalog root written by one script, and the fingerprint of the data it describes.
+struct CatalogPublication {
+    root_page_id: PageId,
+    database_hash: u64,
+}
 
 pub(crate) struct ScriptPublication {
     pub(crate) committed: bool,
@@ -193,6 +200,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                             tree_id,
                             root_page_id: None,
                             row_count: 0,
+                            hash: EMPTY_HASH,
                         },
                     );
                 }
@@ -324,13 +332,9 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                     Some(root) => root,
                     None => Btree::create(&mut transaction, tree_id)?,
                 };
-                root_page_id = Some(Btree::upsert(
-                    &mut transaction,
-                    root,
-                    tree_id,
-                    &index_key,
-                    &[],
-                )?);
+                root_page_id = Some(
+                    Btree::upsert(&mut transaction, root, tree_id, &index_key, &[])?.root_page_id,
+                );
                 entry_count = entry_count.checked_add(1).ok_or_else(batch_too_large)?;
             }
         }
@@ -393,6 +397,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
 
         let new_tree_id = self.allocate_tree_id()?;
         let mut new_root = None;
+        let mut new_hash = EMPTY_HASH;
         let mut rewritten = 0usize;
         {
             let mut transaction = self.transaction.borrow_mut();
@@ -415,13 +420,15 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                     Some(root) => root,
                     None => Btree::create(&mut transaction, new_tree_id)?,
                 };
-                new_root = Some(Btree::upsert(
+                let upserted = Btree::upsert(
                     &mut transaction,
                     root,
                     new_tree_id,
                     &primary_key,
                     &encode_row(&row)?,
-                )?);
+                )?;
+                new_root = Some(upserted.root_page_id);
+                new_hash = upserted.hash;
                 rewritten = rewritten.checked_add(1).ok_or_else(batch_too_large)?;
             }
             if rewritten != table.row_count {
@@ -439,6 +446,9 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         table.schema = schema;
         table.tree_id = new_tree_id;
         table.root_page_id = new_root;
+        // Adding a column rewrites every row, so the table's rows have genuinely changed even
+        // though no statement touched them.
+        table.hash = new_hash;
         Ok(())
     }
 
@@ -605,18 +615,24 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                             Some(root) => root,
                             None => Btree::create(&mut transaction, table.tree_id)?,
                         };
-                        table.root_page_id = Some(Btree::upsert(
+                        let upserted = Btree::upsert(
                             &mut transaction,
                             root,
                             table.tree_id,
                             key,
                             &encode_row(row)?,
-                        )?);
+                        )?;
+                        table.root_page_id = Some(upserted.root_page_id);
+                        table.hash = upserted.hash;
                     }
                     None => {
                         if let Some(root) = table.root_page_id {
-                            table.root_page_id =
-                                Btree::delete(&mut transaction, root, table.tree_id, key)?.0;
+                            let deleted =
+                                Btree::delete(&mut transaction, root, table.tree_id, key)?;
+                            table.root_page_id = deleted.root_page_id;
+                            if let Some(hash) = deleted.hash {
+                                table.hash = hash;
+                            }
                         }
                     }
                 }
@@ -664,15 +680,14 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                     if let Some(key) = old_key
                         && let Some(root) = index.root_page_id
                     {
-                        let (root, removed) =
-                            Btree::delete(&mut transaction, root, index.tree_id, &key)?;
-                        if !removed {
+                        let removal = Btree::delete(&mut transaction, root, index.tree_id, &key)?;
+                        if !removal.removed {
                             return Err(storage_corrupt(format!(
                                 "Index `{}` is missing an entry for a candidate row",
                                 index.definition.name
                             )));
                         }
-                        index.root_page_id = root;
+                        index.root_page_id = removal.root_page_id;
                         deleted += 1;
                     }
                     if let Some(key) = next_key {
@@ -680,13 +695,10 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                             Some(root) => root,
                             None => Btree::create(&mut transaction, index.tree_id)?,
                         };
-                        index.root_page_id = Some(Btree::upsert(
-                            &mut transaction,
-                            root,
-                            index.tree_id,
-                            &key,
-                            &[],
-                        )?);
+                        index.root_page_id = Some(
+                            Btree::upsert(&mut transaction, root, index.tree_id, &key, &[])?
+                                .root_page_id,
+                        );
                         inserted += 1;
                     }
                 }
@@ -747,12 +759,12 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
 
     fn commit(mut self, mut results: Vec<ExecuteResult>) -> Result<ScriptPublication> {
         let revision = crate::revision::next_database_revision(self.base_revision)?;
-        let catalog_root = self.write_catalog()?;
+        let catalog = self.write_catalog()?;
         for result in &mut results {
             result.revision = revision;
         }
         let transaction = self.transaction.into_inner();
-        transaction.commit(revision, Some(catalog_root))?;
+        transaction.commit(revision, catalog.database_hash, Some(catalog.root_page_id))?;
         Ok(ScriptPublication {
             committed: true,
             revision,
@@ -763,7 +775,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         })
     }
 
-    fn write_catalog(&mut self) -> Result<PageId> {
+    fn write_catalog(&mut self) -> Result<CatalogPublication> {
         self.charge_operations(
             1 + self.base_tables.len()
                 + self.base_indexes.len()
@@ -785,33 +797,35 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         let final_indexes = self.indexes.keys().cloned().collect::<BTreeSet<_>>();
         let final_tables = self.tables.keys().cloned().collect::<BTreeSet<_>>();
         for name in self.base_indexes.difference(&final_indexes) {
-            let (next_root, removed) = Btree::delete(
+            let deleted = Btree::delete(
                 &mut transaction,
                 root,
                 CATALOG_TREE_ID,
                 &encode_catalog_index_key(name)?,
             )?;
-            if !removed {
+            if !deleted.removed {
                 return Err(storage_corrupt(format!(
                     "Catalog record for dropped index `{name}` is missing"
                 )));
             }
-            root = next_root
+            root = deleted
+                .root_page_id
                 .ok_or_else(|| storage_corrupt("Dropping an index removed the catalog header"))?;
         }
         for name in self.base_tables.difference(&final_tables) {
-            let (next_root, removed) = Btree::delete(
+            let deleted = Btree::delete(
                 &mut transaction,
                 root,
                 CATALOG_TREE_ID,
                 &encode_catalog_table_key(name)?,
             )?;
-            if !removed {
+            if !deleted.removed {
                 return Err(storage_corrupt(format!(
                     "Catalog record for dropped table `{name}` is missing"
                 )));
             }
-            root = next_root
+            root = deleted
+                .root_page_id
                 .ok_or_else(|| storage_corrupt("Dropping a table removed the catalog header"))?;
         }
         root = Btree::upsert(
@@ -820,15 +834,25 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             CATALOG_TREE_ID,
             &header.0,
             &header.1,
-        )?;
+        )?
+        .root_page_id;
+        let mut database_hash = EMPTY_HASH;
         for table in self.tables.values() {
             let (key, value) = encode_catalog_table_record(&CatalogTableRecord {
                 schema: table.schema.clone(),
                 tree_id: table.tree_id,
                 root_page_id: table.root_page_id,
                 row_count: table.row_count as u64,
+                hash: table.hash,
             })?;
-            root = Btree::upsert(&mut transaction, root, CATALOG_TREE_ID, &key, &value)?;
+            root =
+                Btree::upsert(&mut transaction, root, CATALOG_TREE_ID, &key, &value)?.root_page_id;
+            // Binding each table's fingerprint to its name keeps two tables from cancelling each
+            // other out, and makes exchanging the contents of two tables a visible change.
+            database_hash = combine(
+                database_hash,
+                identify(table.schema.name.as_bytes(), table.hash),
+            );
         }
         for index in self.indexes.values() {
             let (key, value) = encode_catalog_index_record(&CatalogIndexRecord {
@@ -837,9 +861,13 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 root_page_id: index.root_page_id,
                 entry_count: index.entry_count as u64,
             })?;
-            root = Btree::upsert(&mut transaction, root, CATALOG_TREE_ID, &key, &value)?;
+            root =
+                Btree::upsert(&mut transaction, root, CATALOG_TREE_ID, &key, &value)?.root_page_id;
         }
-        Ok(root)
+        Ok(CatalogPublication {
+            root_page_id: root,
+            database_hash,
+        })
     }
 }
 

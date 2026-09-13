@@ -40,6 +40,8 @@ pub(crate) struct PagedTable {
     pub(crate) tree_id: TreeId,
     pub(crate) root_page_id: Option<PageId>,
     pub(crate) row_count: usize,
+    /// The fingerprint of every row in this table.
+    pub(crate) hash: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +101,12 @@ impl<D: PageDevice> PagedStorage<D> {
 
     pub(crate) fn into_device(self) -> D {
         self.pager.into_inner().into_device()
+    }
+
+    /// The fingerprint of every row in this database, as published in the superblock.
+    #[cfg(test)]
+    pub(crate) fn database_hash(&self) -> u64 {
+        self.pager.borrow().database_hash()
     }
 
     pub(crate) fn ensure_readiness(&self) -> Result<()> {
@@ -823,6 +831,7 @@ fn load_and_validate_catalog<D: PageDevice>(
                     tree_id: record.tree_id,
                     root_page_id: record.root_page_id,
                     row_count,
+                    hash: record.hash,
                 },
             ))
         })
@@ -1073,6 +1082,7 @@ fn as_storage_corruption(error: EngineError) -> EngineError {
 
 #[cfg(test)]
 mod tests {
+    use crate::hash::EMPTY_HASH;
     use serde_json::{Value, json};
 
     use super::*;
@@ -1300,6 +1310,7 @@ mod tests {
             tree_id: FIRST_USER_TREE_ID,
             root_page_id: None,
             row_count: 1,
+            hash: crate::hash::EMPTY_HASH,
         };
         assert_eq!(
             validate_table_tree(&mut pager, &table).unwrap_err().code,
@@ -1365,8 +1376,12 @@ mod tests {
             index_count: 2,
         })
         .unwrap();
-        let root = Btree::upsert(&mut transaction, root, CATALOG_TREE_ID, &key, &value).unwrap();
-        transaction.commit(revision, Some(root)).unwrap();
+        let root = Btree::upsert(&mut transaction, root, CATALOG_TREE_ID, &key, &value)
+            .unwrap()
+            .root_page_id;
+        transaction
+            .commit(revision, EMPTY_HASH, Some(root))
+            .unwrap();
         let error = match PagedStorage::open(pager.into_device()) {
             Ok(_) => panic!("a mismatched catalog count must fail closed"),
             Err(error) => error,
@@ -1379,7 +1394,7 @@ mod tests {
         let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
         let mut transaction = pager.begin_write().unwrap();
         Btree::create(&mut transaction, 99).unwrap();
-        transaction.commit(0, None).unwrap();
+        transaction.commit(0, EMPTY_HASH, None).unwrap();
         assert_eq!(pager.active_metadata().superblock.live_data_page_count, 1);
         let device = pager.into_device();
 
@@ -1419,8 +1434,11 @@ mod tests {
             &key,
             &value,
         )
-        .unwrap();
-        transaction.commit(revision, Some(catalog_root)).unwrap();
+        .unwrap()
+        .root_page_id;
+        transaction
+            .commit(revision, EMPTY_HASH, Some(catalog_root))
+            .unwrap();
 
         let error = match PagedStorage::open(pager.into_device()) {
             Ok(_) => panic!("an incomplete secondary index must fail closed"),

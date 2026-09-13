@@ -2,7 +2,9 @@ use std::collections::HashSet;
 
 use crate::{
     CandidateId, EngineError, FIRST_DATA_PAGE_ID, MAX_PAGE_COUNT, MAX_PAGE_PAYLOAD_SIZE, Page,
-    PageDevice, PageId, PageType, Pager, PagerWriteTransaction, Result, checksum::crc32,
+    PageDevice, PageId, PageType, Pager, PagerWriteTransaction, Result,
+    checksum::crc32,
+    hash::{EMPTY_HASH, Hasher, combine},
 };
 
 // Page diagnostics are intentionally compact in the browser build. The stable
@@ -34,13 +36,13 @@ pub(crate) const MAX_BTREE_INLINE_ENTRY_BYTES: usize = 1_536;
 pub(crate) const MAX_BTREE_VALUE_BYTES: usize = 1024 * 1024;
 
 const NODE_MAGIC: &[u8; 4] = b"TGBT";
-const NODE_FORMAT_VERSION: u16 = 1;
+const NODE_FORMAT_VERSION: u16 = 2;
 const NODE_FLAGS: u8 = 0;
-const NODE_HEADER_SIZE: usize = 40;
+const NODE_HEADER_SIZE: usize = 48;
 const SLOT_SIZE: usize = 2;
 const LEAF_CELL_HEADER_SIZE: usize = 8;
 const OVERFLOW_DESCRIPTOR_SIZE: usize = 24;
-const INTERNAL_CELL_HEADER_SIZE: usize = 12;
+const INTERNAL_CELL_HEADER_SIZE: usize = 20;
 const INLINE_CELL_FLAGS: u16 = 0;
 const OVERFLOW_CELL_FLAGS: u16 = 1;
 const NO_PAGE_ID: PageId = u64::MAX;
@@ -60,8 +62,29 @@ const MAX_OVERFLOW_PAGE_COUNT: usize = MAX_BTREE_VALUE_BYTES.div_ceil(MAX_OVERFL
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Btree;
 
+/// The outcome of one [`Btree::upsert`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BtreeUpsert {
+    pub(crate) root_page_id: PageId,
+    /// The fingerprint of every entry in the tree after the insertion.
+    pub(crate) hash: u64,
+}
+
+/// The outcome of one [`Btree::delete`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BtreeDelete {
+    /// The candidate root, or `None` once the last entry has been removed.
+    pub(crate) root_page_id: Option<PageId>,
+    /// The fingerprint of every remaining entry, or `None` when no entry matched. A caller which
+    /// records tree fingerprints must leave the one it already holds in place in that case.
+    pub(crate) hash: Option<u64>,
+    pub(crate) removed: bool,
+}
+
 impl Btree {
     /// Creates an empty leaf and returns its candidate root page ID.
+    ///
+    /// No fingerprint is reported: an empty tree always has [`EMPTY_HASH`].
     pub(crate) fn create<D: PageDevice>(
         transaction: &mut PagerWriteTransaction<'_, D>,
         tree_id: TreeId,
@@ -136,7 +159,7 @@ impl Btree {
         )))
     }
 
-    /// Inserts or replaces an inline value and returns the candidate root page ID.
+    /// Inserts or replaces an inline value and returns the candidate root and its fingerprint.
     ///
     /// On error, the pager transaction is marked failed and must be aborted. Allocation or device
     /// failures may have left unreachable candidate pages which must not be published as part of
@@ -147,7 +170,7 @@ impl Btree {
         tree_id: TreeId,
         key: &[u8],
         value: &[u8],
-    ) -> Result<PageId> {
+    ) -> Result<BtreeUpsert> {
         validate_tree_id(tree_id)?;
         validate_key(key)?;
         validate_value(value)?;
@@ -166,7 +189,7 @@ impl Btree {
                 None,
                 None,
             )?;
-            let root = if let Some(split) = inserted.split {
+            let (root_page_id, hash) = if let Some(split) = inserted.split {
                 let level = split
                     .left_level
                     .checked_add(1)
@@ -182,18 +205,20 @@ impl Btree {
                     generation,
                     level,
                     inserted.page_id,
+                    inserted.hash,
                     vec![InternalEntry {
                         key: split.separator,
                         right_child: split.right_page_id,
+                        child_hash: split.right_hash,
                     }],
                 );
-                write_node(transaction, new_root, &root)?;
-                new_root
+                let hash = write_node(transaction, new_root, &root)?;
+                (new_root, hash)
             } else {
-                inserted.page_id
+                (inserted.page_id, inserted.hash)
             };
             transaction.mark_btree_mutated(tree_id)?;
-            Ok(root)
+            Ok(BtreeUpsert { root_page_id, hash })
         })();
         if result.is_err() {
             transaction.mark_failed();
@@ -201,7 +226,8 @@ impl Btree {
         result
     }
 
-    /// Removes one exact key and returns the candidate root and whether an entry existed.
+    /// Removes one exact key and reports the candidate root, its fingerprint, and whether an
+    /// entry existed.
     ///
     /// Deletion is copy-on-write and deliberately does not rebalance under-full pages. Empty
     /// descendants are pruned; an internal page may retain one child and no separator, and an
@@ -212,7 +238,7 @@ impl Btree {
         root_page_id: PageId,
         tree_id: TreeId,
         key: &[u8],
-    ) -> Result<(Option<PageId>, bool)> {
+    ) -> Result<BtreeDelete> {
         validate_tree_id(tree_id)?;
         validate_key(key)?;
         let result = (|| {
@@ -232,7 +258,11 @@ impl Btree {
             if deleted.removed {
                 transaction.mark_btree_mutated(tree_id)?;
             }
-            Ok((deleted.page_id, deleted.removed))
+            Ok(BtreeDelete {
+                root_page_id: deleted.page_id,
+                hash: deleted.hash,
+                removed: deleted.removed,
+            })
         })();
         if result.is_err() {
             transaction.mark_failed();
@@ -882,6 +912,7 @@ impl OverflowPage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct InternalNode {
     leftmost_child: PageId,
+    leftmost_child_hash: u64,
     entries: Vec<InternalEntry>,
 }
 
@@ -889,6 +920,7 @@ struct InternalNode {
 struct InternalEntry {
     key: Vec<u8>,
     right_child: PageId,
+    child_hash: u64,
 }
 
 impl InternalNode {
@@ -917,12 +949,14 @@ impl InternalNode {
         }
     }
 
-    fn replace_child(&mut self, index: usize, page_id: PageId) -> Result<()> {
+    fn replace_child(&mut self, index: usize, page_id: PageId, child_hash: u64) -> Result<()> {
         if index == 0 {
             self.leftmost_child = page_id;
+            self.leftmost_child_hash = child_hash;
             Ok(())
         } else if let Some(entry) = self.entries.get_mut(index - 1) {
             entry.right_child = page_id;
+            entry.child_hash = child_hash;
             Ok(())
         } else {
             Err(invalid_btree(storage_diagnostic!(
@@ -947,6 +981,7 @@ impl Node {
         generation: u64,
         level: u8,
         leftmost_child: PageId,
+        leftmost_child_hash: u64,
         entries: Vec<InternalEntry>,
     ) -> Self {
         Self {
@@ -955,17 +990,44 @@ impl Node {
             level,
             kind: NodeKind::Internal(InternalNode {
                 leftmost_child,
+                leftmost_child_hash,
                 entries,
             }),
         }
     }
 
-    fn encode(&self, page_id: PageId) -> Result<Page> {
+    /// Fingerprints every entry beneath this node.
+    ///
+    /// A leaf combines its own entries; an internal node combines the fingerprints its children
+    /// reported when they were written. Because [`combine`] is order-independent, the value
+    /// depends only on the set of entries in the subtree and not on how the tree divides them
+    /// across pages.
+    fn subtree_hash(&self) -> u64 {
+        match &self.kind {
+            NodeKind::Leaf(entries) => entries.iter().fold(EMPTY_HASH, |hash, entry| {
+                combine(hash, leaf_entry_hash(entry))
+            }),
+            NodeKind::Internal(internal) => internal
+                .entries
+                .iter()
+                .fold(internal.leftmost_child_hash, |hash, entry| {
+                    combine(hash, entry.child_hash)
+                }),
+        }
+    }
+
+    /// Encodes the node and reports the fingerprint of the subtree it roots.
+    ///
+    /// A node never stores its own fingerprint. The only durable copy is the one its parent
+    /// holds, which keeps the tree free of a second source of truth that could silently disagree
+    /// with the entries themselves. An internal node does store the fingerprint of its leftmost
+    /// child, which has no cell of its own to carry it.
+    fn encode(&self, page_id: PageId) -> Result<(Page, u64)> {
         validate_tree_id(self.tree_id)?;
         if self.generation == 0 {
             return Err(invalid_btree("B-tree page generation must be positive"));
         }
-        let (page_type, leftmost_child, cells) = match &self.kind {
+        let (page_type, leftmost_child, leftmost_child_hash, cells) = match &self.kind {
             NodeKind::Leaf(entries) => {
                 if self.level != 0 {
                     return Err(invalid_btree("A leaf node must have level zero"));
@@ -975,7 +1037,7 @@ impl Node {
                     .iter()
                     .map(encode_leaf_cell)
                     .collect::<Result<Vec<_>>>()?;
-                (PageType::BtreeLeaf, NO_PAGE_ID, cells)
+                (PageType::BtreeLeaf, NO_PAGE_ID, EMPTY_HASH, cells)
             }
             NodeKind::Internal(internal) => {
                 if self.level == 0 {
@@ -992,7 +1054,12 @@ impl Node {
                     .iter()
                     .map(encode_internal_cell)
                     .collect::<Result<Vec<_>>>()?;
-                (PageType::BtreeInternal, internal.leftmost_child, cells)
+                (
+                    PageType::BtreeInternal,
+                    internal.leftmost_child,
+                    internal.leftmost_child_hash,
+                    cells,
+                )
             }
         };
         if cells.len() > u16::MAX as usize {
@@ -1021,6 +1088,7 @@ impl Node {
         let free_start = NODE_HEADER_SIZE + cells.len() * SLOT_SIZE;
         payload[26..28].copy_from_slice(&(free_start as u16).to_le_bytes());
         payload[32..40].copy_from_slice(&leftmost_child.to_le_bytes());
+        payload[40..48].copy_from_slice(&leftmost_child_hash.to_le_bytes());
 
         let mut free_end = MAX_PAGE_PAYLOAD_SIZE;
         for (index, cell) in cells.iter().enumerate() {
@@ -1030,7 +1098,7 @@ impl Node {
             payload[slot..slot + SLOT_SIZE].copy_from_slice(&(free_end as u16).to_le_bytes());
         }
         payload[28..30].copy_from_slice(&(free_end as u16).to_le_bytes());
-        Page::new(page_id, page_type, payload)
+        Ok((Page::new(page_id, page_type, payload)?, self.subtree_hash()))
     }
 
     fn decode(
@@ -1115,11 +1183,12 @@ impl Node {
             )));
         }
         let leftmost_child = read_u64(bytes, 32);
+        let leftmost_child_hash = read_u64(bytes, 40);
         let mut expected_cell_end = MAX_PAGE_PAYLOAD_SIZE;
 
         let kind = match page.page_type {
             PageType::BtreeLeaf => {
-                if level != 0 || leftmost_child != NO_PAGE_ID {
+                if level != 0 || leftmost_child != NO_PAGE_ID || leftmost_child_hash != EMPTY_HASH {
                     return Err(invalid_btree(storage_diagnostic!(
                         "B-tree leaf page {} has internal-node header fields",
                         page.id
@@ -1173,6 +1242,7 @@ impl Node {
                     .map_err(as_corruption)?;
                 NodeKind::Internal(InternalNode {
                     leftmost_child,
+                    leftmost_child_hash,
                     entries,
                 })
             }
@@ -1222,17 +1292,22 @@ impl Node {
 
 struct InsertedPage {
     page_id: PageId,
+    hash: u64,
     split: Option<PageSplit>,
 }
 
 struct PageSplit {
     separator: Vec<u8>,
     right_page_id: PageId,
+    right_hash: u64,
     left_level: u8,
 }
 
 struct DeletedPage {
     page_id: Option<PageId>,
+    /// The fingerprint of the surviving subtree, or `None` when no entry matched and the subtree
+    /// is unchanged. A parent must leave the fingerprint it already holds in place in that case.
+    hash: Option<u64>,
     removed: bool,
     first_key_changed: bool,
     first_key: Option<Vec<u8>>,
@@ -1272,6 +1347,7 @@ fn delete_recursive<D: PageDevice>(
             let Ok(index) = entries.binary_search_by(|entry| entry.key.as_slice().cmp(key)) else {
                 return Ok(DeletedPage {
                     page_id: Some(page_id),
+                    hash: None,
                     removed: false,
                     first_key_changed: false,
                     first_key: None,
@@ -1312,14 +1388,18 @@ fn delete_recursive<D: PageDevice>(
             if !child.removed {
                 return Ok(DeletedPage {
                     page_id: Some(page_id),
+                    hash: None,
                     removed: false,
                     first_key_changed: false,
                     first_key: None,
                 });
             }
+            let child_hash = child
+                .hash
+                .ok_or_else(|| invalid_btree("A child reported a removal without a fingerprint"))?;
             match child.page_id {
                 Some(child_page_id) => {
-                    internal.replace_child(child_index, child_page_id)?;
+                    internal.replace_child(child_index, child_page_id, child_hash)?;
                     if child_index > 0 && child.first_key_changed {
                         internal.entries[child_index - 1].key =
                             child.first_key.clone().ok_or_else(|| {
@@ -1341,6 +1421,7 @@ fn delete_recursive<D: PageDevice>(
                 None if child_index == 0 => {
                     let replacement = internal.entries.remove(0);
                     internal.leftmost_child = replacement.right_child;
+                    internal.leftmost_child_hash = replacement.child_hash;
                     (true, true, Some(replacement.key), false)
                 }
                 None => {
@@ -1355,6 +1436,7 @@ fn delete_recursive<D: PageDevice>(
         release_node_page(transaction, page_id, owned)?;
         return Ok(DeletedPage {
             page_id: None,
+            hash: Some(EMPTY_HASH),
             removed,
             first_key_changed,
             first_key,
@@ -1369,6 +1451,7 @@ fn delete_recursive<D: PageDevice>(
     );
     Ok(DeletedPage {
         page_id: Some(materialized.page_id),
+        hash: Some(materialized.hash),
         removed,
         first_key_changed,
         first_key,
@@ -1456,7 +1539,7 @@ fn insert_recursive<D: PageDevice>(
                 Some(node_level - 1),
                 Some(node_generation),
             )?;
-            internal.replace_child(child_index, child.page_id)?;
+            internal.replace_child(child_index, child.page_id, child.hash)?;
             if let Some(split) = child.split {
                 if split.left_level + 1 != node_level {
                     return Err(invalid_btree(storage_diagnostic!(
@@ -1470,6 +1553,7 @@ fn insert_recursive<D: PageDevice>(
                     InternalEntry {
                         key: split.separator,
                         right_child: split.right_page_id,
+                        child_hash: split.right_hash,
                     },
                 );
             }
@@ -1491,12 +1575,13 @@ fn materialize_node<D: PageDevice>(
         } else {
             transaction.allocate_page()?
         };
-        write_node(transaction, page_id, &node)?;
+        let hash = write_node(transaction, page_id, &node)?;
         if !old_owned {
             transaction.free_shared_page(old_page_id)?;
         }
         return Ok(InsertedPage {
             page_id,
+            hash,
             split: None,
         });
     }
@@ -1509,16 +1594,18 @@ fn materialize_node<D: PageDevice>(
         transaction.allocate_page()?
     };
     let right_page_id = transaction.allocate_page()?;
-    write_node(transaction, left_page_id, &left)?;
-    write_node(transaction, right_page_id, &right)?;
+    let left_hash = write_node(transaction, left_page_id, &left)?;
+    let right_hash = write_node(transaction, right_page_id, &right)?;
     if !old_owned {
         transaction.free_shared_page(old_page_id)?;
     }
     Ok(InsertedPage {
         page_id: left_page_id,
+        hash: left_hash,
         split: Some(PageSplit {
             separator,
             right_page_id,
+            right_hash,
             left_level: level,
         }),
     })
@@ -1552,6 +1639,7 @@ fn split_node(node: Node) -> Result<(Node, Node, Vec<u8>)> {
                     node.generation,
                     node.level,
                     internal.leftmost_child,
+                    internal.leftmost_child_hash,
                     left_entries,
                 ),
                 Node::internal(
@@ -1559,6 +1647,7 @@ fn split_node(node: Node) -> Result<(Node, Node, Vec<u8>)> {
                     node.generation,
                     node.level,
                     promoted.right_child,
+                    promoted.child_hash,
                     right_entries,
                 ),
                 promoted.key,
@@ -1617,12 +1706,15 @@ fn internal_entries_size(entries: &[InternalEntry]) -> Result<usize> {
     )
 }
 
+/// Writes one node and reports the fingerprint of the subtree it roots.
 fn write_node<D: PageDevice>(
     transaction: &mut PagerWriteTransaction<'_, D>,
     page_id: PageId,
     node: &Node,
-) -> Result<()> {
-    transaction.write_new_page(&node.encode(page_id)?)
+) -> Result<u64> {
+    let (page, subtree_hash) = node.encode(page_id)?;
+    transaction.write_new_page(&page)?;
+    Ok(subtree_hash)
 }
 
 fn store_leaf_value<D: PageDevice>(
@@ -1917,8 +2009,32 @@ fn encode_internal_cell(entry: &InternalEntry) -> Result<Vec<u8>> {
     cell.extend_from_slice(&(entry.key.len() as u16).to_le_bytes());
     cell.extend_from_slice(&INLINE_CELL_FLAGS.to_le_bytes());
     cell.extend_from_slice(&entry.right_child.to_le_bytes());
+    cell.extend_from_slice(&entry.child_hash.to_le_bytes());
     cell.extend_from_slice(&entry.key);
     Ok(cell)
+}
+
+/// Fingerprints one stored entry from its key and its logical value.
+///
+/// An overflow value is represented by the length and checksum already held in its descriptor, so
+/// fingerprinting never reads an overflow chain. [`store_leaf_value`] chooses between the inline
+/// and overflow representations from the key and value lengths alone, so two databases holding the
+/// same entry always store it the same way and therefore always fingerprint it the same way.
+fn leaf_entry_hash(entry: &LeafEntry) -> u64 {
+    let mut hasher = Hasher::new();
+    hasher.write_bytes(&entry.key);
+    match &entry.value {
+        LeafValue::Inline(value) => {
+            hasher.write_u8(0);
+            hasher.write_bytes(value);
+        }
+        LeafValue::Overflow(descriptor) => {
+            hasher.write_u8(1);
+            hasher.write_u64(u64::from(descriptor.total_length));
+            hasher.write_u64(u64::from(descriptor.checksum));
+        }
+    }
+    hasher.finish()
 }
 
 fn decode_leaf_cell(
@@ -1986,6 +2102,7 @@ fn decode_internal_cell(bytes: &[u8], offset: usize) -> Result<(InternalEntry, u
         InternalEntry {
             key: bytes[header_end..key_end].to_vec(),
             right_child: read_u64(bytes, offset + 4),
+            child_hash: read_u64(bytes, offset + 12),
         },
         key_end,
     ))
@@ -2313,7 +2430,7 @@ mod tests {
     fn create_tree(pager: &mut Pager<MemoryPageDevice>) -> PageId {
         let mut transaction = pager.begin_write().unwrap();
         let root = Btree::create(&mut transaction, TREE).unwrap();
-        transaction.commit(1, Some(root)).unwrap();
+        transaction.commit(1, EMPTY_HASH, Some(root)).unwrap();
         root
     }
 
@@ -2325,9 +2442,67 @@ mod tests {
         value: &[u8],
     ) -> PageId {
         let mut transaction = pager.begin_write().unwrap();
-        let root = Btree::upsert(&mut transaction, root, TREE, key, value).unwrap();
-        transaction.commit(revision, Some(root)).unwrap();
+        let root = Btree::upsert(&mut transaction, root, TREE, key, value)
+            .unwrap()
+            .root_page_id;
+        transaction
+            .commit(revision, EMPTY_HASH, Some(root))
+            .unwrap();
         root
+    }
+
+    /// Walks a committed tree and checks the invariant a future synchronization descent needs:
+    /// every internal cell records the fingerprint of the child it points at. Returns the
+    /// fingerprint of the subtree rooted at `page_id`.
+    fn verified_subtree_hash(pager: &mut Pager<MemoryPageDevice>, page_id: PageId) -> u64 {
+        let generation = pager.generation();
+        let node =
+            Node::decode(pager.read_page(page_id).unwrap(), TREE, generation, false).unwrap();
+        if let NodeKind::Internal(internal) = &node.kind {
+            assert_eq!(
+                verified_subtree_hash(pager, internal.leftmost_child),
+                internal.leftmost_child_hash,
+                "internal page {page_id} misreports its leftmost child"
+            );
+            for entry in &internal.entries {
+                assert_eq!(
+                    verified_subtree_hash(pager, entry.right_child),
+                    entry.child_hash,
+                    "internal page {page_id} misreports child {}",
+                    entry.right_child
+                );
+            }
+        }
+        node.subtree_hash()
+    }
+
+    fn page_count_of(pager: &mut Pager<MemoryPageDevice>, page_id: PageId) -> usize {
+        let generation = pager.generation();
+        let node =
+            Node::decode(pager.read_page(page_id).unwrap(), TREE, generation, false).unwrap();
+        match &node.kind {
+            NodeKind::Leaf(_) => 1,
+            NodeKind::Internal(internal) => {
+                let mut total = 1 + page_count_of(pager, internal.leftmost_child);
+                for entry in &internal.entries {
+                    total += page_count_of(pager, entry.right_child);
+                }
+                total
+            }
+        }
+    }
+
+    /// The fingerprint the tree must produce, computed from the entries alone.
+    fn expected_hash(entries: &[(Vec<u8>, Vec<u8>)]) -> u64 {
+        entries.iter().fold(EMPTY_HASH, |hash, (key, value)| {
+            combine(
+                hash,
+                leaf_entry_hash(&LeafEntry {
+                    key: key.clone(),
+                    value: LeafValue::Inline(value.clone()),
+                }),
+            )
+        })
     }
 
     fn overflow_descriptor_from_root(
@@ -2453,6 +2628,152 @@ mod tests {
     }
 
     #[test]
+    fn fingerprints_describe_the_entries_and_not_the_shape_of_the_tree() {
+        // The same entries inserted in opposite orders produce differently shaped trees. A
+        // fingerprint which depended on page boundaries would disagree between them, and a
+        // synchronization protocol built on it would report a difference where there is none.
+        let entries = (0..40u32)
+            .map(|number| (key(number), value(number)))
+            .collect::<Vec<_>>();
+
+        let mut forwards = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let mut forwards_root = create_tree(&mut forwards);
+        for (revision, (key, value)) in entries.iter().enumerate() {
+            forwards_root = upsert_and_commit(
+                &mut forwards,
+                forwards_root,
+                revision as u64 + 2,
+                key,
+                value,
+            );
+        }
+
+        let mut backwards = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let mut backwards_root = create_tree(&mut backwards);
+        for (revision, (key, value)) in entries.iter().rev().enumerate() {
+            backwards_root = upsert_and_commit(
+                &mut backwards,
+                backwards_root,
+                revision as u64 + 2,
+                key,
+                value,
+            );
+        }
+
+        assert!(
+            page_count_of(&mut forwards, forwards_root) > 1
+                && page_count_of(&mut backwards, backwards_root) > 1,
+            "the fixture must split so that the two trees can differ in shape"
+        );
+        assert_ne!(
+            page_count_of(&mut forwards, forwards_root),
+            page_count_of(&mut backwards, backwards_root),
+            "insertion order must actually produce different trees"
+        );
+
+        let hash = verified_subtree_hash(&mut forwards, forwards_root);
+        assert_eq!(hash, verified_subtree_hash(&mut backwards, backwards_root));
+        assert_eq!(hash, expected_hash(&entries));
+        assert_ne!(hash, EMPTY_HASH);
+    }
+
+    #[test]
+    fn fingerprints_follow_replacement_removal_and_restoration() {
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let mut root = create_tree(&mut pager);
+        for (revision, number) in (0..24u32).enumerate() {
+            root = upsert_and_commit(
+                &mut pager,
+                root,
+                revision as u64 + 2,
+                &key(number),
+                &value(number),
+            );
+        }
+        let original = verified_subtree_hash(&mut pager, root);
+
+        root = upsert_and_commit(&mut pager, root, 30, &key(7), b"replacement");
+        let replaced = verified_subtree_hash(&mut pager, root);
+        assert_ne!(replaced, original, "a changed value must change the tree");
+
+        root = upsert_and_commit(&mut pager, root, 31, &key(7), &value(7));
+        assert_eq!(
+            verified_subtree_hash(&mut pager, root),
+            original,
+            "restoring the original value must restore the fingerprint"
+        );
+
+        // Removing every entry must return the tree to the identity fingerprint, so that an empty
+        // table and a never-written table compare equal.
+        let mut current = Some(root);
+        for (revision, number) in (0..24u32).enumerate() {
+            let mut transaction = pager.begin_write().unwrap();
+            let deleted = Btree::delete(
+                &mut transaction,
+                current.expect("the tree still holds entries"),
+                TREE,
+                &key(number),
+            )
+            .unwrap();
+            assert!(deleted.removed);
+            current = deleted.root_page_id;
+            let hash = deleted.hash.expect("a removal reports a fingerprint");
+            transaction
+                .commit(revision as u64 + 32, hash, current)
+                .unwrap();
+            if let Some(page_id) = current {
+                assert_eq!(verified_subtree_hash(&mut pager, page_id), hash);
+            } else {
+                assert_eq!(hash, EMPTY_HASH);
+            }
+        }
+        assert_eq!(current, None);
+    }
+
+    #[test]
+    fn a_removal_which_matches_nothing_reports_no_fingerprint() {
+        // The caller keeps the fingerprint it already holds, so an absent key must not be able to
+        // present itself as a new one.
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let mut root = create_tree(&mut pager);
+        root = upsert_and_commit(&mut pager, root, 2, &key(1), &value(1));
+        let before = verified_subtree_hash(&mut pager, root);
+
+        let mut transaction = pager.begin_write().unwrap();
+        let deleted = Btree::delete(&mut transaction, root, TREE, &key(99)).unwrap();
+        transaction.abort();
+        assert!(!deleted.removed);
+        assert_eq!(deleted.hash, None);
+        assert_eq!(deleted.root_page_id, Some(root));
+        assert_eq!(verified_subtree_hash(&mut pager, root), before);
+    }
+
+    #[test]
+    fn overflow_values_are_fingerprinted_from_their_descriptors() {
+        // An overflow value is summarized by its length and checksum, so a fingerprint never has
+        // to walk a chain of pages. The summary must still follow the content.
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let mut root = create_tree(&mut pager);
+        let large = vec![b'x'; MAX_BTREE_INLINE_VALUE_BYTES + 1];
+        root = upsert_and_commit(&mut pager, root, 2, b"large", &large);
+        let first = verified_subtree_hash(&mut pager, root);
+
+        let mut different = large.clone();
+        different[0] = b'y';
+        root = upsert_and_commit(&mut pager, root, 3, b"large", &different);
+        assert_ne!(verified_subtree_hash(&mut pager, root), first);
+
+        root = upsert_and_commit(&mut pager, root, 4, b"large", &large);
+        assert_eq!(verified_subtree_hash(&mut pager, root), first);
+
+        // A value which spills is never fingerprinted as though it were stored inline, and the
+        // choice between the two depends only on the key and value lengths.
+        let inline = vec![b'x'; MAX_BTREE_INLINE_VALUE_BYTES];
+        root = upsert_and_commit(&mut pager, root, 5, b"large", &inline);
+        assert_ne!(verified_subtree_hash(&mut pager, root), first);
+    }
+
+    #[test]
     fn inserts_splits_reads_scans_seeks_updates_and_reopens() {
         let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
         let mut root = create_tree(&mut pager);
@@ -2461,14 +2782,17 @@ mod tests {
             let mut transaction = pager.begin_write().unwrap();
             for number in (0..80).rev() {
                 root = Btree::upsert(&mut transaction, root, TREE, &key(number), &value(number))
-                    .unwrap();
+                    .unwrap()
+                    .root_page_id;
             }
             // Repeated right-edge changes must rewrite candidate-owned pages rather than leaking
             // a fresh COW path for every change in one transaction.
             for _ in 0..3 {
-                root = Btree::upsert(&mut transaction, root, TREE, &key(79), &value(79)).unwrap();
+                root = Btree::upsert(&mut transaction, root, TREE, &key(79), &value(79))
+                    .unwrap()
+                    .root_page_id;
             }
-            transaction.commit(2, Some(root)).unwrap();
+            transaction.commit(2, EMPTY_HASH, Some(root)).unwrap();
         }
 
         let root_node = Node::decode(
@@ -2517,8 +2841,10 @@ mod tests {
 
         {
             let mut transaction = pager.begin_write().unwrap();
-            root = Btree::upsert(&mut transaction, root, TREE, &key(37), b"replacement").unwrap();
-            transaction.commit(3, Some(root)).unwrap();
+            root = Btree::upsert(&mut transaction, root, TREE, &key(37), b"replacement")
+                .unwrap()
+                .root_page_id;
+            transaction.commit(3, EMPTY_HASH, Some(root)).unwrap();
         }
         assert_eq!(
             Btree::get(&mut pager, root, TREE, &key(37)).unwrap(),
@@ -2542,9 +2868,10 @@ mod tests {
             let mut transaction = pager.begin_write().unwrap();
             for number in 0..80 {
                 root = Btree::upsert(&mut transaction, root, TREE, &key(number), &value(number))
-                    .unwrap();
+                    .unwrap()
+                    .root_page_id;
             }
-            transaction.commit(2, Some(root)).unwrap();
+            transaction.commit(2, EMPTY_HASH, Some(root)).unwrap();
         }
         assert!(
             Node::decode(
@@ -2574,31 +2901,40 @@ mod tests {
         let boundary_number = u32::from_be_bytes(boundary_key[..4].try_into().unwrap());
         {
             let mut transaction = pager.begin_write().unwrap();
-            let (next, removed) =
-                Btree::delete(&mut transaction, root, TREE, &boundary_key).unwrap();
+            let BtreeDelete {
+                root_page_id: next,
+                removed,
+                ..
+            } = Btree::delete(&mut transaction, root, TREE, &boundary_key).unwrap();
             assert!(removed);
             root = next.unwrap();
-            transaction.commit(3, Some(root)).unwrap();
+            transaction.commit(3, EMPTY_HASH, Some(root)).unwrap();
         }
         assert!(assert_exact_separators(&mut pager, root).is_some());
 
         let committed_root = root;
         {
             let mut transaction = pager.begin_write().unwrap();
-            let (unchanged, removed) =
-                Btree::delete(&mut transaction, root, TREE, &key(100)).unwrap();
+            let BtreeDelete {
+                root_page_id: unchanged,
+                removed,
+                ..
+            } = Btree::delete(&mut transaction, root, TREE, &key(100)).unwrap();
             assert!(!removed);
             assert_eq!(unchanged, Some(root));
             for number in 0..70 {
                 if number == boundary_number {
                     continue;
                 }
-                let (next, removed) =
-                    Btree::delete(&mut transaction, root, TREE, &key(number)).unwrap();
+                let BtreeDelete {
+                    root_page_id: next,
+                    removed,
+                    ..
+                } = Btree::delete(&mut transaction, root, TREE, &key(number)).unwrap();
                 assert!(removed);
                 root = next.unwrap();
             }
-            transaction.commit(4, Some(root)).unwrap();
+            transaction.commit(4, EMPTY_HASH, Some(root)).unwrap();
         }
         assert_ne!(root, committed_root);
         assert_eq!(Btree::get(&mut pager, root, TREE, &key(69)).unwrap(), None);
@@ -2615,8 +2951,10 @@ mod tests {
 
         {
             let mut transaction = pager.begin_write().unwrap();
-            root = Btree::upsert(&mut transaction, root, TREE, &key(65), &value(65)).unwrap();
-            transaction.commit(5, Some(root)).unwrap();
+            root = Btree::upsert(&mut transaction, root, TREE, &key(65), &value(65))
+                .unwrap()
+                .root_page_id;
+            transaction.commit(5, EMPTY_HASH, Some(root)).unwrap();
         }
         let mut cursor = Btree::cursor(&mut pager, root, TREE).unwrap();
         let mut reinserted = Vec::new();
@@ -2647,15 +2985,21 @@ mod tests {
 
         {
             let mut transaction = pager.begin_write().unwrap();
-            let (same_root, removed) =
-                Btree::delete(&mut transaction, root, TREE, b"absent").unwrap();
+            let BtreeDelete {
+                root_page_id: same_root,
+                removed,
+                ..
+            } = Btree::delete(&mut transaction, root, TREE, b"absent").unwrap();
             assert!(!removed);
             assert_eq!(same_root, Some(root));
-            let (empty_root, removed) =
-                Btree::delete(&mut transaction, root, TREE, b"large").unwrap();
+            let BtreeDelete {
+                root_page_id: empty_root,
+                removed,
+                ..
+            } = Btree::delete(&mut transaction, root, TREE, b"large").unwrap();
             assert!(removed);
             assert_eq!(empty_root, None);
-            transaction.commit(3, None).unwrap();
+            transaction.commit(3, EMPTY_HASH, None).unwrap();
         }
         assert!(pager.active_metadata().superblock.live_data_page_count < live_before);
         assert_eq!(
@@ -2672,30 +3016,36 @@ mod tests {
             let mut transaction = pager.begin_write().unwrap();
             for number in 0..80 {
                 root = Btree::upsert(&mut transaction, root, TREE, &key(number), &value(number))
-                    .unwrap();
+                    .unwrap()
+                    .root_page_id;
             }
-            transaction.commit(2, Some(root)).unwrap();
+            transaction.commit(2, EMPTY_HASH, Some(root)).unwrap();
         }
         let live_before = pager.active_metadata().superblock.live_data_page_count;
         let mut next_root = Some(root);
         {
             let mut transaction = pager.begin_write().unwrap();
             for number in (0..80).rev() {
-                let (next, removed) =
-                    Btree::delete(&mut transaction, next_root.unwrap(), TREE, &key(number))
-                        .unwrap();
+                let BtreeDelete {
+                    root_page_id: next,
+                    removed,
+                    ..
+                } = Btree::delete(&mut transaction, next_root.unwrap(), TREE, &key(number))
+                    .unwrap();
                 assert!(removed);
                 next_root = next;
             }
             assert_eq!(next_root, None);
-            transaction.commit(3, None).unwrap();
+            transaction.commit(3, EMPTY_HASH, None).unwrap();
         }
         assert!(pager.active_metadata().superblock.live_data_page_count < live_before);
 
         let mut transaction = pager.begin_write().unwrap();
         let reused = Btree::create(&mut transaction, TREE).unwrap();
-        let reused = Btree::upsert(&mut transaction, reused, TREE, b"again", b"works").unwrap();
-        transaction.commit(4, Some(reused)).unwrap();
+        let reused = Btree::upsert(&mut transaction, reused, TREE, b"again", b"works")
+            .unwrap()
+            .root_page_id;
+        transaction.commit(4, EMPTY_HASH, Some(reused)).unwrap();
         assert_eq!(
             Btree::get(&mut pager, reused, TREE, b"again").unwrap(),
             Some(b"works".to_vec())
@@ -2714,11 +3064,16 @@ mod tests {
 
         {
             let mut transaction = pager.begin_write().unwrap();
-            root = Btree::upsert(&mut transaction, root, TREE, b"inline", &inline).unwrap();
-            root =
-                Btree::upsert(&mut transaction, root, TREE, b"overflow", &forced_overflow).unwrap();
-            root = Btree::upsert(&mut transaction, root, TREE, b"maximum", &maximum).unwrap();
-            transaction.commit(2, Some(root)).unwrap();
+            root = Btree::upsert(&mut transaction, root, TREE, b"inline", &inline)
+                .unwrap()
+                .root_page_id;
+            root = Btree::upsert(&mut transaction, root, TREE, b"overflow", &forced_overflow)
+                .unwrap()
+                .root_page_id;
+            root = Btree::upsert(&mut transaction, root, TREE, b"maximum", &maximum)
+                .unwrap()
+                .root_page_id;
+            transaction.commit(2, EMPTY_HASH, Some(root)).unwrap();
         }
 
         assert_eq!(
@@ -2759,7 +3114,9 @@ mod tests {
         let spilled = vec![3; inline.len() + 1];
         {
             let mut transaction = pager.begin_write().unwrap();
-            root = Btree::upsert(&mut transaction, root, TREE, &key, &inline).unwrap();
+            root = Btree::upsert(&mut transaction, root, TREE, &key, &inline)
+                .unwrap()
+                .root_page_id;
             let node = Node::decode(
                 transaction.read_page(root).unwrap(),
                 TREE,
@@ -2771,7 +3128,9 @@ mod tests {
                 panic!("test expected leaf");
             };
             assert!(matches!(entries[0].value, LeafValue::Inline(_)));
-            root = Btree::upsert(&mut transaction, root, TREE, &key, &spilled).unwrap();
+            root = Btree::upsert(&mut transaction, root, TREE, &key, &spilled)
+                .unwrap()
+                .root_page_id;
             let node = Node::decode(
                 transaction.read_page(root).unwrap(),
                 TREE,
@@ -2783,7 +3142,7 @@ mod tests {
                 panic!("test expected leaf");
             };
             assert!(matches!(entries[0].value, LeafValue::Overflow(_)));
-            transaction.commit(2, Some(root)).unwrap();
+            transaction.commit(2, EMPTY_HASH, Some(root)).unwrap();
         }
         assert_eq!(
             Btree::get(&mut pager, root, TREE, &key).unwrap(),
@@ -2828,11 +3187,19 @@ mod tests {
         let before_same_transaction = pager.active_metadata().superblock.live_data_page_count;
         {
             let mut transaction = pager.begin_write().unwrap();
-            root = Btree::upsert(&mut transaction, root, TREE, b"same-tx", &large_a).unwrap();
-            root = Btree::upsert(&mut transaction, root, TREE, b"same-tx", b"tiny").unwrap();
-            root = Btree::upsert(&mut transaction, root, TREE, b"same-tx", &large_b).unwrap();
-            root = Btree::upsert(&mut transaction, root, TREE, b"same-tx", &large_c).unwrap();
-            transaction.commit(6, Some(root)).unwrap();
+            root = Btree::upsert(&mut transaction, root, TREE, b"same-tx", &large_a)
+                .unwrap()
+                .root_page_id;
+            root = Btree::upsert(&mut transaction, root, TREE, b"same-tx", b"tiny")
+                .unwrap()
+                .root_page_id;
+            root = Btree::upsert(&mut transaction, root, TREE, b"same-tx", &large_b)
+                .unwrap()
+                .root_page_id;
+            root = Btree::upsert(&mut transaction, root, TREE, b"same-tx", &large_c)
+                .unwrap()
+                .root_page_id;
+            transaction.commit(6, EMPTY_HASH, Some(root)).unwrap();
         }
         assert_eq!(
             pager.active_metadata().superblock.live_data_page_count,
@@ -2881,8 +3248,10 @@ mod tests {
         let mut cursor = Btree::cursor(&mut pager, root, TREE).unwrap();
 
         let mut transaction = pager.begin_write().unwrap();
-        let next_root = Btree::upsert(&mut transaction, root, TREE, b"a", b"b").unwrap();
-        transaction.commit(2, Some(next_root)).unwrap();
+        let next_root = Btree::upsert(&mut transaction, root, TREE, b"a", b"b")
+            .unwrap()
+            .root_page_id;
+        transaction.commit(2, EMPTY_HASH, Some(next_root)).unwrap();
         assert_eq!(
             cursor.next(&mut pager).unwrap_err().code,
             "CURSOR_INVALIDATED"
@@ -2905,9 +3274,12 @@ mod tests {
                     &key(number),
                     &value(number),
                 )
-                .unwrap();
+                .unwrap()
+                .root_page_id;
             }
-            transaction.commit(2, Some(source_root)).unwrap();
+            transaction
+                .commit(2, EMPTY_HASH, Some(source_root))
+                .unwrap();
         }
 
         let mut transaction = pager.begin_write().unwrap();
@@ -2924,7 +3296,8 @@ mod tests {
                 &source_key,
                 &source_value,
             )
-            .unwrap();
+            .unwrap()
+            .root_page_id;
             copied += 1;
         }
         assert_eq!(copied, 20);
@@ -2940,7 +3313,9 @@ mod tests {
             candidate.next_in_transaction(&mut transaction).unwrap(),
             Some((key(8), value(8)))
         );
-        transaction.commit(3, Some(target_root)).unwrap();
+        transaction
+            .commit(3, EMPTY_HASH, Some(target_root))
+            .unwrap();
 
         let mut cursor = Btree::cursor(&mut pager, target_root, TARGET_TREE).unwrap();
         let mut copied = 0;
@@ -2989,11 +3364,14 @@ mod tests {
             b"unrelated",
             b"value",
         )
-        .unwrap();
+        .unwrap()
+        .root_page_id;
         assert_eq!(cursor.next_in_transaction(&mut transaction).unwrap(), None);
 
         let mut cursor = Btree::cursor_in_transaction(&mut transaction, root, TREE).unwrap();
-        let _next_root = Btree::upsert(&mut transaction, root, TREE, b"changed", b"value").unwrap();
+        let _next_root = Btree::upsert(&mut transaction, root, TREE, b"changed", b"value")
+            .unwrap()
+            .root_page_id;
         assert_eq!(
             cursor
                 .next_in_transaction(&mut transaction)
@@ -3019,9 +3397,10 @@ mod tests {
                     inline.as_slice()
                 };
                 root = Btree::upsert(&mut transaction, root, TREE, &key(number), stored_value)
-                    .unwrap();
+                    .unwrap()
+                    .root_page_id;
             }
-            transaction.commit(2, Some(root)).unwrap();
+            transaction.commit(2, EMPTY_HASH, Some(root)).unwrap();
         }
         assert!(
             Node::decode(
@@ -3050,7 +3429,7 @@ mod tests {
 
         let mut transaction = pager.begin_write().unwrap();
         Btree::reclaim(&mut transaction, root, TREE).unwrap();
-        transaction.commit(3, None).unwrap();
+        transaction.commit(3, EMPTY_HASH, None).unwrap();
         assert_eq!(pager.active_metadata().superblock.live_data_page_count, 0);
         assert_eq!(
             pager.read_page(root).unwrap_err().code,
@@ -3082,9 +3461,10 @@ mod tests {
             b"overflow",
             &vec![1; MAX_OVERFLOW_CHUNK_BYTES + 1],
         )
-        .unwrap();
+        .unwrap()
+        .root_page_id;
         Btree::reclaim(&mut transaction, root, TREE).unwrap();
-        transaction.commit(1, None).unwrap();
+        transaction.commit(1, EMPTY_HASH, None).unwrap();
         assert_eq!(
             pager.active_metadata().superblock.live_data_page_count,
             live_before
@@ -3142,9 +3522,10 @@ mod tests {
             let mut transaction = pager.begin_write().unwrap();
             for number in 0..10 {
                 root = Btree::upsert(&mut transaction, root, TREE, &key(number), &value(number))
-                    .unwrap();
+                    .unwrap()
+                    .root_page_id;
             }
-            transaction.commit(2, Some(root)).unwrap();
+            transaction.commit(2, EMPTY_HASH, Some(root)).unwrap();
         }
         assert!(
             Node::decode(
@@ -3195,7 +3576,10 @@ mod tests {
             "DATABASE_FULL"
         );
         assert_eq!(
-            transaction.commit(3, Some(root)).unwrap_err().code,
+            transaction
+                .commit(3, EMPTY_HASH, Some(root))
+                .unwrap_err()
+                .code,
             "TRANSACTION_FAILED"
         );
         assert_eq!(
@@ -3250,7 +3634,7 @@ mod tests {
                 value: LeafValue::Inline(b"2".to_vec()),
             },
         ];
-        let page = Node::leaf(TREE, 2, entries.clone())
+        let (page, _) = Node::leaf(TREE, 2, entries.clone())
             .encode(FIRST_DATA_PAGE_ID)
             .unwrap();
         assert_eq!(
@@ -3305,7 +3689,8 @@ mod tests {
             }],
         )
         .encode(FIRST_DATA_PAGE_ID)
-        .unwrap();
+        .unwrap()
+        .0;
         let mut bytes = page.encode().unwrap();
         bytes[100] ^= 1;
         assert_eq!(Page::decode(&bytes).unwrap_err().code, "INVALID_PAGE");
@@ -3503,9 +3888,11 @@ mod tests {
             generation,
             1,
             root,
+            EMPTY_HASH,
             vec![InternalEntry {
                 key: b"m".to_vec(),
                 right_child: root + 1,
+                child_hash: EMPTY_HASH,
             }],
         );
         // The encoder itself refuses a direct self-reference, before corrupt bytes can reach disk.
@@ -3550,17 +3937,22 @@ mod tests {
                 generation,
                 1,
                 left,
+                EMPTY_HASH,
                 vec![InternalEntry {
                     key: b"m".to_vec(),
                     right_child: right,
+                    child_hash: EMPTY_HASH,
                 }],
             )
             .encode(duplicate_root)
-            .unwrap();
+            .unwrap()
+            .0;
             let cell_offset = read_u16(&page.payload, NODE_HEADER_SIZE) as usize;
             page.payload[cell_offset + 4..cell_offset + 12].copy_from_slice(&left.to_le_bytes());
             transaction.write_new_page(&page).unwrap();
-            transaction.commit(1, Some(duplicate_root)).unwrap();
+            transaction
+                .commit(1, EMPTY_HASH, Some(duplicate_root))
+                .unwrap();
         }
         assert_eq!(
             Btree::cursor(&mut pager, duplicate_root, TREE)
@@ -3597,14 +3989,18 @@ mod tests {
                     generation,
                     2,
                     left,
+                    EMPTY_HASH,
                     vec![InternalEntry {
                         key: b"m".to_vec(),
                         right_child: right,
+                        child_hash: EMPTY_HASH,
                     }],
                 ),
             )
             .unwrap();
-            transaction.commit(1, Some(wrong_level_root)).unwrap();
+            transaction
+                .commit(1, EMPTY_HASH, Some(wrong_level_root))
+                .unwrap();
         }
         assert_eq!(
             Btree::get(&mut pager, wrong_level_root, TREE, b"a")

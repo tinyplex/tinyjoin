@@ -268,6 +268,11 @@ Every SQL-created table has a primary key. TinyJoin currently implements:
 It does not implement foreign keys, `CHECK`, exclusion constraints, generated
 columns, sequences, triggers, or dependency cascades.
 
+A row is identified by its primary key: each table is stored keyed by that
+value, and an `UPDATE` which changes a primary key is applied as a removal at
+the old key and an insertion at the new one rather than an edit in place. Treat
+primary keys as stable, opaque identifiers.
+
 Composite primary and secondary indexes are supported. A unique index omits a
 key containing `NULL`, so multiple null-containing keys are allowed, matching
 PostgreSQL's default `NULLS DISTINCT` behavior. Complete primary-key equality
