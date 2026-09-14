@@ -20,7 +20,11 @@ mod paged_transaction;
 mod pager;
 mod prepared_statement;
 mod query;
+#[cfg(test)]
+mod recovery_property_tests;
 mod revision;
+#[cfg(test)]
+mod semantic_property_tests;
 mod sql_script;
 mod statement;
 mod storage;
