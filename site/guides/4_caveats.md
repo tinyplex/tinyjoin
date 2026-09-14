@@ -10,7 +10,7 @@ problem with different trade-offs.
 
 ## It is experimental
 
-TinyJoin is at v0.0.5. The JavaScript API, the SQL dialect, the error codes,
+TinyJoin is at v0.0.6. The JavaScript API, the SQL dialect, the error codes,
 and the page format can all change between releases, and a release may require
 an application to recreate its persistent database rather than migrate it.
 

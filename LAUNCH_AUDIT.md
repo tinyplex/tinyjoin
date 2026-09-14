@@ -6,7 +6,7 @@ Remediation is proceeding in the seven-summary-concern order below. The original
 | --- | --- | --- |
 | 1. SQL correctness | Fixed shared predicate/assignment validation and heterogeneous JSON equality | 249 Rust tests; two real-WASM contract tests; typecheck, docs and size checks |
 | 2. Resource limits | Fixed shared-graph traversal and capped expanded SQL bindings at 16 MiB before copying | 253 Rust tests; 105 TypeScript tests; three real-WASM contract tests; typecheck, docs and size checks |
-| 3. Release compatibility | Pending | |
+| 3. Release compatibility | Prepared TinyJoin 0.0.6 and starter 0.0.7 with explicit format-1/format-2 boundary and new starter namespace; not published | Packed 0.0.6 installed and built in four generated app variants; two Chromium CRUD/reload checks; 17 starter CLI tests, typecheck, spell, docs and notices checks |
 | 4. First-use experience | Pending | |
 | 5. Performance | Pending | |
 | 6. Practical join scope | Pending | |
