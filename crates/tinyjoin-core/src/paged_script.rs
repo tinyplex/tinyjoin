@@ -463,7 +463,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             .values()
             .map(|index| &index.definition)
             .collect::<Vec<_>>();
-        preflight_row_write_set(input_changes, &schemas, &definitions)?;
+        preflight_row_write_set(input_changes, &schemas, &definitions, Default::default())?;
         for change in input_changes {
             let table = match change {
                 RowChange::Upsert { table, .. } | RowChange::Delete { table, .. } => table,

@@ -1,0 +1,271 @@
+{
+  "measuredAt": "2026-09-14T03:43:33.500Z",
+  "environment": "Node in-memory structured WASM; no Worker, no OPFS; timings exclude initialization, schema setup, preparation, and validation read",
+  "node": "v25.2.1",
+  "platform": "darwin",
+  "architecture": "arm64",
+  "cpu": "Apple M2",
+  "packageVersion": "0.0.6",
+  "wasmSha256": "e16434e1d1b254d78f2320132e615221f8f8406517c0014d363192a57c84fc09",
+  "wasmBytes": 739244,
+  "repetitions": 3,
+  "warmupRowsPerShape": 100,
+  "results": [
+    {
+      "rows": 100,
+      "uniqueIndex": false,
+      "stagingMedianMs": 2.369041999999979,
+      "commitMedianMs": 16.54487500000002,
+      "samples": [
+        {
+          "rows": 100,
+          "uniqueIndex": false,
+          "stagingMs": 3.5150409999999965,
+          "commitMs": 17.329792000000012,
+          "stagingPageReads": 0,
+          "pageCount": 13
+        },
+        {
+          "rows": 100,
+          "uniqueIndex": false,
+          "stagingMs": 2.369041999999979,
+          "commitMs": 16.54487500000002,
+          "stagingPageReads": 0,
+          "pageCount": 13
+        },
+        {
+          "rows": 100,
+          "uniqueIndex": false,
+          "stagingMs": 1.982875000000007,
+          "commitMs": 16.26929099999998,
+          "stagingPageReads": 0,
+          "pageCount": 13
+        }
+      ]
+    },
+    {
+      "rows": 500,
+      "uniqueIndex": false,
+      "stagingMedianMs": 8.607916999999986,
+      "commitMedianMs": 112.87000000000006,
+      "samples": [
+        {
+          "rows": 500,
+          "uniqueIndex": false,
+          "stagingMs": 9.491291999999987,
+          "commitMs": 114.40812499999998,
+          "stagingPageReads": 0,
+          "pageCount": 25
+        },
+        {
+          "rows": 500,
+          "uniqueIndex": false,
+          "stagingMs": 8.607916999999986,
+          "commitMs": 112.08825000000002,
+          "stagingPageReads": 0,
+          "pageCount": 25
+        },
+        {
+          "rows": 500,
+          "uniqueIndex": false,
+          "stagingMs": 7.848374999999976,
+          "commitMs": 112.87000000000006,
+          "stagingPageReads": 0,
+          "pageCount": 25
+        }
+      ]
+    },
+    {
+      "rows": 1000,
+      "uniqueIndex": false,
+      "stagingMedianMs": 13.689041999999972,
+      "commitMedianMs": 234.00533299999995,
+      "samples": [
+        {
+          "rows": 1000,
+          "uniqueIndex": false,
+          "stagingMs": 14.511042000000089,
+          "commitMs": 232.29891699999996,
+          "stagingPageReads": 0,
+          "pageCount": 39
+        },
+        {
+          "rows": 1000,
+          "uniqueIndex": false,
+          "stagingMs": 13.689041999999972,
+          "commitMs": 234.00533299999995,
+          "stagingPageReads": 0,
+          "pageCount": 39
+        },
+        {
+          "rows": 1000,
+          "uniqueIndex": false,
+          "stagingMs": 12.89712499999996,
+          "commitMs": 234.8532090000001,
+          "stagingPageReads": 0,
+          "pageCount": 39
+        }
+      ]
+    },
+    {
+      "rows": 2000,
+      "uniqueIndex": false,
+      "stagingMedianMs": 24.843165999999883,
+      "commitMedianMs": 478.66775000000007,
+      "samples": [
+        {
+          "rows": 2000,
+          "uniqueIndex": false,
+          "stagingMs": 25.27491699999996,
+          "commitMs": 478.66775000000007,
+          "stagingPageReads": 0,
+          "pageCount": 69
+        },
+        {
+          "rows": 2000,
+          "uniqueIndex": false,
+          "stagingMs": 24.843165999999883,
+          "commitMs": 475.9262919999999,
+          "stagingPageReads": 0,
+          "pageCount": 69
+        },
+        {
+          "rows": 2000,
+          "uniqueIndex": false,
+          "stagingMs": 24.011833999999908,
+          "commitMs": 481.23383300000023,
+          "stagingPageReads": 0,
+          "pageCount": 69
+        }
+      ]
+    },
+    {
+      "rows": 100,
+      "uniqueIndex": true,
+      "stagingMedianMs": 1.336334000000079,
+      "commitMedianMs": 26.970124999999825,
+      "samples": [
+        {
+          "rows": 100,
+          "uniqueIndex": true,
+          "stagingMs": 1.468417000000045,
+          "commitMs": 26.970124999999825,
+          "stagingPageReads": 0,
+          "pageCount": 14
+        },
+        {
+          "rows": 100,
+          "uniqueIndex": true,
+          "stagingMs": 1.3290420000002996,
+          "commitMs": 26.762040999999954,
+          "stagingPageReads": 0,
+          "pageCount": 14
+        },
+        {
+          "rows": 100,
+          "uniqueIndex": true,
+          "stagingMs": 1.336334000000079,
+          "commitMs": 27.14270800000031,
+          "stagingPageReads": 0,
+          "pageCount": 14
+        }
+      ]
+    },
+    {
+      "rows": 500,
+      "uniqueIndex": true,
+      "stagingMedianMs": 6.676542000000154,
+      "commitMedianMs": 209.58420799999976,
+      "samples": [
+        {
+          "rows": 500,
+          "uniqueIndex": true,
+          "stagingMs": 6.721082999999908,
+          "commitMs": 217.38412500000004,
+          "stagingPageReads": 0,
+          "pageCount": 34
+        },
+        {
+          "rows": 500,
+          "uniqueIndex": true,
+          "stagingMs": 6.63287500000024,
+          "commitMs": 209.02608400000008,
+          "stagingPageReads": 0,
+          "pageCount": 34
+        },
+        {
+          "rows": 500,
+          "uniqueIndex": true,
+          "stagingMs": 6.676542000000154,
+          "commitMs": 209.58420799999976,
+          "stagingPageReads": 0,
+          "pageCount": 34
+        }
+      ]
+    },
+    {
+      "rows": 1000,
+      "uniqueIndex": true,
+      "stagingMedianMs": 13.078375000000051,
+      "commitMedianMs": 454.7937919999995,
+      "samples": [
+        {
+          "rows": 1000,
+          "uniqueIndex": true,
+          "stagingMs": 13.078375000000051,
+          "commitMs": 455.00025000000005,
+          "stagingPageReads": 0,
+          "pageCount": 56
+        },
+        {
+          "rows": 1000,
+          "uniqueIndex": true,
+          "stagingMs": 13.922999999999774,
+          "commitMs": 454.7937919999995,
+          "stagingPageReads": 0,
+          "pageCount": 56
+        },
+        {
+          "rows": 1000,
+          "uniqueIndex": true,
+          "stagingMs": 13.015333000000282,
+          "commitMs": 447.149042,
+          "stagingPageReads": 0,
+          "pageCount": 56
+        }
+      ]
+    },
+    {
+      "rows": 2000,
+      "uniqueIndex": true,
+      "stagingMedianMs": 26.44420799999989,
+      "commitMedianMs": 918.5837499999998,
+      "samples": [
+        {
+          "rows": 2000,
+          "uniqueIndex": true,
+          "stagingMs": 26.464874999999665,
+          "commitMs": 950.9887090000002,
+          "stagingPageReads": 0,
+          "pageCount": 103
+        },
+        {
+          "rows": 2000,
+          "uniqueIndex": true,
+          "stagingMs": 26.389165999999932,
+          "commitMs": 917.9413749999994,
+          "stagingPageReads": 0,
+          "pageCount": 103
+        },
+        {
+          "rows": 2000,
+          "uniqueIndex": true,
+          "stagingMs": 26.44420799999989,
+          "commitMs": 918.5837499999998,
+          "stagingPageReads": 0,
+          "pageCount": 103
+        }
+      ]
+    }
+  ]
+}

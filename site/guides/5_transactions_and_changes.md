@@ -23,6 +23,37 @@ unit should be discarded.
 Run schema DDL such as `CREATE`, `ALTER`, and `DROP` outside the callback, using
 a standalone query() or an atomic exec() script.
 
+## Inserting many rows
+
+Prepare a parameterized `INSERT` once and execute it through the transaction
+object. Transactions that only append new primary keys validate each new
+statement incrementally, including unique-index constraints. Final commit
+still validates and publishes the complete write set.
+
+```ts
+const insert = await db.prepare('INSERT INTO tasks (id, title) VALUES ($1, $2)');
+try {
+  await db.transaction(async (tx) => {
+    for (const title of titles) {
+      await tx.execute(insert, [crypto.randomUUID(), title]);
+    }
+  });
+} finally {
+  await insert.close();
+}
+```
+
+Updating, deleting, or revisiting a staged key switches that transaction to
+complete write-set validation after each statement. Many individual writes
+on that path can have quadratic staging cost. Repeated tx.exec() calls also
+copy the current transaction state for script rollback. Keep transactions
+bounded and prefer multi-row statements when the application can form them
+within the [SQL limits](/guides/sql-compatibility/#hard-limits).
+
+These limits apply cumulatively across the transaction, even when each
+individual statement is small. Transaction reads use the staged row view;
+secondary-index query acceleration is currently disabled inside callbacks.
+
 ## Re-query after a commit
 
 Subscriptions report changed table names rather than maintaining a live result

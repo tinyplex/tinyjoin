@@ -107,13 +107,38 @@ list is in [hard limits](/guides/sql-compatibility/#hard-limits).
 That boundedness is deliberate, but it does mean TinyJoin is sized for
 application state rather than for analytics over a large dataset.
 
-## Performance is unmeasured
+## Performance depends on the workload
 
-TinyJoin runs its engine off the main thread, which keeps a page responsive
-while queries run, and its bounded planner has no room for the pathological
-cases that come with a general optimizer. Neither of those is a throughput
-claim: there are no published benchmarks yet. Measure with the schema and query
-shapes an application actually uses.
+Running SQL off the main thread keeps engine work out of the page's rendering
+loop. It does not guarantee low latency or throughput on every browser and
+device. Measure the application's schema, query shapes, and storage mode.
+
+Transactions that only append new primary keys use incremental statement
+validation. Mixed writes still validate the complete staged write set after
+each statement and can have quadratic staging cost. Multi-row statements can
+reduce that overhead; see [inserting many rows](/guides/transactions-and-changes/#inserting-many-rows).
+
+Aggregates scan their input table, and transaction queries currently do not
+use secondary indexes for lookup acceleration. Opening a persistent database
+validates its stored trees, so startup cost grows with the stored data. Commit
+and browser storage costs are separate from statement staging.
+
+A local before/after check of incremental insertion used 1,000 awaited
+prepared inserts in one transaction, with an integer primary key and a short
+text value. Three-run medians on an Apple M2 in Chromium, using the packaged
+default Worker, were:
+
+| Storage | Staging before / after | Whole transaction before / after |
+| --- | --- | --- |
+| Memory | 1,324 / 62 ms | 1,557 / 304 ms |
+| OPFS | 1,327 / 56 ms | 1,571 / 310 ms |
+
+Commit time remained about 230–250 ms. These are diagnostic measurements of
+one insertion workload, not a controlled comparison with other databases or
+a browser support/performance guarantee. The repository retains the samples
+and runtime hashes under `benchmarks/`; after `npm run build`, reproduce the
+browser workload with `node scripts/benchmark-browser-inserts.mjs` and the
+separate engine/unique-index workload with `node scripts/benchmark-staging.mjs`.
 
 ## If TinyJoin is not the right fit
 

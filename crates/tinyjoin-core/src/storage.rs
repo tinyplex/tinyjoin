@@ -1267,25 +1267,40 @@ fn row_write_limit_error(message: String) -> EngineError {
     EngineError::new("RESOURCE_LIMIT", message)
 }
 
+/// Cumulative logical input retained by a disjoint sequence of row write sets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RowWriteUsage {
+    changes: usize,
+    bytes: usize,
+}
+
 pub(crate) fn preflight_row_write_set(
     changes: &[RowChange],
     schemas: &BTreeMap<&str, &TableDefinition>,
     indexes: &[&IndexDefinition],
-) -> Result<()> {
-    if changes.len() > MAX_ROW_WRITE_CHANGES {
+    previous: RowWriteUsage,
+) -> Result<RowWriteUsage> {
+    let change_count = previous
+        .changes
+        .checked_add(changes.len())
+        .ok_or_else(row_write_overflow_error)?;
+    if change_count > MAX_ROW_WRITE_CHANGES {
         return Err(row_write_limit_error(format!(
             "A row write-set cannot contain more than {MAX_ROW_WRITE_CHANGES} changes"
         )));
     }
-    preflight_row_changes(changes, schemas, indexes)
+    Ok(RowWriteUsage {
+        changes: change_count,
+        bytes: preflight_row_changes(changes, schemas, indexes, previous.bytes)?,
+    })
 }
 
 fn preflight_row_changes(
     changes: &[RowChange],
     schemas: &BTreeMap<&str, &TableDefinition>,
     indexes: &[&IndexDefinition],
-) -> Result<()> {
-    let mut batch_bytes = 0usize;
+    mut batch_bytes: usize,
+) -> Result<usize> {
     for change in changes {
         let (table, input, is_delete) = match change {
             RowChange::Upsert { table, row } => (table, row, false),
@@ -1356,7 +1371,7 @@ fn preflight_row_changes(
             ));
         }
     }
-    Ok(())
+    Ok(batch_bytes)
 }
 
 fn validate_prospective_storage_keys(
@@ -1473,6 +1488,45 @@ mod tests {
             })
             .unwrap();
         storage
+    }
+
+    #[test]
+    fn row_write_preflight_preserves_cumulative_count_and_byte_boundaries() {
+        let schema = users_storage().table_schema("users").unwrap();
+        let schemas = BTreeMap::from([("users", &schema)]);
+        let changes = vec![RowChange::Upsert {
+            table: "users".to_owned(),
+            row: row(json!({"id": 1, "email": "one"})),
+        }];
+        let addition =
+            preflight_row_write_set(&changes, &schemas, &[], RowWriteUsage::default()).unwrap();
+        for extra in [0, 1] {
+            let count = preflight_row_write_set(
+                &changes,
+                &schemas,
+                &[],
+                RowWriteUsage {
+                    changes: MAX_ROW_WRITE_CHANGES - 1 + extra,
+                    bytes: 0,
+                },
+            );
+            let bytes = preflight_row_write_set(
+                &changes,
+                &schemas,
+                &[],
+                RowWriteUsage {
+                    changes: 0,
+                    bytes: MAX_ROW_WRITE_BYTES - addition.bytes + extra,
+                },
+            );
+            if extra == 0 {
+                assert_eq!(count.unwrap().changes, MAX_ROW_WRITE_CHANGES);
+                assert_eq!(bytes.unwrap().bytes, MAX_ROW_WRITE_BYTES);
+            } else {
+                assert_eq!(count.unwrap_err().code, "RESOURCE_LIMIT");
+                assert_eq!(bytes.unwrap_err().code, "TRANSACTION_TOO_LARGE");
+            }
+        }
     }
 
     #[test]

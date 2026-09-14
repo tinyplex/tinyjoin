@@ -1,0 +1,80 @@
+{
+  "createdAt": "2026-09-14T03:39:32.224Z",
+  "packageVersion": "0.0.6",
+  "wasmSha256": "2ec114b66d344e57f998e1be21842ac936bf219b6559987a97e7aa4571426445",
+  "wasmBytes": 732647,
+  "browserVersion": "151.0.7922.34",
+  "rows": 1000,
+  "indexes": "primary key only",
+  "notes": "Packaged default Worker; three sequential fresh databases per mode; commitMs measures callback completion to transaction resolution; local diagnostic, not controlled hardware or competitor benchmark.",
+  "samples": [
+    {
+      "mode": "memory",
+      "repetition": 0,
+      "rowCount": 1000,
+      "openMs": 34.200000047683716,
+      "stagingMs": 1341.7000000476837,
+      "commitMs": 230.89999997615814,
+      "transactionMs": 1572.7000000476837
+    },
+    {
+      "mode": "memory",
+      "repetition": 1,
+      "rowCount": 1000,
+      "openMs": 12,
+      "stagingMs": 1323.8999999761581,
+      "commitMs": 232.5,
+      "transactionMs": 1556.5
+    },
+    {
+      "mode": "memory",
+      "repetition": 2,
+      "rowCount": 1000,
+      "openMs": 11.199999928474426,
+      "stagingMs": 1320.8999999761581,
+      "commitMs": 233.80000007152557,
+      "transactionMs": 1554.7000000476837
+    },
+    {
+      "mode": "opfs",
+      "repetition": 0,
+      "rowCount": 1000,
+      "openMs": 28.700000047683716,
+      "stagingMs": 1320.6000000238419,
+      "commitMs": 250.39999997615814,
+      "transactionMs": 1571.1000000238419
+    },
+    {
+      "mode": "opfs",
+      "repetition": 1,
+      "rowCount": 1000,
+      "openMs": 15.399999976158142,
+      "stagingMs": 1350.1000000238419,
+      "commitMs": 247.29999995231628,
+      "transactionMs": 1597.5
+    },
+    {
+      "mode": "opfs",
+      "repetition": 2,
+      "rowCount": 1000,
+      "openMs": 17,
+      "stagingMs": 1326.5,
+      "commitMs": 244.09999990463257,
+      "transactionMs": 1570.6999999284744
+    }
+  ],
+  "medians": {
+    "memory": {
+      "openMs": 12,
+      "stagingMs": 1323.8999999761581,
+      "commitMs": 232.5,
+      "transactionMs": 1556.5
+    },
+    "opfs": {
+      "openMs": 17,
+      "stagingMs": 1326.5,
+      "commitMs": 247.29999995231628,
+      "transactionMs": 1571.1000000238419
+    }
+  }
+}

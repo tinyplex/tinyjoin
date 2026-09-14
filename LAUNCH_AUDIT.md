@@ -8,7 +8,7 @@ Remediation is proceeding in the seven-summary-concern order below. The original
 | 2. Resource limits | Fixed shared-graph traversal and capped expanded SQL bindings at 16 MiB before copying | 253 Rust tests; 105 TypeScript tests; three real-WASM contract tests; typecheck, docs and size checks |
 | 3. Release compatibility | Prepared TinyJoin 0.0.6 and starter 0.0.7 with explicit format-1/format-2 boundary and new starter namespace; not published | Packed 0.0.6 installed and built in four generated app variants; two Chromium CRUD/reload checks; 17 starter CLI tests, typecheck, spell, docs and notices checks |
 | 4. First-use experience | Starter shows startup errors and Retry, preserves failed drafts, restores failed toggles, handles cleanup, and documents single-tab use | Four generated builds; six Chromium scenarios across JavaScript/TypeScript, including second-tab recovery and rejected writes; 17 CLI tests, typecheck and spelling |
-| 5. Performance | Pending | |
+| 5. Performance | Incremental validation for append-only transactions, including unique indexes; documented mixed-write, scan and startup costs | 261 Rust tests, including differential/budget/work-count regressions; three real-WASM contracts; retained engine and browser benchmarks (1,000 OPFS inserts: 1,571 to 310 ms); docs and size gates |
 | 6. Practical join scope | Pending | |
 | 7. Documentation/site | Pending | |
 

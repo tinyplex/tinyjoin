@@ -18,7 +18,7 @@ use crate::{
         secondary_index_entry_matches_prefix, secondary_index_primary_key,
         secondary_index_primary_key_for_definition,
     },
-    storage::{normalize_row, preflight_row_write_set},
+    storage::{RowWriteUsage, normalize_row, preflight_row_write_set},
 };
 /// A relational view over the crash-safe paged B-tree store.
 ///
@@ -32,6 +32,8 @@ pub(crate) struct PagedStorage<D: PageDevice> {
     tables: BTreeMap<String, PagedTable>,
     indexes: BTreeMap<String, PagedIndex>,
     recovery_required: bool,
+    #[cfg(test)]
+    validated_row_count: std::cell::Cell<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +56,32 @@ pub(crate) struct PagedIndex {
 
 struct PagedRowChange {
     next: Option<Row>,
+}
+
+/// The three byte estimates protect different allocations and must stay independent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PagedWriteUsage {
+    row_write: RowWriteUsage,
+    input_bytes: usize,
+    prepared_bytes: usize,
+    operations: usize,
+}
+
+/// A flat set avoids retaining a catalog name or another container per appended row.
+/// The existing unique-prefix charge (prefix + primary key + 64 bytes) covers this
+/// smaller key: one tree ID, one exact-length boxed prefix, and its B-tree entry.
+pub(crate) type UniquePrefixes = BTreeSet<(TreeId, Box<[u8]>)>;
+
+pub(crate) struct ValidatedRowWrites {
+    pub(crate) usage: PagedWriteUsage,
+    pub(crate) unique_prefixes: UniquePrefixes,
+}
+
+/// Only valid while every preceding change appended a previously absent primary key.
+pub(crate) struct AppendWriteContext<'a> {
+    pub(crate) usage: PagedWriteUsage,
+    pub(crate) unique_prefixes: &'a UniquePrefixes,
+    pub(crate) touched_tables: &'a BTreeSet<String>,
 }
 
 const MAX_PAGED_BATCH_OPERATIONS: usize = 1_000_000;
@@ -84,6 +112,8 @@ impl<D: PageDevice> PagedStorage<D> {
                 tables: BTreeMap::new(),
                 indexes: BTreeMap::new(),
                 recovery_required: false,
+                #[cfg(test)]
+                validated_row_count: std::cell::Cell::new(0),
             });
         };
 
@@ -96,6 +126,8 @@ impl<D: PageDevice> PagedStorage<D> {
             tables,
             indexes,
             recovery_required: false,
+            #[cfg(test)]
+            validated_row_count: std::cell::Cell::new(0),
         })
     }
 
@@ -179,8 +211,9 @@ impl<D: PageDevice> PagedStorage<D> {
         }
         Ok((revision, results))
     }
-    pub(crate) fn validate_row_write_set(&self, input_changes: &[RowChange]) -> Result<()> {
-        self.prepare_row_write_set(input_changes, true)
+    #[cfg(test)]
+    pub(crate) fn validated_row_count(&self) -> usize {
+        self.validated_row_count.get()
     }
 
     /// Rejects two SQL upserts which target the same canonical page key in one statement.
@@ -213,17 +246,19 @@ impl<D: PageDevice> PagedStorage<D> {
         Ok(())
     }
 
-    fn prepare_row_write_set(
+    pub(crate) fn validate_row_write_set(
         &self,
         input_changes: &[RowChange],
-        reject_duplicate_upserts: bool,
-    ) -> Result<()> {
+        append: Option<AppendWriteContext<'_>>,
+    ) -> Result<ValidatedRowWrites> {
         self.ensure_ready()?;
-        preflight_batch(input_changes, &self.tables, &self.indexes)?;
-        if reject_duplicate_upserts {
-            self.validate_sql_row_change_sequence(input_changes)?;
-        }
-        let mut retained_bytes = 0usize;
+        #[cfg(test)]
+        self.validated_row_count
+            .set(self.validated_row_count.get() + input_changes.len());
+        let mut usage =
+            preflight_batch(input_changes, &self.tables, &self.indexes, append.as_ref())?;
+        self.validate_sql_row_change_sequence(input_changes)?;
+        let mut retained_bytes = usage.prepared_bytes;
         let mut tables = BTreeMap::<String, BTreeMap<Vec<u8>, PagedRowChange>>::new();
         for change in input_changes {
             let (table_name, input, is_delete) = match change {
@@ -271,16 +306,25 @@ impl<D: PageDevice> PagedStorage<D> {
             table_changes.insert(key, PagedRowChange { next });
         }
 
-        self.validate_changed_unique_indexes(&tables, retained_bytes)?;
-
-        Ok(())
+        let (prepared_bytes, unique_prefixes) = self.validate_changed_unique_indexes(
+            &tables,
+            retained_bytes,
+            append.as_ref().map(|context| context.unique_prefixes),
+        )?;
+        usage.prepared_bytes = prepared_bytes;
+        Ok(ValidatedRowWrites {
+            usage,
+            unique_prefixes,
+        })
     }
 
     fn validate_changed_unique_indexes(
         &self,
         tables: &BTreeMap<String, BTreeMap<Vec<u8>, PagedRowChange>>,
         mut retained_bytes: usize,
-    ) -> Result<()> {
+        previous_prefixes: Option<&UniquePrefixes>,
+    ) -> Result<(usize, UniquePrefixes)> {
+        let mut changed_prefixes = UniquePrefixes::new();
         for (table_name, changes) in tables {
             let table = &self.tables[table_name];
             for index in self
@@ -288,7 +332,6 @@ impl<D: PageDevice> PagedStorage<D> {
                 .values()
                 .filter(|index| index.definition.table == *table_name && index.definition.unique)
             {
-                let mut changed_prefixes = BTreeMap::<Vec<u8>, &[u8]>::new();
                 for (primary_key, change) in changes {
                     let Some(row) = &change.next else {
                         continue;
@@ -302,15 +345,17 @@ impl<D: PageDevice> PagedStorage<D> {
                         .checked_add(prefix.len() + primary_key.len() + 64)
                         .ok_or_else(batch_too_large)?;
                     ensure_batch_bytes(retained_bytes)?;
-                    if changed_prefixes
-                        .insert(prefix.clone(), primary_key)
-                        .is_some()
+                    let claim = (index.tree_id, prefix.into_boxed_slice());
+                    if changed_prefixes.contains(&claim)
+                        || previous_prefixes.is_some_and(|prefixes| prefixes.contains(&claim))
                     {
                         return Err(unique_violation(&index.definition.name));
                     }
 
+                    let prefix = claim.1.as_ref();
+
                     let existing_primary_keys =
-                        committed_index_primary_keys(&mut self.pager.borrow_mut(), index, &prefix)?;
+                        committed_index_primary_keys(&mut self.pager.borrow_mut(), index, prefix)?;
                     for existing_primary_key in existing_primary_keys {
                         retained_bytes = retained_bytes
                             .checked_add(existing_primary_key.len())
@@ -330,7 +375,7 @@ impl<D: PageDevice> PagedStorage<D> {
                                             row,
                                         )?
                                         .as_deref()
-                                            != Some(prefix.as_slice())
+                                            != Some(prefix)
                                     }
                                 }
                             } else {
@@ -340,10 +385,11 @@ impl<D: PageDevice> PagedStorage<D> {
                             return Err(unique_violation(&index.definition.name));
                         }
                     }
+                    changed_prefixes.insert(claim);
                 }
             }
         }
-        Ok(())
+        Ok((retained_bytes, changed_prefixes))
     }
 
     pub(crate) fn commit_transaction_changes(
@@ -374,7 +420,8 @@ fn preflight_batch(
     changes: &[RowChange],
     tables: &BTreeMap<String, PagedTable>,
     indexes: &BTreeMap<String, PagedIndex>,
-) -> Result<()> {
+    append: Option<&AppendWriteContext<'_>>,
+) -> Result<PagedWriteUsage> {
     let schemas = tables
         .iter()
         .map(|(name, table)| (name.as_str(), &table.schema))
@@ -383,9 +430,10 @@ fn preflight_batch(
         .values()
         .map(|index| &index.definition)
         .collect::<Vec<_>>();
-    preflight_row_write_set(changes, &schemas, &definitions)?;
-    let mut bytes = 0usize;
-    let mut operations = 0usize;
+    let mut usage = append.map_or(PagedWriteUsage::default(), |context| context.usage);
+    usage.row_write = preflight_row_write_set(changes, &schemas, &definitions, usage.row_write)?;
+    let mut bytes = usage.input_bytes;
+    let mut operations = usage.operations;
     let mut changed_tables = BTreeSet::new();
     let mut index_counts = BTreeMap::<&str, usize>::new();
     for index in indexes.values() {
@@ -416,7 +464,9 @@ fn preflight_batch(
             .and_then(|bytes| bytes.checked_add(64))
             .ok_or_else(batch_too_large)?;
         ensure_batch_bytes(bytes)?;
-        changed_tables.insert(table.as_str());
+        if !append.is_some_and(|context| context.touched_tables.contains(table)) {
+            changed_tables.insert(table.as_str());
+        }
     }
     let affected_index_count = changed_tables.iter().try_fold(0usize, |count, table| {
         count
@@ -430,7 +480,9 @@ fn preflight_batch(
     if operations > MAX_PAGED_BATCH_OPERATIONS {
         return Err(operation_limit());
     }
-    Ok(())
+    usage.input_bytes = bytes;
+    usage.operations = operations;
+    Ok(usage)
 }
 
 fn operation_limit() -> EngineError {
@@ -1162,6 +1214,108 @@ mod tests {
         let paged = page_native_fixture(MemoryPageDevice::new(0).unwrap()).unwrap();
         let actual = Engine::new(paged).query_sql(sql, &[]).unwrap();
         (expected, actual)
+    }
+
+    #[test]
+    fn append_validation_charges_catalog_operations_once_per_table() {
+        let mut storage = PagedStorage::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        for sql in [
+            "CREATE TABLE first_table (id INTEGER PRIMARY KEY, value TEXT)",
+            "CREATE UNIQUE INDEX first_unique ON first_table (value)",
+            "CREATE INDEX first_secondary ON first_table (value)",
+            "CREATE TABLE second_table (id INTEGER PRIMARY KEY, value TEXT)",
+            "CREATE UNIQUE INDEX second_unique ON second_table (value)",
+        ] {
+            execute_sql(&mut storage, sql, &[]).unwrap();
+        }
+        let change = |table: &str, id: i64, value: &str| RowChange::Upsert {
+            table: table.to_owned(),
+            row: row(json!({"id": id, "value": value})),
+        };
+        let first = vec![change("first_table", 1, "one")];
+        let initial = storage.validate_row_write_set(&first, None).unwrap();
+        // One row and two maintained indexes, then one table and two catalog indexes.
+        assert_eq!(initial.usage.operations, 5 + 3);
+        let touched_tables = BTreeSet::from(["first_table".to_owned()]);
+        let second = vec![
+            change("first_table", 2, "two"),
+            change("first_table", 3, "three"),
+            change("second_table", 1, "one"),
+        ];
+        let appended = storage
+            .validate_row_write_set(
+                &second,
+                Some(AppendWriteContext {
+                    usage: initial.usage,
+                    unique_prefixes: &initial.unique_prefixes,
+                    touched_tables: &touched_tables,
+                }),
+            )
+            .unwrap();
+        assert_eq!(appended.usage.operations, 3 * 5 + 3 + 3 + 2);
+        let all = first.into_iter().chain(second).collect::<Vec<_>>();
+        let complete = storage.validate_row_write_set(&all, None).unwrap();
+        assert_eq!(appended.usage, complete.usage);
+        let prefixes = initial
+            .unique_prefixes
+            .into_iter()
+            .chain(appended.unique_prefixes)
+            .collect::<UniquePrefixes>();
+        assert_eq!(prefixes, complete.unique_prefixes);
+    }
+
+    #[test]
+    fn append_validation_preserves_exact_paged_byte_and_operation_boundaries() {
+        let mut storage = PagedStorage::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        for sql in [
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)",
+            "CREATE UNIQUE INDEX items_unique ON items (value)",
+        ] {
+            execute_sql(&mut storage, sql, &[]).unwrap();
+        }
+        let changes = vec![RowChange::Upsert {
+            table: "items".to_owned(),
+            row: row(json!({"id": 1, "value": "one"})),
+        }];
+        let touched_tables = BTreeSet::from(["items".to_owned()]);
+        let unique_prefixes = UniquePrefixes::new();
+        let context = |usage| AppendWriteContext {
+            usage,
+            unique_prefixes: &unique_prefixes,
+            touched_tables: &touched_tables,
+        };
+        let addition = storage
+            .validate_row_write_set(&changes, Some(context(PagedWriteUsage::default())))
+            .unwrap()
+            .usage;
+        // Seed each independent budget just below its limit, leaving the other two empty.
+        // This checks that the existing validators enforce cumulative, inclusive bounds.
+        for budget in 0..3 {
+            for extra in [0, 1] {
+                let mut usage = PagedWriteUsage::default();
+                match budget {
+                    0 => usage.input_bytes = MAX_PAGED_BATCH_BYTES - addition.input_bytes + extra,
+                    1 => {
+                        usage.prepared_bytes =
+                            MAX_PAGED_BATCH_BYTES - addition.prepared_bytes + extra
+                    }
+                    _ => {
+                        usage.operations = MAX_PAGED_BATCH_OPERATIONS - addition.operations + extra
+                    }
+                }
+                let result = storage.validate_row_write_set(&changes, Some(context(usage)));
+                if extra == 0 {
+                    let result = result.unwrap();
+                    match budget {
+                        0 => assert_eq!(result.usage.input_bytes, MAX_PAGED_BATCH_BYTES),
+                        1 => assert_eq!(result.usage.prepared_bytes, MAX_PAGED_BATCH_BYTES),
+                        _ => assert_eq!(result.usage.operations, MAX_PAGED_BATCH_OPERATIONS),
+                    }
+                } else {
+                    assert_eq!(result.err().unwrap().code, "TRANSACTION_TOO_LARGE");
+                }
+            }
+        }
     }
 
     #[test]

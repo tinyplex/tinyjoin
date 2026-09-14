@@ -27,7 +27,9 @@ migration, and changing the OPFS name does not copy existing data.
 This release also makes predicate and assignment type validation consistent
 across reads and writes, compares heterogeneous JSON values consistently,
 and bounds shared parameter-graph traversal and expanded SQL bindings before
-copying values.
+copying values. Append-only transactions now validate new row statements
+incrementally, including unique-index checks; mixed writes retain complete
+staged write-set validation.
 
 ## v0.0.5
 

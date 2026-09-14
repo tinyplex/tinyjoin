@@ -5,7 +5,9 @@ use std::{
 
 use crate::{
     EngineError, IndexDefinition, PageDevice, PagedStorage, Result, Row, RowChange, StorageReader,
-    TableDefinition, VisitControl, VisitOutcome, paged_codec::encode_primary_key,
+    TableDefinition, VisitControl, VisitOutcome,
+    paged_codec::encode_primary_key,
+    paged_storage::{AppendWriteContext, PagedWriteUsage, UniquePrefixes},
     storage::estimated_row_bytes,
 };
 
@@ -19,6 +21,18 @@ pub(crate) struct PagedTransaction {
     base_revision: u64,
     entries: BTreeMap<String, BTreeMap<Vec<u8>, OverlayEntry>>,
     touched_tables: BTreeSet<String>,
+    append_validation: Option<AppendValidation>,
+}
+
+/// Disjoint inserts have additive validation costs and never release a unique prefix.
+/// Mixed mutations retain the complete existing validator instead of extending this cache
+/// into another implementation of update/delete or unique-key movement semantics.
+#[derive(Clone, Default)]
+struct AppendValidation {
+    overlay_keys: usize,
+    overlay_bytes: usize,
+    usage: PagedWriteUsage,
+    unique_prefixes: UniquePrefixes,
 }
 
 #[derive(Clone)]
@@ -39,6 +53,7 @@ impl PagedTransaction {
             base_revision,
             entries: BTreeMap::new(),
             touched_tables: BTreeSet::new(),
+            append_validation: Some(AppendValidation::default()),
         }
     }
 
@@ -75,13 +90,17 @@ impl PagedTransaction {
         storage.validate_sql_row_change_sequence(&changes)?;
 
         let mut patch = OverlayPatch::default();
+        let mut append_only = self.append_validation.is_some();
         for change in changes {
             let (table, input, next) = match change {
                 RowChange::Upsert { table, row } => {
                     let next = Some(row.clone());
                     (table, row, next)
                 }
-                RowChange::Delete { table, key } => (table, key, None),
+                RowChange::Delete { table, key } => {
+                    append_only = false;
+                    (table, key, None)
+                }
             };
             let schema = storage.table_schema(&table)?;
             let key = primary_key_row(&schema, &input)?;
@@ -97,9 +116,13 @@ impl PagedTransaction {
                     .get(&table)
                     .and_then(|entries| entries.get(&encoded_key))
                 {
-                    Some(entry) => entry.clone(),
+                    Some(entry) => {
+                        append_only = false;
+                        entry.clone()
+                    }
                     None => {
                         let base = storage.lookup_primary_key(&table, &key)?;
+                        append_only &= base.is_none();
                         OverlayEntry {
                             key,
                             next: base.clone(),
@@ -121,15 +144,56 @@ impl PagedTransaction {
                 .next = next;
         }
 
-        self.validate_candidate_overlay(&patch)?;
-        let candidate_changes = self.candidate_changes(&patch);
-        // This performs the canonical physical row/key, unique-index, operation-count, and
-        // retained-byte validation against the complete transaction final state.
-        storage.validate_row_write_set(&candidate_changes)?;
+        let append = if append_only {
+            let previous = self
+                .append_validation
+                .as_ref()
+                .expect("append mode is active");
+            let mut keys = previous.overlay_keys;
+            let mut bytes = previous.overlay_bytes;
+            for (table, entries) in &patch.entries {
+                for (key, entry) in entries {
+                    retain_entry(table, key, entry, &mut keys, &mut bytes)?;
+                }
+            }
+            let changes =
+                changes_from_entries(patch.entries.iter().flat_map(|(table, entries)| {
+                    entries.values().map(move |entry| (table.as_str(), entry))
+                }));
+            let validated = storage.validate_row_write_set(
+                &changes,
+                Some(AppendWriteContext {
+                    usage: previous.usage,
+                    unique_prefixes: &previous.unique_prefixes,
+                    touched_tables: &self.touched_tables,
+                }),
+            )?;
+            Some((keys, bytes, validated))
+        } else {
+            self.validate_candidate_overlay(&patch)?;
+            let candidate_changes = self.candidate_changes(&patch);
+            // Replacements, deletions and committed rows need the complete final-state view.
+            storage.validate_row_write_set(&candidate_changes, None)?;
+            None
+        };
 
+        // No fallible validation remains: failed statements must not change cache eligibility,
+        // counters, prefix claims, touched tables, or the staged row view.
         for (table, entries) in patch.entries {
             self.touched_tables.insert(table.clone());
             self.entries.entry(table).or_default().extend(entries);
+        }
+        if let Some((keys, bytes, validated)) = append {
+            let state = self
+                .append_validation
+                .as_mut()
+                .expect("append mode is active");
+            state.overlay_keys = keys;
+            state.overlay_bytes = bytes;
+            state.usage = validated.usage;
+            state.unique_prefixes.extend(validated.unique_prefixes);
+        } else {
+            self.append_validation = None;
         }
         Ok(())
     }
@@ -211,6 +275,10 @@ impl PagedTransaction {
         self.entries.get(table)
     }
 }
+
+#[cfg(test)]
+#[path = "paged_transaction_append_tests.rs"]
+mod append_tests;
 
 fn changes_from_entries<'a>(
     entries: impl Iterator<Item = (&'a str, &'a OverlayEntry)>,
@@ -501,6 +569,45 @@ mod tests {
     }
 
     #[test]
+    fn sequential_appends_validate_each_new_row_once_with_or_without_unique_indexes() {
+        for unique in [false, true] {
+            let mut storage = storage();
+            if unique {
+                storage
+                    .execute_script(vec![
+                        crate::statement::parse(
+                            "CREATE UNIQUE INDEX items_name ON items (name)",
+                            &[],
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap();
+            }
+            let mut transaction = PagedTransaction::new(storage.revision());
+            let before = storage.validated_row_count();
+            for id in 3..131 {
+                transaction
+                    .stage(
+                        &storage,
+                        vec![RowChange::Upsert {
+                            table: "items".to_owned(),
+                            row: row(json!({"id": id, "name": format!("item-{id}")})),
+                        }],
+                    )
+                    .unwrap();
+            }
+            assert_eq!(storage.validated_row_count() - before, 128);
+            let append = transaction.append_validation.as_ref().unwrap();
+            assert_eq!(append.overlay_keys, 128);
+            let complete = storage
+                .validate_row_write_set(&transaction.changes(), None)
+                .unwrap();
+            assert_eq!(append.usage, complete.usage);
+            assert_eq!(append.unique_prefixes, complete.unique_prefixes);
+        }
+    }
+
+    #[test]
     fn overlay_reader_merges_updates_inserts_deletes_and_neutral_keys() {
         let storage = storage();
         let mut transaction = PagedTransaction::new(storage.revision());
@@ -584,6 +691,29 @@ mod tests {
                 .code,
             "TRANSACTION_TOO_LARGE"
         );
+    }
+
+    #[test]
+    fn overlay_byte_limit_accepts_the_boundary_and_rejects_one_more_byte() {
+        let entry = OverlayEntry {
+            key: row(json!({"id": 1})),
+            base: None,
+            next: Some(row(json!({"id": 1, "name": "one"}))),
+        };
+        let mut keys = 0;
+        let mut bytes = 0;
+        retain_entry("items", b"[1]", &entry, &mut keys, &mut bytes).unwrap();
+        let entry_bytes = bytes;
+        for extra in [0, 1] {
+            let mut bytes = MAX_TRANSACTION_BYTES - entry_bytes + extra;
+            let result = retain_entry("items", b"[1]", &entry, &mut keys, &mut bytes);
+            if extra == 0 {
+                result.unwrap();
+                assert_eq!(bytes, MAX_TRANSACTION_BYTES);
+            } else {
+                assert_eq!(result.unwrap_err().code, "TRANSACTION_TOO_LARGE");
+            }
+        }
     }
 
     #[test]
