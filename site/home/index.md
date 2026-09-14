@@ -82,8 +82,10 @@ await db.exec(`
 
 > ## Write with parameters
 >
-> query() runs one read or write statement. Application values go in the `$n`
-> array and never reach the SQL text.
+> query() runs one read or write statement, with application values in the `$n`
+> array so that they never reach the SQL text. The sql tagged template is the
+> same parameterized call in a shorter form, and takes values only, so there is
+> no way to interpolate raw SQL by accident.
 
 ```ts
 const id = crypto.randomUUID();
@@ -92,14 +94,7 @@ await db.query(
   'INSERT INTO tasks (id, title) VALUES ($1, $2)',
   [id, 'Try TinyJoin'],
 );
-```
 
-> ## Or tag a template
->
-> The sql tagged template is the same parameterized call in a shorter form. It
-> takes values only, so there is no way to interpolate raw SQL by accident.
-
-```ts
 const title = 'Written with a tag';
 
 await db.sql`
@@ -173,24 +168,20 @@ unsubscribe();
 await db.close();
 ```
 
-> ## Local by default
+> ## Local, and deliberately bounded
 >
 > TinyJoin contains no hosted service, credentials, analytics, or hidden network
 > path. Memory and OPFS use the same page-native database engine. Persistent
 > OPFS storage is single-writer and intended for reconstructable application
 > data; users can still clear or lose browser-managed storage.
-
-> ## Deliberately bounded
 >
-> **Important:** TinyJoin is experimental. It implements a deliberately bounded
-> SQL and type subset; it is not PostgreSQL compiled to WebAssembly and has no
-> PostgreSQL server, wire protocol, or replication client.
->
-> Check the exact [SQL compatibility
-> contract](/guides/sql-compatibility/) before relying on unlisted PostgreSQL
-> syntax or types, and read the [caveats](/guides/caveats/) - experimental
-> status, single-tab persistence, browser support, and the projects to reach
-> for instead - before committing to it.
+> **Important:** TinyJoin is also experimental, and implements a deliberately
+> bounded SQL and type subset; it is not PostgreSQL compiled to WebAssembly and
+> has no PostgreSQL server, wire protocol, or replication client. Check the
+> exact [SQL compatibility contract](/guides/sql-compatibility/) and the
+> [caveats](/guides/caveats/) - experimental status, single-tab persistence,
+> browser support, and the projects to reach for instead - before committing to
+> it.
 
 > ## Go deeper when you need to
 >
@@ -202,3 +193,43 @@ await db.close();
 > - Read the [source](https://github.com/tinyplex/tinyjoin).
 >
 > TinyJoin is MIT licensed.
+
+---
+
+<section id="family">
+  <h2>Meet the family</h2>
+  <p>
+    TinyJoin is one of a group of small libraries that make rich client and
+    local-first apps easier to build. Take a look at the others!
+  </p>
+  <ul>
+    <li>
+      <a href="https://tinybase.org/">
+        <img src="https://tinybase.org/favicon.svg?asImg" alt="" width="40" height="40" />
+        <b>TinyBase</b>
+      </a>
+      A reactive data store with persistence and synchronization.
+    </li>
+    <li>
+      <a href="https://synclets.org/">
+        <img src="https://synclets.org/favicon.svg?asImg" alt="" width="40" height="40" />
+        <b>Synclets</b>
+      </a>
+      An open, storage-agnostic sync engine development kit.
+    </li>
+    <li>
+      <a href="https://tinywidgets.org/">
+        <img src="https://tinywidgets.org/favicon.svg?asImg" alt="" width="40" height="40" />
+        <b>TinyWidgets</b>
+      </a>
+      A collection of tiny, reusable UI components.
+    </li>
+    <li>
+      <a href="https://tinytick.org/">
+        <img src="https://tinytick.org/favicon.svg?asImg" alt="" width="40" height="40" />
+        <b>TinyTick</b>
+      </a>
+      A tiny but very useful task orchestrator.
+    </li>
+  </ul>
+</section>
