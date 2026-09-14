@@ -1785,6 +1785,60 @@ mod tests {
     }
 
     #[test]
+    fn exec_sql_shares_join_work_budget_and_rolls_back_earlier_mutations() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .exec_sql(
+                "CREATE TABLE marker (id INTEGER PRIMARY KEY, changed BOOLEAN NOT NULL); \
+                 INSERT INTO marker VALUES (1, false); \
+                 CREATE TABLE a (id INTEGER PRIMARY KEY, join_key INTEGER NOT NULL); \
+                 CREATE TABLE b (id INTEGER PRIMARY KEY, join_key INTEGER NOT NULL)",
+            )
+            .unwrap();
+        for (table, count) in [("a", 600), ("b", 1_000)] {
+            for start in (0..count).step_by(500) {
+                let values = (start..(start + 500).min(count))
+                    .map(|id| format!("({id}, 1)"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                engine
+                    .execute_sql(&format!("INSERT INTO {table} VALUES {values}"), &[])
+                    .unwrap();
+            }
+        }
+        let join = "SELECT a.id AS id FROM a JOIN b ON a.join_key = b.join_key WHERE a.id < 0";
+        // Each query examines 600,000 pairs plus its scanned rows. Separate
+        // requests fit, but two joins in one script share the work budget.
+        for _ in 0..2 {
+            assert!(engine.execute_sql(join, &[]).unwrap().rows.is_empty());
+        }
+        let revision = engine.revision();
+        let script = format!("UPDATE marker SET changed = true WHERE id = 1; {join}; {join}");
+
+        assert_eq!(
+            engine.exec_sql(&script).unwrap_err().code,
+            "TRANSACTION_TOO_LARGE"
+        );
+        assert_eq!(engine.revision(), revision);
+        assert_eq!(
+            engine
+                .query_sql("SELECT changed FROM marker WHERE id = 1", &[])
+                .unwrap()
+                .rows,
+            vec![row(json!({"changed": false}))]
+        );
+        let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        assert_eq!(reopened.revision(), revision);
+        assert_eq!(
+            reopened
+                .query_sql("SELECT changed FROM marker WHERE id = 1", &[])
+                .unwrap()
+                .rows,
+            vec![row(json!({"changed": false}))]
+        );
+    }
+
+    #[test]
     fn heterogeneous_json_predicates_preserve_structural_equality_and_sql_nulls() {
         let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
         engine

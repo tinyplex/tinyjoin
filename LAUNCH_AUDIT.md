@@ -9,7 +9,7 @@ Remediation is proceeding in the seven-summary-concern order below. The original
 | 3. Release compatibility | Prepared TinyJoin 0.0.6 and starter 0.0.7 with explicit format-1/format-2 boundary and new starter namespace; not published | Packed 0.0.6 installed and built in four generated app variants; two Chromium CRUD/reload checks; 17 starter CLI tests, typecheck, spell, docs and notices checks |
 | 4. First-use experience | Starter shows startup errors and Retry, preserves failed drafts, restores failed toggles, handles cleanup, and documents single-tab use | Four generated builds; six Chromium scenarios across JavaScript/TypeScript, including second-tab recovery and rejected writes; 17 CLI tests, typecheck and spelling |
 | 5. Performance | Incremental validation for append-only transactions, including unique indexes; documented mixed-write, scan and startup costs | 261 Rust tests, including differential/budget/work-count regressions; three real-WASM contracts; retained engine and browser benchmarks (1,000 OPFS inserts: 1,571 to 310 ms); docs and size gates |
-| 6. Practical join scope | Pending | |
+| 6. Practical join scope | Selective chains run within actual work bounds; removed Cartesian estimate while preserving comparison, scan, build, memory and script limits | 265 Rust tests with true exhaustion and script rollback; four real-WASM contracts including three 100-row sources; docs and size gates |
 | 7. Documentation/site | Pending | |
 
 Reviewed TinyJoin at `d6505bc` and the adjacent create-tinyjoin project. This is an assessment, not an implementation plan or security certification. No product fixes, releases, commits, deployments, or public issues were made. This report is the only added repository file.

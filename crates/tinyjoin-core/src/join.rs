@@ -170,8 +170,8 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &JoinPlan) -> Result<Qu
     let (conditions, fields) = validate_plan(plan, &relations)?;
 
     // LIMIT 0 remains a validation-only operation, matching the other SELECT
-    // executors. Every join that can inspect a pair is preflighted below before
-    // either table is visited.
+    // executors. Other joins preflight table sizes and count candidate pairs
+    // as they are examined, including across successive join stages.
     if plan.limit == Some(0) {
         return Ok(QueryResult {
             revision: storage.revision(),
@@ -190,7 +190,6 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &JoinPlan) -> Result<Qu
     if scan_rows > MAX_SCAN_ROWS {
         return Err(scan_limit_error());
     }
-    preflight_candidate_extensions(plan, &counts)?;
     preflight_build_rows(&counts)?;
 
     let rows = if plan.order_by.is_empty() {
@@ -213,24 +212,6 @@ fn preflight_build_rows(counts: &[usize]) -> Result<()> {
         > MAX_JOIN_BUILD_ROWS
     {
         return Err(build_rows_limit_error());
-    }
-    Ok(())
-}
-
-fn preflight_candidate_extensions(plan: &JoinPlan, counts: &[usize]) -> Result<()> {
-    let mut prefix = counts[0];
-    let mut pairs = 0_usize;
-    for (stage, count) in plan.joins.iter().zip(&counts[1..]) {
-        let extensions = prefix.saturating_mul(*count);
-        pairs = pairs.saturating_add(extensions);
-        if pairs > MAX_JOIN_PAIRS {
-            return Err(join_pairs_limit_error());
-        }
-        prefix = if stage.kind == JoinKind::Left {
-            prefix.saturating_mul((*count).max(1))
-        } else {
-            extensions
-        };
     }
     Ok(())
 }
@@ -1564,6 +1545,28 @@ mod tests {
         *engine = Engine::new(storage);
     }
 
+    fn large_join_database(tables: &[(&str, usize)]) -> Engine {
+        let mut engine = Engine::default();
+        for (table, count) in tables {
+            engine
+                .execute_sql(
+                    &format!(
+                        "CREATE TABLE {table} (id INTEGER PRIMARY KEY, join_key INTEGER NOT NULL)"
+                    ),
+                    &[],
+                )
+                .unwrap();
+            seed_rows(
+                &mut engine,
+                table,
+                (0..*count)
+                    .map(|id| row(json!({"id": id, "join_key": 1})))
+                    .collect(),
+            );
+        }
+        engine
+    }
+
     fn database() -> Engine {
         let mut engine = Engine::default();
         engine
@@ -2207,7 +2210,7 @@ mod tests {
     }
 
     #[test]
-    fn bounds_join_parse_and_execution_complexity() {
+    fn bounds_join_parse_complexity() {
         let projections = (0..=super::MAX_PROJECTIONS)
             .map(|index| format!("l.id AS output_{index}"))
             .collect::<Vec<_>>()
@@ -2263,37 +2266,59 @@ mod tests {
             .code,
             "INVALID_QUERY"
         );
+    }
 
-        let mut engine = Engine::default();
-        for table in ["many_left", "many_right"] {
-            engine
-                .execute_sql(
-                    &format!(
-                        "CREATE TABLE {table} (id INTEGER PRIMARY KEY, join_key INTEGER NOT NULL)"
-                    ),
-                    &[],
-                )
-                .unwrap();
-            for first_id in (0..=1_000).step_by(400) {
-                let values = (first_id..=(first_id + 399).min(1_000))
-                    .map(|id| format!("({id}, 1)"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                engine
-                    .execute_sql(
-                        &format!("INSERT INTO {table} (id, join_key) VALUES {values}"),
-                        &[],
-                    )
-                    .unwrap();
+    #[test]
+    fn selective_three_table_joins_count_only_actual_candidate_extensions() {
+        let engine = large_join_database(&[("a", 100), ("b", 100), ("c", 100)]);
+        // The Cartesian estimate is 10,000 + 1,000,000, but each first-stage
+        // match extends only once: these joins examine 20,000 actual pairs.
+        for kind in ["JOIN", "LEFT JOIN"] {
+            for order in ["", " ORDER BY a.id DESC"] {
+                let extra_condition = if kind == "LEFT JOIN" {
+                    " AND b.id = c.join_key"
+                } else {
+                    ""
+                };
+                let sql = format!(
+                    "SELECT a.id AS a_id, b.id AS b_id, c.id AS c_id \
+                     FROM a {kind} b ON a.id = b.id \
+                     {kind} c ON b.id = c.id{extra_condition}{order}"
+                );
+                let mut expected = (0..100)
+                    .map(|id| {
+                        let c_id = if kind == "LEFT JOIN" && id != 1 {
+                            Value::Null
+                        } else {
+                            json!(id)
+                        };
+                        row(json!({"a_id": id, "b_id": id, "c_id": c_id}))
+                    })
+                    .collect::<Vec<_>>();
+                if !order.is_empty() {
+                    expected.reverse();
+                }
+                let mut actual = engine.query_sql(&sql, &[]).unwrap().rows;
+                if order.is_empty() {
+                    actual.sort_by_key(|row| row["a_id"].as_i64().unwrap());
+                }
+                assert_eq!(actual, expected, "{sql}");
             }
         }
-        let zero = engine
-            .query_sql(
-                "SELECT l.id AS left_id FROM many_left l JOIN many_right r \
-                 ON l.join_key = r.join_key LIMIT 0",
-                &[],
-            )
-            .unwrap();
+    }
+
+    #[test]
+    fn actual_candidate_pair_limit_allows_early_limits_and_rejects_exhaustion() {
+        let storage =
+            large_join_database(&[("many_left", 1_001), ("many_right", 1_001)]).into_storage();
+        let query = "SELECT l.id AS left_id FROM many_left l JOIN many_right r \
+                     ON l.join_key = r.join_key";
+        let before = storage.visitor_counts();
+        let zero = super::execute(
+            &storage,
+            &super::parse_sql(&format!("{query} LIMIT 0"), &[]).unwrap(),
+        )
+        .unwrap();
         assert!(zero.rows.is_empty());
         assert_eq!(
             zero.fields,
@@ -2302,37 +2327,53 @@ mod tests {
                 crate::ColumnType::Integer
             )]
         );
-        let storage = engine.into_storage();
-        let before = storage.visitor_counts();
-        let plan = super::parse_sql(
-            "SELECT l.id AS left_id FROM many_left l JOIN many_right r \
-             ON l.join_key = r.join_key",
-            &[],
+        assert_eq!(storage.visitor_counts(), before);
+
+        let limited = super::execute(
+            &storage,
+            &super::parse_sql(&format!("{query} LIMIT 1"), &[]).unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            super::execute(&storage, &plan).unwrap_err().code,
-            "INVALID_QUERY"
-        );
-        assert_eq!(storage.visitor_counts(), before);
+        assert_eq!(limited.rows, vec![row(json!({"left_id": 0}))]);
+        // The build side is retained, then one probe and one pair suffice.
+        assert_eq!(storage.visitor_counts().0 - before.0, 1_002);
+
+        for order in ["", " ORDER BY l.id LIMIT 1"] {
+            let before = storage.visitor_counts();
+            // Reject every output row so the result-row cap cannot mask the
+            // candidate-pair guard. ORDER BY must finish even with LIMIT 1.
+            let plan = super::parse_sql(&format!("{query} WHERE l.id < 0{order}"), &[]).unwrap();
+            let error = super::execute(&storage, &plan).unwrap_err();
+            assert_eq!(error.code, "INVALID_QUERY");
+            assert!(
+                error.message.contains("1000000 candidate pairs"),
+                "{error:?}"
+            );
+            assert!(storage.visitor_counts().0 > before.0);
+        }
     }
 
     #[test]
-    fn cumulative_stage_pair_and_build_row_preflights_are_global() {
+    fn candidate_pair_budget_is_shared_across_join_stages() {
+        let storage = large_join_database(&[("a", 600), ("b", 1_000), ("c", 1)]).into_storage();
+        // Each stage would examine 600,000 pairs, so a per-stage budget would
+        // pass. The shared one-million-pair budget must reject the whole join.
         let plan = super::parse_sql(
-            "SELECT a.id AS id FROM chain_a a \
-             JOIN chain_b b ON a.join_key = b.a_key \
-             JOIN chain_c c ON b.id = c.b_id",
+            "SELECT a.id AS id FROM a JOIN b ON a.join_key = b.join_key \
+             JOIN c ON b.join_key = c.join_key WHERE a.id < 0",
             &[],
         )
         .unwrap();
-        assert_eq!(
-            super::preflight_candidate_extensions(&plan, &[600, 1_000, 1])
-                .unwrap_err()
-                .code,
-            "INVALID_QUERY"
+        let error = super::execute(&storage, &plan).unwrap_err();
+        assert_eq!(error.code, "INVALID_QUERY");
+        assert!(
+            error.message.contains("1000000 candidate pairs"),
+            "{error:?}"
         );
-        super::preflight_candidate_extensions(&plan, &[499, 1_000, 1]).unwrap();
+    }
+
+    #[test]
+    fn build_row_preflight_is_global() {
         assert_eq!(
             super::preflight_build_rows(&[1, 50_000, 50_001])
                 .unwrap_err()

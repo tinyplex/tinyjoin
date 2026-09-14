@@ -31,6 +31,10 @@ copying values. Append-only transactions now validate new row statements
 incrementally, including unique-index checks; mixed writes retain complete
 staged write-set validation.
 
+Selective multi-table joins now use their actual comparison count rather than
+a worst-case Cartesian estimate. Scan, build-row, result, memory, and shared
+script-work limits remain in force.
+
 ## v0.0.5
 
 This release establishes TinyJoin as a standalone, SQL-first browser database

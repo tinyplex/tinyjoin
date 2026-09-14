@@ -299,9 +299,19 @@ loop; TinyJoin does not reorder or optimize them. Each `ON` equality must
 connect its newly introduced source to one of the sources already in scope.
 Across the full chain, candidate-extension, retained-row, result-row, and byte
 budgets are global rather than resetting for each `JOIN`. Aggregates over joins
-are not supported. Before scanning, source row counts are also used to reject a
-chain whose worst-case candidate-extension bound exceeds 1,000,000; the
-preflight does not assume that an `ON` condition will be selective.
+are not supported. The engine counts actual candidate comparisons while
+executing; it does not reject a join merely because the full Cartesian product
+is large. Source row counts still enforce the scan and retained-build-row
+limits before execution.
+
+For example, three tables of 100 rows joined on unique matching identifiers
+need about 20,000 candidate comparisons and return 100 rows. Such a selective
+chain fits. Two tables of 1,001 rows whose join keys all match can exceed the
+1,000,000-comparison budget even when a later `WHERE` removes every result.
+Order and join shape therefore matter. An unordered `LIMIT` can stop early;
+an ordered join must first collect its matches. Standalone queries and exec()
+also charge scans and comparisons to their shared script-work budget, which
+can be reached before the comparison-only limit.
 
 Many-to-many relationships can use a bridge table with a composite primary
 key, for example:
@@ -399,8 +409,8 @@ rather than growing without bound.
 An ordered query can reach its materialization limit before applying a small
 `LIMIT`. Join candidate-extension and retained-row bounds apply to the complete
 left-deep chain, not separately to each step and not just to returned rows. The
-candidate limit is enforced both by the conservative row-count preflight above
-and by a runtime counter. The
+candidate limit is enforced by a runtime counter, including comparisons that
+fail the join condition. The
 1,024-byte secondary-index key limit covers the complete encoded indexed tuple,
 separator, and primary-key tuple together, not each component independently.
 An individual JSON value remains subject to the smaller budget for the row that

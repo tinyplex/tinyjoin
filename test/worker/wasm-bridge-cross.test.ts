@@ -95,6 +95,31 @@ const runIfArtifactExists =
     : describe.skip;
 
 runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
+  it('executes selective three-table joins whose actual work fits the budget', async () => {
+    const wasm = await loadStructuredModule();
+    const {engine} = createRecordingEngine(wasm, new MemoryPageDevice());
+    try {
+      const values = Array.from({length: 100}, (_, id) => `(${id})`).join(',');
+      for (const table of ['a', 'b', 'c']) {
+        engine.execSql(
+          `CREATE TABLE ${table} (id INTEGER PRIMARY KEY); INSERT INTO ${table} VALUES ${values}`,
+        );
+      }
+      const sql = 'SELECT a.id AS id FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id ORDER BY id';
+      const expected = Array.from({length: 100}, (_, id) => ({id}));
+      const statement = engine.prepareSql(sql);
+      const revision = engine.revision();
+      expect(engine.executeSql(sql, []).rows).toEqual(expected);
+      expect(engine.executePrepared(statement, []).rows).toEqual(expected);
+      engine.beginTransaction();
+      expect(engine.executePrepared(statement, []).rows).toEqual(expected);
+      engine.commitTransaction();
+      expect(engine.revision()).toBe(revision);
+    } finally {
+      engine.close();
+    }
+  });
+
   it('rejects amplified parameters without poisoning the real WASM engine', async () => {
     const wasm = await loadStructuredModule();
     const {engine} = createRecordingEngine(wasm, new MemoryPageDevice());
