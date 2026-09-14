@@ -45,33 +45,27 @@ The omissions most likely to matter are:
 The [SQL compatibility contract](/guides/sql-compatibility/) is the exact list.
 Read it before designing a schema, not after.
 
-## One writer, and effectively one tab
+## Multiple tabs share one writer
 
-A persistent database opens with an exclusive OPFS synchronous access handle. A
-second Worker for the same `opfs://` name fails to open rather than risking
-concurrent mutation, and in practice a second Worker means a second tab of the
-same application. There is no silent fallback to memory.
+Clients using the same OPFS name automatically share one database-owning
+Worker. Election, routing, prepared statement restoration, and cross-tab
+notifications are internal. Different names and browser storage partitions
+remain independent.
 
-TinyJoin does not coordinate tabs. It uses no `SharedWorker`,
-`BroadcastChannel`, or Web Locks, and a
-[subscription](/guides/transactions-and-changes/) only reports changes made
-through its own Client.
-
-The same restriction applies to two Clients in one page. Different OPFS names
-can open at the same time, but each has independent data; they provide no
-shared view or synchronization.
-
-An application that needs a real multi-tab story has to build one:
-
-- Catch the open failure and tell the user the application is already open in
-  another tab. This is the smallest honest option.
-- Or elect one writer tab and route queries to it over a channel you own.
-- Or open a memory database in secondary tabs when they only need a snapshot.
+This is one serialized engine. An open transaction holds other Clients until
+its callback finishes, and a frozen live owner or transaction holder can delay
+other tabs until it resumes or closes. Keep callbacks short. Closing or losing
+the owner triggers automatic election, but requests already sent to it fail
+with `LEADER_CHANGED` and are never silently replayed. Incompatible releases
+fail with `DATABASE_VERSION_MISMATCH`; old versions that do not coordinate
+can still hold the underlying OPFS lock. See
+[tab handover](/guides/storage-and-lifecycle/#tab-handover-and-subscriptions).
 
 ## It needs a modern browser
 
 TinyJoin requires WebAssembly and dedicated module Workers, and persistence
-additionally requires a secure context and OPFS synchronous access handles. It
+additionally requires a secure context, OPFS synchronous access handles, Web
+Locks, and BroadcastChannel. It
 deliberately does not use `SharedArrayBuffer`, so a page does not need
 cross-origin isolation headers.
 
@@ -130,6 +124,12 @@ persistent database is bounded to 256 MiB, one query returns at most 100,000
 rows, a join chains at most eight table sources, and SQL text, parameters,
 prepared statements, and working memory each have a named bound. The complete
 list is in [hard limits](/guides/sql-compatibility/#hard-limits).
+
+Multi-tab routing also bounds each Client's pending requests and the owner's
+waiting queue to 256 requests and approximately 8 MiB each, with a small
+reserved allowance for transaction cleanup. Hitting these bounds rejects with
+`RESOURCE_LIMIT`; await work or batch related writes. Prepared engine limits
+are shared across connected Clients; at most 128 Clients can attach to an owner.
 
 That boundedness is deliberate, but it does mean TinyJoin is sized for
 application state rather than for analytics over a large dataset.

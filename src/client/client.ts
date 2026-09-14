@@ -55,7 +55,9 @@ export interface ClientOptions {
 
 export type DataDir = string;
 
-export interface TablesChangedEvent extends ApplyOutcome {}
+export interface TablesChangedEvent extends ApplyOutcome {
+  reset?: boolean;
+}
 
 export type SubscriptionOptions = {
   tables?: string[];
@@ -191,6 +193,22 @@ const createClient = (options: ClientOptions): Client => {
   let preparedCloseTail: Promise<void> = Promise.resolve();
   let transactionTail: Promise<void> = Promise.resolve();
   let transactionActive = false;
+  let pendingNotification: TablesChangedEvent | undefined;
+
+  // Cross-tab notifications can arrive while this Client has a callback open
+  // (or is waiting to begin one). Defer listeners so their documented re-query
+  // pattern does not fail with TRANSACTION_ACTIVE.
+  const flushNotifications = (): void => {
+    if (transactionActive || closing || !pendingNotification) return;
+    const event = pendingNotification;
+    pendingNotification = undefined;
+    for (const subscription of subscriptions) {
+      if (
+        event.reset || !subscription.tables ||
+        event.tables.some((table) => subscription.tables?.has(table))
+      ) subscription.listener(event);
+    }
+  };
 
   const noteRevision = (next: number): void => {
     revision = mathMax(revision, next);
@@ -259,6 +277,7 @@ const createClient = (options: ClientOptions): Client => {
         return (await rpc.request('beginTransaction', undefined)).transactionId;
       } catch (error) {
         transactionActive = false;
+        queueMicrotask(flushNotifications);
         throw error;
       }
     }
@@ -297,6 +316,7 @@ const createClient = (options: ClientOptions): Client => {
       throw error;
     } finally {
       transactionActive = false;
+      queueMicrotask(flushNotifications);
     }
   };
 
@@ -309,21 +329,23 @@ const createClient = (options: ClientOptions): Client => {
       closing = false;
       closed = true;
       subscriptions.clear();
+      pendingNotification = undefined;
       rpc.dispose();
     }
   };
 
   rpc.onEvent((event) => {
-    if (event.event === 'tablesChanged') {
+    if (event.event === 'tablesChanged' || event.event === 'resync') {
       noteRevision(event.payload.revision);
-      for (const subscription of subscriptions) {
-        if (
-          !subscription.tables ||
-          event.payload.tables.some((table) => subscription.tables?.has(table))
-        ) {
-          subscription.listener(event.payload);
-        }
-      }
+      const reset = event.event === 'resync' || pendingNotification?.reset;
+      pendingNotification = {
+        revision,
+        tables: reset ? [] : [...new Set([
+          ...pendingNotification?.tables ?? [], ...event.payload.tables,
+        ])],
+        ...(reset ? {reset: true} : {}),
+      };
+      flushNotifications();
     }
   });
 
@@ -714,7 +736,10 @@ const createWorker = (
   if (workerUrl) {
     return [createUrlWorker(workerUrl), 'full'];
   }
-  return [createDefaultWorker(), 'header'];
+  return [
+    createDefaultWorker(options.dataDir?.startsWith(OPFS_PREFIX)),
+    'header',
+  ];
 };
 
 const preparedStatementState = (value: unknown): PreparedStatementState => {

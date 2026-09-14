@@ -37,7 +37,9 @@
  *
  * Use `memory://` for an ephemeral database, or `opfs://name` for a persistent
  * database. Calling create without a data directory also uses memory.
- * Only one Client can hold an OPFS name at a time, including across tabs.
+ * Clients using the same OPFS name automatically share an elected database
+ * owner, including across tabs. Pending operations interrupted by owner loss
+ * reject without replay; subsequent operations reconnect automatically.
  * Different names have independent data and do not synchronize.
  * @category Configuration
  * @since v0.0.5
@@ -303,12 +305,23 @@
 
 /**
  * The TablesChangedEvent interface describes one committed table-level
- * invalidation.
+ * invalidation or a request to refresh after database-owner handover.
  * @category Subscriptions
  * @since v0.0.5
  */
 /// TablesChangedEvent
+
 {
+  /**
+   * The reset property is true when database-owner handover or page restoration
+   * requires a re-query even though the changed tables are unknown. In that
+   * case tables is empty and every subscription is notified, including filtered
+   * ones. Normal committed-change events omit this property.
+   * @category Event
+   * @since v0.0.6
+   */
+  /// TablesChangedEvent.reset
+
   /**
    * The revision property contains the committed database revision.
    * @category Event
@@ -317,7 +330,8 @@
   /// TablesChangedEvent.revision
 
   /**
-   * The tables property contains the names of changed tables.
+   * The tables property contains the names of changed tables. It is empty when
+   * reset is true, which means the subscriber should refresh its query anyway.
    * @category Event
    * @since v0.0.5
    */
@@ -521,6 +535,8 @@
    * Transaction calls on this Client queue in order. Do not await another transaction on
    * this Client inside the callback; pass its Transaction to helpers instead.
    * Use that object for all SQL in the callback and prepare handles beforehand.
+   * Other Clients for the same OPFS name wait for the whole callback to finish.
+   * Do not await work on those Clients from inside this callback.
    * An uncaught callback error before commit discards staged work. A caught
    * statement error leaves earlier writes staged unless rollback is called.
    *
@@ -537,7 +553,9 @@
 
   /**
    * The subscribe method listens for committed table changes and returns an
-   * unsubscribe function.
+   * unsubscribe function. OPFS Clients receive changes from every connected
+   * tab. After handover or page restoration, reset events notify every
+   * subscriber to re-query even though tables is empty.
    * @category Subscriptions
    * @since v0.0.5
    */
@@ -552,7 +570,9 @@
   /// Client.getRevision
 
   /**
-   * The close method releases prepared statements, storage, and the Worker.
+   * The close method detaches this Client and releases its prepared statements
+   * and Worker. Other Clients for the same OPFS name stay connected; ownership
+   * transfers automatically when necessary.
    * Repeated calls share the same asynchronous cleanup.
    * A closed Client cannot resume; create a new one and recreate its prepared
    * statements and subscriptions. Closing is not a cancellation or rollback

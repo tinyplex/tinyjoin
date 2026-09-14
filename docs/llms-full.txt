@@ -19,6 +19,9 @@ TinyJoin publishes JavaScript, TypeScript declarations, its Worker runtime, and
 the WebAssembly engine together. An application does not need Rust tooling or a
 separate Worker plugin.
 
+For a new application, `npm create tinyjoin@latest` generates a working Vite
+starter. Its production build includes [offline loading](https://tinyjoin.org/guides/offline/).
+
 ## Open a database
 
 ```ts
@@ -30,6 +33,10 @@ const db = await create('opfs://my-app');
 The Promise resolves after the Worker and database are ready. The string gives
 the persistent database a stable local name. Call create() without an
 argument while experimenting with an ephemeral database.
+
+Use the same name in every tab. TinyJoin automatically shares one database
+owner and delivers committed-change notifications across those Clients. See
+[storage and tab handover](https://tinyjoin.org/guides/storage-and-lifecycle/) for lifecycle details.
 
 ## Create a table
 
@@ -95,8 +102,9 @@ window.addEventListener('pageshow', (event) => {
 });
 ```
 
-Closing releases prepared statements, storage, and the Worker. It is
-asynchronous and safe to call more than once.
+Closing releases this Client's prepared statements and Worker. Other Clients
+for the same name continue, with automatic owner handover when needed. Closing
+is asynchronous and safe to call more than once.
 
 Closing cannot be undone. This example reloads a page restored from the
 back/forward cache so startup creates a fresh Client. A browser does not await
@@ -135,16 +143,22 @@ hyphens, and start with a letter or number. Include the application, dataset,
 and schema generation in it. A name is a namespace, not an encryption or
 access-control boundary.
 
-OPFS persistence requires a secure browser context and a dedicated Worker.
-TinyJoin opens the database with an exclusive synchronous access handle. A
-second Worker opening the same name fails rather than risking concurrent
-mutation; closing the first Client releases the lock.
+OPFS persistence requires a secure browser context, a dedicated Worker, Web
+Locks, and BroadcastChannel. Call create() with the same name in every tab:
+TinyJoin elects one database-owning Worker, routes operations to it, and
+broadcasts committed changes to all connected Clients. Multiple Clients in one
+page work the same way. No additional configuration is needed.
 
-This applies to two Clients in one page as well as Clients in separate tabs of
-the same origin. Different names can be open independently, but their rows and
-subscriptions are separate: changing the name does not share or synchronize
-the original database. Handle `STORAGE_LOCKED` during startup with an
-already-open message and an explicit retry after the other Client closes.
+Different names can open independently, but their rows and subscriptions are
+separate. Coordination stays within the same origin and browser storage
+partition; it does not connect other browser profiles or devices.
+
+The owner retains an exclusive synchronous OPFS access handle. That remains
+the final protection against concurrent mutation, including older TinyJoin
+versions or custom code that does not participate in coordination. Such an
+owner can still cause `STORAGE_LOCKED`; close the older application before
+retrying. Mixed TinyJoin releases fail with `DATABASE_VERSION_MISMATCH`
+instead of sharing an incompatible engine.
 
 There is no silent fallback to memory if persistent storage is unavailable,
 locked, corrupt, or out of quota.
@@ -172,13 +186,14 @@ await create() is the simplest lifecycle: it returns only after
 initialization succeeds. The returned Client also exposes `ready`, `waitReady`,
 and `closed` for code that constructs a Client directly.
 
-Call close() during application teardown. It seals prepared statements,
-closes storage, and terminates TinyJoin's packaged Worker. Outstanding cleanup
-is shared by repeated calls.
+Call close() during application teardown. It seals that Client's prepared
+statements, detaches it, and terminates its Worker. Other Clients retain their
+data and connection. If the departing Worker owned the database, another
+connected Worker automatically opens it. Outstanding cleanup is shared by
+repeated close() calls.
 
 Closing is irreversible. A Client, its prepared statements, and its
-subscriptions cannot resume after close(). TinyJoin does not manage the
-browser's back/forward cache lifecycle. If a `pagehide` handler closes the
+subscriptions cannot resume after close(). If a `pagehide` handler closes the
 database, a page restored from that cache must initialize a new Client and
 recreate its statements and subscriptions before accepting work. The
 [getting-started example](https://tinyjoin.org/guides/getting-started/#close-cleanly) uses a reload
@@ -187,6 +202,37 @@ on `pageshow` when `event.persisted` is true as a simple application policy.
 A browser does not await asynchronous `pagehide` cleanup, and teardown events
 are not guaranteed to run. Await writes while the application is active;
 close() during navigation is not a final-save or cancellation guarantee.
+
+## Tab handover and subscriptions
+
+The browser's locks elect the next owner when the previous Worker closes or
+dies. New operations wait while that owner opens the database. Prepared
+statements are restored automatically when needed. Notifications fan out to
+every Client, including the one that wrote the data.
+
+Operations already sent to a departing owner reject with `LEADER_CHANGED`.
+Their effects may already have committed; TinyJoin never silently repeats
+them. The Client reconnects for subsequent operations, so inspect the stored
+outcome before retrying a write. A callback transaction interrupted by owner
+loss cannot continue: subsequent transaction operations reject with
+`TRANSACTION_LOST`. Start a new transaction after reconciliation.
+
+After handover, or when a page becomes visible or resumes, subscriptions may
+receive `{revision, tables: [], reset: true}`. Re-query on this notification
+even though the precise changed tables are unknown. Filtered subscriptions
+also receive it. A subscription is an invalidation signal, not a durable log
+of every commit.
+
+Transactions exclude other Clients for the entire callback. Keep callbacks
+short and do not wait on work that needs another Client for the same name.
+If a client disappears with a transaction open, the owner rolls it back. A
+frozen but still live owner or transaction holder can delay other tabs until
+it resumes or closes. TinyJoin does not steal a live storage lock based on a
+timer, since doing so could let two engines write concurrently.
+
+For offline reopening of the application itself, use the
+[offline build integration](https://tinyjoin.org/guides/offline/). OPFS stores the data; a service
+worker caches the application and database runtime files.
 
 ## Recovering after an uncertain write
 
@@ -712,33 +758,27 @@ The omissions most likely to matter are:
 The [SQL compatibility contract](https://tinyjoin.org/guides/sql-compatibility/) is the exact list.
 Read it before designing a schema, not after.
 
-## One writer, and effectively one tab
+## Multiple tabs share one writer
 
-A persistent database opens with an exclusive OPFS synchronous access handle. A
-second Worker for the same `opfs://` name fails to open rather than risking
-concurrent mutation, and in practice a second Worker means a second tab of the
-same application. There is no silent fallback to memory.
+Clients using the same OPFS name automatically share one database-owning
+Worker. Election, routing, prepared statement restoration, and cross-tab
+notifications are internal. Different names and browser storage partitions
+remain independent.
 
-TinyJoin does not coordinate tabs. It uses no `SharedWorker`,
-`BroadcastChannel`, or Web Locks, and a
-[subscription](https://tinyjoin.org/guides/transactions-and-changes/) only reports changes made
-through its own Client.
-
-The same restriction applies to two Clients in one page. Different OPFS names
-can open at the same time, but each has independent data; they provide no
-shared view or synchronization.
-
-An application that needs a real multi-tab story has to build one:
-
-- Catch the open failure and tell the user the application is already open in
-  another tab. This is the smallest honest option.
-- Or elect one writer tab and route queries to it over a channel you own.
-- Or open a memory database in secondary tabs when they only need a snapshot.
+This is one serialized engine. An open transaction holds other Clients until
+its callback finishes, and a frozen live owner or transaction holder can delay
+other tabs until it resumes or closes. Keep callbacks short. Closing or losing
+the owner triggers automatic election, but requests already sent to it fail
+with `LEADER_CHANGED` and are never silently replayed. Incompatible releases
+fail with `DATABASE_VERSION_MISMATCH`; old versions that do not coordinate
+can still hold the underlying OPFS lock. See
+[tab handover](https://tinyjoin.org/guides/storage-and-lifecycle/#tab-handover-and-subscriptions).
 
 ## It needs a modern browser
 
 TinyJoin requires WebAssembly and dedicated module Workers, and persistence
-additionally requires a secure context and OPFS synchronous access handles. It
+additionally requires a secure context, OPFS synchronous access handles, Web
+Locks, and BroadcastChannel. It
 deliberately does not use `SharedArrayBuffer`, so a page does not need
 cross-origin isolation headers.
 
@@ -797,6 +837,12 @@ persistent database is bounded to 256 MiB, one query returns at most 100,000
 rows, a join chains at most eight table sources, and SQL text, parameters,
 prepared statements, and working memory each have a named bound. The complete
 list is in [hard limits](https://tinyjoin.org/guides/sql-compatibility/#hard-limits).
+
+Multi-tab routing also bounds each Client's pending requests and the owner's
+waiting queue to 256 requests and approximately 8 MiB each, with a small
+reserved allowance for transaction cleanup. Hitting these bounds rejects with
+`RESOURCE_LIMIT`; await work or batch related writes. Prepared engine limits
+are shared across connected Clients; at most 128 Clients can attach to an owner.
 
 That boundedness is deliberate, but it does mean TinyJoin is sized for
 application state rather than for analytics over a large dataset.
@@ -878,6 +924,11 @@ database work until its callback finishes; direct Client operations fail while
 it is active, and a later transaction() call waits its turn. Letting an error
 escape before commit discards the staged transaction.
 
+For an OPFS database, other Clients using the same name wait for the entire
+callback, including Clients in other tabs. They never read its uncommitted
+rows. Do not await work on another Client for that name inside the callback:
+that work needs the callback to finish first.
+
 TinyJoin does not put a callback transaction into PostgreSQL's aborted state
 after a statement failure. If application code catches that failure, earlier
 staged writes may still commit. Call tx.rollback() or rethrow when the whole
@@ -923,6 +974,12 @@ while publishing a commit has a different boundary: `RECOVERY_REQUIRED`,
 the Client, reopening the same OPFS name, and reconciling the operation before
 replay. Rejection of transaction() alone is not proof that a commit did not
 happen. Follow the [recovery procedure](https://tinyjoin.org/guides/storage-and-lifecycle/#recovering-after-an-uncertain-write).
+
+If the database-owning tab closes or crashes, an already sent operation rejects
+with `LEADER_CHANGED` and may have committed. A still-running callback cannot
+continue on the replacement owner: later transaction operations reject with
+`TRANSACTION_LOST`. The Client reconnects automatically for new operations,
+but never repeats writes or reruns the callback. Reconcile before retrying.
 
 There is no AbortSignal, query timeout, or transaction timeout option.
 Promise.race() with a timer only stops the caller waiting; the callback and
@@ -976,9 +1033,17 @@ const unsubscribe = db.subscribe({tables: ['tasks']}, async () => {
 });
 ```
 
-The listener runs after a commit. Several statements in one transaction produce
-one committed revision and one table-level invalidation. Call the returned
-function to unsubscribe before closing the database.
+The listener runs after commits from any connected Client. Several statements
+in one transaction produce one committed revision and one table-level
+invalidation. Events arriving while this Client has a transaction open are
+coalesced and delivered after its callback finishes, when re-querying is safe.
+Call the returned function to unsubscribe before closing the database.
+
+After tab handover or page restoration, a listener can also receive an event
+with `reset: true` and an empty `tables` array. Its precise missed changes are
+unknown, so every subscription is notified, even one filtered to specific
+tables. The example above works for both normal changes and resets because it
+always re-queries. See [tab handover](https://tinyjoin.org/guides/storage-and-lifecycle/#tab-handover-and-subscriptions).
 
 This explicit re-query model keeps TinyJoin independent of UI frameworks and
 lets an application choose its own caching or rendering policy.
@@ -1003,7 +1068,7 @@ const db = await create({
 });
 ```
 
-The Worker entry starts the same standalone engine:
+The Worker entry starts the same engine and automatic OPFS coordination:
 
 ```ts
 import {startWorker} from 'tinyjoin/worker';
@@ -1013,6 +1078,13 @@ startWorker();
 
 Use at most one of `worker`, `workerFactory`, or `workerUrl`. A custom Worker is
 an advanced bundling boundary, not a requirement for persistent storage.
+
+Tabs using the same OPFS name and compatible TinyJoin release share one owner,
+even when their Workers use different bundle URLs. Keep startWorker() in the
+entry to participate in that protocol. An arbitrary Worker-like replacement is
+responsible for implementing its own storage and coordination behavior. The
+packaged Worker also requests subscription refreshes when the page becomes
+visible or resumes; custom lifecycle integration should re-query on restoration.
 
 Synchronous OPFS access is available in a dedicated Worker, not a SharedWorker.
 Ordinary browser Workers also cannot open arbitrary PostgreSQL TCP connections.
@@ -1117,8 +1189,19 @@ do not assume a subscription contains changed rows.
 
 - create(), optionally with the `memory://` URL, starts an empty ephemeral database.
 - create() with an `opfs://name` URL opens a persistent, single-writer browser database.
-- One Client can hold a name at a time, including across tabs. Different names
-  have independent data and do not synchronize.
+- Clients using the same name automatically share one owner across tabs.
+  Different names have independent data and do not synchronize.
+- Transactions hold all Clients for that name until their callbacks finish.
+  Keep callbacks short; a frozen live owner can delay other tabs.
+- Owner loss reconnects automatically. Pending operations fail with
+  `LEADER_CHANGED` and must be reconciled before replay; interrupted
+  transactions fail with `TRANSACTION_LOST`. Never automatically retry writes.
+- Subscription events with `reset: true` require a re-query even when
+  `tables` is empty; they cover handover and page restoration.
+- `create-tinyjoin` generates offline-capable production builds. Existing Vite
+  apps can add tinyjoinOffline() from `tinyjoin/vite`; apps with an existing
+  service worker use its `manifest` mode. See the
+  [offline guide](https://tinyjoin.org/guides/offline/). Caching does not add remote synchronization.
 - Keep the OPFS name stable and version it deliberately with the schema.
 - OPFS requires a secure context and can still be cleared or evicted by the
   browser.
@@ -1173,6 +1256,152 @@ runtime files, WebAssembly, or OPFS. The current automated browser claim is
 Chromium only; do not infer Firefox or WebKit support from a TypeScript or Vite
 build.
 
+# Offline
+
+Source: https://tinyjoin.org/guides/offline/
+
+OPFS persists database rows. Reopening the application without a network also
+requires its HTML, JavaScript, CSS, Worker, and WASM files to be available.
+TinyJoin's optional Vite plugin caches the complete production build, including
+lazy assets that the first visit has not used yet.
+
+## Vite setup
+
+Add tinyjoinOffline to the application's Vite configuration:
+
+```ts
+import {defineConfig} from 'vite';
+import {tinyjoinOffline} from 'tinyjoin/vite';
+
+export default defineConfig({
+  plugins: [tinyjoinOffline()],
+});
+```
+
+The [starter](https://tinyjoin.org/guides/getting-started/#install) includes this plugin.
+No extra Worker entry, asset-copying command, or registration code is needed.
+The plugin is a Node-only build integration; importing tinyjoin in application
+code does not include it in the browser runtime.
+
+Run the production build and serve the complete output over HTTPS, or localhost
+while testing. The Vite development server does not register an offline service
+worker. To exercise offline behavior locally, use `vite build` followed by
+`vite preview`.
+
+The first visit needs a network connection. The service worker downloads and
+verifies every build file before installation succeeds. After
+`navigator.serviceWorker.ready` resolves, a subsequent navigation can use that
+installed application offline. The first page is not forcibly taken over while
+it is running.
+
+## What gets cached
+
+The plugin produces these files:
+
+| File | Purpose |
+| --- | --- |
+| `tinyjoin-sw.js` | Application service worker. |
+| `tinyjoin-register.js` | External registration script inserted into built HTML. |
+| `tinyjoin-precache.json` | Build version, base, and relative asset URLs with SHA-256 content revisions. |
+| `tinyjoin-precache.js` | Service-worker helper containing the same manifest. |
+
+Every regular file in the final Vite output is included, including public files,
+unused dynamic chunks, and TinyJoin's private lazy OPFS runtime. The service
+worker and its manifest/helper are maintained by the browser's service-worker
+installation mechanism rather than included recursively in their own cache.
+
+API requests, cross-origin URLs, and files created after the build are outside
+this cache. Bundle necessary application resources or provide your own caching
+policy for them. Cache Storage and OPFS have separate contents; installing or
+updating the application cache does not migrate or delete database rows.
+Browsers can still clear or evict either kind of storage. See
+[storage retention](https://tinyjoin.org/guides/storage-and-lifecycle/#browser-retention).
+
+The plugin supports Vite bases such as `/`, `/my-app/`, and `./`. Its service
+worker only controls the application's base directory. A CDN URL as the Vite
+base is not supported because this integration requires same-origin files.
+
+Navigation uses a cached emitted HTML file when one matches. Otherwise it falls
+back to `index.html` for client-side routes within the application scope. Change
+that file with `tinyjoinOffline({navigationFallback: 'app.html'})`, or disable
+the fallback with `tinyjoinOffline({navigationFallback: false})`.
+
+## Safe application updates
+
+A new build gets a separate cache. Its files must all match their recorded
+content hashes before it can install. An interrupted or mixed deployment leaves
+the previously installed application available.
+
+The new service worker waits until every tab controlled by the old one closes.
+Running tabs keep the old application and its old assets, including lazy files
+they have not fetched before. Once the replacement activates, it removes this
+application's previous TinyJoin caches. Close all application tabs and reopen to
+finish an update; reloading only one tab while another remains open can continue
+using the old build.
+
+Do not add automatic `skipWaiting()` or `clients.claim()` calls to force updates.
+They can make a running application use assets from a different build. Deploy
+the complete build together and retain normal static-file MIME types. If a
+cached entry is later missing, the helper tries to restore the exact recorded
+content from the network. If that content is unavailable or has changed, the
+request fails with HTTP 503 rather than mixing in a newer deployment. Close the
+application's tabs and reopen online to finish installing a newer release or
+repair an incomplete cache from the matching deployment.
+
+Application updates and database schema changes are separate decisions. Keep
+schema setup idempotent and observe the
+[storage compatibility boundary](https://tinyjoin.org/guides/releases/#v0-0-6).
+
+## Integrating an existing service worker
+
+An application should have one owner for its service-worker lifecycle. Automatic
+TinyJoin registration detects another worker already controlling the application
+and leaves it alone, with a console message explaining the conflict.
+
+Use manifest mode when an application already owns its service worker:
+
+```ts
+export default defineConfig({
+  plugins: [tinyjoinOffline({mode: 'manifest'})],
+});
+```
+
+This emits only `tinyjoin-precache.json` and `tinyjoin-precache.js`. It does not
+insert registration code or create `tinyjoin-sw.js`. A classic service worker
+beside the build output can use the generated helper:
+
+```js
+importScripts('./tinyjoin-precache.js');
+
+const precache = self.createTinyjoinPrecache();
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(precache.install());
+});
+self.addEventListener('activate', (event) => {
+  event.waitUntil(precache.activate());
+});
+self.addEventListener('fetch', (event) => {
+  const response = precache.match(event.request);
+  if (response) {
+    event.respondWith(response);
+  }
+  // Otherwise leave this request to the application's existing fetch policy.
+});
+```
+
+Combine this branch with the existing fetch handler so that each request calls
+`respondWith` at most once. Keep the native waiting lifecycle described above;
+calling activate early would remove assets still needed by old tabs. Register
+the existing worker with `updateViaCache: 'none'` so its imported manifest is
+checked for changes. For a relative Vite base and a service worker registered
+outside the application directory, pass that directory explicitly:
+`self.createTinyjoinPrecache(new URL('./my-app/', self.location.origin))`.
+
+An existing precaching system can instead consume the JSON manifest. Resolve
+its asset URLs against the application's build base and preserve content
+verification and coherent version activation in that integration.
+
 # Releases
 
 Source: https://tinyjoin.org/guides/releases/
@@ -1216,6 +1445,18 @@ Duplicate output names in simple projections and `RETURNING` now fail
 consistently with `INVALID_QUERY` before execution. `LIMIT` and `OFFSET`
 reject nonnumeric parameter values consistently in ordinary, aggregate, and
 join queries, including JSON objects shaped like internal prepared placeholders.
+
+Persistent Clients now coordinate automatically across tabs and within a page.
+One elected Worker owns the database; operations, prepared statements, and
+notifications follow it through handover. Callback transactions exclude other
+Clients for their duration. In-flight operations interrupted by owner loss
+reject without automatic replay, and incompatible releases reject explicitly.
+
+The optional `tinyjoin/vite` build plugin precaches a complete production
+application, including lazy Worker, OPFS, and WASM assets. New starter apps
+enable it by default. Updates wait for old controlled tabs to close; existing
+service workers can use its generated manifest and helper instead. See the
+[offline guide](https://tinyjoin.org/guides/offline/).
 
 ## v0.0.5
 
@@ -1298,7 +1539,9 @@ export type Row = Record<string, JsonValue>;
  *
  * Use `memory://` for an ephemeral database, or `opfs://name` for a persistent
  * database. Calling create without a data directory also uses memory.
- * Only one Client can hold an OPFS name at a time, including across tabs.
+ * Clients using the same OPFS name automatically share an elected database
+ * owner, including across tabs. Pending operations interrupted by owner loss
+ * reject without replay; subsequent operations reconnect automatically.
  * Different names have independent data and do not synchronize.
  * @category Configuration
  * @since v0.0.5
@@ -1576,11 +1819,21 @@ export interface ClientOptions {
 
 /**
  * The TablesChangedEvent interface describes one committed table-level
- * invalidation.
+ * invalidation or a request to refresh after database-owner handover.
  * @category Subscriptions
  * @since v0.0.5
  */
 export interface TablesChangedEvent {
+  /**
+   * The reset property is true when database-owner handover or page restoration
+   * requires a re-query even though the changed tables are unknown. In that
+   * case tables is empty and every subscription is notified, including filtered
+   * ones. Normal committed-change events omit this property.
+   * @category Event
+   * @since v0.0.6
+   */
+  reset?: boolean;
+
   /**
    * The revision property contains the committed database revision.
    * @category Event
@@ -1589,7 +1842,8 @@ export interface TablesChangedEvent {
   revision: number;
 
   /**
-   * The tables property contains the names of changed tables.
+   * The tables property contains the names of changed tables. It is empty when
+   * reset is true, which means the subscriber should refresh its query anyway.
    * @category Event
    * @since v0.0.5
    */
@@ -1810,6 +2064,8 @@ export class Client {
    * Transaction calls on this Client queue in order. Do not await another transaction on
    * this Client inside the callback; pass its Transaction to helpers instead.
    * Use that object for all SQL in the callback and prepare handles beforehand.
+   * Other Clients for the same OPFS name wait for the whole callback to finish.
+   * Do not await work on those Clients from inside this callback.
    * An uncaught callback error before commit discards staged work. A caught
    * statement error leaves earlier writes staged unless rollback is called.
    *
@@ -1828,7 +2084,9 @@ export class Client {
 
   /**
    * The subscribe method listens for committed table changes and returns an
-   * unsubscribe function.
+   * unsubscribe function. OPFS Clients receive changes from every connected
+   * tab. After handover or page restoration, reset events notify every
+   * subscriber to re-query even though tables is empty.
    * @category Subscriptions
    * @since v0.0.5
    */
@@ -1846,7 +2104,9 @@ export class Client {
   getRevision(): number;
 
   /**
-   * The close method releases prepared statements, storage, and the Worker.
+   * The close method detaches this Client and releases its prepared statements
+   * and Worker. Other Clients for the same OPFS name stay connected; ownership
+   * transfers automatically when necessary.
    * Repeated calls share the same asynchronous cleanup.
    * A closed Client cannot resume; create a new one and recreate its prepared
    * statements and subscriptions. Closing is not a cancellation or rollback
@@ -1952,6 +2212,8 @@ Source: https://tinyjoin.org/api/worker/
 /**
  * The startWorker function starts the TinyJoin request host in the current
  * dedicated Worker.
+ * Persistent databases participate in automatic same-name coordination across
+ * tabs, just like the packaged Worker. Memory databases remain independent.
  * @example
  * ```ts
  * import {startWorker} from 'tinyjoin/worker';
@@ -1962,4 +2224,73 @@ Source: https://tinyjoin.org/api/worker/
  * @since v0.0.5
  */
 export function startWorker(): void;
+````
+
+# Public API: tinyjoin/vite
+
+Source: https://tinyjoin.org/api/vite/
+
+````ts
+/**
+ * The vite module provides optional production offline caching for Vite
+ * applications, including TinyJoin's lazily loaded Worker, OPFS, and WASM files.
+ * This Node-only build integration is separate from the browser runtime.
+ * @packageDocumentation
+ * @module vite
+ * @since v0.0.6
+ */
+
+import type {Plugin} from 'vite';
+
+/**
+ * The TinyjoinOfflineOptions interface configures production offline caching.
+ * @category Offline
+ * @since v0.0.6
+ */
+export interface TinyjoinOfflineOptions {
+  /**
+ * The mode property selects automatic service-worker registration or integration
+ * with an existing service worker. The default is `service-worker`.
+ *
+ * The `manifest` mode emits `tinyjoin-precache.json` and
+ * `tinyjoin-precache.js` without registering or replacing a service worker.
+ * @category Offline
+ * @since v0.0.6
+ */
+  mode?: 'service-worker' | 'manifest';
+  /**
+ * The navigationFallback property names the emitted HTML file served for
+ * otherwise unmatched navigation requests within the application scope.
+ * It defaults to `index.html`; use `false` to disable SPA navigation fallback.
+ * @category Offline
+ * @since v0.0.6
+ */
+  navigationFallback?: string | false;
+}
+
+/**
+ * The tinyjoinOffline function returns a Vite plugin that precaches the complete
+ * emitted production build, including lazy runtime assets, with verified content
+ * hashes. It does not register a service worker during development.
+ *
+ * The first visit requires a network connection. Wait for
+ * `navigator.serviceWorker.ready` before expecting a subsequent navigation to
+ * work offline. Storage persistence and application-file caching remain separate:
+ * OPFS stores the database, while the service worker stores the application.
+ *
+ * Updates wait until all tabs controlled by the old service worker close. The
+ * plugin does not force a new worker onto running tabs. Serve the whole build
+ * together at one same-origin root-relative or relative Vite base. External
+ * requests and files created after the build are not cached.
+ * @example
+ * ```ts
+ * import {defineConfig} from 'vite';
+ * import {tinyjoinOffline} from 'tinyjoin/vite';
+ *
+ * export default defineConfig({plugins: [tinyjoinOffline()]});
+ * ```
+ * @category Offline
+ * @since v0.0.6
+ */
+export function tinyjoinOffline(options?: TinyjoinOfflineOptions): Plugin;
 ````

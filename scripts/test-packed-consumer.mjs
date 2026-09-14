@@ -298,6 +298,7 @@ function assertPackedFiles(packed) {
   const expected = [
     '@types/index.d.ts',
     '@types/worker/index.d.ts',
+    '@types/vite/index.d.ts',
     'LICENSE',
     'README.md',
     'RUST_STANDARD_LIBRARY_NOTICES.html',
@@ -313,6 +314,7 @@ function assertPackedFiles(packed) {
     'worker-opfs/tinyjoin_opfs_runtime.js',
     'worker/default-entry.js',
     'worker/index.js',
+    'vite/index.js',
   ].sort();
   const missing = expected.filter((file) => !files.includes(file));
   const unexpected = files.filter((file) => !expected.includes(file));

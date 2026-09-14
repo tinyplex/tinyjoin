@@ -47,10 +47,12 @@ const RUNTIME_BUNDLES = [
   // one into a Worker of its own - so the duplicate costs nobody any bytes, and
   // it saves the browser a round trip on a forty-five byte shim.
   {entry: 'worker/default-entry.js', shared: WORKER_SHARED},
+  {entry: 'vite/index.js', shared: {}, platform: 'node'},
 ];
 
-// Every file a browser downloads. tsc emits one module per source file; each
-// one that is not listed here is inside a bundle by the time they are pruned.
+// Published JavaScript, including the Node-only Vite plugin. tsc emits one
+// module per source file; unlisted modules are bundled before pruning. The
+// size measurement separately excludes the Vite plugin from browser payload.
 const RUNTIME_FILES = [
   'index.js',
   'protocol.js',
@@ -58,6 +60,7 @@ const RUNTIME_FILES = [
   'worker-opfs/tinyjoin_opfs_runtime.js',
   'worker/default-entry.js',
   'worker/index.js',
+  'vite/index.js',
 ];
 
 // Terser settings shared by every published file. Mangling top-level names is
@@ -142,6 +145,10 @@ manifest.exports = {
     import: './worker/index.js',
   },
   './package.json': './package.json',
+  './vite': {
+    types: './@types/vite/index.d.ts',
+    import: './vite/index.js',
+  },
 };
 
 await writeFile(
@@ -183,15 +190,20 @@ async function buildPrivateWorkerRuntime() {
 }
 
 async function bundleRuntime() {
+  const {version} = JSON.parse(
+    await readFile(resolve(root, 'package.json'), 'utf8'),
+  );
   // Every bundle is built from the modules tsc emitted, and only written once
   // they all are: two of them share an entry, so writing as we went would build
   // the second from the first one's output rather than from the source.
   const bundled = [];
-  for (const {entry, shared} of RUNTIME_BUNDLES) {
+  for (const {entry, shared, platform} of RUNTIME_BUNDLES) {
     const {outputFiles} = await esbuildBuild({
       bundle: true,
+      define: {__TINYJOIN_VERSION__: JSON.stringify(version)},
       entryPoints: [resolve(dist, entry)],
       format: 'esm',
+      platform: platform ?? 'browser',
       plugins: [shareModules(shared)],
       target: 'es2022',
       write: false,

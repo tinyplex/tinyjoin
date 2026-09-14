@@ -1,6 +1,6 @@
-import {startWorker as startWorkerHost} from './host.js';
+import {startCoordinatedWorker} from './coordinator.js';
 
 /** Starts TinyJoin in the current dedicated Worker. */
 export const startWorker = (): void => {
-  startWorkerHost();
+  startCoordinatedWorker();
 };

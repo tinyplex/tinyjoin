@@ -13,6 +13,8 @@
 /**
  * The startWorker function starts the TinyJoin request host in the current
  * dedicated Worker.
+ * Persistent databases participate in automatic same-name coordination across
+ * tabs, just like the packaged Worker. Memory databases remain independent.
  * @example
  * ```ts
  * import {startWorker} from 'tinyjoin/worker';

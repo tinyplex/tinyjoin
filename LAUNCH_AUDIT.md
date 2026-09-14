@@ -22,7 +22,7 @@ safety, all three SELECT families, and marker-shaped JSON remaining data.
 The regressions failed against the previous implementation and pass with the
 fixes. The SQL contract and release notes describe the resulting behavior.
 
-Final validation passed: the complete release gate (267 Rust tests, 105
+Validation after the SQL pass: the complete release gate (267 Rust tests, 105
 TypeScript tests, seven real-WASM contracts, eight runtime Chromium checks,
 documentation checks, and packed-package consumers), Clippy with warnings
 denied, and third-party notice verification. The starter passed 17 CLI tests,
@@ -31,6 +31,42 @@ four generated JavaScript/TypeScript and memory/OPFS builds against the local
 static documentation browser suite also passed independently. The complete
 runtime is 293,384 bytes gzip (286.5 KiB); the WASM itself is 738,352 bytes raw
 and 277,465 bytes gzip. These results do not extend the Chromium-only claim.
+
+The subsequent multi-tab/offline implementation replaces the original
+single-tab limitation. Persistent Clients now share an automatically elected
+database owner, including transaction scheduling, prepared statement recovery,
+cross-tab subscriptions, and bounded request queues. Owner loss rejects
+already-sent work without replay, and stale transaction tokens cannot operate
+on the replacement engine. Subscription resets are deferred during callbacks
+so listeners can safely re-query afterward. Browser locks remain the lifetime
+and ownership authority; frozen live owners can still delay progress.
+
+The optional `tinyjoin/vite` plugin caches every emitted production-build file,
+including unused lazy runtime assets. It verifies content before installation,
+keeps running tabs on their existing release, and offers manifest/helper mode
+for existing service workers. The starter enables offline builds by default
+and creates/seeds its first table atomically when multiple tabs start together.
+API documentation, storage/transaction/caveat/offline guides, getting started,
+release notes, homepage, and both agent references describe these contracts.
+
+All release-check components pass on this implementation: 267 Rust tests,
+124 TypeScript tests, seven real-WASM contracts, 19 runtime Chromium scenarios
+(including 11 multi-tab cases), 12 documentation browser checks, 328 HTML
+pages and fresh generated references, packed default/custom Worker consumers,
+SSR and Vite checks, and the production offline update lifecycle. One stale
+transaction test initially waited for a public reset inside its own callback;
+it now observes transport reconnection first and verifies public notification
+after the callback, matching the new deferral contract. The runtime suite and
+remaining release checks passed after that test correction. Notices and size
+checks also pass. The WASM is unchanged; total runtime is 298,012 bytes gzip
+(291.0 KiB), an increase of 4,628 bytes over the SQL-pass build. Node-only build
+integration is excluded from browser payload measurements.
+
+The final local tarball also passes all four generated starter builds and 15
+Chromium scenarios. The combined production acceptance test opens two
+service-worker-controlled tabs, edits from both while offline, closes the
+original owner, writes in the survivor, and reloads offline with every row
+intact. This does not add server synchronization or broaden browser support.
 
 The release candidates remain local: TinyJoin 0.0.6 and create-tinyjoin 0.0.7
 have not been published, pushed, or deployed by this remediation. Publication

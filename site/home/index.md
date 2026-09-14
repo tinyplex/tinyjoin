@@ -190,12 +190,15 @@ await db.close();
 > path. Memory and OPFS use the same page-native database engine. Persistent
 > OPFS storage is single-writer and intended for reconstructable application
 > data; users can still clear or lose browser-managed storage.
+> Tabs using the same database name share that writer automatically. New
+> starter apps also cache their production build for
+> [offline reopening](/guides/offline/).
 >
 > **Important:** TinyJoin is also experimental, and implements a deliberately
 > bounded SQL and type subset; it is not PostgreSQL compiled to WebAssembly and
 > has no PostgreSQL server, wire protocol, or replication client. Check the
 > exact [SQL compatibility contract](/guides/sql-compatibility/) and the
-> [caveats](/guides/caveats/) - experimental status, single-tab persistence,
+> [caveats](/guides/caveats/) - experimental status, tab handover,
 > browser support, and the projects to reach for instead - before committing to
 > it.
 

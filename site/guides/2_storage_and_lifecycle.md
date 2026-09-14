@@ -24,16 +24,22 @@ hyphens, and start with a letter or number. Include the application, dataset,
 and schema generation in it. A name is a namespace, not an encryption or
 access-control boundary.
 
-OPFS persistence requires a secure browser context and a dedicated Worker.
-TinyJoin opens the database with an exclusive synchronous access handle. A
-second Worker opening the same name fails rather than risking concurrent
-mutation; closing the first Client releases the lock.
+OPFS persistence requires a secure browser context, a dedicated Worker, Web
+Locks, and BroadcastChannel. Call create() with the same name in every tab:
+TinyJoin elects one database-owning Worker, routes operations to it, and
+broadcasts committed changes to all connected Clients. Multiple Clients in one
+page work the same way. No additional configuration is needed.
 
-This applies to two Clients in one page as well as Clients in separate tabs of
-the same origin. Different names can be open independently, but their rows and
-subscriptions are separate: changing the name does not share or synchronize
-the original database. Handle `STORAGE_LOCKED` during startup with an
-already-open message and an explicit retry after the other Client closes.
+Different names can open independently, but their rows and subscriptions are
+separate. Coordination stays within the same origin and browser storage
+partition; it does not connect other browser profiles or devices.
+
+The owner retains an exclusive synchronous OPFS access handle. That remains
+the final protection against concurrent mutation, including older TinyJoin
+versions or custom code that does not participate in coordination. Such an
+owner can still cause `STORAGE_LOCKED`; close the older application before
+retrying. Mixed TinyJoin releases fail with `DATABASE_VERSION_MISMATCH`
+instead of sharing an incompatible engine.
 
 There is no silent fallback to memory if persistent storage is unavailable,
 locked, corrupt, or out of quota.
@@ -61,13 +67,14 @@ await create() is the simplest lifecycle: it returns only after
 initialization succeeds. The returned Client also exposes `ready`, `waitReady`,
 and `closed` for code that constructs a Client directly.
 
-Call close() during application teardown. It seals prepared statements,
-closes storage, and terminates TinyJoin's packaged Worker. Outstanding cleanup
-is shared by repeated calls.
+Call close() during application teardown. It seals that Client's prepared
+statements, detaches it, and terminates its Worker. Other Clients retain their
+data and connection. If the departing Worker owned the database, another
+connected Worker automatically opens it. Outstanding cleanup is shared by
+repeated close() calls.
 
 Closing is irreversible. A Client, its prepared statements, and its
-subscriptions cannot resume after close(). TinyJoin does not manage the
-browser's back/forward cache lifecycle. If a `pagehide` handler closes the
+subscriptions cannot resume after close(). If a `pagehide` handler closes the
 database, a page restored from that cache must initialize a new Client and
 recreate its statements and subscriptions before accepting work. The
 [getting-started example](/guides/getting-started/#close-cleanly) uses a reload
@@ -76,6 +83,37 @@ on `pageshow` when `event.persisted` is true as a simple application policy.
 A browser does not await asynchronous `pagehide` cleanup, and teardown events
 are not guaranteed to run. Await writes while the application is active;
 close() during navigation is not a final-save or cancellation guarantee.
+
+## Tab handover and subscriptions
+
+The browser's locks elect the next owner when the previous Worker closes or
+dies. New operations wait while that owner opens the database. Prepared
+statements are restored automatically when needed. Notifications fan out to
+every Client, including the one that wrote the data.
+
+Operations already sent to a departing owner reject with `LEADER_CHANGED`.
+Their effects may already have committed; TinyJoin never silently repeats
+them. The Client reconnects for subsequent operations, so inspect the stored
+outcome before retrying a write. A callback transaction interrupted by owner
+loss cannot continue: subsequent transaction operations reject with
+`TRANSACTION_LOST`. Start a new transaction after reconciliation.
+
+After handover, or when a page becomes visible or resumes, subscriptions may
+receive `{revision, tables: [], reset: true}`. Re-query on this notification
+even though the precise changed tables are unknown. Filtered subscriptions
+also receive it. A subscription is an invalidation signal, not a durable log
+of every commit.
+
+Transactions exclude other Clients for the entire callback. Keep callbacks
+short and do not wait on work that needs another Client for the same name.
+If a client disappears with a transaction open, the owner rolls it back. A
+frozen but still live owner or transaction holder can delay other tabs until
+it resumes or closes. TinyJoin does not steal a live storage lock based on a
+timer, since doing so could let two engines write concurrently.
+
+For offline reopening of the application itself, use the
+[offline build integration](/guides/offline/). OPFS stores the data; a service
+worker caches the application and database runtime files.
 
 ## Recovering after an uncertain write
 

@@ -93,8 +93,19 @@ do not assume a subscription contains changed rows.
 
 - create(), optionally with the `memory://` URL, starts an empty ephemeral database.
 - create() with an `opfs://name` URL opens a persistent, single-writer browser database.
-- One Client can hold a name at a time, including across tabs. Different names
-  have independent data and do not synchronize.
+- Clients using the same name automatically share one owner across tabs.
+  Different names have independent data and do not synchronize.
+- Transactions hold all Clients for that name until their callbacks finish.
+  Keep callbacks short; a frozen live owner can delay other tabs.
+- Owner loss reconnects automatically. Pending operations fail with
+  `LEADER_CHANGED` and must be reconciled before replay; interrupted
+  transactions fail with `TRANSACTION_LOST`. Never automatically retry writes.
+- Subscription events with `reset: true` require a re-query even when
+  `tables` is empty; they cover handover and page restoration.
+- `create-tinyjoin` generates offline-capable production builds. Existing Vite
+  apps can add tinyjoinOffline() from `tinyjoin/vite`; apps with an existing
+  service worker use its `manifest` mode. See the
+  [offline guide](/guides/offline/). Caching does not add remote synchronization.
 - Keep the OPFS name stable and version it deliberately with the schema.
 - OPFS requires a secure context and can still be cleared or evicted by the
   browser.

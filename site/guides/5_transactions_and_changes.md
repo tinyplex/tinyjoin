@@ -15,6 +15,11 @@ database work until its callback finishes; direct Client operations fail while
 it is active, and a later transaction() call waits its turn. Letting an error
 escape before commit discards the staged transaction.
 
+For an OPFS database, other Clients using the same name wait for the entire
+callback, including Clients in other tabs. They never read its uncommitted
+rows. Do not await work on another Client for that name inside the callback:
+that work needs the callback to finish first.
+
 TinyJoin does not put a callback transaction into PostgreSQL's aborted state
 after a statement failure. If application code catches that failure, earlier
 staged writes may still commit. Call tx.rollback() or rethrow when the whole
@@ -60,6 +65,12 @@ while publishing a commit has a different boundary: `RECOVERY_REQUIRED`,
 the Client, reopening the same OPFS name, and reconciling the operation before
 replay. Rejection of transaction() alone is not proof that a commit did not
 happen. Follow the [recovery procedure](/guides/storage-and-lifecycle/#recovering-after-an-uncertain-write).
+
+If the database-owning tab closes or crashes, an already sent operation rejects
+with `LEADER_CHANGED` and may have committed. A still-running callback cannot
+continue on the replacement owner: later transaction operations reject with
+`TRANSACTION_LOST`. The Client reconnects automatically for new operations,
+but never repeats writes or reruns the callback. Reconcile before retrying.
 
 There is no AbortSignal, query timeout, or transaction timeout option.
 Promise.race() with a timer only stops the caller waiting; the callback and
@@ -113,9 +124,17 @@ const unsubscribe = db.subscribe({tables: ['tasks']}, async () => {
 });
 ```
 
-The listener runs after a commit. Several statements in one transaction produce
-one committed revision and one table-level invalidation. Call the returned
-function to unsubscribe before closing the database.
+The listener runs after commits from any connected Client. Several statements
+in one transaction produce one committed revision and one table-level
+invalidation. Events arriving while this Client has a transaction open are
+coalesced and delivered after its callback finishes, when re-querying is safe.
+Call the returned function to unsubscribe before closing the database.
+
+After tab handover or page restoration, a listener can also receive an event
+with `reset: true` and an empty `tables` array. Its precise missed changes are
+unknown, so every subscription is notified, even one filtered to specific
+tables. The example above works for both normal changes and resets because it
+always re-queries. See [tab handover](/guides/storage-and-lifecycle/#tab-handover-and-subscriptions).
 
 This explicit re-query model keeps TinyJoin independent of UI frameworks and
 lets an application choose its own caching or rendering policy.

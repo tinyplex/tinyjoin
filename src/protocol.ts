@@ -146,7 +146,7 @@ export type WorkerResponse =
 
 export type WorkerEvent = {
   v: typeof PROTOCOL_VERSION;
-  event: 'tablesChanged';
+  event: 'tablesChanged' | 'resync';
   payload: ApplyOutcome;
 };
 
@@ -173,7 +173,7 @@ export const isWorkerResponse = (value: unknown): value is WorkerResponse =>
 export const isWorkerEvent = (value: unknown): value is WorkerEvent =>
   isEnvelope(value) &&
   hasExactKeys(value, ['v', 'event', 'payload']) &&
-  value.event === 'tablesChanged' &&
+  (value.event === 'tablesChanged' || value.event === 'resync') &&
   isApplyOutcome(value.payload);
 
 export const isWorkerRequest = (value: unknown): value is WorkerRequest => {

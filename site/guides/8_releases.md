@@ -40,6 +40,18 @@ consistently with `INVALID_QUERY` before execution. `LIMIT` and `OFFSET`
 reject nonnumeric parameter values consistently in ordinary, aggregate, and
 join queries, including JSON objects shaped like internal prepared placeholders.
 
+Persistent Clients now coordinate automatically across tabs and within a page.
+One elected Worker owns the database; operations, prepared statements, and
+notifications follow it through handover. Callback transactions exclude other
+Clients for their duration. In-flight operations interrupted by owner loss
+reject without automatic replay, and incompatible releases reject explicitly.
+
+The optional `tinyjoin/vite` build plugin precaches a complete production
+application, including lazy Worker, OPFS, and WASM assets. New starter apps
+enable it by default. Updates wait for old controlled tabs to close; existing
+service workers can use its generated manifest and helper instead. See the
+[offline guide](/guides/offline/).
+
 ## v0.0.5
 
 This release establishes TinyJoin as a standalone, SQL-first browser database

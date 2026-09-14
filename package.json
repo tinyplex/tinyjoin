@@ -15,7 +15,11 @@
       "types": "./dist/@types/worker/index.d.ts",
       "import": "./dist/worker/index.js"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./vite": {
+      "types": "./dist/@types/vite/index.d.ts",
+      "import": "./dist/vite/index.js"
+    }
   },
   "scripts": {
     "build": "node scripts/build.mjs",
@@ -29,7 +33,7 @@
     "check:docs:built": "node scripts/check-docs.mjs",
     "check:docs:committed": "node scripts/check-docs-fresh.mjs",
     "check:demo-runtime": "node scripts/check-demo-runtime.mjs",
-    "check:release": "npm run check:docs:committed && npm run check:source && npm run build && npm run build:docs:built && npm run check:docs:built && npm run check:demo-runtime && npm run test:docs:built && npm run test:wasm:contract && npm run check:size && npm run test:browser:built && npm run test:package:built",
+    "check:release": "npm run check:docs:committed && npm run check:source && npm run build && npm run build:docs:built && npm run check:docs:built && npm run check:demo-runtime && npm run test:docs:built && npm run test:wasm:contract && npm run check:size && npm run test:browser:built && npm run test:package:built && npm run test:offline:built",
     "check:source": "npm run typecheck && npm test",
     "check:size": "node scripts/check-size.mjs",
     "prePublishPackage": "npm i && npm run check:release",
@@ -41,6 +45,7 @@
     "test:browser:serve": "vite test/browser/app",
     "test:docs:built": "playwright test --config playwright.docs.config.ts",
     "test:docs:serve": "vite preview --outDir docs",
+    "test:offline:built": "node scripts/test-offline.mjs",
     "test:package": "node scripts/test-packed-consumer.mjs",
     "test:package:built": "node scripts/test-packed-consumer.mjs --built",
     "test:rust": "node scripts/cargo.mjs test --workspace",

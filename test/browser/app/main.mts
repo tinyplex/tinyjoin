@@ -571,14 +571,16 @@ async function persistenceProbe(
     await insertPersistencePosts(first.client, rows);
     const initialCommitMs = performance.now() - commitStartedAt;
 
-    const competing = openOpfsClient(databaseName);
-    let lockErrorCode = '';
+    const competing = new Worker(new URL('./raw-lock.mts', import.meta.url), {type: 'module'});
+    let lockErrorCode: string;
     try {
-      await competing.client.waitReady;
-    } catch (error) {
-      lockErrorCode = errorCode(error);
+      lockErrorCode = await new Promise<string>((resolve, reject) => {
+        competing.onmessage = (event: MessageEvent<string>) => resolve(event.data);
+        competing.onerror = (event) => reject(new Error(event.message));
+        competing.postMessage(databaseName);
+      });
     } finally {
-      competing.worker.terminate();
+      competing.terminate();
     }
 
     const independent = openOpfsClient(`${databaseName}-independent`);

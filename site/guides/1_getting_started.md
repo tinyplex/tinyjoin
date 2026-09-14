@@ -13,6 +13,9 @@ TinyJoin publishes JavaScript, TypeScript declarations, its Worker runtime, and
 the WebAssembly engine together. An application does not need Rust tooling or a
 separate Worker plugin.
 
+For a new application, `npm create tinyjoin@latest` generates a working Vite
+starter. Its production build includes [offline loading](/guides/offline/).
+
 ## Open a database
 
 ```ts
@@ -24,6 +27,10 @@ const db = await create('opfs://my-app');
 The Promise resolves after the Worker and database are ready. The string gives
 the persistent database a stable local name. Call create() without an
 argument while experimenting with an ephemeral database.
+
+Use the same name in every tab. TinyJoin automatically shares one database
+owner and delivers committed-change notifications across those Clients. See
+[storage and tab handover](/guides/storage-and-lifecycle/) for lifecycle details.
 
 ## Create a table
 
@@ -89,8 +96,9 @@ window.addEventListener('pageshow', (event) => {
 });
 ```
 
-Closing releases prepared statements, storage, and the Worker. It is
-asynchronous and safe to call more than once.
+Closing releases this Client's prepared statements and Worker. Other Clients
+for the same name continue, with automatic owner handover when needed. Closing
+is asynchronous and safe to call more than once.
 
 Closing cannot be undone. This example reloads a page restored from the
 back/forward cache so startup creates a fresh Client. A browser does not await

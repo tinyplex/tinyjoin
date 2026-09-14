@@ -134,6 +134,9 @@ export interface ClientOptions {
 
 /// TablesChangedEvent
 export interface TablesChangedEvent {
+  /// TablesChangedEvent.reset
+  reset?: boolean;
+
   /// TablesChangedEvent.revision
   revision: number;
 

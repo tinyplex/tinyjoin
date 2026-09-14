@@ -117,6 +117,7 @@ export const build = async (
     .addNodeTransform(collapseLoneEssentialGroup)
     .addApiFile(resolve(typesDir, 'index.d.ts'))
     .addApiFile(resolve(typesDir, 'worker/index.d.ts'))
+    .addApiFile(resolve(typesDir, 'vite/index.d.ts'))
     .addRootMarkdownFile('site/home/index.md')
     .addMarkdownDir('site/guides')
     .addMarkdownDir('site/demos', true);
@@ -216,6 +217,7 @@ const getFullReference = (
   for (const [module, declaration, source] of [
     ['tinyjoin', 'index.d.ts', 'https://tinyjoin.org/api/tinyjoin/'],
     ['tinyjoin/worker', 'worker/index.d.ts', 'https://tinyjoin.org/api/worker/'],
+    ['tinyjoin/vite', 'vite/index.d.ts', 'https://tinyjoin.org/api/vite/'],
   ]) {
     sections.push(
       `# Public API: ${module}\n\nSource: ${source}\n\n` +

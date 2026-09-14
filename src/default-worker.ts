@@ -25,10 +25,34 @@ export const createUrlWorker = (url: string | URL): WorkerLike => {
  * that reason: the published client is one bundle at this same depth, so the
  * relative path is correct in the source tree and in the bundle alike.
  */
-export const createDefaultWorker = (): WorkerLike => {
+export const createDefaultWorker = (refreshOnResume = false): WorkerLike => {
   assertWorkerAvailable();
-  return new Worker(new URL('./worker/default-entry.js', import.meta.url), {
-    name: 'tinyjoin',
-    type: 'module',
-  });
+  const worker = new Worker(
+    new URL('./worker/default-entry.js', import.meta.url),
+    {
+      name: 'tinyjoin',
+      type: 'module',
+    },
+  );
+  if (!refreshOnResume || typeof document === 'undefined') return worker;
+  const refresh = (): void => {
+    if (document.visibilityState === 'visible')
+      worker.postMessage({tinyjoin: 'resync'});
+  };
+  window.addEventListener('pageshow', refresh);
+  document.addEventListener('resume', refresh);
+  document.addEventListener('visibilitychange', refresh);
+  return {
+    postMessage: (message) => worker.postMessage(message),
+    addEventListener: (type, listener) =>
+      worker.addEventListener(type, listener as EventListener),
+    removeEventListener: (type, listener) =>
+      worker.removeEventListener(type, listener as EventListener),
+    terminate: () => {
+      window.removeEventListener('pageshow', refresh);
+      document.removeEventListener('resume', refresh);
+      document.removeEventListener('visibilitychange', refresh);
+      worker.terminate();
+    },
+  };
 };
