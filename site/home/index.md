@@ -82,10 +82,8 @@ await db.exec(`
 
 > ## Write with parameters
 >
-> query() runs one read or write statement, with application values in the `$n`
-> array so that they never reach the SQL text. The sql tagged template is the
-> same parameterized call in a shorter form, and takes values only, so there is
-> no way to interpolate raw SQL by accident.
+> query() runs one read or write statement. Application values go in the `$n`
+> array and never reach the SQL text.
 
 ```ts
 const id = crypto.randomUUID();
@@ -94,7 +92,14 @@ await db.query(
   'INSERT INTO tasks (id, title) VALUES ($1, $2)',
   [id, 'Try TinyJoin'],
 );
+```
 
+> ## Or tag a template
+>
+> The sql tagged template is the same parameterized call in a shorter form. It
+> takes values only, so there is no way to interpolate raw SQL by accident.
+
+```ts
 const title = 'Written with a tag';
 
 await db.sql`
@@ -168,6 +173,17 @@ unsubscribe();
 await db.close();
 ```
 
+> ## Go deeper when you need to
+>
+> - Follow the [getting started guide](/guides/getting-started/).
+> - Browse the [API reference](/api/).
+> - Understand the [caveats](/guides/caveats/).
+> - Review the [release notes](/guides/releases/).
+> - Start an app with [create-tinyjoin](https://github.com/tinyplex/create-tinyjoin).
+> - Read the [source](https://github.com/tinyplex/tinyjoin).
+>
+> TinyJoin is MIT licensed.
+
 > ## Local, and deliberately bounded
 >
 > TinyJoin contains no hosted service, credentials, analytics, or hidden network
@@ -182,17 +198,6 @@ await db.close();
 > [caveats](/guides/caveats/) - experimental status, single-tab persistence,
 > browser support, and the projects to reach for instead - before committing to
 > it.
-
-> ## Go deeper when you need to
->
-> - Follow the [getting started guide](/guides/getting-started/).
-> - Browse the [API reference](/api/).
-> - Understand the [caveats](/guides/caveats/).
-> - Review the [release notes](/guides/releases/).
-> - Start an app with [create-tinyjoin](https://github.com/tinyplex/create-tinyjoin).
-> - Read the [source](https://github.com/tinyplex/tinyjoin).
->
-> TinyJoin is MIT licensed.
 
 ---
 
