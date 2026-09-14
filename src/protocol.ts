@@ -252,7 +252,7 @@ export const isSerializedError = (value: unknown): value is SerializedError =>
   objHasOwn(value, 'message') &&
   isString(value.code) &&
   isString(value.message) &&
-  (isUndefined(value.details) || isJsonValue(value.details)) &&
+  (isUndefined(value.details) || createJsonValidation().isJson(value.details)) &&
   (isUndefined(value.retryable) || isBoolean(value.retryable));
 
 // Each message carries the protocol version it was built for, so that a mixed
@@ -267,6 +267,7 @@ const isResult = (
   value: unknown,
   deep: boolean,
 ): boolean => {
+  const validation = deep ? createJsonValidation() : undefined;
   switch (method) {
     case 'init':
       return (
@@ -282,7 +283,7 @@ const isResult = (
       return isApplyOutcome(value);
     case 'executeSql':
     case 'executePrepared':
-      return isSqlResult(value, deep);
+      return isSqlResult(value, validation);
     case 'prepareSql':
       return (
         isRecord(value) &&
@@ -291,8 +292,8 @@ const isResult = (
       );
     case 'execSql':
       return deep
-        ? isDenseArray(value, (result) => isSqlResult(result, true))
-        : arrayIsArray(value) && value.every((result) => isSqlResult(result, false));
+        ? isDenseArray(value, (result) => isSqlResult(result, validation))
+        : arrayIsArray(value) && value.every((result) => isSqlResult(result));
     case 'beginTransaction':
       return (
         isRecord(value) &&
@@ -351,23 +352,24 @@ const isStorageOptions = (value: unknown): value is StorageOptions =>
 const isDenseArray = <Item>(
   value: unknown,
   isItem: (item: unknown) => boolean,
+  step?: () => boolean,
 ): value is Item[] => {
   if (!arrayIsArray(value) || value.length > MAX_ARRAY_ITEMS) {
     return false;
   }
   for (let index = 0; index < value.length; index++) {
-    if (!objHasOwn(value, index) || !isItem(value[index])) {
+    if ((step && !step()) || !objHasOwn(value, index) || !isItem(value[index])) {
       return false;
     }
   }
   return true;
 };
 
-const isStrings = (value: unknown): value is string[] =>
-  isDenseArray(value, isString);
+const isStrings = (value: unknown, step?: () => boolean): value is string[] =>
+  isDenseArray(value, isString, step);
 
 const isJsonValues = (value: unknown): value is JsonValue[] =>
-  isDenseArray(value, (item) => isJsonValue(item));
+  isDenseArray(value, createJsonValidation().isJson);
 
 const isApplyOutcome = (value: unknown): value is ApplyOutcome =>
   isRecord(value) &&
@@ -375,8 +377,10 @@ const isApplyOutcome = (value: unknown): value is ApplyOutcome =>
   isCount(value.revision) &&
   isStrings(value.tables);
 
-const isRow = (value: unknown): value is Row =>
-  isPlainRecord(value) && objValues(value).every((cell) => isJsonValue(cell));
+const isRow = (value: unknown, validation: JsonValidation): value is Row =>
+  validation.step() &&
+  isPlainRecord(value) &&
+  objValues(value).every(validation.isJson);
 
 const isResultField = (value: unknown): value is ResultField =>
   isRecord(value) &&
@@ -384,44 +388,74 @@ const isResultField = (value: unknown): value is ResultField =>
   isString(value.name) &&
   isCountWithin(value.dataTypeID, 0, MAX_U32);
 
-// `deep` walks every field and row. The header-only pass checks the envelope
-// and leaves the two large arrays to whoever produced them.
-const isSqlResult = (value: unknown, deep: boolean): value is SqlResult =>
+// A validation context walks every field and row. The header-only pass checks
+// the envelope and leaves the two large arrays to whoever produced them.
+const isSqlResult = (
+  value: unknown,
+  validation?: JsonValidation,
+): value is SqlResult =>
+  (!validation || validation.step()) &&
   isRecord(value) &&
   hasExactKeys(value, SQL_RESULT_KEYS) &&
   isString(value.command) &&
-  (deep
-    ? isDenseArray(value.fields, isResultField)
+  (validation
+    ? isDenseArray(value.fields, isResultField, validation.step)
     : arrayIsArray(value.fields)) &&
   isCount(value.revision) &&
   isCount(value.rowCount) &&
-  (deep ? isDenseArray(value.rows, isRow) : arrayIsArray(value.rows)) &&
-  isStrings(value.tables);
+  (validation
+    ? isDenseArray(value.rows, (row) => isRow(row, validation))
+    : arrayIsArray(value.rows)) &&
+  isStrings(value.tables, validation?.step);
 
-const isJsonValue = (
-  value: unknown,
-  seen = new WeakSet<object>(),
-  depth = 0,
-): value is JsonValue => {
-  if (depth > MAX_JSON_DEPTH) {
-    return false;
-  }
-  if (value === null || isBoolean(value) || isString(value)) {
-    return true;
-  }
-  if (isNumber(value)) {
-    return isFiniteNumber(value);
-  }
-  if (!isObject(value) || seen.has(value)) {
-    return false;
-  }
-  seen.add(value);
-  const valid = arrayIsArray(value)
-    ? isDenseArray(value, (item) => isJsonValue(item, seen, depth + 1))
-    : isPlainRecord(value) &&
-      objValues(value).every((item) => isJsonValue(item, seen, depth + 1));
-  seen.delete(value);
-  return valid;
+type JsonValidation = ReturnType<typeof createJsonValidation>;
+
+/** Shares one work budget and graph cache across a complete protocol payload. */
+const createJsonValidation = () => {
+  let remaining = MAX_JSON_VISITS;
+  let ancestors: WeakSet<object> | undefined;
+  let validatedDepths: WeakMap<object, number> | undefined;
+  const step = (): boolean => remaining-- > 0;
+
+  const visit = (value: unknown, depth: number): boolean => {
+    if (!step() || depth > MAX_JSON_DEPTH) {
+      return false;
+    }
+    if (value === null || isBoolean(value) || isString(value)) {
+      return true;
+    }
+    if (isNumber(value)) {
+      return isFiniteNumber(value);
+    }
+    if (!isObject(value) || ancestors?.has(value)) {
+      return false;
+    }
+    // Structured clone preserves aliases. Reuse a subtree only when it was
+    // already valid at this depth or deeper, so a later longer path cannot
+    // hide a descendant beyond the depth limit. Expanded WASM input is still
+    // charged separately by its preflight before any Rust allocation.
+    if ((validatedDepths?.get(value) ?? -1) >= depth) {
+      return true;
+    }
+    ancestors ??= new WeakSet<object>();
+    validatedDepths ??= new WeakMap<object, number>();
+    ancestors.add(value);
+    const valid = arrayIsArray(value)
+      ? isDenseArray(value, (item) => visit(item, depth + 1))
+      : isPlainRecord(value) &&
+        objValues(value).every((item) => visit(item, depth + 1));
+    ancestors.delete(value);
+    if (valid) {
+      validatedDepths.set(value, depth);
+    }
+    return valid;
+  };
+
+  return {
+    step,
+    isJson: (value: unknown): value is JsonValue => visit(value, 0),
+  };
 };
 
 const MAX_JSON_DEPTH = 64;
+const MAX_JSON_VISITS = 1_000_000;

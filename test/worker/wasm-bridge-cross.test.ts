@@ -95,6 +95,41 @@ const runIfArtifactExists =
     : describe.skip;
 
 runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
+  it('rejects amplified parameters without poisoning the real WASM engine', async () => {
+    const wasm = await loadStructuredModule();
+    const {engine} = createRecordingEngine(wasm, new MemoryPageDevice());
+    try {
+      engine.execSql('CREATE TABLE items (id INTEGER PRIMARY KEY, payload JSON)');
+      const sql = `SELECT id FROM items WHERE payload IN (${Array(384).fill('$1').join(',')}) LIMIT 0`;
+      const statement = engine.prepareSql(sql);
+      const revision = engine.revision();
+      const params = ['x'.repeat(64 * 1024)];
+      expect(captureError(() => engine.executeSql(sql, params))).toMatchObject({
+        code: 'RESOURCE_LIMIT',
+      });
+      expect(
+        captureError(() => engine.executePrepared(statement, params)),
+      ).toMatchObject({code: 'RESOURCE_LIMIT'});
+
+      let shared: JsonValue = 1;
+      for (let depth = 0; depth < 40; depth++) {
+        shared = [shared, shared];
+      }
+      expect(
+        captureError(() =>
+          engine.executeSql('INSERT INTO items VALUES (1, $1)', [shared]),
+        ),
+      ).toMatchObject({code: 'RESOURCE_LIMIT'});
+      expect(engine.revision()).toBe(revision);
+      expect(engine.executeSql('SELECT id FROM items', []).rows).toEqual([]);
+      engine.executeSql('INSERT INTO items VALUES (1, $1)', [{safe: true}]);
+      expect(engine.executeSql('SELECT id FROM items', []).rows).toEqual([{id: 1}]);
+      expect(engine.executePrepared(statement, ['small']).rows).toEqual([]);
+    } finally {
+      engine.close();
+    }
+  });
+
   it('keeps JSON comparisons and rejected mutations consistent through WASM', async () => {
     const wasm = await loadStructuredModule();
     const {engine} = createRecordingEngine(wasm, new MemoryPageDevice());

@@ -3,12 +3,17 @@ import {describe, expect, it, vi} from 'vitest';
 import {
   PROTOCOL_VERSION,
   isWorkerRequest,
+  type JsonValue,
   type WorkerEvent,
   type WorkerRequest,
   type WorkerResponse,
 } from '../../src/protocol.ts';
 import type {WorkerEngine} from '../../src/worker/engine.ts';
 import {startWorker, type WorkerScope} from '../../src/worker/host.ts';
+import {
+  WASM_OPERATION,
+  adaptStructuredWasmEngine,
+} from '../../src/worker/wasm-bridge.ts';
 
 class FakeScope implements WorkerScope {
   readonly posted: Array<WorkerResponse | WorkerEvent> = [];
@@ -142,6 +147,75 @@ async function waitForPosted(scope: FakeScope, count: number): Promise<void> {
 }
 
 describe('startWorker', () => {
+  it('rejects graph expansion in preflight and keeps serving requests', async () => {
+    const scope = new FakeScope();
+    const result = {
+      command: 'SELECT',
+      fields: [{name: 'id', dataTypeID: 20}],
+      revision: 0,
+      rowCount: 1,
+      rows: [{id: 1}],
+      tables: [],
+    };
+    const callStructured = vi.fn((_version: number, operation: number) => {
+      const payload =
+        operation === WASM_OPERATION.revision
+          ? 0
+          : operation === WASM_OPERATION.executeSql ? result : undefined;
+      return [2, 0, 0, payload];
+    });
+    const engine = adaptStructuredWasmEngine({callStructured});
+    const controller = startWorker({
+      scope,
+      durableEngineFactory: async () => engine,
+    });
+    let shared: JsonValue = null;
+    for (let depth = 0; depth < 40; depth += 1) {
+      shared = [shared, shared];
+    }
+
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 1,
+      method: 'init',
+      params: {storage: {kind: 'memory'}},
+    } satisfies WorkerRequest);
+    scope.send(structuredClone({
+      v: PROTOCOL_VERSION,
+      id: 2,
+      method: 'executeSql',
+      params: {sql: 'SELECT id FROM posts WHERE id = $1', params: [shared]},
+    } satisfies WorkerRequest));
+    scope.send(structuredClone({
+      v: PROTOCOL_VERSION,
+      id: 3,
+      method: 'executePrepared',
+      params: {statementId: 1, params: [shared]},
+    } satisfies WorkerRequest));
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 4,
+      method: 'executeSql',
+      params: {sql: 'SELECT id FROM posts', params: []},
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 4);
+
+    for (const index of [1, 2]) {
+      expect(scope.posted[index]).toMatchObject({
+        id: index + 1,
+        ok: false,
+        error: {code: 'RESOURCE_LIMIT'},
+      });
+    }
+    expect(scope.posted[3]).toEqual({v: PROTOCOL_VERSION, id: 4, ok: true, result});
+    expect(callStructured.mock.calls.map(([, operation]) => operation)).toEqual([
+      WASM_OPERATION.revision,
+      WASM_OPERATION.executeSql,
+    ]);
+    expect(scope.closed).toBe(false);
+    await controller.close();
+  });
+
   it('rejects unknown initialization and SQL metadata at the protocol boundary', () => {
     expect(
       isWorkerRequest({

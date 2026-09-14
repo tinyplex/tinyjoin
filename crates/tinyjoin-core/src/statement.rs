@@ -7,7 +7,8 @@ use serde_json::{Map, Number, Value};
 use crate::StorageDriver;
 use crate::query::{
     Token, bind_parameter, is_reserved_keyword, matches_predicate, parse_predicate_at, tokenize,
-    validate_predicate_columns, validate_predicate_types, validate_sql_input,
+    validate_parameter_expansion, validate_predicate_columns, validate_predicate_types,
+    validate_sql_input,
 };
 use crate::storage::{
     estimated_row_bytes, estimated_value_bytes, normalize_row, row_key, schema_with_added_column,
@@ -114,6 +115,7 @@ pub(crate) fn parse(sql: &str, params: &[Value]) -> Result<Statement> {
         }
         return crate::query::parse_sql(sql, params).map(Statement::Select);
     }
+    validate_parameter_expansion(&tokens, params)?;
     MutationParser::new(tokens, params)
         .parse()
         .map(Statement::Write)

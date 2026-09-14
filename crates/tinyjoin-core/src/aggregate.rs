@@ -6,7 +6,8 @@ use serde_json::{Map, Number, Value};
 
 use crate::query::{
     Token, bind_parameter, is_reserved_keyword, matches_predicate, parse_predicate_at, tokenize,
-    validate_predicate_columns, validate_predicate_types, validate_sql_input,
+    validate_parameter_expansion, validate_predicate_columns, validate_predicate_types,
+    validate_sql_input,
 };
 use crate::storage::StorageReader;
 use crate::{
@@ -113,7 +114,9 @@ pub(crate) fn is_aggregate_select(tokens: &[Token]) -> bool {
 
 pub(crate) fn parse_sql(sql: &str, params: &[Value]) -> Result<AggregatePlan> {
     validate_sql_input(sql, params)?;
-    Parser::new(tokenize(sql)?, params).parse()
+    let tokens = tokenize(sql)?;
+    validate_parameter_expansion(&tokens, params)?;
+    Parser::new(tokens, params).parse()
 }
 
 pub(crate) fn bind_plan_parameters(

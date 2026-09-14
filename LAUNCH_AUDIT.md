@@ -5,7 +5,7 @@ Remediation is proceeding in the seven-summary-concern order below. The original
 | Concern | Status | Validation |
 | --- | --- | --- |
 | 1. SQL correctness | Fixed shared predicate/assignment validation and heterogeneous JSON equality | 249 Rust tests; two real-WASM contract tests; typecheck, docs and size checks |
-| 2. Resource limits | Pending | |
+| 2. Resource limits | Fixed shared-graph traversal and capped expanded SQL bindings at 16 MiB before copying | 253 Rust tests; 105 TypeScript tests; three real-WASM contract tests; typecheck, docs and size checks |
 | 3. Release compatibility | Pending | |
 | 4. First-use experience | Pending | |
 | 5. Performance | Pending | |

@@ -14,6 +14,7 @@ use crate::{
 
 const MAX_SQL_BYTES: usize = 64 * 1024;
 const MAX_SQL_TOKENS: usize = 4 * 1024;
+const MAX_BOUND_PARAMETER_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROJECTION_COLUMNS: usize = 256;
 const MAX_PREDICATE_NODES: usize = 256;
 const MAX_PREDICATE_DEPTH: usize = 32;
@@ -345,7 +346,9 @@ fn result_bytes_limit_exceeded() -> EngineError {
 
 pub(crate) fn parse_sql(sql: &str, params: &[Value]) -> Result<SelectPlan> {
     validate_sql_input(sql, params)?;
-    SqlParser::new(tokenize(sql)?, params).parse()
+    let tokens = tokenize(sql)?;
+    validate_parameter_expansion(&tokens, params)?;
+    SqlParser::new(tokens, params).parse()
 }
 
 pub(crate) fn validate_sql_input(sql: &str, params: &[Value]) -> Result<()> {
@@ -372,6 +375,58 @@ pub(crate) fn validate_sql_parameters(params: &[Value]) -> Result<()> {
         })?;
     }
     Ok(())
+}
+
+/// Bounds retained parameter copies before parsing can clone any bound value into its AST.
+/// The lexer has already excluded quoted strings, identifiers, and comments from placeholders.
+pub(crate) fn validate_parameter_expansion(tokens: &[Token], params: &[Value]) -> Result<()> {
+    let mut occurrences = vec![0usize; params.len()];
+    for token in tokens {
+        if let Token::Placeholder(raw_index) = token {
+            let index = parameter_index(raw_index)?;
+            let count = occurrences.get_mut(index - 1).ok_or_else(|| {
+                EngineError::bind_error(format!("No value was provided for `${raw_index}`"))
+            })?;
+            *count = count.checked_add(1).ok_or_else(binding_limit_exceeded)?;
+        }
+    }
+    validate_bound_parameter_bytes(&occurrences, params)
+}
+
+/// The occurrence vector is retained by prepared statements and recomputed for ordinary queries.
+/// Each supplied value is measured once, even when its parameter appears many times in the SQL.
+pub(crate) fn validate_bound_parameter_bytes(
+    occurrences: &[usize],
+    params: &[Value],
+) -> Result<()> {
+    debug_assert_eq!(occurrences.len(), params.len());
+    let mut bytes = 0usize;
+    for (count, value) in occurrences.iter().zip(params) {
+        if *count == 0 {
+            continue;
+        }
+        let retained = estimated_value_bytes(value)
+            .map_err(|error| EngineError::bind_error(error.message))?
+            .checked_add(std::mem::size_of::<Value>())
+            .ok_or_else(binding_limit_exceeded)?;
+        bytes = retained
+            .checked_mul(*count)
+            .and_then(|retained| bytes.checked_add(retained))
+            .ok_or_else(binding_limit_exceeded)?;
+        if bytes > MAX_BOUND_PARAMETER_BYTES {
+            return Err(binding_limit_exceeded());
+        }
+    }
+    Ok(())
+}
+
+fn binding_limit_exceeded() -> EngineError {
+    EngineError::new(
+        "RESOURCE_LIMIT",
+        format!(
+            "Expanded SQL parameters cannot retain more than {MAX_BOUND_PARAMETER_BYTES} bytes"
+        ),
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2739,6 +2794,28 @@ mod tests {
         assert_eq!(
             parse_sql(&deeply_nested_comment, &[]).unwrap_err().code,
             "INVALID_QUERY"
+        );
+    }
+
+    #[test]
+    fn expanded_parameter_accounting_checks_its_boundary_and_overflow() {
+        let value = json!("x".repeat(1024));
+        let retained = estimated_value_bytes(&value).unwrap() + std::mem::size_of::<Value>();
+        let maximum_copies = MAX_BOUND_PARAMETER_BYTES / retained;
+        validate_bound_parameter_bytes(&[maximum_copies], std::slice::from_ref(&value)).unwrap();
+        for count in [maximum_copies + 1, usize::MAX] {
+            assert_eq!(
+                validate_bound_parameter_bytes(&[count], std::slice::from_ref(&value))
+                    .unwrap_err()
+                    .code,
+                "RESOURCE_LIMIT"
+            );
+        }
+        assert_eq!(
+            validate_bound_parameter_bytes(&[maximum_copies, 1], &[value.clone(), value])
+                .unwrap_err()
+                .code,
+            "RESOURCE_LIMIT"
         );
     }
 

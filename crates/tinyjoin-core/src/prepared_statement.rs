@@ -5,7 +5,8 @@ use serde_json::Value;
 
 use crate::query::{
     MAX_SQL_PARAMETERS, Token, bind_predicate_parameters, bind_prepared_value, parameter_index,
-    prepared_parameter_marker, tokenize, validate_sql_input, validate_sql_parameters,
+    prepared_parameter_marker, tokenize, validate_bound_parameter_bytes, validate_sql_input,
+    validate_sql_parameters,
 };
 use crate::statement::{SqlValue, Statement, WriteStatement};
 use crate::{EngineError, Result};
@@ -22,6 +23,7 @@ pub(crate) struct PreparedStatement {
     source: Box<str>,
     statement: Statement,
     parameter_count: usize,
+    parameter_occurrences: Box<[usize]>,
     limit_parameter: Option<usize>,
     offset_parameter: Option<usize>,
     retained_bytes: usize,
@@ -51,11 +53,12 @@ impl PreparedStatement {
                 "Prepared statements support SELECT, INSERT, UPDATE, and DELETE, but not DDL",
             ));
         }
-        let retained_bytes = retained_bytes(sql.len(), tokens.len())?;
+        let retained_bytes = retained_bytes(sql.len(), tokens.len(), layout.parameter_count)?;
         Ok(Self {
             source: sql.into(),
             statement,
             parameter_count: layout.parameter_count,
+            parameter_occurrences: layout.parameter_occurrences.into_boxed_slice(),
             limit_parameter: layout.limit_parameter,
             offset_parameter: layout.offset_parameter,
             retained_bytes,
@@ -73,6 +76,7 @@ impl PreparedStatement {
         // Validate every slot, including gaps in PostgreSQL-style numbering, before cloning the
         // parsed template or opening any mutation candidate.
         validate_sql_parameters(params)?;
+        validate_bound_parameter_bytes(&self.parameter_occurrences, params)?;
         match &self.statement {
             Statement::Select(plan) => Ok(Statement::Select(
                 crate::query::bind_select_plan_parameters(
@@ -175,6 +179,7 @@ impl PreparedStatementRegistry {
 
 struct ParameterLayout {
     parameter_count: usize,
+    parameter_occurrences: Vec<usize>,
     limit_parameter: Option<usize>,
     offset_parameter: Option<usize>,
 }
@@ -182,6 +187,7 @@ struct ParameterLayout {
 impl ParameterLayout {
     fn from_tokens(tokens: &[Token]) -> Result<Self> {
         let mut parameter_count = 0;
+        let mut parameter_occurrences = Vec::new();
         let mut limit_parameter = None;
         let mut offset_parameter = None;
         for (position, token) in tokens.iter().enumerate() {
@@ -195,6 +201,8 @@ impl ParameterLayout {
                 )));
             }
             parameter_count = parameter_count.max(index);
+            parameter_occurrences.resize(parameter_count, 0);
+            parameter_occurrences[index - 1] += 1;
             match position
                 .checked_sub(1)
                 .and_then(|position| tokens.get(position))
@@ -212,6 +220,7 @@ impl ParameterLayout {
         }
         Ok(Self {
             parameter_count,
+            parameter_occurrences,
             limit_parameter,
             offset_parameter,
         })
@@ -262,7 +271,7 @@ fn bind_sql_value(value: &mut SqlValue, params: &[Value]) -> Result<()> {
     }
 }
 
-fn retained_bytes(sql_bytes: usize, tokens: usize) -> Result<usize> {
+fn retained_bytes(sql_bytes: usize, tokens: usize, parameter_count: usize) -> Result<usize> {
     // The source is retained for statement identity and diagnostics. Token storage is discarded,
     // but every retained AST node originates in a bounded token. Charging 512 bytes per token is
     // deliberately conservative enough to cover enum/vector capacity and the allocated JSON map
@@ -271,6 +280,7 @@ fn retained_bytes(sql_bytes: usize, tokens: usize) -> Result<usize> {
     size_of::<PreparedStatement>()
         .checked_add(PREPARED_ENTRY_OVERHEAD)
         .and_then(|bytes| bytes.checked_add(sql_bytes))
+        .and_then(|bytes| bytes.checked_add(parameter_count.checked_mul(size_of::<usize>())?))
         .and_then(|bytes| bytes.checked_add(tokens.checked_mul(TOKEN_AST_UPPER_BOUND)?))
         .ok_or_else(|| prepared_limit("Prepared statement memory accounting overflowed"))
 }
@@ -328,6 +338,7 @@ mod tests {
             PreparedStatement::parse("SELECT id FROM tasks WHERE id = $2 OR id = $2 LIMIT $3")
                 .unwrap();
         assert_eq!(statement.parameter_count, 3);
+        assert_eq!(&*statement.parameter_occurrences, &[0, 2, 1]);
         assert_eq!(statement.limit_parameter, Some(3));
         statement
             .bind(&[json!({"unused": true}), json!(7), json!(1)])
@@ -350,6 +361,160 @@ mod tests {
                 "BIND_ERROR"
             );
         }
+    }
+
+    #[test]
+    fn expanded_parameter_limits_cover_every_parser_and_prepared_binding() {
+        let placeholders = vec!["$1"; 384].join(", ");
+        let insert_rows = (0..384)
+            .map(|id| format!("({id}, $1)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let statements = [
+            format!("SELECT id FROM tasks WHERE title IN ({placeholders}) LIMIT 0"),
+            format!("SELECT COUNT(*) AS count FROM tasks WHERE title IN ({placeholders}) LIMIT 0"),
+            format!(
+                "SELECT t.id FROM tasks AS t JOIN owners AS o ON t.id = o.task_id WHERE t.title IN ({placeholders}) LIMIT 0"
+            ),
+            format!("UPDATE tasks SET done = true WHERE title IN ({placeholders})"),
+            format!("DELETE FROM tasks WHERE title IN ({placeholders})"),
+            format!("INSERT INTO tasks (id, title) VALUES {insert_rows}"),
+        ];
+        let oversized = [json!("x".repeat(64 * 1024))];
+        let smaller = [json!("x".repeat(1024))];
+        for sql in statements {
+            let statement = PreparedStatement::parse(&sql).unwrap();
+            assert_eq!(statement.parameter_occurrences[0], 384);
+            assert_eq!(
+                crate::statement::parse(&sql, &oversized).unwrap_err().code,
+                "RESOURCE_LIMIT",
+                "direct: {sql}"
+            );
+            assert_eq!(
+                statement.bind(&oversized).unwrap_err().code,
+                "RESOURCE_LIMIT",
+                "prepared: {sql}"
+            );
+            // This cumulative amount would exceed the budget if accounting leaked between calls.
+            for _ in 0..48 {
+                statement.bind(&smaller).unwrap();
+            }
+            crate::statement::parse(&sql, &smaller).unwrap();
+        }
+    }
+
+    #[test]
+    fn parameter_occurrences_ignore_quoted_text_comments_and_unused_slots() {
+        let quoted = "$1 ".repeat(384);
+        let sql = format!(
+            "SELECT \"$9999\" FROM tasks WHERE title = $2 AND title <> '{quoted}' \
+             /* $0 /* $9999 */ $2 */ -- $9999"
+        );
+        let statement = PreparedStatement::parse(&sql).unwrap();
+        assert_eq!(&*statement.parameter_occurrences, &[0, 1]);
+        let params = [json!("x".repeat(64 * 1024)), json!("y".repeat(64 * 1024))];
+        crate::statement::parse(&sql, &params).unwrap();
+        statement.bind(&params).unwrap();
+
+        let sparse = PreparedStatement::parse("SELECT id FROM tasks WHERE id = $1024").unwrap();
+        assert_eq!(sparse.parameter_occurrences.len(), 1024);
+        assert_eq!(sparse.parameter_occurrences.iter().sum::<usize>(), 1);
+        assert!(sparse.retained_bytes() >= 1024 * size_of::<usize>());
+        let mut params = vec![Value::Null; 1024];
+        params[1023] = json!(1);
+        sparse.bind(&params).unwrap();
+        crate::statement::parse("SELECT id FROM tasks WHERE id = $1024", &params).unwrap();
+
+        for sql in [
+            "SELECT id FROM tasks WHERE id = $0",
+            "SELECT id FROM tasks WHERE id = $1025",
+        ] {
+            assert_eq!(
+                crate::statement::parse(sql, &params).unwrap_err().code,
+                "BIND_ERROR"
+            );
+        }
+        assert_eq!(
+            crate::statement::parse("SELECT id FROM tasks WHERE id = $2", &[json!(1)])
+                .unwrap_err()
+                .message,
+            "No value was provided for `$2`"
+        );
+    }
+
+    #[test]
+    fn expanded_binding_failures_preserve_committed_and_staged_rows() {
+        let mut engine = engine();
+        engine
+            .execute_sql("INSERT INTO tasks (id, title) VALUES (1, 'base')", &[])
+            .unwrap();
+        let placeholders = vec!["$1"; 384].join(", ");
+        let insert_rows = (10..394)
+            .map(|id| format!("({id}, $1)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let statements = [
+            format!("UPDATE tasks SET done = true WHERE title IN ({placeholders})"),
+            format!("DELETE FROM tasks WHERE title IN ({placeholders})"),
+            format!("INSERT INTO tasks (id, title) VALUES {insert_rows}"),
+        ]
+        .into_iter()
+        .map(|sql| {
+            let id = engine.prepare_sql(&sql).unwrap();
+            (sql, id)
+        })
+        .collect::<Vec<_>>();
+        let oversized = [json!("x".repeat(64 * 1024))];
+        for transaction in [false, true] {
+            if transaction {
+                engine.begin_transaction().unwrap();
+                engine
+                    .execute_sql("INSERT INTO tasks (id, title) VALUES (2, 'staged')", &[])
+                    .unwrap();
+            }
+            let before = engine
+                .query_sql("SELECT * FROM tasks ORDER BY id", &[])
+                .unwrap();
+            for (sql, id) in &statements {
+                assert_eq!(
+                    engine.execute_sql(sql, &oversized).unwrap_err().code,
+                    "RESOURCE_LIMIT"
+                );
+                assert_eq!(
+                    engine.execute_prepared(*id, &oversized).unwrap_err().code,
+                    "RESOURCE_LIMIT"
+                );
+                assert_eq!(
+                    engine
+                        .query_sql("SELECT * FROM tasks ORDER BY id", &[])
+                        .unwrap(),
+                    before
+                );
+                assert_eq!(engine.in_transaction(), transaction);
+            }
+            // Reusing an over-budget prepared handle with small bindings remains valid.
+            assert_eq!(
+                engine
+                    .execute_prepared(statements[0].1, &[json!("not present")])
+                    .unwrap()
+                    .row_count,
+                0
+            );
+            if transaction {
+                engine.commit_transaction().unwrap();
+            }
+        }
+        let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        assert_eq!(
+            reopened
+                .query_sql("SELECT id, title FROM tasks ORDER BY id", &[])
+                .unwrap()
+                .rows,
+            vec![
+                row(json!({"id": 1, "title": "base"})),
+                row(json!({"id": 2, "title": "staged"}))
+            ]
+        );
     }
 
     #[test]

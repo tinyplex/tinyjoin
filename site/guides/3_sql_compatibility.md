@@ -375,6 +375,7 @@ rather than growing without bound.
 | Complete paged row / individual encoded JSON value | 1,048,576 bytes |
 | JSON nesting | 64 levels |
 | SQL text / tokens / parameters | 64 KiB / 4,096 / 1,024 |
+| Expanded bound parameter values | 16 MiB per statement |
 | Open prepared statements / retained prepared state | 128 / 8 MiB per open database |
 | exec() script text / statements | 1 MiB / 256 |
 | exec() row, index, scan, and join operations | 1,000,000 across the script |
@@ -404,3 +405,10 @@ and by a runtime counter. The
 separator, and primary-key tuple together, not each component independently.
 An individual JSON value remains subject to the smaller budget for the row that
 contains it.
+
+Every occurrence of a parameter in a statement counts toward the expanded
+binding budget. Repeating one large `$1` value many times can therefore fail
+with `RESOURCE_LIMIT` even when the supplied parameter array is small. This
+check runs before the values are copied into the statement, including prepared
+executions and queries with `LIMIT 0`. It is an independent allocation bound,
+not a limit on the total memory used by the browser or WebAssembly instance.

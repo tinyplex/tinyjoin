@@ -5,7 +5,9 @@ import {
   PROTOCOL_VERSION,
   isRpcResult,
   isRpcResultHeader,
+  isSerializedError,
   isWorkerRequest,
+  type JsonValue,
   type WorkerRequest,
 } from '../../src/protocol.ts';
 import {FakeWorker} from '../helpers/fake-worker.ts';
@@ -281,6 +283,97 @@ describe('WorkerRpc', () => {
     ).toBe(false);
   });
 
+  it('validates shared JSON graphs without expanding every reference path', () => {
+    let shared: JsonValue = 1;
+    for (let depth = 0; depth < 60; depth += 1) {
+      shared = depth % 2 === 0 ? [shared, shared] : {left: shared, right: shared};
+    }
+    // Structured clone retains these sixty containers, rather than creating
+    // the exponentially larger JSON tree they represent.
+    const value = structuredClone(shared);
+    expect(isWorkerRequest(queryRequest([value]))).toBe(true);
+    expect(
+      isWorkerRequest({
+        ...queryRequest([]),
+        method: 'executePrepared',
+        params: {statementId: 1, params: [value]},
+      }),
+    ).toBe(true);
+    expect(isRpcResult('executeSql', jsonResult(value))).toBe(true);
+    expect(
+      isSerializedError({code: 'CUSTOM_ERROR', message: 'details', details: value}),
+    ).toBe(true);
+  });
+
+  it('keeps depth and cycle checks when cached JSON takes a longer path', () => {
+    const shared: JsonValue = {leaf: 1};
+    const nested = (depth: number): JsonValue => {
+      let value: JsonValue = shared;
+      for (let index = 0; index < depth; index += 1) {
+        value = [value];
+      }
+      return value;
+    };
+
+    for (const [depth, valid] of [[63, true], [64, false]] as const) {
+      const values = [shared, nested(depth)];
+      expect(isWorkerRequest(queryRequest(values))).toBe(valid);
+      expect(
+        isRpcResult('executeSql', {
+          ...sqlResult(0),
+          rows: [{shallow: shared}, {deep: values[1]}],
+        }),
+      ).toBe(valid);
+      expect(isRpcResult('execSql', values.map(jsonResult))).toBe(valid);
+    }
+
+    const cyclic: JsonValue[] = [];
+    cyclic.push(cyclic);
+    expect(isWorkerRequest(queryRequest([shared, cyclic]))).toBe(false);
+    expect(isRpcResult('executeSql', jsonResult(cyclic))).toBe(false);
+    expect(
+      isSerializedError({code: 'CUSTOM_ERROR', message: 'cycle', details: cyclic}),
+    ).toBe(false);
+    const sparse = new Array<JsonValue>(1);
+    expect(isWorkerRequest(queryRequest([sparse]))).toBe(false);
+    expect(isRpcResult('executeSql', jsonResult(sparse))).toBe(false);
+  });
+
+  it('shares one JSON work budget across parameters, rows, and script results', () => {
+    const first = new Array<JsonValue>(600_000).fill(null);
+    const second = new Array<JsonValue>(600_000).fill(null);
+    expect(isWorkerRequest(queryRequest([first]))).toBe(true);
+    expect(isRpcResult('executeSql', jsonResult(first))).toBe(true);
+    expect(isWorkerRequest(queryRequest([first, second]))).toBe(false);
+    expect(
+      isRpcResult('executeSql', {
+        ...sqlResult(0),
+        rows: [{payload: first}, {payload: second}],
+      }),
+    ).toBe(false);
+    expect(
+      isRpcResult('execSql', [jsonResult(first), jsonResult(second)]),
+    ).toBe(false);
+    expect(
+      isSerializedError({
+        code: 'CUSTOM_ERROR',
+        message: 'large',
+        details: [first, second],
+      }),
+    ).toBe(false);
+    // Independent messages receive independent budgets.
+    expect(isWorkerRequest(queryRequest([second]))).toBe(true);
+  });
+
+  it('also bounds repeated non-JSON result metadata within a script response', () => {
+    const result = {
+      ...sqlResult(0),
+      fields: new Array(600_000).fill({name: 'id', dataTypeID: 20}),
+    };
+    expect(isRpcResult('executeSql', result)).toBe(true);
+    expect(isRpcResult('execSql', [result, result])).toBe(false);
+  });
+
   it('rejects every pending request after a protocol mismatch', async () => {
     const worker = new FakeWorker();
     const rpc = createWorkerRpc(worker);
@@ -314,5 +407,23 @@ function sqlResult(revision: number, rows: Array<{id: number}> = []) {
     rowCount: rows.length,
     rows,
     tables: [],
+  };
+}
+
+function queryRequest(params: JsonValue[]): WorkerRequest {
+  return {
+    v: PROTOCOL_VERSION,
+    id: 1,
+    method: 'executeSql',
+    params: {sql: 'SELECT id FROM posts WHERE id = $1', params},
+  };
+}
+
+function jsonResult(value: JsonValue) {
+  return {
+    ...sqlResult(0),
+    fields: [{name: 'payload', dataTypeID: 114}],
+    rowCount: 1,
+    rows: [{payload: value}],
   };
 }
