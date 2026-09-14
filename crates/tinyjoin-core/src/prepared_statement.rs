@@ -38,7 +38,7 @@ impl PreparedStatement {
         let params = (1..=layout.parameter_count)
             .map(prepared_parameter_marker)
             .collect::<Vec<_>>();
-        let statement = crate::statement::parse(sql, &params)?;
+        let statement = crate::statement::parse_prepared(sql, &params)?;
         if matches!(
             statement,
             Statement::Write(
@@ -360,6 +360,119 @@ mod tests {
                 PreparedStatement::parse(sql).unwrap_err().code,
                 "BIND_ERROR"
             );
+        }
+    }
+
+    #[test]
+    fn pagination_rejects_caller_objects_in_every_select_family() {
+        let mut engine = engine();
+        engine.exec_sql("INSERT INTO tasks (id, title) VALUES (1, 'one'), (2, 'two'); INSERT INTO owners VALUES (1, 1, 'owner')").unwrap();
+        let queries = [
+            "SELECT id FROM tasks WHERE id >= $1 ORDER BY id",
+            "SELECT id, COUNT(*) AS count FROM tasks WHERE id >= $1 GROUP BY id ORDER BY id",
+            "SELECT t.id FROM tasks t JOIN owners o ON t.id = o.task_id WHERE t.id >= $1 ORDER BY t.id",
+        ];
+        for query in queries {
+            for clause in ["LIMIT", "OFFSET"] {
+                let sql = format!("{query} {clause} $1");
+                let statement = engine.prepare_sql(&sql).unwrap();
+                for transaction in [false, true] {
+                    if transaction {
+                        engine.begin_transaction().unwrap();
+                    }
+                    let before = engine.revision();
+                    for invalid in [
+                        json!({"plain": 1}),
+                        prepared_parameter_marker(1),
+                        json!([]),
+                        json!(null),
+                        json!(true),
+                        json!(-1),
+                        json!(1.5),
+                    ] {
+                        assert_eq!(
+                            engine
+                                .execute_sql(&sql, std::slice::from_ref(&invalid))
+                                .unwrap_err()
+                                .code,
+                            "INVALID_QUERY",
+                            "direct: {sql}"
+                        );
+                        assert_eq!(
+                            engine
+                                .execute_prepared(statement, &[invalid])
+                                .unwrap_err()
+                                .code,
+                            "INVALID_QUERY",
+                            "prepared: {sql}"
+                        );
+                    }
+                    // The pagination parameter is also used in WHERE. Its template
+                    // placeholder must be bound afresh in both positions on every reuse.
+                    for valid in [0, 1, 2] {
+                        assert_eq!(
+                            engine.execute_sql(&sql, &[json!(valid)]).unwrap(),
+                            engine.execute_prepared(statement, &[json!(valid)]).unwrap()
+                        );
+                    }
+                    assert_eq!(engine.revision(), before);
+                    if transaction {
+                        engine.rollback_transaction().unwrap();
+                    }
+                }
+                engine.close_prepared(statement).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_projection_names_fail_before_reads_or_writes() {
+        for populated in [false, true] {
+            let mut engine = engine();
+            if populated {
+                engine
+                    .execute_sql("INSERT INTO tasks (id, title) VALUES (1, 'one')", &[])
+                    .unwrap();
+            }
+            for transaction in [false, true] {
+                if transaction {
+                    engine.begin_transaction().unwrap();
+                }
+                let before = engine
+                    .query_sql("SELECT * FROM tasks ORDER BY id", &[])
+                    .unwrap();
+                for sql in [
+                    "SELECT id, id FROM tasks",
+                    "SELECT ID, id FROM tasks LIMIT 0",
+                    "SELECT id, id FROM tasks WHERE id = 99",
+                    "SELECT id, id FROM tasks ORDER BY id",
+                    "INSERT INTO tasks (id, title) VALUES (2, 'two') RETURNING id, id",
+                    "UPDATE tasks SET title = 'changed' RETURNING id, id",
+                    "DELETE FROM tasks RETURNING id, id",
+                ] {
+                    let statement = engine.prepare_sql(sql).unwrap();
+                    assert_eq!(
+                        engine.execute_sql(sql, &[]).unwrap_err().code,
+                        "INVALID_QUERY",
+                        "direct: {sql}"
+                    );
+                    assert_eq!(
+                        engine.execute_prepared(statement, &[]).unwrap_err().code,
+                        "INVALID_QUERY",
+                        "prepared: {sql}"
+                    );
+                    assert_eq!(
+                        engine
+                            .query_sql("SELECT * FROM tasks ORDER BY id", &[])
+                            .unwrap(),
+                        before
+                    );
+                    engine.close_prepared(statement).unwrap();
+                }
+                if transaction {
+                    engine.rollback_transaction().unwrap();
+                }
+            }
         }
     }
 

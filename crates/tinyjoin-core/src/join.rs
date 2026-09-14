@@ -5,8 +5,8 @@ use std::str::FromStr;
 use serde_json::{Map, Number, Value};
 
 use crate::query::{
-    Token, bind_parameter, is_reserved_keyword, matches_predicate, parse_predicate_at, tokenize,
-    validate_parameter_expansion, validate_sql_input,
+    ParseMode, Token, bind_parameter, is_reserved_keyword, matches_predicate, pagination_value,
+    parse_predicate_at, tokenize, validate_parameter_expansion, validate_sql_input,
 };
 use crate::storage::StorageReader;
 use crate::{
@@ -129,11 +129,20 @@ pub(crate) fn is_join_select(tokens: &[Token]) -> bool {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn parse_sql(sql: &str, params: &[Value]) -> Result<JoinPlan> {
+    parse_sql_with_mode(sql, params, ParseMode::Bound)
+}
+
+pub(crate) fn parse_sql_with_mode(
+    sql: &str,
+    params: &[Value],
+    mode: ParseMode,
+) -> Result<JoinPlan> {
     validate_sql_input(sql, params)?;
     let tokens = tokenize(sql)?;
     validate_parameter_expansion(&tokens, params)?;
-    Parser::new(tokens, params).parse()
+    Parser::new(tokens, params, mode).parse()
 }
 
 pub(crate) fn bind_plan_parameters(
@@ -1085,14 +1094,16 @@ struct Parser<'a> {
     tokens: Vec<Token>,
     position: usize,
     params: &'a [Value],
+    mode: ParseMode,
 }
 
 impl<'a> Parser<'a> {
-    fn new(tokens: Vec<Token>, params: &'a [Value]) -> Self {
+    fn new(tokens: Vec<Token>, params: &'a [Value], mode: ParseMode) -> Self {
         Self {
             tokens,
             position: 0,
             params,
+            mode,
         }
     }
 
@@ -1346,13 +1357,7 @@ impl<'a> Parser<'a> {
                 ));
             }
         };
-        if crate::query::prepared_parameter_index(&value).is_some() {
-            return Ok(0);
-        }
-        value
-            .as_u64()
-            .and_then(|value| usize::try_from(value).ok())
-            .ok_or_else(|| EngineError::invalid_query("LIMIT or OFFSET is too large"))
+        pagination_value(&value, self.mode)
     }
 
     fn parse_identifier(&mut self) -> Result<String> {

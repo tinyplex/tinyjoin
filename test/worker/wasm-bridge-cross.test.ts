@@ -95,6 +95,136 @@ const runIfArtifactExists =
     : describe.skip;
 
 runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
+  it('rejects duplicate projections independently of matching rows', async () => {
+    const wasm = await loadStructuredModule();
+    const {engine} = createRecordingEngine(wasm, new MemoryPageDevice());
+    try {
+      engine.execSql('CREATE TABLE items (id INTEGER PRIMARY KEY)');
+      const queries = [
+        'SELECT id, id FROM items',
+        'SELECT id, id FROM items WHERE id = 99',
+        'SELECT id, id FROM items ORDER BY id',
+        'SELECT id, id FROM items LIMIT 0',
+      ];
+      const prepared = queries.map(sql => engine.prepareSql(sql));
+      for (const populated of [false, true]) {
+        if (populated) {
+          engine.executeSql('INSERT INTO items VALUES (1)', []);
+        }
+        const revision = engine.revision();
+        for (const [index, sql] of queries.entries()) {
+          expect(
+            captureError(() => engine.executeSql(sql, [])),
+            sql,
+          ).toMatchObject({code: 'INVALID_QUERY'});
+          expect(
+            captureError(() => engine.executePrepared(prepared[index]!, [])),
+            sql,
+          ).toMatchObject({code: 'INVALID_QUERY'});
+        }
+        expect(engine.revision()).toBe(revision);
+        expect(engine.executeSql('SELECT id FROM items', []).rows).toEqual(
+          populated ? [{id: 1}] : [],
+        );
+      }
+    } finally {
+      engine.close();
+    }
+  });
+
+  it('rejects duplicate RETURNING columns before changing durable or staged rows', async () => {
+    const wasm = await loadStructuredModule();
+    const {engine} = createRecordingEngine(wasm, new MemoryPageDevice());
+    try {
+      engine.execSql(
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, title TEXT); INSERT INTO items VALUES (1, 'original')",
+      );
+      const statements = [
+        "INSERT INTO items VALUES (2, 'new') RETURNING id, id",
+        "UPDATE items SET title = 'changed' WHERE id = 1 RETURNING id, id",
+        "UPDATE items SET title = 'changed' WHERE id = 99 RETURNING id, id",
+        'DELETE FROM items WHERE id = 1 RETURNING id, id',
+        'DELETE FROM items WHERE id = 99 RETURNING id, id',
+      ];
+      const prepared = statements.map(sql => engine.prepareSql(sql));
+      const revision = engine.revision();
+      for (const inTransaction of [false, true]) {
+        if (inTransaction) engine.beginTransaction();
+        for (const [index, sql] of statements.entries()) {
+          for (const run of [
+            () => engine.executeSql(sql, []),
+            () => engine.executePrepared(prepared[index]!, []),
+          ]) {
+            expect(captureError(run), sql).toMatchObject({code: 'INVALID_QUERY'});
+            expect(engine.executeSql('SELECT * FROM items', []).rows).toEqual([
+              {id: 1, title: 'original'},
+            ]);
+          }
+        }
+        if (inTransaction) engine.commitTransaction();
+        expect(engine.revision()).toBe(revision);
+      }
+    } finally {
+      engine.close();
+    }
+  });
+
+  it('rejects JSON pagination values without confusing prepared markers with user data', async () => {
+    const wasm = await loadStructuredModule();
+    const {engine} = createRecordingEngine(wasm, new MemoryPageDevice());
+    try {
+      engine.execSql('CREATE TABLE items (id INTEGER PRIMARY KEY, payload JSON)');
+      const marker = {['\0tinyjoin:parameter']: 1} satisfies JsonValue;
+      const insert = engine.prepareSql('INSERT INTO items VALUES ($1, $2)');
+      engine.executeSql('INSERT INTO items VALUES ($1, $2)', [1, marker]);
+      engine.executePrepared(insert, [2, marker]);
+      const selects = [
+        {sql: 'SELECT id FROM items ORDER BY id', rows: [{id: 1}, {id: 2}]},
+        {
+          sql: 'SELECT id, COUNT(*) AS count FROM items GROUP BY id ORDER BY id',
+          rows: [{id: 1, count: 1}, {id: 2, count: 1}],
+        },
+        {
+          sql: 'SELECT a.id AS id FROM items a JOIN items b ON a.id = b.id ORDER BY id',
+          rows: [{id: 1}, {id: 2}],
+        },
+      ];
+      const revision = engine.revision();
+      for (const {sql: select, rows} of selects) {
+        for (const clause of ['LIMIT', 'OFFSET']) {
+          const sql = `${select} ${clause} $1`;
+          const statement = engine.prepareSql(sql);
+          const expected = clause === 'LIMIT' ? rows.slice(0, 1) : rows.slice(1);
+          for (const value of [{ordinary: true}, marker]) {
+            expect(
+              captureError(() => engine.executeSql(sql, [value])),
+              sql,
+            ).toMatchObject({code: 'INVALID_QUERY'});
+            expect(
+              captureError(() => engine.executePrepared(statement, [value])),
+              sql,
+            ).toMatchObject({code: 'INVALID_QUERY'});
+            expect(engine.executeSql(sql, [1]).rows, sql).toEqual(expected);
+            expect(engine.executePrepared(statement, [1]).rows, sql).toEqual(expected);
+          }
+          expect(engine.executePrepared(statement, [0]).rows, sql).toEqual(
+            clause === 'LIMIT' ? [] : rows,
+          );
+        }
+      }
+      const jsonQuery = 'SELECT id, payload FROM items WHERE payload = $1 ORDER BY id';
+      const jsonStatement = engine.prepareSql(jsonQuery);
+      const expected = [{id: 1, payload: marker}, {id: 2, payload: marker}];
+      expect(engine.executeSql(jsonQuery, [marker]).rows).toEqual(expected);
+      expect(engine.executePrepared(jsonStatement, [marker]).rows).toEqual(expected);
+      expect(engine.executePrepared(jsonStatement, [{ordinary: true}]).rows).toEqual([]);
+      expect(engine.executePrepared(jsonStatement, [marker]).rows).toEqual(expected);
+      expect(engine.revision()).toBe(revision);
+    } finally {
+      engine.close();
+    }
+  });
+
   it('executes selective three-table joins whose actual work fits the budget', async () => {
     const wasm = await loadStructuredModule();
     const {engine} = createRecordingEngine(wasm, new MemoryPageDevice());

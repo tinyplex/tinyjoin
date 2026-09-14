@@ -155,7 +155,7 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 
 | Keyword or form | Status | TinyJoin form and boundary |
 | --- | --- | --- |
-| `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or a left-deep join over two to eight typed table sources. A simple projection is `*` or plain column names. There is no `SELECT` without `FROM`. |
+| `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or a left-deep join over two to eight typed table sources. A simple projection is `*` or distinct plain column names. Duplicate output names return `INVALID_QUERY`, including for empty results and `LIMIT 0`. There is no `SELECT` without `FROM`. |
 | `WHERE` | Supported | Predicates described below, with SQL three-valued null logic. |
 | `ORDER BY` | Narrow | Up to 32 plain columns for simple queries, projected output names for grouped/aggregate queries, and projected output names or qualified/unambiguous source columns for joins; `ASC`/`DESC` and `NULLS FIRST`/`LAST`. JSON values cannot be ordered. |
 | `LIMIT`, `OFFSET` | Supported | Non-negative integer literal or `$n` parameter. `LIMIT` is at most 100,000; `OFFSET` and `OFFSET + LIMIT` are at most 4,294,967,295. `OFFSET` may appear alone; when both occur, `LIMIT` must precede `OFFSET`. |
@@ -179,7 +179,7 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 | `INSERT ... SELECT`, `ON CONFLICT`, `MERGE` | No | No query-sourced insert, upsert clause, or merge statement. |
 | `UPDATE ... SET ... [WHERE ...]` | Narrow | Assigns literals, parameters, or `DEFAULT`; optional `RETURNING`. No expressions or `UPDATE ... FROM`. |
 | `DELETE FROM ... [WHERE ...]` | Narrow | Optional `RETURNING`. No `DELETE ... USING`. |
-| `RETURNING` | Narrow | `*` or a list of plain columns; no expressions or aliases. |
+| `RETURNING` | Narrow | `*` or a list of distinct plain columns; no expressions or aliases. Duplicate names return `INVALID_QUERY` before any rows are changed, even when no rows match. |
 | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT` | No | Use the JavaScript callback transaction API. |
 | `PREPARE`, `EXECUTE`, `DEALLOCATE` | No | SQL-level named statements are not implemented. Use the session-local JavaScript prepare() handle and its execute()/close() methods. |
 | `COPY`, `TRUNCATE`, `EXPLAIN`, `VACUUM`, `ANALYZE` | No | No server maintenance or bulk-file SQL commands. |

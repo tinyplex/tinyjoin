@@ -35,6 +35,11 @@ Selective multi-table joins now use their actual comparison count rather than
 a worst-case Cartesian estimate. Scan, build-row, result, memory, and shared
 script-work limits remain in force.
 
+Duplicate output names in simple projections and `RETURNING` now fail
+consistently with `INVALID_QUERY` before execution. `LIMIT` and `OFFSET`
+reject nonnumeric parameter values consistently in ordinary, aggregate, and
+join queries, including JSON objects shaped like internal prepared placeholders.
+
 ## v0.0.5
 
 This release establishes TinyJoin as a standalone, SQL-first browser database

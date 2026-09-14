@@ -6,9 +6,9 @@ use serde_json::{Map, Number, Value};
 #[cfg(test)]
 use crate::StorageDriver;
 use crate::query::{
-    Token, bind_parameter, is_reserved_keyword, matches_predicate, parse_predicate_at, tokenize,
-    validate_parameter_expansion, validate_predicate_columns, validate_predicate_types,
-    validate_sql_input,
+    ParseMode, Token, bind_parameter, is_reserved_keyword, matches_predicate, parse_predicate_at,
+    tokenize, validate_named_columns, validate_parameter_expansion, validate_predicate_columns,
+    validate_predicate_types, validate_sql_input,
 };
 use crate::storage::{
     estimated_row_bytes, estimated_value_bytes, normalize_row, row_key, schema_with_added_column,
@@ -98,6 +98,14 @@ pub(crate) struct PlannedDml {
 }
 
 pub(crate) fn parse(sql: &str, params: &[Value]) -> Result<Statement> {
+    parse_with_mode(sql, params, ParseMode::Bound)
+}
+
+pub(crate) fn parse_prepared(sql: &str, params: &[Value]) -> Result<Statement> {
+    parse_with_mode(sql, params, ParseMode::Template)
+}
+
+fn parse_with_mode(sql: &str, params: &[Value], mode: ParseMode) -> Result<Statement> {
     validate_sql_input(sql, params)?;
     let tokens = tokenize(sql)?;
     if matches!(
@@ -108,12 +116,13 @@ pub(crate) fn parse(sql: &str, params: &[Value]) -> Result<Statement> {
         }) if value.eq_ignore_ascii_case("select")
     ) {
         if crate::join::is_join_select(&tokens) {
-            return crate::join::parse_sql(sql, params).map(Statement::Join);
+            return crate::join::parse_sql_with_mode(sql, params, mode).map(Statement::Join);
         }
         if crate::aggregate::is_aggregate_select(&tokens) {
-            return crate::aggregate::parse_sql(sql, params).map(Statement::Aggregate);
+            return crate::aggregate::parse_sql_with_mode(sql, params, mode)
+                .map(Statement::Aggregate);
         }
-        return crate::query::parse_sql(sql, params).map(Statement::Select);
+        return crate::query::parse_sql_with_mode(sql, params, mode).map(Statement::Select);
     }
     validate_parameter_expansion(&tokens, params)?;
     MutationParser::new(tokens, params)
@@ -797,36 +806,9 @@ fn plan_delete(
     })
 }
 
-fn validate_named_columns(schema: &TableDefinition, columns: &[String]) -> Result<()> {
-    let mut names = HashSet::with_capacity(columns.len());
-    for column in columns {
-        if !names.insert(column) {
-            return Err(EngineError::invalid_query(format!(
-                "Column `{column}` is named more than once"
-            )));
-        }
-        if !schema
-            .columns
-            .iter()
-            .any(|definition| definition.name == *column)
-        {
-            return Err(EngineError::column_not_found(column, &schema.name));
-        }
-    }
-    Ok(())
-}
-
 fn validate_projection(schema: &TableDefinition, returning: Option<&[String]>) -> Result<()> {
     if let Some(columns) = returning {
-        for column in columns {
-            if !schema
-                .columns
-                .iter()
-                .any(|definition| definition.name == *column)
-            {
-                return Err(EngineError::column_not_found(column, &schema.name));
-            }
-        }
+        validate_named_columns(schema, columns)?;
     }
     Ok(())
 }

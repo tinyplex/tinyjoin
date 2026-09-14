@@ -12,15 +12,25 @@ Remediation was completed in the seven-summary-concern order below, with focused
 | 6. Practical join scope | Selective chains run within actual work bounds; removed Cartesian estimate while preserving comparison, scan, build, memory and script limits | 265 Rust tests with true exhaustion and script rollback; four real-WASM contracts including three 100-row sources; docs and size gates |
 | 7. Documentation/site | Fixed section navigation, mobile discovery, transaction demos, recovery/lifecycle guidance, and complete agent reference; starter reopens after cached-page restoration | 12 browser checks against the static documentation build; 8 starter browser checks; 302 HTML files checked for links; generated-reference freshness; desktop/mobile visual review |
 
-Final validation passed: the complete release gate (265 Rust tests, 105
-TypeScript tests, four real-WASM contracts, eight runtime Chromium checks,
+The subsequent SQL correctness pass also closes the two smaller defects in
+item 15: duplicate simple projections now return `INVALID_QUERY` for every row
+state, and caller JSON objects cannot act as internal pagination placeholders.
+The same duplicate-name rule applies to `RETURNING` before any mutation is
+staged. Two native regressions and three real-WASM regressions cover ordinary
+and prepared execution, empty and populated results, transactional write
+safety, all three SELECT families, and marker-shaped JSON remaining data.
+The regressions failed against the previous implementation and pass with the
+fixes. The SQL contract and release notes describe the resulting behavior.
+
+Final validation passed: the complete release gate (267 Rust tests, 105
+TypeScript tests, seven real-WASM contracts, eight runtime Chromium checks,
 documentation checks, and packed-package consumers), Clippy with warnings
 denied, and third-party notice verification. The starter passed 17 CLI tests,
 four generated JavaScript/TypeScript and memory/OPFS builds against the local
 0.0.6 tarball, typecheck, spelling, and its eight Chromium scenarios. The final
 static documentation browser suite also passed independently. The complete
-runtime is 293,723 bytes gzip (286.8 KiB); the WASM itself is 738,959 bytes raw
-and 277,804 bytes gzip. These results do not extend the Chromium-only claim.
+runtime is 293,384 bytes gzip (286.5 KiB); the WASM itself is 738,352 bytes raw
+and 277,465 bytes gzip. These results do not extend the Chromium-only claim.
 
 The release candidates remain local: TinyJoin 0.0.6 and create-tinyjoin 0.0.7
 have not been published, pushed, or deployed by this remediation. Publication

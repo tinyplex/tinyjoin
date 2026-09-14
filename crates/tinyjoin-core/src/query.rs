@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::str::FromStr;
 
 use serde_json::{Map, Number, Value};
@@ -64,17 +65,7 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &SelectPlan) -> Result<
     }
 
     let schema = storage.table_schema(&plan.table)?;
-    if let Some(columns) = &plan.columns {
-        for column in columns {
-            if !schema
-                .columns
-                .iter()
-                .any(|definition| definition.name == *column)
-            {
-                return Err(EngineError::column_not_found(column, &plan.table));
-            }
-        }
-    }
+    let fields = projection_fields(&schema, plan.columns.as_deref())?;
     if let Some(predicate) = &plan.predicate {
         validate_predicate_columns(predicate, &schema, &plan.table)?;
         validate_predicate_types(predicate, &schema, &plan.table)?;
@@ -92,7 +83,7 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &SelectPlan) -> Result<
     if plan.limit == Some(0) {
         return Ok(QueryResult {
             revision: storage.revision(),
-            fields: projection_fields(&schema, plan.columns.as_deref())?,
+            fields,
             rows: Vec::new(),
         });
     }
@@ -105,7 +96,7 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &SelectPlan) -> Result<
 
     Ok(QueryResult {
         revision: storage.revision(),
-        fields: projection_fields(&schema, plan.columns.as_deref())?,
+        fields,
         rows,
     })
 }
@@ -115,19 +106,35 @@ pub(crate) fn projection_fields(
     columns: Option<&[String]>,
 ) -> Result<Vec<ResultField>> {
     match columns {
-        Some(columns) => columns
-            .iter()
-            .map(|name| {
-                column_definition(schema, name, &schema.name)
-                    .map(|definition| ResultField::new(name, definition.data_type))
-            })
-            .collect(),
+        Some(columns) => {
+            validate_named_columns(schema, columns)?;
+            columns
+                .iter()
+                .map(|name| {
+                    column_definition(schema, name, &schema.name)
+                        .map(|definition| ResultField::new(name, definition.data_type))
+                })
+                .collect()
+        }
         None => Ok(schema
             .columns
             .iter()
             .map(|definition| ResultField::new(&definition.name, definition.data_type))
             .collect()),
     }
+}
+
+pub(crate) fn validate_named_columns(schema: &TableDefinition, columns: &[String]) -> Result<()> {
+    let mut names = HashSet::with_capacity(columns.len());
+    for column in columns {
+        if !names.insert(column) {
+            return Err(EngineError::invalid_query(format!(
+                "Column `{column}` is named more than once"
+            )));
+        }
+        column_definition(schema, column, &schema.name)?;
+    }
+    Ok(())
 }
 
 fn execute_unordered(
@@ -297,13 +304,10 @@ fn projected_row_bytes(row: &Row, columns: Option<&[String]>, table: &str) -> Re
         return owned_row_bytes(row);
     };
     let mut bytes = 32_usize;
-    for (index, column) in columns.iter().enumerate() {
+    for column in columns {
         let value = row
             .get(column)
             .ok_or_else(|| EngineError::column_not_found(column, table))?;
-        if columns[..index].contains(column) {
-            return Err(EngineError::column_not_found(column, table));
-        }
         bytes = checked_result_add(bytes, 64)?;
         bytes = checked_result_add(bytes, checked_result_mul(column.len(), 2)?)?;
         bytes = checked_result_add(bytes, checked_result_mul(owned_value_bytes(value)?, 2)?)?;
@@ -344,11 +348,26 @@ fn result_bytes_limit_exceeded() -> EngineError {
     )
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ParseMode {
+    Bound,
+    Template,
+}
+
+#[cfg(test)]
 pub(crate) fn parse_sql(sql: &str, params: &[Value]) -> Result<SelectPlan> {
+    parse_sql_with_mode(sql, params, ParseMode::Bound)
+}
+
+pub(crate) fn parse_sql_with_mode(
+    sql: &str,
+    params: &[Value],
+    mode: ParseMode,
+) -> Result<SelectPlan> {
     validate_sql_input(sql, params)?;
     let tokens = tokenize(sql)?;
     validate_parameter_expansion(&tokens, params)?;
-    SqlParser::new(tokens, params).parse()
+    SqlParser::new(tokens, params, mode).parse()
 }
 
 pub(crate) fn validate_sql_input(sql: &str, params: &[Value]) -> Result<()> {
@@ -740,14 +759,16 @@ struct SqlParser<'a> {
     tokens: Vec<Token>,
     position: usize,
     params: &'a [Value],
+    mode: ParseMode,
 }
 
 impl<'a> SqlParser<'a> {
-    fn new(tokens: Vec<Token>, params: &'a [Value]) -> Self {
+    fn new(tokens: Vec<Token>, params: &'a [Value], mode: ParseMode) -> Self {
         Self {
             tokens,
             position: 0,
             params,
+            mode,
         }
     }
 
@@ -880,18 +901,7 @@ impl<'a> SqlParser<'a> {
 
     fn parse_limit(&mut self) -> Result<usize> {
         let value = self.parse_value()?;
-        if prepared_parameter_index(&value).is_some() {
-            return Ok(0);
-        }
-        let Value::Number(number) = value else {
-            return Err(EngineError::invalid_query(
-                "LIMIT must be a non-negative integer",
-            ));
-        };
-        number
-            .as_u64()
-            .and_then(|number| usize::try_from(number).ok())
-            .ok_or_else(|| EngineError::invalid_query("LIMIT is too large"))
+        pagination_value(&value, self.mode)
     }
 
     fn parse_value(&mut self) -> Result<Value> {
@@ -1434,9 +1444,20 @@ pub(crate) fn bind_prepared_value(value: &mut Value, params: &[Value]) -> Result
 }
 
 pub(crate) fn bind_nonnegative_integer_parameter(index: usize, params: &[Value]) -> Result<usize> {
-    params
-        .get(index - 1)
-        .and_then(Value::as_u64)
+    let value = params.get(index - 1).ok_or_else(|| {
+        EngineError::invalid_query("LIMIT and OFFSET must be non-negative integers")
+    })?;
+    pagination_value(value, ParseMode::Bound)
+}
+
+pub(crate) fn pagination_value(value: &Value, mode: ParseMode) -> Result<usize> {
+    // Only the internal prepare path supplies template markers. A caller's JSON
+    // object with the same shape is still data and cannot stand in for an integer.
+    if mode == ParseMode::Template && prepared_parameter_index(value).is_some() {
+        return Ok(0);
+    }
+    value
+        .as_u64()
         .and_then(|value| usize::try_from(value).ok())
         .ok_or_else(|| EngineError::invalid_query("LIMIT and OFFSET must be non-negative integers"))
 }
