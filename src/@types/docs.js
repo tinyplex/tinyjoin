@@ -37,6 +37,8 @@
  *
  * Use `memory://` for an ephemeral database, or `opfs://name` for a persistent
  * database. Calling create without a data directory also uses memory.
+ * Only one Client can hold an OPFS name at a time, including across tabs.
+ * Different names have independent data and do not synchronize.
  * @category Configuration
  * @since v0.0.5
  */
@@ -51,6 +53,9 @@
 
 /**
  * The QueryOptions interface configures the shape of query results.
+ *
+ * Only rowMode is supported. There is no AbortSignal or timeout option;
+ * Promise.race with a timer does not cancel database work.
  * @category Query results
  * @since v0.0.5
  */
@@ -181,6 +186,8 @@
 
   /**
    * The retryable property indicates whether reopening or retrying may succeed.
+   * It does not guarantee that replaying a write is safe or that the current
+   * Client remains usable. Reconcile uncertain writes after reopening.
    * @category Error
    * @since v0.0.5
    */
@@ -374,6 +381,8 @@
  *
  * Do not retain this object after its callback completes. Run schema DDL in a
  * standalone Client.query call or Client.exec script.
+ * Pass this object to helpers instead of awaiting another transaction on the
+ * same Client, which would queue behind the active callback and deadlock.
  * @category Transactions
  * @since v0.0.5
  */
@@ -508,6 +517,18 @@
   /**
    * The transaction method stages row mutations and publishes them together
    * when the callback succeeds, unless it explicitly rolls back.
+   *
+   * Transaction calls on this Client queue in order. Do not await another transaction on
+   * this Client inside the callback; pass its Transaction to helpers instead.
+   * Use that object for all SQL in the callback and prepare handles beforehand.
+   * An uncaught callback error before commit discards staged work. A caught
+   * statement error leaves earlier writes staged unless rollback is called.
+   *
+   * There is no cancellation or timeout option. Promise.race only stops
+   * waiting, and queued work can still commit. Rejection during commit can
+   * leave its outcome uncertain; see the
+   * [recovery guide](/guides/storage-and-lifecycle/#recovering-after-an-uncertain-write)
+   * before replaying a failed write.
    * @category Transactions
    * @essential Using a database
    * @since v0.0.5
@@ -533,6 +554,9 @@
   /**
    * The close method releases prepared statements, storage, and the Worker.
    * Repeated calls share the same asynchronous cleanup.
+   * A closed Client cannot resume; create a new one and recreate its prepared
+   * statements and subscriptions. Closing is not a cancellation or rollback
+   * guarantee for a write already in flight.
    * @category Lifecycle
    * @since v0.0.5
    */
@@ -567,6 +591,13 @@
 /**
  * The ClientError class extends JavaScript Error with a validated error
  * returned by the TinyJoin Worker.
+ *
+ * RECOVERY_REQUIRED, STORAGE_COMMIT_OUTCOME_UNKNOWN, and
+ * STORAGE_ENGINE_POISONED mean the engine must no longer be used. Stop work,
+ * close the Client, reopen the same OPFS name, and reconcile stored state
+ * using stable operation identifiers before replaying a write. A rejected
+ * operation may already have committed. See the
+ * [recovery guide](/guides/storage-and-lifecycle/#recovering-after-an-uncertain-write).
  * @category Errors
  * @since v0.0.5
  */
@@ -595,6 +626,8 @@
 
   /**
    * The retryable property indicates whether reopening or retrying may succeed.
+   * It is not a safe-replay guarantee. An uncertain write requires reopening
+   * and reconciliation even when application code wants to retry it.
    * @category Error
    * @since v0.0.5
    */

@@ -57,6 +57,10 @@ TinyJoin does not coordinate tabs. It uses no `SharedWorker`,
 [subscription](/guides/transactions-and-changes/) only reports changes made
 through its own Client.
 
+The same restriction applies to two Clients in one page. Different OPFS names
+can open at the same time, but each has independent data; they provide no
+shared view or synchronization.
+
 An application that needs a real multi-tab story has to build one:
 
 - Catch the open failure and tell the user the application is already open in
@@ -78,6 +82,12 @@ them. Test the browsers an application actually targets.
 There is also no fallback to IndexedDB or memory when persistent storage is
 unavailable, locked, corrupt, or out of quota. create() rejects instead.
 
+TinyJoin does not automatically restore a Client closed during page teardown.
+If the browser restores that page from its back/forward cache, the application
+must reopen its Client and recreate statements and subscriptions, or reload
+the page. The [lifecycle guide](/guides/storage-and-lifecycle/#opening-and-closing)
+describes this boundary.
+
 ## Browser storage is not durable storage
 
 OPFS is browser-managed. A user can clear it, and a browser may evict
@@ -87,6 +97,23 @@ during startup.
 
 Treat a TinyJoin database as reconstructable local state. Data that has to
 survive needs a copy the application controls.
+
+A storage or commit-result failure can leave a write's outcome uncertain.
+`RECOVERY_REQUIRED`, `STORAGE_COMMIT_OUTCOME_UNKNOWN`, and
+`STORAGE_ENGINE_POISONED` require closing and reopening the Client. Reconcile
+the recovered rows with stable operation identifiers before any replay;
+`retryable` does not guarantee that replay is safe. The
+[recovery guide](/guides/storage-and-lifecycle/#recovering-after-an-uncertain-write)
+explains how to preserve that distinction.
+
+## Transactions need bounded callbacks
+
+Nested callback transactions are unsupported: awaiting another transaction()
+on the same Client inside its callback deadlocks. Pass the active Transaction
+to helpers. There is no AbortSignal or built-in timeout; Promise.race() stops
+waiting without cancelling work, which can still commit. Read the
+[transaction guide](/guides/transactions-and-changes/#composing-transaction-helpers)
+before composing asynchronous application work.
 
 ## There is no server, and no sync
 

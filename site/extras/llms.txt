@@ -4,10 +4,13 @@
 > dedicated browser Worker and stores data in memory or OPFS.
 
 - [Getting started](https://tinyjoin.org/guides/getting-started/)
+- [Storage, lifecycle, and recovery](https://tinyjoin.org/guides/storage-and-lifecycle/)
 - [SQL compatibility](https://tinyjoin.org/guides/sql-compatibility/)
 - [Caveats](https://tinyjoin.org/guides/caveats/)
+- [Transactions and changes](https://tinyjoin.org/guides/transactions-and-changes/)
 - [API reference](https://tinyjoin.org/api/)
 - [Demos](https://tinyjoin.org/demos/)
 - [Release notes](https://tinyjoin.org/guides/releases/)
 - [Agent guide](https://tinyjoin.org/guides/agents-guide/)
+- [Full agent reference: guides and public declarations](https://tinyjoin.org/llms-full.txt)
 - [Repository](https://github.com/tinyplex/tinyjoin)

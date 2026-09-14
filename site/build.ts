@@ -36,15 +36,12 @@ const REFLECTIONS = [
 // the documentation freshness check and the site workflow.
 type Sizes = {[group: string]: {raw: number; gzip: number; gzipLabel: string}};
 
-const addSizeReplacers = (docs: Docs): Docs => {
+const getSizeReplacers = (): [RegExp, string][] => {
   const sizes: Sizes = JSON.parse(readFileSync('site/data/sizes.json', 'utf8'));
-  for (const [group, {gzipLabel}] of Object.entries(sizes)) {
-    docs.addReplacer(
-      new RegExp(`\\{\\{sizes\\.${group}\\.gzip\\}\\}`, 'g'),
-      gzipLabel,
-    );
-  }
-  return docs;
+  return Object.entries(sizes).map(([group, {gzipLabel}]) => [
+    new RegExp(`\\{\\{sizes\\.${group}\\.gzip\\}\\}`, 'g'),
+    gzipLabel,
+  ]);
 };
 
 const RUNTIME_FILES = [
@@ -122,13 +119,12 @@ export const build = async (
     .addApiFile(resolve(typesDir, 'worker/index.d.ts'))
     .addRootMarkdownFile('site/home/index.md')
     .addMarkdownDir('site/guides')
-    .addMarkdownDir('site/demos', true)
-    .addStringFile(
-      readFileSync('site/guides/7_agents.md', 'utf8'),
-      'llms-full.txt',
-    );
+    .addMarkdownDir('site/demos', true);
 
-  addSizeReplacers(docs);
+  const sizeReplacers = getSizeReplacers();
+  for (const [pattern, replacement] of sizeReplacers) {
+    docs.addReplacer(pattern, replacement);
+  }
 
   await docs.generateNodes({
     group: getSorter(GROUPS),
@@ -137,6 +133,10 @@ export const build = async (
   });
 
   docs
+    .addStringFile(
+      getFullReference(docs, typesDir, sizeReplacers),
+      'llms-full.txt',
+    )
     .addPageForEachNode('/', Page)
     .addPageForEachNode('/', MainInner, 'main.html')
     .addPageForNode('/api/', Page, 'all.html', true)
@@ -170,10 +170,79 @@ export const build = async (
     )
     .publish();
 
+  fixCombinedApiLinks(outDir);
   await waitForFile(resolve(outDir, 'css/index.css'));
   writeSearchIndex(docs, outDir);
   await copyRuntime(outDir, packageDir);
 };
+
+const fixCombinedApiLinks = (outDir: string): void => {
+  // TinyDocs single-page mode turns every node link into a local fragment,
+  // including navigation outside the rendered API tree. Keep API anchors local
+  // and let links to the homepage, guides, and demos navigate to their pages.
+  const file = resolve(outDir, 'api/all.html');
+  const html = readFileSync(file, 'utf8');
+  writeFileSync(
+    file,
+    html.replaceAll(/href="#(\/(?!api\/)[^"]*)"/g, 'href="$1"'),
+  );
+};
+
+// Use the same guide nodes and generated declarations as this build, including
+// fresh temporary declarations in check:docs:committed. Never read the previous
+// docs output or embed local paths/timestamps in this portable reference.
+const getFullReference = (
+  docs: Docs,
+  typesDir: string,
+  sizeReplacers: [RegExp, string][],
+): string => {
+  const sections = [
+    '# TinyJoin full reference',
+    'All guides and documented public TypeScript declarations from this build. ' +
+      'Source links identify the corresponding website pages.',
+  ];
+  docs.forEachNode((node) => {
+    if (node.publish && node.url.startsWith('/guides/')) {
+      const source = `https://tinyjoin.org${node.url}`;
+      sections.push(
+        `# ${node.name}\n\nSource: ${source}\n\n` +
+          absoluteReferenceLinks(
+            [node.summary, node.body].filter(Boolean).join('\n\n'),
+            source,
+          ),
+      );
+    }
+  });
+  for (const [module, declaration, source] of [
+    ['tinyjoin', 'index.d.ts', 'https://tinyjoin.org/api/tinyjoin/'],
+    ['tinyjoin/worker', 'worker/index.d.ts', 'https://tinyjoin.org/api/worker/'],
+  ]) {
+    sections.push(
+      `# Public API: ${module}\n\nSource: ${source}\n\n` +
+        '````ts\n' +
+        absoluteReferenceLinks(
+          readFileSync(resolve(typesDir, declaration), 'utf8').trim(),
+          source,
+        ) +
+        '\n````',
+    );
+  }
+  let reference = sections.join('\n\n') + '\n';
+  for (const [pattern, replacement] of sizeReplacers) {
+    reference = reference.replaceAll(pattern, replacement);
+  }
+  return reference;
+};
+
+// A fragment belongs to its original guide, not to the combined document.
+// Preserve external URLs and source code while resolving authored Markdown and
+// HTML links that begin at the site root or the current page's fragment.
+const absoluteReferenceLinks = (markdown: string, source: string): string =>
+  markdown.replaceAll(
+    /(\]\(|(?:href|src)=["'])(\/(?!\/)[^)\s"']*|#[^)\s"']*)/g,
+    (_match, prefix: string, target: string) =>
+      prefix + new URL(target, source).href,
+  );
 
 const writeSearchIndex = (docs: Docs, outDir: string): void => {
   const pages: {u: string; n: string; s: string}[] = [];

@@ -346,10 +346,24 @@ catches the error, earlier staged writes may still commit. This is also true for
 a prepared execution. Letting the error escape the callback rolls the
 transaction back.
 
+Calls to the same Client's transaction() queue in order. Awaiting one from
+inside its own active callback deadlocks; pass the existing Transaction into
+helpers instead. There is no AbortSignal or timeout option, and racing a
+Promise against a timer does not cancel the work. See
+[transaction composition and errors](/guides/transactions-and-changes/#composing-transaction-helpers).
+
+Atomicity does not make every failed write's outcome knowable to its caller.
+After `RECOVERY_REQUIRED`, `STORAGE_COMMIT_OUTCOME_UNKNOWN`, or
+`STORAGE_ENGINE_POISONED`, stop using the Client, close and reopen it, and
+reconcile stored state before replaying a write. The `retryable` flag is not a
+safe-replay guarantee. See [storage recovery](/guides/storage-and-lifecycle/#recovering-after-an-uncertain-write).
+
 Requests are serialized through one Worker. OPFS persistence permits one open
 Worker for a database name; it is an exclusive writer rather than a
 PostgreSQL-style set of concurrent sessions. There is no MVCC session model,
-isolation-level selection, savepoints, lock manager, or deadlock detection.
+isolation-level selection, user-controlled savepoints, lock manager, or
+deadlock detection. Different OPFS names are independent databases and do not
+synchronize with one another.
 
 ## PostgreSQL facilities that are not present
 

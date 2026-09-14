@@ -26,8 +26,12 @@ Start with the markup the app will fill in:
 </main>
 ```
 
-Opening the database is one call. `memory://` keeps this demo to the page, so a
-reload starts it over; a named `opfs://todos` would keep it instead:
+Opening the database is one call. This demo is intentionally memory-only:
+`memory://` starts a fresh database on every reload, including the two sample
+todos added below. For an app that keeps todos between visits, use the
+[persistent Vite starter](/guides/getting-started/) with
+`npm create tinyjoin@latest`. Its schema setup and sample data are designed for
+reopening an existing database.
 
 ```js
 import {create} from 'tinyjoin';

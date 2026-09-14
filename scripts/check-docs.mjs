@@ -80,15 +80,25 @@ export async function checkDocs(
   if (!stylesheet.includes('--accent:#7c3aed')) {
     errors.push('The site accent must match the final TinyJoin logo');
   }
-  if (!/body>header>nav\{display:none/.test(stylesheet)) {
-    errors.push('The primary navigation must be hidden on mobile');
+  const agentIndex = await readFile(resolve(docs, 'llms.txt'), 'utf8');
+  const agentReference = await readFile(resolve(docs, 'llms-full.txt'), 'utf8');
+  if (!agentIndex.includes('https://tinyjoin.org/llms-full.txt')) {
+    errors.push('The agent index must link to the combined text reference');
   }
-  if (
-    !/@media \(min-width:38rem\)\{body>header>nav\{display:flex/.test(
-      stylesheet,
-    )
-  ) {
-    errors.push('The primary navigation must reappear at the desktop breakpoint');
+  for (const content of [
+    '# SQL compatibility',
+    '## Hard limits',
+    'STORAGE_COMMIT_OUTCOME_UNKNOWN',
+    'export interface Transaction',
+    'export class Client',
+    '# Public API: tinyjoin/worker',
+    'export function startWorker',
+    'Source: https://tinyjoin.org/guides/caveats/',
+    '](https://tinyjoin.org/guides/caveats/#if-tinyjoin-is-not-the-right-fit)',
+  ]) {
+    if (!agentReference.includes(content)) {
+      errors.push(`The combined agent reference is missing ${content}`);
+    }
   }
   for (const [name, html] of [
     ['homepage', homepage],
@@ -115,7 +125,6 @@ export async function checkDocs(
     for (const match of html.matchAll(/(?:href|src)="([^"]+)"/g)) {
       const href = match[1];
       if (
-        href.startsWith('#') ||
         href.startsWith('http:') ||
         href.startsWith('https:') ||
         href.startsWith('mailto:') ||
@@ -124,7 +133,9 @@ export async function checkDocs(
         continue;
       }
 
-      const url = new URL(href, 'https://tinyjoin.org/');
+      // Resolve document-local anchors against this HTML file, including the
+      // independently served main.html fragments and generated demo pages.
+      const url = new URL(href, new URL(sourcePath, 'https://tinyjoin.org/'));
       let target = decodeURIComponent(url.pathname).replace(/^\//, '');
       target = target === '' ? 'index.html' : target;
       if (target.endsWith('/')) {

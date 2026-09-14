@@ -21,6 +21,7 @@
     "src/**/*.ts",
     "site/js/**/*.ts",
     "test/**/*.ts",
-    "vitest.config.ts"
+    "vitest.config.ts",
+    "playwright*.config.ts"
   ]
 }

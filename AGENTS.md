@@ -62,6 +62,8 @@ supported Vite starter.
 - Consult the
   [SQL compatibility contract](https://tinyjoin.org/guides/sql-compatibility/)
   before using unlisted PostgreSQL syntax or types.
+- Joins run left to right as bounded nested loops, without reordering or
+  index-based join lookup. Check actual workload size against the join limits.
 
 Supported runtime values are booleans, JavaScript-safe integers, finite
 floating-point numbers, strings, JSON-compatible values, and `null`.
@@ -72,9 +74,17 @@ Use db.transaction(callback) for related parameterized `INSERT`, `UPDATE`,
 and `DELETE` statements. Use the transaction object inside the callback and do
 not retain it. Run DDL outside the callback.
 
-An uncaught callback error rolls everything back. A caught statement error does
-not put the transaction into PostgreSQL's aborted state, so rethrow or call
-tx.rollback() when earlier staged changes must also be discarded.
+Pass the active Transaction to helpers; awaiting another db.transaction() on
+the same Client inside its callback deadlocks. There is no AbortSignal or
+timeout API. Promise.race() stops waiting but does not cancel a write.
+
+An uncaught callback error before commit discards staged work. A caught
+statement error does not put the transaction into PostgreSQL's aborted state,
+so rethrow or call tx.rollback() when earlier staged changes must also be discarded.
+
+Append-only inserts validate incrementally; updates, deletes, or revisiting a
+staged key switch to full write-set validation per statement. Keep mixed
+transactions bounded and prefer multi-row writes where practical.
 
 Subscriptions report changed tables. Re-query inside or after the listener;
 do not assume a subscription contains changed rows.
@@ -83,10 +93,21 @@ do not assume a subscription contains changed rows.
 
 - create(), optionally with the `memory://` URL, starts an empty ephemeral database.
 - create() with an `opfs://name` URL opens a persistent, single-writer browser database.
+- One Client can hold a name at a time, including across tabs. Different names
+  have independent data and do not synchronize.
 - Keep the OPFS name stable and version it deliberately with the schema.
 - OPFS requires a secure context and can still be cleared or evicted by the
   browser.
 - Call db.close() on teardown so storage locks and the Worker are released.
+- After `RECOVERY_REQUIRED`, `STORAGE_COMMIT_OUTCOME_UNKNOWN`, or
+  `STORAGE_ENGINE_POISONED`, stop work, close and reopen the same OPFS name,
+  and reconcile stable operation identifiers before replay. `retryable` is
+  not a safe-replay guarantee. Follow the
+  [recovery guide](https://tinyjoin.org/guides/storage-and-lifecycle/#recovering-after-an-uncertain-write).
+
+The [full agent reference](https://tinyjoin.org/llms-full.txt) combines all guides and documented
+public TypeScript declarations. Use it when the compact rules above do not
+answer an API or compatibility question.
 
 ## Repository work
 

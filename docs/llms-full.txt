@@ -1,4 +1,1028 @@
+# TinyJoin full reference
+
+All guides and documented public TypeScript declarations from this build. Source links identify the corresponding website pages.
+
+# Getting started
+
+Source: https://tinyjoin.org/guides/getting-started/
+
+TinyJoin is a relational database that runs locally in a browser. The normal
+setup is one import and one asynchronous call.
+
+## Install
+
+```sh
+npm install tinyjoin
+```
+
+TinyJoin publishes JavaScript, TypeScript declarations, its Worker runtime, and
+the WebAssembly engine together. An application does not need Rust tooling or a
+separate Worker plugin.
+
+## Open a database
+
+```ts
+import {create} from 'tinyjoin';
+
+const db = await create('opfs://my-app');
+```
+
+The Promise resolves after the Worker and database are ready. The string gives
+the persistent database a stable local name. Call create() without an
+argument while experimenting with an ephemeral database.
+
+## Create a table
+
+Schema setup can be idempotent, so the same application startup works for a new
+or existing database:
+
+```ts
+await db.exec(`
+  CREATE TABLE IF NOT EXISTS notes (
+    id TEXT PRIMARY KEY,
+    body TEXT NOT NULL,
+    pinned BOOLEAN NOT NULL DEFAULT false
+  )
+`);
+```
+
+exec() accepts a parameter-free script and commits all of it together. Use it
+for schema setup. TinyJoin requires every SQL-created table to have a primary
+key.
+
+## Write with parameters
+
+```ts
+await db.query('INSERT INTO notes (id, body) VALUES ($1, $2)', [
+  crypto.randomUUID(),
+  'Hello from the browser',
+]);
+```
+
+Keep application values in the parameter array. TinyJoin parameters are
+one-based (`$1`, `$2`, and so on) and accept JSON-compatible values.
+
+## Read typed rows
+
+```ts
+type Note = {
+  id: string;
+  body: string;
+  pinned: boolean;
+};
+
+const {rows} = await db.query<Note>(
+  'SELECT id, body, pinned FROM notes ORDER BY id',
+);
+```
+
+The generic describes the expected result to TypeScript; it does not validate
+rows at runtime. Use an explicit projection when callers require a stable
+shape.
+
+## Close cleanly
+
+```ts
+window.addEventListener(
+  'pagehide',
+  () => void db.close().catch(console.error),
+  {once: true},
+);
+window.addEventListener('pageshow', (event) => {
+  if (event.persisted) {
+    window.location.reload();
+  }
+});
+```
+
+Closing releases prepared statements, storage, and the Worker. It is
+asynchronous and safe to call more than once.
+
+Closing cannot be undone. This example reloads a page restored from the
+back/forward cache so startup creates a fresh Client. A browser does not await
+pagehide cleanup; finish and await writes during normal use. Applications
+with their own lifecycle can reopen and recreate their database state instead
+of reloading. See [storage and lifecycle](https://tinyjoin.org/guides/storage-and-lifecycle/).
+
+The [Todo starter demo](https://tinyjoin.org/demos/todo-starter/) puts these calls together in a
+small browser application.
+
+# Storage and lifecycle
+
+Source: https://tinyjoin.org/guides/storage-and-lifecycle/
+
+TinyJoin supports an ephemeral memory database and an opt-in persistent browser
+database. Both use the same Worker and page-native engine.
+
+## Memory
+
+```ts
+const db = await create();
+// Equivalent to: await create('memory://')
+```
+
+Memory starts empty each time the Worker opens. It is useful for tests,
+temporary views, and trying the API.
+
+## Persistent browser storage
+
+```ts
+const db = await create('opfs://my-project-v1');
+```
+
+The name must contain 1-64 ASCII letters, numbers, dots, underscores, or
+hyphens, and start with a letter or number. Include the application, dataset,
+and schema generation in it. A name is a namespace, not an encryption or
+access-control boundary.
+
+OPFS persistence requires a secure browser context and a dedicated Worker.
+TinyJoin opens the database with an exclusive synchronous access handle. A
+second Worker opening the same name fails rather than risking concurrent
+mutation; closing the first Client releases the lock.
+
+This applies to two Clients in one page as well as Clients in separate tabs of
+the same origin. Different names can be open independently, but their rows and
+subscriptions are separate: changing the name does not share or synchronize
+the original database. Handle `STORAGE_LOCKED` during startup with an
+already-open message and an explicit retry after the other Client closes.
+
+There is no silent fallback to memory if persistent storage is unavailable,
+locked, corrupt, or out of quota.
+
+An OPFS name identifies stored data; changing the name opens a different
+database and leaves the old data in place. Check the
+[release compatibility boundary](https://tinyjoin.org/guides/releases/#v0-0-6) before upgrading
+TinyJoin: v0.0.6 cannot open the page format published in v0.0.5. Preserve any
+needed data with the old version before moving to a new namespace.
+
+The current persistent database is bounded to 65,536 4 KiB pages (256 MiB).
+The [SQL compatibility guide](https://tinyjoin.org/guides/sql-compatibility/#hard-limits) lists the
+independent query and mutation limits.
+
+## Browser retention
+
+OPFS is browser-managed storage. A user can clear it and a browser may evict
+best-effort storage under pressure. An application that needs stronger local
+retention can make a user-appropriate `navigator.storage.persist()` request.
+TinyJoin does not make that product decision during startup.
+
+## Opening and closing
+
+await create() is the simplest lifecycle: it returns only after
+initialization succeeds. The returned Client also exposes `ready`, `waitReady`,
+and `closed` for code that constructs a Client directly.
+
+Call close() during application teardown. It seals prepared statements,
+closes storage, and terminates TinyJoin's packaged Worker. Outstanding cleanup
+is shared by repeated calls.
+
+Closing is irreversible. A Client, its prepared statements, and its
+subscriptions cannot resume after close(). TinyJoin does not manage the
+browser's back/forward cache lifecycle. If a `pagehide` handler closes the
+database, a page restored from that cache must initialize a new Client and
+recreate its statements and subscriptions before accepting work. The
+[getting-started example](https://tinyjoin.org/guides/getting-started/#close-cleanly) uses a reload
+on `pageshow` when `event.persisted` is true as a simple application policy.
+
+A browser does not await asynchronous `pagehide` cleanup, and teardown events
+are not guaranteed to run. Await writes while the application is active;
+close() during navigation is not a final-save or cancellation guarantee.
+
+## Recovering after an uncertain write
+
+A rejected write does not always prove that nothing committed. The following
+ClientError codes mean the current engine must no longer be used:
+
+| Code | Meaning |
+| --- | --- |
+| `RECOVERY_REQUIRED` | The engine cannot safely continue after a storage publication failure; reopening must establish the stored state. |
+| `STORAGE_COMMIT_OUTCOME_UNKNOWN` | A storage write or a result after a possible commit could not be confirmed. The requested change may have committed. |
+| `STORAGE_ENGINE_POISONED` | A previous uncertain or fatal result already made this engine unusable. |
+
+Stop accepting database work, keep the original error, and close the Client.
+For OPFS, open the **same database name** with a new create() call and inspect
+the recovered rows before deciding whether to repeat the operation. If open
+or inspection fails, keep the application in a recovery state and preserve the
+stored data; changing the name or deleting the database would hide the state
+you need to reconcile. A new memory database starts empty and cannot recover
+the old Client's data.
+
+Give an application operation a stable identifier before its first attempt
+and record that identifier in the same transaction as its effects. After
+reopening, query that record and compare the intended values. A matching
+record means the operation already happened; a missing record may allow a
+deliberate retry with the **same identifier**. An unexpected record needs
+application reconciliation. Generating a fresh identifier on every retry can
+apply an operation twice. TinyJoin has no automatic replay or `ON CONFLICT`
+clause, so this policy belongs to the application.
+
+The `retryable` property only says that a later attempt or reopen may succeed.
+It is not a guarantee that replaying a write is safe, nor that the current
+Client remains usable. A rollback attempted after an uncertain commit cannot
+establish that the commit was absent. See also
+[transaction error handling](https://tinyjoin.org/guides/transactions-and-changes/#errors-and-cancellation).
+
+# SQL compatibility
+
+Source: https://tinyjoin.org/guides/sql-compatibility/
+
+TinyJoin implements its own deliberately bounded, PostgreSQL-shaped SQL
+dialect. It is not PostgreSQL compiled to WebAssembly, a PostgreSQL server, or
+a general PostgreSQL replacement. Familiar syntax is used where the smaller
+runtime can give it clear and deterministic semantics.
+
+This document is the compatibility contract for the current dialect. A form
+not listed as supported here is unsupported, even if its keywords happen to be
+accepted by PostgreSQL. Unsupported forms fail explicitly rather than being
+silently reinterpreted.
+
+## JavaScript entry point
+
+SQL is the primary relational interface. The basic lifecycle has four calls:
+
+```ts
+import { create } from "tinyjoin";
+
+const db = await create();
+
+await db.exec(`
+  CREATE TABLE tasks (
+    id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    done BOOLEAN NOT NULL DEFAULT false
+  );
+`);
+await db.query("INSERT INTO tasks (id, title) VALUES ($1, $2)", [
+  1,
+  "Write the compatibility contract",
+]);
+
+const { rows } = await db.query<{ id: number; title: string }>(
+  "SELECT id, title FROM tasks WHERE done = $1",
+  [false],
+);
+
+await db.close();
+```
+
+Calling create() opens the Worker-backed database and resolves after
+initialization. With no argument, or `memory://`, storage is ephemeral. A named
+`opfs://database-name` data directory opts into persistent browser storage.
+The client also exposes read-only `ready`, `waitReady`, and `closed`
+properties.
+
+query(sql, params?, options?) executes one read or write statement with
+optional JSON-compatible `$1` parameters. exec(sql, options?) executes one or
+more statements without parameters as one implicit transaction and returns one
+result per statement. Both use `{rows, fields, affectedRows?, command?,
+rowCount?}` results; TinyJoin adds `revision` and `tables`. `fields` contains
+ordered `{name, dataTypeID}` entries, including for empty typed results.
+`rowMode: "array"` returns values in that field order. The `sql` tagged template
+is a parameterizing form of query(). `rowMode` is the only query option
+implemented today; parser, serializer, notice, parameter-type, and blob
+options are rejected. The tag accepts parameter values only and does not
+provide raw-SQL, identifier, or nested-template helpers.
+close() is asynchronous and idempotent.
+
+Interactive atomicity uses transaction(callback), not SQL transaction
+statements:
+
+```ts
+await db.transaction(async (tx) => {
+  await tx.query("UPDATE tasks SET done = true WHERE id = $1", [1]);
+  await tx.query("INSERT INTO tasks (id, title) VALUES ($1, $2)", [
+    2,
+    "Committed together",
+  ]);
+});
+```
+
+Invalidation subscriptions and Worker/storage configuration form the small
+JavaScript control surface around the SQL-first engine; relational reads,
+writes, and schema changes use SQL.
+
+## Prepared statements
+
+Use a prepared statement when the same parameterized read or row mutation will
+execute repeatedly:
+
+```ts
+const tasksByDone = await db.prepare<{
+  id: number;
+  title: string;
+  done: boolean;
+}>("SELECT id, title, done FROM tasks WHERE done = $1 ORDER BY id");
+const setTaskDone = await db.prepare(
+  "UPDATE tasks SET done = $1 WHERE id = $2",
+);
+
+const { rows } = await tasksByDone.execute([false]);
+
+await db.transaction(async (tx) => {
+  await tx.execute(setTaskDone, [true, 1]);
+  console.log((await tx.execute(tasksByDone, [true])).rows);
+});
+
+await tasksByDone.close();
+await setTaskDone.close();
+```
+
+prepare<Row>(sql) parses and retains one `SELECT`, aggregate, join, `INSERT`,
+`UPDATE`, or `DELETE` statement in the Worker. It rejects DDL, an empty string,
+and more than one statement. The returned PreparedStatement<Row> has
+execute(params?, options?), asynchronous idempotent close(), and a read-only
+`closed` property. execute() returns the same Results<Row> shape as
+query() and accepts the same sole option, `rowMode`.
+
+The prepared parameter count is the highest referenced `$n`. Every execution
+must provide exactly that many JSON-compatible values; a numbering gap still
+occupies a slot. Binding or execution failure leaves the handle open for a later
+valid execution. exec() remains parameter-free and is not a prepared-script
+API.
+
+Preparation retains parsed syntax and parameter positions, not a schema
+snapshot. Every execution resolves tables and columns and validates types
+against the current catalog and, inside a transaction, its current staged view.
+A compatible DDL change is transparent. An incompatible change returns the
+ordinary current table, column, constraint, or type error and does not make the
+handle permanently stale. Consequently, `SELECT *` or `RETURNING *` can expose
+new fields after `ALTER TABLE ... ADD COLUMN`, including a new positional value
+in array row mode. Use an explicit projection when callers require a stable
+result shape. As with query<Row>(), the Row generic is a compile-time cast,
+not runtime result validation.
+
+A prepared statement is session-local: it belongs to the client that created
+it, is not stored in OPFS, cannot be used by another client, and does not survive
+db.close() or a Worker restart. Prepare handles before entering a callback
+transaction. Inside the callback, use
+tx.execute(statement, params?, options?); it accepts only an open statement
+from the same client and participates in the same staged commit or rollback as
+tx.query(). Direct db.prepare(), statement.execute(), and
+statement.close() calls are blocked while that client's transaction callback
+is active.
+
+Calling statement.close() seals it immediately, rejects new executions, waits
+for executions that already started, and then releases its Worker resources.
+Concurrent close calls share the same cleanup, and a cleanup failure does not
+reopen the handle. Closing the database seals and releases every remaining
+prepared statement. At most 128 handles and 8 MiB of conservatively accounted
+prepared-statement state may be retained by one open database.
+
+## How to read the matrices
+
+- **Supported** means the exact form described here is implemented and tested.
+- **Narrow** means TinyJoin implements a useful but intentionally smaller form
+  than PostgreSQL.
+- **No** means the form is rejected.
+
+These labels do not claim compatibility with a particular PostgreSQL release.
+
+## Statements and clauses
+
+| Keyword or form | Status | TinyJoin form and boundary |
+| --- | --- | --- |
+| `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or a left-deep join over two to eight typed table sources. A simple projection is `*` or plain column names. There is no `SELECT` without `FROM`. |
+| `WHERE` | Supported | Predicates described below, with SQL three-valued null logic. |
+| `ORDER BY` | Narrow | Up to 32 plain columns for simple queries, projected output names for grouped/aggregate queries, and projected output names or qualified/unambiguous source columns for joins; `ASC`/`DESC` and `NULLS FIRST`/`LAST`. JSON values cannot be ordered. |
+| `LIMIT`, `OFFSET` | Supported | Non-negative integer literal or `$n` parameter. `LIMIT` is at most 100,000; `OFFSET` and `OFFSET + LIMIT` are at most 4,294,967,295. `OFFSET` may appear alone; when both occur, `LIMIT` must precede `OFFSET`. |
+| `GROUP BY` | Narrow | Up to 32 plain boolean, integer, float, or text columns (not JSON) on one typed table. Every selected non-aggregate column must be grouped explicitly. |
+| `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` | Narrow | Every aggregate query requires a typed column catalog, including `COUNT(*)`. Functions accept `COUNT(*)` or one plain column argument. `SUM`/`AVG` accept integer or float; `MIN`/`MAX` accept integer, float, or text. Up to 64 aggregate calls. |
+| `HAVING`, aggregate `DISTINCT`, `FILTER`, windows | No | No post-group predicate, distinct aggregate, filter clause, or window form. |
+| `JOIN`, `INNER JOIN` | Narrow | Adds one typed table to a left-deep chain of at most eight sources. Each `ON` has one or more column equalities joined by `AND`, with at most 32 across the query; every equality connects the incoming source to an earlier source. |
+| `LEFT [OUTER] JOIN` | Narrow | The same bounded chain; an unmatched incoming source is represented by `NULL` columns. A later inner join can remove that null-extended row. |
+| `RIGHT`, `FULL`, `CROSS`, `NATURAL`, `USING`, `LATERAL` | No | No additional join families, parenthesized/derived relations, or join reordering. |
+| `AS` | Narrow | Output aliases on `SELECT` items in grouped/aggregate queries, plus table and projection-output aliases in joins. Ordinary single-table projections do not accept aliases. |
+| `DISTINCT`, `WITH`, subqueries, `UNION`/`INTERSECT`/`EXCEPT` | No | No CTEs, subqueries, set operations, or distinct-row projection. |
+| `CREATE TABLE [IF NOT EXISTS]` | Narrow | Typed columns and a required inline or table-level primary key. Up to 256 columns. |
+| `PRIMARY KEY` | Narrow | One inline single-column declaration or one table-level column list (single or composite). It implies `NOT NULL`; JSON keys are rejected. |
+| `NULL`, `NOT NULL`, `DEFAULT` | Narrow | String, number, boolean, or `NULL` literal defaults only. No default expressions, functions, sequences, or parameters. |
+| `CREATE [UNIQUE] INDEX [IF NOT EXISTS]` | Narrow | One or more boolean, integer, or text columns. No methods, expressions, predicates, `INCLUDE`, ordering, or concurrent build. |
+| `ALTER TABLE ... ADD [COLUMN] [IF NOT EXISTS]` | Narrow | Adds one non-primary-key column and atomically backfills its literal default or `NULL`. On a nonempty table, `NOT NULL` requires a non-null default. Other `ALTER` forms are rejected. |
+| `DROP TABLE [IF EXISTS]` | Narrow | Drops the table and its indexes. No `CASCADE`/`RESTRICT` dependency model. |
+| `DROP INDEX [IF EXISTS]` | Supported | Drops one globally named index. |
+| `INSERT ... VALUES` | Narrow | Optional column list, up to 4,096 literal/parameter rows, per-cell `DEFAULT`, and optional `RETURNING`. |
+| `INSERT ... DEFAULT VALUES` | Supported | Inserts one row using defaults and `NULL` values. |
+| `INSERT ... SELECT`, `ON CONFLICT`, `MERGE` | No | No query-sourced insert, upsert clause, or merge statement. |
+| `UPDATE ... SET ... [WHERE ...]` | Narrow | Assigns literals, parameters, or `DEFAULT`; optional `RETURNING`. No expressions or `UPDATE ... FROM`. |
+| `DELETE FROM ... [WHERE ...]` | Narrow | Optional `RETURNING`. No `DELETE ... USING`. |
+| `RETURNING` | Narrow | `*` or a list of plain columns; no expressions or aliases. |
+| `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT` | No | Use the JavaScript callback transaction API. |
+| `PREPARE`, `EXECUTE`, `DEALLOCATE` | No | SQL-level named statements are not implemented. Use the session-local JavaScript prepare() handle and its execute()/close() methods. |
+| `COPY`, `TRUNCATE`, `EXPLAIN`, `VACUUM`, `ANALYZE` | No | No server maintenance or bulk-file SQL commands. |
+
+query() accepts exactly one statement, with one optional trailing semicolon.
+prepare() has the same one-statement and ordinary SQL text/token limits, but
+accepts only the read and row-mutation statement families listed above.
+exec() splits only top-level semicolons: strings, quoted identifiers, line
+comments, nested block comments, and parentheses cannot accidentally terminate
+a statement. A script contains at most 256 statements and 1 MiB of SQL text;
+each statement retains the ordinary parser limits below.
+
+## Predicates and expressions
+
+| Form | Status | Semantics |
+| --- | --- | --- |
+| Strings, numbers, `TRUE`, `FALSE`, `NULL` | Supported | Single-quoted strings escape a single quote as `''`; numbers and booleans use their JSON-compatible scalar forms. |
+| `$1`, `$2`, ... | Supported | One-based JSON-compatible parameters; at most 1,024. |
+| `=`, `<>`, `!=`, `<`, `<=`, `>`, `>=` | Narrow | Strict scalar comparison, with integer/float cross-comparison. JSON supports structural equality/inequality only. |
+| `AND`, `OR`, `NOT`, parentheses | Supported | Precedence is `NOT`, then `AND`, then `OR`; SQL unknown/null propagation is preserved. |
+| `IS NULL`, `IS NOT NULL` | Supported | Tests the single runtime null value. |
+| `IN (...)`, `NOT IN (...)` | Supported | One to 1,024 literals or parameters with SQL null behavior. |
+| Arithmetic, concatenation, casts, scalar functions | No | Values are not a general expression language. |
+| `LIKE`, `ILIKE`, `BETWEEN`, `IS DISTINCT FROM`, `ANY`, `ALL` | No | These PostgreSQL predicate families are not implemented. |
+| JSON/path operators | No | JSON can be stored, returned, and compared for structural equality only. |
+
+The right side of an ordinary predicate is a literal or parameter, not another
+column or subquery. Column-to-column comparison exists only in a join's `ON`
+equality terms.
+
+## Runtime types
+
+PostgreSQL type spellings map onto five TinyJoin runtime types. The spelling
+does not import PostgreSQL's storage width, coercion, operator, or catalog
+semantics.
+
+| Accepted SQL spellings | TinyJoin value | Important difference |
+| --- | --- | --- |
+| `BOOLEAN`, `BOOL` | JavaScript boolean | No PostgreSQL coercions. |
+| `SMALLINT`, `INTEGER`, `INT`, `INT2`, `INT4`, `BIGINT`, `INT8` | One JavaScript-safe integer type | Range is -9,007,199,254,740,991 through 9,007,199,254,740,991. `SMALLINT`/`INTEGER` are wider and `BIGINT` is narrower than PostgreSQL. |
+| `REAL`, `FLOAT`, `FLOAT4`, `FLOAT8`, `DOUBLE PRECISION` | One finite binary64 JavaScript number | No real/double distinction, `NaN`, or infinity. |
+| `TEXT`, `VARCHAR`, `CHARACTER VARYING` | JavaScript string | No length modifiers or database collation. Ordering is deterministic Unicode code-point ordering. |
+| `JSON`, `JSONB` | The same JSON-compatible value (scalar, array, or object) | No textual/binary distinction, JSON operators, casts, or JSON index type. |
+
+SQL `NULL` and a JSON scalar `null` are the same runtime value, including in a
+JSON column. TinyJoin cannot distinguish them for `NOT NULL`, `IS NULL`,
+aggregates, or defaults.
+
+There are no implicit PostgreSQL casts. Notable unavailable types include
+`NUMERIC`/`DECIMAL`, date/time/interval types, UUID, `BYTEA`, arrays,
+serial/identity, enum/domain, and user-defined types. Type modifiers such as
+`VARCHAR(100)` are rejected.
+
+## Identifiers, comments, and table names
+
+- Unquoted identifiers are folded to ASCII lower case. Double-quoted
+  identifiers preserve case and use doubled quotes to escape a quote.
+- An unquoted identifier may begin with `_`, an ASCII letter, or any non-ASCII
+  character. Later characters may additionally be ASCII digits or `$`.
+- TinyJoin reserves these unquoted words case-insensitively: `SELECT`, `FROM`,
+  `WHERE`, `AND`, `OR`, `IS`, `IN`, `LIMIT`, `OFFSET`, `ORDER`, `BY`, `ASC`,
+  `DESC`, `NULLS`, `FIRST`, `LAST`, `NULL`, `TRUE`, `FALSE`, `CREATE`, `TABLE`,
+  `IF`, `NOT`, `EXISTS`, `PRIMARY`, `KEY`, `DEFAULT`, `INSERT`, `INTO`,
+  `VALUES`, `UPDATE`, `SET`, `DELETE`, `RETURNING`, `AS`, `JOIN`, `INNER`,
+  `LEFT`, `OUTER`, `ON`, `GROUP`, and `HAVING`. Double-quote one to use it as
+  an identifier. Other words used contextually by supported statements are not
+  necessarily reserved.
+- `--` line comments and nested `/* ... */` comments are supported.
+- Single-quoted strings use doubled single quotes. Dollar-quoted strings are
+  not supported.
+- A two-part table name such as `public.tasks` is accepted as one flat catalog
+  key. It does **not** create or resolve a PostgreSQL schema. `tasks` and
+  `public.tasks` are different TinyJoin table names.
+- There is no `CREATE SCHEMA`, `search_path`, `information_schema`, or
+  `pg_catalog`. Index names are global catalog keys.
+
+## Constraints and indexes
+
+Every SQL-created table has a primary key. TinyJoin currently implements:
+
+- primary-key uniqueness and non-nullability;
+- column `NOT NULL`;
+- scalar literal column defaults; and
+- separate unique indexes.
+
+It does not implement foreign keys, `CHECK`, exclusion constraints, generated
+columns, sequences, triggers, or dependency cascades.
+
+A row is identified by its primary key: each table is stored keyed by that
+value, and an `UPDATE` which changes a primary key is applied as a removal at
+the old key and an insertion at the new one rather than an edit in place. Treat
+primary keys as stable, opaque identifiers.
+
+Composite primary and secondary indexes are supported. A unique index omits a
+key containing `NULL`, so multiple null-containing keys are allowed, matching
+PostgreSQL's default `NULLS DISTINCT` behavior. Complete primary-key equality
+uses direct lookup; complete equality for every column of a secondary index can
+use its postings. Partial composite matches, ranges, `OR`, and `NOT` scan.
+`UPDATE` and `DELETE` currently scan even for a primary-key predicate.
+
+## Aggregates and joins
+
+Aggregate null behavior follows the familiar SQL rules: `COUNT(*)` counts
+rows; other aggregates skip `NULL`; a global aggregate over no rows emits one
+row with count zero and other aggregates `NULL`; an empty grouped input emits
+no rows. Integer `SUM` fails beyond the JavaScript-safe range, and integer
+`AVG` returns a floating-point value rather than PostgreSQL `numeric`.
+
+Join keys containing `NULL` never match. Integer and float keys may compare;
+JSON join keys are rejected. Every source requires a typed SQL catalog and a
+unique alias, and the result must use distinct JSON object field names.
+Unqualified columns are accepted only when exactly one source contains the
+name. Without `ORDER BY`, row order is not part of the contract.
+
+Join chains are evaluated as written, from left to right, by a bounded nested
+loop; TinyJoin does not reorder or optimize them. Each `ON` equality must
+connect its newly introduced source to one of the sources already in scope.
+Across the full chain, candidate-extension, retained-row, result-row, and byte
+budgets are global rather than resetting for each `JOIN`. Aggregates over joins
+are not supported. The engine counts actual candidate comparisons while
+executing; it does not reject a join merely because the full Cartesian product
+is large. Source row counts still enforce the scan and retained-build-row
+limits before execution.
+
+For example, three tables of 100 rows joined on unique matching identifiers
+need about 20,000 candidate comparisons and return 100 rows. Such a selective
+chain fits. Two tables of 1,001 rows whose join keys all match can exceed the
+1,000,000-comparison budget even when a later `WHERE` removes every result.
+Order and join shape therefore matter. An unordered `LIMIT` can stop early;
+an ordered join must first collect its matches. Standalone queries and exec()
+also charge scans and comparisons to their shared script-work budget, which
+can be reached before the comparison-only limit.
+
+Many-to-many relationships can use a bridge table with a composite primary
+key, for example:
+
+```sql
+SELECT post.id AS post_id, tag.name AS tag_name
+FROM posts AS post
+JOIN post_tags AS post_tag ON post.id = post_tag.post_id
+JOIN tags AS tag ON post_tag.tag_id = tag.id
+ORDER BY post_id, tag_name
+```
+
+Foreign keys are not implemented, so TinyJoin does not enforce the bridge
+table's references.
+
+## Transactions and concurrency
+
+Each query() or standalone prepared-statement write is atomic. A standalone
+exec() script runs its supported reads, DDL, and DML against one page candidate
+and publishes one durable generation only after every statement succeeds. A
+callback transaction stages `INSERT`, `UPDATE`, and `DELETE` statements,
+including through tx.execute(), exposes those staged rows to reads through its
+transaction object, and publishes the complete result once.
+transaction.exec() may group DML and reads as an atomic savepoint within that
+staged transaction: a failure installs none of that script's changes. DDL is
+rejected before any statement in a transaction script runs and must use a
+standalone query() or exec() call.
+
+If a transaction statement fails, that statement installs no partial change,
+but the transaction is not put into PostgreSQL's aborted state. If the callback
+catches the error, earlier staged writes may still commit. This is also true for
+a prepared execution. Letting the error escape the callback rolls the
+transaction back.
+
+Calls to the same Client's transaction() queue in order. Awaiting one from
+inside its own active callback deadlocks; pass the existing Transaction into
+helpers instead. There is no AbortSignal or timeout option, and racing a
+Promise against a timer does not cancel the work. See
+[transaction composition and errors](https://tinyjoin.org/guides/transactions-and-changes/#composing-transaction-helpers).
+
+Atomicity does not make every failed write's outcome knowable to its caller.
+After `RECOVERY_REQUIRED`, `STORAGE_COMMIT_OUTCOME_UNKNOWN`, or
+`STORAGE_ENGINE_POISONED`, stop using the Client, close and reopen it, and
+reconcile stored state before replaying a write. The `retryable` flag is not a
+safe-replay guarantee. See [storage recovery](https://tinyjoin.org/guides/storage-and-lifecycle/#recovering-after-an-uncertain-write).
+
+Requests are serialized through one Worker. OPFS persistence permits one open
+Worker for a database name; it is an exclusive writer rather than a
+PostgreSQL-style set of concurrent sessions. There is no MVCC session model,
+isolation-level selection, user-controlled savepoints, lock manager, or
+deadlock detection. Different OPFS names are independent databases and do not
+synchronize with one another.
+
+## PostgreSQL facilities that are not present
+
+TinyJoin has no PostgreSQL wire protocol, SQLSTATE-compatible error protocol,
+server process, roles or grants, system catalogs, extensions, stored
+procedures, triggers, notifications, WAL, replication, point-in-time recovery,
+or PostgreSQL file-format compatibility. Rows and parameters are
+JSON-compatible JavaScript values. Result fields use the closest stable
+PostgreSQL OID as metadata: boolean `16`, integer `20`, text `25`, JSON `114`,
+and float `701`. This mapping does not add PostgreSQL storage widths,
+coercions, operators, parsers, or wire semantics.
+
+Persistence is TinyJoin's own page format in memory or one browser OPFS file.
+It is not a PostgreSQL data directory.
+
+JavaScript prepared statements are Worker-owned parsed statements, not
+PostgreSQL named prepared statements, server plan-cache entries, protocol
+objects, or persistent database objects.
+
+## Hard limits
+
+Limits are part of the runtime contract: oversized work fails explicitly
+rather than growing without bound.
+
+| Resource | Current limit |
+| --- | ---: |
+| Physical database | 65,536 4 KiB pages (256 MiB) |
+| Tables / indexes | 4,096 each |
+| Columns per table or projection | 256 |
+| Catalog name | 1,023 UTF-8 bytes |
+| Complete encoded storage key | 1,024 bytes |
+| Encoded logical row data | 1,048,568 bytes |
+| Complete paged row / individual encoded JSON value | 1,048,576 bytes |
+| JSON nesting | 64 levels |
+| SQL text / tokens / parameters | 64 KiB / 4,096 / 1,024 |
+| Expanded bound parameter values | 16 MiB per statement |
+| Open prepared statements / retained prepared state | 128 / 8 MiB per open database |
+| exec() script text / statements | 1 MiB / 256 |
+| exec() row, index, scan, and join operations | 1,000,000 across the script |
+| exec() retained result work | 16 MiB across the script |
+| Predicate nodes / nesting / `IN` values | 256 / 32 / 1,024 |
+| Rows in one `INSERT ... VALUES` | 4,096 |
+| Explicit `LIMIT` / `OFFSET` / `OFFSET + LIMIT` | 100,000 / 4,294,967,295 / 4,294,967,295 |
+| Rows scanned / returned by a query | 1,000,000 / 100,000 |
+| Rows changed by one `UPDATE` or `DELETE` | 100,000 |
+| Ordered matching rows | 100,000 |
+| Transaction overlay | 100,000 keys and 16 MiB |
+| Table sources in one joined `SELECT` | 8 total (one base plus seven `JOIN` clauses) |
+| `ON` equalities in one joined `SELECT` | 32 across the chain |
+| Join candidate row extensions / returned rows | 1,000,000 across the chain / 100,000 |
+| Join retained build rows | 100,000 across the chain |
+| Join working state / result data | 16 MiB / 16 MiB across the chain |
+| Aggregate groups / calls | 100,000 / 64 |
+| Aggregate cells (groups times aggregate calls) | 1,000,000 |
+| Query, DML result, join, aggregate, or mutation working set | 16 MiB per operation-specific bound |
+
+An ordered query can reach its materialization limit before applying a small
+`LIMIT`. Join candidate-extension and retained-row bounds apply to the complete
+left-deep chain, not separately to each step and not just to returned rows. The
+candidate limit is enforced by a runtime counter, including comparisons that
+fail the join condition. The
+1,024-byte secondary-index key limit covers the complete encoded indexed tuple,
+separator, and primary-key tuple together, not each component independently.
+An individual JSON value remains subject to the smaller budget for the row that
+contains it.
+
+Every occurrence of a parameter in a statement counts toward the expanded
+binding budget. Repeating one large `$1` value many times can therefore fail
+with `RESOURCE_LIMIT` even when the supplied parameter array is small. This
+check runs before the values are copied into the statement, including prepared
+executions and queries with `LIMIT 0`. It is an independent allocation bound,
+not a limit on the total memory used by the browser or WebAssembly instance.
+
+# Caveats
+
+Source: https://tinyjoin.org/guides/caveats/
+
+TinyJoin is small on purpose, and being small has costs. This page collects
+what an application signs up for, in one place, so that the decision gets made
+before the schema does.
+
+If any of these are unacceptable, there are
+[more mature projects](https://tinyjoin.org/guides/caveats/#if-tinyjoin-is-not-the-right-fit) that solve the same
+problem with different trade-offs.
+
+## It is experimental
+
+TinyJoin is at v0.0.6. The JavaScript API, the SQL dialect, the error codes,
+and the page format can all change between releases, and a release may require
+an application to recreate its persistent database rather than migrate it.
+
+Version the OPFS name alongside the schema generation, as in
+`opfs://my-app-v1`, so that a breaking change becomes a new database rather
+than a broken one. The [release notes](https://tinyjoin.org/guides/releases/) record each release's
+compatibility boundary.
+
+## The SQL is a bounded subset
+
+TinyJoin implements its own PostgreSQL-shaped dialect. It is not PostgreSQL
+compiled to WebAssembly, and familiar syntax is implemented only where the
+smaller runtime can give it clear and deterministic semantics. Unsupported
+forms are rejected explicitly rather than silently reinterpreted.
+
+The omissions most likely to matter are:
+
+- No subqueries, CTEs, `UNION`/`INTERSECT`/`EXCEPT`, or `DISTINCT`.
+- No arithmetic, concatenation, casts, or scalar functions. Values are not a
+  general expression language.
+- No `LIKE`/`ILIKE`, `BETWEEN`, `ANY`/`ALL`, or JSON path operators, so
+  substring search and ranged text matching have to happen outside SQL.
+- No `ON CONFLICT` upsert, `INSERT ... SELECT`, `MERGE`, or `UPDATE ... FROM`.
+- No sequences, `SERIAL`, or generated identity. Generate text identifiers in
+  the client.
+- No `NUMERIC`/`DECIMAL`, date, time, interval, `UUID`, `BYTEA`, array, enum,
+  or user-defined types. Five runtime types cover boolean, integer, float,
+  text, and JSON.
+- No `HAVING`, distinct or filtered aggregates, window functions,
+  `RIGHT`/`FULL`/`CROSS` joins, views, or triggers.
+
+The [SQL compatibility contract](https://tinyjoin.org/guides/sql-compatibility/) is the exact list.
+Read it before designing a schema, not after.
+
+## One writer, and effectively one tab
+
+A persistent database opens with an exclusive OPFS synchronous access handle. A
+second Worker for the same `opfs://` name fails to open rather than risking
+concurrent mutation, and in practice a second Worker means a second tab of the
+same application. There is no silent fallback to memory.
+
+TinyJoin does not coordinate tabs. It uses no `SharedWorker`,
+`BroadcastChannel`, or Web Locks, and a
+[subscription](https://tinyjoin.org/guides/transactions-and-changes/) only reports changes made
+through its own Client.
+
+The same restriction applies to two Clients in one page. Different OPFS names
+can open at the same time, but each has independent data; they provide no
+shared view or synchronization.
+
+An application that needs a real multi-tab story has to build one:
+
+- Catch the open failure and tell the user the application is already open in
+  another tab. This is the smallest honest option.
+- Or elect one writer tab and route queries to it over a channel you own.
+- Or open a memory database in secondary tabs when they only need a snapshot.
+
+## It needs a modern browser
+
+TinyJoin requires WebAssembly and dedicated module Workers, and persistence
+additionally requires a secure context and OPFS synchronous access handles. It
+deliberately does not use `SharedArrayBuffer`, so a page does not need
+cross-origin isolation headers.
+
+The automated browser suite currently runs on Chromium only. Firefox and WebKit
+are not verified, and a successful TypeScript or Vite build says nothing about
+them. Test the browsers an application actually targets.
+
+There is also no fallback to IndexedDB or memory when persistent storage is
+unavailable, locked, corrupt, or out of quota. create() rejects instead.
+
+TinyJoin does not automatically restore a Client closed during page teardown.
+If the browser restores that page from its back/forward cache, the application
+must reopen its Client and recreate statements and subscriptions, or reload
+the page. The [lifecycle guide](https://tinyjoin.org/guides/storage-and-lifecycle/#opening-and-closing)
+describes this boundary.
+
+## Browser storage is not durable storage
+
+OPFS is browser-managed. A user can clear it, and a browser may evict
+best-effort storage under pressure. A `navigator.storage.persist()` request is
+a request, not a guarantee, and TinyJoin does not make that product decision
+during startup.
+
+Treat a TinyJoin database as reconstructable local state. Data that has to
+survive needs a copy the application controls.
+
+A storage or commit-result failure can leave a write's outcome uncertain.
+`RECOVERY_REQUIRED`, `STORAGE_COMMIT_OUTCOME_UNKNOWN`, and
+`STORAGE_ENGINE_POISONED` require closing and reopening the Client. Reconcile
+the recovered rows with stable operation identifiers before any replay;
+`retryable` does not guarantee that replay is safe. The
+[recovery guide](https://tinyjoin.org/guides/storage-and-lifecycle/#recovering-after-an-uncertain-write)
+explains how to preserve that distinction.
+
+## Transactions need bounded callbacks
+
+Nested callback transactions are unsupported: awaiting another transaction()
+on the same Client inside its callback deadlocks. Pass the active Transaction
+to helpers. There is no AbortSignal or built-in timeout; Promise.race() stops
+waiting without cancelling work, which can still commit. Read the
+[transaction guide](https://tinyjoin.org/guides/transactions-and-changes/#composing-transaction-helpers)
+before composing asynchronous application work.
+
+## There is no server, and no sync
+
+TinyJoin has no PostgreSQL wire protocol, server process, roles or grants,
+system catalogs, extensions, stored procedures, WAL, replication, or
+point-in-time recovery. It does not synchronize with a remote database and does
+not propagate offline writes. Its storage is TinyJoin's own page format, not a
+PostgreSQL data directory.
+
+## The limits are hard limits
+
+Oversized work fails explicitly rather than growing until the tab dies. A
+persistent database is bounded to 256 MiB, one query returns at most 100,000
+rows, a join chains at most eight table sources, and SQL text, parameters,
+prepared statements, and working memory each have a named bound. The complete
+list is in [hard limits](https://tinyjoin.org/guides/sql-compatibility/#hard-limits).
+
+That boundedness is deliberate, but it does mean TinyJoin is sized for
+application state rather than for analytics over a large dataset.
+
+## Performance depends on the workload
+
+Running SQL off the main thread keeps engine work out of the page's rendering
+loop. It does not guarantee low latency or throughput on every browser and
+device. Measure the application's schema, query shapes, and storage mode.
+
+Transactions that only append new primary keys use incremental statement
+validation. Mixed writes still validate the complete staged write set after
+each statement and can have quadratic staging cost. Multi-row statements can
+reduce that overhead; see [inserting many rows](https://tinyjoin.org/guides/transactions-and-changes/#inserting-many-rows).
+
+Aggregates scan their input table, and transaction queries currently do not
+use secondary indexes for lookup acceleration. Opening a persistent database
+validates its stored trees, so startup cost grows with the stored data. Commit
+and browser storage costs are separate from statement staging.
+
+A local before/after check of incremental insertion used 1,000 awaited
+prepared inserts in one transaction, with an integer primary key and a short
+text value. Three-run medians on an Apple M2 in Chromium, using the packaged
+default Worker, were:
+
+| Storage | Staging before / after | Whole transaction before / after |
+| --- | --- | --- |
+| Memory | 1,324 / 62 ms | 1,557 / 304 ms |
+| OPFS | 1,327 / 56 ms | 1,571 / 310 ms |
+
+Commit time remained about 230–250 ms. These are diagnostic measurements of
+one insertion workload, not a controlled comparison with other databases or
+a browser support/performance guarantee. The repository retains the samples
+and runtime hashes under `benchmarks/`; after `npm run build`, reproduce the
+browser workload with `node scripts/benchmark-browser-inserts.mjs` and the
+separate engine/unique-index workload with `node scripts/benchmark-staging.mjs`.
+
+## If TinyJoin is not the right fit
+
+These projects are larger, more mature, or both, and are the better answer when
+the caveats above are not acceptable:
+
+- [PGlite](https://pglite.dev/) is real PostgreSQL compiled to WebAssembly,
+  with the full dialect and extensions. Choose it when genuine PostgreSQL
+  compatibility matters more than download size.
+- [SQLite Wasm](https://sqlite.org/wasm/) is the official SQLite build for the
+  browser, with an OPFS backend, decades of stability, and a much larger SQL
+  surface.
+- [wa-sqlite](https://github.com/rhashimoto/wa-sqlite) is SQLite for the
+  browser with pluggable storage backends, including ones designed for
+  concurrent tabs.
+- [DuckDB-Wasm](https://github.com/duckdb/duckdb-wasm) is columnar analytics in
+  the browser, for aggregate queries over large datasets.
+- [Dexie](https://dexie.org/) is a typed IndexedDB wrapper, for when relational
+  SQL is not the requirement and broad browser support is.
+- [TinyBase](https://tinybase.org/) is a reactive data store with persistence
+  and synchronization, for when the requirement is local-first sync rather than
+  SQL.
+
+None of that is a criticism of those projects. TinyJoin exists because a useful
+subset of the same problem fits in a much smaller download.
+
+# Transactions and changes
+
+Source: https://tinyjoin.org/guides/transactions-and-changes/
+
+Each TinyJoin query is atomic. Use a callback transaction when several related
+row mutations must commit together.
+
+```ts
+await db.transaction(async (tx) => {
+  await tx.query('UPDATE accounts SET balance = $1 WHERE id = $2', [40, 'a']);
+  await tx.query('UPDATE accounts SET balance = $1 WHERE id = $2', [60, 'b']);
+});
+```
+
+Reads inside the callback see staged rows. Use the transaction object for all
+database work until its callback finishes; direct Client operations fail while
+it is active, and a later transaction() call waits its turn. Letting an error
+escape before commit discards the staged transaction.
+
+TinyJoin does not put a callback transaction into PostgreSQL's aborted state
+after a statement failure. If application code catches that failure, earlier
+staged writes may still commit. Call tx.rollback() or rethrow when the whole
+unit should be discarded.
+
+Run schema DDL such as `CREATE`, `ALTER`, and `DROP` outside the callback, using
+a standalone query() or an atomic exec() script.
+
+## Composing transaction helpers
+
+Nested callback transactions are not supported. In particular, do not await
+db.transaction() from inside that same Client's transaction callback: the
+inner call queues behind the outer call, while the outer callback waits for
+the inner call. Neither can finish, and there is no deadlock detector.
+
+Pass the active Transaction to helpers instead of having each helper open a
+transaction:
+
+```ts
+import type {Transaction} from 'tinyjoin';
+
+const setBalance = async (tx: Transaction, id: string, balance: number) => {
+  await tx.query('UPDATE accounts SET balance = $1 WHERE id = $2', [balance, id]);
+};
+
+await db.transaction(async (tx) => {
+  await setBalance(tx, 'a', 40);
+  await setBalance(tx, 'b', 60);
+});
+```
+
+Use tx.query(), tx.exec(), or tx.execute() throughout the callback. Prepare
+handles before entering it. tx.exec() gives a read/DML script its own atomic
+failure boundary within the active transaction; it does not open a nested
+transaction or expose general-purpose savepoints.
+
+## Errors and cancellation
+
+An ordinary statement failure changes none of that statement's staged rows.
+Rethrow it or call tx.rollback() to discard earlier staged work too. A failure
+while publishing a commit has a different boundary: `RECOVERY_REQUIRED`,
+`STORAGE_COMMIT_OUTCOME_UNKNOWN`, or `STORAGE_ENGINE_POISONED` requires closing
+the Client, reopening the same OPFS name, and reconciling the operation before
+replay. Rejection of transaction() alone is not proof that a commit did not
+happen. Follow the [recovery procedure](https://tinyjoin.org/guides/storage-and-lifecycle/#recovering-after-an-uncertain-write).
+
+There is no AbortSignal, query timeout, or transaction timeout option.
+Promise.race() with a timer only stops the caller waiting; the callback and
+queued database work can continue and may commit. It is not cancellation or
+evidence of rollback. Avoid waiting for network requests, user input, or a
+nested transaction inside a callback. Keep the callback bounded, and request
+an explicit tx.rollback() while it is active when application logic decides
+to abandon staged work. Closing a Client is teardown, not a safe way to infer
+the outcome of an in-flight write.
+
+## Inserting many rows
+
+Prepare a parameterized `INSERT` once and execute it through the transaction
+object. Transactions that only append new primary keys validate each new
+statement incrementally, including unique-index constraints. Final commit
+still validates and publishes the complete write set.
+
+```ts
+const insert = await db.prepare('INSERT INTO tasks (id, title) VALUES ($1, $2)');
+try {
+  await db.transaction(async (tx) => {
+    for (const title of titles) {
+      await tx.execute(insert, [crypto.randomUUID(), title]);
+    }
+  });
+} finally {
+  await insert.close();
+}
+```
+
+Updating, deleting, or revisiting a staged key switches that transaction to
+complete write-set validation after each statement. Many individual writes
+on that path can have quadratic staging cost. Repeated tx.exec() calls also
+copy the current transaction state for script rollback. Keep transactions
+bounded and prefer multi-row statements when the application can form them
+within the [SQL limits](https://tinyjoin.org/guides/sql-compatibility/#hard-limits).
+
+These limits apply cumulatively across the transaction, even when each
+individual statement is small. Transaction reads use the staged row view;
+secondary-index query acceleration is currently disabled inside callbacks.
+
+## Re-query after a commit
+
+Subscriptions report changed table names rather than maintaining a live result
+object:
+
+```ts
+const unsubscribe = db.subscribe({tables: ['tasks']}, async () => {
+  const {rows} = await db.query('SELECT * FROM tasks ORDER BY id');
+  render(rows);
+});
+```
+
+The listener runs after a commit. Several statements in one transaction produce
+one committed revision and one table-level invalidation. Call the returned
+function to unsubscribe before closing the database.
+
+This explicit re-query model keeps TinyJoin independent of UI frameworks and
+lets an application choose its own caching or rendering policy.
+
+# Custom Workers
+
+Source: https://tinyjoin.org/guides/custom-workers/
+
+Most applications should use create(). It constructs TinyJoin's packaged
+module Worker and preserves the relative Worker, OPFS runtime, and WebAssembly
+assets during the supported Vite build path.
+
+An application that needs to own the Worker can provide a factory:
+
+```ts
+const db = await create({
+  workerFactory: () =>
+    new Worker(new URL('./tinyjoin.worker.ts', import.meta.url), {
+      name: 'tinyjoin',
+      type: 'module',
+    }),
+});
+```
+
+The Worker entry starts the same standalone engine:
+
+```ts
+import {startWorker} from 'tinyjoin/worker';
+
+startWorker();
+```
+
+Use at most one of `worker`, `workerFactory`, or `workerUrl`. A custom Worker is
+an advanced bundling boundary, not a requirement for persistent storage.
+
+Synchronous OPFS access is available in a dedicated Worker, not a SharedWorker.
+Ordinary browser Workers also cannot open arbitrary PostgreSQL TCP connections.
+Network replication or offline write synchronization would require separately
+designed transports, durability, authorization, and conflict semantics; none is
+hidden in the current package.
+
 # Agents guide
+
+Source: https://tinyjoin.org/guides/agents-guide/
 
 This guide follows the [agents.md](https://agents.md/) convention and gives AI
 coding assistants a compact, current model of TinyJoin.
@@ -62,6 +1086,8 @@ supported Vite starter.
 - Consult the
   [SQL compatibility contract](https://tinyjoin.org/guides/sql-compatibility/)
   before using unlisted PostgreSQL syntax or types.
+- Joins run left to right as bounded nested loops, without reordering or
+  index-based join lookup. Check actual workload size against the join limits.
 
 Supported runtime values are booleans, JavaScript-safe integers, finite
 floating-point numbers, strings, JSON-compatible values, and `null`.
@@ -72,9 +1098,17 @@ Use db.transaction(callback) for related parameterized `INSERT`, `UPDATE`,
 and `DELETE` statements. Use the transaction object inside the callback and do
 not retain it. Run DDL outside the callback.
 
-An uncaught callback error rolls everything back. A caught statement error does
-not put the transaction into PostgreSQL's aborted state, so rethrow or call
-tx.rollback() when earlier staged changes must also be discarded.
+Pass the active Transaction to helpers; awaiting another db.transaction() on
+the same Client inside its callback deadlocks. There is no AbortSignal or
+timeout API. Promise.race() stops waiting but does not cancel a write.
+
+An uncaught callback error before commit discards staged work. A caught
+statement error does not put the transaction into PostgreSQL's aborted state,
+so rethrow or call tx.rollback() when earlier staged changes must also be discarded.
+
+Append-only inserts validate incrementally; updates, deletes, or revisiting a
+staged key switch to full write-set validation per statement. Keep mixed
+transactions bounded and prefer multi-row writes where practical.
 
 Subscriptions report changed tables. Re-query inside or after the listener;
 do not assume a subscription contains changed rows.
@@ -83,10 +1117,21 @@ do not assume a subscription contains changed rows.
 
 - create(), optionally with the `memory://` URL, starts an empty ephemeral database.
 - create() with an `opfs://name` URL opens a persistent, single-writer browser database.
+- One Client can hold a name at a time, including across tabs. Different names
+  have independent data and do not synchronize.
 - Keep the OPFS name stable and version it deliberately with the schema.
 - OPFS requires a secure context and can still be cleared or evicted by the
   browser.
 - Call db.close() on teardown so storage locks and the Worker are released.
+- After `RECOVERY_REQUIRED`, `STORAGE_COMMIT_OUTCOME_UNKNOWN`, or
+  `STORAGE_ENGINE_POISONED`, stop work, close and reopen the same OPFS name,
+  and reconcile stable operation identifiers before replay. `retryable` is
+  not a safe-replay guarantee. Follow the
+  [recovery guide](https://tinyjoin.org/guides/storage-and-lifecycle/#recovering-after-an-uncertain-write).
+
+The [full agent reference](https://tinyjoin.org/llms-full.txt) combines all guides and documented
+public TypeScript declarations. Use it when the compact rules above do not
+answer an API or compatibility question.
 
 ## Repository work
 
@@ -127,3 +1172,789 @@ The real package/browser gates matter for changes around Worker URLs, private
 runtime files, WebAssembly, or OPFS. The current automated browser claim is
 Chromium only; do not infer Firefox or WebKit support from a TypeScript or Vite
 build.
+
+# Releases
+
+Source: https://tinyjoin.org/guides/releases/
+
+This is a reverse chronological summary of TinyJoin releases and their public
+compatibility boundaries.
+
+## v0.0.6
+
+This release is being prepared locally and has not yet been published.
+
+**Persistent storage breaks compatibility with v0.0.5.** The npm v0.0.5
+release uses page format 1; v0.0.6 uses page format 2. Opening a v0.0.5
+database with v0.0.6 fails with `UNSUPPORTED_PAGE`. There is no automatic
+migration, and changing the OPFS name does not copy existing data.
+
+- For data that can be reconstructed, use a new OPFS namespace, for example
+  change `opfs://my-app-v1` to `opfs://my-app-v2`, and rebuild the database.
+  The old namespace remains intact.
+- To retain existing data, export the application's known tables using a
+  client pinned to `tinyjoin@0.0.5` before upgrading. Create the schema in a
+  new namespace with v0.0.6, import rows with parameterized statements, and
+  verify the data before retiring the old database. TinyJoin does not yet
+  provide a general database export or migration API.
+- New apps generated by create-tinyjoin v0.0.7 target `tinyjoin@^0.0.6` and
+  use a `-db-v2` storage name. Updating the generator does not migrate
+  applications it generated previously.
+
+This release also makes predicate and assignment type validation consistent
+across reads and writes, compares heterogeneous JSON values consistently,
+and bounds shared parameter-graph traversal and expanded SQL bindings before
+copying values. Append-only transactions now validate new row statements
+incrementally, including unique-index checks; mixed writes retain complete
+staged write-set validation.
+
+Selective multi-table joins now use their actual comparison count rather than
+a worst-case Cartesian estimate. Scan, build-row, result, memory, and shared
+script-work limits remain in force.
+
+## v0.0.5
+
+This release establishes TinyJoin as a standalone, SQL-first browser database
+package.
+
+- create() opens the packaged dedicated Worker and WebAssembly engine with no
+  application Worker boilerplate.
+- Memory and persistent OPFS databases use one bounded page-native engine.
+- The JavaScript client provides parameterized queries, atomic scripts,
+  callback transactions, reusable prepared statements, and table-level change
+  subscriptions.
+- Typed tables support primary keys, maintained secondary and unique indexes,
+  bounded schema additions, aggregates, and left-deep inner and left joins.
+- Results use a familiar `rows`, `fields`, `affectedRows`, `command`, and
+  `rowCount` shape, with TinyJoin revision and changed-table metadata.
+- The published package includes its runtime, Worker, WASM, declarations,
+  compatibility guide, README, release notes, and agent guidance.
+
+TinyJoin remains experimental and deliberately smaller than PostgreSQL. This
+release does not include a PostgreSQL server or wire protocol, hosted service,
+remote replication, or offline-write synchronization.
+
+# Guides
+
+Source: https://tinyjoin.org/guides/
+
+These guides start with the smallest useful TinyJoin application and reveal
+storage, transactions, custom Workers, and compatibility details only when they
+become relevant.
+
+The [caveats](https://tinyjoin.org/guides/caveats/) collect what TinyJoin deliberately does not do,
+and which projects to reach for when that matters.
+
+For exact method and type signatures, use the [API reference](https://tinyjoin.org/api/).
+
+# Public API: tinyjoin
+
+Source: https://tinyjoin.org/api/tinyjoin/
+
+````ts
+/**
+ * The tinyjoin module provides a small PostgreSQL-shaped relational database
+ * that runs in a dedicated browser Worker and stores data in memory or OPFS.
+ *
+ * Start with the create function. It constructs the Worker and loads the
+ * WebAssembly engine, so applications do not need to manage either directly.
+ * @packageDocumentation
+ * @module tinyjoin
+ * @since v0.0.5
+ */
+
+/**
+ * The JsonPrimitive type represents a scalar value accepted by TinyJoin.
+ * @category Data types
+ * @since v0.0.5
+ */
+export type JsonPrimitive = null | boolean | number | string;
+
+/**
+ * The JsonValue type represents a parameter or result value accepted by the
+ * TinyJoin JavaScript API.
+ * @category Data types
+ * @since v0.0.5
+ */
+export type JsonValue =
+  | JsonPrimitive
+  | JsonValue[]
+  | {[key: string]: JsonValue};
+
+/**
+ * The Row type represents the default object form of a result row.
+ * @category Data types
+ * @since v0.0.5
+ */
+export type Row = Record<string, JsonValue>;
+
+/**
+ * The DataDir type identifies the database storage mode.
+ *
+ * Use `memory://` for an ephemeral database, or `opfs://name` for a persistent
+ * database. Calling create without a data directory also uses memory.
+ * Only one Client can hold an OPFS name at a time, including across tabs.
+ * Different names have independent data and do not synchronize.
+ * @category Configuration
+ * @since v0.0.5
+ */
+export type DataDir = string;
+
+/**
+ * The RowMode type selects object rows or positional array rows.
+ * @category Query results
+ * @since v0.0.5
+ */
+export type RowMode = 'array' | 'object';
+
+/**
+ * The QueryOptions interface configures the shape of query results.
+ *
+ * Only rowMode is supported. There is no AbortSignal or timeout option;
+ * Promise.race with a timer does not cancel database work.
+ * @category Query results
+ * @since v0.0.5
+ */
+export interface QueryOptions {
+  /**
+   * The rowMode property selects object rows by default, or arrays whose values
+   * follow the order of the fields property.
+   * @category Option
+   * @since v0.0.5
+   */
+  rowMode?: RowMode;
+}
+
+/**
+ * The ResultField interface describes one projected result column.
+ * @category Query results
+ * @since v0.0.5
+ */
+export interface ResultField {
+  /**
+   * The name property contains the projected column name or alias.
+   * @category Result
+   * @since v0.0.5
+   */
+  name: string;
+
+  /**
+   * The dataTypeID property contains the closest stable PostgreSQL OID for the
+   * TinyJoin runtime type.
+   * @category Result
+   * @since v0.0.5
+   */
+  dataTypeID: number;
+}
+
+/**
+ * The Results interface is returned by queries, prepared statements, and
+ * scripts.
+ *
+ * It follows the familiar PGlite result shape and adds the observed database
+ * revision and the names of changed tables.
+ * @category Query results
+ * @since v0.0.5
+ */
+export interface Results<RowType = Row> {
+  /**
+   * The rows property contains the rows returned by the statement.
+   * @category Result
+   * @since v0.0.5
+   */
+  rows: RowType[];
+
+  /**
+   * The fields property describes the projected columns in result order.
+   * @category Result
+   * @since v0.0.5
+   */
+  fields: ResultField[];
+
+  /**
+   * The affectedRows property reports the number of rows changed by a write.
+   * @category Result
+   * @since v0.0.5
+   */
+  affectedRows?: number;
+
+  /**
+   * The command property contains the executed statement family.
+   * @category Result
+   * @since v0.0.5
+   */
+  command?: string;
+
+  /**
+   * The rowCount property reports the number of rows returned or changed.
+   * @category Result
+   * @since v0.0.5
+   */
+  rowCount?: number;
+
+  /**
+   * The revision property contains the database revision observed by the
+   * statement.
+   * @category Result
+   * @since v0.0.5
+   */
+  revision: number;
+
+  /**
+   * The tables property contains the tables changed by the statement.
+   * @category Result
+   * @since v0.0.5
+   */
+  tables: string[];
+}
+
+/**
+ * The SerializedError interface is the stable error envelope sent by the
+ * Worker.
+ * @category Errors
+ * @since v0.0.5
+ */
+export interface SerializedError {
+  /**
+   * The code property identifies the TinyJoin error family.
+   * @category Error
+   * @since v0.0.5
+   */
+  code: string;
+
+  /**
+   * The message property explains the failure.
+   * @category Error
+   * @since v0.0.5
+   */
+  message: string;
+
+  /**
+   * The details property contains optional JSON-compatible context.
+   * @category Error
+   * @since v0.0.5
+   */
+  details?: JsonValue;
+
+  /**
+   * The retryable property indicates whether reopening or retrying may succeed.
+   * It does not guarantee that replaying a write is safe or that the current
+   * Client remains usable. Reconcile uncertain writes after reopening.
+   * @category Error
+   * @since v0.0.5
+   */
+  retryable?: boolean;
+}
+
+/**
+ * The WorkerLike interface is the minimal Worker surface accepted by a custom
+ * Client configuration.
+ *
+ * Most applications should let create construct the packaged Worker instead.
+ * @category Workers
+ * @since v0.0.5
+ */
+export interface WorkerLike {
+  /**
+   * The postMessage method sends a request to the Worker.
+   * @category Worker
+   * @since v0.0.5
+   */
+  postMessage(message: unknown): void;
+
+  /**
+   * This addEventListener overload listens for Worker messages.
+   * @category Worker
+   * @since v0.0.5
+   */
+  addEventListener(
+    type: 'message',
+    listener: (event: MessageEvent<unknown>) => void,
+  ): void;
+
+  /**
+   * This addEventListener overload listens for message decoding failures.
+   * @category Worker
+   * @since v0.0.5
+   */
+  addEventListener(
+    type: 'messageerror',
+    listener: (event: MessageEvent<unknown>) => void,
+  ): void;
+
+  /**
+   * This addEventListener overload listens for Worker runtime failures.
+   * @category Worker
+   * @since v0.0.5
+   */
+  addEventListener(
+    type: 'error',
+    listener: (event: ErrorEvent) => void,
+  ): void;
+
+  /**
+   * This removeEventListener overload removes a message listener.
+   * @category Worker
+   * @since v0.0.5
+   */
+  removeEventListener(
+    type: 'message',
+    listener: (event: MessageEvent<unknown>) => void,
+  ): void;
+
+  /**
+   * This removeEventListener overload removes a message-error listener.
+   * @category Worker
+   * @since v0.0.5
+   */
+  removeEventListener(
+    type: 'messageerror',
+    listener: (event: MessageEvent<unknown>) => void,
+  ): void;
+
+  /**
+   * This removeEventListener overload removes a Worker error listener.
+   * @category Worker
+   * @since v0.0.5
+   */
+  removeEventListener(
+    type: 'error',
+    listener: (event: ErrorEvent) => void,
+  ): void;
+
+  /**
+   * The terminate method stops an application-owned Worker when available.
+   * @category Worker
+   * @since v0.0.5
+   */
+  terminate?: () => void;
+}
+
+/**
+ * The ClientOptions interface configures storage or an application-owned
+ * Worker.
+ *
+ * The zero-boilerplate default constructs TinyJoin's packaged module Worker.
+ * Provide at most one of worker, workerFactory, or workerUrl.
+ * @category Configuration
+ * @since v0.0.5
+ */
+export interface ClientOptions {
+  /**
+   * The worker property provides an already-created Worker-compatible object.
+   * @category Option
+   * @since v0.0.5
+   */
+  worker?: WorkerLike;
+
+  /**
+   * The workerFactory property creates an application-owned Worker lazily.
+   * @category Option
+   * @since v0.0.5
+   */
+  workerFactory?: () => WorkerLike;
+
+  /**
+   * The workerUrl property identifies an application-owned module Worker.
+   * @category Option
+   * @since v0.0.5
+   */
+  workerUrl?: string | URL;
+
+  /**
+   * The dataDir property selects memory or a named OPFS database.
+   * @category Option
+   * @since v0.0.5
+   */
+  dataDir?: DataDir;
+}
+
+/**
+ * The TablesChangedEvent interface describes one committed table-level
+ * invalidation.
+ * @category Subscriptions
+ * @since v0.0.5
+ */
+export interface TablesChangedEvent {
+  /**
+   * The revision property contains the committed database revision.
+   * @category Event
+   * @since v0.0.5
+   */
+  revision: number;
+
+  /**
+   * The tables property contains the names of changed tables.
+   * @category Event
+   * @since v0.0.5
+   */
+  tables: string[];
+}
+
+/**
+ * The SubscriptionOptions interface filters invalidations by table name.
+ * @category Subscriptions
+ * @since v0.0.5
+ */
+export interface SubscriptionOptions {
+  /**
+   * The tables property limits delivery to invalidations that include at least
+   * one of these tables. Omit it to observe every table-change invalidation;
+   * adjacent changes may be coalesced.
+   * @category Option
+   * @since v0.0.5
+   */
+  tables?: string[];
+}
+
+/**
+ * The PreparedStatement interface represents one parsed SELECT, INSERT,
+ * UPDATE, or DELETE statement retained by an open Client.
+ * @category SQL
+ * @since v0.0.5
+ */
+export interface PreparedStatement<RowType = Row> {
+  /**
+   * The execute method binds a complete parameter list and runs the statement.
+   * @param params JSON-compatible values for `$1`, `$2`, and so on.
+   * @param options Result-shape options.
+   * @returns A Promise resolving to the statement results.
+   * @category SQL
+   * @since v0.0.5
+   */
+  execute(
+    params?: JsonValue[],
+    options?: QueryOptions,
+  ): Promise<Results<RowType>>;
+
+  /**
+   * The close method seals the handle and releases its Worker resources after
+   * already-started executions settle.
+   * @category Lifecycle
+   * @since v0.0.5
+   */
+  close(): Promise<void>;
+
+  /**
+   * The closed property indicates whether the handle has been sealed.
+   * @category Lifecycle
+   * @since v0.0.5
+   */
+  readonly closed: boolean;
+}
+
+/**
+ * The Transaction interface runs reads and row mutations against one isolated
+ * staged database inside a Client.transaction callback.
+ *
+ * Do not retain this object after its callback completes. Run schema DDL in a
+ * standalone Client.query call or Client.exec script.
+ * Pass this object to helpers instead of awaiting another transaction on the
+ * same Client, which would queue behind the active callback and deadlock.
+ * @category Transactions
+ * @since v0.0.5
+ */
+export interface Transaction {
+  /**
+   * The query method runs one parameterized statement against staged data.
+   * @category Transactions
+   * @since v0.0.5
+   */
+  query<RowType = Row>(
+    sql: string,
+    params?: JsonValue[],
+    options?: QueryOptions,
+  ): Promise<Results<RowType>>;
+
+  /**
+   * The sql method is a parameterizing tagged-template form of query.
+   * @category Transactions
+   * @since v0.0.5
+   */
+  sql<RowType = Row>(
+    strings: TemplateStringsArray,
+    ...params: JsonValue[]
+  ): Promise<Results<RowType>>;
+
+  /**
+   * The exec method runs a parameter-free DML and read script as one savepoint.
+   * @category Transactions
+   * @since v0.0.5
+   */
+  exec(sql: string, options?: QueryOptions): Promise<Results[]>;
+
+  /**
+   * The execute method runs a prepared statement owned by the same Client.
+   * @category Transactions
+   * @since v0.0.5
+   */
+  execute<RowType = Row>(
+    statement: PreparedStatement<RowType>,
+    params?: JsonValue[],
+    options?: QueryOptions,
+  ): Promise<Results<RowType>>;
+
+  /**
+   * The rollback method explicitly discards the staged transaction.
+   * @category Transactions
+   * @since v0.0.5
+   */
+  rollback(): Promise<void>;
+
+  /**
+   * The closed property indicates that the transaction is sealed, including
+   * after an explicit rollback or after its callback finishes.
+   * @category Lifecycle
+   * @since v0.0.5
+   */
+  readonly closed: boolean;
+}
+
+/**
+ * The Client class represents one open TinyJoin database and its dedicated
+ * Worker.
+ *
+ * Prefer the async create function so initialization failures are reported
+ * before the Client is returned.
+ * @category Lifecycle
+ * @since v0.0.5
+ */
+export class Client {
+  /**
+   * The constructor begins opening a Client immediately.
+   *
+   * Prefer create unless code specifically needs the waitReady lifecycle.
+   * @category Lifecycle
+   * @since v0.0.5
+   */
+  constructor(options?: ClientOptions);
+
+  /**
+   * The waitReady property resolves when the Worker and database are ready.
+   * @category Lifecycle
+   * @since v0.0.5
+   */
+  readonly waitReady: Promise<void>;
+
+  /**
+   * The ready property indicates that initialization finished and closing has
+   * not started.
+   * @category Lifecycle
+   * @since v0.0.5
+   */
+  readonly ready: boolean;
+
+  /**
+   * The closed property indicates that Client cleanup has completed.
+   * @category Lifecycle
+   * @since v0.0.5
+   */
+  readonly closed: boolean;
+
+  /**
+   * The query method executes exactly one parameterized SQL statement.
+   * @param sql A statement in the documented TinyJoin SQL subset.
+   * @param params JSON-compatible values for `$1`, `$2`, and so on.
+   * @param options Result-shape options.
+   * @returns A Promise resolving to the statement results.
+   * @category SQL
+   * @essential Using a database
+   * @since v0.0.5
+   */
+  query<RowType = Row>(
+    sql: string,
+    params?: JsonValue[],
+    options?: QueryOptions,
+  ): Promise<Results<RowType>>;
+
+  /**
+   * The sql method is a parameterizing tagged-template form of query.
+   *
+   * Interpolated values become `$n` parameters. It does not interpolate raw
+   * identifiers or SQL fragments.
+   * @category SQL
+   * @essential Using a database
+   * @since v0.0.5
+   */
+  sql<RowType = Row>(
+    strings: TemplateStringsArray,
+    ...params: JsonValue[]
+  ): Promise<Results<RowType>>;
+
+  /**
+   * The prepare method parses and retains one reusable read or row-mutation
+   * statement in the Worker.
+   * @category SQL
+   * @since v0.0.5
+   */
+  prepare<RowType = Row>(sql: string): Promise<PreparedStatement<RowType>>;
+
+  /**
+   * The exec method runs one or more parameter-free statements as one implicit
+   * transaction.
+   * @category SQL
+   * @essential Using a database
+   * @since v0.0.5
+   */
+  exec(sql: string, options?: QueryOptions): Promise<Results[]>;
+
+  /**
+   * The transaction method stages row mutations and publishes them together
+   * when the callback succeeds, unless it explicitly rolls back.
+   *
+   * Transaction calls on this Client queue in order. Do not await another transaction on
+   * this Client inside the callback; pass its Transaction to helpers instead.
+   * Use that object for all SQL in the callback and prepare handles beforehand.
+   * An uncaught callback error before commit discards staged work. A caught
+   * statement error leaves earlier writes staged unless rollback is called.
+   *
+   * There is no cancellation or timeout option. Promise.race only stops
+   * waiting, and queued work can still commit. Rejection during commit can
+   * leave its outcome uncertain; see the
+   * [recovery guide](https://tinyjoin.org/guides/storage-and-lifecycle/#recovering-after-an-uncertain-write)
+   * before replaying a failed write.
+   * @category Transactions
+   * @essential Using a database
+   * @since v0.0.5
+   */
+  transaction<Result>(
+    callback: (transaction: Transaction) => Result | Promise<Result>,
+  ): Promise<Result>;
+
+  /**
+   * The subscribe method listens for committed table changes and returns an
+   * unsubscribe function.
+   * @category Subscriptions
+   * @since v0.0.5
+   */
+  subscribe(
+    options: SubscriptionOptions,
+    listener: (event: TablesChangedEvent) => void,
+  ): () => void;
+
+  /**
+   * The getRevision method returns the newest database revision observed by
+   * this Client.
+   * @category Subscriptions
+   * @since v0.0.5
+   */
+  getRevision(): number;
+
+  /**
+   * The close method releases prepared statements, storage, and the Worker.
+   * Repeated calls share the same asynchronous cleanup.
+   * A closed Client cannot resume; create a new one and recreate its prepared
+   * statements and subscriptions. Closing is not a cancellation or rollback
+   * guarantee for a write already in flight.
+   * @category Lifecycle
+   * @since v0.0.5
+   */
+  close(): Promise<void>;
+}
+
+/**
+ * The create function opens a TinyJoin database in a dedicated Worker.
+ *
+ * Calling it with no argument creates an ephemeral memory database. Pass a
+ * stable `opfs://name` to persist the database in browser storage.
+ * @example
+ * ```ts
+ * import {create} from 'tinyjoin';
+ *
+ * const db = await create('opfs://my-app');
+ * await db.exec(`
+ *   CREATE TABLE IF NOT EXISTS tasks (
+ *     id INTEGER PRIMARY KEY,
+ *     title TEXT NOT NULL
+ *   )
+ * `);
+ * const {rows} = await db.query('SELECT * FROM tasks ORDER BY id');
+ * await db.close();
+ * ```
+ * @category Lifecycle
+ * @essential Using a database
+ * @since v0.0.5
+ */
+export function create(): Promise<Client>;
+export function create(options: ClientOptions): Promise<Client>;
+export function create(
+  dataDir: DataDir | undefined,
+  options?: ClientOptions,
+): Promise<Client>;
+
+/**
+ * The ClientError class extends JavaScript Error with a validated error
+ * returned by the TinyJoin Worker.
+ *
+ * RECOVERY_REQUIRED, STORAGE_COMMIT_OUTCOME_UNKNOWN, and
+ * STORAGE_ENGINE_POISONED mean the engine must no longer be used. Stop work,
+ * close the Client, reopen the same OPFS name, and reconcile stored state
+ * using stable operation identifiers before replaying a write. A rejected
+ * operation may already have committed. See the
+ * [recovery guide](https://tinyjoin.org/guides/storage-and-lifecycle/#recovering-after-an-uncertain-write).
+ * @category Errors
+ * @since v0.0.5
+ */
+export class ClientError extends Error {
+  /**
+   * The constructor creates an Error from its serialized Worker envelope.
+   * @category Error
+   * @since v0.0.5
+   */
+  constructor(error: SerializedError);
+
+  /**
+   * The code property identifies the TinyJoin error family.
+   * @category Error
+   * @since v0.0.5
+   */
+  readonly code: string;
+
+  /**
+   * The details property contains optional JSON-compatible context.
+   * @category Error
+   * @since v0.0.5
+   */
+  readonly details: SerializedError['details'];
+
+  /**
+   * The retryable property indicates whether reopening or retrying may succeed.
+   * It is not a safe-replay guarantee. An uncertain write requires reopening
+   * and reconciliation even when application code wants to retry it.
+   * @category Error
+   * @since v0.0.5
+   */
+  readonly retryable: boolean;
+}
+````
+
+# Public API: tinyjoin/worker
+
+Source: https://tinyjoin.org/api/worker/
+
+````ts
+/**
+ * The worker module lets advanced applications start TinyJoin inside a Worker
+ * that they construct and bundle themselves.
+ *
+ * Most applications should use create from the main tinyjoin module, which
+ * constructs the packaged Worker automatically.
+ * @packageDocumentation
+ * @module worker
+ * @since v0.0.5
+ */
+
+/**
+ * The startWorker function starts the TinyJoin request host in the current
+ * dedicated Worker.
+ * @example
+ * ```ts
+ * import {startWorker} from 'tinyjoin/worker';
+ *
+ * startWorker();
+ * ```
+ * @category Workers
+ * @since v0.0.5
+ */
+export function startWorker(): void;
+````

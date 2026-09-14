@@ -13,7 +13,7 @@ await db.transaction(async (tx) => {
 Reads inside the callback see staged rows. Use the transaction object for all
 database work until its callback finishes; direct Client operations fail while
 it is active, and a later transaction() call waits its turn. Letting an error
-escape rolls the complete transaction back.
+escape before commit discards the staged transaction.
 
 TinyJoin does not put a callback transaction into PostgreSQL's aborted state
 after a statement failure. If application code catches that failure, earlier
@@ -22,6 +22,53 @@ unit should be discarded.
 
 Run schema DDL such as `CREATE`, `ALTER`, and `DROP` outside the callback, using
 a standalone query() or an atomic exec() script.
+
+## Composing transaction helpers
+
+Nested callback transactions are not supported. In particular, do not await
+db.transaction() from inside that same Client's transaction callback: the
+inner call queues behind the outer call, while the outer callback waits for
+the inner call. Neither can finish, and there is no deadlock detector.
+
+Pass the active Transaction to helpers instead of having each helper open a
+transaction:
+
+```ts
+import type {Transaction} from 'tinyjoin';
+
+const setBalance = async (tx: Transaction, id: string, balance: number) => {
+  await tx.query('UPDATE accounts SET balance = $1 WHERE id = $2', [balance, id]);
+};
+
+await db.transaction(async (tx) => {
+  await setBalance(tx, 'a', 40);
+  await setBalance(tx, 'b', 60);
+});
+```
+
+Use tx.query(), tx.exec(), or tx.execute() throughout the callback. Prepare
+handles before entering it. tx.exec() gives a read/DML script its own atomic
+failure boundary within the active transaction; it does not open a nested
+transaction or expose general-purpose savepoints.
+
+## Errors and cancellation
+
+An ordinary statement failure changes none of that statement's staged rows.
+Rethrow it or call tx.rollback() to discard earlier staged work too. A failure
+while publishing a commit has a different boundary: `RECOVERY_REQUIRED`,
+`STORAGE_COMMIT_OUTCOME_UNKNOWN`, or `STORAGE_ENGINE_POISONED` requires closing
+the Client, reopening the same OPFS name, and reconciling the operation before
+replay. Rejection of transaction() alone is not proof that a commit did not
+happen. Follow the [recovery procedure](/guides/storage-and-lifecycle/#recovering-after-an-uncertain-write).
+
+There is no AbortSignal, query timeout, or transaction timeout option.
+Promise.race() with a timer only stops the caller waiting; the callback and
+queued database work can continue and may commit. It is not cancellation or
+evidence of rollback. Avoid waiting for network requests, user input, or a
+nested transaction inside a callback. Keep the callback bounded, and request
+an explicit tx.rollback() while it is active when application logic decides
+to abandon staged work. Closing a Client is teardown, not a safe way to infer
+the outcome of an in-flight write.
 
 ## Inserting many rows
 

@@ -79,13 +79,24 @@ shape.
 ```ts
 window.addEventListener(
   'pagehide',
-  () => void db.close(),
+  () => void db.close().catch(console.error),
   {once: true},
 );
+window.addEventListener('pageshow', (event) => {
+  if (event.persisted) {
+    window.location.reload();
+  }
+});
 ```
 
 Closing releases prepared statements, storage, and the Worker. It is
 asynchronous and safe to call more than once.
+
+Closing cannot be undone. This example reloads a page restored from the
+back/forward cache so startup creates a fresh Client. A browser does not await
+pagehide cleanup; finish and await writes during normal use. Applications
+with their own lifecycle can reopen and recreate their database state instead
+of reloading. See [storage and lifecycle](/guides/storage-and-lifecycle/).
 
 The [Todo starter demo](/demos/todo-starter/) puts these calls together in a
 small browser application.

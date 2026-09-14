@@ -1,9 +1,9 @@
 # Bank transactions
 
-Callback transactions group related parameterized mutations, so a failure part
-way through leaves nothing behind. The demo above moves money between two
-accounts; the second button deliberately fails, and you can watch the balances
-stay exactly where they were.
+Callback transactions group related parameterized mutations. An error thrown
+out of the callback rolls back its staged changes. The demo above moves money
+between two accounts; the second button deliberately throws after staging the
+debit, and you can watch both balances stay exactly where they were.
 
 First, since the demo runs in a browser, register an import alias for
 TinyJoin. The site serves its own copy, because a Worker cannot be constructed
@@ -51,9 +51,14 @@ await db.query(
 
 A transfer is two updates that must both happen, or neither. transaction()
 stages them and publishes them once, and reads through the transaction object
-see the staged rows before the commit:
+see the staged rows before the commit. An application would normally check
+available funds before writing. To demonstrate rollback of an actual write,
+this demo deliberately checks after staging Ada's debit and before crediting
+Grace:
 
 ```js
+class InsufficientFundsError extends Error {}
+
 const transfer = async (amount) => {
   await db.transaction(async (tx) => {
     const {rows} = await tx.query(
@@ -63,14 +68,15 @@ const transfer = async (amount) => {
       rows.map(({id, balance}) => [id, balance]),
     );
 
-    if (balances.sender < amount) {
-      throw new Error(`Ada cannot afford ${amount}`);
-    }
-
     await tx.query('UPDATE accounts SET balance = $1 WHERE id = $2', [
       balances.sender - amount,
       'sender',
     ]);
+
+    if (balances.sender < amount) {
+      throw new InsufficientFundsError(`Ada cannot afford ${amount}`);
+    }
+
     await tx.query('UPDATE accounts SET balance = $1 WHERE id = $2', [
       balances.recipient + amount,
       'recipient',
@@ -81,7 +87,9 @@ const transfer = async (amount) => {
 
 Letting the error escape the callback rolls the transaction back. Nothing the
 callback had already staged is installed, so the first `UPDATE` never becomes
-visible even though it ran:
+visible outside the transaction even though it ran. After this expected funds
+error, re-query the committed rows to show that both balances are unchanged.
+Unexpected errors get their own message:
 
 ```js
 const status = document.getElementById('status');
@@ -92,7 +100,12 @@ const attempt = async (amount) => {
     status.textContent = `Transferred ${amount}.`;
     status.className = '';
   } catch (error) {
-    status.textContent = `${error.message}. Both balances are unchanged.`;
+    if (error instanceof InsufficientFundsError) {
+      await render();
+      status.textContent = `${error.message}. The staged debit was rolled back; both balances are unchanged.`;
+    } else {
+      status.textContent = `Transfer failed: ${error.message}`;
+    }
     status.className = 'failed';
   }
 };

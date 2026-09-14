@@ -1,6 +1,6 @@
 **TinyJoin prelaunch audit — 14 September 2026**
 
-Remediation is proceeding in the seven-summary-concern order below. The original audit is preserved after this progress record.
+Remediation was completed in the seven-summary-concern order below, with focused commits as each concern was addressed. The original audit is preserved after this progress record.
 
 | Concern | Status | Validation |
 | --- | --- | --- |
@@ -10,7 +10,34 @@ Remediation is proceeding in the seven-summary-concern order below. The original
 | 4. First-use experience | Starter shows startup errors and Retry, preserves failed drafts, restores failed toggles, handles cleanup, and documents single-tab use | Four generated builds; six Chromium scenarios across JavaScript/TypeScript, including second-tab recovery and rejected writes; 17 CLI tests, typecheck and spelling |
 | 5. Performance | Incremental validation for append-only transactions, including unique indexes; documented mixed-write, scan and startup costs | 261 Rust tests, including differential/budget/work-count regressions; three real-WASM contracts; retained engine and browser benchmarks (1,000 OPFS inserts: 1,571 to 310 ms); docs and size gates |
 | 6. Practical join scope | Selective chains run within actual work bounds; removed Cartesian estimate while preserving comparison, scan, build, memory and script limits | 265 Rust tests with true exhaustion and script rollback; four real-WASM contracts including three 100-row sources; docs and size gates |
-| 7. Documentation/site | Pending | |
+| 7. Documentation/site | Fixed section navigation, mobile discovery, transaction demos, recovery/lifecycle guidance, and complete agent reference; starter reopens after cached-page restoration | 12 browser checks against the static documentation build; 8 starter browser checks; 302 HTML files checked for links; generated-reference freshness; desktop/mobile visual review |
+
+Final validation passed: the complete release gate (265 Rust tests, 105
+TypeScript tests, four real-WASM contracts, eight runtime Chromium checks,
+documentation checks, and packed-package consumers), Clippy with warnings
+denied, and third-party notice verification. The starter passed 17 CLI tests,
+four generated JavaScript/TypeScript and memory/OPFS builds against the local
+0.0.6 tarball, typecheck, spelling, and its eight Chromium scenarios. The final
+static documentation browser suite also passed independently. The complete
+runtime is 293,723 bytes gzip (286.8 KiB); the WASM itself is 738,959 bytes raw
+and 277,804 bytes gzip. These results do not extend the Chromium-only claim.
+
+The release candidates remain local: TinyJoin 0.0.6 and create-tinyjoin 0.0.7
+have not been published, pushed, or deployed by this remediation. Publication
+still needs the library first, registry-backed starter validation, starter
+publication, and a clean registry smoke test. The unpublished release-note
+marker should be removed as part of that release operation. Public repository,
+domain, and hosting activation remain separate launch steps.
+
+The original audit's source/release CI gap and development-dependency
+advisories (items 13 and 14) remain separate follow-ups. Documented boundaries
+also remain intentional: Chromium-only verification, one writer per OPFS name,
+no automatic page-format migration, no nested callback transactions or
+cancellation API, and full validation for mixed transaction writes.
+
+The observations below describe the original reviewed snapshot; their source
+line references and measurements are historical. The progress record above
+states their remediation status.
 
 Reviewed TinyJoin at `d6505bc` and the adjacent create-tinyjoin project. This is an assessment, not an implementation plan or security certification. No product fixes, releases, commits, deployments, or public issues were made. This report is the only added repository file.
 
