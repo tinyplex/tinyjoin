@@ -7,11 +7,11 @@ use serde_json::{Map, Number, Value};
 use crate::StorageDriver;
 use crate::query::{
     Token, bind_parameter, is_reserved_keyword, matches_predicate, parse_predicate_at, tokenize,
-    validate_predicate_columns, validate_sql_input,
+    validate_predicate_columns, validate_predicate_types, validate_sql_input,
 };
 use crate::storage::{
     estimated_row_bytes, estimated_value_bytes, normalize_row, row_key, schema_with_added_column,
-    validate_index_columns_for_schema, validate_index_definition_shape,
+    validate_index_columns_for_schema, validate_index_definition_shape, validate_value,
 };
 use crate::{
     ColumnDefinition, ColumnType, EngineError, Predicate, Result, ResultField, Row, RowChange,
@@ -544,21 +544,23 @@ fn plan_update(
     )?;
     if let Some(predicate) = predicate {
         validate_predicate_columns(predicate, &schema, table)?;
+        validate_predicate_types(predicate, &schema, table)?;
     }
     validate_projection(&schema, returning)?;
 
     let assignment_bytes = assignments
         .iter()
         .try_fold(0usize, |bytes, (column, value)| {
+            let definition = schema
+                .columns
+                .iter()
+                .find(|definition| definition.name == *column)
+                .expect("assignment columns were validated above");
             let value = match value {
                 SqlValue::Value(value) => value,
-                SqlValue::Default => schema
-                    .columns
-                    .iter()
-                    .find(|definition| definition.name == *column)
-                    .and_then(|definition| definition.default.as_ref())
-                    .unwrap_or(&Value::Null),
+                SqlValue::Default => definition.default.as_ref().unwrap_or(&Value::Null),
             };
+            validate_value(definition, value, table)?;
             let value_bytes = estimated_value_bytes(value)?;
             checked_dml_add(
                 bytes,
@@ -724,6 +726,7 @@ fn plan_delete(
     let schema = storage.table_schema(table)?;
     if let Some(predicate) = predicate {
         validate_predicate_columns(predicate, &schema, table)?;
+        validate_predicate_types(predicate, &schema, table)?;
     }
     validate_projection(&schema, returning)?;
 

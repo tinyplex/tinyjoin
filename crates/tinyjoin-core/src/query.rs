@@ -1492,7 +1492,7 @@ fn evaluate_comparison(
         return Ok(Truth::Unknown);
     }
     if matches!(operator, ComparisonOperator::Eq | ComparisonOperator::Neq) {
-        let equal = values_equal(left, right, table, column)?;
+        let equal = values_equal(left, right);
         let matched = if operator == ComparisonOperator::Eq {
             equal
         } else {
@@ -1511,14 +1511,13 @@ fn evaluate_comparison(
     Ok(if matched { Truth::True } else { Truth::False })
 }
 
-fn values_equal(left: &Value, right: &Value, table: &str, column: &str) -> Result<bool> {
+fn values_equal(left: &Value, right: &Value) -> bool {
+    // Every executor validates predicates against its catalog before evaluating rows. Different
+    // non-null runtime kinds can therefore meet here only in a JSON comparison, where they are
+    // unequal rather than incompatible. Numeric scalar comparisons retain integer/float equality.
     match (left, right) {
-        (Value::Number(left), Value::Number(right)) => Ok(left.as_f64() == right.as_f64()),
-        (Value::String(left), Value::String(right)) => Ok(left == right),
-        (Value::Bool(left), Value::Bool(right)) => Ok(left == right),
-        (Value::Array(left), Value::Array(right)) => Ok(left == right),
-        (Value::Object(left), Value::Object(right)) => Ok(left == right),
-        _ => Err(comparison_error(table, column)),
+        (Value::Number(left), Value::Number(right)) => left.as_f64() == right.as_f64(),
+        _ => left == right,
     }
 }
 

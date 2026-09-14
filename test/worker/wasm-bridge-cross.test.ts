@@ -95,6 +95,68 @@ const runIfArtifactExists =
     : describe.skip;
 
 runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
+  it('keeps JSON comparisons and rejected mutations consistent through WASM', async () => {
+    const wasm = await loadStructuredModule();
+    const {engine} = createRecordingEngine(wasm, new MemoryPageDevice());
+    try {
+      engine.execSql(
+        'CREATE TABLE items (id INTEGER PRIMARY KEY, payload JSON, changed BOOLEAN NOT NULL DEFAULT false)',
+      );
+      const values: JsonValue[] = [{a: 1}, [1], 'one', 3, true, null];
+      for (const [id, value] of values.entries()) {
+        engine.executeSql('INSERT INTO items (id, payload) VALUES ($1, $2)', [
+          id,
+          value,
+        ]);
+      }
+      const equality = engine.prepareSql(
+        'SELECT id FROM items WHERE payload = $1 ORDER BY id',
+      );
+      for (const [id, value] of values.entries()) {
+        const expected = value === null ? [] : [{id}];
+        expect(engine.executePrepared(equality, [value]).rows).toEqual(expected);
+      }
+      expect(
+        engine.executeSql('SELECT id FROM items WHERE payload <> $1 ORDER BY id', [
+          {a: 1},
+        ]).rows,
+      ).toEqual([{id: 1}, {id: 2}, {id: 3}, {id: 4}]);
+
+      const invalidDelete = engine.prepareSql(
+        'DELETE FROM items WHERE payload > $1 RETURNING id',
+      );
+      const before = engine.revision();
+      for (const inTransaction of [false, true]) {
+        if (inTransaction) {
+          engine.beginTransaction();
+        }
+        expect(
+          captureError(() => engine.executePrepared(invalidDelete, [2])),
+        ).toMatchObject({code: 'TYPE_MISMATCH'});
+        expect(
+          captureError(() =>
+            engine.executeSql('UPDATE items SET changed = $1 WHERE id = 99', [
+              'not a boolean',
+            ]),
+          ),
+        ).toMatchObject({code: 'TYPE_MISMATCH'});
+        if (inTransaction) {
+          engine.commitTransaction();
+        }
+        expect(engine.revision()).toBe(before);
+        expect(engine.executeSql('SELECT id FROM items', []).rows).toHaveLength(6);
+      }
+      expect(
+        engine.executeSql(
+          'UPDATE items SET changed = true WHERE payload = $1 RETURNING id',
+          [{a: 1}],
+        ).rows,
+      ).toEqual([{id: 0}]);
+    } finally {
+      engine.close();
+    }
+  });
+
   it('round-trips every SQL-first operation against the real WASM artifact', async () => {
     const wasm = await loadStructuredModule();
     const device = new MemoryPageDevice();

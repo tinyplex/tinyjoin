@@ -912,7 +912,7 @@ pub(crate) fn normalize_row(schema: &TableDefinition, mut row: Row) -> Result<Ro
     Ok(row)
 }
 
-fn validate_value(column: &ColumnDefinition, value: &Value, table: &str) -> Result<()> {
+pub(crate) fn validate_value(column: &ColumnDefinition, value: &Value, table: &str) -> Result<()> {
     if value == &Value::Null {
         if column.nullable {
             return Ok(());

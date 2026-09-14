@@ -1783,4 +1783,243 @@ mod tests {
             vec![row(json!({"marker": false}))]
         );
     }
+
+    #[test]
+    fn heterogeneous_json_predicates_preserve_structural_equality_and_sql_nulls() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .execute_sql(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, payload JSON)",
+                &[],
+            )
+            .unwrap();
+        let values = [
+            Value::Null,
+            json!(false),
+            json!(true),
+            json!(0),
+            json!(1),
+            json!("one"),
+            json!([]),
+            json!([1]),
+            json!({}),
+            json!({"a": [1, true]}),
+        ];
+        for (id, value) in values.iter().enumerate() {
+            engine
+                .execute_sql(
+                    "INSERT INTO items VALUES ($1, $2)",
+                    &[json!(id), value.clone()],
+                )
+                .unwrap();
+        }
+        let predicates = [
+            "= $1",
+            "<> $1",
+            "IN ($1, NULL)",
+            "NOT IN ($1)",
+            "NOT IN ($1, NULL)",
+        ];
+        let statements = predicates
+            .iter()
+            .map(|predicate| {
+                let sql = format!("SELECT id FROM items WHERE payload {predicate} ORDER BY id");
+                let prepared = engine.prepare_sql(&sql).unwrap();
+                (sql, prepared)
+            })
+            .collect::<Vec<_>>();
+
+        for transaction in [false, true] {
+            if transaction {
+                engine.begin_transaction().unwrap();
+            }
+            for (id, value) in values.iter().enumerate() {
+                for (predicate, (sql, prepared)) in statements.iter().enumerate() {
+                    let expected_ids = match (id, predicate) {
+                        (0, _) | (_, 4) => Vec::new(),
+                        (_, 0 | 2) => vec![id],
+                        (_, 1 | 3) => (1..values.len()).filter(|other| *other != id).collect(),
+                        _ => unreachable!(),
+                    };
+                    let expected = expected_ids
+                        .into_iter()
+                        .map(|id| row(json!({"id": id})))
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        engine
+                            .execute_sql(sql, std::slice::from_ref(value))
+                            .unwrap()
+                            .rows,
+                        expected,
+                        "direct: {sql}, parameter {value}, transaction {transaction}"
+                    );
+                    assert_eq!(
+                        engine
+                            .execute_prepared(*prepared, std::slice::from_ref(value))
+                            .unwrap()
+                            .rows,
+                        expected,
+                        "prepared: {sql}, parameter {value}, transaction {transaction}"
+                    );
+                }
+            }
+            if transaction {
+                engine.rollback_transaction().unwrap();
+            }
+        }
+
+        let object = json!({"a": [1, true]});
+        assert_eq!(
+            engine
+                .execute_sql(
+                    "SELECT COUNT(*) AS count FROM items WHERE payload = $1",
+                    std::slice::from_ref(&object)
+                )
+                .unwrap()
+                .rows,
+            vec![row(json!({"count": 1}))]
+        );
+        assert_eq!(
+            engine.execute_sql("SELECT a.id FROM items AS a JOIN items AS b ON a.id = b.id WHERE a.payload = $1", std::slice::from_ref(&object)).unwrap().rows,
+            vec![row(json!({"id": 9}))]
+        );
+        engine.begin_transaction().unwrap();
+        assert_eq!(
+            engine
+                .execute_sql(
+                    "UPDATE items SET payload = $1 WHERE payload = $2 RETURNING id",
+                    &[json!("changed"), object]
+                )
+                .unwrap()
+                .rows,
+            vec![row(json!({"id": 9}))]
+        );
+        assert_eq!(
+            engine
+                .execute_sql(
+                    "DELETE FROM items WHERE payload = $1 RETURNING id",
+                    &[json!("changed")]
+                )
+                .unwrap()
+                .rows,
+            vec![row(json!({"id": 9}))]
+        );
+        engine.rollback_transaction().unwrap();
+    }
+
+    #[test]
+    fn dml_rejects_invalid_predicates_and_assignments_independently_of_matches() {
+        let invalid = [
+            (
+                "UPDATE items SET n = 1 WHERE payload > 2",
+                vec![],
+                "TYPE_MISMATCH",
+            ),
+            (
+                "DELETE FROM items WHERE payload > 2",
+                vec![],
+                "TYPE_MISMATCH",
+            ),
+            (
+                "UPDATE items SET n = 1 WHERE id = 99 AND n = 'wrong'",
+                vec![],
+                "TYPE_MISMATCH",
+            ),
+            (
+                "DELETE FROM items WHERE id = 99 AND n = 'wrong'",
+                vec![],
+                "TYPE_MISMATCH",
+            ),
+            (
+                "UPDATE items SET n = $1 WHERE id = 99",
+                vec![json!("wrong")],
+                "TYPE_MISMATCH",
+            ),
+            (
+                "UPDATE items SET n = 1.25 WHERE id = 99",
+                vec![],
+                "TYPE_MISMATCH",
+            ),
+            (
+                "UPDATE items SET n = NULL WHERE id = 99",
+                vec![],
+                "CONSTRAINT_VIOLATION",
+            ),
+            (
+                "UPDATE items SET required = DEFAULT WHERE id = 99",
+                vec![],
+                "CONSTRAINT_VIOLATION",
+            ),
+        ];
+        for populated in [false, true] {
+            for transaction in [false, true] {
+                let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+                engine.execute_sql("CREATE TABLE items (id INTEGER PRIMARY KEY, n INTEGER NOT NULL DEFAULT 0, payload JSON, required TEXT NOT NULL)", &[]).unwrap();
+                if populated {
+                    engine
+                        .execute_sql(
+                            "INSERT INTO items (id, payload, required) VALUES (1, 3, 'base')",
+                            &[],
+                        )
+                        .unwrap();
+                }
+                let prepared = invalid
+                    .iter()
+                    .map(|(sql, _, _)| engine.prepare_sql(sql).unwrap())
+                    .collect::<Vec<_>>();
+                if transaction {
+                    engine.begin_transaction().unwrap();
+                    if populated {
+                        engine
+                            .execute_sql(
+                                "INSERT INTO items (id, payload, required) VALUES (2, 4, 'staged')",
+                                &[],
+                            )
+                            .unwrap();
+                    }
+                }
+                let before = engine
+                    .execute_sql("SELECT * FROM items ORDER BY id", &[])
+                    .unwrap();
+                for ((sql, params, code), prepared) in invalid.iter().zip(prepared) {
+                    assert_eq!(
+                        engine.execute_sql(sql, params).unwrap_err().code,
+                        *code,
+                        "direct: {sql}, populated {populated}, transaction {transaction}"
+                    );
+                    assert_eq!(
+                        engine.execute_prepared(prepared, params).unwrap_err().code,
+                        *code,
+                        "prepared: {sql}, populated {populated}, transaction {transaction}"
+                    );
+                    assert_eq!(
+                        engine
+                            .execute_sql("SELECT * FROM items ORDER BY id", &[])
+                            .unwrap(),
+                        before
+                    );
+                    assert_eq!(engine.in_transaction(), transaction);
+                }
+                // A valid default remains valid even when the UPDATE does not match a row.
+                assert_eq!(
+                    engine
+                        .execute_sql("UPDATE items SET n = DEFAULT WHERE id = 99", &[])
+                        .unwrap()
+                        .row_count,
+                    0
+                );
+                if transaction {
+                    engine.commit_transaction().unwrap();
+                }
+                let reopened = PagedEngine::open(engine.into_device()).unwrap();
+                assert_eq!(
+                    reopened
+                        .query_sql("SELECT * FROM items ORDER BY id", &[])
+                        .unwrap()
+                        .rows,
+                    before.rows
+                );
+            }
+        }
+    }
 }

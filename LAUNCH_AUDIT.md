@@ -1,5 +1,17 @@
 **TinyJoin prelaunch audit — 14 September 2026**
 
+Remediation is proceeding in the seven-summary-concern order below. The original audit is preserved after this progress record.
+
+| Concern | Status | Validation |
+| --- | --- | --- |
+| 1. SQL correctness | Fixed shared predicate/assignment validation and heterogeneous JSON equality | 249 Rust tests; two real-WASM contract tests; typecheck, docs and size checks |
+| 2. Resource limits | Pending | |
+| 3. Release compatibility | Pending | |
+| 4. First-use experience | Pending | |
+| 5. Performance | Pending | |
+| 6. Practical join scope | Pending | |
+| 7. Documentation/site | Pending | |
+
 Reviewed TinyJoin at `d6505bc` and the adjacent create-tinyjoin project. This is an assessment, not an implementation plan or security certification. No product fixes, releases, commits, deployments, or public issues were made. This report is the only added repository file.
 
 **Recommendation: fix the correctness and resource-accounting defects before promoting the current checkout as the first public launch.** The architecture, package validation, documentation of intentional boundaries, and payload are strong enough to build on. A general SQL expansion or engine rewrite would distract from the smaller set of actual launch problems.
