@@ -161,12 +161,13 @@ let serverOutput = '';
 let browser;
 let completed = false;
 try {
+  // Own the Vite process directly. On Linux, terminating an npm wrapper can
+  // leave Vite alive with inherited output pipes, preventing this test exiting.
   server = spawn(
-    npm,
+    process.execPath,
     [
-      'run',
+      resolve(appDirectory, 'node_modules/vite/bin/vite.js'),
       'preview',
-      '--',
       '--host',
       '127.0.0.1',
       '--port',
@@ -249,6 +250,7 @@ console.log(`VITE_BUILD_OK ${builtFiles.length} files`);
 
 await rm(generatedRoot, {force: true, recursive: true});
 process.removeListener('exit', cleanupGeneratedRoot);
+console.log('PACKED_CONSUMER_CLEANUP_OK');
 
 function run(command, args, cwd, options = {}) {
   const result = spawnSync(command, args, {
@@ -595,19 +597,34 @@ function isOpfsRuntimeRequest(url) {
 }
 
 async function stopServer(child) {
-  if (child.exitCode !== null) {
+  if (
+    (child.exitCode !== null || child.signalCode !== null) &&
+    child.stdout.destroyed &&
+    child.stderr.destroyed
+  ) {
     return;
   }
-  await new Promise((resolvePromise) => {
-    const timeout = setTimeout(() => {
+  await new Promise((resolvePromise, reject) => {
+    const forceStop = setTimeout(() => {
       child.kill('SIGKILL');
-      resolvePromise();
     }, 5_000);
-    timeout.unref();
-    child.once('exit', () => {
-      clearTimeout(timeout);
-      resolvePromise();
-    });
+    const deadline = setTimeout(() => {
+      child.stdout.destroy();
+      child.stderr.destroy();
+      finish(new Error('Packed consumer preview did not close within 10 seconds'));
+    }, 10_000);
+    const finish = (error) => {
+      clearTimeout(forceStop);
+      clearTimeout(deadline);
+      child.removeListener('close', onClose);
+      child.removeListener('error', finish);
+      if (error) reject(error);
+      else resolvePromise();
+    };
+    const onClose = () => finish();
+    // "exit" only covers the process; "close" also covers its output pipes.
+    child.once('close', onClose);
+    child.once('error', finish);
     child.kill('SIGTERM');
   });
 }
