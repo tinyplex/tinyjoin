@@ -1,9 +1,10 @@
 @accentColorLight: #7c3aed;
-@accentColorDark: lighten(@accentColorLight, 20%);
+@accentColorDark: @accentColorLight;
 
 html {
   color-scheme: light;
   --accent: @accentColorLight;
+  --code-accent: @accentColorLight;
   --glow: #ccc;
   --text: #555;
   --text2: #111;
@@ -29,7 +30,8 @@ html {
 .darkTheme() {
   color-scheme: dark;
   --accent: @accentColorDark;
-  --glow: @accentColorDark;
+  --code-accent: lighten(@accentColorLight, 20%);
+  --glow: @accentColorLight;
   --text: #bbb;
   --text2: #eee;
   --back: #111;
@@ -62,6 +64,7 @@ html.dark {
 }
 
 @accentColor: var(--accent);
+@accentTextColor: #fff;
 @glowColor: var(--glow);
 @textColor: var(--text);
 @text2Color: var(--text2);

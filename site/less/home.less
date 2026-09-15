@@ -1,12 +1,14 @@
 .glow() {
+  aspect-ratio: 1;
   background: @glowColor;
   border-radius: 50%;
   content: "";
   filter: blur(4rem);
-  height: 120%;
   left: -10%;
   position: absolute;
-  top: -10%;
+  // Match the logo's -1rem top margin inside the stretched grid item.
+  top: calc(50% - 1rem);
+  transform: translateY(-50%);
   width: 120%;
   z-index: -1;
 }
@@ -86,7 +88,7 @@ body > main > article#home {
 
       &.start {
         background: @accentColor;
-        color: @backColor;
+        color: @accentTextColor;
       }
     }
   }
