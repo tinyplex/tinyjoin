@@ -8,7 +8,7 @@ for (const width of [390, 768]) {
     for (const name of ['Guides', 'Demos', 'API', 'GitHub']) {
       await expect(primary.getByRole('link', {name, exact: true})).toBeVisible();
     }
-    const search = page.getByRole('searchbox', {name: 'Search the documentation'});
+    const search = page.getByRole('combobox', {name: 'Search the documentation'});
     await expect(search).toBeVisible();
     await search.fill('storage');
     const result = page.locator('#search li').filter({hasText: 'Storage and lifecycle'}).first();

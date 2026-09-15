@@ -54,23 +54,48 @@ export const searchLoad = () => {
   const input = document.createElement('input');
   input.type = 'search';
   input.autocomplete = 'off';
+  input.setAttribute('role', 'combobox');
+  input.setAttribute('aria-autocomplete', 'list');
+  input.setAttribute('aria-controls', 'search-results');
+  input.setAttribute('aria-expanded', 'false');
   input.setAttribute('aria-label', 'Search the documentation');
   input.placeholder =
     (navigator.platform.startsWith('Mac') ? '⌘' : 'ctrl-') + 'K Search';
   const results = document.createElement('ol');
-  search.append(input, results);
+  results.id = 'search-results';
+  results.setAttribute('role', 'listbox');
+  results.setAttribute('aria-label', 'Documentation results');
+  const status = document.createElement('div');
+  status.className = 'search-status';
+  status.setAttribute('role', 'status');
+  status.setAttribute('aria-atomic', 'true');
+  search.append(input, results, status);
 
   let pages: Page[] = [];
 
-  const show = (visible: boolean) =>
-    results.classList.toggle('show', visible && input.value !== '');
+  const hovered = () => results.querySelector<HTMLElement>('[role="option"].hover');
 
-  const hovered = () => results.querySelector('li.hover');
+  const show = (visible: boolean) => {
+    const expanded = visible && input.value.trim() !== '';
+    results.classList.toggle('show', expanded);
+    input.setAttribute('aria-expanded', String(expanded));
+    const current = hovered();
+    if (expanded && current) {
+      input.setAttribute('aria-activedescendant', current.id);
+    } else {
+      input.removeAttribute('aria-activedescendant');
+    }
+    if (!expanded) status.textContent = '';
+  };
 
   const moveHover = (to: Element | null | undefined) => {
     if (to instanceof HTMLElement) {
-      hovered()?.classList.remove('hover');
+      const previous = hovered();
+      previous?.classList.remove('hover');
+      previous?.setAttribute('aria-selected', 'false');
       to.classList.add('hover');
+      to.setAttribute('aria-selected', 'true');
+      input.setAttribute('aria-activedescendant', to.id);
       to.scrollIntoView({block: 'nearest'});
     }
   };
@@ -78,8 +103,9 @@ export const searchLoad = () => {
   const populate = () => {
     const words = tokenize(input.value);
     const ranked = pages
-      .map((page) => ({
+      .map((page, id) => ({
         page,
+        id,
         weight: words.reduce((total, word) => total + weigh(page, word), 0),
       }))
       .filter(({weight}) => weight > 0)
@@ -89,20 +115,30 @@ export const searchLoad = () => {
     if (ranked.length === 0) {
       const empty = document.createElement('li');
       empty.textContent = 'No results found';
+      empty.setAttribute('role', 'presentation');
+      empty.setAttribute('aria-hidden', 'true');
       results.replaceChildren(empty);
+      input.removeAttribute('aria-activedescendant');
+      status.textContent = input.value.trim() ? 'No results found.' : '';
       return;
     }
 
     results.replaceChildren(
-      ...ranked.map(({page}, index) => {
+      ...ranked.map(({page, id}, index) => {
         const result = document.createElement('li');
+        result.id = `search-result-${id}`;
+        result.dataset.url = page.u;
+        result.setAttribute('role', 'option');
+        result.setAttribute('aria-selected', String(index === 0));
         const name = document.createElement('b');
         const summary = document.createElement('span');
         highlight(name, page.n, words[0] ?? '');
         highlight(summary, page.s, words[0] ?? '');
         result.append(name, summary);
         result.title = page.s;
-        result.addEventListener('mousedown', () => {
+        result.addEventListener('mousedown', (event) => event.preventDefault());
+        result.addEventListener('mousemove', () => moveHover(result));
+        result.addEventListener('click', () => {
           location.href = page.u;
         });
         if (index === 0) {
@@ -111,13 +147,17 @@ export const searchLoad = () => {
         return result;
       }),
     );
+    status.textContent = `${ranked.length} ${ranked.length === 1 ? 'result' : 'results'} available. Use Up and Down arrows to select, then Enter to open.`;
   };
 
-  input.addEventListener('focus', () => show(true));
+  input.addEventListener('focus', () => {
+    populate();
+    show(true);
+  });
   input.addEventListener('blur', () => show(false));
   input.addEventListener('input', () => {
-    show(true);
     populate();
+    show(true);
   });
 
   addEventListener('keydown', (event) => {
@@ -132,18 +172,21 @@ export const searchLoad = () => {
     }
     const current = hovered();
     if (event.key === 'Escape') {
+      event.preventDefault();
       input.blur();
     } else if (event.key === 'ArrowDown') {
       event.preventDefault();
-      moveHover(current?.nextElementSibling ?? results.firstElementChild);
+      show(true);
+      moveHover(current?.nextElementSibling ?? results.querySelector('[role="option"]'));
     } else if (event.key === 'ArrowUp') {
       event.preventDefault();
-      moveHover(current?.previousElementSibling ?? results.lastElementChild);
+      show(true);
+      moveHover(current?.previousElementSibling ?? results.querySelector('[role="option"]:last-child'));
     } else if (event.key === 'Enter') {
-      const to = current?.querySelector('b')?.textContent;
-      const page = pages.find((candidate) => candidate.n === to);
-      if (page != null) {
-        location.href = page.u;
+      const url = current?.dataset.url;
+      if (url != null && input.getAttribute('aria-expanded') === 'true') {
+        event.preventDefault();
+        location.href = url;
       }
     }
   });
@@ -154,6 +197,10 @@ export const searchLoad = () => {
     .then((response) => response.json())
     .then((json: Page[]) => {
       pages = json;
+      if (document.activeElement === input) {
+        populate();
+        show(true);
+      }
     })
     .catch(() => {
       search.remove();
