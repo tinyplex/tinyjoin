@@ -195,12 +195,18 @@ await db.close();
 > Your app can keep working when the network drops. Apps created with the
 > starter can also [reopen offline](/guides/offline/) once their production
 > build has been cached.
->
-> **Know the limits.** TinyJoin is experimental, with a bounded SQL dialect and
-> no built-in remote synchronization. Browser storage can be lost, so use it
-> for data you can reconstruct. Read the [caveats](/guides/caveats/) and
-> [SQL compatibility guide](/guides/sql-compatibility/) to check whether it
-> fits your app.
+
+<section id="limits" aria-labelledby="know-the-limits">
+
+## Know the limits
+
+TinyJoin is experimental, with a bounded SQL dialect and no built-in remote
+synchronization. Browser storage can be lost, so use it for data you can
+reconstruct. Read the [caveats](/guides/caveats/) and
+[SQL compatibility guide](/guides/sql-compatibility/) to check whether it
+fits your app.
+
+</section>
 
 ---
 

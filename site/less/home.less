@@ -122,6 +122,16 @@ body > main > article#home {
     box-shadow: @shadow;
   }
 
+  > section#limits {
+    background: #d99a1814;
+    border: 1px solid #d99a1855;
+    border-inline-start: 0.25rem solid #d99a18;
+    border-radius: 0.25rem;
+    box-sizing: border-box;
+    padding: 1.5rem;
+    text-align: left;
+  }
+
   > section#family {
     text-align: center;
 
@@ -228,6 +238,11 @@ body > main > article#home {
 
     > hr {
       grid-column: 1 / 7;
+    }
+
+    > section#limits {
+      grid-column: 1 / -1;
+      padding: 2rem;
     }
 
     // A full-width band, rather than one more cell in the paired grid.
