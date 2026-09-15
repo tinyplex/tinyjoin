@@ -383,6 +383,8 @@
 
   /**
    * The closed property indicates whether the handle has been sealed.
+   * It is not a Worker health check. A terminal Worker failure can leave it
+   * false while execute rejects. Closing the Client seals its handles.
    * @category Lifecycle
    * @since v0.0.5
    */
@@ -468,6 +470,8 @@
 
   /**
    * The waitReady property resolves when the Worker and database are ready.
+   * It settles once for initialization; it does not track later Worker health
+   * or temporary OPFS owner handover.
    * @category Lifecycle
    * @since v0.0.5
    */
@@ -476,6 +480,10 @@
   /**
    * The ready property indicates that initialization finished and closing has
    * not started.
+   * It is not a health check: it can remain true after a terminal Worker error
+   * while operations reject. Close and reopen the Client and reconcile writes;
+   * see the [lifecycle guide](/guides/storage-and-lifecycle/#terminal-worker-failures).
+   * Temporary OPFS owner handover reconnects the same Client automatically.
    * @category Lifecycle
    * @since v0.0.5
    */
@@ -483,6 +491,8 @@
 
   /**
    * The closed property indicates that Client cleanup has completed.
+   * A terminal Worker failure does not itself complete Client cleanup. Call
+   * close even when subsequent operations reject with WORKER_TERMINATED.
    * @category Lifecycle
    * @since v0.0.5
    */

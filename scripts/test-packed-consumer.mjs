@@ -17,6 +17,7 @@ import {fileURLToPath} from 'node:url';
 import {chromium} from '@playwright/test';
 
 import {requireWasmArtifacts, wasmArtifacts} from './wasm-artifacts.mjs';
+import {getPackageDocumentation} from './package-documentation.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const fixture = resolve(root, 'test/consumers/vite');
@@ -65,7 +66,8 @@ const packOutput = run(
   root,
 );
 const packed = parsePackOutput(packOutput);
-assertPackedFiles(packed);
+const packageDocumentation = await getPackageDocumentation(root);
+assertPackedFiles(packed, Object.keys(packageDocumentation));
 const tarball = resolve(packageDirectory, packed.filename);
 
 await cp(fixture, appDirectory, {recursive: true});
@@ -113,6 +115,19 @@ if (
   );
 }
 await assertInstalledOpfsLoader(installedPackage);
+// Reading the installed contracts uses only the tarball's files, without a
+// website request. Also reject stale content and broken local guide links.
+for (const [path, expected] of Object.entries(packageDocumentation)) {
+  const contents = await readFile(resolve(installedPackage, path), 'utf8');
+  if (contents !== expected) {
+    throw new Error(`Installed documentation is stale: ${path}`);
+  }
+  for (const [, href] of contents.matchAll(/\]\(([^)]+\.md(?:#[^)]*)?)\)/g)) {
+    if (/^https?:/.test(href)) continue;
+    await readFile(resolve(installedPackage, dirname(path), href.split('#')[0]));
+  }
+}
+console.log('PACKAGE_LOCAL_GUIDES_OK');
 
 const ssrOutput = run(
   process.execPath,
@@ -291,7 +306,7 @@ function parsePackOutput(output) {
   return entry;
 }
 
-function assertPackedFiles(packed) {
+function assertPackedFiles(packed, documentationFiles) {
   const files = Array.isArray(packed.files)
     ? packed.files.map((file) => file.path).sort()
     : [];
@@ -303,8 +318,7 @@ function assertPackedFiles(packed) {
     'README.md',
     'RUST_STANDARD_LIBRARY_NOTICES.html',
     'THIRD_PARTY_NOTICES.txt',
-    'agents.md',
-    'docs/sql.md',
+    ...documentationFiles,
     'package.json',
     'index.js',
     'protocol.js',

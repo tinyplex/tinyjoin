@@ -1,6 +1,7 @@
 import {readFile, readdir} from 'node:fs/promises';
 import {extname, join, relative, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {getPackageDocumentation} from './package-documentation.mjs';
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const requiredFiles = [
@@ -169,7 +170,7 @@ async function checkMarkdownCopies(errors) {
   const markdownCopies = [
     ['README.md', 'dist/README.md'],
     ['releases.md', 'dist/releases.md'],
-    ['site/guides/7_agents.md', 'AGENTS.md', 'dist/agents.md'],
+    ['site/guides/7_agents.md', 'AGENTS.md'],
   ];
   for (const paths of markdownCopies) {
     const [source, ...copies] = await Promise.all(
@@ -180,6 +181,12 @@ async function checkMarkdownCopies(errors) {
         errors.push(`${path} is out of sync with ${paths[0]}`);
       }
     });
+  }
+
+  for (const [path, expected] of Object.entries(await getPackageDocumentation(root))) {
+    if (await readFile(resolve(root, 'dist', path), 'utf8') !== expected) {
+      errors.push(`dist/${path} is out of sync with its documentation source`);
+    }
   }
 
   for (const path of ['README.md', 'releases.md']) {

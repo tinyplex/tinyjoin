@@ -1,8 +1,10 @@
 import {existsSync, readFileSync} from 'node:fs';
 import {resolve} from 'node:path';
 import {pathToFileURL} from 'node:url';
+import {compileFunction} from 'node:vm';
 
 import {describe, expect, it} from 'vitest';
+import {transformSync} from 'esbuild';
 
 import type {JsonValue} from '../../src/protocol.js';
 import type {PageDevice} from '../../src/worker/page-device.js';
@@ -95,6 +97,79 @@ const runIfArtifactExists =
     : describe.skip;
 
 runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
+  it('executes the documented join boundaries against the real engine', async () => {
+    const wasm = await loadStructuredModule();
+    const {engine} = createRecordingEngine(wasm, new MemoryPageDevice());
+    const section = readFileSync('site/guides/3_sql_compatibility.md', 'utf8')
+      .split('### Join projection and identifier boundaries')[1]!
+      .split('### Join work budgets')[0]!;
+    const examples = [...section.matchAll(/```sql\n([\s\S]*?)```/g)].map((match) => match[1]!);
+    expect(examples).toHaveLength(6);
+    try {
+      engine.execSql(examples[0]!);
+      expect(engine.executeSql(examples[1]!, []).rows).toEqual([{id: 1}]);
+      expect(engine.executeSql(examples[2]!, []).rows).toEqual([{id: 1, 'extra.value': 'kept'}]);
+      for (const [index, sql] of examples.slice(3).entries()) {
+        expect(captureError(() => engine.executeSql(sql, [])), sql)
+          .toMatchObject({code: index === 1 ? 'SQL_PARSE_ERROR' : 'UNSUPPORTED_SQL'});
+      }
+    } finally {
+      engine.close();
+    }
+  });
+
+  it('round-trips the documented application backup and rejects unsafe restores', async () => {
+    const {engine, db, backupNotes, restoreNotes} = await createDocumentedBackupFixture();
+    const notes = [
+      {id: 'stable-a', body: "'); DROP TABLE notes; --", pinned: true},
+      {id: 'stable-b', body: 'retained', pinned: false},
+    ];
+    const backup = JSON.stringify({schemaVersion: 1, notes});
+    try {
+      await restoreNotes(db, backup);
+      expect(JSON.parse(await backupNotes(db))).toEqual({schemaVersion: 1, notes});
+      await expect(restoreNotes(db, backup)).rejects.toThrow('empty notes table');
+      engine.execSql('DELETE FROM notes');
+      await expect(restoreNotes(db, JSON.stringify({schemaVersion: 2, notes}))).rejects.toThrow('Invalid notes backup');
+      await expect(restoreNotes(db, JSON.stringify({schemaVersion: 1, notes: [{...notes[0], pinned: 'true'}]}))).rejects.toThrow('Invalid notes backup');
+      await expect(restoreNotes(db, JSON.stringify({schemaVersion: 1, notes: [notes[0], notes[0]]}))).rejects.toMatchObject({code: 'CONSTRAINT_VIOLATION'});
+      expect(engine.executeSql('SELECT id FROM notes', []).rows).toEqual([]);
+      await restoreNotes(db, backup);
+      expect(JSON.parse(await backupNotes(db))).toEqual({schemaVersion: 1, notes});
+    } finally {
+      engine.close();
+    }
+  });
+
+  it('enforces the documented backup and restore row caps at the real WASM boundary', async () => {
+    const {engine, db, backupNotes, restoreNotes} = await createDocumentedBackupFixture();
+    try {
+      await restoreNotes(db, JSON.stringify({schemaVersion: 1, notes: []}));
+      const oversized = {schemaVersion: 1, notes: Array.from({length: 1001}, (_, id) => ({id: `note-${id}`, body: 'small', pinned: false}))};
+      await expect(restoreNotes(db, JSON.stringify(oversized))).rejects.toThrow('Invalid notes backup');
+
+      // This test measures the example's row cap, not 1,001 separate commits.
+      // Seed full-size data in bounded batches below the engine's 1,024-parameter
+      // and 4,096-token statement limits.
+      for (let offset = 0; offset < 1000; offset += 250) {
+        const batch = oversized.notes.slice(offset, offset + 250);
+        const values = batch.map((_, index) =>
+          `($${index * 3 + 1}, $${index * 3 + 2}, $${index * 3 + 3})`,
+        ).join(', ');
+        engine.executeSql(
+          `INSERT INTO notes VALUES ${values}`,
+          batch.flatMap((note) => [note.id, note.body, note.pinned]),
+        );
+      }
+      expect(JSON.parse(await backupNotes(db)).notes).toHaveLength(1000);
+      const last = oversized.notes[1000]!;
+      engine.executeSql('INSERT INTO notes VALUES ($1, $2, $3)', [last.id, last.body, last.pinned]);
+      await expect(backupNotes(db)).rejects.toThrow('larger-data policy');
+    } finally {
+      engine.close();
+    }
+  });
+
   it('rejects duplicate projections independently of matching rows', async () => {
     const wasm = await loadStructuredModule();
     const {engine} = createRecordingEngine(wasm, new MemoryPageDevice());
@@ -501,6 +576,36 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
     expect(recording.calls).toHaveLength(callCount);
   });
 });
+
+async function createDocumentedBackupFixture() {
+  const wasm = await loadStructuredModule();
+  const {engine} = createRecordingEngine(wasm, new MemoryPageDevice());
+  const section = readFileSync('site/guides/2_storage_and_lifecycle.md', 'utf8')
+    .split('## Application backups and restoration')[1]!
+    .split('## Resetting and removing obsolete databases')[0]!;
+  const source = /```ts\n([\s\S]*?)```/.exec(section)![1]!;
+  const {code} = transformSync(source, {loader: 'ts', target: 'es2022'});
+  const {backupNotes, restoreNotes} = compileFunction(
+    code + '\nreturn {backupNotes, restoreNotes};',
+  )();
+  // Use the documented Client operations over the real WASM engine, keeping
+  // the example itself verbatim so an edited SQL statement is exercised too.
+  const db = {
+    query: async (sql: string, params: JsonValue[] = []) => engine.executeSql(sql, params),
+    exec: async (sql: string) => engine.execSql(sql),
+    transaction: async (callback: (tx: unknown) => Promise<void>) => {
+      engine.beginTransaction();
+      try {
+        await callback(db);
+        engine.commitTransaction();
+      } catch (error) {
+        engine.rollbackTransaction();
+        throw error;
+      }
+    },
+  };
+  return {engine, db, backupNotes, restoreNotes};
+}
 
 async function loadStructuredModule(): Promise<StructuredModule> {
   const wasm = (await import(

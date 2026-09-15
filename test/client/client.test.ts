@@ -194,6 +194,49 @@ describe('Client', () => {
     await client.close();
   });
 
+  it.each([
+    ['WORKER_ERROR', (worker: FakeWorker) => worker.emitError('terminal crash')],
+    ['WORKER_MESSAGE_ERROR', (worker: FakeWorker) => worker.emitMessageError()],
+    ['PROTOCOL_MISMATCH', (worker: FakeWorker) => worker.emitInvalidMessage({invalid: true})],
+  ] as const)('retains initialization state after %s until explicit cleanup', async (code, fail) => {
+    const worker = writableWorker();
+    const client = await create({worker});
+    const statement = await client.prepare('SELECT id FROM posts');
+    worker.onPost = () => undefined;
+    const pendingQuery = client.query('INSERT INTO posts VALUES (1)');
+    const pendingExecution = statement.execute();
+    const queryFailure = expect(pendingQuery).rejects.toMatchObject({code});
+    const executionFailure = expect(pendingExecution).rejects.toMatchObject({code});
+    await vi.waitFor(() => expect(worker.posted).toHaveLength(4));
+    fail(worker);
+    await Promise.all([queryFailure, executionFailure]);
+
+    expect(worker.terminated).toBe(true);
+    expect(client.ready).toBe(true);
+    expect(client.closed).toBe(false);
+    expect(statement.closed).toBe(false);
+    await expect(client.waitReady).resolves.toBeUndefined();
+    for (const operation of [
+      client.query('SELECT id FROM posts'),
+      client.exec('SELECT id FROM posts'),
+      client.prepare('SELECT id FROM posts'),
+      statement.execute(),
+      client.transaction(() => undefined),
+    ]) {
+      await expect(operation).rejects.toMatchObject({code: 'WORKER_TERMINATED'});
+    }
+
+    const closing = client.close();
+    expect(client.ready).toBe(false);
+    expect(statement.closed).toBe(true);
+    await expect(closing).rejects.toMatchObject({code: 'WORKER_TERMINATED'});
+    expect(client.closed).toBe(true);
+    await expect(client.query('SELECT id FROM posts')).rejects.toMatchObject({code: 'CLIENT_CLOSED'});
+    await expect(statement.execute()).rejects.toMatchObject({code: 'CLIENT_CLOSED'});
+    await expect(statement.close()).resolves.toBeUndefined();
+    expect(worker.posted).toHaveLength(4);
+  });
+
   it('accepts dataDir in options and rejects ambiguous or unsupported storage', async () => {
     const optionsWorker = respondingWorker();
     const client = await create({

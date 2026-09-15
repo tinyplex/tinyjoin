@@ -15,6 +15,7 @@ import {minify} from 'terser';
 import {build as viteBuild} from 'vite';
 
 import {buildDefinitions} from './build-definitions.mjs';
+import {writePackageDocumentation} from './package-documentation.mjs';
 import {
   assertThirdPartyNotices,
   thirdPartyNoticeFiles,
@@ -160,15 +161,11 @@ for (const notice of thirdPartyNoticeFiles) {
   await copyFile(resolve(root, notice), resolve(dist, notice));
 }
 await copyPublicMarkdown();
-await mkdir(resolve(dist, 'docs'), {recursive: true});
-await copyFile(
-  resolve(root, 'site/guides/3_sql_compatibility.md'),
-  resolve(dist, 'docs/sql.md'),
-);
 
 // Measure the built runtime into committed metadata, which the site reads to
 // fill in the download sizes it publishes.
 await writeSizes(dist);
+await writePackageDocumentation(root, dist);
 
 async function copyPublicMarkdown() {
   await copyFile(
@@ -178,7 +175,6 @@ async function copyPublicMarkdown() {
   const markdown = [
     ['README.md', 'README.md'],
     ['releases.md', 'releases.md'],
-    ['AGENTS.md', 'agents.md'],
   ];
   for (const [source, packageFile] of markdown) {
     await copyFile(resolve(root, source), resolve(dist, packageFile));

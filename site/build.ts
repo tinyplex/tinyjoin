@@ -4,6 +4,7 @@ import {relative, resolve} from 'node:path';
 
 import type {Docs, Node} from 'tinydocs';
 import {createDocs, getSorter} from 'tinydocs';
+import {writePackageDocumentation} from '../scripts/package-documentation.mjs';
 import {MainInner} from './ui/MainInner.tsx';
 import {MarkdownPage} from './ui/MarkdownPage.tsx';
 import {Page} from './ui/Page.tsx';
@@ -207,6 +208,7 @@ export const build = async (
   fixCombinedApiLinks(outDir);
   await waitForFile(resolve(outDir, 'css/index.css'));
   writeSearchIndex(docs, outDir);
+  await writePackageDocumentation(repositoryRoot, packageDir);
   await copyRuntime(outDir, packageDir);
 };
 

@@ -58,6 +58,9 @@ npm install tinyjoin
 > create() owns Worker construction and WebAssembly loading, and resolves once
 > the database is ready. Use `opfs://[name]` when data should survive reloads in
 > the same browser, or call it with no argument for ephemeral in-memory storage.
+>
+> TinyJoin is experimental and verified on Chromium only. Browser data can be
+> lost; use data you can reconstruct and read the [caveats](/guides/caveats/).
 
 ```ts
 import {create} from 'tinyjoin';
@@ -196,13 +199,13 @@ await db.close();
 
 <section id="warning" aria-labelledby="an-important-warning">
 
-## An important warning!
+## An important warning
 
 TinyJoin is experimental, with a bounded SQL dialect and no built-in remote
-synchronization. Browser storage can be lost, so use it for data you can
+synchronization (yet!). Browser storage can be lost, so use it for data you can
 reconstruct. Read the [caveats](/guides/caveats/) and [SQL compatibility
 guide](/guides/sql-compatibility/) to check whether this project currently fits
-your app. We're working on it though, so keep checking back!
+your app. We're working on it though, so keep checking back.
 
 </section>
 

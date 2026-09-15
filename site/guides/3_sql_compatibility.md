@@ -155,7 +155,7 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 
 | Keyword or form | Status | TinyJoin form and boundary |
 | --- | --- | --- |
-| `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or a left-deep join over two to eight typed table sources. A simple projection is `*` or distinct plain column names. Duplicate output names return `INVALID_QUERY`, including for empty results and `LIMIT 0`. There is no `SELECT` without `FROM`. |
+| `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or a left-deep join over two to eight typed table sources. A simple single-table projection is `*` or distinct plain column names. Join projections require explicit columns: neither `*` nor `table.*` is supported. Duplicate output names return `INVALID_QUERY`, including for empty results and `LIMIT 0`. There is no `SELECT` without `FROM`. |
 | `WHERE` | Supported | Predicates described below, with SQL three-valued null logic. |
 | `ORDER BY` | Narrow | Up to 32 plain columns for simple queries, projected output names for grouped/aggregate queries, and projected output names or qualified/unambiguous source columns for joins; `ASC`/`DESC` and `NULLS FIRST`/`LAST`. JSON values cannot be ordered. |
 | `LIMIT`, `OFFSET` | Supported | Non-negative integer literal or `$n` parameter. `LIMIT` is at most 100,000; `OFFSET` and `OFFSET + LIMIT` are at most 4,294,967,295. `OFFSET` may appear alone; when both occur, `LIMIT` must precede `OFFSET`. |
@@ -237,6 +237,9 @@ serial/identity, enum/domain, and user-defined types. Type modifiers such as
 
 - Unquoted identifiers are folded to ASCII lower case. Double-quoted
   identifiers preserve case and use doubled quotes to escape a quote.
+  A quoted column name containing a dot is usable in a single-table query,
+  but a table containing any such column cannot be a join source, even when
+  the column is not selected. Quoted join aliases cannot contain dots either.
 - An unquoted identifier may begin with `_`, an ASCII letter, or any non-ASCII
   character. Later characters may additionally be ASCII digits or `$`.
 - TinyJoin reserves these unquoted words case-insensitively: `SELECT`, `FROM`,
@@ -293,6 +296,55 @@ JSON join keys are rejected. Every source requires a typed SQL catalog and a
 unique alias, and the result must use distinct JSON object field names.
 Unqualified columns are accepted only when exactly one source contains the
 name. Without `ORDER BY`, row order is not part of the contract.
+
+### Join projection and identifier boundaries
+
+Join projections must name each output column explicitly. Wildcards `*` and
+`table.*` are rejected. A join also rejects any source table whose catalog
+contains a column name with a dot, even if the projection and `ON` clause do
+not use that column. Quoting does not remove this restriction.
+
+This small schema reproduces both boundaries:
+
+```sql
+CREATE TABLE left_items (id INTEGER PRIMARY KEY);
+CREATE TABLE right_items (id INTEGER PRIMARY KEY);
+CREATE TABLE dotted_items (id INTEGER PRIMARY KEY, "extra.value" TEXT);
+INSERT INTO left_items VALUES (1);
+INSERT INTO right_items VALUES (1);
+INSERT INTO dotted_items VALUES (1, 'kept');
+```
+
+These single statements succeed:
+
+```sql
+SELECT left_items.id AS id
+FROM left_items JOIN right_items ON left_items.id = right_items.id;
+```
+
+```sql
+SELECT id, "extra.value" FROM dotted_items;
+```
+
+Each of the following statements is unsupported:
+
+```sql
+SELECT * FROM left_items JOIN right_items ON left_items.id = right_items.id;
+```
+
+```sql
+SELECT left_items.* FROM left_items JOIN right_items ON left_items.id = right_items.id;
+```
+
+```sql
+SELECT left_items.id AS id
+FROM left_items JOIN dotted_items ON left_items.id = dotted_items.id;
+```
+
+The last query fails even though `"extra.value"` is never selected. Use column
+names without dots for tables that will participate in joins.
+
+### Join work budgets
 
 Join chains are evaluated as written, from left to right, by a bounded nested
 loop; TinyJoin does not reorder or optimize them. Each `ON` equality must

@@ -120,6 +120,12 @@ The [full agent reference](https://tinyjoin.org/llms-full.txt) combines all guid
 public TypeScript declarations. Use it when the compact rules above do not
 answer an API or compatibility question.
 
+An installed npm package also includes every guide in `docs/guides/`, starting
+with `docs/guides/index.md`, and documented declarations in `@types/`. The links
+to guides in the packaged `agents.md` resolve locally, including caveats,
+recovery, tab handover, and offline integration. These contracts can be read
+without accessing the website.
+
 ## Repository work
 
 The TypeScript client and Worker host live in `src/`. The database engine lives
