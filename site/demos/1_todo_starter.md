@@ -149,6 +149,7 @@ Add a little styling, and we're done:
 @border: 1px solid #ccc;
 
 body {
+  box-sizing: border-box;
   font-family: Inter, sans-serif;
   letter-spacing: -0.04rem;
   margin: 0;

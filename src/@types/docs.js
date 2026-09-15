@@ -215,6 +215,8 @@
 
   /**
    * This addEventListener overload listens for Worker messages.
+   * @param type The `message` event type.
+   * @param listener The callback receiving messages from the Worker.
    * @category Worker
    * @since v0.0.5
    */
@@ -222,6 +224,8 @@
 
   /**
    * This addEventListener overload listens for message decoding failures.
+   * @param type The `messageerror` event type.
+   * @param listener The callback receiving message decoding failures.
    * @category Worker
    * @since v0.0.5
    */
@@ -229,6 +233,8 @@
 
   /**
    * This addEventListener overload listens for Worker runtime failures.
+   * @param type The `error` event type.
+   * @param listener The callback receiving Worker runtime failures.
    * @category Worker
    * @since v0.0.5
    */
@@ -236,6 +242,8 @@
 
   /**
    * This removeEventListener overload removes a message listener.
+   * @param type The `message` event type.
+   * @param listener The same callback passed to addEventListener.
    * @category Worker
    * @since v0.0.5
    */
@@ -243,6 +251,8 @@
 
   /**
    * This removeEventListener overload removes a message-error listener.
+   * @param type The `messageerror` event type.
+   * @param listener The same callback passed to addEventListener.
    * @category Worker
    * @since v0.0.5
    */
@@ -250,6 +260,8 @@
 
   /**
    * This removeEventListener overload removes a Worker error listener.
+   * @param type The `error` event type.
+   * @param listener The same callback passed to addEventListener.
    * @category Worker
    * @since v0.0.5
    */
@@ -607,14 +619,14 @@
 /**
  * The create function opens a TinyJoin database in a dedicated Worker.
  *
- * Calling it with no argument creates an ephemeral memory database. Pass a
- * stable `opfs://name` to persist the database in browser storage.
+ * This overload creates an ephemeral in-memory database using the packaged
+ * Worker. Its data is lost when the Client closes or the page reloads.
  * @returns A Promise resolving to a Client whose Worker and database are ready.
  * @example
  * ```ts
  * import {create} from 'tinyjoin';
  *
- * const db = await create('opfs://my-app');
+ * const db = await create();
  * await db.exec(`
  *   CREATE TABLE IF NOT EXISTS tasks (
  *     id INTEGER PRIMARY KEY,
@@ -629,6 +641,49 @@
  * @since v0.0.5
  */
 /// create
+
+/**
+ * This create overload opens a database with ClientOptions.
+ *
+ * Use the options object to select storage or provide a custom Worker.
+ * Omitting its dataDir property selects an ephemeral in-memory database.
+ * @param options Storage and Worker configuration.
+ * @returns A Promise resolving to a Client whose Worker and database are ready.
+ * @example
+ * ```ts
+ * import {create} from 'tinyjoin';
+ *
+ * const db = await create({dataDir: 'memory://'});
+ * await db.close();
+ * ```
+ * @category Lifecycle
+ * @essential Using a database
+ * @since v0.0.5
+ */
+/// create.options
+
+/**
+ * This create overload opens a database at the supplied storage URL.
+ *
+ * Use a stable `opfs://name` to persist data in the same browser, or
+ * `memory://` for an ephemeral database. When providing the second argument,
+ * supply a storage URL and leave options.dataDir unset.
+ * @param dataDir The `memory://` URL, a named `opfs://` URL, or `undefined` for
+ * the default in-memory database.
+ * @param options Optional Worker configuration.
+ * @returns A Promise resolving to a Client whose Worker and database are ready.
+ * @example
+ * ```ts
+ * import {create} from 'tinyjoin';
+ *
+ * const db = await create('opfs://my-app');
+ * await db.close();
+ * ```
+ * @category Lifecycle
+ * @essential Using a database
+ * @since v0.0.5
+ */
+/// create.dataDir
 
 /**
  * The ClientError class extends JavaScript Error with a validated error

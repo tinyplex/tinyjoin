@@ -71,14 +71,17 @@ const RUNTIME_FILES = [
 // repository root comes from the working directory, like every other path here.
 const repositoryRoot = process.cwd();
 
-// TinyDocs groups @essential members under the text of their tag. There is only
-// one such group, so give it empty markdown, which makes TinyDocs skip it and
-// list its members directly under The Essentials, as it does any lone child.
-const collapseLoneEssentialGroup = (node: Node): void => {
-  if (node.name === 'The Essentials' && node.children.length === 1) {
-    const [group] = node.children;
-    group.summary = '';
-    group.body = '';
+// TinyDocs collapses lone structural children with empty markdown, but treats
+// undefined markdown as content. Normalize empty groups so that navigation and
+// breadcrumbs skip redundant levels while keeping every API page available.
+const collapseEmptyGroups = (node: Node): void => {
+  if (
+    node.group != null ||
+    node.category != null ||
+    node.parent?.url === '/api/the-essentials/'
+  ) {
+    node.summary ??= '';
+    node.body ??= '';
   }
 };
 
@@ -117,38 +120,6 @@ const hideInheritedErrorMembers = (reflection: any): void => {
   );
 };
 
-// TypeDoc copies create's shared documentation to each overload. Show the
-// introduction and examples once, retaining distinct text and signature tags.
-const deduplicateCreateDocumentation = (reflection: any): void => {
-  if (reflection.name !== 'create' || reflection.signatures?.length < 2) {
-    return;
-  }
-  const [first, ...overloads] = reflection.signatures ?? [];
-  if (first?.comment == null) {
-    return;
-  }
-  const summary = (comment: any): string =>
-    JSON.stringify(comment.constructor.serializeDisplayParts(comment.summary));
-  const firstSummary = summary(first.comment);
-  const firstTags = new Set(
-    first.comment.blockTags.map((tag: any) => JSON.stringify(tag.toObject())),
-  );
-  for (const overload of overloads) {
-    if (overload.comment == null) {
-      continue;
-    }
-    const comment = (overload.comment = overload.comment.clone());
-    if (summary(comment) === firstSummary) {
-      comment.summary = [];
-    }
-    comment.blockTags = comment.blockTags.filter(
-      (tag: any) =>
-        ['@param', '@returns', '@category', '@essential'].includes(tag.tag) ||
-        !firstTags.has(JSON.stringify(tag.toObject())),
-    );
-  }
-};
-
 export const build = async (
   outDir = 'docs',
   typesDir = 'dist/@types',
@@ -161,8 +132,7 @@ export const build = async (
     .addDir('site/fonts', 'fonts')
     .addDir('site/extras')
     .addReflectionTransform(hideInheritedErrorMembers)
-    .addReflectionTransform(deduplicateCreateDocumentation)
-    .addNodeTransform(collapseLoneEssentialGroup)
+    .addNodeTransform(collapseEmptyGroups)
     .addNodeTransform((node) => {
       if (node.url === '/guides/') {
         node.children.sort((left, right) => sortGuides(left.name, right.name));

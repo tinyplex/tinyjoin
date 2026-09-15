@@ -155,6 +155,7 @@ A little styling, and the demo is complete:
 @border: 1px solid #ccc;
 
 body {
+  box-sizing: border-box;
   font-family: Inter, sans-serif;
   letter-spacing: -0.04rem;
   margin: 0;

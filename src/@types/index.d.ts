@@ -266,7 +266,11 @@ export class Client {
 
 /// create
 export function create(): Promise<Client>;
+
+/// create.options
 export function create(options: ClientOptions): Promise<Client>;
+
+/// create.dataDir
 export function create(
   dataDir: DataDir | undefined,
   options?: ClientOptions,
