@@ -1,5 +1,37 @@
 # Workload measurements
 
+## Prelaunch performance improvements
+
+The quick profile compares the same 250-operation mixed transaction and
+5,000-row database with 1,024-byte payloads across three samples per build.
+It uses the same schema, isolated Chromium contexts, row-model checks, and
+reopen/owner/follower checks as the full workload suite below. Run builds and
+benchmarks sequentially, without concurrent tests or compilation:
+
+```sh
+npm run build
+node scripts/benchmark-workloads.mjs /tmp/launch-performance.json --quick
+```
+
+On the same Apple M2 and Chromium 151.0.7922.34, measured medians were:
+
+| Build | 250 mixed writes, whole transaction | Populated reopen | First full read |
+| --- | ---: | ---: | ---: |
+| Baseline | 7,563.1 ms | 4,274.8 ms | 1,353.8 ms |
+| Lookup-table CRC-32 | 2,412.8 ms | 3,129.2 ms | 1,091.4 ms |
+
+`launch-performance-before.json` and `launch-performance-checksum.json` retain
+the samples, environment, and runtime hashes. The baseline used an isolated
+prototype of the quick profile; the checksum run used the committed runner and
+rebuilt package. The baseline run completed first. These are local diagnostics,
+not controlled device guarantees.
+
+The checksum optimization preserves the stored checksum values and all page
+validation. Its WASM is 738,134 bytes raw / 278,546 bytes gzip, compared with
+737,145 / 277,336 before: an increase of 989 raw and 1,210 gzip bytes.
+It reduces calculation cost without removing the repeated full validation
+performed by mixed transactions.
+
 ## Launch workload envelope
 
 `workload-envelope.json` retains five samples for each of nine OPFS workloads on

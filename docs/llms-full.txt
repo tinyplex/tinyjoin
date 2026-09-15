@@ -1757,6 +1757,11 @@ Selective multi-table joins now use their actual comparison count rather than
 a worst-case Cartesian estimate. Scan, build-row, result, memory, and shared
 script-work limits remain in force.
 
+Page checksum calculation is faster while preserving the stored checksum
+values, storage format, and corruption checks. This improves mixed writes and
+populated startup; the repository's [workload measurements](https://github.com/tinyplex/tinyjoin/tree/main/benchmarks)
+retain the before/after samples and runtime hashes.
+
 Duplicate output names in simple projections and `RETURNING` now fail
 consistently with `INVALID_QUERY` before execution. `LIMIT` and `OFFSET`
 reject nonnumeric parameter values consistently in ordinary, aggregate, and

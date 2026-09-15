@@ -1,0 +1,255 @@
+{
+  "measuredAt": "2026-09-15T09:20:09.794Z",
+  "packageVersion": "0.0.6",
+  "runtime": [
+    {
+      "path": "index.js",
+      "bytes": 10204,
+      "sha256": "fc3a9220bfd76693f6150ff9eadf743535d82c63b3f8ccf121562da768c47bb6"
+    },
+    {
+      "path": "protocol.js",
+      "bytes": 3530,
+      "sha256": "3a3f26ea0b5ccce24b6d18232d4c569e08809d9ff5256914acf30aea053c0e0d"
+    },
+    {
+      "path": "vite/index.js",
+      "bytes": 7737,
+      "sha256": "c3bb6eab11ac7e7de79fbb7010e329ba433b96d20f59a9cc070e96f4112043c9"
+    },
+    {
+      "path": "wasm/tinyjoin_wasm_bg.wasm",
+      "bytes": 738134,
+      "sha256": "e78413246116695b1b8784e8abec26e4eb11ae69eacaf17dbc889d384cb884f7"
+    },
+    {
+      "path": "wasm/tinyjoin_wasm.js",
+      "bytes": 9553,
+      "sha256": "2ad61c5367ad263f3400838903caf2cf215fe163e6410f3aa4edae79b5b384a9"
+    },
+    {
+      "path": "worker-opfs/tinyjoin_opfs_runtime.js",
+      "bytes": 5541,
+      "sha256": "cd7755056326e2dbd1df6d4eb4c73f15059845c3ed27b0cd57a702bdcf93bf0a"
+    },
+    {
+      "path": "worker/default-entry.js",
+      "bytes": 26066,
+      "sha256": "3b598f241626daab12d74153f3605ec890a2a97fd85f9a985361fa6269bd40f1"
+    },
+    {
+      "path": "worker/index.js",
+      "bytes": 26101,
+      "sha256": "cc5d8efc69579de541a94df09a2acc9f162ada8cf9842f3a43e3ec91daf9b47a"
+    }
+  ],
+  "environment": {
+    "node": "v25.2.1",
+    "os": "darwin",
+    "osRelease": "25.5.0",
+    "architecture": "arm64",
+    "cpu": "Apple M2",
+    "logicalCpus": 8,
+    "memoryBytes": 17179869184,
+    "headless": true,
+    "viewport": {
+      "width": 1280,
+      "height": 720
+    },
+    "cpuThrottling": "none",
+    "network": "loopback HTTP; warm cache permitted within each isolated context",
+    "browserVersion": "151.0.7922.34",
+    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/151.0.7922.34 Safari/537.36"
+  },
+  "repetitions": 3,
+  "profile": "quick",
+  "schema": "CREATE TABLE items (id INTEGER PRIMARY KEY, title TEXT NOT NULL, payload TEXT NOT NULL); CREATE UNIQUE INDEX items_title ON items (title)",
+  "definitions": {
+    "coldOpenMs": "First create(opfs://fresh-name) in a fresh browser context, before schema setup. Client module already loaded; Worker/WASM first-load included. Browser process, OS, and filesystem caches are not reset.",
+    "reopenMs": "After closing the sole client, create the same populated OPFS name in the same context. Includes fresh Worker and catalog open; HTTP/OS caches may be warm.",
+    "reopenReadMs": "First ordered full read after reopening; separate from reopenMs.",
+    "stagingMs": "Inside transaction callback: sequential prepared INSERT/UPDATE/DELETE requests, including Worker round trips and validation.",
+    "commitMs": "End of callback to transaction resolution; includes commit RPC, persistence, and coordination overhead.",
+    "resultMs": "query() call to complete materialized rows on requesting page, including engine execution, structured clone and owner/follower routing. Not an isolated copy benchmark; JSON byte sizing is outside timing.",
+    "percentiles": "Nearest-rank p90 of 3 samples is the maximum; retain all samples and do not treat it as a tail-latency estimate."
+  },
+  "notes": "One local desktop and one installed Chromium build. Sequential samples; no competitor, real mobile, Firefox, WebKit, power/thermal control, network download, or long-lived fragmentation coverage. No timing gate. Row checks run outside timing.",
+  "results": [
+    {
+      "kind": "mixed",
+      "rowCount": 250,
+      "payloadBytes": 64,
+      "samples": [
+        {
+          "repetition": 0,
+          "coldOpenMs": 56.699999928474426,
+          "stagingMs": 2339.5,
+          "commitMs": 73.20000004768372,
+          "transactionMs": 2412.8000000715256,
+          "operationCount": 250,
+          "finalRows": 251,
+          "reopenMs": 37.799999952316284,
+          "reopenReadMs": 7.5,
+          "resultJsonBytes": 27006,
+          "storageBytes": 249856
+        },
+        {
+          "repetition": 1,
+          "coldOpenMs": 19.699999928474426,
+          "stagingMs": 2326,
+          "commitMs": 73,
+          "transactionMs": 2399.0999999046326,
+          "operationCount": 250,
+          "finalRows": 251,
+          "reopenMs": 38.699999928474426,
+          "reopenReadMs": 7.399999976158142,
+          "resultJsonBytes": 27006,
+          "storageBytes": 249856
+        },
+        {
+          "repetition": 2,
+          "coldOpenMs": 19.799999952316284,
+          "stagingMs": 2368.9000000953674,
+          "commitMs": 73,
+          "transactionMs": 2441.9000000953674,
+          "operationCount": 250,
+          "finalRows": 251,
+          "reopenMs": 38.699999928474426,
+          "reopenReadMs": 7.5,
+          "resultJsonBytes": 27006,
+          "storageBytes": 249856
+        }
+      ],
+      "distributions": {
+        "coldOpenMs": {
+          "count": 3,
+          "min": 19.699999928474426,
+          "median": 19.799999952316284,
+          "p90": 56.699999928474426,
+          "max": 56.699999928474426
+        },
+        "reopenMs": {
+          "count": 3,
+          "min": 37.799999952316284,
+          "median": 38.699999928474426,
+          "p90": 38.699999928474426,
+          "max": 38.699999928474426
+        },
+        "reopenReadMs": {
+          "count": 3,
+          "min": 7.399999976158142,
+          "median": 7.5,
+          "p90": 7.5,
+          "max": 7.5
+        },
+        "stagingMs": {
+          "count": 3,
+          "min": 2326,
+          "median": 2339.5,
+          "p90": 2368.9000000953674,
+          "max": 2368.9000000953674
+        },
+        "commitMs": {
+          "count": 3,
+          "min": 73,
+          "median": 73,
+          "p90": 73.20000004768372,
+          "max": 73.20000004768372
+        },
+        "transactionMs": {
+          "count": 3,
+          "min": 2399.0999999046326,
+          "median": 2412.8000000715256,
+          "p90": 2441.9000000953674,
+          "max": 2441.9000000953674
+        }
+      }
+    },
+    {
+      "kind": "result",
+      "rowCount": 5000,
+      "payloadBytes": 1024,
+      "samples": [
+        {
+          "repetition": 0,
+          "coldOpenMs": 20.200000047683716,
+          "reopenMs": 3043.399999976158,
+          "reopenReadMs": 1091.3999999761581,
+          "resultJsonBytes": 5342781,
+          "storageBytes": 21344256,
+          "followerOpenMs": 5.700000047683716,
+          "ownerResultMs": 1071.5999999046326,
+          "followerResultMs": 1058.5
+        },
+        {
+          "repetition": 1,
+          "coldOpenMs": 20.09999990463257,
+          "reopenMs": 3194,
+          "reopenReadMs": 1086,
+          "resultJsonBytes": 5342781,
+          "storageBytes": 21344256,
+          "followerOpenMs": 6.100000023841858,
+          "ownerResultMs": 1090,
+          "followerResultMs": 1070.6000000238419
+        },
+        {
+          "repetition": 2,
+          "coldOpenMs": 20.199999928474426,
+          "reopenMs": 3129.1999999284744,
+          "reopenReadMs": 1116.7000000476837,
+          "resultJsonBytes": 5342781,
+          "storageBytes": 21344256,
+          "followerOpenMs": 6.199999928474426,
+          "ownerResultMs": 1096,
+          "followerResultMs": 1091.2999999523163
+        }
+      ],
+      "distributions": {
+        "coldOpenMs": {
+          "count": 3,
+          "min": 20.09999990463257,
+          "median": 20.199999928474426,
+          "p90": 20.200000047683716,
+          "max": 20.200000047683716
+        },
+        "reopenMs": {
+          "count": 3,
+          "min": 3043.399999976158,
+          "median": 3129.1999999284744,
+          "p90": 3194,
+          "max": 3194
+        },
+        "reopenReadMs": {
+          "count": 3,
+          "min": 1086,
+          "median": 1091.3999999761581,
+          "p90": 1116.7000000476837,
+          "max": 1116.7000000476837
+        },
+        "followerOpenMs": {
+          "count": 3,
+          "min": 5.700000047683716,
+          "median": 6.100000023841858,
+          "p90": 6.199999928474426,
+          "max": 6.199999928474426
+        },
+        "ownerResultMs": {
+          "count": 3,
+          "min": 1071.5999999046326,
+          "median": 1090,
+          "p90": 1096,
+          "max": 1096
+        },
+        "followerResultMs": {
+          "count": 3,
+          "min": 1058.5,
+          "median": 1070.6000000238419,
+          "p90": 1091.2999999523163,
+          "max": 1091.2999999523163
+        }
+      }
+    }
+  ],
+  "seeding": "Setup is outside all timings. Payloads of 1024 bytes use at most 1000 rows per seed transaction to stay below retained batch limits; 64-byte payloads seed the whole shape in one transaction.",
+  "completedAt": "2026-09-15T09:21:02.885Z"
+}

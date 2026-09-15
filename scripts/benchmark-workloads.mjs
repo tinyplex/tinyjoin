@@ -10,10 +10,13 @@ import {chromium} from '@playwright/test';
 // Each sample owns a fresh browser context and closes all clients and OPFS files.
 const root = fileURLToPath(new URL('../', import.meta.url));
 const dist = resolve(root, 'dist');
-const output = process.argv[2];
-const resume = process.argv[3] === '--resume';
-if (process.argv.length > 4 || (process.argv[3] && !resume)) throw new Error('Usage: node scripts/benchmark-workloads.mjs [output.json] [--resume]');
-const repetitions = 5;
+const args = process.argv.slice(2);
+const outputs = args.filter(argument => !argument.startsWith('--'));
+const output = outputs[0];
+const resume = args.includes('--resume');
+const quick = args.includes('--quick');
+if (outputs.length > 1 || new Set(args).size !== args.length || args.some(argument => argument.startsWith('--') && !['--resume', '--quick'].includes(argument)) || (resume && !output)) throw new Error('Usage: node scripts/benchmark-workloads.mjs [output.json] [--quick] [--resume]');
+const repetitions = quick ? 3 : 5;
 const runtime = [];
 async function fingerprint(directory = dist) {
   for (const entry of await readdir(directory, {withFileTypes: true})) {
@@ -58,6 +61,7 @@ const report = {
   runtime,
   environment: {node: process.version, os: platform(), osRelease: release(), architecture: arch(), cpu: cpus()[0]?.model, logicalCpus: cpus().length, memoryBytes: totalmem(), headless: true, viewport: {width: 1280, height: 720}, cpuThrottling: 'none', network: 'loopback HTTP; warm cache permitted within each isolated context'},
   repetitions,
+  profile: quick ? 'quick' : 'full',
   schema: 'CREATE TABLE items (id INTEGER PRIMARY KEY, title TEXT NOT NULL, payload TEXT NOT NULL); CREATE UNIQUE INDEX items_title ON items (title)',
   definitions: {
     coldOpenMs: 'First create(opfs://fresh-name) in a fresh browser context, before schema setup. Client module already loaded; Worker/WASM first-load included. Browser process, OS, and filesystem caches are not reset.',
@@ -66,7 +70,7 @@ const report = {
     stagingMs: 'Inside transaction callback: sequential prepared INSERT/UPDATE/DELETE requests, including Worker round trips and validation.',
     commitMs: 'End of callback to transaction resolution; includes commit RPC, persistence, and coordination overhead.',
     resultMs: 'query() call to complete materialized rows on requesting page, including engine execution, structured clone and owner/follower routing. Not an isolated copy benchmark; JSON byte sizing is outside timing.',
-    percentiles: 'Nearest-rank p90 of five samples is the maximum; retain all samples and do not treat it as a tail-latency estimate.',
+    percentiles: `Nearest-rank p90 of ${repetitions} samples is the maximum; retain all samples and do not treat it as a tail-latency estimate.`,
   },
   notes: 'One local desktop and one installed Chromium build. Sequential samples; no competitor, real mobile, Firefox, WebKit, power/thermal control, network download, or long-lived fragmentation coverage. No timing gate. Row checks run outside timing.',
   results: [],
@@ -74,7 +78,7 @@ const report = {
 let resumeBrowserVersion;
 if (resume) {
   const previous = JSON.parse(await readFile(output, 'utf8'));
-  if (JSON.stringify(previous.runtime) !== JSON.stringify(runtime) || previous.packageVersion !== report.packageVersion || previous.repetitions !== repetitions || previous.schema !== report.schema || Object.entries(report.environment).some(([key, value]) => JSON.stringify(previous.environment[key]) !== JSON.stringify(value))) throw new Error('Cannot resume with different runtime, schema, repetitions, or environment');
+  if (JSON.stringify(previous.runtime) !== JSON.stringify(runtime) || previous.packageVersion !== report.packageVersion || previous.repetitions !== repetitions || (previous.profile ?? 'full') !== report.profile || previous.schema !== report.schema || Object.entries(report.environment).some(([key, value]) => JSON.stringify(previous.environment[key]) !== JSON.stringify(value))) throw new Error('Cannot resume with different runtime, schema, repetitions, profile, or environment');
   if (previous.results.some(result => result.samples.length !== repetitions)) throw new Error('Cannot resume an incomplete result shape');
   resumeBrowserVersion = previous.environment.browserVersion;
   report.environment.userAgent = previous.environment.userAgent;
@@ -139,8 +143,8 @@ try {
   if (resumeBrowserVersion && resumeBrowserVersion !== browser.version()) throw new Error('Cannot resume with a different browser version');
   for (const kind of ['mixed', 'result']) {
     const shapes = kind === 'mixed'
-      ? [25, 100, 250].map(rowCount => ({rowCount, payloadBytes: 64}))
-      : [100, 1000, 5000].flatMap(rowCount => [64, 1024].map(payloadBytes => ({rowCount, payloadBytes})));
+      ? (quick ? [250] : [25, 100, 250]).map(rowCount => ({rowCount, payloadBytes: 64}))
+      : (quick ? [5000] : [100, 1000, 5000]).flatMap(rowCount => (quick ? [1024] : [64, 1024]).map(payloadBytes => ({rowCount, payloadBytes})));
     for (const shape of shapes) {
       if (report.results.some(result => result.kind === kind && result.rowCount === shape.rowCount && result.payloadBytes === shape.payloadBytes)) continue;
       const samples = [];
