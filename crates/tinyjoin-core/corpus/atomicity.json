@@ -1,0 +1,37 @@
+[
+  {
+    "case": {
+      "name": "duplicate-suffix-preserves-catalog-and-rows",
+      "transaction": false,
+      "operations": [{"mode": "script", "sql": "CREATE TABLE audit_marker (id INTEGER PRIMARY KEY); UPDATE items SET v = 'prefix'; INSERT INTO items VALUES (1, 'duplicate')"}]
+    },
+    "errors": ["CONSTRAINT_VIOLATION"]
+  },
+  {
+    "case": {
+      "name": "failed-script-preserves-earlier-transaction-write",
+      "transaction": true,
+      "operations": [{"mode": "script", "sql": "UPDATE items SET v = 'prefix'; SELECT missing FROM items"}]
+    },
+    "errors": ["COLUMN_NOT_FOUND"]
+  },
+  {
+    "case": {
+      "name": "prepared-failed-binding-preserves-earlier-mutation",
+      "transaction": true,
+      "operations": [
+        {"mode": "direct", "sql": "UPDATE items SET v = $1 WHERE id = 1", "params": ["earlier"]},
+        {"mode": "prepared", "sql": "UPDATE items SET v = $1 WHERE id = 1", "params": [{"nested": [{"\u0000tinyjoin:parameter": 1}]}]}
+      ]
+    },
+    "errors": [null, "TYPE_MISMATCH"]
+  },
+  {
+    "case": {
+      "name": "minimized-injected-oracle-replay",
+      "transaction": false,
+      "operations": [{"mode": "direct", "sql": "SELECT g FROM items WHERE d=1"}]
+    },
+    "errors": ["COLUMN_NOT_FOUND"]
+  }
+]

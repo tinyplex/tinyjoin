@@ -460,9 +460,6 @@ fn deterministic_sql_mutations_never_panic_or_partially_apply_failed_scripts() {
         "SELECT id FROM items WHERE v = 1",
         "SELECT missing FROM items",
     ];
-    let mut baseline = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
-    baseline.exec_sql("CREATE TABLE items (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO items VALUES (1, 'base')").unwrap();
-    let baseline = baseline.into_device();
     for seed in [7, 0x5eed, 0xcafe_babe] {
         let mut generator = Generator(seed);
         let mut successes = 0;
@@ -496,88 +493,44 @@ fn deterministic_sql_mutations_never_panic_or_partially_apply_failed_scripts() {
             }
             // Exercise the single-statement and prepared-layout parsers too: scripts
             // can reject a suffix in their splitter before either of these sees it.
-            std::panic::catch_unwind(|| {
-                let _ = crate::statement::parse(&sql, &[]);
-                let mut registry = crate::prepared_statement::PreparedStatementRegistry::default();
-                if let Ok(id) = registry.prepare(&sql) {
-                    let _ = registry.bind(id, &[]);
-                    let _ = registry.bind(id, &[json!({"nested": [true, null, "' ; $1"]})]);
-                    registry.close(id).unwrap();
-                }
-            })
-            .unwrap_or_else(|_| panic!("parser panic: seed={seed:#x}, case={case}, sql={sql:?}"));
+            crate::corpus_support::assert_case(&crate::corpus_support::Case {
+                name: format!("parser seed={seed:#x}, case={case}"),
+                transaction: false,
+                operations: [vec![], vec![json!({"nested": [true, null, "' ; $1"]})]]
+                    .into_iter()
+                    .map(|params| crate::corpus_support::Operation {
+                        mode: "parsers".to_owned(),
+                        sql: sql.clone(),
+                        params,
+                    })
+                    .collect(),
+            });
             for transaction in [false, true] {
-                let mut engine = PagedEngine::open(baseline.clone()).unwrap();
-                if transaction {
-                    engine.begin_transaction().unwrap();
-                    engine
-                        .execute_sql("INSERT INTO items VALUES (3, 'staged')", &[])
-                        .unwrap();
-                }
-                let before = rows(&mut engine);
-                let revision = engine.revision();
-                // The valid prefix makes failure atomicity observable even when the suffix
-                // parses successfully and fails only at catalog/type/constraint validation.
                 let catalog_prefix = if transaction {
                     ""
                 } else {
                     "CREATE TABLE audit_marker (id INTEGER PRIMARY KEY); "
                 };
-                let script = format!("{catalog_prefix}UPDATE items SET v = 'prefix'; {sql}");
-                let context = format!(
-                    "seed={seed:#x}, case={case}, transaction={transaction}, script={script:?}"
-                );
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    engine.exec_sql(&script)
-                }))
-                .unwrap_or_else(|_| panic!("parser/executor panic: {context}"));
-                if result.is_err() {
-                    assert_eq!(rows(&mut engine), before, "{context}");
-                    assert_eq!(engine.revision(), revision, "{context}");
-                    assert_eq!(engine.in_transaction(), transaction, "{context}");
-                }
-                match &result {
-                    Ok(_) => successes += 1,
-                    Err(error) if error.code == "SQL_PARSE_ERROR" => syntax_errors += 1,
-                    Err(error)
-                        if matches!(
-                            error.code.as_str(),
+                let case = crate::corpus_support::Case {
+                    name: format!("seed={seed:#x}, case={case}"),
+                    transaction,
+                    operations: vec![crate::corpus_support::Operation {
+                        mode: "script".to_owned(),
+                        sql: format!("{catalog_prefix}UPDATE items SET v = 'prefix'; {sql}"),
+                        params: vec![],
+                    }],
+                };
+                for outcome in crate::corpus_support::assert_case(&case) {
+                    match outcome.as_deref() {
+                        None => successes += 1,
+                        Some("SQL_PARSE_ERROR") => syntax_errors += 1,
+                        Some(
                             "TYPE_MISMATCH"
-                                | "CONSTRAINT_VIOLATION"
-                                | "COLUMN_NOT_FOUND"
-                                | "TABLE_NOT_FOUND"
-                        ) =>
-                    {
-                        semantic_errors += 1
-                    }
-                    Err(_) => {}
-                }
-                if !transaction && result.is_err() {
-                    assert_eq!(
-                        engine
-                            .query_sql("SELECT id FROM audit_marker", &[])
-                            .unwrap_err()
-                            .code,
-                        "TABLE_NOT_FOUND",
-                        "partial catalog: {context}"
-                    );
-                }
-                if transaction {
-                    engine.rollback_transaction().unwrap();
-                }
-                let before_reopen = rows(&mut engine);
-                let mut reopened = PagedEngine::open(engine.into_device()).unwrap();
-                assert_eq!(rows(&mut reopened), before_reopen, "{context}");
-                if !transaction {
-                    let catalog = reopened.query_sql("SELECT id FROM audit_marker", &[]);
-                    if result.is_ok() {
-                        assert!(catalog.unwrap().rows.is_empty(), "{context}");
-                    } else {
-                        assert_eq!(
-                            catalog.unwrap_err().code,
-                            "TABLE_NOT_FOUND",
-                            "persisted partial catalog: {context}"
-                        );
+                            | "CONSTRAINT_VIOLATION"
+                            | "COLUMN_NOT_FOUND"
+                            | "TABLE_NOT_FOUND",
+                        ) => semantic_errors += 1,
+                        _ => {}
                     }
                 }
             }

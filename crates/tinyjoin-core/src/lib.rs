@@ -4,6 +4,8 @@ mod aggregate;
 mod btree;
 mod cache;
 mod checksum;
+#[cfg(test)]
+mod corpus_support;
 mod device;
 #[cfg(test)]
 mod engine;
