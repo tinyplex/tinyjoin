@@ -2,8 +2,9 @@ import assert from 'node:assert/strict';
 
 const originalWorker = Object.getOwnPropertyDescriptor(globalThis, 'Worker');
 const originalFetch = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
-const {ClientError} = await import('tinyjoin');
-const {create} = await import('tinyjoin/node');
+const {ClientError: BrowserClientError} = await import('tinyjoin');
+const {ClientError, create} = await import('tinyjoin/node');
+assert.equal(ClientError, BrowserClientError);
 
 const clients = [];
 const schema = `

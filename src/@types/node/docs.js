@@ -4,7 +4,11 @@
  * automatically, with no extra dependencies, bundler, or polyfills.
  *
  * The returned Client has the same SQL, transaction, prepared-statement, and
- * subscription APIs as the browser Client. See the [Node guide](/guides/node/).
+ * subscription APIs as the browser Client. The module also exports ClientError
+ * and the shared Client API types, so Node applications can import their query,
+ * result, transaction, and subscription contracts from this entry point.
+ * ClientError is the same class exported by the browser entry point.
+ * See the [Node guide](/guides/node/).
  * @packageDocumentation
  * @module node
  * @since v0.0.6
@@ -23,9 +27,9 @@
  * @returns A ready Client. Always await its close method when finished.
  * @example
  * ```ts
- * import {create} from 'tinyjoin/node';
+ * import {type Client, create} from 'tinyjoin/node';
  *
- * const db = await create();
+ * const db: Client = await create();
  * try {
  *   await db.exec('CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)');
  *   await db.query('INSERT INTO notes VALUES ($1, $2)', [1, 'Hello from Node']);

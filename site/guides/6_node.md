@@ -50,12 +50,16 @@ Worker and engine are ready.
 The returned Client supports the same parameterized queries, transactions,
 prepared statements, subscriptions, and TypeScript row generics as the browser
 Client. The [SQL compatibility rules](/guides/sql-compatibility/) and
-[transaction behavior](/guides/transactions-and-changes/) also apply. Public
-types can be imported from the main module:
+[transaction behavior](/guides/transactions-and-changes/) also apply. The Node
+entry point also exports ClientError and the shared Client API types, including
+row, result, query-option, transaction, prepared-statement, and subscription
+types:
 
 ```ts
-import type {Client, Row} from 'tinyjoin';
+import {type Client, type Row, create, ClientError} from 'tinyjoin/node';
 ```
+
+ClientError is the same error class exported by the browser entry point.
 
 Each call owns one Worker thread and an independent database. Always await
 db.close() when finished, including error paths, so the Worker is released and

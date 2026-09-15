@@ -1421,12 +1421,16 @@ Worker and engine are ready.
 The returned Client supports the same parameterized queries, transactions,
 prepared statements, subscriptions, and TypeScript row generics as the browser
 Client. The [SQL compatibility rules](https://tinyjoin.org/guides/sql-compatibility/) and
-[transaction behavior](https://tinyjoin.org/guides/transactions-and-changes/) also apply. Public
-types can be imported from the main module:
+[transaction behavior](https://tinyjoin.org/guides/transactions-and-changes/) also apply. The Node
+entry point also exports ClientError and the shared Client API types, including
+row, result, query-option, transaction, prepared-statement, and subscription
+types:
 
 ```ts
-import type {Client, Row} from 'tinyjoin';
+import {type Client, type Row, create, ClientError} from 'tinyjoin/node';
 ```
+
+ClientError is the same error class exported by the browser entry point.
 
 Each call owns one Worker thread and an independent database. Always await
 db.close() when finished, including error paths, so the Worker is released and
@@ -2629,13 +2633,34 @@ Source: https://tinyjoin.org/api/node/
  * automatically, with no extra dependencies, bundler, or polyfills.
  *
  * The returned Client has the same SQL, transaction, prepared-statement, and
- * subscription APIs as the browser Client. See the [Node guide](https://tinyjoin.org/guides/node/).
+ * subscription APIs as the browser Client. The module also exports ClientError
+ * and the shared Client API types, so Node applications can import their query,
+ * result, transaction, and subscription contracts from this entry point.
+ * ClientError is the same class exported by the browser entry point.
+ * See the [Node guide](https://tinyjoin.org/guides/node/).
  * @packageDocumentation
  * @module node
  * @since v0.0.6
  */
 
 import type {Client} from '../index.js';
+
+export {ClientError} from '../index.js';
+export type {
+  Client,
+  JsonPrimitive,
+  JsonValue,
+  PreparedStatement,
+  QueryOptions,
+  ResultField,
+  Results,
+  Row,
+  RowMode,
+  SerializedError,
+  SubscriptionOptions,
+  TablesChangedEvent,
+  Transaction,
+} from '../index.js';
 
 /**
  * The create function opens a fresh in-memory database in a dedicated Node
@@ -2649,9 +2674,9 @@ import type {Client} from '../index.js';
  * @returns A ready Client. Always await its close method when finished.
  * @example
  * ```ts
- * import {create} from 'tinyjoin/node';
+ * import {type Client, create} from 'tinyjoin/node';
  *
- * const db = await create();
+ * const db: Client = await create();
  * try {
  *   await db.exec('CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)');
  *   await db.query('INSERT INTO notes VALUES ($1, $2)', [1, 'Hello from Node']);

@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
-import {ClientError} from 'tinyjoin';
-import {create} from 'tinyjoin/node';
+import {ClientError, create} from 'tinyjoin/node';
 
 await assert.rejects(
   create(),

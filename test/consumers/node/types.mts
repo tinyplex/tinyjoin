@@ -1,5 +1,20 @@
-import type {Client, PreparedStatement, Results, Transaction} from 'tinyjoin';
-import {create} from 'tinyjoin/node';
+import {
+  type Client,
+  ClientError,
+  type JsonPrimitive,
+  type JsonValue,
+  type PreparedStatement,
+  type QueryOptions,
+  type ResultField,
+  type Results,
+  type Row,
+  type RowMode,
+  type SerializedError,
+  type SubscriptionOptions,
+  type TablesChangedEvent,
+  type Transaction,
+  create,
+} from 'tinyjoin/node';
 
 type Task = {id: string; title: string};
 
@@ -8,10 +23,16 @@ export async function exerciseNodeDeclarations(): Promise<void> {
   const explicit: Client = await create('memory://');
   const omitted: Client = await create(undefined);
   try {
+    const primitive: JsonPrimitive = 'first';
+    const params: JsonValue[] = [primitive];
+    const rowMode: RowMode = 'object';
+    const options: QueryOptions = {rowMode};
     const statement: PreparedStatement<Task> = await database.prepare<Task>(
       'SELECT id, title FROM tasks WHERE id = $1',
     );
-    const result: Results<Task> = await statement.execute(['first']);
+    const result: Results<Task> = await statement.execute(params, options);
+    const field: ResultField | undefined = result.fields[0];
+    const row: Row | undefined = result.rows[0];
     const title: string | undefined = result.rows[0]?.title;
     const count: number = await database.transaction(
       async (transaction: Transaction) => {
@@ -19,9 +40,10 @@ export async function exerciseNodeDeclarations(): Promise<void> {
         return selected.rows.length;
       },
     );
+    const subscription: SubscriptionOptions = {tables: ['tasks']};
     const unsubscribe: () => void = database.subscribe(
-      {tables: ['tasks']},
-      (event) => {
+      subscription,
+      (event: TablesChangedEvent) => {
         const revision: number = event.revision;
         const tables: string[] = event.tables;
         void [revision, tables];
@@ -29,7 +51,9 @@ export async function exerciseNodeDeclarations(): Promise<void> {
     );
     unsubscribe();
     await statement.close();
-    void [title, count];
+    const serialized: SerializedError = {code: 'EXAMPLE', message: 'example'};
+    const error: ClientError = new ClientError(serialized);
+    void [title, count, field, row, error];
   } finally {
     await Promise.all([database.close(), explicit.close(), omitted.close()]);
   }
