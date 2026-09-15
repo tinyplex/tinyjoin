@@ -71,6 +71,9 @@ assertPackedFiles(packed, Object.keys(packageDocumentation));
 const tarball = resolve(packageDirectory, packed.filename);
 
 await cp(fixture, appDirectory, {recursive: true});
+await cp(resolve(root, 'test/consumers/node'), resolve(appDirectory, 'node'), {
+  recursive: true,
+});
 const manifestPath = resolve(appDirectory, 'package.json');
 const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
 manifest.dependencies.tinyjoin = `file:${tarball}`;
@@ -142,6 +145,7 @@ if (!ssrOutput.includes('SSR_IMPORT_OK')) {
   throw new Error(`SSR-safe import did not complete:\n${ssrOutput}`);
 }
 
+await exerciseNodeConsumer();
 run(npm, ['run', 'typecheck'], appDirectory);
 run(npm, ['run', 'build'], appDirectory);
 const builtFiles = await listFiles(resolve(appDirectory, 'dist'));
@@ -246,20 +250,60 @@ console.log(`VITE_BUILD_OK ${builtFiles.length} files`);
 await rm(generatedRoot, {force: true, recursive: true});
 process.removeListener('exit', cleanupGeneratedRoot);
 
-function run(command, args, cwd) {
+function run(command, args, cwd, options = {}) {
   const result = spawnSync(command, args, {
     cwd,
     encoding: 'utf8',
     env: packageTestEnvironment,
     maxBuffer: 20 * 1024 * 1024,
+    ...options,
   });
   const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
   if (result.status !== 0) {
     throw new Error(
-      `${command} ${args.join(' ')} failed with ${result.status}:\n${output}`,
+      `${command} ${args.join(' ')} failed with ${result.error?.message ?? result.status}:\n${output}`,
     );
   }
   return output;
+}
+
+async function exerciseNodeConsumer() {
+  run(
+    process.execPath,
+    ['node_modules/typescript/bin/tsc', '--project', 'node/tsconfig.json'],
+    appDirectory,
+    {timeout: 30_000},
+  );
+  for (const args of [
+    ['node/main.mjs'],
+    ['--input-type=module', '--eval', "await import('./node/main.mjs')"],
+  ]) {
+    const output = run(process.execPath, args, appDirectory, {timeout: 30_000});
+    if (!output.includes('NODE_MEMORY_CONSUMER_OK')) {
+      throw new Error(`Node packed consumer did not complete:\n${output}`);
+    }
+  }
+
+  // A damaged install must reject create() and stop its Worker. Keep the
+  // installed browser consumer and the repository's build artifacts intact.
+  const damagedApp = resolve(generatedRoot, 'node-missing-wasm');
+  const damagedPackage = resolve(damagedApp, 'node_modules/tinyjoin');
+  await mkdir(dirname(damagedPackage), {recursive: true});
+  await cp(installedPackage, damagedPackage, {recursive: true});
+  await rm(resolve(damagedPackage, 'wasm/tinyjoin_wasm_bg.wasm'));
+  await cp(
+    resolve(root, 'test/consumers/node/missing-wasm.mjs'),
+    resolve(damagedApp, 'main.mjs'),
+  );
+  const output = run(process.execPath, ['main.mjs'], damagedApp, {
+    timeout: 30_000,
+  });
+  if (!output.includes('NODE_MISSING_WASM_REJECTED')) {
+    throw new Error(`Node missing-WASM consumer did not complete:\n${output}`);
+  }
+  console.log('NODE_DECLARATIONS_OK');
+  console.log('NODE_MEMORY_CONSUMER_OK');
+  console.log('NODE_MISSING_WASM_REJECTED');
 }
 
 async function assertBuildLibRejectsMissingWasmArtifacts() {
@@ -312,6 +356,7 @@ function assertPackedFiles(packed, documentationFiles) {
     : [];
   const expected = [
     '@types/index.d.ts',
+    '@types/node/index.d.ts',
     '@types/worker/index.d.ts',
     '@types/vite/index.d.ts',
     'LICENSE',
@@ -321,6 +366,8 @@ function assertPackedFiles(packed, documentationFiles) {
     ...documentationFiles,
     'package.json',
     'index.js',
+    'node/index.js',
+    'node/worker-entry.js',
     'protocol.js',
     'releases.md',
     'wasm/tinyjoin_wasm.js',

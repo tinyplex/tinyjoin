@@ -16,6 +16,10 @@
       "import": "./dist/worker/index.js"
     },
     "./package.json": "./package.json",
+    "./node": {
+      "types": "./dist/@types/node/index.d.ts",
+      "import": "./dist/node/index.js"
+    },
     "./vite": {
       "types": "./dist/@types/vite/index.d.ts",
       "import": "./dist/vite/index.js"

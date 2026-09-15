@@ -12,6 +12,7 @@
     "tinyjoin": "file:__TINYJOIN_TARBALL__"
   },
   "devDependencies": {
+    "@types/node": "^22.20.2",
     "typescript": "^7.0.2",
     "vite": "^8.2.1"
   }

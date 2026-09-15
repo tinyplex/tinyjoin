@@ -48,12 +48,14 @@ const RUNTIME_BUNDLES = [
   // one into a Worker of its own - so the duplicate costs nobody any bytes, and
   // it saves the browser a round trip on a forty-five byte shim.
   {entry: 'worker/default-entry.js', shared: WORKER_SHARED},
+  {entry: 'node/index.js', shared: {'index.js': '../index.js'}, platform: 'node'},
+  {entry: 'node/worker-entry.js', shared: WORKER_SHARED, platform: 'node'},
   {entry: 'vite/index.js', shared: {}, platform: 'node'},
 ];
 
-// Published JavaScript, including the Node-only Vite plugin. tsc emits one
+// Published JavaScript, including the Node entry point and Vite plugin. tsc emits one
 // module per source file; unlisted modules are bundled before pruning. The
-// size measurement separately excludes the Vite plugin from browser payload.
+// size measurement excludes both Node-only modules from the browser payload.
 const RUNTIME_FILES = [
   'index.js',
   'protocol.js',
@@ -61,6 +63,8 @@ const RUNTIME_FILES = [
   'worker-opfs/tinyjoin_opfs_runtime.js',
   'worker/default-entry.js',
   'worker/index.js',
+  'node/index.js',
+  'node/worker-entry.js',
   'vite/index.js',
 ];
 
@@ -146,6 +150,10 @@ manifest.exports = {
     import: './worker/index.js',
   },
   './package.json': './package.json',
+  './node': {
+    types: './@types/node/index.d.ts',
+    import: './node/index.js',
+  },
   './vite': {
     types: './@types/vite/index.d.ts',
     import: './vite/index.js',
@@ -219,7 +227,8 @@ function shareModules(shared) {
   return {
     name: 'tinyjoin-shared-modules',
     setup: (build) =>
-      build.onResolve({filter: /\.js$/}, ({path}) => {
+      build.onResolve({filter: /\.js$/}, ({path, kind}) => {
+        if (kind === 'entry-point') return null;
         const specifier = shared[basename(path)];
         return specifier === undefined ? null : {external: true, path: specifier};
       }),
@@ -247,7 +256,10 @@ async function assertPublishedImports() {
     const source = await readFile(path, 'utf8');
     for (const [, specifier] of source.matchAll(RUNTIME_REFERENCE)) {
       const referenced = relative(dist, resolve(dirname(path), specifier));
-      if (!RUNTIME_FILES.includes(referenced)) {
+      if (
+        !RUNTIME_FILES.includes(referenced) &&
+        referenced !== 'wasm/tinyjoin_wasm_bg.wasm'
+      ) {
         throw new Error(
           `${file} references ${specifier}, which the package does not publish`,
         );

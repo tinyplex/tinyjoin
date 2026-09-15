@@ -1,6 +1,6 @@
 declare module '*tinyjoin_wasm.js' {
   export default function init(
-    moduleOrPath?: WebAssembly.Module | RequestInfo | URL | Response,
+    options?: {module_or_path: Uint8Array | WebAssembly.Module},
   ): Promise<unknown>;
 
   export class WasmEngine {

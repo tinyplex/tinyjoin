@@ -7,6 +7,11 @@ compatibility boundaries.
 
 This release is being prepared locally and has not yet been published.
 
+The new [Node entry point](/guides/node/), `tinyjoin/node`, opens in-memory
+databases in Node.js 22 or later. It constructs a Worker thread and loads WASM
+automatically, returning the same Client API without additional dependencies.
+Each Client owns an independent database; filesystem persistence is not included.
+
 **Persistent storage breaks compatibility with v0.0.5.** The npm v0.0.5
 release uses page format 1; v0.0.6 uses page format 2. Opening a v0.0.5
 database with v0.0.6 fails with `UNSUPPORTED_PAGE`. There is no automatic

@@ -24,6 +24,7 @@ const CATEGORIES = [
 ];
 const REFLECTIONS = [
   'tinyjoin',
+  'node',
   'worker',
   'create',
   'Client',
@@ -150,6 +151,7 @@ export const build = async (
     .addReflectionTransform(deduplicateCreateDocumentation)
     .addNodeTransform(collapseLoneEssentialGroup)
     .addApiFile(resolve(typesDir, 'index.d.ts'))
+    .addApiFile(resolve(typesDir, 'node/index.d.ts'))
     .addApiFile(resolve(typesDir, 'worker/index.d.ts'))
     .addApiFile(resolve(typesDir, 'vite/index.d.ts'))
     .addRootMarkdownFile('site/home/index.md')
@@ -251,6 +253,7 @@ const getFullReference = (
   });
   for (const [module, declaration, source] of [
     ['tinyjoin', 'index.d.ts', 'https://tinyjoin.org/api/tinyjoin/'],
+    ['tinyjoin/node', 'node/index.d.ts', 'https://tinyjoin.org/api/node/'],
     ['tinyjoin/worker', 'worker/index.d.ts', 'https://tinyjoin.org/api/worker/'],
     ['tinyjoin/vite', 'vite/index.d.ts', 'https://tinyjoin.org/api/vite/'],
   ]) {

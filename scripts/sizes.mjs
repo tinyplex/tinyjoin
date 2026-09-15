@@ -33,7 +33,11 @@ export async function measureSizes(dist = resolve(root, 'dist')) {
   );
 
   for (const path of await getRuntimeFiles(dist)) {
-    if (ALTERNATIVE_ENTRIES.includes(path) || path.startsWith('vite/')) {
+    if (
+      ALTERNATIVE_ENTRIES.includes(path) ||
+      path.startsWith('vite/') ||
+      path.startsWith('node/')
+    ) {
       continue;
     }
     const contents = await readFile(resolve(dist, path));

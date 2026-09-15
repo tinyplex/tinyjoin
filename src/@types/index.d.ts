@@ -72,6 +72,22 @@ export interface SerializedError {
   retryable?: boolean;
 }
 
+// Use the host's event shape when available, including DOM event methods in a
+// browser, without requiring DOM declarations in Node applications.
+/** @ignore */
+type WorkerMessageEvent = typeof globalThis extends {
+  MessageEvent: {prototype: infer Event};
+}
+  ? Omit<Event, 'data'> & {readonly data: unknown}
+  : {readonly data: unknown};
+
+/** @ignore */
+type WorkerErrorEvent = typeof globalThis extends {
+  ErrorEvent: {prototype: infer Event};
+}
+  ? Event
+  : {readonly message: string};
+
 /// WorkerLike
 export interface WorkerLike {
   /// WorkerLike.postMessage
@@ -80,37 +96,37 @@ export interface WorkerLike {
   /// WorkerLike.addEventListener.message
   addEventListener(
     type: 'message',
-    listener: (event: MessageEvent<unknown>) => void,
+    listener: (event: WorkerMessageEvent) => void,
   ): void;
 
   /// WorkerLike.addEventListener.messageerror
   addEventListener(
     type: 'messageerror',
-    listener: (event: MessageEvent<unknown>) => void,
+    listener: (event: WorkerMessageEvent) => void,
   ): void;
 
   /// WorkerLike.addEventListener.error
   addEventListener(
     type: 'error',
-    listener: (event: ErrorEvent) => void,
+    listener: (event: WorkerErrorEvent) => void,
   ): void;
 
   /// WorkerLike.removeEventListener.message
   removeEventListener(
     type: 'message',
-    listener: (event: MessageEvent<unknown>) => void,
+    listener: (event: WorkerMessageEvent) => void,
   ): void;
 
   /// WorkerLike.removeEventListener.messageerror
   removeEventListener(
     type: 'messageerror',
-    listener: (event: MessageEvent<unknown>) => void,
+    listener: (event: WorkerMessageEvent) => void,
   ): void;
 
   /// WorkerLike.removeEventListener.error
   removeEventListener(
     type: 'error',
-    listener: (event: ErrorEvent) => void,
+    listener: (event: WorkerErrorEvent) => void,
   ): void;
 
   /// WorkerLike.terminate

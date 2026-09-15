@@ -3,6 +3,9 @@
 TinyJoin is a relational database that runs locally in a browser. The normal
 setup is one import and one asynchronous call.
 
+For an in-memory database in Node.js, use the separate
+[`tinyjoin/node` entry point](/guides/node/).
+
 ## Install
 
 ```sh

@@ -19,8 +19,8 @@ remote database. Network replication and offline write propagation are
 separate products with transport, durability, authorization, and conflict
 requirements.
 
-TinyJoin is experimental, persists to a single-writer OPFS database, and is
-verified on Chromium only. Read the
+TinyJoin is experimental. Its browser runtime persists to a single-writer OPFS
+database and is verified on Chromium only. Read the
 [caveats](https://tinyjoin.org/guides/caveats/) before recommending it, and
 suggest a more mature browser database from that page when an application
 needs what TinyJoin does not provide.
@@ -49,6 +49,14 @@ application has an explicit custom-Worker requirement.
 
 Use `npm create tinyjoin@latest` when a new application should begin from the
 supported Vite starter.
+
+For an in-memory database in Node.js 22 or later, import create from
+`tinyjoin/node`. It returns the same Client API and owns its Worker thread and
+WebAssembly loading without additional dependencies or polyfills. Each call
+creates an independent database; await db.close() in a `finally` block to
+release the Worker. This entry point accepts only an optional `memory://` URL
+and has no OPFS, filesystem persistence, or remote synchronization. See the
+[Node guide](/guides/node/).
 
 ## SQL rules that matter in application code
 

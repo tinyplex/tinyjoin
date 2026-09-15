@@ -5,7 +5,7 @@ const TYPES_DOC_CODE_BLOCKS =
   /\/\/\/\s*(\S*)(.*?)(?=(\s*\/\/\/)|(\n\n)|(\n$))/gs;
 const TYPES_DOC_BLOCKS = /(\/\*\*.*?\*\/)\s*\/\/\/\s*(\S*)/gs;
 
-const modules = ['', 'worker', 'vite'];
+const modules = ['', 'worker', 'vite', 'node'];
 
 export async function buildDefinitions(root, dist) {
   const typesDirectory = resolve(dist, '@types');

@@ -9,6 +9,9 @@ Source: https://tinyjoin.org/guides/getting-started/
 TinyJoin is a relational database that runs locally in a browser. The normal
 setup is one import and one asynchronous call.
 
+For an in-memory database in Node.js, use the separate
+[`tinyjoin/node` entry point](https://tinyjoin.org/guides/node/).
+
 ## Install
 
 ```sh
@@ -1012,11 +1015,14 @@ can still hold the underlying OPFS lock. See
 
 ## It needs a modern browser
 
-TinyJoin requires WebAssembly and dedicated module Workers, and persistence
+The browser entry point requires WebAssembly and dedicated module Workers, and persistence
 additionally requires a secure context, OPFS synchronous access handles, Web
 Locks, and BroadcastChannel. It
 deliberately does not use `SharedArrayBuffer`, so a page does not need
 cross-origin isolation headers.
+
+The separate [Node entry point](https://tinyjoin.org/guides/node/) supports in-memory databases
+in Node.js 22 or later. It does not provide OPFS or filesystem persistence.
 
 The automated browser suite currently runs on Chromium only. Firefox and WebKit
 are not verified, and a successful TypeScript or Vite build says nothing about
@@ -1308,6 +1314,9 @@ Most applications should use create(). It constructs TinyJoin's packaged
 module Worker and preserves the relative Worker, OPFS runtime, and WebAssembly
 assets during the supported Vite build path.
 
+For Node.js, use [`tinyjoin/node`](https://tinyjoin.org/guides/node/), which constructs its own
+Worker thread and loads WebAssembly without a custom bootstrap.
+
 An application that needs to own the Worker can provide a factory:
 
 ```ts
@@ -1394,6 +1403,82 @@ with its response headers; custom Worker URLs and other bundlers may emit a
 different asset graph. The production fixture runs with
 `npm run build && npm run test:offline:built` in this repository.
 
+# Node
+
+Source: https://tinyjoin.org/guides/node/
+
+Use `tinyjoin/node` to run an in-memory TinyJoin database in Node.js 22 or
+later. It uses a dedicated Worker thread and the same WebAssembly engine and
+Client API as the browser runtime.
+
+## Get started
+
+Install TinyJoin:
+
+```sh
+npm install tinyjoin
+```
+
+Save this ESM example as `main.mjs`:
+
+```js
+import {create as createNode} from 'tinyjoin/node';
+
+const db = await createNode();
+try {
+  await db.exec(`
+    CREATE TABLE notes (
+      id INTEGER PRIMARY KEY,
+      body TEXT NOT NULL
+    )
+  `);
+  await db.query('INSERT INTO notes (id, body) VALUES ($1, $2)', [
+    1,
+    'Hello from Node',
+  ]);
+  const {rows} = await db.query('SELECT * FROM notes ORDER BY id');
+  console.log(rows);
+} finally {
+  await db.close();
+}
+```
+
+Run it with `node main.mjs`. No extra dependencies, bundler, Worker entry, or
+polyfills are needed. The entry point constructs the Worker and loads the
+packaged WebAssembly file from disk automatically.
+
+## API and lifecycle
+
+The Node entry point exports
+[`create()`](https://tinyjoin.org/api/node/functions/lifecycle/create/). Call it without arguments,
+or with `memory://`, to create a fresh database. The Promise resolves when the
+Worker and engine are ready.
+
+The returned Client supports the same parameterized queries, transactions,
+prepared statements, subscriptions, and TypeScript row generics as the browser
+Client. The [SQL compatibility rules](https://tinyjoin.org/guides/sql-compatibility/) and
+[transaction behavior](https://tinyjoin.org/guides/transactions-and-changes/) also apply. Public
+types can be imported from the main module:
+
+```ts
+import type {Client, Row} from 'tinyjoin';
+```
+
+Each call owns one Worker thread and an independent database. Always await
+db.close() when finished, including error paths, so the Worker is released and
+the Node process can exit. A closed Client cannot be reused.
+
+## Storage boundaries
+
+This entry point is experimental and supports memory only. Data is lost when
+the Client closes or the process exits. Creating another Client starts with an
+empty database, including when both calls use `memory://`.
+
+There is no OPFS or filesystem persistence, shared database between Clients,
+or remote synchronization. The Node entry point does not accept the browser
+create() options or custom Worker configuration. Use the browser entry point
+for [persistent browser storage](https://tinyjoin.org/guides/storage-and-lifecycle/).
+
 # Agents guide
 
 Source: https://tinyjoin.org/guides/agents-guide/
@@ -1417,8 +1502,8 @@ remote database. Network replication and offline write propagation are
 separate products with transport, durability, authorization, and conflict
 requirements.
 
-TinyJoin is experimental, persists to a single-writer OPFS database, and is
-verified on Chromium only. Read the
+TinyJoin is experimental. Its browser runtime persists to a single-writer OPFS
+database and is verified on Chromium only. Read the
 [caveats](https://tinyjoin.org/guides/caveats/) before recommending it, and
 suggest a more mature browser database from that page when an application
 needs what TinyJoin does not provide.
@@ -1447,6 +1532,14 @@ application has an explicit custom-Worker requirement.
 
 Use `npm create tinyjoin@latest` when a new application should begin from the
 supported Vite starter.
+
+For an in-memory database in Node.js 22 or later, import create from
+`tinyjoin/node`. It returns the same Client API and owns its Worker thread and
+WebAssembly loading without additional dependencies or polyfills. Each call
+creates an independent database; await db.close() in a `finally` block to
+release the Worker. This entry point accepts only an optional `memory://` URL
+and has no OPFS, filesystem persistence, or remote synchronization. See the
+[Node guide](https://tinyjoin.org/guides/node/).
 
 ## SQL rules that matter in application code
 
@@ -1733,6 +1826,11 @@ compatibility boundaries.
 
 This release is being prepared locally and has not yet been published.
 
+The new [Node entry point](https://tinyjoin.org/guides/node/), `tinyjoin/node`, opens in-memory
+databases in Node.js 22 or later. It constructs a Worker thread and loads WASM
+automatically, returning the same Client API without additional dependencies.
+Each Client owns an independent database; filesystem persistence is not included.
+
 **Persistent storage breaks compatibility with v0.0.5.** The npm v0.0.5
 release uses page format 1; v0.0.6 uses page format 2. Opening a v0.0.5
 database with v0.0.6 fails with `UNSUPPORTED_PAGE`. There is no automatic
@@ -1821,6 +1919,9 @@ Source: https://tinyjoin.org/guides/
 These guides start with the smallest useful TinyJoin application and reveal
 storage, transactions, custom Workers, and compatibility details only when they
 become relevant.
+
+The [Node guide](https://tinyjoin.org/guides/node/) covers in-memory databases in Node.js with
+the same Client API.
 
 The [caveats](https://tinyjoin.org/guides/caveats/) collect what TinyJoin deliberately does not do,
 and which projects to reach for when that matters.
@@ -2028,6 +2129,22 @@ export interface SerializedError {
   retryable?: boolean;
 }
 
+// Use the host's event shape when available, including DOM event methods in a
+// browser, without requiring DOM declarations in Node applications.
+/** @ignore */
+type WorkerMessageEvent = typeof globalThis extends {
+  MessageEvent: {prototype: infer Event};
+}
+  ? Omit<Event, 'data'> & {readonly data: unknown}
+  : {readonly data: unknown};
+
+/** @ignore */
+type WorkerErrorEvent = typeof globalThis extends {
+  ErrorEvent: {prototype: infer Event};
+}
+  ? Event
+  : {readonly message: string};
+
 /**
  * The WorkerLike interface is the minimal Worker surface accepted by a custom
  * Client configuration.
@@ -2051,7 +2168,7 @@ export interface WorkerLike {
    */
   addEventListener(
     type: 'message',
-    listener: (event: MessageEvent<unknown>) => void,
+    listener: (event: WorkerMessageEvent) => void,
   ): void;
 
   /**
@@ -2061,7 +2178,7 @@ export interface WorkerLike {
    */
   addEventListener(
     type: 'messageerror',
-    listener: (event: MessageEvent<unknown>) => void,
+    listener: (event: WorkerMessageEvent) => void,
   ): void;
 
   /**
@@ -2071,7 +2188,7 @@ export interface WorkerLike {
    */
   addEventListener(
     type: 'error',
-    listener: (event: ErrorEvent) => void,
+    listener: (event: WorkerErrorEvent) => void,
   ): void;
 
   /**
@@ -2081,7 +2198,7 @@ export interface WorkerLike {
    */
   removeEventListener(
     type: 'message',
-    listener: (event: MessageEvent<unknown>) => void,
+    listener: (event: WorkerMessageEvent) => void,
   ): void;
 
   /**
@@ -2091,7 +2208,7 @@ export interface WorkerLike {
    */
   removeEventListener(
     type: 'messageerror',
-    listener: (event: MessageEvent<unknown>) => void,
+    listener: (event: WorkerMessageEvent) => void,
   ): void;
 
   /**
@@ -2101,7 +2218,7 @@ export interface WorkerLike {
    */
   removeEventListener(
     type: 'error',
-    listener: (event: ErrorEvent) => void,
+    listener: (event: WorkerErrorEvent) => void,
   ): void;
 
   /**
@@ -2535,6 +2652,54 @@ export class ClientError extends Error {
    */
   readonly retryable: boolean;
 }
+````
+
+# Public API: tinyjoin/node
+
+Source: https://tinyjoin.org/api/node/
+
+````ts
+/**
+ * The node module opens ephemeral TinyJoin databases in Node.js 22 or later.
+ * It constructs a Node Worker thread and loads the packaged WebAssembly engine
+ * automatically, with no extra dependencies, bundler, or polyfills.
+ *
+ * The returned Client has the same SQL, transaction, prepared-statement, and
+ * subscription APIs as the browser Client. See the [Node guide](https://tinyjoin.org/guides/node/).
+ * @packageDocumentation
+ * @module node
+ * @since v0.0.6
+ */
+
+import type {Client} from '../index.js';
+
+/**
+ * The create function opens a fresh in-memory database in a dedicated Node
+ * Worker thread. It resolves when the database is ready.
+ *
+ * Omit the argument or pass `memory://`. Each call owns an independent database
+ * and Worker; close the Client to release the Worker. All data is lost when
+ * the Client closes or the process exits. OPFS, filesystem persistence, and
+ * remote synchronization are not supported by this entry point.
+ * @param dataDir The optional `memory://` URL.
+ * @returns A ready Client. Always await its close method when finished.
+ * @example
+ * ```ts
+ * import {create} from 'tinyjoin/node';
+ *
+ * const db = await create();
+ * try {
+ *   await db.exec('CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)');
+ *   await db.query('INSERT INTO notes VALUES ($1, $2)', [1, 'Hello from Node']);
+ *   console.log((await db.query('SELECT * FROM notes ORDER BY id')).rows);
+ * } finally {
+ *   await db.close();
+ * }
+ * ```
+ * @category Lifecycle
+ * @since v0.0.6
+ */
+export function create(dataDir?: 'memory://'): Promise<Client>;
 ````
 
 # Public API: tinyjoin/worker

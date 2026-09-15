@@ -4,6 +4,9 @@ Most applications should use create(). It constructs TinyJoin's packaged
 module Worker and preserves the relative Worker, OPFS runtime, and WebAssembly
 assets during the supported Vite build path.
 
+For Node.js, use [`tinyjoin/node`](/guides/node/), which constructs its own
+Worker thread and loads WebAssembly without a custom bootstrap.
+
 An application that needs to own the Worker can provide a factory:
 
 ```ts

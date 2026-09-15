@@ -63,11 +63,14 @@ can still hold the underlying OPFS lock. See
 
 ## It needs a modern browser
 
-TinyJoin requires WebAssembly and dedicated module Workers, and persistence
+The browser entry point requires WebAssembly and dedicated module Workers, and persistence
 additionally requires a secure context, OPFS synchronous access handles, Web
 Locks, and BroadcastChannel. It
 deliberately does not use `SharedArrayBuffer`, so a page does not need
 cross-origin isolation headers.
+
+The separate [Node entry point](/guides/node/) supports in-memory databases
+in Node.js 22 or later. It does not provide OPFS or filesystem persistence.
 
 The automated browser suite currently runs on Chromium only. Firefox and WebKit
 are not verified, and a successful TypeScript or Vite build says nothing about

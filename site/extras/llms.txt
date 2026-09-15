@@ -8,6 +8,7 @@
 - [SQL compatibility](https://tinyjoin.org/guides/sql-compatibility/)
 - [Caveats](https://tinyjoin.org/guides/caveats/)
 - [Transactions and changes](https://tinyjoin.org/guides/transactions-and-changes/)
+- [Node.js in-memory databases](https://tinyjoin.org/guides/node/)
 - [API reference](https://tinyjoin.org/api/)
 - [Demos](https://tinyjoin.org/demos/)
 - [Release notes](https://tinyjoin.org/guides/releases/)
