@@ -18,8 +18,10 @@ No path filter excludes engine or runtime changes. The job has read-only
 repository access, does not persist checkout credentials, and has no publishing
 or deployment credentials, including on fork pull requests.
 
-`npm run prePublishPackage` installs locked dependencies and the pinned
-auditor, then runs this same full gate before `publishPackage` can publish.
+`npm run prePublishPackage` installs locked dependencies, then runs this same
+full gate before `publishPackage` can publish. The gate starts with spellcheck,
+then installs or reuses the pinned auditor before running the remaining checks.
+Spellcheck excludes `.cache/` and is not repeated during the build.
 The independent Pages deployment workflow keeps its deployment permissions;
 source validation does not use them. Require the `Full release validation`
 check in branch protection when enabling merge enforcement.

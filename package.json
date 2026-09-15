@@ -26,7 +26,7 @@
     }
   },
   "scripts": {
-    "build": "npm run spell && node scripts/build.mjs",
+    "build": "node scripts/build.mjs",
     "build:docs": "npm run build && npm run build:docs:built",
     "build:docs:built": "node scripts/build-docs.mjs",
     "build:lib": "node scripts/build-lib.mjs",
@@ -37,10 +37,10 @@
     "check:docs:built": "node scripts/check-docs.mjs",
     "check:docs:committed": "node scripts/check-docs-fresh.mjs",
     "check:demo-runtime": "node scripts/check-demo-runtime.mjs",
-    "check:release": "npm run check:rust:advisories && npm run check:docs:committed && npm run check:source && npm run build && npm run build:docs:built && npm run check:docs:built && npm run check:demo-runtime && npm run test:docs:built && npm run test:wasm:contract && npm run check:size && npm run test:browser:built && npm run test:package:built && npm run test:offline:built",
+    "check:release": "npm run spell && npm run setup:rust:advisories && npm run check:rust:advisories && npm run check:docs:committed && npm run check:source && npm run build && npm run build:docs:built && npm run check:docs:built && npm run check:demo-runtime && npm run test:docs:built && npm run test:wasm:contract && npm run check:size && npm run test:browser:built && npm run test:package:built && npm run test:offline:built",
     "check:source": "npm run typecheck && npm test",
     "check:size": "node scripts/check-size.mjs",
-    "prePublishPackage": "npm ci && npm run setup:rust:advisories && npm run check:release",
+    "prePublishPackage": "npm ci && npm run check:release",
     "publishPackage": "npm run prePublishPackage && npm publish ./dist",
     "serve:docs": "vite docs",
     "spell": "cspell --no-progress --dot",

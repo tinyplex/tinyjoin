@@ -41,8 +41,6 @@ jobs:
         with:
           path: .cache/tinyjoin/audit-tools
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-audit-0.22.2-${{ hashFiles('rust-toolchain.toml') }}
-      - name: Install pinned Rust advisory auditor
-        run: npm run setup:rust:advisories
       - name: Install Chromium and system dependencies
         run: npx --no-install playwright install --with-deps chromium
       - name: Run full release gate
