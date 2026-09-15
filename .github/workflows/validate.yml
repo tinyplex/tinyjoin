@@ -36,6 +36,11 @@ jobs:
         run: npm ci --no-audit --no-fund
       - name: Install pinned Rust toolchain and WASM target
         run: rustup show active-toolchain
+      - name: Cache pinned Rust advisory auditor
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .cache/tinyjoin/audit-tools
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-audit-0.22.2-${{ hashFiles('rust-toolchain.toml') }}
       - name: Install pinned Rust advisory auditor
         run: npm run setup:rust:advisories
       - name: Install Chromium and system dependencies
@@ -61,4 +66,4 @@ jobs:
             ${{ runner.temp }}/tinyjoin-release.log
             ${{ runner.temp }}/tinyjoin-playwright-results
             ${{ runner.temp }}/tinyjoin-docs-playwright-results
-            node_modules/.cache/tinyjoin/security
+            .cache/tinyjoin/security

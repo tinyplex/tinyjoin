@@ -32,14 +32,23 @@ npm run check:rust:advisories
 ```
 
 The setup command installs maintained `cargo-audit` 0.22.2 with its own locked
-dependency graph into the ignored local cache. The check refreshes the
+dependency graph into `.cache/tinyjoin/audit-tools/`. This ignored cache lives
+outside `node_modules`, so `npm ci` preserves it and repeated setup calls reuse
+the installed version. CI caches the auditor by OS, architecture, auditor
+version, and Rust toolchain; the first run for a new key compiles it once.
+
+The check refreshes the
 [RustSec advisory database](https://github.com/RustSec/advisory-db), audits
 the entire committed `Cargo.lock` without architecture or OS filtering, and
 fails on vulnerabilities or informational warnings, including yanked crates.
 Network or database failures fail the check; stale/offline success is not
 silently substituted. There are no advisory exceptions.
 
-Reports in `node_modules/.cache/tinyjoin/security/` record the audit result,
+The advisory database lives in `.cache/tinyjoin/advisory-db/` and is refreshed
+on every check, including when the auditor is reused. CI caches the auditor
+installation, not audit results or the advisory database.
+
+Reports in `.cache/tinyjoin/security/` record the audit result,
 advisory database revision/date, check time, lockfile SHA-256, and target
 dependency inventory. The inventory follows normal dependencies from
 `tinyjoin-wasm` for `wasm32-unknown-unknown`, excluding procedural macro

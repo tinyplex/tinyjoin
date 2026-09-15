@@ -6,7 +6,7 @@ import {dirname, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const cache = resolve(root, 'node_modules/.cache/tinyjoin');
+const cache = resolve(root, '.cache/tinyjoin');
 const output = resolve(cache, 'security');
 const auditor = resolve(
   cache,
@@ -15,7 +15,7 @@ const auditor = resolve(
 );
 if (!existsSync(auditor)) {
   throw new Error(
-    'Install the pinned Rust auditor: cargo install cargo-audit --version 0.22.2 --locked --root node_modules/.cache/tinyjoin/audit-tools',
+    'Install the pinned Rust auditor: npm run setup:rust:advisories',
   );
 }
 await mkdir(output, {recursive: true});

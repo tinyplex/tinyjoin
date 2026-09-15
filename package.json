@@ -61,7 +61,7 @@
     "typecheck": "tsc --noEmit && tsc --noEmit -p site/tsconfig.json",
     "typecheck:browser": "tsc --noEmit -p test/browser/app/tsconfig.json",
     "check:rust:advisories": "node scripts/check-rust-advisories.mjs",
-    "setup:rust:advisories": "cargo install cargo-audit --version 0.22.2 --locked --root node_modules/.cache/tinyjoin/audit-tools"
+    "setup:rust:advisories": "cargo install cargo-audit --version 0.22.2 --locked --root .cache/tinyjoin/audit-tools"
   },
   "repository": {
     "type": "git",
