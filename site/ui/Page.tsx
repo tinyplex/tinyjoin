@@ -4,6 +4,8 @@ import {Header} from './Header.tsx';
 import {Home} from './Home.tsx';
 import {MainInner} from './MainInner.tsx';
 
+const GTM_ID = 'G-40B96SPQX2';
+
 const DESCRIPTION =
   'A tiny, worker-first relational database for browser apps.';
 
@@ -30,6 +32,12 @@ export const Page = () => {
       <head>
         <meta charSet="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <link rel="dns-prefetch" href="https://www.googletagmanager.com/" />
+        <link
+          href={`https://www.googletagmanager.com/gtag/js?id=${GTM_ID}`}
+          rel="preload"
+          as="script"
+        />
         {['inter', 'inconsolata'].map((font) => (
           <link
             key={font}
@@ -86,6 +94,19 @@ export const Page = () => {
         </main>
         <Footer />
       </body>
+      <script
+        async
+        src={`https://www.googletagmanager.com/gtag/js?id=${GTM_ID}`}
+      />
+      <script
+        dangerouslySetInnerHTML={{
+          __html:
+            `window.dataLayer=window.dataLayer||[];` +
+            `function g(){dataLayer.push(arguments);}` +
+            `g('js',new Date());` +
+            `g('config','${GTM_ID}');`,
+        }}
+      />
     </html>
   );
 };
