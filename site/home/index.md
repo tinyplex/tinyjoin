@@ -182,8 +182,6 @@ await db.close();
 > - Start an app with
 >   [create-tinyjoin](https://github.com/tinyplex/create-tinyjoin).
 > - Read the [source](https://github.com/tinyplex/tinyjoin).
->
-> TinyJoin is MIT licensed.
 
 > ## Local by design
 >
@@ -196,15 +194,15 @@ await db.close();
 > starter can also [reopen offline](/guides/offline/) once their production
 > build has been cached.
 
-<section id="limits" aria-labelledby="know-the-limits">
+<section id="warning" aria-labelledby="an-important-warning">
 
-## Know the limits
+## An important warning!
 
 TinyJoin is experimental, with a bounded SQL dialect and no built-in remote
 synchronization. Browser storage can be lost, so use it for data you can
-reconstruct. Read the [caveats](/guides/caveats/) and
-[SQL compatibility guide](/guides/sql-compatibility/) to check whether it
-fits your app.
+reconstruct. Read the [caveats](/guides/caveats/) and [SQL compatibility
+guide](/guides/sql-compatibility/) to check whether this project currently fits
+your app. We're working on it though, so keep checking back!
 
 </section>
 

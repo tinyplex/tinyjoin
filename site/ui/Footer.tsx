@@ -11,7 +11,7 @@ export const Footer = () => (
       </a>
     </nav>
     <nav>
-      <a href="/">TinyJoin</a> © 2026 James Pearce
+      <a href="/">TinyJoin</a> © 2026 James Pearce. MIT License.
     </nav>
   </footer>
 );
