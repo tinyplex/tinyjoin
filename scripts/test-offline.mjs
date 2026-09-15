@@ -11,6 +11,9 @@ import {tinyjoinOffline} from '../dist/vite/index.js';
 
 const root = await mkdtemp(resolve(tmpdir(), 'tinyjoin-offline-browser-'));
 const output = resolve(root, 'dist');
+// Keep this policy identical to the hosting example in the custom-Worker guide.
+const policy = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self'; style-src 'self'; img-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'";
+const servedRuntime = new Set();
 let browser;
 let server;
 try {
@@ -34,11 +37,21 @@ try {
         return;
       }
       const content = await readFile(path);
+      const extension = extname(path);
+      if (extension === '.wasm' || relative.includes('tinyjoin_opfs_runtime')) {
+        servedRuntime.add(relative);
+      }
       response
         .writeHead(200, {
           'Cache-Control': 'no-store',
-          'Content-Type':
-            extname(path) === '.html' ? 'text/html' : 'text/javascript',
+          'Content-Security-Policy': policy,
+          'X-Content-Type-Options': 'nosniff',
+          'Content-Type': {
+            '.html': 'text/html',
+            '.js': 'text/javascript',
+            '.wasm': 'application/wasm',
+            '.json': 'application/json',
+          }[extension] ?? 'application/octet-stream',
         })
         .end(content);
     } catch {
@@ -49,18 +62,70 @@ try {
   const url = `http://127.0.0.1:${server.address().port}/app/`;
   browser = await chromium.launch({headless: true});
   const context = await browser.newContext();
+  const violations = [];
+  const runtimeResponses = [];
+  context.on('response', (response) => {
+    if (/\.(?:js|wasm)$/.test(new URL(response.url()).pathname)) {
+      runtimeResponses.push({url: response.url(), headers: response.headers()});
+    }
+  });
+  await context.exposeBinding('recordPolicyViolation', (_, directive) => {
+    violations.push(directive);
+  });
+  await context.addInitScript(() => {
+    addEventListener('securitypolicyviolation', (event) => {
+      globalThis.recordPolicyViolation(event.effectiveDirective);
+    });
+  });
+  context.on('console', (message) => {
+    if (/violates.*Content Security Policy|Refused to.*(?:script|worker|WebAssembly)/i.test(message.text())) {
+      violations.push(message.text());
+    }
+  });
   const first = await context.newPage();
-  await first.goto(url);
+  const initial = await first.goto(url);
+  assert.equal(initial.headers()['content-security-policy'], policy);
   await first.evaluate(() => navigator.serviceWorker.ready);
   const controlled = await first.reload();
   assert.equal(controlled.fromServiceWorker(), true);
+  assert.equal(controlled.headers()['content-security-policy'], policy);
   assert.equal(await first.textContent('body'), 'one');
   await context.setOffline(true);
   // This module has never been executed: precaching must cover unused chunks too.
   assert.equal(await first.evaluate(() => globalThis.loadLazy()), 'lazy one');
-  await context.setOffline(false);
+  // Neither TinyJoin nor its lazy OPFS runtime has been used before going offline.
+  await first.evaluate(async () => {
+    await globalThis.openDatabase();
+    await globalThis.database.exec('CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, value TEXT NOT NULL)');
+    await globalThis.database.query('INSERT INTO notes VALUES ($1, $2)', ['one', 'saved offline']);
+  });
+  assert.ok([...servedRuntime].some((path) => path.endsWith('.wasm')));
+  assert.ok([...servedRuntime].some((path) => path.includes('tinyjoin_opfs_runtime')));
   const second = await context.newPage();
-  await second.goto(url);
+  const offlineNavigation = await second.goto(url);
+  assert.equal(offlineNavigation.fromServiceWorker(), true);
+  assert.equal(offlineNavigation.headers()['content-security-policy'], policy);
+  assert.deepEqual(await second.evaluate(async () => {
+    await globalThis.openDatabase();
+    return (await globalThis.database.query('SELECT * FROM notes ORDER BY id')).rows;
+  }), [{id: 'one', value: 'saved offline'}]);
+  await second.evaluate(async () => {
+    await globalThis.database.query('UPDATE notes SET value = $1 WHERE id = $2', ['updated by follower', 'one']);
+  });
+  await first.evaluate(() => globalThis.database.close());
+  assert.deepEqual(await second.evaluate(async () => {
+    const {rows} = await globalThis.database.query('SELECT * FROM notes ORDER BY id');
+    await globalThis.database.close();
+    return rows;
+  }), [{id: 'one', value: 'updated by follower'}]);
+  await first.reload();
+  assert.deepEqual(await first.evaluate(async () => {
+    await globalThis.openDatabase();
+    const {rows} = await globalThis.database.query('SELECT * FROM notes ORDER BY id');
+    await globalThis.database.close();
+    return rows;
+  }), [{id: 'one', value: 'updated by follower'}]);
+  await context.setOffline(false);
 
   await buildRelease('two');
   await first.evaluate(async () =>
@@ -96,8 +161,15 @@ try {
   const third = await context.newPage();
   const upgraded = await third.goto(url);
   assert.equal(upgraded.fromServiceWorker(), true);
+  assert.equal(upgraded.headers()['content-security-policy'], policy);
   assert.equal(await third.textContent('body'), 'two');
   assert.equal(await third.evaluate(() => globalThis.loadLazy()), 'lazy two');
+  assert.deepEqual(await third.evaluate(async () => {
+    await globalThis.openDatabase();
+    const {rows} = await globalThis.database.query('SELECT * FROM notes ORDER BY id');
+    await globalThis.database.close();
+    return rows;
+  }), [{id: 'one', value: 'updated by follower'}]);
   await context.setOffline(false);
 
   await buildRelease('three');
@@ -134,8 +206,15 @@ try {
   await third.reload();
   assert.equal(await third.textContent('body'), 'two');
   assert.equal(await third.evaluate(() => globalThis.loadLazy()), 'lazy two');
+  assert.deepEqual(violations, []);
+  assert.ok(runtimeResponses.some(({url}) => url.endsWith('.wasm')));
+  assert.ok(runtimeResponses.some(({url}) => /default-entry/.test(url)));
+  for (const {url, headers} of runtimeResponses) {
+    assert.equal(headers['content-security-policy'], policy, url);
+    assert.equal(headers['content-type'], url.endsWith('.wasm') ? 'application/wasm' : 'text/javascript', url);
+  }
   console.log(
-    'OFFLINE_RELEASE_LIFECYCLE_OK first install, unused lazy asset, two-tab waiting update, offline activation, torn deployment rollback',
+    'OFFLINE_RELEASE_LIFECYCLE_OK restrictive CSP, default Worker/WASM, offline OPFS first open and reopen, follower write, unused lazy asset, two-tab waiting update, offline activation, torn deployment rollback',
   );
   await context.close();
 } finally {
@@ -147,7 +226,12 @@ try {
 async function buildRelease(version) {
   await writeFile(
     resolve(root, 'main.js'),
-    `document.body.textContent = ${JSON.stringify(version)}; globalThis.loadLazy = async () => (await import('./lazy.js')).value;`,
+    `document.body.textContent = ${JSON.stringify(version)};
+globalThis.loadLazy = async () => (await import('./lazy.js')).value;
+globalThis.openDatabase = async () => {
+  const {create} = await import('tinyjoin');
+  globalThis.database = await create('opfs://offline-csp-v1');
+};`,
   );
   await writeFile(
     resolve(root, 'lazy.js'),
@@ -158,6 +242,7 @@ async function buildRelease(version) {
     base: '/app/',
     configFile: false,
     logLevel: 'silent',
+    resolve: {alias: {tinyjoin: resolve('dist/index.js')}},
     plugins: [tinyjoinOffline()],
   });
 }

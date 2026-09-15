@@ -28,6 +28,13 @@ while testing. The Vite development server does not register an offline service
 worker. To exercise offline behavior locally, use `vite build` followed by
 `vite preview`.
 
+Production hosts must preserve the emitted asset paths, JavaScript/WASM MIME
+types, and security headers, including on Worker responses. The
+[hosting and CSP checklist](/guides/custom-workers/#production-hosting) includes
+a restrictive policy tested with offline OPFS startup and reopen. The default
+and custom Worker paths are verified with Vite in Chromium; other bundlers are
+not currently verified.
+
 The first visit needs a network connection. The service worker downloads and
 verifies every build file before installation succeeds. After
 `navigator.serviceWorker.ready` resolves, a subsequent navigation can use that
@@ -141,3 +148,8 @@ outside the application directory, pass that directory explicitly:
 An existing precaching system can instead consume the JSON manifest. Resolve
 its asset URLs against the application's build base and preserve content
 verification and coherent version activation in that integration.
+
+Consume the **complete** asset list, including the private lazy OPFS runtime,
+Worker, and WASM files even when the first visit only opens a memory database.
+Caching the entry script or the files observed during one online visit is not
+sufficient for a later persistent open without a network.
