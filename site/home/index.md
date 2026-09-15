@@ -21,8 +21,7 @@
 >
 > The whole database - the main-thread client, the Worker host, and the Rust
 > WASM engine - is {{sizes.total.gzip}} gzipped, and only {{sizes.client.gzip}}
-> of that ever runs on the UI thread. A build gate keeps the engine itself under
-> 1 MiB uncompressed.
+> of that ever runs on the UI thread.
 
 | Component      |                     gzip |
 | -------------- | -----------------------: |
@@ -58,9 +57,6 @@ npm install tinyjoin
 > create() owns Worker construction and WebAssembly loading, and resolves once
 > the database is ready. Use `opfs://[name]` when data should survive reloads in
 > the same browser, or call it with no argument for ephemeral in-memory storage.
->
-> TinyJoin is experimental and verified on Chromium only. Browser data can be
-> lost; use data you can reconstruct and read the [caveats](/guides/caveats/).
 
 ```ts
 import {create} from 'tinyjoin';
@@ -201,9 +197,10 @@ await db.close();
 
 ## An important warning
 
-TinyJoin is experimental, with a bounded SQL dialect and no built-in remote
-synchronization (yet!). Browser storage can be lost, so use it for data you can
-reconstruct. Read the [caveats](/guides/caveats/) and [SQL compatibility
+TinyJoin is experimental and verified on Chromium only, with a bounded SQL
+dialect and no built-in remote synchronization (yet!). Browser storage can be
+lost, so use it for data you can reconstruct. Read the
+[caveats](/guides/caveats/) and [SQL compatibility
 guide](/guides/sql-compatibility/) to check whether this project currently fits
 your app. We're working on it though, so keep checking back.
 

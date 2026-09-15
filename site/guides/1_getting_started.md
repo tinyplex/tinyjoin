@@ -19,21 +19,11 @@ separate Worker plugin.
 For a new application, `npm create tinyjoin@latest` generates a working Vite
 starter. Its production build includes [offline loading](/guides/offline/).
 
-For a complete noninteractive setup, supply every starter option:
-
 ```sh
-npm create tinyjoin@latest -- --non-interactive \
-  --projectName my-tinyjoin-app \
-  --language typescript \
-  --storage opfs \
-  --installAndRun false
-cd my-tinyjoin-app
-npm install
-npm run dev
+npm create tinyjoin@latest
 ```
 
-Use `--language javascript` for JavaScript, or `--storage memory` for data that
-starts fresh on each load. The starter's `--list-options` flag lists its options.
+Follow the prompts to choose JavaScript or TypeScript and how to store your data.
 
 ## Open a database
 

@@ -31,6 +31,19 @@ const REFLECTIONS = [
   'ClientError',
   '*',
 ];
+const sortGuides = getSorter([
+  'Getting started',
+  'Caveats',
+  'SQL compatibility',
+  'Storage and lifecycle',
+  'Transactions and changes',
+  'Custom Workers',
+  'Node',
+  'Offline',
+  '*',
+  'Agents guide',
+  'Releases',
+]);
 
 // Download sizes are measured from the built runtime into site/data/sizes.json
 // during npm run build, and substituted into the markdown that publishes them.
@@ -150,6 +163,11 @@ export const build = async (
     .addReflectionTransform(hideInheritedErrorMembers)
     .addReflectionTransform(deduplicateCreateDocumentation)
     .addNodeTransform(collapseLoneEssentialGroup)
+    .addNodeTransform((node) => {
+      if (node.url === '/guides/') {
+        node.children.sort((left, right) => sortGuides(left.name, right.name));
+      }
+    })
     .addApiFile(resolve(typesDir, 'index.d.ts'))
     .addApiFile(resolve(typesDir, 'node/index.d.ts'))
     .addApiFile(resolve(typesDir, 'worker/index.d.ts'))
