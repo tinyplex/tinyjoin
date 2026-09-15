@@ -123,9 +123,9 @@ body > main > article#home {
   }
 
   > section#warning {
-    background: #d99a1814;
-    border: 1px solid #d99a1855;
-    border-inline-start: 0.25rem solid #d99a18;
+    background: color-mix(in srgb, @accentColor 8%, transparent);
+    border: 1px solid color-mix(in srgb, @accentColor 33%, transparent);
+    border-inline-start: 0.25rem solid @accentColor;
     border-radius: 0.25rem;
     box-sizing: border-box;
     padding: 1.5rem;
