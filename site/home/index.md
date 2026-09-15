@@ -185,21 +185,22 @@ await db.close();
 >
 > TinyJoin is MIT licensed.
 
-> ## Local, and deliberately bounded
+> ## Local by design
 >
-> TinyJoin contains no hosted service, credentials, analytics, or hidden network
-> path. Memory and OPFS use the same page-native database engine. Persistent
-> OPFS storage is single-writer and intended for reconstructable application
-> data; users can still clear or lose browser-managed storage. Tabs using the
-> same database name share that writer automatically. New starter apps also
-> cache their production build for [offline reopening](/guides/offline/).
+> TinyJoin keeps your database in the browser. Your app reads and writes data
+> locally, without waiting for a database server. Keep data in memory or save
+> it across reloads with OPFS; tabs opening the same persistent database share
+> access automatically.
 >
-> **Important:** TinyJoin is also experimental, and implements a deliberately
-> bounded SQL and type subset; it is not PostgreSQL compiled to WebAssembly and
-> has no PostgreSQL server, wire protocol, or replication client. Check the
-> exact [SQL compatibility contract](/guides/sql-compatibility/) and the
-> [caveats](/guides/caveats/) - experimental status, tab handover, browser
-> support, and the projects to reach for instead - before committing to it.
+> Your app can keep working when the network drops. Apps created with the
+> starter can also [reopen offline](/guides/offline/) once their production
+> build has been cached.
+>
+> **Know the limits.** TinyJoin is experimental, with a bounded SQL dialect and
+> no built-in remote synchronization. Browser storage can be lost, so use it
+> for data you can reconstruct. Read the [caveats](/guides/caveats/) and
+> [SQL compatibility guide](/guides/sql-compatibility/) to check whether it
+> fits your app.
 
 ---
 
