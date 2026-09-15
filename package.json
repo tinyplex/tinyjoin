@@ -22,7 +22,7 @@
     }
   },
   "scripts": {
-    "build": "node scripts/build.mjs",
+    "build": "npm run spell && node scripts/build.mjs",
     "build:docs": "npm run build && npm run build:docs:built",
     "build:docs:built": "node scripts/build-docs.mjs",
     "build:lib": "node scripts/build-lib.mjs",
@@ -39,6 +39,7 @@
     "prePublishPackage": "npm i && npm run check:release",
     "publishPackage": "npm run prePublishPackage && npm publish ./dist",
     "serve:docs": "vite docs",
+    "spell": "cspell --no-progress --dot",
     "test": "npm run test:rust && npm run test:ts",
     "test:browser": "npm run build && npm run test:browser:built",
     "test:browser:built": "npm run typecheck:browser && playwright test",
@@ -77,6 +78,7 @@
   "devDependencies": {
     "@playwright/test": "^1.62.1",
     "@types/node": "^26.2.0",
+    "cspell": "^10.3.1",
     "esbuild": "^0.28.2",
     "less": "^4.9.0",
     "react": "^19.2.4",

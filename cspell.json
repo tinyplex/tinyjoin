@@ -1,53 +1,155 @@
 {
   "version": "0.2",
-  "ignorePaths": [],
+  "language": "en-US,en-GB",
+  "files": [
+    "**/*.{md,txt,json,js,mjs,cjs,jsx,ts,mts,cts,tsx,rs,toml,html,css,less,yml,yaml}"
+  ],
+  "ignorePaths": [
+    ".git/**",
+    "node_modules/**",
+    "dist/**",
+    "docs/**",
+    "target/**",
+    "tmp/**",
+    "benchmarks/**",
+    "cspell.json",
+    "package-lock.json",
+    "Cargo.lock",
+    "README.md",
+    "releases.md",
+    "AGENTS.md",
+    "site/data/sizes.json",
+    "THIRD_PARTY_NOTICES.txt",
+    "RUST_STANDARD_LIBRARY_NOTICES.html"
+  ],
   "dictionaryDefinitions": [],
-  "dictionaries": [],
+  "dictionaries": [
+    "rust",
+    "rust-crates",
+    "sql"
+  ],
   "words": [
+    "appendable",
     "atrule",
     "bindgen",
     "BYTEA",
+    "bytewise",
+    "cdylib",
     "Clippy",
+    "codegen",
     "Ctarget",
     "Dexie",
     "DuckDB",
+    "equijoin",
     "esbuild",
     "fptoint",
+    "fract",
     "ILIKE",
     "importmap",
+    "jamesgpearce",
     "linejoin",
     "llms",
+    "lparen",
+    "microbatches",
+    "monomorphizing",
     "MVCC",
+    "networkidle",
+    "nocapture",
     "nojekyll",
+    "noncanonical",
+    "nonconnecting",
+    "nonmutating",
     "nontrapping",
     "noreferrer",
     "OPFS",
     "pagehide",
+    "pageshow",
+    "parameterizes",
     "parameterizing",
     "PGlite",
     "Postg",
+    "precaches",
+    "precaching",
+    "preflights",
     "reconstructable",
+    "reentrancy",
+    "reprepare",
+    "requeries",
+    "retryability",
+    "rlib",
+    "rparen",
+    "rsplit",
     "rustc",
     "RUSTFLAGS",
     "rustup",
-    "SAVEPOINT",
     "savepoint",
     "savepoints",
+    "seekable",
     "Segoe",
     "shellenv",
     "SMALLINT",
     "SQLSTATE",
     "srcdoc",
+    "superblocks",
+    "Synclets",
+    "tableless",
     "terser",
     "TinyBase",
     "tinycreate",
     "tinydocs",
     "tinyjoin",
     "tlsv",
+    "underflowed",
+    "unflushed",
+    "unorderable",
+    "unrevisioned",
+    "unstub",
     "upsert",
+    "upserted",
+    "upserts",
     "VARCHAR",
     "Wordmark"
   ],
   "ignoreWords": [],
-  "import": []
+  "import": [],
+  "overrides": [
+    {
+      "filename": "**/*.rs",
+      "ignoreRegExpList": [
+        "/\\b0x[0-9a-f_]+(?:[ui](?:8|16|32|64|128|size))?\\b/gi"
+      ]
+    },
+    {
+      "filename": "crates/tinyjoin-core/src/btree.rs",
+      "words": [
+        "TGBT",
+        "TGOV"
+      ]
+    },
+    {
+      "filename": "crates/tinyjoin-core/src/page.rs",
+      "words": [
+        "TGRPAGE",
+        "TGRSUPR"
+      ]
+    },
+    {
+      "filename": "crates/tinyjoin-core/src/join.rs",
+      "ignoreRegExpList": [
+        "/'Rnull2'/g"
+      ]
+    },
+    {
+      "filename": "crates/tinyjoin-core/src/paged_codec.rs",
+      "ignoreRegExpList": [
+        "/\"insideÿpayload\"/g"
+      ]
+    },
+    {
+      "filename": "site/ui/Page.tsx",
+      "ignoreRegExpList": [
+        "/\\bG-[A-Z0-9]+\\b/g"
+      ]
+    }
+  ]
 }
