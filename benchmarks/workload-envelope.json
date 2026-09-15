@@ -1,0 +1,1065 @@
+{
+  "measuredAt": "2026-09-15T05:15:15.374Z",
+  "packageVersion": "0.0.6",
+  "runtime": [
+    {
+      "path": "index.js",
+      "bytes": 10204,
+      "sha256": "fc3a9220bfd76693f6150ff9eadf743535d82c63b3f8ccf121562da768c47bb6"
+    },
+    {
+      "path": "protocol.js",
+      "bytes": 3530,
+      "sha256": "3a3f26ea0b5ccce24b6d18232d4c569e08809d9ff5256914acf30aea053c0e0d"
+    },
+    {
+      "path": "vite/index.js",
+      "bytes": 7737,
+      "sha256": "c3bb6eab11ac7e7de79fbb7010e329ba433b96d20f59a9cc070e96f4112043c9"
+    },
+    {
+      "path": "wasm/tinyjoin_wasm_bg.wasm",
+      "bytes": 737145,
+      "sha256": "c4a5996edb590e4a44a1b2509e6835cab8a83114a61bf7171ea2346336935f2b"
+    },
+    {
+      "path": "wasm/tinyjoin_wasm.js",
+      "bytes": 9553,
+      "sha256": "2ad61c5367ad263f3400838903caf2cf215fe163e6410f3aa4edae79b5b384a9"
+    },
+    {
+      "path": "worker-opfs/tinyjoin_opfs_runtime.js",
+      "bytes": 5541,
+      "sha256": "cd7755056326e2dbd1df6d4eb4c73f15059845c3ed27b0cd57a702bdcf93bf0a"
+    },
+    {
+      "path": "worker/default-entry.js",
+      "bytes": 26066,
+      "sha256": "3b598f241626daab12d74153f3605ec890a2a97fd85f9a985361fa6269bd40f1"
+    },
+    {
+      "path": "worker/index.js",
+      "bytes": 26101,
+      "sha256": "cc5d8efc69579de541a94df09a2acc9f162ada8cf9842f3a43e3ec91daf9b47a"
+    }
+  ],
+  "environment": {
+    "node": "v25.2.1",
+    "os": "darwin",
+    "osRelease": "25.5.0",
+    "architecture": "arm64",
+    "cpu": "Apple M2",
+    "logicalCpus": 8,
+    "memoryBytes": 17179869184,
+    "headless": true,
+    "viewport": {
+      "width": 1280,
+      "height": 720
+    },
+    "cpuThrottling": "none",
+    "network": "loopback HTTP; warm cache permitted within each isolated context",
+    "browserVersion": "151.0.7922.34",
+    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/151.0.7922.34 Safari/537.36"
+  },
+  "repetitions": 5,
+  "schema": "CREATE TABLE items (id INTEGER PRIMARY KEY, title TEXT NOT NULL, payload TEXT NOT NULL); CREATE UNIQUE INDEX items_title ON items (title)",
+  "definitions": {
+    "coldOpenMs": "First create(opfs://fresh-name) in a fresh browser context, before schema setup. Client module already loaded; Worker/WASM first-load included. Browser process, OS, and filesystem caches are not reset.",
+    "reopenMs": "After closing the sole client, create the same populated OPFS name in the same context. Includes fresh Worker and catalog open; HTTP/OS caches may be warm.",
+    "reopenReadMs": "First ordered full read after reopening; separate from reopenMs.",
+    "stagingMs": "Inside transaction callback: sequential prepared INSERT/UPDATE/DELETE requests, including Worker round trips and validation.",
+    "commitMs": "End of callback to transaction resolution; includes commit RPC, persistence, and coordination overhead.",
+    "resultMs": "query() call to complete materialized rows on requesting page, including engine execution, structured clone and owner/follower routing. Not an isolated copy benchmark; JSON byte sizing is outside timing.",
+    "percentiles": "Nearest-rank p90 of five samples is the maximum; retain all samples and do not treat it as a tail-latency estimate."
+  },
+  "notes": "One local desktop and one installed Chromium build. Sequential samples; no competitor, real mobile, Firefox, WebKit, power/thermal control, network download, or long-lived fragmentation coverage. No timing gate. Row checks run outside timing.",
+  "results": [
+    {
+      "kind": "mixed",
+      "rowCount": 25,
+      "payloadBytes": 64,
+      "samples": [
+        {
+          "repetition": 0,
+          "coldOpenMs": 63.700000047683716,
+          "stagingMs": 47,
+          "commitMs": 12.899999976158142,
+          "transactionMs": 60,
+          "operationCount": 25,
+          "finalRows": 26,
+          "reopenMs": 22.399999976158142,
+          "reopenReadMs": 4.199999928474426,
+          "resultJsonBytes": 2747,
+          "storageBytes": 57344
+        },
+        {
+          "repetition": 1,
+          "coldOpenMs": 22.799999952316284,
+          "stagingMs": 45,
+          "commitMs": 12.799999952316284,
+          "transactionMs": 57.89999997615814,
+          "operationCount": 25,
+          "finalRows": 26,
+          "reopenMs": 21.699999928474426,
+          "reopenReadMs": 4,
+          "resultJsonBytes": 2747,
+          "storageBytes": 57344
+        },
+        {
+          "repetition": 2,
+          "coldOpenMs": 22.399999976158142,
+          "stagingMs": 46.59999990463257,
+          "commitMs": 13.400000095367432,
+          "transactionMs": 60.10000002384186,
+          "operationCount": 25,
+          "finalRows": 26,
+          "reopenMs": 22.799999952316284,
+          "reopenReadMs": 4.5,
+          "resultJsonBytes": 2747,
+          "storageBytes": 57344
+        },
+        {
+          "repetition": 3,
+          "coldOpenMs": 22.899999976158142,
+          "stagingMs": 45.60000002384186,
+          "commitMs": 12.799999952316284,
+          "transactionMs": 58.5,
+          "operationCount": 25,
+          "finalRows": 26,
+          "reopenMs": 23.200000047683716,
+          "reopenReadMs": 4.600000023841858,
+          "resultJsonBytes": 2747,
+          "storageBytes": 57344
+        },
+        {
+          "repetition": 4,
+          "coldOpenMs": 21.09999990463257,
+          "stagingMs": 45.800000071525574,
+          "commitMs": 12.899999976158142,
+          "transactionMs": 58.800000071525574,
+          "operationCount": 25,
+          "finalRows": 26,
+          "reopenMs": 21.399999976158142,
+          "reopenReadMs": 4.200000047683716,
+          "resultJsonBytes": 2747,
+          "storageBytes": 57344
+        }
+      ],
+      "distributions": {
+        "coldOpenMs": {
+          "count": 5,
+          "min": 21.09999990463257,
+          "median": 22.799999952316284,
+          "p90": 63.700000047683716,
+          "max": 63.700000047683716
+        },
+        "reopenMs": {
+          "count": 5,
+          "min": 21.399999976158142,
+          "median": 22.399999976158142,
+          "p90": 23.200000047683716,
+          "max": 23.200000047683716
+        },
+        "reopenReadMs": {
+          "count": 5,
+          "min": 4,
+          "median": 4.200000047683716,
+          "p90": 4.600000023841858,
+          "max": 4.600000023841858
+        },
+        "stagingMs": {
+          "count": 5,
+          "min": 45,
+          "median": 45.800000071525574,
+          "p90": 47,
+          "max": 47
+        },
+        "commitMs": {
+          "count": 5,
+          "min": 12.799999952316284,
+          "median": 12.899999976158142,
+          "p90": 13.400000095367432,
+          "max": 13.400000095367432
+        },
+        "transactionMs": {
+          "count": 5,
+          "min": 57.89999997615814,
+          "median": 58.800000071525574,
+          "p90": 60.10000002384186,
+          "max": 60.10000002384186
+        }
+      }
+    },
+    {
+      "kind": "mixed",
+      "rowCount": 100,
+      "payloadBytes": 64,
+      "samples": [
+        {
+          "repetition": 0,
+          "coldOpenMs": 20.799999952316284,
+          "stagingMs": 867.2999999523163,
+          "commitMs": 64.79999995231628,
+          "transactionMs": 932.2999999523163,
+          "operationCount": 100,
+          "finalRows": 101,
+          "reopenMs": 37.300000071525574,
+          "reopenReadMs": 5.599999904632568,
+          "resultJsonBytes": 10756,
+          "storageBytes": 114688
+        },
+        {
+          "repetition": 1,
+          "coldOpenMs": 21.899999976158142,
+          "stagingMs": 865.7999999523163,
+          "commitMs": 62,
+          "transactionMs": 927.8999999761581,
+          "operationCount": 100,
+          "finalRows": 101,
+          "reopenMs": 37,
+          "reopenReadMs": 5.800000071525574,
+          "resultJsonBytes": 10756,
+          "storageBytes": 114688
+        },
+        {
+          "repetition": 2,
+          "coldOpenMs": 21.899999976158142,
+          "stagingMs": 863.7999999523163,
+          "commitMs": 63.800000071525574,
+          "transactionMs": 927.7000000476837,
+          "operationCount": 100,
+          "finalRows": 101,
+          "reopenMs": 37.700000047683716,
+          "reopenReadMs": 5.699999928474426,
+          "resultJsonBytes": 10756,
+          "storageBytes": 114688
+        },
+        {
+          "repetition": 3,
+          "coldOpenMs": 22.100000023841858,
+          "stagingMs": 869,
+          "commitMs": 62.699999928474426,
+          "transactionMs": 931.6999999284744,
+          "operationCount": 100,
+          "finalRows": 101,
+          "reopenMs": 38,
+          "reopenReadMs": 5.599999904632568,
+          "resultJsonBytes": 10756,
+          "storageBytes": 114688
+        },
+        {
+          "repetition": 4,
+          "coldOpenMs": 22.09999990463257,
+          "stagingMs": 866.2999999523163,
+          "commitMs": 62.800000071525574,
+          "transactionMs": 929.1000000238419,
+          "operationCount": 100,
+          "finalRows": 101,
+          "reopenMs": 36.799999952316284,
+          "reopenReadMs": 5.800000071525574,
+          "resultJsonBytes": 10756,
+          "storageBytes": 114688
+        }
+      ],
+      "distributions": {
+        "coldOpenMs": {
+          "count": 5,
+          "min": 20.799999952316284,
+          "median": 21.899999976158142,
+          "p90": 22.100000023841858,
+          "max": 22.100000023841858
+        },
+        "reopenMs": {
+          "count": 5,
+          "min": 36.799999952316284,
+          "median": 37.300000071525574,
+          "p90": 38,
+          "max": 38
+        },
+        "reopenReadMs": {
+          "count": 5,
+          "min": 5.599999904632568,
+          "median": 5.699999928474426,
+          "p90": 5.800000071525574,
+          "max": 5.800000071525574
+        },
+        "stagingMs": {
+          "count": 5,
+          "min": 863.7999999523163,
+          "median": 866.2999999523163,
+          "p90": 869,
+          "max": 869
+        },
+        "commitMs": {
+          "count": 5,
+          "min": 62,
+          "median": 62.800000071525574,
+          "p90": 64.79999995231628,
+          "max": 64.79999995231628
+        },
+        "transactionMs": {
+          "count": 5,
+          "min": 927.7000000476837,
+          "median": 929.1000000238419,
+          "p90": 932.2999999523163,
+          "max": 932.2999999523163
+        }
+      }
+    },
+    {
+      "kind": "mixed",
+      "rowCount": 250,
+      "payloadBytes": 64,
+      "samples": [
+        {
+          "repetition": 0,
+          "coldOpenMs": 22,
+          "stagingMs": 7389.600000023842,
+          "commitMs": 205.89999997615814,
+          "transactionMs": 7595.699999928474,
+          "operationCount": 250,
+          "finalRows": 251,
+          "reopenMs": 63.799999952316284,
+          "reopenReadMs": 9.200000047683716,
+          "resultJsonBytes": 27006,
+          "storageBytes": 249856
+        },
+        {
+          "repetition": 1,
+          "coldOpenMs": 23.800000071525574,
+          "stagingMs": 7562.899999976158,
+          "commitMs": 214.20000004768372,
+          "transactionMs": 7777.300000071526,
+          "operationCount": 250,
+          "finalRows": 251,
+          "reopenMs": 65,
+          "reopenReadMs": 9.5,
+          "resultJsonBytes": 27006,
+          "storageBytes": 249856
+        },
+        {
+          "repetition": 2,
+          "coldOpenMs": 22.700000047683716,
+          "stagingMs": 7656.700000047684,
+          "commitMs": 214.5,
+          "transactionMs": 7871.299999952316,
+          "operationCount": 250,
+          "finalRows": 251,
+          "reopenMs": 68.20000004768372,
+          "reopenReadMs": 9.699999928474426,
+          "resultJsonBytes": 27006,
+          "storageBytes": 249856
+        },
+        {
+          "repetition": 3,
+          "coldOpenMs": 21.799999952316284,
+          "stagingMs": 7620.899999976158,
+          "commitMs": 205.80000007152557,
+          "transactionMs": 7826.800000071526,
+          "operationCount": 250,
+          "finalRows": 251,
+          "reopenMs": 64.29999995231628,
+          "reopenReadMs": 9.5,
+          "resultJsonBytes": 27006,
+          "storageBytes": 249856
+        },
+        {
+          "repetition": 4,
+          "coldOpenMs": 20.700000047683716,
+          "stagingMs": 7393.899999976158,
+          "commitMs": 207.90000009536743,
+          "transactionMs": 7601.900000095367,
+          "operationCount": 250,
+          "finalRows": 251,
+          "reopenMs": 64.79999995231628,
+          "reopenReadMs": 9.200000047683716,
+          "resultJsonBytes": 27006,
+          "storageBytes": 249856
+        }
+      ],
+      "distributions": {
+        "coldOpenMs": {
+          "count": 5,
+          "min": 20.700000047683716,
+          "median": 22,
+          "p90": 23.800000071525574,
+          "max": 23.800000071525574
+        },
+        "reopenMs": {
+          "count": 5,
+          "min": 63.799999952316284,
+          "median": 64.79999995231628,
+          "p90": 68.20000004768372,
+          "max": 68.20000004768372
+        },
+        "reopenReadMs": {
+          "count": 5,
+          "min": 9.200000047683716,
+          "median": 9.5,
+          "p90": 9.699999928474426,
+          "max": 9.699999928474426
+        },
+        "stagingMs": {
+          "count": 5,
+          "min": 7389.600000023842,
+          "median": 7562.899999976158,
+          "p90": 7656.700000047684,
+          "max": 7656.700000047684
+        },
+        "commitMs": {
+          "count": 5,
+          "min": 205.80000007152557,
+          "median": 207.90000009536743,
+          "p90": 214.5,
+          "max": 214.5
+        },
+        "transactionMs": {
+          "count": 5,
+          "min": 7595.699999928474,
+          "median": 7777.300000071526,
+          "p90": 7871.299999952316,
+          "max": 7871.299999952316
+        }
+      }
+    },
+    {
+      "kind": "result",
+      "rowCount": 100,
+      "payloadBytes": 64,
+      "samples": [
+        {
+          "repetition": 0,
+          "coldOpenMs": 21.799999952316284,
+          "reopenMs": 36.60000002384186,
+          "reopenReadMs": 5.600000023841858,
+          "resultJsonBytes": 10481,
+          "storageBytes": 73728,
+          "followerOpenMs": 7.200000047683716,
+          "ownerResultMs": 2.4000000953674316,
+          "followerResultMs": 2.299999952316284
+        },
+        {
+          "repetition": 1,
+          "coldOpenMs": 22.799999952316284,
+          "reopenMs": 36.700000047683716,
+          "reopenReadMs": 5.799999952316284,
+          "resultJsonBytes": 10481,
+          "storageBytes": 73728,
+          "followerOpenMs": 5.699999928474426,
+          "ownerResultMs": 2.299999952316284,
+          "followerResultMs": 2.600000023841858
+        },
+        {
+          "repetition": 2,
+          "coldOpenMs": 22.800000071525574,
+          "reopenMs": 36.300000071525574,
+          "reopenReadMs": 5.599999904632568,
+          "resultJsonBytes": 10481,
+          "storageBytes": 73728,
+          "followerOpenMs": 6.100000023841858,
+          "ownerResultMs": 2.299999952316284,
+          "followerResultMs": 2.600000023841858
+        },
+        {
+          "repetition": 3,
+          "coldOpenMs": 22.5,
+          "reopenMs": 36.5,
+          "reopenReadMs": 5.600000023841858,
+          "resultJsonBytes": 10481,
+          "storageBytes": 73728,
+          "followerOpenMs": 5.900000095367432,
+          "ownerResultMs": 2.100000023841858,
+          "followerResultMs": 2.600000023841858
+        },
+        {
+          "repetition": 4,
+          "coldOpenMs": 22,
+          "reopenMs": 36.09999990463257,
+          "reopenReadMs": 5.700000047683716,
+          "resultJsonBytes": 10481,
+          "storageBytes": 73728,
+          "followerOpenMs": 6.200000047683716,
+          "ownerResultMs": 2.4000000953674316,
+          "followerResultMs": 2.5
+        }
+      ],
+      "distributions": {
+        "coldOpenMs": {
+          "count": 5,
+          "min": 21.799999952316284,
+          "median": 22.5,
+          "p90": 22.800000071525574,
+          "max": 22.800000071525574
+        },
+        "reopenMs": {
+          "count": 5,
+          "min": 36.09999990463257,
+          "median": 36.5,
+          "p90": 36.700000047683716,
+          "max": 36.700000047683716
+        },
+        "reopenReadMs": {
+          "count": 5,
+          "min": 5.599999904632568,
+          "median": 5.600000023841858,
+          "p90": 5.799999952316284,
+          "max": 5.799999952316284
+        },
+        "followerOpenMs": {
+          "count": 5,
+          "min": 5.699999928474426,
+          "median": 6.100000023841858,
+          "p90": 7.200000047683716,
+          "max": 7.200000047683716
+        },
+        "ownerResultMs": {
+          "count": 5,
+          "min": 2.100000023841858,
+          "median": 2.299999952316284,
+          "p90": 2.4000000953674316,
+          "max": 2.4000000953674316
+        },
+        "followerResultMs": {
+          "count": 5,
+          "min": 2.299999952316284,
+          "median": 2.600000023841858,
+          "p90": 2.600000023841858,
+          "max": 2.600000023841858
+        }
+      }
+    },
+    {
+      "kind": "result",
+      "rowCount": 100,
+      "payloadBytes": 1024,
+      "samples": [
+        {
+          "repetition": 0,
+          "coldOpenMs": 22.399999976158142,
+          "reopenMs": 74.19999992847443,
+          "reopenReadMs": 14.700000047683716,
+          "resultJsonBytes": 106481,
+          "storageBytes": 466944,
+          "followerOpenMs": 6.199999928474426,
+          "ownerResultMs": 11.399999976158142,
+          "followerResultMs": 11.5
+        },
+        {
+          "repetition": 1,
+          "coldOpenMs": 21.59999990463257,
+          "reopenMs": 74.79999995231628,
+          "reopenReadMs": 14.799999952316284,
+          "resultJsonBytes": 106481,
+          "storageBytes": 466944,
+          "followerOpenMs": 5.700000047683716,
+          "ownerResultMs": 11.100000023841858,
+          "followerResultMs": 11.700000047683716
+        },
+        {
+          "repetition": 2,
+          "coldOpenMs": 22.399999976158142,
+          "reopenMs": 75.40000009536743,
+          "reopenReadMs": 14.699999928474426,
+          "resultJsonBytes": 106481,
+          "storageBytes": 466944,
+          "followerOpenMs": 6.300000071525574,
+          "ownerResultMs": 11.300000071525574,
+          "followerResultMs": 11.800000071525574
+        },
+        {
+          "repetition": 3,
+          "coldOpenMs": 22.699999928474426,
+          "reopenMs": 76.79999995231628,
+          "reopenReadMs": 14.600000023841858,
+          "resultJsonBytes": 106481,
+          "storageBytes": 466944,
+          "followerOpenMs": 5.600000023841858,
+          "ownerResultMs": 11.299999952316284,
+          "followerResultMs": 12.5
+        },
+        {
+          "repetition": 4,
+          "coldOpenMs": 22.399999976158142,
+          "reopenMs": 75.20000004768372,
+          "reopenReadMs": 14.399999976158142,
+          "resultJsonBytes": 106481,
+          "storageBytes": 466944,
+          "followerOpenMs": 6.200000047683716,
+          "ownerResultMs": 11.399999976158142,
+          "followerResultMs": 11.399999976158142
+        }
+      ],
+      "distributions": {
+        "coldOpenMs": {
+          "count": 5,
+          "min": 21.59999990463257,
+          "median": 22.399999976158142,
+          "p90": 22.699999928474426,
+          "max": 22.699999928474426
+        },
+        "reopenMs": {
+          "count": 5,
+          "min": 74.19999992847443,
+          "median": 75.20000004768372,
+          "p90": 76.79999995231628,
+          "max": 76.79999995231628
+        },
+        "reopenReadMs": {
+          "count": 5,
+          "min": 14.399999976158142,
+          "median": 14.699999928474426,
+          "p90": 14.799999952316284,
+          "max": 14.799999952316284
+        },
+        "followerOpenMs": {
+          "count": 5,
+          "min": 5.600000023841858,
+          "median": 6.199999928474426,
+          "p90": 6.300000071525574,
+          "max": 6.300000071525574
+        },
+        "ownerResultMs": {
+          "count": 5,
+          "min": 11.100000023841858,
+          "median": 11.300000071525574,
+          "p90": 11.399999976158142,
+          "max": 11.399999976158142
+        },
+        "followerResultMs": {
+          "count": 5,
+          "min": 11.399999976158142,
+          "median": 11.700000047683716,
+          "p90": 12.5,
+          "max": 12.5
+        }
+      }
+    },
+    {
+      "kind": "result",
+      "rowCount": 1000,
+      "payloadBytes": 64,
+      "samples": [
+        {
+          "repetition": 0,
+          "coldOpenMs": 21.800000071525574,
+          "reopenMs": 181.70000004768372,
+          "reopenReadMs": 21.700000047683716,
+          "resultJsonBytes": 106781,
+          "storageBytes": 385024,
+          "followerOpenMs": 5.700000047683716,
+          "ownerResultMs": 16.799999952316284,
+          "followerResultMs": 16.5
+        },
+        {
+          "repetition": 1,
+          "coldOpenMs": 22.700000047683716,
+          "reopenMs": 181.70000004768372,
+          "reopenReadMs": 21.299999952316284,
+          "resultJsonBytes": 106781,
+          "storageBytes": 385024,
+          "followerOpenMs": 5.700000047683716,
+          "ownerResultMs": 15.699999928474426,
+          "followerResultMs": 16.600000023841858
+        },
+        {
+          "repetition": 2,
+          "coldOpenMs": 22.200000047683716,
+          "reopenMs": 182.70000004768372,
+          "reopenReadMs": 21.299999952316284,
+          "resultJsonBytes": 106781,
+          "storageBytes": 385024,
+          "followerOpenMs": 7.199999928474426,
+          "ownerResultMs": 15.899999976158142,
+          "followerResultMs": 16.299999952316284
+        },
+        {
+          "repetition": 3,
+          "coldOpenMs": 22,
+          "reopenMs": 178.89999997615814,
+          "reopenReadMs": 21.300000071525574,
+          "resultJsonBytes": 106781,
+          "storageBytes": 385024,
+          "followerOpenMs": 6.100000023841858,
+          "ownerResultMs": 16,
+          "followerResultMs": 17.600000023841858
+        },
+        {
+          "repetition": 4,
+          "coldOpenMs": 22.600000023841858,
+          "reopenMs": 181,
+          "reopenReadMs": 21.399999976158142,
+          "resultJsonBytes": 106781,
+          "storageBytes": 385024,
+          "followerOpenMs": 5.699999928474426,
+          "ownerResultMs": 16.600000023841858,
+          "followerResultMs": 16.600000023841858
+        }
+      ],
+      "distributions": {
+        "coldOpenMs": {
+          "count": 5,
+          "min": 21.800000071525574,
+          "median": 22.200000047683716,
+          "p90": 22.700000047683716,
+          "max": 22.700000047683716
+        },
+        "reopenMs": {
+          "count": 5,
+          "min": 178.89999997615814,
+          "median": 181.70000004768372,
+          "p90": 182.70000004768372,
+          "max": 182.70000004768372
+        },
+        "reopenReadMs": {
+          "count": 5,
+          "min": 21.299999952316284,
+          "median": 21.300000071525574,
+          "p90": 21.700000047683716,
+          "max": 21.700000047683716
+        },
+        "followerOpenMs": {
+          "count": 5,
+          "min": 5.699999928474426,
+          "median": 5.700000047683716,
+          "p90": 7.199999928474426,
+          "max": 7.199999928474426
+        },
+        "ownerResultMs": {
+          "count": 5,
+          "min": 15.699999928474426,
+          "median": 16,
+          "p90": 16.799999952316284,
+          "max": 16.799999952316284
+        },
+        "followerResultMs": {
+          "count": 5,
+          "min": 16.299999952316284,
+          "median": 16.600000023841858,
+          "p90": 17.600000023841858,
+          "max": 17.600000023841858
+        }
+      }
+    },
+    {
+      "kind": "result",
+      "rowCount": 1000,
+      "payloadBytes": 1024,
+      "samples": [
+        {
+          "repetition": 0,
+          "coldOpenMs": 23.799999952316284,
+          "reopenMs": 544.7999999523163,
+          "reopenReadMs": 112.60000002384186,
+          "resultJsonBytes": 1066781,
+          "storageBytes": 4300800,
+          "followerOpenMs": 6.700000047683716,
+          "ownerResultMs": 107.39999997615814,
+          "followerResultMs": 107.29999995231628
+        },
+        {
+          "repetition": 1,
+          "coldOpenMs": 22.699999928474426,
+          "reopenMs": 547.2999999523163,
+          "reopenReadMs": 111.89999997615814,
+          "resultJsonBytes": 1066781,
+          "storageBytes": 4300800,
+          "followerOpenMs": 5.800000071525574,
+          "ownerResultMs": 105.19999992847443,
+          "followerResultMs": 106.80000007152557
+        },
+        {
+          "repetition": 2,
+          "coldOpenMs": 20.700000047683716,
+          "reopenMs": 544.2000000476837,
+          "reopenReadMs": 112.19999992847443,
+          "resultJsonBytes": 1066781,
+          "storageBytes": 4300800,
+          "followerOpenMs": 5.800000071525574,
+          "ownerResultMs": 105.19999992847443,
+          "followerResultMs": 107
+        },
+        {
+          "repetition": 3,
+          "coldOpenMs": 20.90000009536743,
+          "reopenMs": 547.6000000238419,
+          "reopenReadMs": 111.60000002384186,
+          "resultJsonBytes": 1066781,
+          "storageBytes": 4300800,
+          "followerOpenMs": 5.800000071525574,
+          "ownerResultMs": 104.19999992847443,
+          "followerResultMs": 106.89999997615814
+        },
+        {
+          "repetition": 4,
+          "coldOpenMs": 21.399999976158142,
+          "reopenMs": 545.2999999523163,
+          "reopenReadMs": 111.60000002384186,
+          "resultJsonBytes": 1066781,
+          "storageBytes": 4300800,
+          "followerOpenMs": 5.800000071525574,
+          "ownerResultMs": 104.29999995231628,
+          "followerResultMs": 107
+        }
+      ],
+      "distributions": {
+        "coldOpenMs": {
+          "count": 5,
+          "min": 20.700000047683716,
+          "median": 21.399999976158142,
+          "p90": 23.799999952316284,
+          "max": 23.799999952316284
+        },
+        "reopenMs": {
+          "count": 5,
+          "min": 544.2000000476837,
+          "median": 545.2999999523163,
+          "p90": 547.6000000238419,
+          "max": 547.6000000238419
+        },
+        "reopenReadMs": {
+          "count": 5,
+          "min": 111.60000002384186,
+          "median": 111.89999997615814,
+          "p90": 112.60000002384186,
+          "max": 112.60000002384186
+        },
+        "followerOpenMs": {
+          "count": 5,
+          "min": 5.800000071525574,
+          "median": 5.800000071525574,
+          "p90": 6.700000047683716,
+          "max": 6.700000047683716
+        },
+        "ownerResultMs": {
+          "count": 5,
+          "min": 104.19999992847443,
+          "median": 105.19999992847443,
+          "p90": 107.39999997615814,
+          "max": 107.39999997615814
+        },
+        "followerResultMs": {
+          "count": 5,
+          "min": 106.80000007152557,
+          "median": 107,
+          "p90": 107.29999995231628,
+          "max": 107.29999995231628
+        }
+      }
+    },
+    {
+      "kind": "result",
+      "rowCount": 5000,
+      "payloadBytes": 64,
+      "samples": [
+        {
+          "repetition": 0,
+          "coldOpenMs": 20.5,
+          "reopenMs": 1049.5,
+          "reopenReadMs": 85.39999997615814,
+          "resultJsonBytes": 542781,
+          "storageBytes": 1777664,
+          "followerOpenMs": 6.199999928474426,
+          "ownerResultMs": 77,
+          "followerResultMs": 79.5
+        },
+        {
+          "repetition": 1,
+          "coldOpenMs": 20,
+          "reopenMs": 1050.1000000238419,
+          "reopenReadMs": 87.19999992847443,
+          "resultJsonBytes": 542781,
+          "storageBytes": 1777664,
+          "followerOpenMs": 6.899999976158142,
+          "ownerResultMs": 76.89999997615814,
+          "followerResultMs": 79
+        },
+        {
+          "repetition": 2,
+          "coldOpenMs": 22.100000023841858,
+          "reopenMs": 1054.3000000715256,
+          "reopenReadMs": 85.5,
+          "resultJsonBytes": 542781,
+          "storageBytes": 1777664,
+          "followerOpenMs": 7.300000071525574,
+          "ownerResultMs": 77.5,
+          "followerResultMs": 80.39999997615814
+        },
+        {
+          "repetition": 3,
+          "coldOpenMs": 20.799999952316284,
+          "reopenMs": 1043.3000000715256,
+          "reopenReadMs": 85,
+          "resultJsonBytes": 542781,
+          "storageBytes": 1777664,
+          "followerOpenMs": 6.5,
+          "ownerResultMs": 77,
+          "followerResultMs": 81.29999995231628
+        },
+        {
+          "repetition": 4,
+          "coldOpenMs": 23.200000047683716,
+          "reopenMs": 1051.1999999284744,
+          "reopenReadMs": 85.20000004768372,
+          "resultJsonBytes": 542781,
+          "storageBytes": 1777664,
+          "followerOpenMs": 6.600000023841858,
+          "ownerResultMs": 76,
+          "followerResultMs": 79.19999992847443
+        }
+      ],
+      "distributions": {
+        "coldOpenMs": {
+          "count": 5,
+          "min": 20,
+          "median": 20.799999952316284,
+          "p90": 23.200000047683716,
+          "max": 23.200000047683716
+        },
+        "reopenMs": {
+          "count": 5,
+          "min": 1043.3000000715256,
+          "median": 1050.1000000238419,
+          "p90": 1054.3000000715256,
+          "max": 1054.3000000715256
+        },
+        "reopenReadMs": {
+          "count": 5,
+          "min": 85,
+          "median": 85.39999997615814,
+          "p90": 87.19999992847443,
+          "max": 87.19999992847443
+        },
+        "followerOpenMs": {
+          "count": 5,
+          "min": 6.199999928474426,
+          "median": 6.600000023841858,
+          "p90": 7.300000071525574,
+          "max": 7.300000071525574
+        },
+        "ownerResultMs": {
+          "count": 5,
+          "min": 76,
+          "median": 77,
+          "p90": 77.5,
+          "max": 77.5
+        },
+        "followerResultMs": {
+          "count": 5,
+          "min": 79,
+          "median": 79.5,
+          "p90": 81.29999995231628,
+          "max": 81.29999995231628
+        }
+      }
+    },
+    {
+      "kind": "result",
+      "rowCount": 5000,
+      "payloadBytes": 1024,
+      "samples": [
+        {
+          "repetition": 0,
+          "coldOpenMs": 70.30000007152557,
+          "reopenMs": 4293.300000071526,
+          "reopenReadMs": 1370.3999999761581,
+          "resultJsonBytes": 5342781,
+          "storageBytes": 21344256,
+          "followerOpenMs": 7.600000023841858,
+          "ownerResultMs": 1205.7999999523163,
+          "followerResultMs": 1332.3000000715256
+        },
+        {
+          "repetition": 1,
+          "coldOpenMs": 20.799999952316284,
+          "reopenMs": 4280.899999976158,
+          "reopenReadMs": 1362.8999999761581,
+          "resultJsonBytes": 5342781,
+          "storageBytes": 21344256,
+          "followerOpenMs": 5.5,
+          "ownerResultMs": 1353,
+          "followerResultMs": 1341.8999999761581
+        },
+        {
+          "repetition": 2,
+          "coldOpenMs": 22.199999928474426,
+          "reopenMs": 4313,
+          "reopenReadMs": 1367.5,
+          "resultJsonBytes": 5342781,
+          "storageBytes": 21344256,
+          "followerOpenMs": 6.199999928474426,
+          "ownerResultMs": 1360,
+          "followerResultMs": 1345.1000000238419
+        },
+        {
+          "repetition": 3,
+          "coldOpenMs": 21.899999976158142,
+          "reopenMs": 4298.800000071526,
+          "reopenReadMs": 1364.2999999523163,
+          "resultJsonBytes": 5342781,
+          "storageBytes": 21344256,
+          "followerOpenMs": 7.099999904632568,
+          "ownerResultMs": 1352,
+          "followerResultMs": 1352.0999999046326
+        },
+        {
+          "repetition": 4,
+          "coldOpenMs": 21.5,
+          "reopenMs": 4268.399999976158,
+          "reopenReadMs": 1425.5,
+          "resultJsonBytes": 5342781,
+          "storageBytes": 21344256,
+          "followerOpenMs": 6.600000023841858,
+          "ownerResultMs": 1351.5,
+          "followerResultMs": 1337
+        }
+      ],
+      "distributions": {
+        "coldOpenMs": {
+          "count": 5,
+          "min": 20.799999952316284,
+          "median": 21.899999976158142,
+          "p90": 70.30000007152557,
+          "max": 70.30000007152557
+        },
+        "reopenMs": {
+          "count": 5,
+          "min": 4268.399999976158,
+          "median": 4293.300000071526,
+          "p90": 4313,
+          "max": 4313
+        },
+        "reopenReadMs": {
+          "count": 5,
+          "min": 1362.8999999761581,
+          "median": 1367.5,
+          "p90": 1425.5,
+          "max": 1425.5
+        },
+        "followerOpenMs": {
+          "count": 5,
+          "min": 5.5,
+          "median": 6.600000023841858,
+          "p90": 7.600000023841858,
+          "max": 7.600000023841858
+        },
+        "ownerResultMs": {
+          "count": 5,
+          "min": 1205.7999999523163,
+          "median": 1352,
+          "p90": 1360,
+          "max": 1360
+        },
+        "followerResultMs": {
+          "count": 5,
+          "min": 1332.3000000715256,
+          "median": 1341.8999999761581,
+          "p90": 1352.0999999046326,
+          "max": 1352.0999999046326
+        }
+      }
+    }
+  ],
+  "resumedAt": "2026-09-15T05:18:20.673Z",
+  "seeding": "Setup is outside all timings. Payloads of 1024 bytes use at most 1000 rows per seed transaction to stay below retained batch limits; 64-byte payloads seed the whole shape in one transaction.",
+  "completedAt": "2026-09-15T05:20:10.360Z"
+}

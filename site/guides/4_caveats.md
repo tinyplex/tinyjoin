@@ -167,6 +167,21 @@ and runtime hashes under `benchmarks/`; after `npm run build`, reproduce the
 browser workload with `node scripts/benchmark-browser-inserts.mjs` and the
 separate engine/unique-index workload with `node scripts/benchmark-staging.mjs`.
 
+A separate five-sample Chromium/M2 check used a primary key, a unique title
+index, and 64-byte payloads. Mixed transactions of 25, 100, and 250 operations
+took median totals of about 59 ms, 929 ms, and 7.8 seconds respectively.
+Reopening a 5,000-row database with 1-KiB payloads took about 4.3 seconds;
+materializing its 5.34-MB result took about 1.35 seconds. Owner and follower
+measurements, distributions, runtime hashes, and reproduction commands are
+retained in the [workload report](https://github.com/tinyplex/tinyjoin/tree/main/benchmarks).
+
+For that measured shape, keep mixed batches in the tens of operations and
+bound returned rows and bytes. Larger batches can hold every Client using the
+same OPFS name for seconds. These samples cover one desktop and Chromium
+version; they do not establish a phone, low-end device, or cross-browser
+performance envelope. Measure the application's actual schema and devices
+before choosing its batch and result sizes.
+
 ## If TinyJoin is not the right fit
 
 These projects are larger, more mature, or both, and are the better answer when

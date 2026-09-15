@@ -1,0 +1,135 @@
+{
+  "measuredAt": "2026-09-15T05:13:07.523Z",
+  "packageVersion": "0.0.6",
+  "runtime": [
+    {
+      "path": "index.js",
+      "bytes": 10204,
+      "sha256": "fc3a9220bfd76693f6150ff9eadf743535d82c63b3f8ccf121562da768c47bb6"
+    },
+    {
+      "path": "protocol.js",
+      "bytes": 3530,
+      "sha256": "3a3f26ea0b5ccce24b6d18232d4c569e08809d9ff5256914acf30aea053c0e0d"
+    },
+    {
+      "path": "vite/index.js",
+      "bytes": 7737,
+      "sha256": "c3bb6eab11ac7e7de79fbb7010e329ba433b96d20f59a9cc070e96f4112043c9"
+    },
+    {
+      "path": "wasm/tinyjoin_wasm_bg.wasm",
+      "bytes": 737145,
+      "sha256": "c4a5996edb590e4a44a1b2509e6835cab8a83114a61bf7171ea2346336935f2b"
+    },
+    {
+      "path": "wasm/tinyjoin_wasm.js",
+      "bytes": 9553,
+      "sha256": "2ad61c5367ad263f3400838903caf2cf215fe163e6410f3aa4edae79b5b384a9"
+    },
+    {
+      "path": "worker-opfs/tinyjoin_opfs_runtime.js",
+      "bytes": 5541,
+      "sha256": "cd7755056326e2dbd1df6d4eb4c73f15059845c3ed27b0cd57a702bdcf93bf0a"
+    },
+    {
+      "path": "worker/default-entry.js",
+      "bytes": 26066,
+      "sha256": "3b598f241626daab12d74153f3605ec890a2a97fd85f9a985361fa6269bd40f1"
+    },
+    {
+      "path": "worker/index.js",
+      "bytes": 26101,
+      "sha256": "cc5d8efc69579de541a94df09a2acc9f162ada8cf9842f3a43e3ec91daf9b47a"
+    }
+  ],
+  "environment": {
+    "node": "v25.2.1",
+    "os": "darwin",
+    "osRelease": "25.5.0",
+    "architecture": "arm64",
+    "cpu": "Apple M2",
+    "logicalCpus": 8,
+    "memoryBytes": 17179869184,
+    "headless": true,
+    "viewport": {
+      "width": 1280,
+      "height": 720
+    },
+    "cpuThrottling": "none",
+    "network": "loopback HTTP; warm cache permitted within each isolated context",
+    "browserVersion": "151.0.7922.34",
+    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/151.0.7922.34 Safari/537.36"
+  },
+  "schema": "CREATE TABLE items (id INTEGER PRIMARY KEY, title TEXT NOT NULL, payload TEXT NOT NULL); CREATE UNIQUE INDEX items_title ON items (title)",
+  "definitions": {
+    "coldOpenMs": "First create(opfs://fresh-name) in a fresh browser context, before schema setup. Client module already loaded; Worker/WASM first-load included. Browser process, OS, and filesystem caches are not reset.",
+    "reopenMs": "After closing the sole client, create the same populated OPFS name in the same context. Includes fresh Worker and catalog open; HTTP/OS caches may be warm.",
+    "reopenReadMs": "First ordered full read after reopening; separate from reopenMs.",
+    "stagingMs": "Inside transaction callback: sequential prepared INSERT/UPDATE/DELETE requests, including Worker round trips and validation.",
+    "commitMs": "End of callback to transaction resolution; includes commit RPC, persistence, and coordination overhead.",
+    "resultMs": "query() call to complete materialized rows on requesting page, including engine execution, structured clone and owner/follower routing. Not an isolated copy benchmark; JSON byte sizing is outside timing.",
+    "percentiles": "Nearest-rank p90 of five samples is the maximum; retain all samples and do not treat it as a tail-latency estimate."
+  },
+  "notes": "One local desktop and one installed Chromium build. Sequential samples; no competitor, real mobile, Firefox, WebKit, power/thermal control, network download, or long-lived fragmentation coverage. No timing gate. Row checks run outside timing. Pilot interrupted before the 1000-operation shape after observing roughly 30-second 500-operation staging. Completed samples only; no inferred distributions for partial shapes.",
+  "pilotSamples": [
+    {
+      "kind": "mixed",
+      "rowCount": 500,
+      "payloadBytes": 64,
+      "repetition": 0,
+      "coldOpenMs": 21.799999952316284,
+      "stagingMs": 29789.700000047684,
+      "commitMs": 411.2999999523163,
+      "transactionMs": 30201.100000023842,
+      "operationCount": 500,
+      "finalRows": 501,
+      "reopenMs": 106.89999997615814,
+      "reopenReadMs": 14.399999976158142,
+      "resultJsonBytes": 54090,
+      "storageBytes": 454656
+    },
+    {
+      "kind": "mixed",
+      "rowCount": 500,
+      "payloadBytes": 64,
+      "repetition": 1,
+      "coldOpenMs": 21.40000009536743,
+      "stagingMs": 29923.799999952316,
+      "commitMs": 413.7000000476837,
+      "transactionMs": 30337.700000047684,
+      "operationCount": 500,
+      "finalRows": 501,
+      "reopenMs": 106.39999997615814,
+      "reopenReadMs": 15.100000023841858,
+      "resultJsonBytes": 54090,
+      "storageBytes": 454656
+    },
+    {
+      "kind": "mixed",
+      "rowCount": 500,
+      "payloadBytes": 64,
+      "repetition": 2,
+      "coldOpenMs": 22.100000023841858,
+      "stagingMs": 29726.5,
+      "commitMs": 413.10000002384186,
+      "transactionMs": 30139.700000047684,
+      "operationCount": 500,
+      "finalRows": 501,
+      "reopenMs": 108.90000009536743,
+      "reopenReadMs": 14.899999976158142,
+      "resultJsonBytes": 54090,
+      "storageBytes": 454656
+    }
+  ],
+  "plannedRepetitions": 5,
+  "completedPilotSamples": 3,
+  "setupBoundary": {
+    "rowCount": 5000,
+    "payloadBytes": 1024,
+    "seedTransactions": 1,
+    "outcome": "Rejected during setup before result measurements",
+    "errorMessage": "A paged batch cannot retain more than 16777216 bytes",
+    "note": "The final workload script seeds this shape in 1000-row transactions. Setup is excluded from timings."
+  }
+}
