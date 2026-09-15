@@ -125,11 +125,13 @@ reference includes all guide changes. Existing homepage warning edits are
 preserved. The accepted TinyDocs advisory remains closed.
 
 TinyJoin #8 has an implemented and browser-tested search fix, but observed
-screen-reader announcements remain unverified. VoiceOver was enabled with the
-maintainer's permission, but returned to off before announcements could be
-observed. Its final observed setting was off. Native accessibility state is
-useful evidence, but does not replace that manual check. The search commit uses
-`Refs #8` rather than a closing reference.
+screen-reader announcements remain unverified. On retry, VoiceOver remained on
+while the search query and result state changed. Speech was muted to avoid
+disrupting other audio, but the computer-use tool could not expose VoiceOver's
+caption window. Native accessibility state is useful evidence, but does not
+replace that manual check. VoiceOver was turned off afterward and its original
+speech preference restored. The search commit uses `Refs #8` rather than a
+closing reference.
 
 TinyJoin #15 remains open for the activation checks above. No registry
 publication or starter visibility change is implied by committing these fixes.
