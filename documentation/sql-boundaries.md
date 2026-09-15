@@ -48,7 +48,7 @@ specific timing improvement.
 
 ## Payload observation
 
-The launch build measured WASM at 737,145 bytes raw / 277,336 bytes gzip (level 9),
+The SQL dispatch refactor build measured WASM at 737,145 bytes raw / 277,336 bytes gzip (level 9),
 versus committed pre-refactor metadata of 738,352 / 277,465: a reduction of 1,207
 raw and 129 gzip bytes. The complete default runtime was 792,039 / 297,883 bytes.
 The baseline was retained build metadata, not independently rebuilt during this

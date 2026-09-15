@@ -1084,6 +1084,23 @@ fn expected_index_entry_count<D: PageDevice>(
     let Some(root) = table.root_page_id else {
         return Ok(0);
     };
+    // Catalog opening has already validated every table row and its declared count.
+    // A unique index without nullable columns must contain one entry per row.
+    // Its entry validation also rejects duplicate prefixes and checks every key
+    // against its row, proving complete coverage without scanning the table again.
+    // Retain the scan for indexes without uniqueness: counts alone do not prove
+    // coverage if a corrupt tree contains duplicate entries across leaves.
+    if definition.unique
+        && definition.columns.iter().all(|name| {
+            table
+                .schema
+                .columns
+                .iter()
+                .any(|column| column.name == *name && !column.nullable)
+        })
+    {
+        return Ok(table.row_count);
+    }
     let mut count = 0_u64;
     let mut cursor = Btree::cursor(pager, root, table.tree_id)?;
     while let Some((key, value)) = cursor.next(pager)? {
@@ -1567,18 +1584,119 @@ mod tests {
 
     #[test]
     fn reopening_rejects_an_index_missing_eligible_table_rows() {
-        let paged = page_native_fixture(MemoryPageDevice::new(0).unwrap()).unwrap();
-        let index = paged.indexes.get("posts_author").unwrap().clone();
-        let device = paged.into_device();
-        let mut pager = Pager::open_or_create(device).unwrap();
+        for index_name in ["posts_author", "posts_rank"] {
+            let mut paged = page_native_fixture(MemoryPageDevice::new(0).unwrap()).unwrap();
+            execute_sql(
+                &mut paged,
+                "CREATE UNIQUE INDEX posts_rank ON posts (rank)",
+                &[],
+            )
+            .unwrap();
+            let index = paged.indexes.get(index_name).unwrap().clone();
+            let device = paged.into_device();
+            let mut pager = Pager::open_or_create(device).unwrap();
+            let catalog_root = pager.catalog_root_page_id().unwrap();
+            let revision = pager.database_revision();
+            let mut transaction = pager.begin_write().unwrap();
+            let (key, value) = encode_catalog_index_record(&CatalogIndexRecord {
+                definition: index.definition,
+                tree_id: index.tree_id,
+                root_page_id: None,
+                entry_count: 0,
+            })
+            .unwrap();
+            let catalog_root = Btree::upsert(
+                &mut transaction,
+                catalog_root,
+                CATALOG_TREE_ID,
+                &key,
+                &value,
+            )
+            .unwrap()
+            .root_page_id;
+            transaction
+                .commit(revision, EMPTY_HASH, Some(catalog_root))
+                .unwrap();
+
+            let error = match PagedStorage::open(pager.into_device()) {
+                Ok(_) => panic!("an incomplete secondary index must fail closed"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, "STORAGE_CORRUPT");
+        }
+    }
+
+    #[test]
+    fn reopening_validates_required_and_nullable_index_counts() {
+        let mut paged = PagedStorage::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        for sql in [
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, category TEXT NOT NULL, rank INTEGER NOT NULL, label TEXT)",
+            "INSERT INTO items VALUES (1, 'same', 1, NULL), (2, 'same', 2, 'present'), (3, 'other', 3, NULL)",
+            "CREATE INDEX items_category ON items (category)",
+            "CREATE UNIQUE INDEX items_rank ON items (rank)",
+            "CREATE UNIQUE INDEX items_category_rank ON items (category, rank)",
+            "CREATE UNIQUE INDEX items_category_label ON items (category, label)",
+        ] {
+            execute_sql(&mut paged, sql, &[]).unwrap();
+        }
+        let expected = paged.scan_table("items").unwrap();
+        let reopened = PagedStorage::open(paged.into_device()).unwrap();
+        assert_eq!(reopened.scan_table("items").unwrap(), expected);
+        for (index, entry_count) in [
+            ("items_category", 3),
+            ("items_rank", 3),
+            ("items_category_rank", 3),
+            ("items_category_label", 1),
+        ] {
+            assert_eq!(reopened.indexes[index].entry_count, entry_count);
+        }
+        let mut matches = Vec::new();
+        reopened
+            .visit_index(
+                "items",
+                &["category".to_owned(), "label".to_owned()],
+                &row(json!({"category": "same", "label": "present"})),
+                &mut |item| {
+                    matches.push(item.clone());
+                    Ok(VisitControl::Continue)
+                },
+            )
+            .unwrap();
+        assert_eq!(matches, vec![expected[1].clone()]);
+    }
+
+    #[test]
+    fn reopening_rejects_null_in_a_required_index_column() {
+        let mut paged = page_native_fixture(MemoryPageDevice::new(0).unwrap()).unwrap();
+        execute_sql(
+            &mut paged,
+            "CREATE UNIQUE INDEX posts_rank ON posts (rank)",
+            &[],
+        )
+        .unwrap();
+        let table = paged.tables["posts"].clone();
+        let mut pager = Pager::open_or_create(paged.into_device()).unwrap();
         let catalog_root = pager.catalog_root_page_id().unwrap();
         let revision = pager.database_revision();
         let mut transaction = pager.begin_write().unwrap();
-        let (key, value) = encode_catalog_index_record(&CatalogIndexRecord {
-            definition: index.definition,
-            tree_id: index.tree_id,
-            root_page_id: None,
-            entry_count: 0,
+        let invalid_row = row(json!({"id": 10, "author_id": 1, "state": "draft", "rank": null}));
+        let primary_key = encode_primary_key(&table.schema, &invalid_row).unwrap();
+        let row_value = crate::paged_codec::encode_row(&invalid_row).unwrap();
+        let table_root = Btree::upsert(
+            &mut transaction,
+            table.root_page_id.unwrap(),
+            table.tree_id,
+            &primary_key,
+            &row_value,
+        )
+        .unwrap()
+        .root_page_id;
+        let (key, value) = crate::paged_codec::encode_catalog_table_record(&CatalogTableRecord {
+            schema: table.schema,
+            tree_id: table.tree_id,
+            root_page_id: Some(table_root),
+            row_count: table.row_count as u64,
+            hash: table.hash,
         })
         .unwrap();
         let catalog_root = Btree::upsert(
@@ -1593,9 +1711,114 @@ mod tests {
         transaction
             .commit(revision, EMPTY_HASH, Some(catalog_root))
             .unwrap();
-
         let error = match PagedStorage::open(pager.into_device()) {
-            Ok(_) => panic!("an incomplete secondary index must fail closed"),
+            Ok(_) => panic!("required index columns must still reject stored NULLs"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "STORAGE_CORRUPT");
+    }
+
+    #[test]
+    fn reopening_rejects_duplicate_required_unique_index_prefixes() {
+        let paged = page_native_fixture(MemoryPageDevice::new(0).unwrap()).unwrap();
+        // Both posts by author 1 have valid, distinct entry keys and the catalog
+        // count is correct. Claiming uniqueness must still reject their shared prefix.
+        let mut index = paged.indexes["posts_author"].clone();
+        index.definition.unique = true;
+        let mut pager = Pager::open_or_create(paged.into_device()).unwrap();
+        let catalog_root = pager.catalog_root_page_id().unwrap();
+        let revision = pager.database_revision();
+        let (key, value) = encode_catalog_index_record(&CatalogIndexRecord {
+            definition: index.definition,
+            tree_id: index.tree_id,
+            root_page_id: index.root_page_id,
+            entry_count: index.entry_count as u64,
+        })
+        .unwrap();
+        let mut transaction = pager.begin_write().unwrap();
+        let catalog_root = Btree::upsert(
+            &mut transaction,
+            catalog_root,
+            CATALOG_TREE_ID,
+            &key,
+            &value,
+        )
+        .unwrap()
+        .root_page_id;
+        transaction
+            .commit(revision, EMPTY_HASH, Some(catalog_root))
+            .unwrap();
+        let error = match PagedStorage::open(pager.into_device()) {
+            Ok(_) => panic!("the correct entry count must not hide duplicate unique values"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "STORAGE_CORRUPT");
+    }
+
+    #[test]
+    fn reopening_rejects_a_required_index_entry_mismatching_its_row() {
+        let mut paged = page_native_fixture(MemoryPageDevice::new(0).unwrap()).unwrap();
+        execute_sql(
+            &mut paged,
+            "CREATE UNIQUE INDEX posts_rank ON posts (rank)",
+            &[],
+        )
+        .unwrap();
+        let table = paged.tables["posts"].clone();
+        let index = paged.indexes["posts_rank"].clone();
+        let mut pager = Pager::open_or_create(paged.into_device()).unwrap();
+        let catalog_root = pager.catalog_root_page_id().unwrap();
+        let revision = pager.database_revision();
+        let original_row = row(json!({"id": 10, "author_id": 1, "state": "draft", "rank": 2}));
+        let mut mismatched_row = original_row.clone();
+        mismatched_row.insert("rank".to_owned(), json!(99));
+        let original_key =
+            encode_secondary_index_entry_key(&table.schema, &index.definition, &original_row)
+                .unwrap()
+                .unwrap();
+        let mismatched_key =
+            encode_secondary_index_entry_key(&table.schema, &index.definition, &mismatched_row)
+                .unwrap()
+                .unwrap();
+        let mut transaction = pager.begin_write().unwrap();
+        let index_root = Btree::delete(
+            &mut transaction,
+            index.root_page_id.unwrap(),
+            index.tree_id,
+            &original_key,
+        )
+        .unwrap()
+        .root_page_id;
+        let index_root = Btree::upsert(
+            &mut transaction,
+            index_root.unwrap(),
+            index.tree_id,
+            &mismatched_key,
+            &[],
+        )
+        .unwrap()
+        .root_page_id;
+        let (key, value) = encode_catalog_index_record(&CatalogIndexRecord {
+            definition: index.definition,
+            tree_id: index.tree_id,
+            root_page_id: Some(index_root),
+            entry_count: index.entry_count as u64,
+        })
+        .unwrap();
+        let catalog_root = Btree::upsert(
+            &mut transaction,
+            catalog_root,
+            CATALOG_TREE_ID,
+            &key,
+            &value,
+        )
+        .unwrap()
+        .root_page_id;
+        transaction
+            .commit(revision, EMPTY_HASH, Some(catalog_root))
+            .unwrap();
+        let error = match PagedStorage::open(pager.into_device()) {
+            Ok(_) => panic!("an index entry with the correct count must still match its row"),
             Err(error) => error,
         };
         assert_eq!(error.code, "STORAGE_CORRUPT");

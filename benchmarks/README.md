@@ -20,6 +20,7 @@ On the same Apple M2 and Chromium 151.0.7922.34, measured medians were:
 | Baseline | 7,563.1 ms | 4,274.8 ms | 1,353.8 ms |
 | Lookup-table CRC-32 | 2,412.8 ms | 3,129.2 ms | 1,091.4 ms |
 | CRC-32 + primary-key UPDATE/DELETE | 2,454.6 ms | 3,093.2 ms | 1,106.6 ms |
+| All three improvements (five samples) | 2,197.6 ms | 2,152.1 ms | 1,086.8 ms |
 
 `launch-performance-before.json` and `launch-performance-checksum.json` retain
 the samples, environment, and runtime hashes. The baseline used an isolated
@@ -56,10 +57,29 @@ runtime artifact was identical. Runs were sequential. The benefit is avoiding
 full-table scans for point mutations as the existing table grows, while retaining
 the current complete mixed-transaction validation.
 
-## Launch workload envelope
+The final build also avoids a redundant count scan for unique indexes whose
+columns are all `NOT NULL`. Table validation and full per-entry index checks
+remain. Its complete five-sample workload matrix is retained in
+`workload-envelope-optimized.json`, and is summarized below. The earlier quick
+profiles use three samples; compare these as local distributions rather than
+precise guarantees for an isolated optimization.
 
-`workload-envelope.json` retains five samples for each of nine OPFS workloads on
-an Apple M2 (8 logical CPUs, 16 GiB RAM), macOS (Darwin 25.5.0), headless Chromium
+The final runtime is 793,722 bytes raw / 298,152 bytes gzip. Compared with the
+prelaunch baseline, all three improvements together add 1,683 raw bytes and
+269 gzip bytes. The WASM is 738,828 raw / 277,605 gzip bytes.
+
+Validation for this build: `TINYJOIN_BROWSER_PORT=4184 npm run check:release`
+passed, including 286 native Rust tests, 127 TypeScript tests, 10 real-WASM
+contracts, 16 documentation and 19 runtime Chromium tests, packed consumers,
+size checks, and restrictive-CSP offline lifecycle checks. The release rebuild
+matched every recorded runtime hash. The starter's `npm run test:candidate`
+also passed all four generated builds and 15 Chromium lifecycle tests against
+an immutable tarball of this candidate.
+
+## Current workload envelope
+
+`workload-envelope-optimized.json` retains five samples for each of nine OPFS
+workloads on an Apple M2 (8 logical CPUs, 16 GiB RAM), macOS (Darwin 25.5.0), headless Chromium
 151.0.7922.34, and the packaged default Worker. These are local diagnostics,
 not a timing gate, a competitor comparison, or a supported device limit. All
 runtime JavaScript/WASM byte lengths and SHA-256 hashes are in the artifact.
@@ -67,17 +87,17 @@ runtime JavaScript/WASM byte lengths and SHA-256 hashes are in the artifact.
 Practical guidance for this measured shape:
 
 - Keep mixed transactions short. Tens of sequential mixed writes are a sensible
-  starting point to measure: 25 operations took about 59 ms, 100 about 929 ms,
-  and 250 about 7.8 seconds. All same-name Clients wait for that transaction.
+  starting point to measure: 25 operations took about 24 ms, 100 about 296 ms,
+  and 250 about 2.2 seconds. All same-name Clients wait for that transaction.
   Multi-row statements can reduce repeated validation; append-only insertion
   has a separate incremental path and is measured below.
 - Bound result size. Materializing 100 short rows took a few milliseconds; 5,000
-  1-KiB payload rows took about 1.35 seconds. Paging a UI does not help if it still
+  1-KiB payload rows took about 1.1 seconds. Paging a UI does not help if it still
   requests every row from the database. These timings include execution and
   delivery, not rendering.
 - Budget populated startup separately from the first empty open. The empty open
-  was normally about 22 ms; reopening the largest measured database took about
-  4.3 seconds, followed by another 1.4-second first read. Opening validates the
+  was normally about 20 ms; reopening the largest measured database took about
+  2.2 seconds, followed by another 1.1-second first read. Opening validates the
   stored trees. A warm HTTP cache does not eliminate that work.
 - Batch setup/imports deliberately. One transaction containing 5,000 rows with
   1,024-byte payloads exceeded the 16-MiB retained batch limit. Five 1,000-row
@@ -98,12 +118,13 @@ transaction resolution, including persistence and coordination.
 
 | Initial rows / operations | Staging median (min–max) | Commit median | Whole transaction median |
 | --- | --- | --- | --- |
-| 25 | 45.8 (45.0–47.0) | 12.9 | 58.8 |
-| 100 | 866.3 (863.8–869.0) | 62.8 | 929.1 |
-| 250 | 7,562.9 (7,389.6–7,656.7) | 207.9 | 7,777.3 |
+| 25 | 18.4 (17.8–20.2) | 5.9 | 24.2 |
+| 100 | 271.1 (270.5–273.9) | 25.4 | 296.2 |
+| 250 | 2,123.6 (2,116.1–2,165.4) | 73.3 | 2,197.6 |
 
-`workload-pilot.json` also retains three completed 500-operation samples: staging
-29.73–29.92 seconds, commit 411–414 ms. That pilot was stopped before the planned
+The pre-optimization `workload-envelope.json` remains available for historical
+comparison. `workload-pilot.json` retains three earlier 500-operation samples:
+staging 29.73–29.92 seconds, commit 411–414 ms. That pilot was stopped before the planned
 1,000-operation shape; there is no inferred result for that shape. The repeatable
 mixed suite uses 25/100/250 operations to keep it useful for local iteration.
 
@@ -117,18 +138,17 @@ below are actual UTF-8 JSON result sizes, not raw string payload estimates.
 
 | Rows | Payload bytes/row | JSON result bytes | OPFS bytes | Reopen median ms | First read median ms | Owner median ms | Follower median ms |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 100 | 64 | 10,481 | 73,728 | 36.5 | 5.6 | 2.3 | 2.6 |
-| 100 | 1,024 | 106,481 | 466,944 | 75.2 | 14.7 | 11.3 | 11.7 |
-| 1,000 | 64 | 106,781 | 385,024 | 181.7 | 21.3 | 16.0 | 16.6 |
-| 1,000 | 1,024 | 1,066,781 | 4,300,800 | 545.3 | 111.9 | 105.2 | 107.0 |
-| 5,000 | 64 | 542,781 | 1,777,664 | 1,050.1 | 85.4 | 77.0 | 79.5 |
-| 5,000 | 1,024 | 5,342,781 | 21,344,256 | 4,293.3 | 1,367.5 | 1,352.0 | 1,341.9 |
+| 100 | 64 | 10,481 | 73,728 | 24.7 | 5.1 | 1.8 | 1.9 |
+| 100 | 1,024 | 106,481 | 466,944 | 46.1 | 9.4 | 6.2 | 6.4 |
+| 1,000 | 64 | 106,781 | 385,024 | 83.2 | 16.2 | 10.6 | 11.1 |
+| 1,000 | 1,024 | 1,066,781 | 4,300,800 | 285.0 | 60.8 | 54.3 | 55.8 |
+| 5,000 | 64 | 542,781 | 1,777,664 | 390.7 | 59.5 | 50.0 | 52.2 |
+| 5,000 | 1,024 | 5,342,781 | 21,344,256 | 2,152.1 | 1,086.8 | 1,113.6 | 1,074.4 |
 
 The largest payload shape is seeded in 1,000-row transactions; schema setup and
-all seeding are excluded from the timings. Its final five samples were resumed
-in a new Chromium process after adjusting that setup. The report records both
-start and resume times. Earlier completed shapes used identical setup semantics
-and the same runtime hashes.
+all seeding are excluded from the timings. The final matrix ran to completion
+in one Chromium process with no resume.
+The earlier baseline report retains its own setup and resume notes.
 
 ### Reproduce and interpret
 

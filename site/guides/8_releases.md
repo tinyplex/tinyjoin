@@ -44,6 +44,11 @@ retain the before/after samples and runtime hashes.
 predicates, including staged transaction rows. Other predicates retain their
 scan path, and statement validation and constraint checks remain in force.
 
+Persistent startup avoids a redundant table scan for unique indexes whose
+columns are all `NOT NULL`. Table validation and complete index-entry checks
+remain in force; nullable indexes and indexes without uniqueness retain the
+existing count scan.
+
 Duplicate output names in simple projections and `RETURNING` now fail
 consistently with `INVALID_QUERY` before execution. `LIMIT` and `OFFSET`
 reject nonnumeric parameter values consistently in ordinary, aggregate, and

@@ -167,11 +167,12 @@ and runtime hashes under `benchmarks/`; after `npm run build`, reproduce the
 browser workload with `node scripts/benchmark-browser-inserts.mjs` and the
 separate engine/unique-index workload with `node scripts/benchmark-staging.mjs`.
 
-A separate five-sample Chromium/M2 check used a primary key, a unique title
+After the checksum, primary-key lookup, and startup optimizations, a five-sample
+Chromium/M2 check used a primary key, a unique title
 index, and 64-byte payloads. Mixed transactions of 25, 100, and 250 operations
-took median totals of about 59 ms, 929 ms, and 7.8 seconds respectively.
-Reopening a 5,000-row database with 1-KiB payloads took about 4.3 seconds;
-materializing its 5.34-MB result took about 1.35 seconds. Owner and follower
+took median totals of about 24 ms, 296 ms, and 2.2 seconds respectively.
+Reopening a 5,000-row database with 1-KiB payloads took about 2.2 seconds;
+materializing its 5.34-MB result took about 1.1 seconds. Owner and follower
 measurements, distributions, runtime hashes, and reproduction commands are
 retained in the [workload report](https://github.com/tinyplex/tinyjoin/tree/main/benchmarks).
 
