@@ -1091,52 +1091,16 @@ application state rather than for analytics over a large dataset.
 
 ## Performance depends on the workload
 
-Running SQL off the main thread keeps engine work out of the page's rendering
-loop. It does not guarantee low latency or throughput on every browser and
-device. Measure the application's schema, query shapes, and storage mode.
+Keep transactions short and request only the data your UI needs. Measure
+populated startup and larger batches with your application's data and target
+devices.
 
-Transactions that only append new primary keys use incremental statement
-validation. Mixed writes still validate the complete staged write set after
-each statement and can have quadratic staging cost. Multi-row statements can
-reduce that overhead; see [inserting many rows](https://tinyjoin.org/guides/transactions-and-changes/#inserting-many-rows).
-
-Aggregates scan their input table, and transaction queries currently do not
-use secondary indexes for lookup acceleration. Opening a persistent database
-validates its stored trees, so startup cost grows with the stored data. Commit
-and browser storage costs are separate from statement staging.
-
-A local before/after check of incremental insertion used 1,000 awaited
-prepared inserts in one transaction, with an integer primary key and a short
-text value. Three-run medians on an Apple M2 in Chromium, using the packaged
-default Worker, were:
-
-| Storage | Staging before / after | Whole transaction before / after |
-| --- | --- | --- |
-| Memory | 1,324 / 62 ms | 1,557 / 304 ms |
-| OPFS | 1,327 / 56 ms | 1,571 / 310 ms |
-
-Commit time remained about 230–250 ms. These are diagnostic measurements of
-one insertion workload, not a controlled comparison with other databases or
-a browser support/performance guarantee. The repository retains the samples
-and runtime hashes under `benchmarks/`; after `npm run build`, reproduce the
-browser workload with `node scripts/benchmark-browser-inserts.mjs` and the
-separate engine/unique-index workload with `node scripts/benchmark-staging.mjs`.
-
-After the checksum, primary-key lookup, and startup optimizations, a five-sample
-Chromium/M2 check used a primary key, a unique title
-index, and 64-byte payloads. Mixed transactions of 25, 100, and 250 operations
-took median totals of about 24 ms, 296 ms, and 2.2 seconds respectively.
-Reopening a 5,000-row database with 1-KiB payloads took about 2.2 seconds;
-materializing its 5.34-MB result took about 1.1 seconds. Owner and follower
-measurements, distributions, runtime hashes, and reproduction commands are
-retained in the [workload report](https://github.com/tinyplex/tinyjoin/tree/main/benchmarks).
-
-For that measured shape, keep mixed batches in the tens of operations and
-bound returned rows and bytes. Larger batches can hold every Client using the
-same OPFS name for seconds. These samples cover one desktop and Chromium
-version; they do not establish a phone, low-end device, or cross-browser
-performance envelope. Measure the application's actual schema and devices
-before choosing its batch and result sizes.
+The [transaction guide](https://tinyjoin.org/guides/transactions-and-changes/#inserting-many-rows)
+explains batching and validation costs. The
+[workload report](https://github.com/tinyplex/tinyjoin/tree/main/benchmarks)
+records detailed measurements, runtime hashes, and reproduction commands for
+mixed transactions, populated startup, and result materialization. Those
+measurements cover one desktop and Chromium version.
 
 ## If TinyJoin is not the right fit
 
