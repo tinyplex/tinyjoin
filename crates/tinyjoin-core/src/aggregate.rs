@@ -6,8 +6,7 @@ use serde_json::{Map, Number, Value};
 
 use crate::query::{
     ParseMode, Token, bind_parameter, is_reserved_keyword, matches_predicate, pagination_value,
-    parse_predicate_at, tokenize, validate_parameter_expansion, validate_predicate_columns,
-    validate_predicate_types, validate_sql_input,
+    parse_predicate_at, validate_predicate_columns, validate_predicate_types,
 };
 use crate::storage::StorageReader;
 use crate::{
@@ -114,17 +113,17 @@ pub(crate) fn is_aggregate_select(tokens: &[Token]) -> bool {
 
 #[cfg(test)]
 pub(crate) fn parse_sql(sql: &str, params: &[Value]) -> Result<AggregatePlan> {
-    parse_sql_with_mode(sql, params, ParseMode::Bound)
+    crate::query::validate_sql_input(sql, params)?;
+    let tokens = crate::query::tokenize(sql)?;
+    crate::query::validate_parameter_expansion(&tokens, params)?;
+    parse_tokens(tokens, params, ParseMode::Bound)
 }
 
-pub(crate) fn parse_sql_with_mode(
-    sql: &str,
+pub(crate) fn parse_tokens(
+    tokens: Vec<Token>,
     params: &[Value],
     mode: ParseMode,
 ) -> Result<AggregatePlan> {
-    validate_sql_input(sql, params)?;
-    let tokens = tokenize(sql)?;
-    validate_parameter_expansion(&tokens, params)?;
     Parser::new(tokens, params, mode).parse()
 }
 

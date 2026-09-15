@@ -98,16 +98,18 @@ pub(crate) struct PlannedDml {
 }
 
 pub(crate) fn parse(sql: &str, params: &[Value]) -> Result<Statement> {
-    parse_with_mode(sql, params, ParseMode::Bound)
-}
-
-pub(crate) fn parse_prepared(sql: &str, params: &[Value]) -> Result<Statement> {
-    parse_with_mode(sql, params, ParseMode::Template)
-}
-
-fn parse_with_mode(sql: &str, params: &[Value], mode: ParseMode) -> Result<Statement> {
     validate_sql_input(sql, params)?;
-    let tokens = tokenize(sql)?;
+    parse_tokens(tokenize(sql)?, params, ParseMode::Bound)
+}
+
+/// The shared boundary for direct and prepared SQL. Callers check text/parameter bounds
+/// before tokenization; all families share expansion accounting and consume these tokens once.
+pub(crate) fn parse_tokens(
+    tokens: Vec<Token>,
+    params: &[Value],
+    mode: ParseMode,
+) -> Result<Statement> {
+    validate_parameter_expansion(&tokens, params)?;
     if matches!(
         tokens.first(),
         Some(Token::Identifier {
@@ -116,15 +118,13 @@ fn parse_with_mode(sql: &str, params: &[Value], mode: ParseMode) -> Result<State
         }) if value.eq_ignore_ascii_case("select")
     ) {
         if crate::join::is_join_select(&tokens) {
-            return crate::join::parse_sql_with_mode(sql, params, mode).map(Statement::Join);
+            return crate::join::parse_tokens(tokens, params, mode).map(Statement::Join);
         }
         if crate::aggregate::is_aggregate_select(&tokens) {
-            return crate::aggregate::parse_sql_with_mode(sql, params, mode)
-                .map(Statement::Aggregate);
+            return crate::aggregate::parse_tokens(tokens, params, mode).map(Statement::Aggregate);
         }
-        return crate::query::parse_sql_with_mode(sql, params, mode).map(Statement::Select);
+        return crate::query::parse_tokens(tokens, params, mode).map(Statement::Select);
     }
-    validate_parameter_expansion(&tokens, params)?;
     MutationParser::new(tokens, params)
         .parse()
         .map(Statement::Write)

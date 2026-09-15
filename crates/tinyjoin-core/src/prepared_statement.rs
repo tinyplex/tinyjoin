@@ -4,9 +4,9 @@ use std::mem::size_of;
 use serde_json::Value;
 
 use crate::query::{
-    MAX_SQL_PARAMETERS, Token, bind_predicate_parameters, bind_prepared_value, parameter_index,
-    prepared_parameter_marker, tokenize, validate_bound_parameter_bytes, validate_sql_input,
-    validate_sql_parameters,
+    MAX_SQL_PARAMETERS, ParseMode, Token, bind_predicate_parameters, bind_prepared_value,
+    parameter_index, prepared_parameter_marker, tokenize, validate_bound_parameter_bytes,
+    validate_sql_input, validate_sql_parameters,
 };
 use crate::statement::{SqlValue, Statement, WriteStatement};
 use crate::{EngineError, Result};
@@ -38,7 +38,9 @@ impl PreparedStatement {
         let params = (1..=layout.parameter_count)
             .map(prepared_parameter_marker)
             .collect::<Vec<_>>();
-        let statement = crate::statement::parse_prepared(sql, &params)?;
+        validate_sql_parameters(&params)?;
+        let token_count = tokens.len();
+        let statement = crate::statement::parse_tokens(tokens, &params, ParseMode::Template)?;
         if matches!(
             statement,
             Statement::Write(
@@ -53,7 +55,7 @@ impl PreparedStatement {
                 "Prepared statements support SELECT, INSERT, UPDATE, and DELETE, but not DDL",
             ));
         }
-        let retained_bytes = retained_bytes(sql.len(), tokens.len(), layout.parameter_count)?;
+        let retained_bytes = retained_bytes(sql.len(), token_count, layout.parameter_count)?;
         Ok(Self {
             source: sql.into(),
             statement,

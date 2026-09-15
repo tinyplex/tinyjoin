@@ -356,17 +356,17 @@ pub(crate) enum ParseMode {
 
 #[cfg(test)]
 pub(crate) fn parse_sql(sql: &str, params: &[Value]) -> Result<SelectPlan> {
-    parse_sql_with_mode(sql, params, ParseMode::Bound)
+    crate::query::validate_sql_input(sql, params)?;
+    let tokens = crate::query::tokenize(sql)?;
+    crate::query::validate_parameter_expansion(&tokens, params)?;
+    parse_tokens(tokens, params, ParseMode::Bound)
 }
 
-pub(crate) fn parse_sql_with_mode(
-    sql: &str,
+pub(crate) fn parse_tokens(
+    tokens: Vec<Token>,
     params: &[Value],
     mode: ParseMode,
 ) -> Result<SelectPlan> {
-    validate_sql_input(sql, params)?;
-    let tokens = tokenize(sql)?;
-    validate_parameter_expansion(&tokens, params)?;
     SqlParser::new(tokens, params, mode).parse()
 }
 
