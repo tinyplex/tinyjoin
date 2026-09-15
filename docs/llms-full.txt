@@ -25,21 +25,11 @@ separate Worker plugin.
 For a new application, `npm create tinyjoin@latest` generates a working Vite
 starter. Its production build includes [offline loading](https://tinyjoin.org/guides/offline/).
 
-For a complete noninteractive setup, supply every starter option:
-
 ```sh
-npm create tinyjoin@latest -- --non-interactive \
-  --projectName my-tinyjoin-app \
-  --language typescript \
-  --storage opfs \
-  --installAndRun false
-cd my-tinyjoin-app
-npm install
-npm run dev
+npm create tinyjoin@latest
 ```
 
-Use `--language javascript` for JavaScript, or `--storage memory` for data that
-starts fresh on each load. The starter's `--list-options` flag lists its options.
+Follow the prompts to choose JavaScript or TypeScript and how to store your data.
 
 ## Open a database
 
@@ -138,319 +128,184 @@ of reloading. See [storage and lifecycle](https://tinyjoin.org/guides/storage-an
 The [Todo starter demo](https://tinyjoin.org/demos/todo-starter/) puts these calls together in a
 small browser application.
 
-# Storage and lifecycle
+# Caveats
 
-Source: https://tinyjoin.org/guides/storage-and-lifecycle/
+Source: https://tinyjoin.org/guides/caveats/
 
-TinyJoin supports an ephemeral memory database and an opt-in persistent browser
-database. Both use the same Worker and page-native engine.
+TinyJoin is small on purpose, and being small has costs. This page collects
+what an application signs up for, in one place, so that the decision gets made
+before the schema does.
 
-## Memory
+If any of these are unacceptable, there are
+[more mature projects](https://tinyjoin.org/guides/caveats/#if-tinyjoin-is-not-the-right-fit) that solve the same
+problem with different trade-offs.
 
-```ts
-const db = await create();
-// Equivalent to: await create('memory://')
-```
+## It is experimental
 
-Memory starts empty each time the Worker opens. It is useful for tests,
-temporary views, and trying the API.
+TinyJoin is at v0.1.0. The JavaScript API, the SQL dialect, the error codes,
+and the page format can all change between releases, and a release may require
+an application to recreate its persistent database rather than migrate it.
 
-## Persistent browser storage
+Version the OPFS name alongside the schema generation, as in
+`opfs://my-app-v1`, so that a breaking change becomes a new database rather
+than a broken one. The [release notes](https://tinyjoin.org/guides/releases/) record each release's
+compatibility boundary.
 
-```ts
-const db = await create('opfs://my-project-v1');
-```
+## The SQL is a bounded subset
 
-The name must contain 1-64 ASCII letters, numbers, dots, underscores, or
-hyphens, and start with a letter or number. Include the application, dataset,
-and schema generation in it. A name is a namespace, not an encryption or
-access-control boundary.
+TinyJoin implements its own PostgreSQL-shaped dialect. It is not PostgreSQL
+compiled to WebAssembly, and familiar syntax is implemented only where the
+smaller runtime can give it clear and deterministic semantics. Unsupported
+forms are rejected explicitly rather than silently reinterpreted.
 
-OPFS persistence requires a secure browser context, a dedicated Worker, Web
-Locks, and BroadcastChannel. Call create() with the same name in every tab:
-TinyJoin elects one database-owning Worker, routes operations to it, and
-broadcasts committed changes to all connected Clients. Multiple Clients in one
-page work the same way. No additional configuration is needed.
+The omissions most likely to matter are:
 
-Different names can open independently, but their rows and subscriptions are
-separate. Coordination stays within the same origin and browser storage
-partition; it does not connect other browser profiles or devices.
+- No subqueries, CTEs, `UNION`/`INTERSECT`/`EXCEPT`, or `DISTINCT`.
+- No arithmetic, concatenation, casts, or scalar functions. Values are not a
+  general expression language.
+- No `LIKE`/`ILIKE`, `BETWEEN`, `ANY`/`ALL`, or JSON path operators, so
+  substring search and ranged text matching have to happen outside SQL.
+- No `ON CONFLICT` upsert, `INSERT ... SELECT`, `MERGE`, or `UPDATE ... FROM`.
+- No sequences, `SERIAL`, or generated identity. Generate text identifiers in
+  the client.
+- No `NUMERIC`/`DECIMAL`, date, time, interval, `UUID`, `BYTEA`, array, enum,
+  or user-defined types. Five runtime types cover boolean, integer, float,
+  text, and JSON.
+- No `HAVING`, distinct or filtered aggregates, window functions,
+  `RIGHT`/`FULL`/`CROSS` joins, views, or triggers.
 
-The owner retains an exclusive synchronous OPFS access handle. That remains
-the final protection against concurrent mutation, including older TinyJoin
-versions or custom code that does not participate in coordination. Such an
-owner can still cause `STORAGE_LOCKED`; close the older application before
-retrying. Mixed TinyJoin releases fail with `DATABASE_VERSION_MISMATCH`
-instead of sharing an incompatible engine.
+The [SQL compatibility contract](https://tinyjoin.org/guides/sql-compatibility/) is the exact list.
+Read it before designing a schema, not after.
 
-There is no silent fallback to memory if persistent storage is unavailable,
-locked, corrupt, or out of quota.
+## Multiple tabs share one writer
 
-An OPFS name identifies stored data; changing the name opens a different
-database and leaves the old data in place. Check the
-[release compatibility boundary](https://tinyjoin.org/guides/releases/#v0-1-0) before upgrading
-TinyJoin: v0.1.0 cannot open the page format published in v0.0.5. Preserve any
-needed data with the old version before moving to a new namespace.
+Clients using the same OPFS name automatically share one database-owning
+Worker. Election, routing, prepared statement restoration, and cross-tab
+notifications are internal. Different names and browser storage partitions
+remain independent.
 
-The current persistent database is bounded to 65,536 4 KiB pages (256 MiB).
-The [SQL compatibility guide](https://tinyjoin.org/guides/sql-compatibility/#hard-limits) lists the
-independent query and mutation limits.
+This is one serialized engine. An open transaction holds other Clients until
+its callback finishes, and a frozen live owner or transaction holder can delay
+other tabs until it resumes or closes. Keep callbacks short. Closing or losing
+the owner triggers automatic election, but requests already sent to it fail
+with `LEADER_CHANGED` and are never silently replayed. Incompatible releases
+fail with `DATABASE_VERSION_MISMATCH`; old versions that do not coordinate
+can still hold the underlying OPFS lock. See
+[tab handover](https://tinyjoin.org/guides/storage-and-lifecycle/#tab-handover-and-subscriptions).
 
-## Browser retention
+## It needs a modern browser
 
-OPFS is browser-managed storage. A user can clear it and a browser may evict
-best-effort storage under pressure. An application that needs stronger local
-retention can make a user-appropriate `navigator.storage.persist()` request.
-TinyJoin does not make that product decision during startup.
+The browser entry point requires WebAssembly and dedicated module Workers, and persistence
+additionally requires a secure context, OPFS synchronous access handles, Web
+Locks, and BroadcastChannel. It
+deliberately does not use `SharedArrayBuffer`, so a page does not need
+cross-origin isolation headers.
 
-## Application backups and restoration
+The separate [Node entry point](https://tinyjoin.org/guides/node/) supports in-memory databases
+in Node.js 22 or later. It does not provide OPFS or filesystem persistence.
 
-TinyJoin has no general public export, import, list-databases, or
-delete-database API. There is no SQL catalog introspection or portable binary
-backup contract. Keep schemas and migration rules in your application. For
-reconstructible data, fetching it again from its original source may be simpler
-than a backup.
+The automated browser suite currently runs on Chromium only. Firefox and WebKit
+are not verified, and a successful TypeScript or Vite build says nothing about
+them. Test the browsers an application actually targets.
 
-For data that must be retained, export explicit columns from each known table
-to an application-owned format. Include a schema version, preserve primary
-keys, and save the result outside this origin's browser storage, for example
-as a user-downloaded file. A second OPFS name on the same origin is not an
-independent backup. Verify the export by restoring and reading it before
-removing the original.
+There is also no fallback to IndexedDB or memory when persistent storage is
+unavailable, locked, corrupt, or out of quota. create() rejects instead.
 
-Here is a bounded example for the `notes` schema in the
-[getting-started guide](https://tinyjoin.org/guides/getting-started/#create-a-table). It exports at
-most 1,000 small notes and restores into an empty table. Imported values are
-validated before they become SQL parameters; a TypeScript row generic alone
-does not validate a file.
+TinyJoin does not automatically restore a Client closed during page teardown.
+If the browser restores that page from its back/forward cache, the application
+must reopen its Client and recreate statements and subscriptions, or reload
+the page. The [lifecycle guide](https://tinyjoin.org/guides/storage-and-lifecycle/#opening-and-closing)
+describes this boundary.
 
-```ts
-import type {Client} from 'tinyjoin';
+## Browser storage is not durable storage
 
-type SavedNote = {id: string; body: string; pinned: boolean};
+OPFS is browser-managed. A user can clear it, and a browser may evict
+best-effort storage under pressure. A `navigator.storage.persist()` request is
+a request, not a guarantee, and TinyJoin does not make that product decision
+during startup.
 
-async function backupNotes(db: Client): Promise<string> {
-  const {rows} = await db.query<SavedNote>(
-    'SELECT id, body, pinned FROM notes ORDER BY id LIMIT 1001',
-  );
-  if (rows.length > 1000) throw new Error('Export needs a larger-data policy');
-  return JSON.stringify({schemaVersion: 1, notes: rows});
-}
+Treat a TinyJoin database as reconstructable local state. Data that has to
+survive needs a copy the application controls.
 
-async function restoreNotes(db: Client, text: string): Promise<void> {
-  const backup = JSON.parse(text);
-  if (
-    backup?.schemaVersion !== 1 || !Array.isArray(backup.notes) ||
-    backup.notes.length > 1000 ||
-    !backup.notes.every((note: SavedNote) =>
-      note !== null && typeof note === 'object' &&
-      typeof note.id === 'string' && typeof note.body === 'string' &&
-      typeof note.pinned === 'boolean'
-    )
-  ) throw new Error('Invalid notes backup');
+A storage or commit-result failure can leave a write's outcome uncertain.
+`RECOVERY_REQUIRED`, `STORAGE_COMMIT_OUTCOME_UNKNOWN`, and
+`STORAGE_ENGINE_POISONED` require closing and reopening the Client. Reconcile
+the recovered rows with stable operation identifiers before any replay;
+`retryable` does not guarantee that replay is safe. The
+[recovery guide](https://tinyjoin.org/guides/storage-and-lifecycle/#recovering-after-an-uncertain-write)
+explains how to preserve that distinction.
 
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS notes (
-      id TEXT PRIMARY KEY,
-      body TEXT NOT NULL,
-      pinned BOOLEAN NOT NULL DEFAULT false
-    )
-  `);
-  await db.transaction(async (tx) => {
-    if ((await tx.query('SELECT id FROM notes LIMIT 1')).rows.length) {
-      throw new Error('Restore requires an empty notes table');
-    }
-    for (const note of backup.notes) {
-      await tx.query(
-        'INSERT INTO notes (id, body, pinned) VALUES ($1, $2, $3)',
-        [note.id, note.body, note.pinned],
-      );
-    }
-  });
-}
-```
+## Transactions need bounded callbacks
 
-This is an application example, not an arbitrary database importer. Stop
-application writes while exporting; for several tables, read them in one short
-transaction when the full snapshot fits the limits. Large rows, result bytes,
-and staged writes can reach the [engine limits](https://tinyjoin.org/guides/sql-compatibility/#hard-limits)
-before the example's row cap. There is no streaming backup or cross-batch
-snapshot API. Plan bounded batches and a stable maintenance window for larger
-datasets. Restore schema DDL before the data transaction, including your known
-indexes. If restoring fails, preserve the export and follow the uncertain-write
-recovery rules below before retrying.
+Nested callback transactions are unsupported: awaiting another transaction()
+on the same Client inside its callback deadlocks. Pass the active Transaction
+to helpers. There is no AbortSignal or built-in timeout; Promise.race() stops
+waiting without cancelling work, which can still commit. Read the
+[transaction guide](https://tinyjoin.org/guides/transactions-and-changes/#composing-transaction-helpers)
+before composing asynchronous application work.
 
-## Resetting and removing obsolete databases
+## There is no server, and no sync
 
-A logical reset can use `DELETE FROM notes` to empty a known table, or
-`DROP TABLE IF EXISTS notes` followed by the application's schema setup. First
-preserve and verify any data that must survive, stop writes, and await close()
-on **every Client in every tab or Worker** for this name. Closing only the owner
-causes handover to another connected Client. Keep other pages closed, open one
-maintenance Client, perform the deliberate reset, and close it before normal
-startup resumes. A reset is destructive and is never an uncertain-write
-recovery step.
+TinyJoin has no PostgreSQL wire protocol, server process, roles or grants,
+system catalogs, extensions, stored procedures, WAL, replication, or
+point-in-time recovery. It does not synchronize with a remote database and does
+not propagate offline writes. Its storage is TinyJoin's own page format, not a
+PostgreSQL data directory.
 
-Changing `opfs://my-app-v1` to `opfs://my-app-v2` leaves the first namespace on
-disk. Record the names your application creates; TinyJoin does not list or
-selectively delete them through its public API. A logical reset also leaves
-the namespace allocated. Do not depend on private directory names or remove
-individual engine files while a database is open.
+## The limits are hard limits
 
-To remove obsolete names and their physical storage with current public
-facilities, use the browser's **clear site data** control for this origin:
+Oversized work fails explicitly rather than growing until the tab dies. A
+persistent database is bounded to 256 MiB, one query returns at most 100,000
+rows, a join chains at most eight table sources, and SQL text, parameters,
+prepared statements, and working memory each have a named bound. The complete
+list is in [hard limits](https://tinyjoin.org/guides/sql-compatibility/#hard-limits).
 
-1. Export or otherwise preserve all needed data for every database and other
-   application sharing the origin, and verify those backups outside the origin.
-2. Stop application work, await all Client closes, and close every page or
-   Worker that could reopen these databases.
-3. Clear storage for the origin in the browser's site settings. This also
-   removes other origin data and offline application caches; it is not a
-   TinyJoin-only operation.
-4. Reopen the application online, create only its current namespaces, and
-   restore the known schemas and retained data before accepting new writes.
+Multi-tab routing also bounds each Client's pending requests and the owner's
+waiting queue to 256 requests and approximately 8 MiB each, with a small
+reserved allowance for transaction cleanup. Hitting these bounds rejects with
+`RESOURCE_LIMIT`; await work or batch related writes. Prepared engine limits
+are shared across connected Clients; at most 128 Clients can attach to an owner.
 
-If clearing the entire origin is inappropriate, retain the obsolete namespace
-until the application has an independently reviewed storage-management policy.
-Selective deletion and automatic migration remain separate API decisions.
+That boundedness is deliberate, but it does mean TinyJoin is sized for
+application state rather than for analytics over a large dataset.
 
-## Space reuse and quota
+## Performance depends on the workload
 
-`DELETE` and `DROP` free engine pages for internal reuse. The page file normally
-keeps its high-water size: fewer rows do not mean a smaller physical file or
-immediate browser-quota reclamation. TinyJoin has no public `VACUUM` or
-compaction API. Opening a new namespace can temporarily require space for both
-databases and does not reclaim the old one.
+Keep transactions short and request only the data your UI needs. Measure
+populated startup and larger batches with your application's data and target
+devices.
 
-`navigator.storage.estimate()` can help monitor approximate origin-wide usage
-and quota; it is not a per-database size or a reservation. Allow space for
-writes and recovery, handle quota failures, and use the deliberate cleanup
-procedure above when physical storage must be removed.
+The [transaction guide](https://tinyjoin.org/guides/transactions-and-changes/#inserting-many-rows)
+explains batching and validation costs. The
+[workload report](https://github.com/tinyplex/tinyjoin/tree/main/benchmarks)
+records detailed measurements, runtime hashes, and reproduction commands for
+mixed transactions, populated startup, and result materialization. Those
+measurements cover one desktop and Chromium version.
 
-## Opening and closing
+## If TinyJoin is not the right fit
 
-await create() is the simplest lifecycle: it returns only after
-initialization succeeds. The returned Client also exposes `ready`, `waitReady`,
-and `closed` for code that constructs a Client directly.
+These projects are larger, more mature, or both, and are the better answer when
+the caveats above are not acceptable:
 
-These properties describe initialization and explicit cleanup, not connection
-health. `waitReady` resolves once; `ready` can remain `true`, `closed` can remain
-`false`, and prepared handles can remain unsealed after a terminal Worker
-failure. Operations still reject. Do not poll these properties to decide
-whether a failed operation is safe to repeat.
+- [PGlite](https://pglite.dev/) is real PostgreSQL compiled to WebAssembly,
+  with the full dialect and extensions. Choose it when genuine PostgreSQL
+  compatibility matters more than download size.
+- [SQLite Wasm](https://sqlite.org/wasm/) is the official SQLite build for the
+  browser, with an OPFS backend, decades of stability, and a much larger SQL
+  surface.
+- [wa-sqlite](https://github.com/rhashimoto/wa-sqlite) is SQLite for the
+  browser with pluggable storage backends, including ones designed for
+  concurrent tabs.
+- [DuckDB-Wasm](https://github.com/duckdb/duckdb-wasm) is columnar analytics in
+  the browser, for aggregate queries over large datasets.
+- [Dexie](https://dexie.org/) is a typed IndexedDB wrapper, for when relational
+  SQL is not the requirement and broad browser support is.
+- [TinyBase](https://tinybase.org/) is a reactive data store with persistence
+  and synchronization, for when the requirement is local-first sync rather than
+  SQL.
 
-Call close() during application teardown. It seals that Client's prepared
-statements, detaches it, and terminates its Worker. Other Clients retain their
-data and connection. If the departing Worker owned the database, another
-connected Worker automatically opens it. Outstanding cleanup is shared by
-repeated close() calls.
-
-Closing is irreversible. A Client, its prepared statements, and its
-subscriptions cannot resume after close(). If a `pagehide` handler closes the
-database, a page restored from that cache must initialize a new Client and
-recreate its statements and subscriptions before accepting work. The
-[getting-started example](https://tinyjoin.org/guides/getting-started/#close-cleanly) uses a reload
-on `pageshow` when `event.persisted` is true as a simple application policy.
-
-A browser does not await asynchronous `pagehide` cleanup, and teardown events
-are not guaranteed to run. Await writes while the application is active;
-close() during navigation is not a final-save or cancellation guarantee.
-
-### Terminal Worker failures
-
-A Worker crash (`WORKER_ERROR`), unreadable message (`WORKER_MESSAGE_ERROR`), or
-invalid protocol response (`PROTOCOL_MISMATCH`) disposes that connection.
-Pending operations reject with the failure; subsequent database operations and
-prepared executions reject with `WORKER_TERMINATED`. The Client does not
-automatically replace a terminally failed Worker. Its statements' `closed`
-properties report whether they were sealed, not whether the Worker is healthy.
-
-Stop accepting work, retain the original error, and call close(). Cleanup seals
-the prepared handles and completes Client cleanup even if its Promise rejects
-because the Worker is already gone. Open a new Client, recreate statements and
-subscriptions, and inspect stored operation identifiers before replaying writes:
-
-```ts
-// In the application's recovery path, after preserving the original error:
-await db.close().catch((cleanupError) => console.error(cleanupError));
-const reopened = await create('opfs://my-app'); // Use the original name.
-// Reconcile the original operation using reopened before accepting more work.
-```
-
-A crash during a write can lose its acknowledgement after committing. Follow
-[uncertain-write reconciliation](https://tinyjoin.org/guides/storage-and-lifecycle/#recovering-after-an-uncertain-write), even
-when the error is a Worker failure instead of a storage code. Memory data is
-lost with its Worker.
-
-Temporary OPFS owner handover is different: `LEADER_CHANGED` rejects in-flight
-operations, but the same Client reconnects and restores prepared statements for
-subsequent work. Reconcile interrupted writes; an interrupted transaction ends
-with `TRANSACTION_LOST`. The next section describes this recoverable lifecycle.
-
-## Tab handover and subscriptions
-
-The browser's locks elect the next owner when the previous Worker closes or
-dies. New operations wait while that owner opens the database. Prepared
-statements are restored automatically when needed. Notifications fan out to
-every Client, including the one that wrote the data.
-
-Operations already sent to a departing owner reject with `LEADER_CHANGED`.
-Their effects may already have committed; TinyJoin never silently repeats
-them. The Client reconnects for subsequent operations, so inspect the stored
-outcome before retrying a write. A callback transaction interrupted by owner
-loss cannot continue: subsequent transaction operations reject with
-`TRANSACTION_LOST`. Start a new transaction after reconciliation.
-
-After handover, or when a page becomes visible or resumes, subscriptions may
-receive `{revision, tables: [], reset: true}`. Re-query on this notification
-even though the precise changed tables are unknown. Filtered subscriptions
-also receive it. A subscription is an invalidation signal, not a durable log
-of every commit.
-
-Transactions exclude other Clients for the entire callback. Keep callbacks
-short and do not wait on work that needs another Client for the same name.
-If a client disappears with a transaction open, the owner rolls it back. A
-frozen but still live owner or transaction holder can delay other tabs until
-it resumes or closes. TinyJoin does not steal a live storage lock based on a
-timer, since doing so could let two engines write concurrently.
-
-For offline reopening of the application itself, use the
-[offline build integration](https://tinyjoin.org/guides/offline/). OPFS stores the data; a service
-worker caches the application and database runtime files.
-
-## Recovering after an uncertain write
-
-A rejected write does not always prove that nothing committed. The following
-ClientError codes mean the current engine must no longer be used:
-
-| Code | Meaning |
-| --- | --- |
-| `RECOVERY_REQUIRED` | The engine cannot safely continue after a storage publication failure; reopening must establish the stored state. |
-| `STORAGE_COMMIT_OUTCOME_UNKNOWN` | A storage write or a result after a possible commit could not be confirmed. The requested change may have committed. |
-| `STORAGE_ENGINE_POISONED` | A previous uncertain or fatal result already made this engine unusable. |
-
-Stop accepting database work, keep the original error, and close the Client.
-For OPFS, open the **same database name** with a new create() call and inspect
-the recovered rows before deciding whether to repeat the operation. If open
-or inspection fails, keep the application in a recovery state and preserve the
-stored data; changing the name or deleting the database would hide the state
-you need to reconcile. A new memory database starts empty and cannot recover
-the old Client's data.
-
-Give an application operation a stable identifier before its first attempt
-and record that identifier in the same transaction as its effects. After
-reopening, query that record and compare the intended values. A matching
-record means the operation already happened; a missing record may allow a
-deliberate retry with the **same identifier**. An unexpected record needs
-application reconciliation. Generating a fresh identifier on every retry can
-apply an operation twice. TinyJoin has no automatic replay or `ON CONFLICT`
-clause, so this policy belongs to the application.
-
-The `retryable` property only says that a later attempt or reopen may succeed.
-It is not a guarantee that replaying a write is safe, nor that the current
-Client remains usable. A rollback attempted after an uncertain commit cannot
-establish that the commit was absent. See also
-[transaction error handling](https://tinyjoin.org/guides/transactions-and-changes/#errors-and-cancellation).
+None of that is a criticism of those projects. TinyJoin exists because a useful
+subset of the same problem fits in a much smaller download.
 
 # SQL compatibility
 
@@ -948,184 +803,319 @@ check runs before the values are copied into the statement, including prepared
 executions and queries with `LIMIT 0`. It is an independent allocation bound,
 not a limit on the total memory used by the browser or WebAssembly instance.
 
-# Caveats
+# Storage and lifecycle
 
-Source: https://tinyjoin.org/guides/caveats/
+Source: https://tinyjoin.org/guides/storage-and-lifecycle/
 
-TinyJoin is small on purpose, and being small has costs. This page collects
-what an application signs up for, in one place, so that the decision gets made
-before the schema does.
+TinyJoin supports an ephemeral memory database and an opt-in persistent browser
+database. Both use the same Worker and page-native engine.
 
-If any of these are unacceptable, there are
-[more mature projects](https://tinyjoin.org/guides/caveats/#if-tinyjoin-is-not-the-right-fit) that solve the same
-problem with different trade-offs.
+## Memory
 
-## It is experimental
+```ts
+const db = await create();
+// Equivalent to: await create('memory://')
+```
 
-TinyJoin is at v0.1.0. The JavaScript API, the SQL dialect, the error codes,
-and the page format can all change between releases, and a release may require
-an application to recreate its persistent database rather than migrate it.
+Memory starts empty each time the Worker opens. It is useful for tests,
+temporary views, and trying the API.
 
-Version the OPFS name alongside the schema generation, as in
-`opfs://my-app-v1`, so that a breaking change becomes a new database rather
-than a broken one. The [release notes](https://tinyjoin.org/guides/releases/) record each release's
-compatibility boundary.
+## Persistent browser storage
 
-## The SQL is a bounded subset
+```ts
+const db = await create('opfs://my-project-v1');
+```
 
-TinyJoin implements its own PostgreSQL-shaped dialect. It is not PostgreSQL
-compiled to WebAssembly, and familiar syntax is implemented only where the
-smaller runtime can give it clear and deterministic semantics. Unsupported
-forms are rejected explicitly rather than silently reinterpreted.
+The name must contain 1-64 ASCII letters, numbers, dots, underscores, or
+hyphens, and start with a letter or number. Include the application, dataset,
+and schema generation in it. A name is a namespace, not an encryption or
+access-control boundary.
 
-The omissions most likely to matter are:
+OPFS persistence requires a secure browser context, a dedicated Worker, Web
+Locks, and BroadcastChannel. Call create() with the same name in every tab:
+TinyJoin elects one database-owning Worker, routes operations to it, and
+broadcasts committed changes to all connected Clients. Multiple Clients in one
+page work the same way. No additional configuration is needed.
 
-- No subqueries, CTEs, `UNION`/`INTERSECT`/`EXCEPT`, or `DISTINCT`.
-- No arithmetic, concatenation, casts, or scalar functions. Values are not a
-  general expression language.
-- No `LIKE`/`ILIKE`, `BETWEEN`, `ANY`/`ALL`, or JSON path operators, so
-  substring search and ranged text matching have to happen outside SQL.
-- No `ON CONFLICT` upsert, `INSERT ... SELECT`, `MERGE`, or `UPDATE ... FROM`.
-- No sequences, `SERIAL`, or generated identity. Generate text identifiers in
-  the client.
-- No `NUMERIC`/`DECIMAL`, date, time, interval, `UUID`, `BYTEA`, array, enum,
-  or user-defined types. Five runtime types cover boolean, integer, float,
-  text, and JSON.
-- No `HAVING`, distinct or filtered aggregates, window functions,
-  `RIGHT`/`FULL`/`CROSS` joins, views, or triggers.
+Different names can open independently, but their rows and subscriptions are
+separate. Coordination stays within the same origin and browser storage
+partition; it does not connect other browser profiles or devices.
 
-The [SQL compatibility contract](https://tinyjoin.org/guides/sql-compatibility/) is the exact list.
-Read it before designing a schema, not after.
+The owner retains an exclusive synchronous OPFS access handle. That remains
+the final protection against concurrent mutation, including older TinyJoin
+versions or custom code that does not participate in coordination. Such an
+owner can still cause `STORAGE_LOCKED`; close the older application before
+retrying. Mixed TinyJoin releases fail with `DATABASE_VERSION_MISMATCH`
+instead of sharing an incompatible engine.
 
-## Multiple tabs share one writer
+There is no silent fallback to memory if persistent storage is unavailable,
+locked, corrupt, or out of quota.
 
-Clients using the same OPFS name automatically share one database-owning
-Worker. Election, routing, prepared statement restoration, and cross-tab
-notifications are internal. Different names and browser storage partitions
-remain independent.
+An OPFS name identifies stored data; changing the name opens a different
+database and leaves the old data in place. Check the
+[release compatibility boundary](https://tinyjoin.org/guides/releases/#v0-1-0) before upgrading
+TinyJoin: v0.1.0 cannot open the page format published in v0.0.5. Preserve any
+needed data with the old version before moving to a new namespace.
 
-This is one serialized engine. An open transaction holds other Clients until
-its callback finishes, and a frozen live owner or transaction holder can delay
-other tabs until it resumes or closes. Keep callbacks short. Closing or losing
-the owner triggers automatic election, but requests already sent to it fail
-with `LEADER_CHANGED` and are never silently replayed. Incompatible releases
-fail with `DATABASE_VERSION_MISMATCH`; old versions that do not coordinate
-can still hold the underlying OPFS lock. See
-[tab handover](https://tinyjoin.org/guides/storage-and-lifecycle/#tab-handover-and-subscriptions).
+The current persistent database is bounded to 65,536 4 KiB pages (256 MiB).
+The [SQL compatibility guide](https://tinyjoin.org/guides/sql-compatibility/#hard-limits) lists the
+independent query and mutation limits.
 
-## It needs a modern browser
+## Browser retention
 
-The browser entry point requires WebAssembly and dedicated module Workers, and persistence
-additionally requires a secure context, OPFS synchronous access handles, Web
-Locks, and BroadcastChannel. It
-deliberately does not use `SharedArrayBuffer`, so a page does not need
-cross-origin isolation headers.
+OPFS is browser-managed storage. A user can clear it and a browser may evict
+best-effort storage under pressure. An application that needs stronger local
+retention can make a user-appropriate `navigator.storage.persist()` request.
+TinyJoin does not make that product decision during startup.
 
-The separate [Node entry point](https://tinyjoin.org/guides/node/) supports in-memory databases
-in Node.js 22 or later. It does not provide OPFS or filesystem persistence.
+## Application backups and restoration
 
-The automated browser suite currently runs on Chromium only. Firefox and WebKit
-are not verified, and a successful TypeScript or Vite build says nothing about
-them. Test the browsers an application actually targets.
+TinyJoin has no general public export, import, list-databases, or
+delete-database API. There is no SQL catalog introspection or portable binary
+backup contract. Keep schemas and migration rules in your application. For
+reconstructible data, fetching it again from its original source may be simpler
+than a backup.
 
-There is also no fallback to IndexedDB or memory when persistent storage is
-unavailable, locked, corrupt, or out of quota. create() rejects instead.
+For data that must be retained, export explicit columns from each known table
+to an application-owned format. Include a schema version, preserve primary
+keys, and save the result outside this origin's browser storage, for example
+as a user-downloaded file. A second OPFS name on the same origin is not an
+independent backup. Verify the export by restoring and reading it before
+removing the original.
 
-TinyJoin does not automatically restore a Client closed during page teardown.
-If the browser restores that page from its back/forward cache, the application
-must reopen its Client and recreate statements and subscriptions, or reload
-the page. The [lifecycle guide](https://tinyjoin.org/guides/storage-and-lifecycle/#opening-and-closing)
-describes this boundary.
+Here is a bounded example for the `notes` schema in the
+[getting-started guide](https://tinyjoin.org/guides/getting-started/#create-a-table). It exports at
+most 1,000 small notes and restores into an empty table. Imported values are
+validated before they become SQL parameters; a TypeScript row generic alone
+does not validate a file.
 
-## Browser storage is not durable storage
+```ts
+import type {Client} from 'tinyjoin';
 
-OPFS is browser-managed. A user can clear it, and a browser may evict
-best-effort storage under pressure. A `navigator.storage.persist()` request is
-a request, not a guarantee, and TinyJoin does not make that product decision
-during startup.
+type SavedNote = {id: string; body: string; pinned: boolean};
 
-Treat a TinyJoin database as reconstructable local state. Data that has to
-survive needs a copy the application controls.
+async function backupNotes(db: Client): Promise<string> {
+  const {rows} = await db.query<SavedNote>(
+    'SELECT id, body, pinned FROM notes ORDER BY id LIMIT 1001',
+  );
+  if (rows.length > 1000) throw new Error('Export needs a larger-data policy');
+  return JSON.stringify({schemaVersion: 1, notes: rows});
+}
 
-A storage or commit-result failure can leave a write's outcome uncertain.
-`RECOVERY_REQUIRED`, `STORAGE_COMMIT_OUTCOME_UNKNOWN`, and
-`STORAGE_ENGINE_POISONED` require closing and reopening the Client. Reconcile
-the recovered rows with stable operation identifiers before any replay;
-`retryable` does not guarantee that replay is safe. The
-[recovery guide](https://tinyjoin.org/guides/storage-and-lifecycle/#recovering-after-an-uncertain-write)
-explains how to preserve that distinction.
+async function restoreNotes(db: Client, text: string): Promise<void> {
+  const backup = JSON.parse(text);
+  if (
+    backup?.schemaVersion !== 1 || !Array.isArray(backup.notes) ||
+    backup.notes.length > 1000 ||
+    !backup.notes.every((note: SavedNote) =>
+      note !== null && typeof note === 'object' &&
+      typeof note.id === 'string' && typeof note.body === 'string' &&
+      typeof note.pinned === 'boolean'
+    )
+  ) throw new Error('Invalid notes backup');
 
-## Transactions need bounded callbacks
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS notes (
+      id TEXT PRIMARY KEY,
+      body TEXT NOT NULL,
+      pinned BOOLEAN NOT NULL DEFAULT false
+    )
+  `);
+  await db.transaction(async (tx) => {
+    if ((await tx.query('SELECT id FROM notes LIMIT 1')).rows.length) {
+      throw new Error('Restore requires an empty notes table');
+    }
+    for (const note of backup.notes) {
+      await tx.query(
+        'INSERT INTO notes (id, body, pinned) VALUES ($1, $2, $3)',
+        [note.id, note.body, note.pinned],
+      );
+    }
+  });
+}
+```
 
-Nested callback transactions are unsupported: awaiting another transaction()
-on the same Client inside its callback deadlocks. Pass the active Transaction
-to helpers. There is no AbortSignal or built-in timeout; Promise.race() stops
-waiting without cancelling work, which can still commit. Read the
-[transaction guide](https://tinyjoin.org/guides/transactions-and-changes/#composing-transaction-helpers)
-before composing asynchronous application work.
+This is an application example, not an arbitrary database importer. Stop
+application writes while exporting; for several tables, read them in one short
+transaction when the full snapshot fits the limits. Large rows, result bytes,
+and staged writes can reach the [engine limits](https://tinyjoin.org/guides/sql-compatibility/#hard-limits)
+before the example's row cap. There is no streaming backup or cross-batch
+snapshot API. Plan bounded batches and a stable maintenance window for larger
+datasets. Restore schema DDL before the data transaction, including your known
+indexes. If restoring fails, preserve the export and follow the uncertain-write
+recovery rules below before retrying.
 
-## There is no server, and no sync
+## Resetting and removing obsolete databases
 
-TinyJoin has no PostgreSQL wire protocol, server process, roles or grants,
-system catalogs, extensions, stored procedures, WAL, replication, or
-point-in-time recovery. It does not synchronize with a remote database and does
-not propagate offline writes. Its storage is TinyJoin's own page format, not a
-PostgreSQL data directory.
+A logical reset can use `DELETE FROM notes` to empty a known table, or
+`DROP TABLE IF EXISTS notes` followed by the application's schema setup. First
+preserve and verify any data that must survive, stop writes, and await close()
+on **every Client in every tab or Worker** for this name. Closing only the owner
+causes handover to another connected Client. Keep other pages closed, open one
+maintenance Client, perform the deliberate reset, and close it before normal
+startup resumes. A reset is destructive and is never an uncertain-write
+recovery step.
 
-## The limits are hard limits
+Changing `opfs://my-app-v1` to `opfs://my-app-v2` leaves the first namespace on
+disk. Record the names your application creates; TinyJoin does not list or
+selectively delete them through its public API. A logical reset also leaves
+the namespace allocated. Do not depend on private directory names or remove
+individual engine files while a database is open.
 
-Oversized work fails explicitly rather than growing until the tab dies. A
-persistent database is bounded to 256 MiB, one query returns at most 100,000
-rows, a join chains at most eight table sources, and SQL text, parameters,
-prepared statements, and working memory each have a named bound. The complete
-list is in [hard limits](https://tinyjoin.org/guides/sql-compatibility/#hard-limits).
+To remove obsolete names and their physical storage with current public
+facilities, use the browser's **clear site data** control for this origin:
 
-Multi-tab routing also bounds each Client's pending requests and the owner's
-waiting queue to 256 requests and approximately 8 MiB each, with a small
-reserved allowance for transaction cleanup. Hitting these bounds rejects with
-`RESOURCE_LIMIT`; await work or batch related writes. Prepared engine limits
-are shared across connected Clients; at most 128 Clients can attach to an owner.
+1. Export or otherwise preserve all needed data for every database and other
+   application sharing the origin, and verify those backups outside the origin.
+2. Stop application work, await all Client closes, and close every page or
+   Worker that could reopen these databases.
+3. Clear storage for the origin in the browser's site settings. This also
+   removes other origin data and offline application caches; it is not a
+   TinyJoin-only operation.
+4. Reopen the application online, create only its current namespaces, and
+   restore the known schemas and retained data before accepting new writes.
 
-That boundedness is deliberate, but it does mean TinyJoin is sized for
-application state rather than for analytics over a large dataset.
+If clearing the entire origin is inappropriate, retain the obsolete namespace
+until the application has an independently reviewed storage-management policy.
+Selective deletion and automatic migration remain separate API decisions.
 
-## Performance depends on the workload
+## Space reuse and quota
 
-Keep transactions short and request only the data your UI needs. Measure
-populated startup and larger batches with your application's data and target
-devices.
+`DELETE` and `DROP` free engine pages for internal reuse. The page file normally
+keeps its high-water size: fewer rows do not mean a smaller physical file or
+immediate browser-quota reclamation. TinyJoin has no public `VACUUM` or
+compaction API. Opening a new namespace can temporarily require space for both
+databases and does not reclaim the old one.
 
-The [transaction guide](https://tinyjoin.org/guides/transactions-and-changes/#inserting-many-rows)
-explains batching and validation costs. The
-[workload report](https://github.com/tinyplex/tinyjoin/tree/main/benchmarks)
-records detailed measurements, runtime hashes, and reproduction commands for
-mixed transactions, populated startup, and result materialization. Those
-measurements cover one desktop and Chromium version.
+`navigator.storage.estimate()` can help monitor approximate origin-wide usage
+and quota; it is not a per-database size or a reservation. Allow space for
+writes and recovery, handle quota failures, and use the deliberate cleanup
+procedure above when physical storage must be removed.
 
-## If TinyJoin is not the right fit
+## Opening and closing
 
-These projects are larger, more mature, or both, and are the better answer when
-the caveats above are not acceptable:
+await create() is the simplest lifecycle: it returns only after
+initialization succeeds. The returned Client also exposes `ready`, `waitReady`,
+and `closed` for code that constructs a Client directly.
 
-- [PGlite](https://pglite.dev/) is real PostgreSQL compiled to WebAssembly,
-  with the full dialect and extensions. Choose it when genuine PostgreSQL
-  compatibility matters more than download size.
-- [SQLite Wasm](https://sqlite.org/wasm/) is the official SQLite build for the
-  browser, with an OPFS backend, decades of stability, and a much larger SQL
-  surface.
-- [wa-sqlite](https://github.com/rhashimoto/wa-sqlite) is SQLite for the
-  browser with pluggable storage backends, including ones designed for
-  concurrent tabs.
-- [DuckDB-Wasm](https://github.com/duckdb/duckdb-wasm) is columnar analytics in
-  the browser, for aggregate queries over large datasets.
-- [Dexie](https://dexie.org/) is a typed IndexedDB wrapper, for when relational
-  SQL is not the requirement and broad browser support is.
-- [TinyBase](https://tinybase.org/) is a reactive data store with persistence
-  and synchronization, for when the requirement is local-first sync rather than
-  SQL.
+These properties describe initialization and explicit cleanup, not connection
+health. `waitReady` resolves once; `ready` can remain `true`, `closed` can remain
+`false`, and prepared handles can remain unsealed after a terminal Worker
+failure. Operations still reject. Do not poll these properties to decide
+whether a failed operation is safe to repeat.
 
-None of that is a criticism of those projects. TinyJoin exists because a useful
-subset of the same problem fits in a much smaller download.
+Call close() during application teardown. It seals that Client's prepared
+statements, detaches it, and terminates its Worker. Other Clients retain their
+data and connection. If the departing Worker owned the database, another
+connected Worker automatically opens it. Outstanding cleanup is shared by
+repeated close() calls.
+
+Closing is irreversible. A Client, its prepared statements, and its
+subscriptions cannot resume after close(). If a `pagehide` handler closes the
+database, a page restored from that cache must initialize a new Client and
+recreate its statements and subscriptions before accepting work. The
+[getting-started example](https://tinyjoin.org/guides/getting-started/#close-cleanly) uses a reload
+on `pageshow` when `event.persisted` is true as a simple application policy.
+
+A browser does not await asynchronous `pagehide` cleanup, and teardown events
+are not guaranteed to run. Await writes while the application is active;
+close() during navigation is not a final-save or cancellation guarantee.
+
+### Terminal Worker failures
+
+A Worker crash (`WORKER_ERROR`), unreadable message (`WORKER_MESSAGE_ERROR`), or
+invalid protocol response (`PROTOCOL_MISMATCH`) disposes that connection.
+Pending operations reject with the failure; subsequent database operations and
+prepared executions reject with `WORKER_TERMINATED`. The Client does not
+automatically replace a terminally failed Worker. Its statements' `closed`
+properties report whether they were sealed, not whether the Worker is healthy.
+
+Stop accepting work, retain the original error, and call close(). Cleanup seals
+the prepared handles and completes Client cleanup even if its Promise rejects
+because the Worker is already gone. Open a new Client, recreate statements and
+subscriptions, and inspect stored operation identifiers before replaying writes:
+
+```ts
+// In the application's recovery path, after preserving the original error:
+await db.close().catch((cleanupError) => console.error(cleanupError));
+const reopened = await create('opfs://my-app'); // Use the original name.
+// Reconcile the original operation using reopened before accepting more work.
+```
+
+A crash during a write can lose its acknowledgement after committing. Follow
+[uncertain-write reconciliation](https://tinyjoin.org/guides/storage-and-lifecycle/#recovering-after-an-uncertain-write), even
+when the error is a Worker failure instead of a storage code. Memory data is
+lost with its Worker.
+
+Temporary OPFS owner handover is different: `LEADER_CHANGED` rejects in-flight
+operations, but the same Client reconnects and restores prepared statements for
+subsequent work. Reconcile interrupted writes; an interrupted transaction ends
+with `TRANSACTION_LOST`. The next section describes this recoverable lifecycle.
+
+## Tab handover and subscriptions
+
+The browser's locks elect the next owner when the previous Worker closes or
+dies. New operations wait while that owner opens the database. Prepared
+statements are restored automatically when needed. Notifications fan out to
+every Client, including the one that wrote the data.
+
+Operations already sent to a departing owner reject with `LEADER_CHANGED`.
+Their effects may already have committed; TinyJoin never silently repeats
+them. The Client reconnects for subsequent operations, so inspect the stored
+outcome before retrying a write. A callback transaction interrupted by owner
+loss cannot continue: subsequent transaction operations reject with
+`TRANSACTION_LOST`. Start a new transaction after reconciliation.
+
+After handover, or when a page becomes visible or resumes, subscriptions may
+receive `{revision, tables: [], reset: true}`. Re-query on this notification
+even though the precise changed tables are unknown. Filtered subscriptions
+also receive it. A subscription is an invalidation signal, not a durable log
+of every commit.
+
+Transactions exclude other Clients for the entire callback. Keep callbacks
+short and do not wait on work that needs another Client for the same name.
+If a client disappears with a transaction open, the owner rolls it back. A
+frozen but still live owner or transaction holder can delay other tabs until
+it resumes or closes. TinyJoin does not steal a live storage lock based on a
+timer, since doing so could let two engines write concurrently.
+
+For offline reopening of the application itself, use the
+[offline build integration](https://tinyjoin.org/guides/offline/). OPFS stores the data; a service
+worker caches the application and database runtime files.
+
+## Recovering after an uncertain write
+
+A rejected write does not always prove that nothing committed. The following
+ClientError codes mean the current engine must no longer be used:
+
+| Code | Meaning |
+| --- | --- |
+| `RECOVERY_REQUIRED` | The engine cannot safely continue after a storage publication failure; reopening must establish the stored state. |
+| `STORAGE_COMMIT_OUTCOME_UNKNOWN` | A storage write or a result after a possible commit could not be confirmed. The requested change may have committed. |
+| `STORAGE_ENGINE_POISONED` | A previous uncertain or fatal result already made this engine unusable. |
+
+Stop accepting database work, keep the original error, and close the Client.
+For OPFS, open the **same database name** with a new create() call and inspect
+the recovered rows before deciding whether to repeat the operation. If open
+or inspection fails, keep the application in a recovery state and preserve the
+stored data; changing the name or deleting the database would hide the state
+you need to reconcile. A new memory database starts empty and cannot recover
+the old Client's data.
+
+Give an application operation a stable identifier before its first attempt
+and record that identifier in the same transaction as its effects. After
+reopening, query that record and compare the intended values. A matching
+record means the operation already happened; a missing record may allow a
+deliberate retry with the **same identifier**. An unexpected record needs
+application reconciliation. Generating a fresh identifier on every retry can
+apply an operation twice. TinyJoin has no automatic replay or `ON CONFLICT`
+clause, so this policy belongs to the application.
+
+The `retryable` property only says that a later attempt or reopen may succeed.
+It is not a guarantee that replaying a write is safe, nor that the current
+Client remains usable. A rollback attempted after an uncertain commit cannot
+establish that the commit was absent. See also
+[transaction error handling](https://tinyjoin.org/guides/transactions-and-changes/#errors-and-cancellation).
 
 # Transactions and changes
 
@@ -1447,6 +1437,164 @@ or remote synchronization. The Node entry point does not accept the browser
 create() options or custom Worker configuration. Use the browser entry point
 for [persistent browser storage](https://tinyjoin.org/guides/storage-and-lifecycle/).
 
+# Offline
+
+Source: https://tinyjoin.org/guides/offline/
+
+OPFS persists database rows. Reopening the application without a network also
+requires its HTML, JavaScript, CSS, Worker, and WASM files to be available.
+TinyJoin's optional Vite plugin caches the complete production build, including
+lazy assets that the first visit has not used yet.
+
+## Vite setup
+
+Add tinyjoinOffline to the application's Vite configuration:
+
+```ts
+import {defineConfig} from 'vite';
+import {tinyjoinOffline} from 'tinyjoin/vite';
+
+export default defineConfig({
+  plugins: [tinyjoinOffline()],
+});
+```
+
+The [starter](https://tinyjoin.org/guides/getting-started/#install) includes this plugin.
+No extra Worker entry, asset-copying command, or registration code is needed.
+The plugin is a Node-only build integration; importing tinyjoin in application
+code does not include it in the browser runtime.
+
+Run the production build and serve the complete output over HTTPS, or localhost
+while testing. The Vite development server does not register an offline service
+worker. To exercise offline behavior locally, use `vite build` followed by
+`vite preview`.
+
+Production hosts must preserve the emitted asset paths, JavaScript/WASM MIME
+types, and security headers, including on Worker responses. The
+[hosting and CSP checklist](https://tinyjoin.org/guides/custom-workers/#production-hosting) includes
+a restrictive policy tested with offline OPFS startup and reopen. The default
+and custom Worker paths are verified with Vite in Chromium; other bundlers are
+not currently verified.
+
+The first visit needs a network connection. The service worker downloads and
+verifies every build file before installation succeeds. After
+`navigator.serviceWorker.ready` resolves, a subsequent navigation can use that
+installed application offline. The first page is not forcibly taken over while
+it is running.
+
+## What gets cached
+
+The plugin produces these files:
+
+| File | Purpose |
+| --- | --- |
+| `tinyjoin-sw.js` | Application service worker. |
+| `tinyjoin-register.js` | External registration script inserted into built HTML. |
+| `tinyjoin-precache.json` | Build version, base, and relative asset URLs with SHA-256 content revisions. |
+| `tinyjoin-precache.js` | Service-worker helper containing the same manifest. |
+
+Every regular file in the final Vite output is included, including public files,
+unused dynamic chunks, and TinyJoin's private lazy OPFS runtime. The service
+worker and its manifest/helper are maintained by the browser's service-worker
+installation mechanism rather than included recursively in their own cache.
+
+API requests, cross-origin URLs, and files created after the build are outside
+this cache. Bundle necessary application resources or provide your own caching
+policy for them. Cache Storage and OPFS have separate contents; installing or
+updating the application cache does not migrate or delete database rows.
+Browsers can still clear or evict either kind of storage. See
+[storage retention](https://tinyjoin.org/guides/storage-and-lifecycle/#browser-retention).
+
+The plugin supports Vite bases such as `/`, `/my-app/`, and `./`. Its service
+worker only controls the application's base directory. A CDN URL as the Vite
+base is not supported because this integration requires same-origin files.
+
+Navigation uses a cached emitted HTML file when one matches. Otherwise it falls
+back to `index.html` for client-side routes within the application scope. Change
+that file with `tinyjoinOffline({navigationFallback: 'app.html'})`, or disable
+the fallback with `tinyjoinOffline({navigationFallback: false})`.
+
+## Safe application updates
+
+A new build gets a separate cache. Its files must all match their recorded
+content hashes before it can install. An interrupted or mixed deployment leaves
+the previously installed application available.
+
+The new service worker waits until every tab controlled by the old one closes.
+Running tabs keep the old application and its old assets, including lazy files
+they have not fetched before. Once the replacement activates, it removes this
+application's previous TinyJoin caches. Close all application tabs and reopen to
+finish an update; reloading only one tab while another remains open can continue
+using the old build.
+
+Do not add automatic `skipWaiting()` or `clients.claim()` calls to force updates.
+They can make a running application use assets from a different build. Deploy
+the complete build together and retain normal static-file MIME types. If a
+cached entry is later missing, the helper tries to restore the exact recorded
+content from the network. If that content is unavailable or has changed, the
+request fails with HTTP 503 rather than mixing in a newer deployment. Close the
+application's tabs and reopen online to finish installing a newer release or
+repair an incomplete cache from the matching deployment.
+
+Application updates and database schema changes are separate decisions. Keep
+schema setup idempotent and observe the
+[storage compatibility boundary](https://tinyjoin.org/guides/releases/#v0-1-0).
+
+## Integrating an existing service worker
+
+An application should have one owner for its service-worker lifecycle. Automatic
+TinyJoin registration detects another worker already controlling the application
+and leaves it alone, with a console message explaining the conflict.
+
+Use manifest mode when an application already owns its service worker:
+
+```ts
+export default defineConfig({
+  plugins: [tinyjoinOffline({mode: 'manifest'})],
+});
+```
+
+This emits only `tinyjoin-precache.json` and `tinyjoin-precache.js`. It does not
+insert registration code or create `tinyjoin-sw.js`. A classic service worker
+beside the build output can use the generated helper:
+
+```js
+importScripts('./tinyjoin-precache.js');
+
+const precache = self.createTinyjoinPrecache();
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(precache.install());
+});
+self.addEventListener('activate', (event) => {
+  event.waitUntil(precache.activate());
+});
+self.addEventListener('fetch', (event) => {
+  const response = precache.match(event.request);
+  if (response) {
+    event.respondWith(response);
+  }
+  // Otherwise leave this request to the application's existing fetch policy.
+});
+```
+
+Combine this branch with the existing fetch handler so that each request calls
+`respondWith` at most once. Keep the native waiting lifecycle described above;
+calling activate early would remove assets still needed by old tabs. Register
+the existing worker with `updateViaCache: 'none'` so its imported manifest is
+checked for changes. For a relative Vite base and a service worker registered
+outside the application directory, pass that directory explicitly:
+`self.createTinyjoinPrecache(new URL('./my-app/', self.location.origin))`.
+
+An existing precaching system can instead consume the JSON manifest. Resolve
+its asset URLs against the application's build base and preserve content
+verification and coherent version activation in that integration.
+
+Consume the **complete** asset list, including the private lazy OPFS runtime,
+Worker, and WASM files even when the first visit only opens a memory database.
+Caching the entry script or the files observed during one online visit is not
+sufficient for a later persistent open without a network.
+
 # Agents guide
 
 Source: https://tinyjoin.org/guides/agents-guide/
@@ -1624,164 +1772,6 @@ The real package/browser gates matter for changes around Worker URLs, private
 runtime files, WebAssembly, or OPFS. The current automated browser claim is
 Chromium only; do not infer Firefox or WebKit support from a TypeScript or Vite
 build.
-
-# Offline
-
-Source: https://tinyjoin.org/guides/offline/
-
-OPFS persists database rows. Reopening the application without a network also
-requires its HTML, JavaScript, CSS, Worker, and WASM files to be available.
-TinyJoin's optional Vite plugin caches the complete production build, including
-lazy assets that the first visit has not used yet.
-
-## Vite setup
-
-Add tinyjoinOffline to the application's Vite configuration:
-
-```ts
-import {defineConfig} from 'vite';
-import {tinyjoinOffline} from 'tinyjoin/vite';
-
-export default defineConfig({
-  plugins: [tinyjoinOffline()],
-});
-```
-
-The [starter](https://tinyjoin.org/guides/getting-started/#install) includes this plugin.
-No extra Worker entry, asset-copying command, or registration code is needed.
-The plugin is a Node-only build integration; importing tinyjoin in application
-code does not include it in the browser runtime.
-
-Run the production build and serve the complete output over HTTPS, or localhost
-while testing. The Vite development server does not register an offline service
-worker. To exercise offline behavior locally, use `vite build` followed by
-`vite preview`.
-
-Production hosts must preserve the emitted asset paths, JavaScript/WASM MIME
-types, and security headers, including on Worker responses. The
-[hosting and CSP checklist](https://tinyjoin.org/guides/custom-workers/#production-hosting) includes
-a restrictive policy tested with offline OPFS startup and reopen. The default
-and custom Worker paths are verified with Vite in Chromium; other bundlers are
-not currently verified.
-
-The first visit needs a network connection. The service worker downloads and
-verifies every build file before installation succeeds. After
-`navigator.serviceWorker.ready` resolves, a subsequent navigation can use that
-installed application offline. The first page is not forcibly taken over while
-it is running.
-
-## What gets cached
-
-The plugin produces these files:
-
-| File | Purpose |
-| --- | --- |
-| `tinyjoin-sw.js` | Application service worker. |
-| `tinyjoin-register.js` | External registration script inserted into built HTML. |
-| `tinyjoin-precache.json` | Build version, base, and relative asset URLs with SHA-256 content revisions. |
-| `tinyjoin-precache.js` | Service-worker helper containing the same manifest. |
-
-Every regular file in the final Vite output is included, including public files,
-unused dynamic chunks, and TinyJoin's private lazy OPFS runtime. The service
-worker and its manifest/helper are maintained by the browser's service-worker
-installation mechanism rather than included recursively in their own cache.
-
-API requests, cross-origin URLs, and files created after the build are outside
-this cache. Bundle necessary application resources or provide your own caching
-policy for them. Cache Storage and OPFS have separate contents; installing or
-updating the application cache does not migrate or delete database rows.
-Browsers can still clear or evict either kind of storage. See
-[storage retention](https://tinyjoin.org/guides/storage-and-lifecycle/#browser-retention).
-
-The plugin supports Vite bases such as `/`, `/my-app/`, and `./`. Its service
-worker only controls the application's base directory. A CDN URL as the Vite
-base is not supported because this integration requires same-origin files.
-
-Navigation uses a cached emitted HTML file when one matches. Otherwise it falls
-back to `index.html` for client-side routes within the application scope. Change
-that file with `tinyjoinOffline({navigationFallback: 'app.html'})`, or disable
-the fallback with `tinyjoinOffline({navigationFallback: false})`.
-
-## Safe application updates
-
-A new build gets a separate cache. Its files must all match their recorded
-content hashes before it can install. An interrupted or mixed deployment leaves
-the previously installed application available.
-
-The new service worker waits until every tab controlled by the old one closes.
-Running tabs keep the old application and its old assets, including lazy files
-they have not fetched before. Once the replacement activates, it removes this
-application's previous TinyJoin caches. Close all application tabs and reopen to
-finish an update; reloading only one tab while another remains open can continue
-using the old build.
-
-Do not add automatic `skipWaiting()` or `clients.claim()` calls to force updates.
-They can make a running application use assets from a different build. Deploy
-the complete build together and retain normal static-file MIME types. If a
-cached entry is later missing, the helper tries to restore the exact recorded
-content from the network. If that content is unavailable or has changed, the
-request fails with HTTP 503 rather than mixing in a newer deployment. Close the
-application's tabs and reopen online to finish installing a newer release or
-repair an incomplete cache from the matching deployment.
-
-Application updates and database schema changes are separate decisions. Keep
-schema setup idempotent and observe the
-[storage compatibility boundary](https://tinyjoin.org/guides/releases/#v0-1-0).
-
-## Integrating an existing service worker
-
-An application should have one owner for its service-worker lifecycle. Automatic
-TinyJoin registration detects another worker already controlling the application
-and leaves it alone, with a console message explaining the conflict.
-
-Use manifest mode when an application already owns its service worker:
-
-```ts
-export default defineConfig({
-  plugins: [tinyjoinOffline({mode: 'manifest'})],
-});
-```
-
-This emits only `tinyjoin-precache.json` and `tinyjoin-precache.js`. It does not
-insert registration code or create `tinyjoin-sw.js`. A classic service worker
-beside the build output can use the generated helper:
-
-```js
-importScripts('./tinyjoin-precache.js');
-
-const precache = self.createTinyjoinPrecache();
-
-self.addEventListener('install', (event) => {
-  event.waitUntil(precache.install());
-});
-self.addEventListener('activate', (event) => {
-  event.waitUntil(precache.activate());
-});
-self.addEventListener('fetch', (event) => {
-  const response = precache.match(event.request);
-  if (response) {
-    event.respondWith(response);
-  }
-  // Otherwise leave this request to the application's existing fetch policy.
-});
-```
-
-Combine this branch with the existing fetch handler so that each request calls
-`respondWith` at most once. Keep the native waiting lifecycle described above;
-calling activate early would remove assets still needed by old tabs. Register
-the existing worker with `updateViaCache: 'none'` so its imported manifest is
-checked for changes. For a relative Vite base and a service worker registered
-outside the application directory, pass that directory explicitly:
-`self.createTinyjoinPrecache(new URL('./my-app/', self.location.origin))`.
-
-An existing precaching system can instead consume the JSON manifest. Resolve
-its asset URLs against the application's build base and preserve content
-verification and coherent version activation in that integration.
-
-Consume the **complete** asset list, including the private lazy OPFS runtime,
-Worker, and WASM files even when the first visit only opens a memory database.
-Caching the entry script or the files observed during one online visit is not
-sufficient for a later persistent open without a network.
 
 # Releases
 
@@ -2129,6 +2119,8 @@ export interface WorkerLike {
 
   /**
    * This addEventListener overload listens for Worker messages.
+   * @param type The `message` event type.
+   * @param listener The callback receiving messages from the Worker.
    * @category Worker
    * @since v0.0.5
    */
@@ -2139,6 +2131,8 @@ export interface WorkerLike {
 
   /**
    * This addEventListener overload listens for message decoding failures.
+   * @param type The `messageerror` event type.
+   * @param listener The callback receiving message decoding failures.
    * @category Worker
    * @since v0.0.5
    */
@@ -2149,6 +2143,8 @@ export interface WorkerLike {
 
   /**
    * This addEventListener overload listens for Worker runtime failures.
+   * @param type The `error` event type.
+   * @param listener The callback receiving Worker runtime failures.
    * @category Worker
    * @since v0.0.5
    */
@@ -2159,6 +2155,8 @@ export interface WorkerLike {
 
   /**
    * This removeEventListener overload removes a message listener.
+   * @param type The `message` event type.
+   * @param listener The same callback passed to addEventListener.
    * @category Worker
    * @since v0.0.5
    */
@@ -2169,6 +2167,8 @@ export interface WorkerLike {
 
   /**
    * This removeEventListener overload removes a message-error listener.
+   * @param type The `messageerror` event type.
+   * @param listener The same callback passed to addEventListener.
    * @category Worker
    * @since v0.0.5
    */
@@ -2179,6 +2179,8 @@ export interface WorkerLike {
 
   /**
    * This removeEventListener overload removes a Worker error listener.
+   * @param type The `error` event type.
+   * @param listener The same callback passed to addEventListener.
    * @category Worker
    * @since v0.0.5
    */
@@ -2558,14 +2560,14 @@ export class Client {
 /**
  * The create function opens a TinyJoin database in a dedicated Worker.
  *
- * Calling it with no argument creates an ephemeral memory database. Pass a
- * stable `opfs://name` to persist the database in browser storage.
+ * This overload creates an ephemeral in-memory database using the packaged
+ * Worker. Its data is lost when the Client closes or the page reloads.
  * @returns A Promise resolving to a Client whose Worker and database are ready.
  * @example
  * ```ts
  * import {create} from 'tinyjoin';
  *
- * const db = await create('opfs://my-app');
+ * const db = await create();
  * await db.exec(`
  *   CREATE TABLE IF NOT EXISTS tasks (
  *     id INTEGER PRIMARY KEY,
@@ -2580,7 +2582,48 @@ export class Client {
  * @since v0.0.5
  */
 export function create(): Promise<Client>;
+
+/**
+ * This create overload opens a database with ClientOptions.
+ *
+ * Use the options object to select storage or provide a custom Worker.
+ * Omitting its dataDir property selects an ephemeral in-memory database.
+ * @param options Storage and Worker configuration.
+ * @returns A Promise resolving to a Client whose Worker and database are ready.
+ * @example
+ * ```ts
+ * import {create} from 'tinyjoin';
+ *
+ * const db = await create({dataDir: 'memory://'});
+ * await db.close();
+ * ```
+ * @category Lifecycle
+ * @essential Using a database
+ * @since v0.0.5
+ */
 export function create(options: ClientOptions): Promise<Client>;
+
+/**
+ * This create overload opens a database at the supplied storage URL.
+ *
+ * Use a stable `opfs://name` to persist data in the same browser, or
+ * `memory://` for an ephemeral database. When providing the second argument,
+ * supply a storage URL and leave options.dataDir unset.
+ * @param dataDir The `memory://` URL, a named `opfs://` URL, or `undefined` for
+ * the default in-memory database.
+ * @param options Optional Worker configuration.
+ * @returns A Promise resolving to a Client whose Worker and database are ready.
+ * @example
+ * ```ts
+ * import {create} from 'tinyjoin';
+ *
+ * const db = await create('opfs://my-app');
+ * await db.close();
+ * ```
+ * @category Lifecycle
+ * @essential Using a database
+ * @since v0.0.5
+ */
 export function create(
   dataDir: DataDir | undefined,
   options?: ClientOptions,
