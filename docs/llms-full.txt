@@ -2337,6 +2337,7 @@ export interface PreparedStatement<RowType = Row> {
 export interface Transaction {
   /**
    * The query method runs one parameterized statement against staged data.
+   * @returns A Promise resolving to the statement results.
    * @category Transactions
    * @since v0.0.5
    */
@@ -2348,6 +2349,7 @@ export interface Transaction {
 
   /**
    * The sql method is a parameterizing tagged-template form of query.
+   * @returns A Promise resolving to the statement results.
    * @category Transactions
    * @since v0.0.5
    */
@@ -2358,6 +2360,7 @@ export interface Transaction {
 
   /**
    * The exec method runs a parameter-free DML and read script as one savepoint.
+   * @returns A Promise resolving to one result per statement, in script order.
    * @category Transactions
    * @since v0.0.5
    */
@@ -2365,6 +2368,7 @@ export interface Transaction {
 
   /**
    * The execute method runs a prepared statement owned by the same Client.
+   * @returns A Promise resolving to the statement results.
    * @category Transactions
    * @since v0.0.5
    */
@@ -2460,6 +2464,7 @@ export class Client {
    *
    * Interpolated values become `$n` parameters. It does not interpolate raw
    * identifiers or SQL fragments.
+   * @returns A Promise resolving to the statement results.
    * @category SQL
    * @essential Using a database
    * @since v0.0.5
@@ -2472,6 +2477,7 @@ export class Client {
   /**
    * The prepare method parses and retains one reusable read or row-mutation
    * statement in the Worker.
+   * @returns A Promise resolving to a reusable PreparedStatement handle.
    * @category SQL
    * @since v0.0.5
    */
@@ -2480,6 +2486,7 @@ export class Client {
   /**
    * The exec method runs one or more parameter-free statements as one implicit
    * transaction.
+   * @returns A Promise resolving to one result per statement, in script order.
    * @category SQL
    * @essential Using a database
    * @since v0.0.5
@@ -2503,6 +2510,8 @@ export class Client {
    * leave its outcome uncertain; see the
    * [recovery guide](https://tinyjoin.org/guides/storage-and-lifecycle/#recovering-after-an-uncertain-write)
    * before replaying a failed write.
+   * @returns A Promise resolving to the callback's result after the transaction
+   * commits or explicitly rolls back.
    * @category Transactions
    * @essential Using a database
    * @since v0.0.5
@@ -2516,6 +2525,7 @@ export class Client {
    * unsubscribe function. OPFS Clients receive changes from every connected
    * tab. After handover or page restoration, reset events notify every
    * subscriber to re-query even though tables is empty.
+   * @returns A function that removes this subscription when called.
    * @category Subscriptions
    * @since v0.0.5
    */
@@ -2527,6 +2537,7 @@ export class Client {
   /**
    * The getRevision method returns the newest database revision observed by
    * this Client.
+   * @returns The newest database revision observed by this Client.
    * @category Subscriptions
    * @since v0.0.5
    */
@@ -2551,6 +2562,7 @@ export class Client {
  *
  * Calling it with no argument creates an ephemeral memory database. Pass a
  * stable `opfs://name` to persist the database in browser storage.
+ * @returns A Promise resolving to a Client whose Worker and database are ready.
  * @example
  * ```ts
  * import {create} from 'tinyjoin';
@@ -2645,7 +2657,16 @@ Source: https://tinyjoin.org/api/node/
 
 import type {Client} from '../index.js';
 
+/**
+ * The node module re-exports the shared ClientError class.
+ * @category Shared API
+ */
 export {ClientError} from '../index.js';
+
+/**
+ * The node module re-exports the shared Client API types.
+ * @category Shared API
+ */
 export type {
   Client,
   JsonPrimitive,
@@ -2780,6 +2801,8 @@ export interface TinyjoinOfflineOptions {
  * plugin does not force a new worker onto running tabs. Serve the whole build
  * together at one same-origin root-relative or relative Vite base. External
  * requests and files created after the build are not cached.
+ * @param options Optional offline-caching settings.
+ * @returns A Vite plugin that configures production offline caching.
  * @example
  * ```ts
  * import {defineConfig} from 'vite';

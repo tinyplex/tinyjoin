@@ -2,7 +2,10 @@
 
 import type {Client} from '../index.js';
 
+/// node.ClientError
 export {ClientError} from '../index.js';
+
+/// node.sharedTypes
 export type {
   Client,
   JsonPrimitive,

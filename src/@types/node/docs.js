@@ -16,6 +16,18 @@
 /// node
 
 /**
+ * The node module re-exports the shared ClientError class.
+ * @category Shared API
+ */
+/// node.ClientError
+
+/**
+ * The node module re-exports the shared Client API types.
+ * @category Shared API
+ */
+/// node.sharedTypes
+
+/**
  * The create function opens a fresh in-memory database in a dedicated Node
  * Worker thread. It resolves when the database is ready.
  *

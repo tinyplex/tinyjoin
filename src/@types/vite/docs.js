@@ -49,6 +49,8 @@
  * plugin does not force a new worker onto running tabs. Serve the whole build
  * together at one same-origin root-relative or relative Vite base. External
  * requests and files created after the build are not cached.
+ * @param options Optional offline-caching settings.
+ * @returns A Vite plugin that configures production offline caching.
  * @example
  * ```ts
  * import {defineConfig} from 'vite';

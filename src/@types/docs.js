@@ -406,6 +406,7 @@
 {
   /**
    * The query method runs one parameterized statement against staged data.
+   * @returns A Promise resolving to the statement results.
    * @category Transactions
    * @since v0.0.5
    */
@@ -413,6 +414,7 @@
 
   /**
    * The sql method is a parameterizing tagged-template form of query.
+   * @returns A Promise resolving to the statement results.
    * @category Transactions
    * @since v0.0.5
    */
@@ -420,6 +422,7 @@
 
   /**
    * The exec method runs a parameter-free DML and read script as one savepoint.
+   * @returns A Promise resolving to one result per statement, in script order.
    * @category Transactions
    * @since v0.0.5
    */
@@ -427,6 +430,7 @@
 
   /**
    * The execute method runs a prepared statement owned by the same Client.
+   * @returns A Promise resolving to the statement results.
    * @category Transactions
    * @since v0.0.5
    */
@@ -515,6 +519,7 @@
    *
    * Interpolated values become `$n` parameters. It does not interpolate raw
    * identifiers or SQL fragments.
+   * @returns A Promise resolving to the statement results.
    * @category SQL
    * @essential Using a database
    * @since v0.0.5
@@ -524,6 +529,7 @@
   /**
    * The prepare method parses and retains one reusable read or row-mutation
    * statement in the Worker.
+   * @returns A Promise resolving to a reusable PreparedStatement handle.
    * @category SQL
    * @since v0.0.5
    */
@@ -532,6 +538,7 @@
   /**
    * The exec method runs one or more parameter-free statements as one implicit
    * transaction.
+   * @returns A Promise resolving to one result per statement, in script order.
    * @category SQL
    * @essential Using a database
    * @since v0.0.5
@@ -555,6 +562,8 @@
    * leave its outcome uncertain; see the
    * [recovery guide](/guides/storage-and-lifecycle/#recovering-after-an-uncertain-write)
    * before replaying a failed write.
+   * @returns A Promise resolving to the callback's result after the transaction
+   * commits or explicitly rolls back.
    * @category Transactions
    * @essential Using a database
    * @since v0.0.5
@@ -566,6 +575,7 @@
    * unsubscribe function. OPFS Clients receive changes from every connected
    * tab. After handover or page restoration, reset events notify every
    * subscriber to re-query even though tables is empty.
+   * @returns A function that removes this subscription when called.
    * @category Subscriptions
    * @since v0.0.5
    */
@@ -574,6 +584,7 @@
   /**
    * The getRevision method returns the newest database revision observed by
    * this Client.
+   * @returns The newest database revision observed by this Client.
    * @category Subscriptions
    * @since v0.0.5
    */
@@ -598,6 +609,7 @@
  *
  * Calling it with no argument creates an ephemeral memory database. Pass a
  * stable `opfs://name` to persist the database in browser storage.
+ * @returns A Promise resolving to a Client whose Worker and database are ready.
  * @example
  * ```ts
  * import {create} from 'tinyjoin';
