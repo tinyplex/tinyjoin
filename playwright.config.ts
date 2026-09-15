@@ -2,7 +2,7 @@ import {defineConfig, devices} from '@playwright/test';
 import {tmpdir} from 'node:os';
 import {resolve} from 'node:path';
 
-const port = 4173;
+const port = Number(process.env.TINYJOIN_BROWSER_PORT ?? 4173);
 
 export default defineConfig({
   testDir: './test/browser',
@@ -22,9 +22,11 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: `npm run test:browser:serve -- --host 127.0.0.1 --port ${port}`,
+    command: `npm run test:browser:serve -- --host 127.0.0.1 --port ${port} --strictPort`,
     url: `http://127.0.0.1:${port}`,
-    reuseExistingServer: !process.env.CI,
+    // A docs preview may already occupy this port. Never run runtime tests
+    // against a different application just because it answers HTTP requests.
+    reuseExistingServer: false,
     timeout: 120_000,
   },
 });

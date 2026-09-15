@@ -33,10 +33,10 @@
     "check:docs:built": "node scripts/check-docs.mjs",
     "check:docs:committed": "node scripts/check-docs-fresh.mjs",
     "check:demo-runtime": "node scripts/check-demo-runtime.mjs",
-    "check:release": "npm run check:docs:committed && npm run check:source && npm run build && npm run build:docs:built && npm run check:docs:built && npm run check:demo-runtime && npm run test:docs:built && npm run test:wasm:contract && npm run check:size && npm run test:browser:built && npm run test:package:built && npm run test:offline:built",
+    "check:release": "npm run check:rust:advisories && npm run check:docs:committed && npm run check:source && npm run build && npm run build:docs:built && npm run check:docs:built && npm run check:demo-runtime && npm run test:docs:built && npm run test:wasm:contract && npm run check:size && npm run test:browser:built && npm run test:package:built && npm run test:offline:built",
     "check:source": "npm run typecheck && npm test",
     "check:size": "node scripts/check-size.mjs",
-    "prePublishPackage": "npm i && npm run check:release",
+    "prePublishPackage": "npm ci && npm run setup:rust:advisories && npm run check:release",
     "publishPackage": "npm run prePublishPackage && npm publish ./dist",
     "serve:docs": "vite docs",
     "spell": "cspell --no-progress --dot",
@@ -49,13 +49,15 @@
     "test:offline:built": "node scripts/test-offline.mjs",
     "test:package": "node scripts/test-packed-consumer.mjs",
     "test:package:built": "node scripts/test-packed-consumer.mjs --built",
-    "test:rust": "node scripts/cargo.mjs test --workspace",
+    "test:rust": "node scripts/cargo.mjs test --workspace --locked",
     "test:ts": "vitest run --exclude test/worker/wasm-bridge-cross.test.ts",
     "test:wasm": "npm run build:wasm && npm run test:wasm:built",
     "test:wasm:built": "npm run test:wasm:contract && playwright test test/browser/paged-memory.spec.ts",
     "test:wasm:contract": "vitest run test/worker/wasm-bridge-cross.test.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p site/tsconfig.json",
-    "typecheck:browser": "tsc --noEmit -p test/browser/app/tsconfig.json"
+    "typecheck:browser": "tsc --noEmit -p test/browser/app/tsconfig.json",
+    "check:rust:advisories": "node scripts/check-rust-advisories.mjs",
+    "setup:rust:advisories": "cargo install cargo-audit --version 0.22.2 --locked --root node_modules/.cache/tinyjoin/audit-tools"
   },
   "repository": {
     "type": "git",
@@ -87,7 +89,7 @@
     "tinydocs": "^0.1.76",
     "typescript": "^7.0.2",
     "vite": "^8.2.1",
-    "vitest": "^4.1.10",
+    "vitest": "^4.1.11",
     "wasm-pack": "^0.15.0"
   }
 }

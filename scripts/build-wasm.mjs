@@ -110,6 +110,7 @@ try {
       'tinyjoin_wasm',
       '--release',
       '--no-pack',
+      '--locked',
     ],
     {
       cwd: root,
