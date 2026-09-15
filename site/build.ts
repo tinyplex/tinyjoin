@@ -102,6 +102,38 @@ const hideInheritedErrorMembers = (reflection: any): void => {
   );
 };
 
+// TypeDoc copies create's shared documentation to each overload. Show the
+// introduction and examples once, retaining distinct text and signature tags.
+const deduplicateCreateDocumentation = (reflection: any): void => {
+  if (reflection.name !== 'create' || reflection.signatures?.length < 2) {
+    return;
+  }
+  const [first, ...overloads] = reflection.signatures ?? [];
+  if (first?.comment == null) {
+    return;
+  }
+  const summary = (comment: any): string =>
+    JSON.stringify(comment.constructor.serializeDisplayParts(comment.summary));
+  const firstSummary = summary(first.comment);
+  const firstTags = new Set(
+    first.comment.blockTags.map((tag: any) => JSON.stringify(tag.toObject())),
+  );
+  for (const overload of overloads) {
+    if (overload.comment == null) {
+      continue;
+    }
+    const comment = (overload.comment = overload.comment.clone());
+    if (summary(comment) === firstSummary) {
+      comment.summary = [];
+    }
+    comment.blockTags = comment.blockTags.filter(
+      (tag: any) =>
+        ['@param', '@returns', '@category', '@essential'].includes(tag.tag) ||
+        !firstTags.has(JSON.stringify(tag.toObject())),
+    );
+  }
+};
+
 export const build = async (
   outDir = 'docs',
   typesDir = 'dist/@types',
@@ -114,6 +146,7 @@ export const build = async (
     .addDir('site/fonts', 'fonts')
     .addDir('site/extras')
     .addReflectionTransform(hideInheritedErrorMembers)
+    .addReflectionTransform(deduplicateCreateDocumentation)
     .addNodeTransform(collapseLoneEssentialGroup)
     .addApiFile(resolve(typesDir, 'index.d.ts'))
     .addApiFile(resolve(typesDir, 'worker/index.d.ts'))
