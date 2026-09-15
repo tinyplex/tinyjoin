@@ -46,8 +46,8 @@ locked, corrupt, or out of quota.
 
 An OPFS name identifies stored data; changing the name opens a different
 database and leaves the old data in place. Check the
-[release compatibility boundary](/guides/releases/#v0-0-6) before upgrading
-TinyJoin: v0.0.6 cannot open the page format published in v0.0.5. Preserve any
+[release compatibility boundary](/guides/releases/#v0-1-0) before upgrading
+TinyJoin: v0.1.0 cannot open the page format published in v0.0.5. Preserve any
 needed data with the old version before moving to a new namespace.
 
 The current persistent database is bounded to 65,536 4 KiB pages (256 MiB).

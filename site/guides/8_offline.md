@@ -97,7 +97,7 @@ repair an incomplete cache from the matching deployment.
 
 Application updates and database schema changes are separate decisions. Keep
 schema setup idempotent and observe the
-[storage compatibility boundary](/guides/releases/#v0-0-6).
+[storage compatibility boundary](/guides/releases/#v0-1-0).
 
 ## Integrating an existing service worker
 

@@ -210,7 +210,7 @@ window.__tinyjoinMultiTab = {
       channel.postMessage({
         kind: 'leader',
         epoch: 'fixture-incompatible-owner',
-        compatibility: '1:999:2:0.0.6',
+        compatibility: '1:999:2:0.1.0',
         ready: true,
         revision: 0,
         ownerId,

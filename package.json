@@ -1,6 +1,6 @@
 {
   "name": "tinyjoin",
-  "version": "0.0.6",
+  "version": "0.1.0",
   "author": "jamesgpearce",
   "private": true,
   "type": "module",
@@ -82,18 +82,18 @@
     "webassembly"
   ],
   "devDependencies": {
-    "@playwright/test": "^1.62.1",
-    "@types/node": "^26.2.0",
-    "cspell": "^10.3.1",
+    "@playwright/test": "^1.63.0",
+    "@types/node": "^26.5.1",
+    "cspell": "^10.3.2",
     "esbuild": "^0.28.2",
-    "less": "^4.9.0",
-    "react": "^19.2.4",
-    "react-dom": "^19.2.4",
+    "less": "^4.9.1",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
     "terser": "^5.51.2",
     "tinydocs": "^0.1.76",
     "typescript": "^7.0.2",
-    "vite": "^8.2.1",
-    "vitest": "^4.1.11",
+    "vite": "^8.3.0",
+    "vitest": "^5.0.1",
     "wasm-pack": "^0.15.0"
   }
 }

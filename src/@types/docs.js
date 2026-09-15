@@ -318,7 +318,7 @@
    * case tables is empty and every subscription is notified, including filtered
    * ones. Normal committed-change events omit this property.
    * @category Event
-   * @since v0.0.6
+   * @since v0.1.0
    */
   /// TablesChangedEvent.reset
 

@@ -63,14 +63,14 @@ build executables; the licensing notice check remains separate.
 ### Recorded audit: 15 September 2026
 
 - Command: `npm run check:rust:advisories` using `cargo-audit 0.22.2`.
-- Checked at: `2026-09-15T05:15:35.409Z`.
+- Checked at: `2026-09-15T10:28:30.147Z`.
 - RustSec revision: `e2e640471715167f73e22eaf761f2e547adafeec`.
 - Database commit date: `2026-09-14T18:06:06+02:00`; 1,246 advisories.
-- Committed lock SHA-256:
-  `c0e29317e5844e75bfa27bf6cb25c5540b8d6f02cd0afe87773f20686a10fdec`.
-- Result: 29 locked packages checked; zero vulnerabilities, zero warnings,
+- Lockfile SHA-256:
+  `383903f5e11f0d173ea8eea6885b147a024a0080d93f5ee3b2a3f959d54df3e4`.
+- Result: 28 locked packages checked; zero vulnerabilities, zero warnings,
   and no ignored advisories. This is a dated snapshot; CI refreshes it.
-- External target dependencies: 18 runtime and nine build/macro dependencies.
+- External target dependencies: 18 runtime and eight build/macro dependencies.
   The two workspace crates account for the remainder of the lockfile.
 
 Runtime dependencies: `cfg-if`, `futures-core`, `futures-task`, `futures-util`,
@@ -79,14 +79,14 @@ Runtime dependencies: `cfg-if`, `futures-core`, `futures-task`, `futures-util`,
 `wasm-bindgen`, `wasm-bindgen-shared`, and `zmij`.
 
 Build/macro dependencies: `bumpalo`, `proc-macro2`, `quote`, `rustversion`,
-`serde_derive`, `syn` 2, `syn` 3, `wasm-bindgen-macro`, and
+`serde_derive`, `syn` 3, `wasm-bindgen-macro`, and
 `wasm-bindgen-macro-support`. Exact versions are recorded in `Cargo.lock`
 and each generated inventory.
 
 ## JavaScript audit snapshot
 
 Both TinyJoin and create-tinyjoin now lock `vitest` and `@vitest/mocker` to
-4.1.11. The full npm audits on 15 September 2026 no longer report
+5.0.1. The full npm audits on 15 September 2026 no longer report
 [GHSA-82fw-gwwq-j7x9](https://github.com/vitest-dev/vitest/security/advisories/GHSA-82fw-gwwq-j7x9).
 The starter audit reports zero findings.
 

@@ -11,7 +11,7 @@
  * See the [Node guide](/guides/node/).
  * @packageDocumentation
  * @module node
- * @since v0.0.6
+ * @since v0.1.0
  */
 /// node
 
@@ -51,6 +51,6 @@
  * }
  * ```
  * @category Lifecycle
- * @since v0.0.6
+ * @since v0.1.0
  */
 /// node.create

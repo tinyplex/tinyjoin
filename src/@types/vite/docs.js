@@ -4,14 +4,14 @@
  * This Node-only build integration is separate from the browser runtime.
  * @packageDocumentation
  * @module vite
- * @since v0.0.6
+ * @since v0.1.0
  */
 /// vite
 
 /**
  * The TinyjoinOfflineOptions interface configures production offline caching.
  * @category Offline
- * @since v0.0.6
+ * @since v0.1.0
  */
 /// TinyjoinOfflineOptions
 
@@ -22,7 +22,7 @@
  * The `manifest` mode emits `tinyjoin-precache.json` and
  * `tinyjoin-precache.js` without registering or replacing a service worker.
  * @category Offline
- * @since v0.0.6
+ * @since v0.1.0
  */
 /// TinyjoinOfflineOptions.mode
 
@@ -31,7 +31,7 @@
  * otherwise unmatched navigation requests within the application scope.
  * It defaults to `index.html`; use `false` to disable SPA navigation fallback.
  * @category Offline
- * @since v0.0.6
+ * @since v0.1.0
  */
 /// TinyjoinOfflineOptions.navigationFallback
 
@@ -59,6 +59,6 @@
  * export default defineConfig({plugins: [tinyjoinOffline()]});
  * ```
  * @category Offline
- * @since v0.0.6
+ * @since v0.1.0
  */
 /// tinyjoinOffline
