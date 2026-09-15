@@ -12,6 +12,9 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noUncheckedIndexedAccess": true,
+    "paths": {
+      "tinyjoin": ["./src/@types/index.d.ts"]
+    },
     "skipLibCheck": true,
     "strict": true,
     "target": "ES2022",
