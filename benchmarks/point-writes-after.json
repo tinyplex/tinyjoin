@@ -1,0 +1,172 @@
+{
+  "measuredAt": "2026-09-15T09:26:57.226Z",
+  "packageVersion": "0.0.6",
+  "runtime": [
+    {
+      "path": "index.js",
+      "bytes": 10204,
+      "sha256": "fc3a9220bfd76693f6150ff9eadf743535d82c63b3f8ccf121562da768c47bb6"
+    },
+    {
+      "path": "protocol.js",
+      "bytes": 3530,
+      "sha256": "3a3f26ea0b5ccce24b6d18232d4c569e08809d9ff5256914acf30aea053c0e0d"
+    },
+    {
+      "path": "vite/index.js",
+      "bytes": 7737,
+      "sha256": "c3bb6eab11ac7e7de79fbb7010e329ba433b96d20f59a9cc070e96f4112043c9"
+    },
+    {
+      "path": "wasm/tinyjoin_wasm_bg.wasm",
+      "bytes": 738678,
+      "sha256": "1020c72ededfba9d0320a5f5dc45a6aa1ed5454d408faefbcfe9dc5ca6af6358"
+    },
+    {
+      "path": "wasm/tinyjoin_wasm.js",
+      "bytes": 9553,
+      "sha256": "2ad61c5367ad263f3400838903caf2cf215fe163e6410f3aa4edae79b5b384a9"
+    },
+    {
+      "path": "worker-opfs/tinyjoin_opfs_runtime.js",
+      "bytes": 5541,
+      "sha256": "cd7755056326e2dbd1df6d4eb4c73f15059845c3ed27b0cd57a702bdcf93bf0a"
+    },
+    {
+      "path": "worker/default-entry.js",
+      "bytes": 26066,
+      "sha256": "3b598f241626daab12d74153f3605ec890a2a97fd85f9a985361fa6269bd40f1"
+    },
+    {
+      "path": "worker/index.js",
+      "bytes": 26101,
+      "sha256": "cc5d8efc69579de541a94df09a2acc9f162ada8cf9842f3a43e3ec91daf9b47a"
+    }
+  ],
+  "environment": {
+    "node": "v25.2.1",
+    "os": "darwin",
+    "osRelease": "25.5.0",
+    "architecture": "arm64",
+    "cpu": "Apple M2",
+    "logicalCpus": 8,
+    "memoryBytes": 17179869184,
+    "headless": true,
+    "viewport": {
+      "width": 1280,
+      "height": 720
+    },
+    "cpuThrottling": "none",
+    "network": "loopback HTTP; warm cache permitted within each isolated context",
+    "browserVersion": "151.0.7922.34",
+    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/151.0.7922.34 Safari/537.36"
+  },
+  "repetitions": 3,
+  "profile": "point-writes",
+  "schema": "CREATE TABLE items (id INTEGER PRIMARY KEY, title TEXT NOT NULL, payload TEXT NOT NULL); CREATE UNIQUE INDEX items_title ON items (title)",
+  "definitions": {
+    "coldOpenMs": "First create(opfs://fresh-name) in a fresh browser context, before schema setup. Client module already loaded; Worker/WASM first-load included. Browser process, OS, and filesystem caches are not reset.",
+    "reopenMs": "After closing the sole client, create the same populated OPFS name in the same context. Includes fresh Worker and catalog open; HTTP/OS caches may be warm.",
+    "reopenReadMs": "First ordered full read after reopening; separate from reopenMs.",
+    "stagingMs": "Inside transaction callback: sequential prepared INSERT/UPDATE/DELETE requests, including Worker round trips and validation.",
+    "commitMs": "End of callback to transaction resolution; includes commit RPC, persistence, and coordination overhead.",
+    "resultMs": "query() call to complete materialized rows on requesting page, including engine execution, structured clone and owner/follower routing. Not an isolated copy benchmark; JSON byte sizing is outside timing.",
+    "percentiles": "Nearest-rank p90 of 3 samples is the maximum; retain all samples and do not treat it as a tail-latency estimate."
+  },
+  "notes": "One local desktop and one installed Chromium build. Sequential samples; no competitor, real mobile, Firefox, WebKit, power/thermal control, network download, or long-lived fragmentation coverage. No timing gate. Row checks run outside timing.",
+  "results": [
+    {
+      "kind": "mixed",
+      "rowCount": 5000,
+      "payloadBytes": 64,
+      "operationCount": 25,
+      "samples": [
+        {
+          "repetition": 0,
+          "coldOpenMs": 22.600000023841858,
+          "stagingMs": 34,
+          "commitMs": 14.600000023841858,
+          "transactionMs": 48.799999952316284,
+          "operationCount": 25,
+          "finalRows": 5001,
+          "reopenMs": 417.3000000715256,
+          "reopenReadMs": 58.89999997615814,
+          "resultJsonBytes": 542940,
+          "storageBytes": 1822720
+        },
+        {
+          "repetition": 1,
+          "coldOpenMs": 20.600000023841858,
+          "stagingMs": 33.199999928474426,
+          "commitMs": 14.400000095367432,
+          "transactionMs": 47.700000047683716,
+          "operationCount": 25,
+          "finalRows": 5001,
+          "reopenMs": 416.39999997615814,
+          "reopenReadMs": 59.5,
+          "resultJsonBytes": 542940,
+          "storageBytes": 1822720
+        },
+        {
+          "repetition": 2,
+          "coldOpenMs": 20.399999976158142,
+          "stagingMs": 33.200000047683716,
+          "commitMs": 14.199999928474426,
+          "transactionMs": 47.5,
+          "operationCount": 25,
+          "finalRows": 5001,
+          "reopenMs": 413.7999999523163,
+          "reopenReadMs": 58.39999997615814,
+          "resultJsonBytes": 542940,
+          "storageBytes": 1822720
+        }
+      ],
+      "distributions": {
+        "coldOpenMs": {
+          "count": 3,
+          "min": 20.399999976158142,
+          "median": 20.600000023841858,
+          "p90": 22.600000023841858,
+          "max": 22.600000023841858
+        },
+        "reopenMs": {
+          "count": 3,
+          "min": 413.7999999523163,
+          "median": 416.39999997615814,
+          "p90": 417.3000000715256,
+          "max": 417.3000000715256
+        },
+        "reopenReadMs": {
+          "count": 3,
+          "min": 58.39999997615814,
+          "median": 58.89999997615814,
+          "p90": 59.5,
+          "max": 59.5
+        },
+        "stagingMs": {
+          "count": 3,
+          "min": 33.199999928474426,
+          "median": 33.200000047683716,
+          "p90": 34,
+          "max": 34
+        },
+        "commitMs": {
+          "count": 3,
+          "min": 14.199999928474426,
+          "median": 14.400000095367432,
+          "p90": 14.600000023841858,
+          "max": 14.600000023841858
+        },
+        "transactionMs": {
+          "count": 3,
+          "min": 47.5,
+          "median": 47.700000047683716,
+          "p90": 48.799999952316284,
+          "max": 48.799999952316284
+        }
+      }
+    }
+  ],
+  "seeding": "Setup is outside all timings. Payloads of 1024 bytes use at most 1000 rows per seed transaction to stay below retained batch limits; 64-byte payloads seed the whole shape in one transaction.",
+  "completedAt": "2026-09-15T09:27:03.829Z"
+}

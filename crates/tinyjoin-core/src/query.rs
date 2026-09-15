@@ -242,7 +242,7 @@ fn visit_candidate_rows(
     schema: &crate::TableDefinition,
     visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
 ) -> Result<VisitOutcome> {
-    if let Some(key) = primary_key_lookup(plan, schema) {
+    if let Some(key) = primary_key_lookup(plan.predicate.as_ref(), schema) {
         return match storage.lookup_primary_key(&plan.table, &key)? {
             Some(row) if visitor(&row)? == VisitControl::Stop => Ok(VisitOutcome::Stopped),
             _ => Ok(VisitOutcome::Complete),
@@ -1838,9 +1838,12 @@ fn validate_comparison_value(
     }
 }
 
-fn primary_key_lookup(plan: &SelectPlan, schema: &crate::TableDefinition) -> Option<Row> {
+pub(crate) fn primary_key_lookup(
+    predicate: Option<&Predicate>,
+    schema: &crate::TableDefinition,
+) -> Option<Row> {
     let mut equalities = Map::new();
-    collect_guaranteed_equalities(plan.predicate.as_ref(), &mut equalities);
+    collect_guaranteed_equalities(predicate, &mut equalities);
     schema
         .primary_key
         .iter()

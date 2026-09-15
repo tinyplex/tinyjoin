@@ -19,6 +19,7 @@ On the same Apple M2 and Chromium 151.0.7922.34, measured medians were:
 | --- | ---: | ---: | ---: |
 | Baseline | 7,563.1 ms | 4,274.8 ms | 1,353.8 ms |
 | Lookup-table CRC-32 | 2,412.8 ms | 3,129.2 ms | 1,091.4 ms |
+| CRC-32 + primary-key UPDATE/DELETE | 2,454.6 ms | 3,093.2 ms | 1,106.6 ms |
 
 `launch-performance-before.json` and `launch-performance-checksum.json` retain
 the samples, environment, and runtime hashes. The baseline used an isolated
@@ -31,6 +32,29 @@ validation. Its WASM is 738,134 bytes raw / 278,546 bytes gzip, compared with
 737,145 / 277,336 before: an increase of 989 raw and 1,210 gzip bytes.
 It reduces calculation cost without removing the repeated full validation
 performed by mixed transactions.
+
+`launch-performance-primary-key.json` records the next build. Direct primary-key
+lookup does not materially improve the 250-row/250-operation shape: complete
+write-set validation still dominates it. A complementary workload keeps the
+transaction at 25 operations while increasing the existing table to 5,000 rows
+with 64-byte payloads. It uses the same insert/update/delete cycle and checks
+the final row model and persisted contents:
+
+```sh
+node scripts/benchmark-workloads.mjs /tmp/point-writes.json --point-writes
+```
+
+| 25 mixed writes against 5,000 rows | Staging median | Whole transaction median |
+| --- | ---: | ---: |
+| CRC-32, before primary-key lookup | 446.4 ms | 461.3 ms |
+| CRC-32 + primary-key lookup | 33.2 ms | 47.7 ms |
+
+The three samples per build are in `point-writes-before.json` and
+`point-writes-after.json`. The baseline runtime was reconstructed from the
+checksum commit and byte-checked against its recorded hashes; every other
+runtime artifact was identical. Runs were sequential. The benefit is avoiding
+full-table scans for point mutations as the existing table grows, while retaining
+the current complete mixed-transaction validation.
 
 ## Launch workload envelope
 

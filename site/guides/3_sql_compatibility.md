@@ -278,10 +278,13 @@ primary keys as stable, opaque identifiers.
 
 Composite primary and secondary indexes are supported. A unique index omits a
 key containing `NULL`, so multiple null-containing keys are allowed, matching
-PostgreSQL's default `NULLS DISTINCT` behavior. Complete primary-key equality
-uses direct lookup; complete equality for every column of a secondary index can
-use its postings. Partial composite matches, ranges, `OR`, and `NOT` scan.
-`UPDATE` and `DELETE` currently scan even for a primary-key predicate.
+PostgreSQL's default `NULLS DISTINCT` behavior. Simple `SELECT`, `UPDATE`, and
+`DELETE` use direct lookup for complete primary-key equality when the key types
+and values permit an exact lookup. This also sees staged changes inside a
+transaction, and the complete predicate is still checked. `SELECT` can use
+secondary-index postings for complete equality on every indexed column. Other
+`UPDATE` and `DELETE` predicates scan; partial composite matches, ranges,
+`OR`, and `NOT` also fall back to scans.
 
 ## Aggregates and joins
 

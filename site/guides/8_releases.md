@@ -40,6 +40,10 @@ values, storage format, and corruption checks. This improves mixed writes and
 populated startup; the repository's [workload measurements](https://github.com/tinyplex/tinyjoin/tree/main/benchmarks)
 retain the before/after samples and runtime hashes.
 
+`UPDATE` and `DELETE` now use direct primary-key lookup for exact complete key
+predicates, including staged transaction rows. Other predicates retain their
+scan path, and statement validation and constraint checks remain in force.
+
 Duplicate output names in simple projections and `RETURNING` now fail
 consistently with `INVALID_QUERY` before execution. `LIMIT` and `OFFSET`
 reject nonnumeric parameter values consistently in ordinary, aggregate, and

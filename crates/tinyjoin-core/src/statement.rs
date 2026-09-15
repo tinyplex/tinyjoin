@@ -7,12 +7,13 @@ use serde_json::{Map, Number, Value};
 use crate::StorageDriver;
 use crate::query::{
     ParseMode, Token, bind_parameter, is_reserved_keyword, matches_predicate, parse_predicate_at,
-    tokenize, validate_named_columns, validate_parameter_expansion, validate_predicate_columns,
-    validate_predicate_types, validate_sql_input,
+    primary_key_lookup, tokenize, validate_named_columns, validate_parameter_expansion,
+    validate_predicate_columns, validate_predicate_types, validate_sql_input,
 };
 use crate::storage::{
     estimated_row_bytes, estimated_value_bytes, normalize_row, row_key, schema_with_added_column,
-    validate_index_columns_for_schema, validate_index_definition_shape, validate_value,
+    validate_index_columns_for_schema, validate_index_definition_shape,
+    validate_primary_storage_key_bound, validate_value,
 };
 use crate::{
     ColumnDefinition, ColumnType, EngineError, Predicate, Result, ResultField, Row, RowChange,
@@ -606,7 +607,7 @@ fn plan_update(
     let mut scanned = 0usize;
     let mut work_bytes = 0usize;
     let mut result_bytes = 0usize;
-    let visit_outcome = storage.visit_table(table, &mut |row| {
+    let visit_outcome = visit_dml_candidates(storage, &schema, predicate, &mut |row| {
         scanned = scanned.saturating_add(1);
         if scanned > MAX_DML_SCAN_ROWS {
             return Err(dml_limit_error(format!(
@@ -746,7 +747,7 @@ fn plan_delete(
     let mut scanned = 0usize;
     let mut work_bytes = 0usize;
     let mut result_bytes = 0usize;
-    let visit_outcome = storage.visit_table(table, &mut |row| {
+    let visit_outcome = visit_dml_candidates(storage, &schema, predicate, &mut |row| {
         scanned = scanned.saturating_add(1);
         if scanned > MAX_DML_SCAN_ROWS {
             return Err(dml_limit_error(format!(
@@ -804,6 +805,26 @@ fn plan_delete(
         },
         changes,
     })
+}
+
+/// Predicate and assignment validation precedes this lookup, and the caller still checks the
+/// complete predicate. Only exact complete primary keys can skip the streaming table scan.
+fn visit_dml_candidates(
+    storage: &dyn StorageReader,
+    schema: &TableDefinition,
+    predicate: Option<&Predicate>,
+    visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+) -> Result<VisitOutcome> {
+    // A valid predicate can name a key too large to store; keep its scan behavior.
+    if let Some(key) = primary_key_lookup(predicate, schema)
+        && validate_primary_storage_key_bound(schema, &key).is_ok()
+    {
+        return match storage.lookup_primary_key(&schema.name, &key)? {
+            Some(row) if visitor(&row)? == VisitControl::Stop => Ok(VisitOutcome::Stopped),
+            _ => Ok(VisitOutcome::Complete),
+        };
+    }
+    storage.visit_table(&schema.name, visitor)
 }
 
 fn validate_projection(schema: &TableDefinition, returning: Option<&[String]>) -> Result<()> {
@@ -1688,7 +1709,7 @@ mod tests {
     }
 
     #[test]
-    fn dml_uses_exact_insert_lookups_and_one_streaming_update_or_delete_scan() {
+    fn dml_uses_exact_primary_key_lookups_for_insert_update_and_delete() {
         let mut storage = storage();
 
         execute_sql(
@@ -1710,12 +1731,9 @@ mod tests {
         assert_eq!(update.rows, vec![row(json!({"value": "changed"}))]);
         assert_eq!(
             storage.access_counts(),
-            (before_access.0 + 1, before_access.1)
+            (before_access.0, before_access.1 + 1)
         );
-        assert_eq!(
-            storage.visitor_counts(),
-            (before_visitors.0 + 2, before_visitors.1)
-        );
+        assert_eq!(storage.visitor_counts(), before_visitors);
 
         let before_access = storage.access_counts();
         let before_visitors = storage.visitor_counts();
@@ -1728,11 +1746,246 @@ mod tests {
         assert_eq!(delete.rows, vec![row(json!({"value": "one"}))]);
         assert_eq!(
             storage.access_counts(),
-            (before_access.0 + 1, before_access.1)
+            (before_access.0, before_access.1 + 1)
+        );
+        assert_eq!(storage.visitor_counts(), before_visitors);
+    }
+
+    #[test]
+    fn keyed_dml_preserves_residual_filters_and_scan_fallbacks() {
+        for command in ["UPDATE items SET value = 'changed'", "DELETE FROM items"] {
+            for (predicate, expected_rows, expected_access) in [
+                ("id = 1 AND value = 'one'", 1, (0, 1)),
+                ("id = 1 AND value = 'two'", 0, (0, 1)),
+                ("id = 999", 0, (0, 1)),
+                ("(id = 1 AND value = 'one') AND id = 2", 0, (0, 1)),
+                ("id = 1 OR id = 2", 2, (1, 0)),
+                ("id = 1.0", 1, (1, 0)),
+                ("id = NULL", 0, (1, 0)),
+                ("value = 'one'", 1, (1, 0)),
+            ] {
+                let mut storage = storage();
+                seed_rows(
+                    &mut storage,
+                    "items",
+                    vec![
+                        row(json!({"id": 1, "value": "one"})),
+                        row(json!({"id": 2, "value": "two"})),
+                    ],
+                );
+                storage.reset_counts();
+                let sql = format!("{command} WHERE {predicate} RETURNING id");
+                let outcome = execute_sql(&mut storage, &sql, &[]);
+                assert_eq!(outcome.row_count, expected_rows, "{sql}");
+                assert_eq!(outcome.rows.len(), expected_rows, "{sql}");
+                assert_eq!(storage.access_counts(), expected_access, "{sql}");
+                assert_eq!(
+                    storage.visitor_counts(),
+                    (expected_access.0 * 2, 0),
+                    "{sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn keyed_dml_validates_the_entire_statement_before_a_missing_key_lookup() {
+        for (sql, code) in [
+            (
+                "UPDATE items SET value = 'changed' WHERE value > 1 AND id = 999",
+                "TYPE_MISMATCH",
+            ),
+            (
+                "DELETE FROM items WHERE value > 1 AND id = 999",
+                "TYPE_MISMATCH",
+            ),
+            (
+                "UPDATE items SET value = 'changed' WHERE id = '1' AND id = 999",
+                "TYPE_MISMATCH",
+            ),
+            (
+                "DELETE FROM items WHERE id = '1' AND id = 999",
+                "TYPE_MISMATCH",
+            ),
+            (
+                "UPDATE items SET id = 'bad' WHERE id = 999",
+                "TYPE_MISMATCH",
+            ),
+            (
+                "UPDATE items SET value = 'changed' WHERE id = 999 RETURNING missing",
+                "COLUMN_NOT_FOUND",
+            ),
+            (
+                "DELETE FROM items WHERE id = 999 RETURNING missing",
+                "COLUMN_NOT_FOUND",
+            ),
+        ] {
+            let mut storage = storage();
+            let Statement::Write(statement) = parse(sql, &[]).unwrap() else {
+                unreachable!()
+            };
+            let error = execute(&mut storage, &statement).unwrap_err();
+            assert_eq!(error.code, code, "{sql}");
+            assert_eq!(storage.access_counts(), (0, 0), "{sql}");
+        }
+    }
+
+    #[test]
+    fn keyed_dml_requires_every_composite_key_column_with_exact_values() {
+        for command in ["UPDATE items SET value = 'changed'", "DELETE FROM items"] {
+            for (predicate, expected_rows, expected_access) in [
+                ("id = 1 AND active = true AND tenant = 'a'", 1, (0, 1)),
+                ("id = 1 AND active = false AND tenant = 'a'", 0, (0, 1)),
+                ("id = 1 AND tenant = 'a'", 1, (1, 0)),
+                ("id = 1.0 AND active = true AND tenant = 'a'", 1, (1, 0)),
+            ] {
+                let mut storage = InMemoryStorage::default();
+                execute_sql(
+                    &mut storage,
+                    "CREATE TABLE items (id INTEGER, active BOOLEAN, tenant TEXT, value TEXT, PRIMARY KEY (id, active, tenant))",
+                    &[],
+                );
+                execute_sql(
+                    &mut storage,
+                    "INSERT INTO items VALUES (1, true, 'a', 'one'), (1, true, 'b', 'two')",
+                    &[],
+                );
+                storage.reset_counts();
+                let sql = format!("{command} WHERE {predicate} RETURNING tenant");
+                let outcome = execute_sql(&mut storage, &sql, &[]);
+                assert_eq!(outcome.row_count, expected_rows, "{sql}");
+                assert_eq!(storage.access_counts(), expected_access, "{sql}");
+                assert_eq!(
+                    outcome.rows,
+                    if expected_rows == 1 {
+                        vec![row(json!({"tenant": "a"}))]
+                    } else {
+                        vec![]
+                    },
+                    "{sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn keyed_dml_scans_when_a_valid_text_predicate_exceeds_the_storage_key_bound() {
+        for command in ["UPDATE items SET value = 'changed'", "DELETE FROM items"] {
+            for (schema, insert, predicate, parameter_bytes) in [
+                (
+                    "CREATE TABLE items (id TEXT PRIMARY KEY, value TEXT)",
+                    "INSERT INTO items VALUES ('one', 'one')",
+                    "id = $1",
+                    crate::storage::MAX_STORAGE_KEY_BYTES,
+                ),
+                (
+                    "CREATE TABLE items (tenant TEXT, id TEXT, value TEXT, PRIMARY KEY (tenant, id))",
+                    "INSERT INTO items VALUES ('a', 'one', 'one')",
+                    "tenant = $1 AND id = 'one'",
+                    // The tenant alone fits; the complete encoded composite key does not.
+                    crate::storage::MAX_STORAGE_KEY_BYTES - 3,
+                ),
+            ] {
+                let mut storage = InMemoryStorage::default();
+                execute_sql(&mut storage, schema, &[]);
+                execute_sql(&mut storage, insert, &[]);
+                storage.reset_counts();
+                let sql = format!("{command} WHERE {predicate} RETURNING id");
+                let outcome = execute_sql(
+                    &mut storage,
+                    &sql,
+                    &[json!("x".repeat(parameter_bytes))],
+                );
+                assert_eq!(outcome.row_count, 0, "{sql}");
+                assert!(outcome.rows.is_empty(), "{sql}");
+                assert_eq!(storage.access_counts(), (1, 0), "{sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn keyed_dml_reads_staged_inserts_moves_and_deletes_and_reopens() {
+        use crate::{MemoryPageDevice, PagedEngine};
+
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine.exec_sql("CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT); CREATE UNIQUE INDEX items_value ON items (value); INSERT INTO items VALUES (1, 'one'), (2, 'two')").unwrap();
+        engine.begin_transaction().unwrap();
+        engine
+            .execute_sql("INSERT INTO items VALUES (3, 'three')", &[])
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute_sql(
+                    "UPDATE items SET value = $1 WHERE id = $2 RETURNING value",
+                    &[json!("staged"), json!(3)]
+                )
+                .unwrap()
+                .rows,
+            vec![row(json!({"value": "staged"}))]
+        );
+        engine
+            .execute_sql("UPDATE items SET id = 4 WHERE id = 3", &[])
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute_sql("DELETE FROM items WHERE id = 3", &[])
+                .unwrap()
+                .row_count,
+            0
         );
         assert_eq!(
-            storage.visitor_counts(),
-            (before_visitors.0 + 2, before_visitors.1)
+            engine
+                .execute_sql("UPDATE items SET value = 'two' WHERE id = 4", &[])
+                .unwrap_err()
+                .code,
+            "CONSTRAINT_VIOLATION"
+        );
+        assert_eq!(
+            engine
+                .execute_sql("UPDATE items SET id = 2 WHERE id = 4", &[])
+                .unwrap_err()
+                .code,
+            "CONSTRAINT_VIOLATION"
+        );
+        assert_eq!(
+            engine
+                .execute_sql("DELETE FROM items WHERE id = 4 RETURNING value", &[])
+                .unwrap()
+                .rows,
+            vec![row(json!({"value": "staged"}))]
+        );
+        engine
+            .execute_sql(
+                "UPDATE items SET value = 'committed update' WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        engine
+            .execute_sql("DELETE FROM items WHERE id = 2", &[])
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute_sql("UPDATE items SET value = 'deleted' WHERE id = 2", &[])
+                .unwrap()
+                .row_count,
+            0
+        );
+        engine.commit_transaction().unwrap();
+
+        let mut reopened = PagedEngine::open(engine.into_device()).unwrap();
+        let expected = vec![row(json!({"id": 1, "value": "committed update"}))];
+        assert_eq!(
+            reopened.query_sql("SELECT * FROM items", &[]).unwrap().rows,
+            expected
+        );
+        reopened.begin_transaction().unwrap();
+        reopened
+            .execute_sql("DELETE FROM items WHERE id = 1", &[])
+            .unwrap();
+        reopened.rollback_transaction().unwrap();
+        assert_eq!(
+            reopened.query_sql("SELECT * FROM items", &[]).unwrap().rows,
+            expected
         );
     }
 
@@ -1782,8 +2035,8 @@ mod tests {
     #[test]
     fn update_and_delete_fail_closed_when_a_storage_scan_stops_unexpectedly() {
         for sql in [
-            "UPDATE items SET value = 'changed' WHERE id = 1",
-            "DELETE FROM items WHERE id = 1",
+            "UPDATE items SET value = 'changed' WHERE id >= 1",
+            "DELETE FROM items WHERE id >= 1",
         ] {
             let mut inner = storage();
             seed_rows(

@@ -15,8 +15,9 @@ const outputs = args.filter(argument => !argument.startsWith('--'));
 const output = outputs[0];
 const resume = args.includes('--resume');
 const quick = args.includes('--quick');
-if (outputs.length > 1 || new Set(args).size !== args.length || args.some(argument => argument.startsWith('--') && !['--resume', '--quick'].includes(argument)) || (resume && !output)) throw new Error('Usage: node scripts/benchmark-workloads.mjs [output.json] [--quick] [--resume]');
-const repetitions = quick ? 3 : 5;
+const pointWrites = args.includes('--point-writes');
+if (outputs.length > 1 || new Set(args).size !== args.length || args.some(argument => argument.startsWith('--') && !['--resume', '--quick', '--point-writes'].includes(argument)) || (resume && !output) || (quick && pointWrites)) throw new Error('Usage: node scripts/benchmark-workloads.mjs [output.json] [--quick | --point-writes] [--resume]');
+const repetitions = quick || pointWrites ? 3 : 5;
 const runtime = [];
 async function fingerprint(directory = dist) {
   for (const entry of await readdir(directory, {withFileTypes: true})) {
@@ -61,7 +62,7 @@ const report = {
   runtime,
   environment: {node: process.version, os: platform(), osRelease: release(), architecture: arch(), cpu: cpus()[0]?.model, logicalCpus: cpus().length, memoryBytes: totalmem(), headless: true, viewport: {width: 1280, height: 720}, cpuThrottling: 'none', network: 'loopback HTTP; warm cache permitted within each isolated context'},
   repetitions,
-  profile: quick ? 'quick' : 'full',
+  profile: pointWrites ? 'point-writes' : quick ? 'quick' : 'full',
   schema: 'CREATE TABLE items (id INTEGER PRIMARY KEY, title TEXT NOT NULL, payload TEXT NOT NULL); CREATE UNIQUE INDEX items_title ON items (title)',
   definitions: {
     coldOpenMs: 'First create(opfs://fresh-name) in a fresh browser context, before schema setup. Client module already loaded; Worker/WASM first-load included. Browser process, OS, and filesystem caches are not reset.',
@@ -141,9 +142,9 @@ try {
   browser = await chromium.launch({headless: true});
   report.environment.browserVersion = browser.version();
   if (resumeBrowserVersion && resumeBrowserVersion !== browser.version()) throw new Error('Cannot resume with a different browser version');
-  for (const kind of ['mixed', 'result']) {
+  for (const kind of pointWrites ? ['mixed'] : ['mixed', 'result']) {
     const shapes = kind === 'mixed'
-      ? (quick ? [250] : [25, 100, 250]).map(rowCount => ({rowCount, payloadBytes: 64}))
+      ? pointWrites ? [{rowCount: 5000, payloadBytes: 64, operationCount: 25}] : (quick ? [250] : [25, 100, 250]).map(rowCount => ({rowCount, payloadBytes: 64}))
       : (quick ? [5000] : [100, 1000, 5000]).flatMap(rowCount => (quick ? [1024] : [64, 1024]).map(payloadBytes => ({rowCount, payloadBytes})));
     for (const shape of shapes) {
       if (report.results.some(result => result.kind === kind && result.rowCount === shape.rowCount && result.payloadBytes === shape.payloadBytes)) continue;
@@ -157,7 +158,7 @@ try {
           const sample = {repetition, coldOpenMs: await seed(owner, {...shape, name})};
           let expected = shape.rowCount;
           if (kind === 'mixed') {
-            Object.assign(sample, await owner.evaluate(async rowCount => {
+            Object.assign(sample, await owner.evaluate(async ({rowCount, operationCount = rowCount}) => {
               const insert = await window.db.prepare('INSERT INTO items VALUES ($1, $2, $3)');
               const update = await window.db.prepare('UPDATE items SET title = $1 WHERE id = $2');
               const remove = await window.db.prepare('DELETE FROM items WHERE id = $1');
@@ -166,7 +167,7 @@ try {
               try {
                 await window.db.transaction(async tx => {
                   const beginning = performance.now();
-                  for (let index = 0; index < rowCount; index++) {
+                  for (let index = 0; index < operationCount; index++) {
                     if (index % 3 === 0) await tx.execute(insert, [rowCount + index, `insert-${index}`, 'x'.repeat(64)]);
                     else if (index % 3 === 1) await tx.execute(update, [`update-${index}`, index]);
                     else await tx.execute(remove, [index]);
@@ -177,15 +178,15 @@ try {
                 const end = performance.now();
                 const actual = (await window.db.query('SELECT id, title FROM items ORDER BY id')).rows;
                 const model = new Map(Array.from({length: rowCount}, (_, id) => [id, `item-${id}`]));
-                for (let index = 0; index < rowCount; index++) {
+                for (let index = 0; index < operationCount; index++) {
                   if (index % 3 === 0) model.set(rowCount + index, `insert-${index}`);
                   else if (index % 3 === 1) model.set(index, `update-${index}`);
                   else model.delete(index);
                 }
                 if (actual.length !== model.size || actual.some(row => model.get(row.id) !== row.title)) throw new Error('Mixed transaction differs from row model');
-                return {stagingMs, commitMs: end - staged, transactionMs: end - start, operationCount: rowCount, finalRows: model.size};
+                return {stagingMs, commitMs: end - staged, transactionMs: end - start, operationCount, finalRows: model.size};
               } finally {await Promise.all([insert.close(), update.close(), remove.close()]);}
-            }, shape.rowCount));
+            }, shape));
             expected = sample.finalRows;
           }
           Object.assign(sample, await verifyAndReopen(owner, name, expected));
