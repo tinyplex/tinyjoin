@@ -1,10 +1,11 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
 use crate::storage::StorageReader;
 use crate::{
-    ApplyOutcome, EngineError, ExecuteResult, InMemoryStorage, QueryResult, Result, StorageDriver,
+    ApplyOutcome, EngineError, ExecuteResult, InMemoryStorage, QueryResult, Result, Row,
+    StorageDriver,
 };
 
 #[derive(Clone, Debug)]
@@ -17,6 +18,8 @@ pub(crate) struct Engine<S = InMemoryStorage> {
 struct Transaction<S> {
     storage: S,
     tables: BTreeSet<String>,
+    /// Running changed-key set; `None` for a table whose keys a statement could not report.
+    keys: BTreeMap<String, Option<Vec<Row>>>,
 }
 
 impl Default for Engine<InMemoryStorage> {
@@ -88,6 +91,7 @@ impl<S: StorageDriver + Clone> Engine<S> {
         self.transaction = Some(Transaction {
             storage: self.storage.clone(),
             tables: BTreeSet::new(),
+            keys: BTreeMap::new(),
         });
         Ok(())
     }
@@ -102,6 +106,7 @@ impl<S: StorageDriver + Clone> Engine<S> {
             return Ok(ApplyOutcome {
                 revision: self.storage.revision(),
                 tables: vec![],
+                keys: BTreeMap::new(),
             });
         }
 
@@ -111,8 +116,13 @@ impl<S: StorageDriver + Clone> Engine<S> {
             .take()
             .expect("the active transaction was checked above");
         let tables = transaction.tables.into_iter().collect();
+        let keys = crate::statement::finish_changed_keys(transaction.keys);
         self.storage = transaction.storage;
-        Ok(ApplyOutcome { revision, tables })
+        Ok(ApplyOutcome {
+            revision,
+            tables,
+            keys,
+        })
     }
 
     pub(crate) fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<ExecuteResult> {
@@ -126,6 +136,7 @@ impl<S: StorageDriver + Clone> Engine<S> {
                     fields: result.fields,
                     rows: result.rows,
                     tables: vec![],
+                    keys: BTreeMap::new(),
                 })
             }
             crate::statement::Statement::Aggregate(plan) => {
@@ -137,6 +148,7 @@ impl<S: StorageDriver + Clone> Engine<S> {
                     fields: result.fields,
                     rows: result.rows,
                     tables: vec![],
+                    keys: BTreeMap::new(),
                 })
             }
             crate::statement::Statement::Join(plan) => {
@@ -148,16 +160,22 @@ impl<S: StorageDriver + Clone> Engine<S> {
                     fields: result.fields,
                     rows: result.rows,
                     tables: vec![],
+                    keys: BTreeMap::new(),
                 })
             }
             crate::statement::Statement::Write(statement) => {
                 if let Some(transaction) = &mut self.transaction {
                     let mut candidate = transaction.storage.clone();
-                    let outcome = crate::statement::execute(&mut candidate, &statement)?;
+                    let (outcome, keys) = crate::statement::execute(&mut candidate, &statement)?;
                     let fields = crate::statement::write_result_fields(&candidate, &statement)?;
                     if outcome.mutated {
                         transaction.storage = candidate;
                         transaction.tables.extend(outcome.tables.iter().cloned());
+                        crate::statement::merge_changed_keys(
+                            &mut transaction.keys,
+                            &outcome.tables,
+                            &keys,
+                        );
                     }
                     Ok(ExecuteResult {
                         command: outcome.command.to_owned(),
@@ -166,10 +184,12 @@ impl<S: StorageDriver + Clone> Engine<S> {
                         fields,
                         rows: outcome.rows,
                         tables: outcome.tables,
+                        // Staged work publishes at commit; subscribers ignore these until then.
+                        keys,
                     })
                 } else {
                     let mut candidate = self.storage.clone();
-                    let outcome = crate::statement::execute(&mut candidate, &statement)?;
+                    let (outcome, keys) = crate::statement::execute(&mut candidate, &statement)?;
                     let fields = crate::statement::write_result_fields(&candidate, &statement)?;
                     let revision = if outcome.mutated {
                         candidate.advance_revision()?
@@ -184,6 +204,7 @@ impl<S: StorageDriver + Clone> Engine<S> {
                         fields,
                         rows: outcome.rows,
                         tables: outcome.tables,
+                        keys,
                     })
                 }
             }

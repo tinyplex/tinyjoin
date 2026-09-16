@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::{cell::Cell, collections::BTreeMap};
 
 use serde_json::Value;
 
@@ -215,6 +215,7 @@ impl<D: PageDevice> PagedEngine<D> {
             return Ok(ApplyOutcome {
                 revision: self.storage.revision(),
                 tables: vec![],
+                keys: BTreeMap::new(),
             });
         }
         let changes = transaction.changes();
@@ -273,9 +274,11 @@ impl<D: PageDevice> PagedEngine<D> {
                 "Page-native explicit transactions currently support only INSERT, UPDATE, and DELETE",
             ));
         }
-        let PlannedDml { outcome, changes } = {
+        let (PlannedDml { outcome, changes }, keys) = {
             let view = self.read_view_with_work(work);
-            crate::statement::plan_dml(&view, statement)?
+            let planned = crate::statement::plan_dml(&view, statement)?;
+            let keys = crate::statement::changed_keys(&view, &planned.changes)?;
+            (planned, keys)
         };
         let fields =
             crate::statement::write_result_fields(&self.read_view_with_work(work), statement)?;
@@ -292,6 +295,9 @@ impl<D: PageDevice> PagedEngine<D> {
             fields,
             rows: outcome.rows,
             tables: outcome.tables,
+            // Staged work publishes at commit, so these are reported for symmetry with `tables`
+            // and ignored by subscribers until the transaction commits.
+            keys,
         })
     }
 }
@@ -304,6 +310,7 @@ fn execute_query_result(result: QueryResult) -> Result<ExecuteResult> {
         fields: result.fields,
         rows: result.rows,
         tables: vec![],
+        keys: BTreeMap::new(),
     })
 }
 
@@ -314,7 +321,10 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::{Engine, InMemoryStorage, MemoryPageDevice, PAGE_SIZE, PageId, Row};
+    use crate::{
+        Engine, InMemoryStorage, MAX_CHANGED_KEYS_PER_TABLE, MemoryPageDevice, PAGE_SIZE, PageId,
+        Row,
+    };
 
     #[derive(Default)]
     struct DurableState {
@@ -1111,7 +1121,8 @@ mod tests {
             engine.commit_transaction().unwrap(),
             ApplyOutcome {
                 revision,
-                tables: vec![]
+                tables: vec![],
+                keys: BTreeMap::new()
             }
         );
 
@@ -2075,5 +2086,112 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn keys_for(outcome: &ApplyOutcome, table: &str) -> Option<Vec<Value>> {
+        outcome
+            .keys
+            .get(table)
+            .map(|rows| rows.iter().map(|row| row["id"].clone()).collect())
+    }
+
+    #[test]
+    fn a_write_reports_the_primary_keys_it_changed() {
+        let mut engine = page_native_fixture(MemoryPageDevice::new(0).unwrap()).unwrap();
+
+        let inserted = engine
+            .execute_sql(
+                "INSERT INTO accounts (id, email) VALUES (3, 'grace@example.com')",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(inserted.keys["accounts"], vec![row(json!({"id": 3}))]);
+
+        let updated = engine
+            .execute_sql("UPDATE accounts SET active = true WHERE id = 1", &[])
+            .unwrap();
+        assert_eq!(updated.keys["accounts"], vec![row(json!({"id": 1}))]);
+
+        // A delete names the row that is going away, which is the only chance to observe it.
+        let deleted = engine
+            .execute_sql("DELETE FROM accounts WHERE id = 2", &[])
+            .unwrap();
+        assert_eq!(deleted.keys["accounts"], vec![row(json!({"id": 2}))]);
+
+        // A statement that matches nothing changed nothing, and says so.
+        let missed = engine
+            .execute_sql("DELETE FROM accounts WHERE id = 99", &[])
+            .unwrap();
+        assert!(missed.tables.is_empty());
+        assert!(missed.keys.is_empty());
+    }
+
+    #[test]
+    fn a_transaction_reports_every_key_it_committed_exactly_once() {
+        let mut engine = page_native_fixture(MemoryPageDevice::new(0).unwrap()).unwrap();
+
+        engine.begin_transaction().unwrap();
+        engine
+            .execute_sql(
+                "INSERT INTO accounts (id, email) VALUES (3, 'grace@example.com')",
+                &[],
+            )
+            .unwrap();
+        // Touching the same row twice must still report it once: keys are a set.
+        engine
+            .execute_sql("UPDATE accounts SET active = true WHERE id = 3", &[])
+            .unwrap();
+        engine
+            .execute_sql("DELETE FROM accounts WHERE id = 1", &[])
+            .unwrap();
+        let outcome = engine.commit_transaction().unwrap();
+
+        assert_eq!(outcome.tables, vec!["accounts"]);
+        assert_eq!(
+            keys_for(&outcome, "accounts"),
+            Some(vec![json!(1), json!(3)])
+        );
+    }
+
+    /// Seeds `count` accounts in batches small enough to stay inside the SQL token limit.
+    fn seed_accounts<D: PageDevice>(engine: &mut PagedEngine<D>, count: usize) {
+        for batch in (0..count).collect::<Vec<_>>().chunks(200) {
+            let rows = batch
+                .iter()
+                .map(|index| format!("({}, 'user{index}@example.com')", index + 10))
+                .collect::<Vec<_>>()
+                .join(", ");
+            engine
+                .execute_sql(
+                    &format!("INSERT INTO accounts (id, email) VALUES {rows}"),
+                    &[],
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_write_past_the_reporting_bound_names_no_keys_rather_than_some() {
+        // One statement changing every row is the cheap way to cross the bound; the seeding
+        // inserts above it are batched only to stay inside the SQL token limit.
+        let mut engine = page_native_fixture(MemoryPageDevice::new(0).unwrap()).unwrap();
+        seed_accounts(&mut engine, MAX_CHANGED_KEYS_PER_TABLE + 1);
+        let outcome = engine
+            .execute_sql("UPDATE accounts SET active = true", &[])
+            .unwrap();
+
+        // The table still reports as changed; only the per-row detail is withheld, so a
+        // subscriber re-reads rather than mistaking a partial list for a complete one.
+        assert_eq!(outcome.tables, vec!["accounts"]);
+        assert!(!outcome.keys.contains_key("accounts"));
+
+        // Exactly at the bound the keys are still reported in full.
+        let mut engine = page_native_fixture(MemoryPageDevice::new(0).unwrap()).unwrap();
+        // The fixture already holds two accounts, so seed the remainder.
+        seed_accounts(&mut engine, MAX_CHANGED_KEYS_PER_TABLE - 2);
+        let outcome = engine
+            .execute_sql("UPDATE accounts SET active = true", &[])
+            .unwrap();
+        assert_eq!(outcome.keys["accounts"].len(), MAX_CHANGED_KEYS_PER_TABLE);
     }
 }

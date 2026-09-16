@@ -397,10 +397,14 @@ impl<D: PageDevice> PagedStorage<D> {
         changes: &[RowChange],
         touched_tables: BTreeSet<String>,
     ) -> Result<ApplyOutcome> {
+        // Keys are projected before the write-set is applied, while every schema the changes
+        // refer to is still readable from this storage.
+        let keys = crate::statement::changed_keys(self, changes)?;
         let revision = self.execute_row_changes(changes)?;
         Ok(ApplyOutcome {
             revision,
             tables: touched_tables.into_iter().collect(),
+            keys,
         })
     }
 

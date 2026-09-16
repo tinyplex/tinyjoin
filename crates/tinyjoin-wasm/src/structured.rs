@@ -1,4 +1,4 @@
-use std::mem::size_of;
+use std::{collections::BTreeMap, mem::size_of};
 
 use js_sys::{Array, Object, Reflect};
 use serde::Deserialize;
@@ -192,6 +192,7 @@ fn build_apply_outcome(outcome: &ApplyOutcome) -> Result<JsValue> {
         &JsValue::from_f64(outcome.revision as f64),
     )?;
     set(&value, "tables", &build_strings(&outcome.tables)?.into())?;
+    set(&value, "keys", &build_changed_keys(&outcome.keys)?)?;
     Ok(value.into())
 }
 
@@ -210,6 +211,7 @@ fn build_execute_result(result: &ExecuteResult) -> Result<JsValue> {
     set(&value, "fields", &build_fields(&result.fields)?.into())?;
     set(&value, "rows", &build_rows(&result.rows)?.into())?;
     set(&value, "tables", &build_strings(&result.tables)?.into())?;
+    set(&value, "keys", &build_changed_keys(&result.keys)?)?;
     Ok(value.into())
 }
 
@@ -226,6 +228,16 @@ fn build_fields(fields: &[ResultField]) -> Result<Array> {
         values.set(index as u32, value.into());
     }
     Ok(values)
+}
+
+/// Builds the per-table changed-key map. A table appears only when its complete key set is known,
+/// so an absent table means "changed, but re-read it" rather than "unchanged".
+fn build_changed_keys(keys: &BTreeMap<String, Vec<Row>>) -> Result<JsValue> {
+    let value = record();
+    for (table, rows) in keys {
+        set(&value, table, &build_rows(rows)?.into())?;
+    }
+    Ok(value.into())
 }
 
 fn build_rows(rows: &[Row]) -> Result<Array> {
@@ -406,6 +418,16 @@ impl Measure {
         Ok(())
     }
 
+    fn changed_keys(&mut self, keys: &BTreeMap<String, Vec<Row>>) -> Result<()> {
+        self.retain(JS_OBJECT_OVERHEAD)?;
+        for (table, rows) in keys {
+            self.operation()?;
+            self.string(table)?;
+            self.rows(rows)?;
+        }
+        Ok(())
+    }
+
     fn rows(&mut self, rows: &[Row]) -> Result<()> {
         self.array(rows.len())?;
         for row in rows {
@@ -466,9 +488,10 @@ impl Measure {
 
     fn apply_outcome(&mut self, outcome: &ApplyOutcome) -> Result<()> {
         safe_number(outcome.revision)?;
-        self.result_object(&["revision", "tables"])?;
+        self.result_object(&["revision", "tables", "keys"])?;
         self.raw(8)?;
-        self.strings(&outcome.tables)
+        self.strings(&outcome.tables)?;
+        self.changed_keys(&outcome.keys)
     }
 
     fn execute_result(&mut self, result: &ExecuteResult) -> Result<()> {
@@ -476,13 +499,14 @@ impl Measure {
         let row_count = u64::try_from(result.row_count).map_err(|_| serialization())?;
         safe_number(row_count)?;
         self.result_object(&[
-            "command", "revision", "rowCount", "fields", "rows", "tables",
+            "command", "revision", "rowCount", "fields", "rows", "tables", "keys",
         ])?;
         self.string(&result.command)?;
         self.raw(16)?;
         self.fields(&result.fields)?;
         self.rows(&result.rows)?;
-        self.strings(&result.tables)
+        self.strings(&result.tables)?;
+        self.changed_keys(&result.keys)
     }
 }
 
@@ -565,6 +589,7 @@ mod tests {
             }],
             rows: vec![Map::from_iter([("value".into(), json!([true, null, 1.5]))])],
             tables: vec![],
+            keys: BTreeMap::new(),
         };
         let mut measure = Measure::default();
         measure.execute_result(&valid).unwrap();
@@ -576,6 +601,7 @@ mod tests {
             fields: vec![],
             rows: vec![],
             tables: vec![],
+            keys: BTreeMap::new(),
         };
         assert_eq!(
             Measure::default()
@@ -595,6 +621,7 @@ mod tests {
                 Value::String("x".repeat(MAX_BYTES)),
             )])],
             tables: vec![],
+            keys: BTreeMap::new(),
         };
         assert_eq!(
             Measure::default()
@@ -620,6 +647,7 @@ mod tests {
                 json!({"nested": [true, null, 1.5, "value"]}),
             )])],
             tables: vec!["items".into()],
+            keys: BTreeMap::new(),
         };
         let mut measure = Measure::default();
         measure.execute_result(&result).unwrap();

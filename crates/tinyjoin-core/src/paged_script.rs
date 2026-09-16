@@ -179,6 +179,8 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
     }
 
     fn execute_write(&mut self, statement: &WriteStatement) -> Result<ExecuteResult> {
+        // Only a row mutation reports keys; DDL changes a table without naming rows.
+        let mut keys = BTreeMap::new();
         let outcome = match statement {
             WriteStatement::CreateTable {
                 schema,
@@ -248,6 +250,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             | WriteStatement::Delete { .. } => {
                 let PlannedDml { outcome, changes } = crate::statement::plan_dml(self, statement)?;
                 if outcome.mutated {
+                    keys = crate::statement::changed_keys(self, &changes)?;
                     self.apply_changes(&changes)?;
                 }
                 outcome
@@ -265,6 +268,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             fields,
             rows: outcome.rows,
             tables: outcome.tables,
+            keys,
         })
     }
 
@@ -931,6 +935,7 @@ fn execute_query_result(result: QueryResult) -> Result<ExecuteResult> {
         fields: result.fields,
         rows: result.rows,
         tables: vec![],
+        keys: BTreeMap::new(),
     })
 }
 

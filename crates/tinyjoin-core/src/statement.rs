@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 
 use serde_json::{Map, Number, Value};
@@ -16,8 +16,9 @@ use crate::storage::{
     validate_primary_storage_key_bound, validate_value,
 };
 use crate::{
-    ColumnDefinition, ColumnType, EngineError, Predicate, Result, ResultField, Row, RowChange,
-    SelectPlan, StorageReader, TableDefinition, VisitControl, VisitOutcome,
+    ColumnDefinition, ColumnType, EngineError, MAX_CHANGED_KEYS_PER_TABLE, Predicate, Result,
+    ResultField, Row, RowChange, SelectPlan, StorageReader, TableDefinition, VisitControl,
+    VisitOutcome,
 };
 
 const MAX_COLUMNS: usize = 256;
@@ -131,35 +132,168 @@ pub(crate) fn parse_tokens(
         .map(Statement::Write)
 }
 
+/// Applies one write statement, reporting both its outcome and the primary keys it changed.
 #[cfg(test)]
 pub(crate) fn execute<S: StorageDriver>(
     storage: &mut S,
     statement: &WriteStatement,
-) -> Result<WriteOutcome> {
+) -> Result<(WriteOutcome, BTreeMap<String, Vec<Row>>)> {
     match statement {
         WriteStatement::CreateTable {
             schema,
             if_not_exists,
-        } => create_table(storage, schema, *if_not_exists),
+        } => create_table(storage, schema, *if_not_exists).map(no_changed_keys),
         WriteStatement::CreateIndex {
             definition,
             if_not_exists,
-        } => create_index(storage, definition, *if_not_exists),
-        WriteStatement::DropTable { table, if_exists } => drop_table(storage, table, *if_exists),
-        WriteStatement::DropIndex { name, if_exists } => drop_index(storage, name, *if_exists),
+        } => create_index(storage, definition, *if_not_exists).map(no_changed_keys),
+        WriteStatement::DropTable { table, if_exists } => {
+            drop_table(storage, table, *if_exists).map(no_changed_keys)
+        }
+        WriteStatement::DropIndex { name, if_exists } => {
+            drop_index(storage, name, *if_exists).map(no_changed_keys)
+        }
         WriteStatement::AddColumn {
             table,
             column,
             if_not_exists,
-        } => add_column(storage, table, column, *if_not_exists),
+        } => add_column(storage, table, column, *if_not_exists).map(no_changed_keys),
         WriteStatement::Insert { .. }
         | WriteStatement::Update { .. }
         | WriteStatement::Delete { .. } => {
             let PlannedDml { outcome, changes } = plan_dml(storage, statement)?;
+            let keys = changed_keys(storage, &changes)?;
             storage.apply_row_changes_unrevisioned(changes)?;
-            Ok(outcome)
+            Ok((outcome, keys))
         }
     }
+}
+
+/// Orders a table's changed keys canonically.
+///
+/// Changed keys are a set: the paged and in-memory engines reach the same set by different routes
+/// (one applies a whole transaction write-set, the other accumulates statement by statement), so
+/// the reported order must not depend on which engine produced it. `Row` is a sorted map, so its
+/// serialization is canonical and usable as the sort key.
+fn sort_changed_keys(keys: &mut [Row]) {
+    keys.sort_by_cached_key(|key| Value::Object(key.clone()).to_string());
+}
+
+#[cfg(test)]
+/// Pairs a DDL outcome with an empty key set: DDL changes a table without naming rows.
+fn no_changed_keys(outcome: WriteOutcome) -> (WriteOutcome, BTreeMap<String, Vec<Row>>) {
+    (outcome, BTreeMap::new())
+}
+
+/// Collects the primary keys a planned write-set touches, per table.
+///
+/// A table whose change count exceeds [`MAX_CHANGED_KEYS_PER_TABLE`] is dropped entirely rather
+/// than reported partially, so a consumer can read the presence of a table as "this is every key
+/// that changed". Keys are projected from the row the change carries, so a delete reports the row
+/// that is going away and an upsert reports the row that replaces it.
+pub(crate) fn changed_keys(
+    storage: &dyn StorageReader,
+    changes: &[RowChange],
+) -> Result<BTreeMap<String, Vec<Row>>> {
+    let mut primary_keys: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // `None` marks a table that overflowed and must report nothing.
+    let mut collected: BTreeMap<String, Option<Vec<Row>>> = BTreeMap::new();
+    for change in changes {
+        let (table, row) = match change {
+            RowChange::Upsert { table, row } => (table, row),
+            RowChange::Delete { table, key } => (table, key),
+        };
+        let entry = collected
+            .entry(table.clone())
+            .or_insert_with(|| Some(vec![]));
+        let Some(keys) = entry else {
+            continue;
+        };
+        if keys.len() >= MAX_CHANGED_KEYS_PER_TABLE {
+            *entry = None;
+            continue;
+        }
+        let columns = match primary_keys.get(table) {
+            Some(columns) => columns,
+            None => {
+                let schema = storage.table_schema(table)?;
+                primary_keys
+                    .entry(table.clone())
+                    .or_insert(schema.primary_key)
+            }
+        };
+        let mut key = Row::new();
+        for column in columns {
+            // A planned change always carries its table's key columns; a row that somehow does not
+            // is reported without them rather than failing an otherwise valid write.
+            if let Some(value) = row.get(column) {
+                key.insert(column.clone(), value.clone());
+            }
+        }
+        // One statement can touch a key more than once; a subscriber only needs to know it moved.
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    Ok(collected
+        .into_iter()
+        .filter_map(|(table, keys)| {
+            keys.map(|mut keys| {
+                sort_changed_keys(&mut keys);
+                (table, keys)
+            })
+        })
+        .collect())
+}
+
+#[cfg(test)]
+/// Accumulates one statement's reported keys into a transaction's running set.
+///
+/// `tables` is the statement's authoritative changed-table list. A table that changed but reported
+/// no keys overflowed, and poisons the running set for that table: once any statement in a
+/// transaction cannot name its keys, the transaction as a whole cannot either.
+pub(crate) fn merge_changed_keys(
+    accumulated: &mut BTreeMap<String, Option<Vec<Row>>>,
+    tables: &[String],
+    incoming: &BTreeMap<String, Vec<Row>>,
+) {
+    for table in tables {
+        let entry = accumulated
+            .entry(table.clone())
+            .or_insert_with(|| Some(vec![]));
+        let Some(incoming_keys) = incoming.get(table) else {
+            *entry = None;
+            continue;
+        };
+        let Some(keys) = entry else {
+            continue;
+        };
+        for key in incoming_keys {
+            if keys.len() >= MAX_CHANGED_KEYS_PER_TABLE {
+                *entry = None;
+                break;
+            }
+            if !keys.contains(key) {
+                keys.push(key.clone());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+/// Drops the tables that could not report a complete key set, leaving only usable entries.
+pub(crate) fn finish_changed_keys(
+    accumulated: BTreeMap<String, Option<Vec<Row>>>,
+) -> BTreeMap<String, Vec<Row>> {
+    accumulated
+        .into_iter()
+        .filter_map(|(table, keys)| {
+            keys.map(|mut keys| {
+                sort_changed_keys(&mut keys);
+                (table, keys)
+            })
+        })
+        .collect()
 }
 
 /// Plans one SQL row mutation without modifying storage.
@@ -1705,7 +1839,7 @@ mod tests {
         let Statement::Write(statement) = parse(sql, params).unwrap() else {
             panic!("test SQL must be a write statement");
         };
-        execute(storage, &statement).unwrap()
+        execute(storage, &statement).unwrap().0
     }
 
     #[test]
@@ -1891,11 +2025,8 @@ mod tests {
                 execute_sql(&mut storage, insert, &[]);
                 storage.reset_counts();
                 let sql = format!("{command} WHERE {predicate} RETURNING id");
-                let outcome = execute_sql(
-                    &mut storage,
-                    &sql,
-                    &[json!("x".repeat(parameter_bytes))],
-                );
+                let outcome =
+                    execute_sql(&mut storage, &sql, &[json!("x".repeat(parameter_bytes))]);
                 assert_eq!(outcome.row_count, 0, "{sql}");
                 assert!(outcome.rows.is_empty(), "{sql}");
                 assert_eq!(storage.access_counts(), (1, 0), "{sql}");

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -158,10 +160,17 @@ pub(crate) struct SelectPlan {
     pub(crate) offset: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ApplyOutcome {
     pub revision: u64,
     pub tables: Vec<String>,
+    /// The primary keys changed in each table, for the tables whose complete set is known.
+    ///
+    /// `tables` remains the authoritative list of what changed. A table is present here only when
+    /// every one of its changed keys fits within [`MAX_CHANGED_KEYS_PER_TABLE`]; a table that
+    /// changed more rows than that is absent, and a subscriber must re-read it instead. Reporting
+    /// keys is therefore a bounded best effort that can never grow with the size of a write.
+    pub keys: BTreeMap<String, Vec<Row>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -171,7 +180,7 @@ pub(crate) struct QueryResult {
     pub(crate) rows: Vec<Row>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ExecuteResult {
     pub command: String,
     pub revision: u64,
@@ -179,4 +188,13 @@ pub struct ExecuteResult {
     pub fields: Vec<ResultField>,
     pub rows: Vec<Row>,
     pub tables: Vec<String>,
+    /// Changed primary keys per table, under the same bounded contract as [`ApplyOutcome::keys`].
+    pub keys: BTreeMap<String, Vec<Row>>,
 }
+
+/// The most changed primary keys one table may report in a single change notification.
+///
+/// A write that exceeds this reports no keys for that table rather than a partial set, so a
+/// subscriber never mistakes a truncated list for a complete one. The bound keeps a change
+/// notification's size independent of how many rows a statement touched.
+pub const MAX_CHANGED_KEYS_PER_TABLE: usize = 1_000;
