@@ -787,7 +787,7 @@ struct ConflictIndex {
     written: HashSet<String>,
     /// Existing primary keys by index key, collected with one scan when the storage view cannot
     /// visit this index directly, as inside a transaction.
-    scanned: Option<HashMap<String, Row>>,
+    scanned: Option<BTreeMap<String, Row>>,
 }
 
 /// A validated `ON CONFLICT` clause for one table.
@@ -812,87 +812,75 @@ impl ConflictPlan {
         schema: &TableDefinition,
         clause: &OnConflict,
     ) -> Result<Self> {
-        let unique_indexes = storage
-            .indexes_for_table(&schema.name)?
-            .into_iter()
-            .filter(|index| index.unique);
-        let same_columns = |left: &[String], right: &[String]| {
-            let left = left.iter().collect::<HashSet<_>>();
-            left.len() == right.len() && right.iter().all(|column| left.contains(column))
-        };
-        let (primary, indexes) = match &clause.target {
-            None => (true, unique_indexes.collect::<Vec<_>>()),
-            Some(target) => {
-                validate_named_columns(schema, target)?;
-                if same_columns(target, &schema.primary_key) {
-                    (true, vec![])
-                } else {
-                    let index = unique_indexes
-                        .filter(|index| same_columns(target, &index.columns))
-                        .min_by(|left, right| left.name.cmp(&right.name))
-                        .ok_or_else(|| {
-                            EngineError::invalid_query(format!(
-                                "ON CONFLICT ({}) does not match the primary key or a unique index of `{}`",
-                                target.join(", "),
-                                schema.name
-                            ))
-                        })?;
-                    (false, vec![index])
-                }
+        let mut primary = true;
+        let mut indexes = Vec::new();
+        for definition in storage.indexes_for_table(&schema.name)? {
+            if definition.unique {
+                indexes.push(ConflictIndex {
+                    definition,
+                    written: HashSet::new(),
+                    scanned: None,
+                });
             }
-        };
+        }
+        if let Some(target) = &clause.target {
+            validate_named_columns(schema, target)?;
+            let same_columns = |columns: &[String]| {
+                columns.len() == target.len()
+                    && columns.iter().all(|column| target.contains(column))
+            };
+            primary = same_columns(&schema.primary_key);
+            // Index names are unique, so keeping the first match is deterministic.
+            indexes.retain(|index| !primary && same_columns(&index.definition.columns));
+            indexes.truncate(1);
+            if !primary && indexes.is_empty() {
+                return Err(EngineError::invalid_query(format!(
+                    "The ON CONFLICT target does not match the primary key or a unique index of `{}`",
+                    schema.name
+                )));
+            }
+        }
         let updates = match &clause.action {
             ConflictAction::Nothing => None,
             ConflictAction::Update(assignments) => {
-                validate_named_columns(
-                    schema,
-                    &assignments
+                let mut resolved = Vec::with_capacity(assignments.len());
+                for (column, value) in assignments {
+                    if resolved
                         .iter()
-                        .map(|(column, _)| column.clone())
-                        .collect::<Vec<_>>(),
-                )?;
-                Some(
-                    assignments
-                        .iter()
-                        .map(|(column, value)| {
+                        .any(|(assigned, _): &(String, _)| assigned == column)
+                    {
+                        return Err(EngineError::invalid_query(format!(
+                            "Column `{column}` is named more than once"
+                        )));
+                    }
+                    // `column_default` also rejects an unknown column.
+                    let default = column_default(schema, column)?;
+                    let value = match value {
+                        ConflictValue::Value(SqlValue::Value(value)) => {
                             let definition = schema
                                 .columns
                                 .iter()
                                 .find(|definition| definition.name == *column)
-                                .expect("assignment columns were validated above");
-                            Ok((
-                                column.clone(),
-                                match value {
-                                    ConflictValue::Value(SqlValue::Value(value)) => {
-                                        validate_value(definition, value, &schema.name)?;
-                                        ResolvedConflictValue::Value(value.clone())
-                                    }
-                                    ConflictValue::Value(SqlValue::Default) => {
-                                        ResolvedConflictValue::Value(column_default(
-                                            schema, column,
-                                        )?)
-                                    }
-                                    ConflictValue::Excluded(source) => {
-                                        column_default(schema, source)?;
-                                        ResolvedConflictValue::Excluded(source.clone())
-                                    }
-                                },
-                            ))
-                        })
-                        .collect::<Result<Vec<_>>>()?,
-                )
+                                .expect("column_default found the column");
+                            validate_value(definition, value, &schema.name)?;
+                            ResolvedConflictValue::Value(value.clone())
+                        }
+                        ConflictValue::Value(SqlValue::Default) => {
+                            ResolvedConflictValue::Value(default)
+                        }
+                        ConflictValue::Excluded(source) => {
+                            column_default(schema, source)?;
+                            ResolvedConflictValue::Excluded(source.clone())
+                        }
+                    };
+                    resolved.push((column.clone(), value));
+                }
+                Some(resolved)
             }
         };
         Ok(Self {
             primary,
-            indexes: indexes
-                .into_iter()
-                .map(|definition| ConflictIndex {
-                    definition,
-                    written: HashSet::new(),
-                    scanned: None,
-                })
-                .collect(),
+            indexes,
             updates,
         })
     }
@@ -1045,9 +1033,9 @@ impl ConflictIndex {
         storage: &dyn StorageReader,
         schema: &TableDefinition,
         work_bytes: &mut usize,
-    ) -> Result<HashMap<String, Row>> {
+    ) -> Result<BTreeMap<String, Row>> {
         let mut scanned = 0usize;
-        let mut keys = HashMap::new();
+        let mut keys = BTreeMap::new();
         let outcome = storage.visit_table(&schema.name, &mut |row| {
             scanned = scanned.saturating_add(1);
             if scanned > MAX_DML_SCAN_ROWS {
