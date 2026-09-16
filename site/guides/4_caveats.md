@@ -31,8 +31,9 @@ The omissions most likely to matter are:
 - No subqueries, CTEs, or `UNION`/`INTERSECT`/`EXCEPT`.
 - No arithmetic, concatenation, casts, or scalar functions. Values are not a
   general expression language.
-- No `LIKE`/`ILIKE`, `ANY`/`ALL`, or JSON path operators, so substring search
-  and pattern matching have to happen outside SQL.
+- No regular expressions, full-text search, `ANY`/`ALL`, or JSON path
+  operators. `LIKE` and `ILIKE` scan rather than use an index, and `ILIKE`
+  folds only ASCII letters.
 - No `INSERT ... SELECT`, `MERGE`, or `UPDATE ... FROM`, and an `ON CONFLICT`
   upsert cannot compute a value from the row it updates.
 - No sequences, `SERIAL`, or generated identity. Generate text identifiers in

@@ -50,6 +50,17 @@ or change its primary key, and `DO UPDATE ... WHERE` is not supported.
 rows, so a statement that skips every row reports no change. See
 [upserts](/guides/sql-compatibility/#upserts).
 
+`LIKE`, `ILIKE`, and their `NOT` forms match a text column against a pattern in
+which `%` matches any run of characters and `_` exactly one, so a search box no
+longer has to filter rows in JavaScript: `WHERE title ILIKE $1` with
+`'%' + term + '%'`. Backslash escapes a literal `%` or `_` unless an `ESCAPE`
+clause names another character, and a pattern that ends in its escape
+character is rejected. A search term from user input should have its own `%`,
+`_`, and backslash characters escaped before being wrapped in wildcards.
+`ILIKE` folds only ASCII letters, as PostgreSQL does under the C locale, which
+is consistent with TinyJoin's code-point ordering, so `'É' ILIKE 'é'` is false.
+Pattern matching always scans candidate rows rather than using an index.
+
 ## v0.2.0
 
 Subscriptions and statement results now report **which rows changed**, not only

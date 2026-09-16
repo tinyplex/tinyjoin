@@ -708,6 +708,22 @@ fn validate_join_predicate(predicate: &Predicate, relations: &[Relation]) -> Res
             resolve_column(&parse_column_ref_text(column), relations)?;
             Ok(())
         }
+        Predicate::Like {
+            column,
+            pattern,
+            escape,
+            case_insensitive,
+        } => {
+            let reference = parse_column_ref_text(column);
+            let (_, _, definition) = resolve_column(&reference, relations)?;
+            crate::query::validate_like(
+                definition,
+                pattern,
+                escape.as_ref(),
+                *case_insensitive,
+                "joined tables",
+            )
+        }
         Predicate::In { column, values } => {
             let reference = parse_column_ref_text(column);
             let (_, _, definition) = resolve_column(&reference, relations)?;

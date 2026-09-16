@@ -206,7 +206,8 @@ each statement retains the ordinary parser limits below.
 | `IN (...)`, `NOT IN (...)` | Supported | One to 1,024 literals or parameters with SQL null behavior. |
 | `BETWEEN`, `NOT BETWEEN` | Narrow | `column BETWEEN low AND high` means exactly `column >= low AND column <= high`, and `NOT BETWEEN` means `column < low OR column > high`, with those comparisons' type and null rules. Each bound is a literal or parameter. There is no `SYMMETRIC` form, so a reversed range matches nothing. |
 | Arithmetic, concatenation, casts, scalar functions | No | Values are not a general expression language. |
-| `LIKE`, `ILIKE`, `IS DISTINCT FROM`, `ANY`, `ALL` | No | These PostgreSQL predicate families are not implemented. |
+| `LIKE`, `NOT LIKE`, `ILIKE`, `NOT ILIKE` | Narrow | Matches a whole text column value against a literal or parameter pattern, where `%` matches any run of characters and `_` exactly one character. Backslash escapes a wildcard unless `ESCAPE` names another single character, or `''` for none; a pattern ending in its escape character is rejected. `ILIKE` folds only ASCII letters, as PostgreSQL does under the C locale. A `NULL` operand is unknown. Pattern matches never use an index. |
+| `IS DISTINCT FROM`, `SIMILAR TO`, `ANY`, `ALL` | No | These PostgreSQL predicate families are not implemented. |
 | JSON/path operators | No | JSON can be stored, returned, and compared for structural equality only. |
 
 The right side of an ordinary predicate is a literal or parameter, not another
@@ -326,7 +327,7 @@ and values permit an exact lookup. This also sees staged changes inside a
 transaction, and the complete predicate is still checked. `SELECT` can use
 secondary-index postings for complete equality on every indexed column. Other
 `UPDATE` and `DELETE` predicates scan; partial composite matches, ranges,
-`OR`, and `NOT` also fall back to scans.
+pattern matches, `OR`, and `NOT` also fall back to scans.
 
 ## Aggregates and joins
 

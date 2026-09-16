@@ -391,10 +391,16 @@ fn assert_filter_matrix(
                 format!("UPDATE items SET marked = true WHERE {condition} RETURNING id"),
                 format!("DELETE FROM items WHERE {condition} RETURNING id"),
             ];
-            for params in parameter_sets {
+            // A prepared statement takes exactly as many parameters as the filter references.
+            let arity = (1..=9)
+                .filter(|index| filter.sql.contains(&format!("${index}")))
+                .max()
+                .unwrap_or(0);
+            for model_params in parameter_sets {
+                let params = &model_params[..arity];
                 for prepared in [false, true] {
                     let context = format!(
-                        "{kind}, indexed={indexed}, {}, params={params:?}, prepared={prepared}",
+                        "{kind}, indexed={indexed}, {}, params={model_params:?}, prepared={prepared}",
                         filter.sql
                     );
                     engine.begin_transaction().unwrap();
@@ -411,7 +417,7 @@ fn assert_filter_matrix(
                     for (family, sql) in statements.iter().enumerate() {
                         let expected = ids(&model
                             .iter()
-                            .filter(|row| (filter.matches)(&row["v"], params) == Some(true))
+                            .filter(|row| (filter.matches)(&row["v"], model_params) == Some(true))
                             .cloned()
                             .collect::<Vec<_>>());
                         let result = execute(&mut engine, prepared, sql, params)
@@ -487,6 +493,96 @@ fn between_agrees_with_its_model_across_families_indexes_and_preparation() {
             .collect::<Vec<_>>();
         assert_filter_matrix(kind, &values, &filters, &parameter_sets);
     }
+}
+
+/// An exhaustive recursive `LIKE` model, deliberately unlike the engine's segment matcher.
+fn like_model(text: &[char], pattern: &[char], escape: Option<char>, fold: bool) -> bool {
+    let same = |left: char, right: char| {
+        left == right || (fold && left.is_ascii() && left.eq_ignore_ascii_case(&right))
+    };
+    match pattern {
+        [] => text.is_empty(),
+        [first, literal, rest @ ..] if Some(*first) == escape => {
+            matches!(text, [head, tail @ ..] if same(*head, *literal) && like_model(tail, rest, escape, fold))
+        }
+        ['%', rest @ ..] => {
+            (0..=text.len()).any(|skip| like_model(&text[skip..], rest, escape, fold))
+        }
+        ['_', rest @ ..] => matches!(text, [_, tail @ ..] if like_model(tail, rest, escape, fold)),
+        [literal, rest @ ..] => {
+            matches!(text, [head, tail @ ..] if same(*head, *literal) && like_model(tail, rest, escape, fold))
+        }
+    }
+}
+
+fn like_truth(value: &Value, pattern: &Value, escape: Option<&Value>, fold: bool) -> Truth {
+    let escape = match escape {
+        None => Some('\\'),
+        Some(Value::String(escape)) => escape.chars().next(),
+        Some(_) => return None,
+    };
+    match (value, pattern) {
+        (Value::String(text), Value::String(pattern)) => Some(like_model(
+            &text.chars().collect::<Vec<_>>(),
+            &pattern.chars().collect::<Vec<_>>(),
+            escape,
+            fold,
+        )),
+        _ => None,
+    }
+}
+
+#[test]
+fn like_agrees_with_its_model_across_families_indexes_and_preparation() {
+    let filters = [
+        Filter {
+            sql: "{v} LIKE $1",
+            matches: |value, params| like_truth(value, &params[0], None, false),
+        },
+        Filter {
+            sql: "{v} NOT LIKE $1",
+            matches: |value, params| like_truth(value, &params[0], None, false).map(|truth| !truth),
+        },
+        Filter {
+            sql: "{v} ILIKE $1",
+            matches: |value, params| like_truth(value, &params[0], None, true),
+        },
+        Filter {
+            sql: "NOT ({v} ILIKE $1 ESCAPE $2) OR {v} IS NULL",
+            matches: |value, params| {
+                or(
+                    like_truth(value, &params[0], Some(&params[1]), true).map(|truth| !truth),
+                    Some(value.is_null()),
+                )
+            },
+        },
+    ];
+    let values = ["", "x", "X_%", "é🦀", "Éx\\", "a!b%"].map(|value| json!(value));
+    let patterns = [
+        Value::Null,
+        json!(""),
+        json!("%"),
+        json!("_"),
+        json!("x"),
+        json!("x%"),
+        json!("%🦀"),
+        json!("_É%"),
+        json!("X\\_\\%"),
+        json!("%!%%"),
+        json!("%\\\\"),
+        // A prefix and suffix that overlap in a short value, and a non-ASCII case difference.
+        json!("x%x"),
+        json!("é%"),
+    ];
+    let parameter_sets = patterns
+        .iter()
+        .flat_map(|pattern| {
+            [Value::Null, json!(""), json!("!")]
+                .into_iter()
+                .map(move |escape| vec![pattern.clone(), escape])
+        })
+        .collect::<Vec<_>>();
+    assert_filter_matrix("TEXT", &values, &filters, &parameter_sets);
 }
 
 #[test]

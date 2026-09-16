@@ -1178,6 +1178,34 @@ impl PredicateParser<'_> {
         if self.consume_keyword("between") {
             return self.parse_between(column, negated);
         }
+        let case_insensitive = if self.consume_keyword("like") {
+            Some(false)
+        } else if self.consume_keyword("ilike") {
+            Some(true)
+        } else {
+            None
+        };
+        if let Some(case_insensitive) = case_insensitive {
+            let pattern = self.parse_value()?;
+            let escape = if self.consume_keyword("escape") {
+                Some(self.parse_value()?)
+            } else {
+                None
+            };
+            let predicate = self.node(Predicate::Like {
+                column,
+                pattern,
+                escape,
+                case_insensitive,
+            })?;
+            return if negated {
+                self.node(Predicate::Not {
+                    predicate: Box::new(predicate),
+                })
+            } else {
+                Ok(predicate)
+            };
+        }
         if negated {
             return Err(unsupported_shape());
         }
@@ -1574,6 +1602,14 @@ pub(crate) fn bind_predicate_parameters(
             }
             Ok(())
         }
+        Predicate::Like {
+            pattern, escape, ..
+        } => {
+            bind_prepared_value(pattern, params)?;
+            escape
+                .as_mut()
+                .map_or(Ok(()), |escape| bind_prepared_value(escape, params))
+        }
         Predicate::Not { predicate } => bind_predicate_parameters(Some(predicate), params),
         Predicate::IsNull { .. } => Ok(()),
     }
@@ -1670,6 +1706,32 @@ fn evaluate_predicate(row: &Row, predicate: &Predicate, table: &str) -> Result<T
                 Truth::Unknown
             } else {
                 Truth::False
+            })
+        }
+        Predicate::Like {
+            column,
+            pattern,
+            escape,
+            case_insensitive,
+        } => {
+            let text = row
+                .get(column)
+                .ok_or_else(|| EngineError::column_not_found(column, table))?;
+            let escape = match escape {
+                None => Some(Some('\\')),
+                Some(Value::String(escape)) => Some(escape.chars().next()),
+                Some(_) => None,
+            };
+            Ok(match (text, pattern, escape) {
+                (Value::String(text), Value::String(pattern), Some(escape)) => {
+                    if like_matches(text, pattern, escape, *case_insensitive) {
+                        Truth::True
+                    } else {
+                        Truth::False
+                    }
+                }
+                // Validation admits only text and NULL operands, so anything else is NULL.
+                _ => Truth::Unknown,
             })
         }
         Predicate::And { predicates } => {
@@ -1902,7 +1964,8 @@ pub(crate) fn validate_predicate_columns(
     match predicate {
         Predicate::Comparison { column, .. }
         | Predicate::IsNull { column, .. }
-        | Predicate::In { column, .. } => {
+        | Predicate::In { column, .. }
+        | Predicate::Like { column, .. } => {
             if schema.columns.iter().any(|item| item.name == *column) {
                 Ok(())
             } else {
@@ -1954,6 +2017,18 @@ pub(crate) fn validate_predicate_types(
             }
             Ok(())
         }
+        Predicate::Like {
+            column,
+            pattern,
+            escape,
+            case_insensitive,
+        } => validate_like(
+            column_definition(schema, column, table)?,
+            pattern,
+            escape.as_ref(),
+            *case_insensitive,
+            table,
+        ),
         Predicate::IsNull { .. } => Ok(()),
         Predicate::And { predicates } | Predicate::Or { predicates } => {
             for predicate in predicates {
@@ -1963,6 +2038,135 @@ pub(crate) fn validate_predicate_types(
         }
         Predicate::Not { predicate } => validate_predicate_types(predicate, schema, table),
     }
+}
+
+/// Checks a `LIKE` or `ILIKE` before any row is read, so a malformed pattern fails even when no
+/// row would reach it.
+pub(crate) fn validate_like(
+    definition: &ColumnDefinition,
+    pattern: &Value,
+    escape: Option<&Value>,
+    case_insensitive: bool,
+    table: &str,
+) -> Result<()> {
+    let operator = if case_insensitive { "ILIKE" } else { "LIKE" };
+    if definition.data_type != ColumnType::Text {
+        return Err(EngineError::type_mismatch(format!(
+            "{operator} requires a text column, but `{}` in `{table}` is not text",
+            definition.name
+        )));
+    }
+    if !pattern.is_string() && !pattern.is_null() {
+        return Err(EngineError::type_mismatch(format!(
+            "{operator} requires a text pattern"
+        )));
+    }
+    let escape = match escape {
+        None => Some('\\'),
+        Some(Value::Null) => return Ok(()),
+        Some(Value::String(escape)) => {
+            let mut characters = escape.chars();
+            let escape = characters.next();
+            if characters.next().is_some() {
+                return Err(EngineError::invalid_query(format!(
+                    "{operator} ESCAPE must be empty or a single character"
+                )));
+            }
+            escape
+        }
+        Some(_) => {
+            return Err(EngineError::type_mismatch(format!(
+                "{operator} ESCAPE requires a text value"
+            )));
+        }
+    };
+    if let (Value::String(pattern), Some(escape)) = (pattern, escape) {
+        let mut characters = pattern.chars();
+        while let Some(character) = characters.next() {
+            if character == escape && characters.next().is_none() {
+                return Err(EngineError::invalid_query(format!(
+                    "{operator} pattern must not end with its escape character"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum LikeElement {
+    AnyCharacter,
+    Character(char),
+}
+
+/// Matches a validated `LIKE` pattern against all of `text`.
+///
+/// `ILIKE` folds only ASCII letters, as PostgreSQL does under the C locale. That matches the
+/// code-point collation TinyJoin uses everywhere else and avoids shipping Unicode case tables.
+///
+/// Between unescaped `%` wildcards, each segment matches a fixed number of characters, so taking
+/// the leftmost match of every middle segment always leaves the most room for the rest. That keeps
+/// the work proportional to the text length times the longest segment, with no backtracking.
+fn like_matches(text: &str, pattern: &str, escape: Option<char>, case_insensitive: bool) -> bool {
+    let mut segments = vec![Vec::new()];
+    let mut characters = pattern.chars();
+    while let Some(character) = characters.next() {
+        let segment = segments.last_mut().expect("there is always a segment");
+        if Some(character) == escape {
+            if let Some(escaped) = characters.next() {
+                segment.push(LikeElement::Character(escaped));
+            }
+        } else if character == '%' {
+            segments.push(Vec::new());
+        } else if character == '_' {
+            segment.push(LikeElement::AnyCharacter);
+        } else {
+            segment.push(LikeElement::Character(character));
+        }
+    }
+    let matches_at = |start: usize, segment: &[LikeElement]| -> Option<usize> {
+        let mut end = start;
+        let mut remaining = text[start..].chars();
+        for element in segment {
+            let character = remaining.next()?;
+            if let LikeElement::Character(expected) = element
+                && *expected != character
+                && !(case_insensitive && expected.eq_ignore_ascii_case(&character))
+            {
+                return None;
+            }
+            end += character.len_utf8();
+        }
+        Some(end)
+    };
+
+    let (first, rest) = segments.split_first().expect("there is always a segment");
+    let Some((last, middle)) = rest.split_last() else {
+        return matches_at(0, first) == Some(text.len());
+    };
+    let Some(mut cursor) = matches_at(0, first) else {
+        return false;
+    };
+    for segment in middle.iter().filter(|segment| !segment.is_empty()) {
+        let found = text[cursor..]
+            .char_indices()
+            .map(|(offset, _)| cursor + offset)
+            .find_map(|start| matches_at(start, segment));
+        let Some(end) = found else {
+            return false;
+        };
+        cursor = end;
+    }
+    // The last segment is anchored to the end of the text, a fixed number of characters back.
+    let start = if last.is_empty() {
+        text.len()
+    } else {
+        match text.char_indices().rev().nth(last.len() - 1) {
+            Some((start, _)) => start,
+            None => return false,
+        }
+    };
+    start >= cursor && matches_at(start, last) == Some(text.len())
 }
 
 fn validate_comparison_value(
@@ -2411,6 +2615,150 @@ mod tests {
                 .unwrap()
                 .rows
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn like_matches_whole_text_with_wildcards_escapes_and_folding() {
+        for (text, pattern, escape, case_insensitive, expected) in [
+            ("", "", Some('\\'), false, true),
+            ("", "%", Some('\\'), false, true),
+            ("", "_", Some('\\'), false, false),
+            ("abc", "abc", Some('\\'), false, true),
+            ("abc", "ab", Some('\\'), false, false),
+            ("abc", "a%", Some('\\'), false, true),
+            ("abc", "%c", Some('\\'), false, true),
+            ("abc", "%b%", Some('\\'), false, true),
+            ("abc", "a_c", Some('\\'), false, true),
+            ("abc", "a__c", Some('\\'), false, false),
+            ("abc", "_%_%_", Some('\\'), false, true),
+            ("ab", "_%_%_", Some('\\'), false, false),
+            ("aXbXc", "%X%X%", Some('\\'), false, true),
+            ("aXb", "%X%X%", Some('\\'), false, false),
+            ("seeded", "%ded", Some('\\'), false, true),
+            ("abab", "%ab%ab", Some('\\'), false, true),
+            ("aab", "%ab%ab", Some('\\'), false, false),
+            ("bob", "b%b", Some('\\'), false, true),
+            ("b", "b%b", Some('\\'), false, false),
+            ("mississippi", "m%iss%ppi", Some('\\'), false, true),
+            ("mississippi", "%sip%", Some('\\'), false, true),
+            ("mississippi", "m%ss%ss%ss%", Some('\\'), false, false),
+            ("100%", "100\\%", Some('\\'), false, true),
+            ("1000", "100\\%", Some('\\'), false, false),
+            ("a_b", "a\\_b", Some('\\'), false, true),
+            ("axb", "a\\_b", Some('\\'), false, false),
+            ("a\\b", "a\\\\b", Some('\\'), false, true),
+            ("a%b", "a#%b", Some('#'), false, true),
+            ("a\\b", "a\\b", None, false, true),
+            ("a%", "a%%", Some('%'), false, true),
+            ("ab", "a%%", Some('%'), false, false),
+            ("é🦀", "_🦀", Some('\\'), false, true),
+            ("é🦀", "__", Some('\\'), false, true),
+            ("é🦀", "___", Some('\\'), false, false),
+            ("Hello", "hELLO", Some('\\'), true, true),
+            ("Hello", "hELLO", Some('\\'), false, false),
+            ("Éte", "É_E", Some('\\'), true, true),
+            // Only ASCII letters fold, as under PostgreSQL's C locale.
+            ("ÉTE", "éte", Some('\\'), true, false),
+            ("ß", "SS", Some('\\'), true, false),
+        ] {
+            assert_eq!(
+                like_matches(text, pattern, escape, case_insensitive),
+                expected,
+                "{text:?} LIKE {pattern:?}, escape={escape:?}, case_insensitive={case_insensitive}"
+            );
+        }
+    }
+
+    #[test]
+    fn like_predicates_validate_operands_and_propagate_null() {
+        let database = engine();
+        let ids = |sql: &str, params: &[Value]| {
+            database
+                .query_sql(sql, params)
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|row| row["id"].as_i64().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(
+                "SELECT id FROM posts WHERE title LIKE 't%' ORDER BY id",
+                &[]
+            ),
+            [2, 3]
+        );
+        assert_eq!(
+            ids(
+                "SELECT id FROM posts WHERE title NOT ILIKE $1 ORDER BY id",
+                &[json!("T%")]
+            ),
+            [1]
+        );
+        assert_eq!(
+            ids(
+                "SELECT id FROM posts WHERE title LIKE $1 ESCAPE $2 ORDER BY id",
+                &[json!("_!%%"), json!("!")],
+            ),
+            Vec::<i64>::new()
+        );
+        // A NULL pattern or escape makes the predicate unknown, and so does its negation.
+        for sql in [
+            "SELECT id FROM posts WHERE title LIKE NULL",
+            "SELECT id FROM posts WHERE title NOT LIKE NULL",
+            "SELECT id FROM posts WHERE title NOT LIKE '%' ESCAPE NULL",
+        ] {
+            assert!(ids(sql, &[]).is_empty(), "{sql}");
+        }
+        for (sql, params, code) in [
+            (
+                "SELECT id FROM posts WHERE user_id LIKE '7'",
+                vec![],
+                "TYPE_MISMATCH",
+            ),
+            (
+                "SELECT id FROM posts WHERE title LIKE $1",
+                vec![json!(7)],
+                "TYPE_MISMATCH",
+            ),
+            (
+                "SELECT id FROM posts WHERE title LIKE 'x' ESCAPE $1",
+                vec![json!(true)],
+                "TYPE_MISMATCH",
+            ),
+            (
+                "SELECT id FROM posts WHERE title LIKE 'x' ESCAPE '!!'",
+                vec![],
+                "INVALID_QUERY",
+            ),
+            (
+                "SELECT id FROM posts WHERE title LIKE 'x\\' LIMIT 0",
+                vec![],
+                "INVALID_QUERY",
+            ),
+            (
+                "SELECT id FROM posts WHERE title LIKE 'x!' ESCAPE '!'",
+                vec![],
+                "INVALID_QUERY",
+            ),
+            (
+                "SELECT id FROM posts WHERE title SIMILAR TO 'x'",
+                vec![],
+                "UNSUPPORTED_SQL",
+            ),
+        ] {
+            assert_eq!(
+                database.query_sql(sql, &params).unwrap_err().code,
+                code,
+                "{sql}"
+            );
+        }
+        // Without ESCAPE, backslash escapes; an empty ESCAPE makes it an ordinary character.
+        assert!(
+            database
+                .query_sql("SELECT id FROM posts WHERE title LIKE 'x\\' ESCAPE ''", &[])
+                .is_ok()
         );
     }
 

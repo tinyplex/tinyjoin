@@ -119,6 +119,14 @@ pub(crate) enum Predicate {
         column: String,
         values: Vec<Value>,
     },
+    /// `LIKE`, or `ILIKE` when `case_insensitive`. `escape` is `None` when no `ESCAPE` clause was
+    /// given, which makes backslash the escape character.
+    Like {
+        column: String,
+        pattern: Value,
+        escape: Option<Value>,
+        case_insensitive: bool,
+    },
     And {
         predicates: Vec<Predicate>,
     },
