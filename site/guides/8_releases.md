@@ -61,6 +61,13 @@ character is rejected. A search term from user input should have its own `%`,
 is consistent with TinyJoin's code-point ordering, so `'É' ILIKE 'é'` is false.
 Pattern matching always scans candidate rows rather than using an index.
 
+**Upgrading from v0.2.0 needs no action.** Install, rebuild, and redeploy. The
+Worker protocol stays at version 8 and the page format stays at format 2, so an
+existing database opens with no migration and no OPFS namespace change. The new
+syntax was previously rejected, so statements that already worked keep their
+results. The WebAssembly engine grows by about 11 KiB compressed to carry the
+new SQL.
+
 ## v0.2.0
 
 Subscriptions and statement results now report **which rows changed**, not only
