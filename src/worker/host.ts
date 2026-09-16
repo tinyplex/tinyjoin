@@ -1,9 +1,12 @@
 import {
   asCodedError,
+  finishChangedKeys,
   isRecord,
   isSafeInteger,
   isUndefined,
   mathMax,
+  mergeChangedKeys,
+  type PendingChangedKeys,
 } from '../common.js';
 import {
   PROTOCOL_VERSION,
@@ -64,10 +67,21 @@ export const startWorker = (
   let closed = false;
   let pendingRevision = 0;
   const pendingTables = new Set<string>();
+  const pendingKeys: PendingChangedKeys = new Map();
   let invalidationScheduled = false;
   let activeTransactionId: string | undefined;
   let nextTransactionId = 1;
   let requestTail: Promise<void> = Promise.resolve();
+
+  // A script's statements each report their own keys; union them under the same bound the
+  // engine and the event merge use, so one overflowing statement does not silently truncate.
+  const mergeScriptKeys = (results: {tables: string[]; keys: ApplyOutcome['keys']}[]) => {
+    const merged: PendingChangedKeys = new Map();
+    for (const result of results) {
+      mergeChangedKeys(merged, result.tables, result.keys);
+    }
+    return finishChangedKeys(merged);
+  };
 
   const respondWith = (message: WorkerResponse): void =>
     scope.postMessage(message);
@@ -77,6 +91,7 @@ export const startWorker = (
     for (const table of outcome.tables) {
       pendingTables.add(table);
     }
+    mergeChangedKeys(pendingKeys, outcome.tables, outcome.keys);
     if (invalidationScheduled || pendingTables.size === 0) {
       return;
     }
@@ -94,9 +109,11 @@ export const startWorker = (
         payload: {
           revision: pendingRevision,
           tables: [...pendingTables].sort(),
+          keys: finishChangedKeys(pendingKeys),
         },
       };
       pendingTables.clear();
+      pendingKeys.clear();
       scope.postMessage(event);
     }, 0);
   };
@@ -182,6 +199,8 @@ export const startWorker = (
         emitUnlessInTransaction({
           revision: mathMax(...results.map((result) => result.revision), 0),
           tables: [...new Set(results.flatMap((result) => result.tables))],
+          // Each statement in a script reports its own keys; the event merge unions them.
+          keys: mergeScriptKeys(results),
         });
         return results;
       }

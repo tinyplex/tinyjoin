@@ -10,6 +10,7 @@ export type {
 } from './client/client.js';
 export {ClientError} from './client/error.js';
 export type {
+  ChangedKeys,
   JsonPrimitive,
   JsonValue,
   QueryOptions,

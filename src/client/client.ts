@@ -1,11 +1,14 @@
 import {
+  finishChangedKeys,
   isFunction,
   isRecord,
   isString,
   isUndefined,
   mathMax,
+  mergeChangedKeys,
   objFreeze,
   ownKeys,
+  type PendingChangedKeys,
 } from '../common.js';
 import {createDefaultWorker, createUrlWorker} from '../default-worker.js';
 import {
@@ -194,6 +197,7 @@ const createClient = (options: ClientOptions): Client => {
   let transactionTail: Promise<void> = Promise.resolve();
   let transactionActive = false;
   let pendingNotification: TablesChangedEvent | undefined;
+  const pendingKeys: PendingChangedKeys = new Map();
 
   // Cross-tab notifications can arrive while this Client has a callback open
   // (or is waiting to begin one). Defer listeners so their documented re-query
@@ -202,6 +206,7 @@ const createClient = (options: ClientOptions): Client => {
     if (transactionActive || closing || !pendingNotification) return;
     const event = pendingNotification;
     pendingNotification = undefined;
+    pendingKeys.clear();
     for (const subscription of subscriptions) {
       if (
         event.reset || !subscription.tables ||
@@ -330,6 +335,7 @@ const createClient = (options: ClientOptions): Client => {
       closed = true;
       subscriptions.clear();
       pendingNotification = undefined;
+      pendingKeys.clear();
       rpc.dispose();
     }
   };
@@ -338,11 +344,22 @@ const createClient = (options: ClientOptions): Client => {
     if (event.event === 'tablesChanged' || event.event === 'resync') {
       noteRevision(event.payload.revision);
       const reset = event.event === 'resync' || pendingNotification?.reset;
+      if (reset) {
+        pendingKeys.clear();
+      } else {
+        mergeChangedKeys(
+          pendingKeys,
+          event.payload.tables,
+          event.payload.keys,
+        );
+      }
       pendingNotification = {
         revision,
         tables: reset ? [] : [...new Set([
           ...pendingNotification?.tables ?? [], ...event.payload.tables,
         ])],
+        // A reset requires a full re-query, so naming individual keys would be misleading.
+        keys: reset ? {} : finishChangedKeys(pendingKeys),
         ...(reset ? {reset: true} : {}),
       };
       flushNotifications();
@@ -842,6 +859,7 @@ const toResults = <RowType>(
     : {}),
   revision: result.revision,
   tables: result.tables,
+  keys: result.keys,
 });
 
 const rowsAsArrays = (

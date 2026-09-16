@@ -16,7 +16,7 @@ import {
   ownKeys,
 } from './common.js';
 
-export const PROTOCOL_VERSION = 7 as const;
+export const PROTOCOL_VERSION = 8 as const;
 
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue =
@@ -47,13 +47,25 @@ export interface Results<RowType = Row> {
   revision: number;
   /** TinyJoin extension: tables changed by this statement. */
   tables: string[];
+  /** TinyJoin extension: primary keys changed by this statement, per table. */
+  keys: ChangedKeys;
 }
 
 export type StorageOptions = {kind: 'memory'} | {kind: 'opfs'; name: string};
 
+/**
+ * The primary keys changed in each table, for the tables whose complete set is known.
+ *
+ * A table is present only when every key it changed fits the engine's per-table bound; a table
+ * that changed more rows than that is absent, so an absent table means "changed, re-read it"
+ * rather than "unchanged". The changed-table list stays authoritative either way.
+ */
+export type ChangedKeys = {[table: string]: Row[]};
+
 export interface ApplyOutcome {
   revision: number;
   tables: string[];
+  keys: ChangedKeys;
 }
 
 export interface SqlResult<RowType extends object = Row> {
@@ -63,6 +75,7 @@ export interface SqlResult<RowType extends object = Row> {
   rowCount: number;
   rows: RowType[];
   tables: string[];
+  keys: ChangedKeys;
 }
 
 export interface SerializedError {
@@ -159,6 +172,7 @@ const SQL_RESULT_KEYS = [
   'rowCount',
   'rows',
   'tables',
+  'keys',
 ] as const;
 
 export const isWorkerResponse = (value: unknown): value is WorkerResponse =>
@@ -373,9 +387,23 @@ const isJsonValues = (value: unknown): value is JsonValue[] =>
 
 const isApplyOutcome = (value: unknown): value is ApplyOutcome =>
   isRecord(value) &&
-  hasExactKeys(value, ['revision', 'tables']) &&
+  hasExactKeys(value, ['revision', 'tables', 'keys']) &&
   isCount(value.revision) &&
-  isStrings(value.tables);
+  isStrings(value.tables) &&
+  isChangedKeys(value.keys);
+
+// Changed keys are reported only for tables that also appear in `tables`, so the walk is bounded
+// by the same per-table key bound the engine applied when producing them.
+const isChangedKeys = (
+  value: unknown,
+  validation?: JsonValidation,
+): value is ChangedKeys =>
+  isPlainRecord(value) &&
+  objValues(value).every((rows) =>
+    validation
+      ? isDenseArray(rows, (row) => isRow(row, validation))
+      : arrayIsArray(rows),
+  );
 
 const isRow = (value: unknown, validation: JsonValidation): value is Row =>
   validation.step() &&
@@ -406,7 +434,8 @@ const isSqlResult = (
   (validation
     ? isDenseArray(value.rows, (row) => isRow(row, validation))
     : arrayIsArray(value.rows)) &&
-  isStrings(value.tables, validation?.step);
+  isStrings(value.tables, validation?.step) &&
+  isChangedKeys(value.keys, validation);
 
 type JsonValidation = ReturnType<typeof createJsonValidation>;
 

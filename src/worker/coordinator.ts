@@ -129,7 +129,7 @@ const startCoordinator = (
       scope.postMessage({
         v: PROTOCOL_VERSION,
         event: 'resync',
-        payload: {revision, tables: []},
+        payload: {revision, tables: [], keys: {}},
       });
   };
   const shutdown = async (): Promise<void> => {

@@ -10,6 +10,8 @@
  * global method after the module has loaded.
  */
 
+import type {Row} from './protocol.js';
+
 export const arrayIsArray = Array.isArray;
 export const objFreeze = Object.freeze;
 export const objHasOwn = Object.hasOwn;
@@ -109,3 +111,63 @@ export const errorName = (error: unknown): string =>
 /** The `: reason` to append to a TinyJoin message, when there is one. */
 export const errorDetail = (error: unknown): string =>
   error instanceof Error && error.message ? `: ${error.message}` : '';
+
+/**
+ * The most changed primary keys one table reports in a single change notification.
+ *
+ * This mirrors the engine's own bound. Coalescing several writes into one event can push a table
+ * past it even when no single write did, so the merge below applies the same rule again.
+ */
+export const MAX_CHANGED_KEYS_PER_TABLE = 1_000;
+
+/**
+ * A running changed-key set. `undefined` marks a table whose keys can no longer be reported in
+ * full, either because a write did not report them or because coalescing exceeded the bound.
+ */
+export type PendingChangedKeys = Map<
+  string,
+  {rows: Row[]; seen: Set<string>} | undefined
+>;
+
+/**
+ * Folds one outcome's changed keys into a running set.
+ *
+ * `tables` is authoritative: a table that changed without reporting keys poisons its entry, so a
+ * consumer can read the presence of a table in the finished set as "this is every key that
+ * changed". Keys are deduplicated because coalesced writes routinely touch a row more than once.
+ */
+export const mergeChangedKeys = (
+  pending: PendingChangedKeys,
+  tables: string[],
+  keys: {[table: string]: Row[]},
+): void => {
+  for (const table of tables) {
+    const incoming = keys[table];
+    if (!incoming) {
+      pending.set(table, undefined);
+      continue;
+    }
+    if (!pending.has(table)) pending.set(table, {rows: [], seen: new Set()});
+    const entry = pending.get(table);
+    if (!entry) continue;
+    for (const key of incoming) {
+      if (entry.rows.length >= MAX_CHANGED_KEYS_PER_TABLE) {
+        pending.set(table, undefined);
+        break;
+      }
+      const identity = JSON.stringify(key);
+      if (entry.seen.has(identity)) continue;
+      entry.seen.add(identity);
+      entry.rows.push(key);
+    }
+  }
+};
+
+/** Drops the tables that could not report a complete key set, leaving only usable entries. */
+export const finishChangedKeys = (pending: PendingChangedKeys): {
+  [table: string]: Row[];
+} => {
+  const keys: {[table: string]: Row[]} = {};
+  for (const [table, entry] of pending) if (entry) keys[table] = entry.rows;
+  return keys;
+};

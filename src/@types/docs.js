@@ -73,6 +73,17 @@
 }
 
 /**
+ * The ChangedKeys type maps a table name to the primary keys that changed in
+ * it.
+ *
+ * Each key is an object holding only that table's primary-key columns, so a
+ * composite key arrives as one object with one property per column.
+ * @category Query results
+ * @since v0.1.1
+ */
+/// ChangedKeys
+
+/**
  * The ResultField interface describes one projected result column.
  * @category Query results
  * @since v0.0.5
@@ -155,6 +166,19 @@
    * @since v0.0.5
    */
   /// Results.tables
+
+  /**
+   * The keys property contains the primary keys the statement changed, keyed by
+   * table name.
+   *
+   * A table appears only when every key it changed fits the reporting bound of
+   * 1,000 keys per table. A table that changed more rows than that is absent,
+   * so an absent table means the rows that changed cannot be named, not that
+   * nothing changed. The tables property stays authoritative either way.
+   * @category Result
+   * @since v0.1.1
+   */
+  /// Results.keys
 }
 
 /**
@@ -348,6 +372,19 @@
    * @since v0.0.5
    */
   /// TablesChangedEvent.tables
+
+  /**
+   * The keys property contains the primary keys that changed, keyed by table
+   * name, for the tables whose complete set is known.
+   *
+   * Use it to refresh individual rows instead of re-reading a whole table. A
+   * table listed in tables but absent here changed more rows than the bound of
+   * 1,000 keys per table allows an event to name, or changed across a handover;
+   * re-query that table instead. It is always empty when reset is true.
+   * @category Event
+   * @since v0.1.1
+   */
+  /// TablesChangedEvent.keys
 }
 
 /**

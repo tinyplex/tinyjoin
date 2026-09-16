@@ -33,6 +33,9 @@ export interface ResultField {
   dataTypeID: number;
 }
 
+/// ChangedKeys
+export type ChangedKeys = {[table: string]: Row[]};
+
 /// Results
 export interface Results<RowType = Row> {
   /// Results.rows
@@ -55,6 +58,9 @@ export interface Results<RowType = Row> {
 
   /// Results.tables
   tables: string[];
+
+  /// Results.keys
+  keys: ChangedKeys;
 }
 
 /// SerializedError
@@ -158,6 +164,9 @@ export interface TablesChangedEvent {
 
   /// TablesChangedEvent.tables
   tables: string[];
+
+  /// TablesChangedEvent.keys
+  keys: ChangedKeys;
 }
 
 /// SubscriptionOptions
