@@ -1012,7 +1012,7 @@ describe('Client', () => {
     await client.close();
   });
 
-  it('unions changed keys across coalesced events and drops unreportable tables', async () => {
+  it('unions changed keys across coalesced events', async () => {
     const worker = respondingWorker();
     const client = await create({worker});
     const listener = vi.fn();

@@ -142,7 +142,7 @@ problem with different trade-offs.
 
 ## It is experimental
 
-TinyJoin is at v0.1.0. The JavaScript API, the SQL dialect, the error codes,
+TinyJoin is at v0.2.0. The JavaScript API, the SQL dialect, the error codes,
 and the page format can all change between releases, and a release may require
 an application to recreate its persistent database rather than migrate it.
 
@@ -853,9 +853,11 @@ locked, corrupt, or out of quota.
 
 An OPFS name identifies stored data; changing the name opens a different
 database and leaves the old data in place. Check the
-[release compatibility boundary](https://tinyjoin.org/guides/releases/#v0-1-0) before upgrading
-TinyJoin: v0.1.0 cannot open the page format published in v0.0.5. Preserve any
-needed data with the old version before moving to a new namespace.
+[release notes](https://tinyjoin.org/guides/releases/) before upgrading TinyJoin: each release
+states whether it can open the page format written by earlier ones. The only
+such break so far is that v0.1.0 and later cannot open a database written by
+v0.0.5. Preserve any needed data with the old version before moving to a new
+namespace.
 
 The current persistent database is bounded to 65,536 4 KiB pages (256 MiB).
 The [SQL compatibility guide](https://tinyjoin.org/guides/sql-compatibility/#hard-limits) lists the
@@ -1259,6 +1261,37 @@ always re-queries. See [tab handover](https://tinyjoin.org/guides/storage-and-li
 
 This explicit re-query model keeps TinyJoin independent of UI frameworks and
 lets an application choose its own caching or rendering policy.
+
+## Refreshing individual rows
+
+An event also names the primary keys that changed, keyed by table, so a
+listener can refresh individual rows rather than re-reading a whole table:
+
+```ts
+const unsubscribe = db.subscribe({tables: ['tasks']}, async (event) => {
+  const keys = event.keys.tasks;
+  if (!keys) {
+    render(await db.query('SELECT * FROM tasks ORDER BY id'));
+    return;
+  }
+  for (const {id} of keys) {
+    refreshRow(await db.query('SELECT * FROM tasks WHERE id = $1', [id]));
+  }
+});
+```
+
+Each key is an object holding only that table's primary-key columns, so a
+composite key arrives as one object with one property per column. Keys are
+reported for writes from any connected Client, which makes a change made in
+another tab resolvable to individual rows.
+
+Reporting is a bounded best effort, and `tables` stays authoritative. A table
+appears in `keys` only when every key it changed fits the bound of 1,000 keys
+per table. A table listed in `tables` but absent from `keys` changed more rows
+than an event can name, so its rows cannot be identified and it must be
+re-queried. `keys` is always empty alongside `reset: true` for the same reason.
+Always handle the absent case, as the example above does: a listener that
+assumes keys are present will silently miss large writes.
 
 # Custom Workers
 
@@ -1778,7 +1811,53 @@ build.
 Source: https://tinyjoin.org/guides/releases/
 
 This is a reverse chronological summary of TinyJoin releases and their public
-compatibility boundaries.
+compatibility boundaries. Every entry states what upgrading to it requires, so
+check the entries between the version in use and the target before upgrading.
+A release that needs no action says so explicitly.
+
+## v0.2.0
+
+Subscriptions and statement results now report **which rows changed**, not only
+which tables. A [`TablesChangedEvent`](https://tinyjoin.org/api/tinyjoin/interfaces/subscriptions/tableschangedevent/)
+and every [`Results`](https://tinyjoin.org/api/tinyjoin/interfaces/query-results/results/) carry a
+`keys` map of table name to the primary keys that changed, so a listener can
+refresh individual rows instead of re-reading a table. Keys are reported for
+writes from any connected Client, which makes a change made in another tab
+resolvable to individual rows. See
+[refreshing individual rows](https://tinyjoin.org/guides/transactions-and-changes/#refreshing-individual-rows).
+
+Reporting is a bounded best effort, and the changed-table list stays
+authoritative. A table appears in `keys` only when every key it changed fits
+the bound of 1,000 keys per table; a table that changed more rows is absent
+rather than partially listed, so an absent table means its rows cannot be named
+and must be re-queried. `keys` is always empty alongside `reset: true`. Code
+that assumes keys are present will silently miss large writes, so handle the
+absent case.
+
+**The Worker protocol version moves from 7 to 8.** Client and Worker ship
+together and are upgraded together by a normal install, so this affects only a
+deployment that pins or caches a Worker file independently of the client
+bundle. A mismatched pair fails cleanly with `PROTOCOL_MISMATCH` rather than
+misreading a result. Applications using
+[`tinyjoinOffline()`](https://tinyjoin.org/api/vite/functions/offline/tinyjoinoffline/) are unaffected: the
+plugin revisions both files by content, so a rebuild replaces them together.
+
+**Upgrading from v0.1.0 needs no action.** Install, rebuild, and redeploy.
+Persistent storage is unchanged: the page format remains format 2, so an
+existing database opens with no migration and no OPFS namespace change. The
+`keys` field is additive, so application code that ignores it behaves exactly
+as it did before.
+
+Grouped and aggregate queries now use a secondary index when their predicate
+supplies every column of one, instead of always scanning the table. Results are
+unchanged, because the predicate is still evaluated for each candidate row.
+Because the scan limit counts candidate rows, a grouped query that previously
+exceeded `QUERY_WORK_LIMIT_EXCEEDED` on a large table may now succeed.
+
+`tinyjoin/node` no longer fails to start when the parent process runs with a
+flag that Node rejects for a worker thread, such as the `--stack-trace-limit`
+that several test runners set. Inherited flags are dropped rather than the
+database failing to open.
 
 ## v0.1.0
 
@@ -1987,6 +2066,17 @@ export interface ResultField {
 }
 
 /**
+ * The ChangedKeys type maps a table name to the primary keys that changed in
+ * it.
+ *
+ * Each key is an object holding only that table's primary-key columns, so a
+ * composite key arrives as one object with one property per column.
+ * @category Query results
+ * @since v0.1.1
+ */
+export type ChangedKeys = {[table: string]: Row[]};
+
+/**
  * The Results interface is returned by queries, prepared statements, and
  * scripts.
  *
@@ -2045,6 +2135,19 @@ export interface Results<RowType = Row> {
    * @since v0.0.5
    */
   tables: string[];
+
+  /**
+   * The keys property contains the primary keys the statement changed, keyed by
+   * table name.
+   *
+   * A table appears only when every key it changed fits the reporting bound of
+   * 1,000 keys per table. A table that changed more rows than that is absent,
+   * so an absent table means the rows that changed cannot be named, not that
+   * nothing changed. The tables property stays authoritative either way.
+   * @category Result
+   * @since v0.1.1
+   */
+  keys: ChangedKeys;
 }
 
 /**
@@ -2267,6 +2370,19 @@ export interface TablesChangedEvent {
    * @since v0.0.5
    */
   tables: string[];
+
+  /**
+   * The keys property contains the primary keys that changed, keyed by table
+   * name, for the tables whose complete set is known.
+   *
+   * Use it to refresh individual rows instead of re-reading a whole table. A
+   * table listed in tables but absent here changed more rows than the bound of
+   * 1,000 keys per table allows an event to name, or changed across a handover;
+   * re-query that table instead. It is always empty when reset is true.
+   * @category Event
+   * @since v0.1.1
+   */
+  keys: ChangedKeys;
 }
 
 /**

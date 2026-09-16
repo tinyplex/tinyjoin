@@ -1,7 +1,53 @@
 # Releases
 
 This is a reverse chronological summary of TinyJoin releases and their public
-compatibility boundaries.
+compatibility boundaries. Every entry states what upgrading to it requires, so
+check the entries between the version in use and the target before upgrading.
+A release that needs no action says so explicitly.
+
+## v0.2.0
+
+Subscriptions and statement results now report **which rows changed**, not only
+which tables. A [`TablesChangedEvent`](/api/tinyjoin/interfaces/subscriptions/tableschangedevent/)
+and every [`Results`](/api/tinyjoin/interfaces/query-results/results/) carry a
+`keys` map of table name to the primary keys that changed, so a listener can
+refresh individual rows instead of re-reading a table. Keys are reported for
+writes from any connected Client, which makes a change made in another tab
+resolvable to individual rows. See
+[refreshing individual rows](/guides/transactions-and-changes/#refreshing-individual-rows).
+
+Reporting is a bounded best effort, and the changed-table list stays
+authoritative. A table appears in `keys` only when every key it changed fits
+the bound of 1,000 keys per table; a table that changed more rows is absent
+rather than partially listed, so an absent table means its rows cannot be named
+and must be re-queried. `keys` is always empty alongside `reset: true`. Code
+that assumes keys are present will silently miss large writes, so handle the
+absent case.
+
+**The Worker protocol version moves from 7 to 8.** Client and Worker ship
+together and are upgraded together by a normal install, so this affects only a
+deployment that pins or caches a Worker file independently of the client
+bundle. A mismatched pair fails cleanly with `PROTOCOL_MISMATCH` rather than
+misreading a result. Applications using
+[`tinyjoinOffline()`](/api/vite/functions/offline/tinyjoinoffline/) are unaffected: the
+plugin revisions both files by content, so a rebuild replaces them together.
+
+**Upgrading from v0.1.0 needs no action.** Install, rebuild, and redeploy.
+Persistent storage is unchanged: the page format remains format 2, so an
+existing database opens with no migration and no OPFS namespace change. The
+`keys` field is additive, so application code that ignores it behaves exactly
+as it did before.
+
+Grouped and aggregate queries now use a secondary index when their predicate
+supplies every column of one, instead of always scanning the table. Results are
+unchanged, because the predicate is still evaluated for each candidate row.
+Because the scan limit counts candidate rows, a grouped query that previously
+exceeded `QUERY_WORK_LIMIT_EXCEEDED` on a large table may now succeed.
+
+`tinyjoin/node` no longer fails to start when the parent process runs with a
+flag that Node rejects for a worker thread, such as the `--stack-trace-limit`
+that several test runners set. Inherited flags are dropped rather than the
+database failing to open.
 
 ## v0.1.0
 
