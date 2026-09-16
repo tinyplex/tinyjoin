@@ -242,28 +242,49 @@ fn visit_candidate_rows(
     schema: &crate::TableDefinition,
     visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
 ) -> Result<VisitOutcome> {
-    if let Some(key) = primary_key_lookup(plan.predicate.as_ref(), schema) {
-        return match storage.lookup_primary_key(&plan.table, &key)? {
+    visit_predicate_candidates(
+        storage,
+        &plan.table,
+        plan.predicate.as_ref(),
+        schema,
+        visitor,
+    )
+}
+
+/// Narrows a scan to the rows a predicate can possibly match, shared by every statement family
+/// that filters one table. Narrowing is only ever a candidate-selection step: each caller still
+/// evaluates the full predicate per visited row, so an index that covers part of a predicate
+/// cannot change which rows the caller accepts.
+pub(crate) fn visit_predicate_candidates(
+    storage: &dyn StorageReader,
+    table: &str,
+    predicate: Option<&Predicate>,
+    schema: &crate::TableDefinition,
+    visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+) -> Result<VisitOutcome> {
+    if let Some(key) = primary_key_lookup(predicate, schema) {
+        return match storage.lookup_primary_key(table, &key)? {
             Some(row) if visitor(&row)? == VisitControl::Stop => Ok(VisitOutcome::Stopped),
             _ => Ok(VisitOutcome::Complete),
         };
     }
-    if let Some((columns, key)) = secondary_index_key(storage, plan, schema)?
-        && let Some(outcome) = storage.visit_index(&plan.table, &columns, &key, visitor)?
+    if let Some((columns, key)) = secondary_index_key(storage, table, predicate, schema)?
+        && let Some(outcome) = storage.visit_index(table, &columns, &key, visitor)?
     {
         return Ok(outcome);
     }
-    storage.visit_table(&plan.table, visitor)
+    storage.visit_table(table, visitor)
 }
 
 fn secondary_index_key(
     storage: &dyn StorageReader,
-    plan: &SelectPlan,
+    table: &str,
+    predicate: Option<&Predicate>,
     schema: &crate::TableDefinition,
 ) -> Result<Option<(Vec<String>, Row)>> {
     let mut equalities = Map::new();
-    collect_guaranteed_equalities(plan.predicate.as_ref(), &mut equalities);
-    for definition in storage.indexes_for_table(&plan.table)? {
+    collect_guaranteed_equalities(predicate, &mut equalities);
+    for definition in storage.indexes_for_table(table)? {
         if definition.columns.iter().all(|column| {
             equalities
                 .get(column)

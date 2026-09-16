@@ -173,74 +173,80 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &AggregatePlan) -> Resu
     ensure_work_budget(working_bytes, MAX_AGGREGATE_WORK_BYTES)?;
     let mut groups = BTreeMap::<String, GroupState>::new();
     let mut scanned = 0_usize;
-    storage.visit_table(&plan.table, &mut |row| {
-        scanned = scanned.saturating_add(1);
-        if scanned > MAX_SCAN_ROWS {
-            return Err(EngineError::new(
-                "QUERY_WORK_LIMIT_EXCEEDED",
-                format!("An aggregate query cannot scan more than {MAX_SCAN_ROWS} rows"),
-            ));
-        }
-        if matches_predicate(row, plan.predicate.as_ref(), &plan.table)? {
-            if let Some(state) = &mut global {
-                let before = state.estimated_bytes()?;
-                let after = state.estimated_bytes_after(row)?;
-                let next_total = replace_budget_charge(
-                    working_bytes,
-                    before,
-                    after,
-                    MAX_AGGREGATE_WORK_BYTES,
-                )?;
-                state.update(row)?;
-                working_bytes = next_total;
-                return Ok(VisitControl::Continue);
+    // Grouping never stops early, so narrowing only removes rows the predicate would reject
+    // anyway; the per-row `matches_predicate` below remains the authority on membership.
+    crate::query::visit_predicate_candidates(
+        storage,
+        &plan.table,
+        plan.predicate.as_ref(),
+        &schema,
+        &mut |row| {
+            scanned = scanned.saturating_add(1);
+            if scanned > MAX_SCAN_ROWS {
+                return Err(EngineError::new(
+                    "QUERY_WORK_LIMIT_EXCEEDED",
+                    format!("An aggregate query cannot scan more than {MAX_SCAN_ROWS} rows"),
+                ));
             }
-            ensure_group_key_input_budget(&schema, &plan.group_by, row)?;
-            let key = group_key(&schema, &plan.group_by, row)?;
-            let group_count = groups.len();
-            match groups.entry(key) {
-                Entry::Vacant(entry) => {
-                    if group_count >= MAX_GROUPS {
-                        return Err(EngineError::invalid_query(format!(
-                            "A grouped query cannot produce more than {MAX_GROUPS} groups"
-                        )));
-                    }
-                    if (group_count + 1).saturating_mul(aggregate_count)
-                        > MAX_AGGREGATE_CELLS
-                    {
-                        return Err(EngineError::invalid_query(format!(
-                            "A grouped query cannot materialize more than {MAX_AGGREGATE_CELLS} aggregate cells"
-                        )));
-                    }
-                    let key_bytes = checked_mul(entry.key().len(), 2)?;
-                    let state = GroupState::new(plan, &schema, Some(row))?;
-                    let charge = checked_add(
-                        checked_add(256, key_bytes)?,
-                        state.estimated_bytes_after(row)?,
-                    )?;
-                    let next_total = checked_add(working_bytes, charge)?;
-                    ensure_work_budget(next_total, MAX_AGGREGATE_WORK_BYTES)?;
-                    let mut state = state;
-                    state.update(row)?;
-                    working_bytes = next_total;
-                    entry.insert(state);
-                }
-                Entry::Occupied(mut entry) => {
-                    let before = entry.get().estimated_bytes()?;
-                    let after = entry.get().estimated_bytes_after(row)?;
+            if matches_predicate(row, plan.predicate.as_ref(), &plan.table)? {
+                if let Some(state) = &mut global {
+                    let before = state.estimated_bytes()?;
+                    let after = state.estimated_bytes_after(row)?;
                     let next_total = replace_budget_charge(
                         working_bytes,
                         before,
                         after,
                         MAX_AGGREGATE_WORK_BYTES,
                     )?;
-                    entry.get_mut().update(row)?;
+                    state.update(row)?;
                     working_bytes = next_total;
+                    return Ok(VisitControl::Continue);
+                }
+                ensure_group_key_input_budget(&schema, &plan.group_by, row)?;
+                let key = group_key(&schema, &plan.group_by, row)?;
+                let group_count = groups.len();
+                match groups.entry(key) {
+                    Entry::Vacant(entry) => {
+                        if group_count >= MAX_GROUPS {
+                            return Err(EngineError::invalid_query(format!(
+                                "A grouped query cannot produce more than {MAX_GROUPS} groups"
+                            )));
+                        }
+                        if (group_count + 1).saturating_mul(aggregate_count) > MAX_AGGREGATE_CELLS {
+                            return Err(EngineError::invalid_query(format!(
+                                "A grouped query cannot materialize more than {MAX_AGGREGATE_CELLS} aggregate cells"
+                            )));
+                        }
+                        let key_bytes = checked_mul(entry.key().len(), 2)?;
+                        let state = GroupState::new(plan, &schema, Some(row))?;
+                        let charge = checked_add(
+                            checked_add(256, key_bytes)?,
+                            state.estimated_bytes_after(row)?,
+                        )?;
+                        let next_total = checked_add(working_bytes, charge)?;
+                        ensure_work_budget(next_total, MAX_AGGREGATE_WORK_BYTES)?;
+                        let mut state = state;
+                        state.update(row)?;
+                        working_bytes = next_total;
+                        entry.insert(state);
+                    }
+                    Entry::Occupied(mut entry) => {
+                        let before = entry.get().estimated_bytes()?;
+                        let after = entry.get().estimated_bytes_after(row)?;
+                        let next_total = replace_budget_charge(
+                            working_bytes,
+                            before,
+                            after,
+                            MAX_AGGREGATE_WORK_BYTES,
+                        )?;
+                        entry.get_mut().update(row)?;
+                        working_bytes = next_total;
+                    }
                 }
             }
-        }
-        Ok(VisitControl::Continue)
-    })?;
+            Ok(VisitControl::Continue)
+        },
+    )?;
 
     let states = if let Some(global) = global {
         vec![global]
@@ -1828,5 +1834,166 @@ mod tests {
                 .code,
             "INVALID_QUERY"
         );
+    }
+
+    /// Counts how a grouped query reached its rows, so index narrowing is observable rather than
+    /// inferred from timing.
+    #[derive(Clone, Debug)]
+    struct CountingStorage {
+        inner: crate::InMemoryStorage,
+        table_scans: std::cell::Cell<usize>,
+        index_scans: std::cell::Cell<usize>,
+        rows_visited: std::cell::Cell<usize>,
+    }
+
+    impl CountingStorage {
+        fn new(inner: crate::InMemoryStorage) -> Self {
+            Self {
+                inner,
+                table_scans: std::cell::Cell::new(0),
+                index_scans: std::cell::Cell::new(0),
+                rows_visited: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl StorageReader for CountingStorage {
+        fn visit_table(
+            &self,
+            table: &str,
+            visitor: &mut dyn FnMut(&Row) -> crate::Result<crate::VisitControl>,
+        ) -> crate::Result<crate::VisitOutcome> {
+            self.table_scans.set(self.table_scans.get() + 1);
+            self.inner.visit_table(table, &mut |row| {
+                self.rows_visited.set(self.rows_visited.get() + 1);
+                visitor(row)
+            })
+        }
+
+        fn visit_index(
+            &self,
+            table: &str,
+            columns: &[String],
+            key: &Row,
+            visitor: &mut dyn FnMut(&Row) -> crate::Result<crate::VisitControl>,
+        ) -> crate::Result<Option<crate::VisitOutcome>> {
+            let outcome = self.inner.visit_index(table, columns, key, &mut |row| {
+                self.rows_visited.set(self.rows_visited.get() + 1);
+                visitor(row)
+            })?;
+            if outcome.is_some() {
+                self.index_scans.set(self.index_scans.get() + 1);
+            }
+            Ok(outcome)
+        }
+
+        fn table_row_count(&self, table: &str) -> crate::Result<usize> {
+            self.inner.table_row_count(table)
+        }
+
+        fn lookup_primary_key(&self, table: &str, key: &Row) -> crate::Result<Option<Row>> {
+            self.inner.lookup_primary_key(table, key)
+        }
+
+        fn index_definition(&self, name: &str) -> Option<crate::IndexDefinition> {
+            self.inner.index_definition(name)
+        }
+
+        fn indexes_for_table(&self, table: &str) -> crate::Result<Vec<crate::IndexDefinition>> {
+            self.inner.indexes_for_table(table)
+        }
+
+        fn table_schema(&self, table: &str) -> crate::Result<crate::TableDefinition> {
+            self.inner.table_schema(table)
+        }
+
+        fn revision(&self) -> u64 {
+            self.inner.revision()
+        }
+    }
+
+    /// The atom-tree child listing a sync connector issues is
+    /// `SELECT child FROM t WHERE parent = $1 GROUP BY child`. It must cost the matching
+    /// subtree, not the whole table, or listing one parent's children scans every atom.
+    fn atoms() -> Engine<CountingStorage> {
+        let mut engine = Engine::default();
+        engine
+            .execute_sql(
+                "CREATE TABLE atoms (address TEXT PRIMARY KEY, parent TEXT, child TEXT)",
+                &[],
+            )
+            .unwrap();
+        engine
+            .execute_sql("CREATE INDEX atoms_parent ON atoms (parent)", &[])
+            .unwrap();
+        engine
+            .execute_sql(
+                "INSERT INTO atoms (address, parent, child) VALUES \
+                 ('a/x', 'a', 'x'), ('a/x2', 'a', 'x'), ('a/y', 'a', 'y'), \
+                 ('b/p', 'b', 'p'), ('b/q', 'b', 'q'), ('b/r', 'b', 'r')",
+                &[],
+            )
+            .unwrap();
+        Engine::new(CountingStorage::new(engine.into_storage()))
+    }
+
+    #[test]
+    fn a_grouped_query_narrows_through_an_index_on_its_equality_predicate() {
+        let engine = atoms();
+        let result = engine
+            .query_sql(
+                "SELECT child FROM atoms WHERE parent = $1 GROUP BY child ORDER BY child",
+                &[json!("a")],
+            )
+            .unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![row(json!({"child": "x"})), row(json!({"child": "y"}))]
+        );
+        let storage = engine.into_storage();
+        assert_eq!(storage.index_scans.get(), 1);
+        assert_eq!(storage.table_scans.get(), 0);
+        // Only the three rows under `a`, not all six in the table.
+        assert_eq!(storage.rows_visited.get(), 3);
+    }
+
+    #[test]
+    fn a_grouped_query_without_a_usable_index_still_scans_the_table() {
+        let engine = atoms();
+        let result = engine
+            .query_sql(
+                "SELECT parent FROM atoms WHERE child = $1 GROUP BY parent",
+                &[json!("x")],
+            )
+            .unwrap();
+
+        assert_eq!(result.rows, vec![row(json!({"parent": "a"}))]);
+        let storage = engine.into_storage();
+        assert_eq!(storage.index_scans.get(), 0);
+        assert_eq!(storage.table_scans.get(), 1);
+        assert_eq!(storage.rows_visited.get(), 6);
+    }
+
+    #[test]
+    fn index_narrowing_does_not_change_aggregate_results() {
+        let engine = atoms();
+        let narrowed = engine
+            .query_sql(
+                "SELECT COUNT(*) AS rows, MIN(child) AS lowest FROM atoms WHERE parent = $1",
+                &[json!("a")],
+            )
+            .unwrap();
+        assert_eq!(narrowed.rows, vec![row(json!({"rows": 3, "lowest": "x"}))]);
+
+        // The same predicate expressed so no index covers it must agree.
+        let scanned = engine
+            .query_sql(
+                "SELECT COUNT(*) AS rows, MIN(child) AS lowest FROM atoms \
+                 WHERE parent >= $1 AND parent <= $1",
+                &[json!("a")],
+            )
+            .unwrap();
+        assert_eq!(scanned.rows, narrowed.rows);
     }
 }
