@@ -166,7 +166,8 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 | `LEFT [OUTER] JOIN` | Narrow | The same bounded chain; an unmatched incoming source is represented by `NULL` columns. A later inner join can remove that null-extended row. |
 | `RIGHT`, `FULL`, `CROSS`, `NATURAL`, `USING`, `LATERAL` | No | No additional join families, parenthesized/derived relations, or join reordering. |
 | `AS` | Narrow | Output aliases on `SELECT` items in single-table, grouped/aggregate, and join queries, plus table aliases in joins. A projection alias requires the `AS` keyword, and one column may be returned under several aliases. Single-table queries do not accept table aliases. |
-| `DISTINCT`, `WITH`, subqueries, `UNION`/`INTERSECT`/`EXCEPT` | No | No CTEs, subqueries, set operations, or distinct-row projection. |
+| `SELECT DISTINCT` | Narrow | Removes duplicate rows from an explicit single-table or join projection. `NULL`s compare as equal to each other, and other values compare by SQL equality; JSON columns are rejected. `ORDER BY` must name projected columns. A single-table `DISTINCT` compares at most 32 distinct source columns and shares the aggregate group limits. `DISTINCT *`, `DISTINCT ON`, and `DISTINCT` combined with `GROUP BY` or aggregate functions are rejected. |
+| `WITH`, subqueries, `UNION`/`INTERSECT`/`EXCEPT` | No | No CTEs, subqueries, or set operations. |
 | `CREATE TABLE [IF NOT EXISTS]` | Narrow | Typed columns and a required inline or table-level primary key. Up to 256 columns. |
 | `PRIMARY KEY` | Narrow | One inline single-column declaration or one table-level column list (single or composite). It implies `NOT NULL`; JSON keys are rejected. |
 | `NULL`, `NOT NULL`, `DEFAULT` | Narrow | String, number, boolean, or `NULL` literal defaults only. No default expressions, functions, sequences, or parameters. |
@@ -472,7 +473,7 @@ rather than growing without bound.
 | Join candidate row extensions / returned rows | 1,000,000 across the chain / 100,000 |
 | Join retained build rows | 100,000 across the chain |
 | Join working state / result data | 16 MiB / 16 MiB across the chain |
-| Aggregate groups / calls | 100,000 / 64 |
+| Aggregate groups or single-table `DISTINCT` rows / aggregate calls | 100,000 / 64 |
 | Aggregate cells (groups times aggregate calls) | 1,000,000 |
 | Query, DML result, join, aggregate, or mutation working set | 16 MiB per operation-specific bound |
 

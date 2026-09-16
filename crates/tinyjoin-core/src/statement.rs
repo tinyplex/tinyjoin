@@ -122,7 +122,10 @@ pub(crate) fn parse_tokens(
         if crate::join::is_join_select(&tokens) {
             return crate::join::parse_tokens(tokens, params, mode).map(Statement::Join);
         }
-        if crate::aggregate::is_aggregate_select(&tokens) {
+        // SELECT DISTINCT is grouping by every projected column without aggregates.
+        if crate::aggregate::is_aggregate_select(&tokens)
+            || crate::query::is_distinct_keyword_at(&tokens, 1)
+        {
             return crate::aggregate::parse_tokens(tokens, params, mode).map(Statement::Aggregate);
         }
         return crate::query::parse_tokens(tokens, params, mode).map(Statement::Select);

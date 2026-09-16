@@ -5,8 +5,9 @@ use std::str::FromStr;
 use serde_json::{Map, Number, Value};
 
 use crate::query::{
-    ParseMode, Token, bind_parameter, is_reserved_keyword, matches_predicate, pagination_value,
-    parse_predicate_at, validate_predicate_columns, validate_predicate_types,
+    ParseMode, Token, bind_parameter, is_distinct_keyword_at, is_reserved_keyword,
+    matches_predicate, pagination_value, parse_predicate_at, validate_predicate_columns,
+    validate_predicate_types,
 };
 use crate::storage::StorageReader;
 use crate::{
@@ -70,6 +71,8 @@ struct SelectItem {
 #[derive(Clone, Debug)]
 pub(crate) struct AggregatePlan {
     table: String,
+    /// `SELECT DISTINCT`, planned as a grouping by every projected column with no aggregates.
+    distinct: bool,
     items: Vec<SelectItem>,
     predicate: Option<Predicate>,
     group_by: Vec<String>,
@@ -334,8 +337,13 @@ fn validate_plan(plan: &AggregatePlan, schema: &TableDefinition) -> Result<()> {
         let definition = column_definition(schema, column, &plan.table)?;
         if definition.data_type == ColumnType::Json {
             return Err(EngineError::type_mismatch(format!(
-                "JSON column `{column}` in `{}` cannot be grouped",
-                plan.table
+                "JSON column `{column}` in `{}` cannot be {}",
+                plan.table,
+                if plan.distinct {
+                    "compared by SELECT DISTINCT"
+                } else {
+                    "grouped"
+                }
             )));
         }
     }
@@ -916,32 +924,41 @@ fn group_key(schema: &TableDefinition, columns: &[String], row: &Row) -> Result<
         let value = row
             .get(column)
             .ok_or_else(|| EngineError::column_not_found(column, &schema.name))?;
-        let part = match (definition.data_type, value) {
-            (_, Value::Null) => "null".to_owned(),
-            (ColumnType::Boolean, Value::Bool(value)) => format!("b:{value}"),
-            (ColumnType::Integer, _) => format!("i:{}", integer_value(value)?),
-            (ColumnType::Float, Value::Number(value)) => {
-                let mut number = value.as_f64().expect("typed float was validated");
-                if number == 0.0 {
-                    number = 0.0;
-                }
-                format!("f:{:016x}", number.to_bits())
-            }
-            (ColumnType::Text, Value::String(value)) => {
-                format!(
-                    "s:{}",
-                    serde_json::to_string(value).expect("strings encode")
-                )
-            }
-            _ => {
-                return Err(EngineError::type_mismatch(format!(
-                    "Column `{column}` contains a value incompatible with its catalog type"
-                )));
-            }
-        };
-        parts.push(part);
+        parts.push(group_key_part(definition.data_type, value, column)?);
     }
-    serde_json::to_string(&parts)
+    encode_group_key(&parts)
+}
+
+/// Encodes one grouped value so that values SQL considers equal encode identically: `NULL`s group
+/// together, integers ignore their JSON spelling, and floating-point zero ignores its sign.
+pub(crate) fn group_key_part(data_type: ColumnType, value: &Value, column: &str) -> Result<String> {
+    Ok(match (data_type, value) {
+        (_, Value::Null) => "null".to_owned(),
+        (ColumnType::Boolean, Value::Bool(value)) => format!("b:{value}"),
+        (ColumnType::Integer, _) => format!("i:{}", integer_value(value)?),
+        (ColumnType::Float, Value::Number(value)) => {
+            let mut number = value.as_f64().expect("typed float was validated");
+            if number == 0.0 {
+                number = 0.0;
+            }
+            format!("f:{:016x}", number.to_bits())
+        }
+        (ColumnType::Text, Value::String(value)) => {
+            format!(
+                "s:{}",
+                serde_json::to_string(value).expect("strings encode")
+            )
+        }
+        _ => {
+            return Err(EngineError::type_mismatch(format!(
+                "Column `{column}` contains a value incompatible with its catalog type"
+            )));
+        }
+    })
+}
+
+pub(crate) fn encode_group_key(parts: &[String]) -> Result<String> {
+    serde_json::to_string(parts)
         .map_err(|error| EngineError::invalid_query(format!("Could not encode group key: {error}")))
 }
 
@@ -1071,6 +1088,20 @@ impl<'a> Parser<'a> {
 
     fn parse(mut self) -> Result<AggregatePlan> {
         self.expect_keyword("select")?;
+        let distinct = is_distinct_keyword_at(&self.tokens, self.position);
+        if distinct {
+            self.position += 1;
+            if self.consume_keyword("on") {
+                return Err(EngineError::unsupported_sql(
+                    "SELECT DISTINCT ON is not supported",
+                ));
+            }
+            if self.consume_star() {
+                return Err(EngineError::unsupported_sql(
+                    "SELECT DISTINCT requires an explicit column list",
+                ));
+            }
+        }
         let items = self.parse_items()?;
         self.expect_keyword("from")?;
         let table = self.parse_table_name()?;
@@ -1083,12 +1114,36 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let group_by = if self.consume_keyword("group") {
+        let mut group_by = if self.consume_keyword("group") {
             self.expect_keyword("by")?;
             self.parse_identifier_list(MAX_GROUP_COLUMNS, "GROUP BY")?
         } else {
             vec![]
         };
+        if distinct {
+            if !group_by.is_empty()
+                || items
+                    .iter()
+                    .any(|item| matches!(item.expression, SelectExpression::Aggregate { .. }))
+            {
+                return Err(EngineError::unsupported_sql(
+                    "SELECT DISTINCT cannot be combined with GROUP BY or aggregate functions",
+                ));
+            }
+            for item in &items {
+                let SelectExpression::Column(column) = &item.expression else {
+                    unreachable!("aggregate items were rejected above");
+                };
+                if !group_by.contains(column) {
+                    if group_by.len() == MAX_GROUP_COLUMNS {
+                        return Err(EngineError::invalid_query(format!(
+                            "SELECT DISTINCT cannot compare more than {MAX_GROUP_COLUMNS} columns"
+                        )));
+                    }
+                    group_by.push(column.clone());
+                }
+            }
+        }
         let order_by = if self.consume_keyword("order") {
             self.expect_keyword("by")?;
             self.parse_order_by()?
@@ -1108,11 +1163,12 @@ impl<'a> Parser<'a> {
         self.consume_semicolon();
         if self.position != self.tokens.len() {
             return Err(EngineError::unsupported_sql(
-                "This aggregate subset does not support HAVING, DISTINCT, FILTER, windows, expressions, or joins",
+                "This aggregate subset does not support HAVING, FILTER, windows, expressions, or joins",
             ));
         }
         Ok(AggregatePlan {
             table,
+            distinct,
             items,
             predicate,
             group_by,
@@ -1144,6 +1200,10 @@ impl<'a> Parser<'a> {
         let expression = if let Some(function) = function.filter(|_| self.consume_lparen()) {
             let argument = if self.consume_star() {
                 AggregateArgument::Star
+            } else if is_distinct_keyword_at(&self.tokens, self.position) {
+                return Err(EngineError::unsupported_sql(
+                    "Aggregate DISTINCT, such as COUNT(DISTINCT column), is not supported",
+                ));
             } else {
                 AggregateArgument::Column(self.parse_identifier()?)
             };
@@ -1652,6 +1712,173 @@ mod tests {
                 row(json!({"region": null})),
             ]
         );
+    }
+
+    #[test]
+    fn select_distinct_removes_duplicate_projected_rows() {
+        let mut engine = sales();
+        engine
+            .execute_sql(
+                "INSERT INTO sales (id, region, amount, score, label, active) VALUES \
+                 (5, 'east', 10, -0.0, 'b', true), (6, NULL, 5, 0.0, 'e', false)",
+                &[],
+            )
+            .unwrap();
+        fn query(engine: &Engine, sql: &str, params: &[Value]) -> Vec<Row> {
+            engine.query_sql(sql, params).unwrap().rows
+        }
+
+        // NULLs compare as equal, and so do an integer or float spelled differently.
+        assert_eq!(
+            query(
+                &engine,
+                "SELECT DISTINCT region FROM sales ORDER BY region NULLS FIRST",
+                &[]
+            ),
+            vec![
+                row(json!({"region": null})),
+                row(json!({"region": "east"})),
+                row(json!({"region": "west"})),
+            ]
+        );
+        assert_eq!(
+            query(
+                &engine,
+                "SELECT DISTINCT region AS area, amount FROM sales \
+                 WHERE amount IS NOT NULL ORDER BY area, amount DESC",
+                &[],
+            ),
+            vec![
+                row(json!({"area": "east", "amount": 20})),
+                row(json!({"area": "east", "amount": 10})),
+                row(json!({"area": null, "amount": 5})),
+            ]
+        );
+        assert_eq!(
+            query(
+                &engine,
+                "SELECT DISTINCT score FROM sales WHERE score <= $1 ORDER BY score",
+                &[json!(0)],
+            )
+            .len(),
+            1
+        );
+        // A repeated column adds no distinguishing value, and LIMIT/OFFSET apply to distinct rows.
+        assert_eq!(
+            query(
+                &engine,
+                "SELECT DISTINCT active, active AS again FROM sales ORDER BY active LIMIT 1 OFFSET 1",
+                &[],
+            ),
+            vec![row(json!({"active": true, "again": true}))]
+        );
+        let empty = engine
+            .query_sql("SELECT DISTINCT label FROM sales WHERE id > 99", &[])
+            .unwrap();
+        assert_eq!(
+            empty.fields,
+            vec![crate::ResultField::new("label", crate::ColumnType::Text)]
+        );
+        assert!(empty.rows.is_empty());
+
+        // `distinct` stays usable as a column name wherever it cannot be the keyword.
+        engine
+            .execute_sql(
+                "CREATE TABLE words (id INTEGER PRIMARY KEY, distinct TEXT)",
+                &[],
+            )
+            .unwrap();
+        engine
+            .execute_sql(
+                "INSERT INTO words VALUES (1, 'x'), (2, 'x'), (3, NULL)",
+                &[],
+            )
+            .unwrap();
+        for (sql, expected) in [
+            ("SELECT distinct FROM words ORDER BY id", 3),
+            ("SELECT distinct, id FROM words", 3),
+            ("SELECT distinct AS word FROM words", 3),
+            ("SELECT DISTINCT distinct FROM words", 2),
+            ("SELECT COUNT(distinct) AS n FROM words", 1),
+        ] {
+            assert_eq!(query(&engine, sql, &[]).len(), expected, "{sql}");
+        }
+        assert_eq!(
+            query(&engine, "SELECT COUNT(distinct) AS n FROM words", &[]),
+            vec![row(json!({"n": 2}))]
+        );
+
+        for (sql, code) in [
+            ("SELECT DISTINCT * FROM sales", "UNSUPPORTED_SQL"),
+            (
+                "SELECT DISTINCT ON (region) region FROM sales",
+                "UNSUPPORTED_SQL",
+            ),
+            (
+                "SELECT DISTINCT COUNT(*) AS n FROM sales",
+                "UNSUPPORTED_SQL",
+            ),
+            (
+                "SELECT DISTINCT region FROM sales GROUP BY region",
+                "UNSUPPORTED_SQL",
+            ),
+            (
+                "SELECT COUNT(DISTINCT region) AS n FROM sales",
+                "UNSUPPORTED_SQL",
+            ),
+            ("SELECT DISTINCT metadata FROM sales", "TYPE_MISMATCH"),
+            (
+                "SELECT DISTINCT region FROM sales ORDER BY amount",
+                "COLUMN_NOT_FOUND",
+            ),
+            (
+                "SELECT DISTINCT region AS r, label AS r FROM sales",
+                "INVALID_QUERY",
+            ),
+        ] {
+            assert_eq!(
+                engine.query_sql(sql, &[]).unwrap_err().code,
+                code,
+                "query was `{sql}`"
+            );
+        }
+
+        // The distinct-column bound counts source columns, so repeating one column never reaches it.
+        let repeated = (0..=super::MAX_GROUP_COLUMNS)
+            .map(|index| format!("region AS r{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        engine
+            .query_sql(&format!("SELECT DISTINCT {repeated} FROM sales"), &[])
+            .unwrap();
+        let columns = (0..=super::MAX_GROUP_COLUMNS)
+            .map(|index| format!("c{index}"))
+            .collect::<Vec<_>>();
+        engine
+            .execute_sql(
+                &format!(
+                    "CREATE TABLE wide (id INTEGER PRIMARY KEY, {} INTEGER)",
+                    columns.join(" INTEGER, ")
+                ),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            engine
+                .query_sql(
+                    &format!("SELECT DISTINCT {} FROM wide", columns.join(", ")),
+                    &[]
+                )
+                .unwrap_err()
+                .code,
+            "INVALID_QUERY"
+        );
+        engine
+            .query_sql(
+                &format!("SELECT DISTINCT {} FROM wide", columns[1..].join(", ")),
+                &[],
+            )
+            .unwrap();
     }
 
     #[test]

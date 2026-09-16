@@ -489,6 +489,113 @@ fn between_agrees_with_its_model_across_families_indexes_and_preparation() {
     }
 }
 
+#[test]
+fn distinct_agrees_with_sql_equality_across_executors_preparation_and_overlays() {
+    // Each case holds values SQL considers equal to one another, including a float spelled as an
+    // integer and both signs of zero, then values that are distinct from each other.
+    for (kind, equal, others) in [
+        (
+            "BOOLEAN",
+            vec![json!(true), json!(true)],
+            vec![json!(false)],
+        ),
+        (
+            "INTEGER",
+            vec![json!(1), json!(1)],
+            vec![json!(-1), json!(0)],
+        ),
+        (
+            "FLOAT",
+            vec![json!(0.0), json!(-0.0), json!(0)],
+            vec![json!(1.5), json!(-1.5)],
+        ),
+        (
+            "TEXT",
+            vec![json!("é🦀"), json!("é🦀")],
+            vec![json!(""), json!("E")],
+        ),
+    ] {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .execute_sql(
+                &format!("CREATE TABLE items (id INTEGER PRIMARY KEY, v {kind})"),
+                &[],
+            )
+            .unwrap();
+        let committed = [Value::Null, Value::Null]
+            .into_iter()
+            .chain(equal.iter().cloned())
+            .chain(others.iter().cloned())
+            .collect::<Vec<_>>();
+        for (id, value) in committed.iter().enumerate() {
+            engine
+                .execute_sql(
+                    "INSERT INTO items VALUES ($1, $2)",
+                    &[json!(id), value.clone()],
+                )
+                .unwrap();
+        }
+        // NULL, the equal group, and each other value.
+        let expected = 2 + others.len();
+        for transaction in [false, true] {
+            if transaction {
+                engine.begin_transaction().unwrap();
+                for (offset, value) in equal.iter().chain(&others).enumerate() {
+                    engine
+                        .execute_sql(
+                            "INSERT INTO items VALUES ($1, $2)",
+                            &[json!(100 + offset), value.clone()],
+                        )
+                        .unwrap();
+                }
+            }
+            for sql in [
+                "SELECT DISTINCT v FROM items ORDER BY v",
+                "SELECT DISTINCT v AS value FROM items WHERE id >= $1",
+                "SELECT DISTINCT a.v AS v FROM items a JOIN items b ON a.id = b.id WHERE a.id >= $1 ORDER BY v",
+                "SELECT DISTINCT a.v AS v FROM items a LEFT JOIN items b ON a.id = b.id WHERE a.id >= $1",
+            ] {
+                let params = if sql.contains("$1") {
+                    vec![json!(0)]
+                } else {
+                    vec![]
+                };
+                for prepared in [false, true] {
+                    let context =
+                        format!("{kind}, transaction={transaction}, prepared={prepared}: {sql}");
+                    let result = execute(&mut engine, prepared, sql, &params)
+                        .unwrap_or_else(|error| panic!("{context}: {error}"));
+                    assert_eq!(result.rows.len(), expected, "{context}");
+                    let values = result
+                        .rows
+                        .iter()
+                        .map(|row| row.values().next().unwrap())
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        values.iter().filter(|value| value.is_null()).count(),
+                        1,
+                        "{context}"
+                    );
+                    for other in &others {
+                        assert_eq!(
+                            values
+                                .iter()
+                                .filter(|value| compare(value, other)
+                                    .is_some_and(|ordering| ordering.is_eq()))
+                                .count(),
+                            1,
+                            "{context}"
+                        );
+                    }
+                }
+            }
+            if transaction {
+                engine.rollback_transaction().unwrap();
+            }
+        }
+    }
+}
+
 // Fixed integer arithmetic makes the generated corpus stable across platforms/toolchains.
 struct Generator(u64);
 

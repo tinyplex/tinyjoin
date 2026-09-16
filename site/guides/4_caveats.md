@@ -28,7 +28,7 @@ forms are rejected explicitly rather than silently reinterpreted.
 
 The omissions most likely to matter are:
 
-- No subqueries, CTEs, `UNION`/`INTERSECT`/`EXCEPT`, or `DISTINCT`.
+- No subqueries, CTEs, or `UNION`/`INTERSECT`/`EXCEPT`.
 - No arithmetic, concatenation, casts, or scalar functions. Values are not a
   general expression language.
 - No `LIKE`/`ILIKE`, `ANY`/`ALL`, or JSON path operators, so substring search

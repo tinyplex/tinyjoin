@@ -25,6 +25,16 @@ returned under several names. As in PostgreSQL, an `ORDER BY` name matches an
 output alias before a source column of the same name. Output names must still be
 distinct.
 
+`SELECT DISTINCT` removes duplicate rows from a single-table or join projection,
+which is especially useful for collapsing the rows a many-to-many join
+multiplies, as in
+`SELECT DISTINCT tag.name FROM post_tags JOIN tags AS tag ON post_tags.tag_id = tag.id`.
+`NULL`s compare as equal to one another, and `LIMIT` and `OFFSET` count distinct
+rows. As in PostgreSQL, `ORDER BY` must name projected columns. The projection
+must list its columns explicitly and cannot contain JSON columns or aggregates,
+and `DISTINCT ON` and aggregate `DISTINCT`, such as `COUNT(DISTINCT column)`,
+remain unsupported. A column named `distinct` remains usable.
+
 ## v0.2.0
 
 Subscriptions and statement results now report **which rows changed**, not only

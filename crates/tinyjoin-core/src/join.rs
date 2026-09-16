@@ -4,9 +4,10 @@ use std::str::FromStr;
 
 use serde_json::{Map, Number, Value};
 
+use crate::aggregate::{encode_group_key, group_key_part};
 use crate::query::{
-    ParseMode, Token, bind_parameter, is_reserved_keyword, matches_predicate, pagination_value,
-    parse_predicate_at,
+    ParseMode, Token, bind_parameter, is_distinct_keyword_at, is_reserved_keyword,
+    matches_predicate, pagination_value, parse_predicate_at,
 };
 use crate::storage::StorageReader;
 use crate::{
@@ -77,6 +78,8 @@ enum OrderSource {
 
 #[derive(Clone, Debug)]
 pub(crate) struct JoinPlan {
+    /// `SELECT DISTINCT`: joined rows with equal projected values are returned once.
+    distinct: bool,
     projections: Vec<Projection>,
     first: Source,
     joins: Vec<JoinStage>,
@@ -234,13 +237,16 @@ fn execute_unordered(
     let mut rows = Vec::new();
     let mut skipped = 0_usize;
     let mut result_bytes = 0_usize;
+    let mut seen = HashSet::new();
     visit_joined_rows(
         storage,
         plan,
         relations,
         conditions,
         &mut |bindings, budget| {
-            if !matches_joined_predicate(bindings, plan, relations, budget)? {
+            if !matches_joined_predicate(bindings, plan, relations, budget)?
+                || !first_distinct_row(&mut seen, bindings, plan, relations, budget)?
+            {
                 return Ok(VisitControl::Continue);
             }
             if skipped < plan.offset {
@@ -272,13 +278,18 @@ fn execute_ordered(
     conditions: &[Vec<ResolvedCondition>],
 ) -> Result<Vec<Row>> {
     let mut joined_rows = Vec::new();
+    let mut seen = HashSet::new();
     visit_joined_rows(
         storage,
         plan,
         relations,
         conditions,
         &mut |bindings, budget| {
-            if !matches_joined_predicate(bindings, plan, relations, budget)? {
+            // DISTINCT may keep the first of several equal rows because every ordering key is a
+            // projected value, which validation guarantees, so equal rows also sort equally.
+            if !matches_joined_predicate(bindings, plan, relations, budget)?
+                || !first_distinct_row(&mut seen, bindings, plan, relations, budget)?
+            {
                 return Ok(VisitControl::Continue);
             }
             if joined_rows.len() == MAX_RESULT_ROWS {
@@ -446,6 +457,41 @@ fn visit_extensions<'a>(
     Ok(VisitControl::Continue)
 }
 
+/// Reports whether a matching joined row is the first with its projected values, remembering it if
+/// so. Without DISTINCT every row is first. Remembered keys are retained work for the whole join.
+fn first_distinct_row(
+    seen: &mut HashSet<String>,
+    bindings: &[Option<&Row>],
+    plan: &JoinPlan,
+    relations: &[Relation],
+    budget: &mut WorkBudget,
+) -> Result<bool> {
+    if !plan.distinct {
+        return Ok(true);
+    }
+    let mut parts = Vec::with_capacity(plan.projections.len());
+    let mut input_bytes = 32_usize;
+    for projection in &plan.projections {
+        let (_, _, definition) = resolve_column(&projection.source, relations)?;
+        let value = joined_value(bindings, &projection.source, relations)?;
+        // A text part is JSON-escaped twice while the key is encoded; see the aggregate executor.
+        input_bytes = checked_add(input_bytes, checked_mul(owned_value_bytes(value)?, 14)?)?;
+        budget.ensure_transient(input_bytes)?;
+        parts.push(group_key_part(
+            definition.data_type,
+            value,
+            &projection.source.column,
+        )?);
+    }
+    let key = encode_group_key(&parts)?;
+    if seen.contains(&key) {
+        return Ok(false);
+    }
+    budget.retain(checked_add(64, checked_mul(key.len(), 2)?)?)?;
+    seen.insert(key);
+    Ok(true)
+}
+
 fn matches_joined_predicate(
     bindings: &[Option<&Row>],
     plan: &JoinPlan,
@@ -579,14 +625,22 @@ fn validate_plan(
 
     let mut outputs = HashSet::new();
     let mut fields = Vec::with_capacity(plan.projections.len());
+    let mut projected = HashSet::new();
     for projection in &plan.projections {
-        let (_, _, definition) = resolve_column(&projection.source, relations)?;
+        let (source, index, definition) = resolve_column(&projection.source, relations)?;
         if !outputs.insert(projection.output.as_str()) {
             return Err(EngineError::invalid_query(format!(
                 "SELECT produces output column `{}` more than once; use distinct AS aliases",
                 projection.output
             )));
         }
+        if plan.distinct && definition.data_type == ColumnType::Json {
+            return Err(EngineError::type_mismatch(format!(
+                "JSON output column `{}` cannot be compared by SELECT DISTINCT",
+                projection.output
+            )));
+        }
+        projected.insert((source, index));
         fields.push(ResultField::new(&projection.output, definition.data_type));
     }
     if let Some(predicate) = &plan.predicate {
@@ -595,9 +649,15 @@ fn validate_plan(
     for order in &plan.order_by {
         match &order.source {
             OrderSource::Column(column) => {
-                let (_, _, definition) = resolve_column(column, relations)?;
+                let (source, index, definition) = resolve_column(column, relations)?;
                 if definition.data_type == ColumnType::Json {
                     return Err(EngineError::type_mismatch("JSON columns cannot be ordered"));
+                }
+                if plan.distinct && !projected.contains(&(source, index)) {
+                    return Err(EngineError::invalid_query(format!(
+                        "SELECT DISTINCT can only be ordered by projected columns, not `{}`",
+                        column.column
+                    )));
                 }
             }
             OrderSource::Output(output) => {
@@ -1109,6 +1169,15 @@ impl<'a> Parser<'a> {
 
     fn parse(mut self) -> Result<JoinPlan> {
         self.expect_keyword("select")?;
+        let distinct = is_distinct_keyword_at(&self.tokens, self.position);
+        if distinct {
+            self.position += 1;
+            if self.consume_keyword("on") {
+                return Err(EngineError::unsupported_sql(
+                    "SELECT DISTINCT ON is not supported",
+                ));
+            }
+        }
         let projections = self.parse_projections()?;
         self.expect_keyword("from")?;
         let first = self.parse_source()?;
@@ -1185,6 +1254,7 @@ impl<'a> Parser<'a> {
             ));
         }
         Ok(JoinPlan {
+            distinct,
             projections,
             first,
             joins,
@@ -1678,6 +1748,92 @@ mod tests {
                 row(json!({"left_id": 5, "right_id": 106})),
             ]
         );
+    }
+
+    #[test]
+    fn select_distinct_collapses_rows_the_join_multiplied() {
+        let engine = database();
+        let values = |sql: &str, params: &[Value]| {
+            engine
+                .query_sql(sql, params)
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|row| row.into_iter().next().unwrap().1)
+                .collect::<Vec<_>>()
+        };
+        let from = "FROM left_items AS l JOIN right_items AS r ON l.k1 = r.k1";
+        assert_eq!(
+            values(&format!("SELECT DISTINCT l.k1 AS k {from} ORDER BY k"), &[]),
+            [json!(10), json!(20), json!(30)]
+        );
+        assert_eq!(
+            values(
+                &format!("SELECT DISTINCT l.k1 AS k {from} ORDER BY l.k1 DESC"),
+                &[]
+            ),
+            [json!(30), json!(20), json!(10)]
+        );
+        assert_eq!(
+            values(
+                &format!("SELECT DISTINCT r.k2 {from} WHERE r.score <= $1 ORDER BY k2 NULLS FIRST"),
+                &[json!(6)],
+            ),
+            [Value::Null, json!("a"), json!("b")]
+        );
+        // Unordered pagination counts distinct rows in the join's left-major order.
+        assert_eq!(
+            values(
+                &format!("SELECT DISTINCT l.label {from} LIMIT 2 OFFSET 1"),
+                &[]
+            ),
+            [json!("L2"), json!("L3")]
+        );
+        // Every unmatched left row null-extends to the same projected row.
+        assert_eq!(
+            values(
+                "SELECT DISTINCT r.label AS label FROM left_items AS l \
+                 LEFT JOIN right_items AS r ON l.k1 = r.k1 AND l.k2 = r.k2 \
+                 ORDER BY label NULLS FIRST",
+                &[],
+            ),
+            [
+                Value::Null,
+                json!("R1"),
+                json!("R2"),
+                json!("R3"),
+                json!("R4")
+            ]
+        );
+        assert_eq!(
+            engine
+                .query_sql(
+                    &format!("SELECT DISTINCT l.k1 AS k, r.k2 AS k2 {from} ORDER BY k, k2"),
+                    &[]
+                )
+                .unwrap()
+                .rows,
+            vec![
+                row(json!({"k": 10, "k2": "a"})),
+                row(json!({"k": 10, "k2": "b"})),
+                row(json!({"k": 20, "k2": "a"})),
+                row(json!({"k": 30, "k2": null})),
+            ]
+        );
+
+        for (sql, code) in [
+            (
+                format!("SELECT DISTINCT l.k1 AS k {from} ORDER BY r.score"),
+                "INVALID_QUERY",
+            ),
+            (
+                format!("SELECT DISTINCT ON (l.k1) l.k1 AS k {from}"),
+                "UNSUPPORTED_SQL",
+            ),
+            (format!("SELECT DISTINCT * {from}"), "UNSUPPORTED_SQL"),
+        ] {
+            assert_eq!(engine.query_sql(&sql, &[]).unwrap_err().code, code, "{sql}");
+        }
     }
 
     #[test]

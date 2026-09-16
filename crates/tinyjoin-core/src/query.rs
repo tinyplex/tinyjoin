@@ -1421,6 +1421,28 @@ fn is_identifier_continue(character: char) -> bool {
     is_identifier_start(character) || character.is_ascii_digit() || character == '$'
 }
 
+/// Whether the token at `position`, directly after `SELECT`, is the `DISTINCT` keyword.
+///
+/// `DISTINCT` is not reserved, so a column may be named `distinct`. The word is a keyword only when
+/// something other than the end of a projection item or aggregate argument follows it.
+pub(crate) fn is_distinct_keyword_at(tokens: &[Token], position: usize) -> bool {
+    let is_keyword = |token: Option<&Token>, keyword: &str| {
+        matches!(
+            token,
+            Some(Token::Identifier {
+                value,
+                quoted: false,
+            }) if value.eq_ignore_ascii_case(keyword)
+        )
+    };
+    is_keyword(tokens.get(position), "distinct")
+        && tokens.get(position + 1).is_some_and(|next| {
+            !matches!(next, Token::Comma | Token::RParen)
+                && !is_keyword(Some(next), "from")
+                && !is_keyword(Some(next), "as")
+        })
+}
+
 pub(crate) fn is_reserved_keyword(identifier: &str) -> bool {
     [
         "select",
