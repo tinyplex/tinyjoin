@@ -304,6 +304,191 @@ fn predicate_matrix_agrees_across_reads_writes_indexes_preparation_and_overlays(
     }
 }
 
+/// A filter's model result: `None` is SQL unknown, which a `WHERE` clause rejects like false.
+type Truth = Option<bool>;
+
+fn and(left: Truth, right: Truth) -> Truth {
+    match (left, right) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    }
+}
+
+fn or(left: Truth, right: Truth) -> Truth {
+    match (left, right) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    }
+}
+
+fn compare(value: &Value, bound: &Value) -> Option<std::cmp::Ordering> {
+    match (value, bound) {
+        (Value::Null, _) | (_, Value::Null) => None,
+        (Value::Number(value), Value::Number(bound)) => value.as_f64().partial_cmp(&bound.as_f64()),
+        // Rust string ordering is UTF-8 byte order, which is Unicode code-point order.
+        (Value::String(value), Value::String(bound)) => Some(value.cmp(bound)),
+        (Value::Bool(value), Value::Bool(bound)) => Some(value.cmp(bound)),
+        _ => unreachable!("the matrix only binds parameters of the column's own type"),
+    }
+}
+
+/// One `WHERE` template over column `v` and parameters `$1`, `$2`, ..., with its model.
+struct Filter {
+    sql: &'static str,
+    matches: fn(&Value, &[Value]) -> Truth,
+}
+
+/// Checks each filter against a row model in every statement family, directly and prepared, with
+/// and without a secondary index on the filtered column, inside a transaction that also has staged
+/// changes. Every case rolls back, so each one starts from the same committed rows.
+fn assert_filter_matrix(
+    kind: &str,
+    values: &[Value],
+    filters: &[Filter],
+    parameter_sets: &[Vec<Value>],
+) {
+    for indexed in [false, true] {
+        if indexed && kind == "FLOAT" {
+            continue;
+        }
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .execute_sql(
+                &format!("CREATE TABLE items (id INTEGER PRIMARY KEY, v {kind}, marked BOOLEAN NOT NULL DEFAULT false)"),
+                &[],
+            )
+            .unwrap();
+        if indexed {
+            engine
+                .execute_sql("CREATE INDEX items_v ON items (v)", &[])
+                .unwrap();
+        }
+        let mut committed = Vec::new();
+        for (id, value) in std::iter::once(&Value::Null)
+            .chain(values)
+            .chain(values.first())
+            .enumerate()
+        {
+            engine
+                .execute_sql(
+                    "INSERT INTO items (id, v) VALUES ($1, $2)",
+                    &[json!(id), value.clone()],
+                )
+                .unwrap();
+            committed.push(row(json!({"id": id, "v": value, "marked": false})));
+        }
+        for filter in filters {
+            let condition = filter.sql.replace("{v}", "v");
+            let join_condition = filter.sql.replace("{v}", "a.v");
+            let statements = [
+                format!("SELECT id FROM items WHERE {condition} ORDER BY id"),
+                format!("SELECT COUNT(*) AS n FROM items WHERE {condition}"),
+                format!(
+                    "SELECT a.id AS id FROM items a JOIN items b ON a.id = b.id WHERE {join_condition} ORDER BY id"
+                ),
+                format!("UPDATE items SET marked = true WHERE {condition} RETURNING id"),
+                format!("DELETE FROM items WHERE {condition} RETURNING id"),
+            ];
+            for params in parameter_sets {
+                for prepared in [false, true] {
+                    let context = format!(
+                        "{kind}, indexed={indexed}, {}, params={params:?}, prepared={prepared}",
+                        filter.sql
+                    );
+                    engine.begin_transaction().unwrap();
+                    // A staged row makes every family read through the transaction overlay.
+                    let staged = values.last().unwrap();
+                    engine
+                        .execute_sql(
+                            "INSERT INTO items (id, v) VALUES (99, $1)",
+                            std::slice::from_ref(staged),
+                        )
+                        .unwrap();
+                    let mut model = committed.clone();
+                    model.push(row(json!({"id": 99, "v": staged, "marked": false})));
+                    for (family, sql) in statements.iter().enumerate() {
+                        let expected = ids(&model
+                            .iter()
+                            .filter(|row| (filter.matches)(&row["v"], params) == Some(true))
+                            .cloned()
+                            .collect::<Vec<_>>());
+                        let result = execute(&mut engine, prepared, sql, params)
+                            .unwrap_or_else(|error| panic!("{context}: {sql}: {error}"));
+                        match family {
+                            1 => assert_eq!(
+                                result.rows,
+                                vec![row(json!({"n": expected.len()}))],
+                                "{context}: {sql}"
+                            ),
+                            0 | 2 => {
+                                assert_eq!(ordered_ids(&result.rows), expected, "{context}: {sql}")
+                            }
+                            _ => assert_eq!(ids(&result.rows), expected, "{context}: {sql}"),
+                        }
+                        let matched = |row: &Row| expected.contains(&row["id"].as_i64().unwrap());
+                        if family == 3 {
+                            for row in model.iter_mut().filter(|row| matched(row)) {
+                                row.insert("marked".to_owned(), json!(true));
+                            }
+                        } else if family == 4 {
+                            model.retain(|row| !matched(row));
+                        }
+                        assert_eq!(rows(&mut engine), model, "{context}: {sql}");
+                    }
+                    engine.rollback_transaction().unwrap();
+                    assert_eq!(rows(&mut engine), committed, "{context}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn between_agrees_with_its_model_across_families_indexes_and_preparation() {
+    fn between(value: &Value, params: &[Value]) -> Truth {
+        and(
+            compare(value, &params[0]).map(|ordering| ordering.is_ge()),
+            compare(value, &params[1]).map(|ordering| ordering.is_le()),
+        )
+    }
+    let filters = [
+        Filter {
+            sql: "{v} BETWEEN $1 AND $2",
+            matches: between,
+        },
+        Filter {
+            sql: "{v} NOT BETWEEN $1 AND $2",
+            matches: |value, params| between(value, params).map(|truth| !truth),
+        },
+        Filter {
+            sql: "NOT ({v} BETWEEN $1 AND $2) OR {v} IS NULL",
+            matches: |value, params| {
+                or(
+                    between(value, params).map(|truth| !truth),
+                    Some(value.is_null()),
+                )
+            },
+        },
+    ];
+    for (kind, values) in [
+        ("BOOLEAN", vec![json!(false), json!(true)]),
+        ("INTEGER", vec![json!(-1), json!(0), json!(1)]),
+        ("FLOAT", vec![json!(-1.5), json!(0.0), json!(1.0)]),
+        ("TEXT", vec![json!(""), json!("x"), json!("é🦀")]),
+    ] {
+        let bounds = std::iter::once(Value::Null)
+            .chain(values.iter().cloned())
+            .collect::<Vec<_>>();
+        let parameter_sets = bounds
+            .iter()
+            .flat_map(|low| bounds.iter().map(|high| vec![low.clone(), high.clone()]))
+            .collect::<Vec<_>>();
+        assert_filter_matrix(kind, &values, &filters, &parameter_sets);
+    }
+}
+
 // Fixed integer arithmetic makes the generated corpus stable across platforms/toolchains.
 struct Generator(u64);
 

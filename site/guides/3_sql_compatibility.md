@@ -202,8 +202,9 @@ each statement retains the ordinary parser limits below.
 | `AND`, `OR`, `NOT`, parentheses | Supported | Precedence is `NOT`, then `AND`, then `OR`; SQL unknown/null propagation is preserved. |
 | `IS NULL`, `IS NOT NULL` | Supported | Tests the single runtime null value. |
 | `IN (...)`, `NOT IN (...)` | Supported | One to 1,024 literals or parameters with SQL null behavior. |
+| `BETWEEN`, `NOT BETWEEN` | Narrow | `column BETWEEN low AND high` means exactly `column >= low AND column <= high`, and `NOT BETWEEN` means `column < low OR column > high`, with those comparisons' type and null rules. Each bound is a literal or parameter. There is no `SYMMETRIC` form, so a reversed range matches nothing. |
 | Arithmetic, concatenation, casts, scalar functions | No | Values are not a general expression language. |
-| `LIKE`, `ILIKE`, `BETWEEN`, `IS DISTINCT FROM`, `ANY`, `ALL` | No | These PostgreSQL predicate families are not implemented. |
+| `LIKE`, `ILIKE`, `IS DISTINCT FROM`, `ANY`, `ALL` | No | These PostgreSQL predicate families are not implemented. |
 | JSON/path operators | No | JSON can be stored, returned, and compared for structural equality only. |
 
 The right side of an ordinary predicate is a literal or parameter, not another

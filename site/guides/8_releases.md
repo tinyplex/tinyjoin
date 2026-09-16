@@ -5,6 +5,19 @@ compatibility boundaries. Every entry states what upgrading to it requires, so
 check the entries between the version in use and the target before upgrading.
 A release that needs no action says so explicitly.
 
+## v0.3.0
+
+This release closes some of the most commonly encountered gaps in the
+[SQL dialect](/guides/sql-compatibility/). Each form is new syntax that was
+previously rejected, so an existing statement keeps its meaning.
+
+`BETWEEN` and `NOT BETWEEN` are accepted wherever a `WHERE` clause is, including
+in aggregates, joins, `UPDATE`, `DELETE`, and prepared statements.
+`price BETWEEN $1 AND $2` means exactly `price >= $1 AND price <= $2`, with the
+same type checking and `NULL` behavior as those two comparisons, and it is
+inclusive at both ends. There is no `SYMMETRIC` form, so a range whose bounds
+are reversed matches nothing rather than being swapped.
+
 ## v0.2.0
 
 Subscriptions and statement results now report **which rows changed**, not only

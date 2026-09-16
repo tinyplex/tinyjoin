@@ -1101,10 +1101,10 @@ impl PredicateParser<'_> {
             return self.node(Predicate::IsNull { column, negated });
         }
 
-        let negated_in = self.consume_keyword("not");
+        let negated = self.consume_keyword("not");
         if self.consume_keyword("in") {
             let predicate = self.parse_in(column)?;
-            return if negated_in {
+            return if negated {
                 self.node(Predicate::Not {
                     predicate: Box::new(predicate),
                 })
@@ -1112,7 +1112,10 @@ impl PredicateParser<'_> {
                 Ok(predicate)
             };
         }
-        if negated_in {
+        if self.consume_keyword("between") {
+            return self.parse_between(column, negated);
+        }
+        if negated {
             return Err(unsupported_shape());
         }
 
@@ -1149,6 +1152,46 @@ impl PredicateParser<'_> {
         }
         self.expect_token(TokenMatcher::RParen, "Expected `)` after IN values")?;
         self.node(Predicate::In { column, values })
+    }
+
+    /// `BETWEEN` is exactly its two inclusive comparisons, so it expands into them rather than
+    /// adding a predicate the evaluator, validators, binders, and index planner would all need to
+    /// learn. `NOT BETWEEN` is the De Morgan form, which preserves SQL unknown propagation.
+    fn parse_between(&mut self, column: String, negated: bool) -> Result<Predicate> {
+        if self.consume_keyword("symmetric") || self.consume_keyword("asymmetric") {
+            return Err(EngineError::unsupported_sql(
+                "BETWEEN SYMMETRIC and BETWEEN ASYMMETRIC are not supported",
+            ));
+        }
+        let low = self.parse_value()?;
+        if !self.consume_keyword("and") {
+            return Err(EngineError::parse_error(
+                "Expected AND between the BETWEEN bounds",
+            ));
+        }
+        let high = self.parse_value()?;
+        let (lower, upper) = if negated {
+            (ComparisonOperator::Lt, ComparisonOperator::Gt)
+        } else {
+            (ComparisonOperator::Gte, ComparisonOperator::Lte)
+        };
+        let predicates = vec![
+            self.node(Predicate::Comparison {
+                column: column.clone(),
+                operator: lower,
+                value: low,
+            })?,
+            self.node(Predicate::Comparison {
+                column,
+                operator: upper,
+                value: high,
+            })?,
+        ];
+        self.node(if negated {
+            Predicate::Or { predicates }
+        } else {
+            Predicate::And { predicates }
+        })
     }
 
     fn parse_identifier(&mut self) -> Result<String> {
@@ -2273,6 +2316,97 @@ mod tests {
                 .rows
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn between_is_inclusive_and_propagates_unknown_like_its_comparisons() {
+        let database = engine();
+        let ids = |sql: &str, params: &[Value]| {
+            database
+                .query_sql(sql, params)
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|row| row["id"].as_i64().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(
+                "SELECT id FROM posts WHERE id BETWEEN 1 AND 2 ORDER BY id",
+                &[]
+            ),
+            [1, 2]
+        );
+        assert_eq!(
+            ids(
+                "SELECT id FROM posts WHERE id NOT BETWEEN $1 AND $2 ORDER BY id",
+                &[json!(2), json!(2.5)],
+            ),
+            [1, 3]
+        );
+        // Bounds are not reordered: a reversed range is empty rather than symmetric.
+        assert!(ids("SELECT id FROM posts WHERE id BETWEEN 2 AND 1", &[]).is_empty());
+        assert_eq!(
+            ids(
+                "SELECT id FROM posts WHERE title BETWEEN 'one' AND 'three' ORDER BY id",
+                &[],
+            ),
+            [1, 3]
+        );
+        // The trailing AND belongs to the enclosing conjunction, not to the range.
+        assert_eq!(
+            ids(
+                "SELECT id FROM posts WHERE user_id BETWEEN 7 AND 8 AND id <> 1 ORDER BY id",
+                &[],
+            ),
+            [2, 3]
+        );
+        // A NULL bound makes one comparison unknown. The range can then only be false or unknown,
+        // and negating an unknown range must not match.
+        assert_eq!(
+            ids(
+                "SELECT id FROM posts WHERE id NOT BETWEEN NULL AND 1 ORDER BY id",
+                &[],
+            ),
+            [2, 3]
+        );
+        assert!(ids("SELECT id FROM posts WHERE id BETWEEN NULL AND 3", &[]).is_empty());
+        assert!(
+            ids(
+                "SELECT id FROM posts WHERE NOT (id BETWEEN NULL AND 3)",
+                &[]
+            )
+            .is_empty()
+        );
+        assert!(
+            ids(
+                "SELECT id FROM posts WHERE deleted NOT BETWEEN false AND true",
+                &[],
+            )
+            .is_empty()
+        );
+
+        for (sql, code) in [
+            (
+                "SELECT id FROM posts WHERE id BETWEEN SYMMETRIC 2 AND 1",
+                "UNSUPPORTED_SQL",
+            ),
+            (
+                "SELECT id FROM posts WHERE id BETWEEN 1 OR 2",
+                "SQL_PARSE_ERROR",
+            ),
+            ("SELECT id FROM posts WHERE id BETWEEN 1", "SQL_PARSE_ERROR"),
+            (
+                "SELECT id FROM posts WHERE id BETWEEN 'a' AND 2",
+                "TYPE_MISMATCH",
+            ),
+        ] {
+            assert_eq!(
+                database.query_sql(sql, &[]).unwrap_err().code,
+                code,
+                "{sql}"
+            );
+        }
     }
 
     #[test]

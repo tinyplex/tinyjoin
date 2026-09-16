@@ -31,8 +31,8 @@ The omissions most likely to matter are:
 - No subqueries, CTEs, `UNION`/`INTERSECT`/`EXCEPT`, or `DISTINCT`.
 - No arithmetic, concatenation, casts, or scalar functions. Values are not a
   general expression language.
-- No `LIKE`/`ILIKE`, `BETWEEN`, `ANY`/`ALL`, or JSON path operators, so
-  substring search and ranged text matching have to happen outside SQL.
+- No `LIKE`/`ILIKE`, `ANY`/`ALL`, or JSON path operators, so substring search
+  and pattern matching have to happen outside SQL.
 - No `ON CONFLICT` upsert, `INSERT ... SELECT`, `MERGE`, or `UPDATE ... FROM`.
 - No sequences, `SERIAL`, or generated identity. Generate text identifiers in
   the client.
