@@ -71,7 +71,7 @@ function harness(options: {rollbackFailure?: boolean} = {}) {
     async (method: RpcMethod, _params: unknown): Promise<unknown> => {
       if (method === 'beginTransaction') return {transactionId: 'tx-1'};
       if (method === 'commitTransaction')
-        return {revision: 1, tables: ['items']};
+        return {revision: 1, tables: ['items'], keys: {}};
       if (method === 'rollbackTransaction') {
         if (options.rollbackFailure)
           throw Object.assign(new Error('Injected rollback failure'), {

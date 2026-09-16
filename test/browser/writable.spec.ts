@@ -53,7 +53,10 @@ test('writes, transacts, rolls back, and reopens through Worker/WASM/OPFS', asyn
   ]);
   expect(report.reopenedRows).toEqual(report.stagedRows);
   expect(report.invalidations).toEqual([
-    {revision: 1, tables: ['tasks']},
-    {revision: 2, tables: ['tasks']},
+    // The setup script creates the table as well as inserting, and DDL changes a table without
+    // naming rows, so that event withholds keys for it.
+    {revision: 1, tables: ['tasks'], keys: {}},
+    // The transaction only mutates rows, so its commit names every key it changed.
+    {revision: 2, tables: ['tasks'], keys: {tasks: [{id: 1}, {id: 3}]}},
   ]);
 });

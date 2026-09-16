@@ -67,7 +67,7 @@ describe('WorkerRpc', () => {
     worker.respond({
       v: PROTOCOL_VERSION,
       event: 'tablesChanged',
-      payload: {revision: 3, tables: ['posts']},
+      payload: {revision: 3, tables: ['posts'], keys: {}},
     });
     worker.respond({
       v: PROTOCOL_VERSION,
@@ -148,7 +148,7 @@ describe('WorkerRpc', () => {
   });
 
   it('validates every method-specific success shape', () => {
-    const outcome = {revision: 1, tables: ['posts']};
+    const outcome = {revision: 1, tables: ['posts'], keys: {}};
 
     expect(isRpcResult('init', {revision: 0})).toBe(true);
     expect(isRpcResult('executeSql', sqlResult(1, [{id: 1}]))).toBe(true);
@@ -407,6 +407,7 @@ function sqlResult(revision: number, rows: Array<{id: number}> = []) {
     rowCount: rows.length,
     rows,
     tables: [],
+    keys: {},
   };
 }
 

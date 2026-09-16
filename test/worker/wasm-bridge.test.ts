@@ -45,7 +45,7 @@ function failure(
 }
 
 function outcome(revision = 1, tables: string[] = ['items']) {
-  return {revision, tables};
+  return {revision, tables, keys: {}};
 }
 
 function sqlResult(rows: Row[] = []): SqlResult {
@@ -56,6 +56,7 @@ function sqlResult(rows: Row[] = []): SqlResult {
     rowCount: rows.length,
     rows,
     tables: [],
+    keys: {},
   };
 }
 

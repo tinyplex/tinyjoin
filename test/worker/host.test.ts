@@ -70,6 +70,7 @@ function mockEngine() {
         rowCount: 1,
         rows: [],
         tables: [table],
+        keys: {},
       };
     }),
     prepareSql: vi.fn(() => 1),
@@ -87,6 +88,7 @@ function mockEngine() {
         rowCount: params.length,
         rows: [],
         tables: [table],
+        keys: {},
       };
     }),
     closePrepared: vi.fn(),
@@ -105,6 +107,7 @@ function mockEngine() {
           rowCount: 0,
           rows: [],
           tables: [table],
+          keys: {},
         },
         {
           command: 'SELECT',
@@ -113,6 +116,7 @@ function mockEngine() {
           rowCount: 1,
           rows: [{id: 1}],
           tables: [],
+          keys: {},
         },
       ];
     }),
@@ -127,7 +131,7 @@ function mockEngine() {
       }
       transactionActive = false;
       transactionTables.clear();
-      return {revision, tables};
+      return {revision, tables, keys: {}};
     }),
     rollbackTransaction: vi.fn(() => {
       transactionActive = false;
@@ -156,6 +160,7 @@ describe('startWorker', () => {
       rowCount: 1,
       rows: [{id: 1}],
       tables: [],
+      keys: {},
     };
     const callStructured = vi.fn((_version: number, operation: number) => {
       const payload =
@@ -343,6 +348,7 @@ describe('startWorker', () => {
         rowCount: 1,
         rows: [],
         tables: ['posts'],
+        keys: {},
       },
     });
   });
@@ -383,7 +389,7 @@ describe('startWorker', () => {
       {
         v: PROTOCOL_VERSION,
         event: 'tablesChanged',
-        payload: {revision: 2, tables: ['posts', 'users']},
+        payload: {revision: 2, tables: ['posts', 'users'], keys: {}},
       },
     ]);
   });
@@ -419,12 +425,13 @@ describe('startWorker', () => {
         rowCount: 1,
         rows: [],
         tables: ['posts'],
+        keys: {},
       },
     });
     expect(scope.posted).toContainEqual({
       v: PROTOCOL_VERSION,
       event: 'tablesChanged',
-      payload: {revision: 1, tables: ['posts']},
+      payload: {revision: 1, tables: ['posts'], keys: {}},
     });
     scope.posted.length = 0;
 
@@ -466,6 +473,7 @@ describe('startWorker', () => {
           rowCount: 1,
           rows: [],
           tables: ['posts'],
+          keys: {},
         },
       },
     ]);
@@ -481,12 +489,12 @@ describe('startWorker', () => {
       v: PROTOCOL_VERSION,
       id: 5,
       ok: true,
-      result: {revision: 2, tables: ['posts']},
+      result: {revision: 2, tables: ['posts'], keys: {}},
     });
     expect(scope.posted).toContainEqual({
       v: PROTOCOL_VERSION,
       event: 'tablesChanged',
-      payload: {revision: 2, tables: ['posts']},
+      payload: {revision: 2, tables: ['posts'], keys: {}},
     });
   });
 
@@ -523,7 +531,7 @@ describe('startWorker', () => {
     expect(scope.posted).toContainEqual({
       v: PROTOCOL_VERSION,
       event: 'tablesChanged',
-      payload: {revision: 1, tables: ['posts']},
+      payload: {revision: 1, tables: ['posts'], keys: {}},
     });
 
     scope.posted.length = 0;
@@ -588,7 +596,7 @@ describe('startWorker', () => {
     expect(scope.posted).toContainEqual({
       v: PROTOCOL_VERSION,
       event: 'tablesChanged',
-      payload: {revision: 2, tables: ['posts']},
+      payload: {revision: 2, tables: ['posts'], keys: {}},
     });
     scope.send({
       v: PROTOCOL_VERSION,
@@ -636,6 +644,7 @@ describe('startWorker', () => {
           rowCount: 0,
           rows: [],
           tables: ['posts'],
+          keys: {},
         },
         {
           command: 'SELECT',
@@ -644,13 +653,14 @@ describe('startWorker', () => {
           rowCount: 1,
           rows: [{id: 1}],
           tables: [],
+          keys: {},
         },
       ],
     });
     expect(scope.posted).toContainEqual({
       v: PROTOCOL_VERSION,
       event: 'tablesChanged',
-      payload: {revision: 1, tables: ['posts']},
+      payload: {revision: 1, tables: ['posts'], keys: {}},
     });
   });
 

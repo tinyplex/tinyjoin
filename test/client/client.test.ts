@@ -54,6 +54,7 @@ function writableWorker(): FakeWorker {
             ? [{id: message.params.params[0] ?? 1}]
             : [],
           tables: writes ? ['posts'] : [],
+          keys: {},
         });
       } else if (message.method === 'prepareSql') {
         const statementId = nextStatementId++;
@@ -75,6 +76,7 @@ function writableWorker(): FakeWorker {
           rowCount: 1,
           rows: isSelect ? [{id: message.params.params[0] ?? 1}] : [],
           tables: writes ? ['posts'] : [],
+          keys: {},
         });
       } else if (message.method === 'closePrepared') {
         preparedSql.delete(message.params.statementId);
@@ -91,6 +93,7 @@ function writableWorker(): FakeWorker {
             rowCount: 0,
             rows: [],
             tables: ['posts'],
+            keys: {},
           },
           {
             command: 'INSERT',
@@ -99,6 +102,7 @@ function writableWorker(): FakeWorker {
             rowCount: 1,
             rows: [],
             tables: ['posts'],
+            keys: {},
           },
           {
             command: 'SELECT',
@@ -107,6 +111,7 @@ function writableWorker(): FakeWorker {
             rowCount: 1,
             rows: [{id: 1}],
             tables: [],
+            keys: {},
           },
         ]);
       } else if (message.method === 'beginTransaction') {
@@ -115,7 +120,7 @@ function writableWorker(): FakeWorker {
         });
       } else if (message.method === 'commitTransaction') {
         revision += 1;
-        respondOk(worker, message, {revision, tables: ['posts']});
+        respondOk(worker, message, {revision, tables: ['posts'], keys: {}});
       } else if (message.method === 'rollbackTransaction') {
         respondOk(worker, message, undefined);
       } else if (message.method === 'close') {
@@ -320,6 +325,7 @@ describe('Client', () => {
       rowCount: 1,
       rows: [{id: 7}],
       tables: ['posts'],
+      keys: {},
     });
     expect(client.getRevision()).toBe(1);
     expect(
@@ -341,6 +347,7 @@ describe('Client', () => {
       rowCount: 1,
       rows: [[1]],
       tables: [],
+      keys: {},
     });
     await client.close();
   });
@@ -500,6 +507,7 @@ describe('Client', () => {
       rowCount: 1,
       rows: [{id: 4}],
       tables: [],
+      keys: {},
     });
     await pending;
     await vi.waitFor(() => expect(statementClose).toBeDefined());
@@ -556,6 +564,7 @@ describe('Client', () => {
       rowCount: 1,
       rows: [{id: 1}],
       tables: [],
+      keys: {},
     });
     await executionPromise;
     await vi.waitFor(() => expect(statementClose).toBeDefined());
@@ -566,7 +575,7 @@ describe('Client', () => {
     await vi.waitFor(() => expect(begin).toBeDefined());
     respondOk(worker, begin!, {transactionId: 'tx-1'});
     await vi.waitFor(() => expect(commit).toBeDefined());
-    respondOk(worker, commit!, {revision: 0, tables: []});
+    respondOk(worker, commit!, {revision: 0, tables: [], keys: {}});
     await transactionPromise;
     expect(
       (worker.posted as WorkerRequest[]).map((request) => request.method),
@@ -639,7 +648,7 @@ describe('Client', () => {
     expect(second.closed).toBe(false);
     respondOk(worker, begin!, {transactionId: 'tx-1'});
     await vi.waitFor(() => expect(commit).toBeDefined());
-    respondOk(worker, commit!, {revision: 0, tables: []});
+    respondOk(worker, commit!, {revision: 0, tables: [], keys: {}});
     await transaction;
 
     await second.close();
@@ -755,6 +764,7 @@ describe('Client', () => {
         revision: 1,
         rows: [],
         tables: ['posts'],
+        keys: {},
       },
       {
         affectedRows: 1,
@@ -764,6 +774,7 @@ describe('Client', () => {
         rowCount: 1,
         rows: [],
         tables: ['posts'],
+        keys: {},
       },
       {
         affectedRows: 0,
@@ -773,6 +784,7 @@ describe('Client', () => {
         rowCount: 1,
         rows: [{id: 1}],
         tables: [],
+        keys: {},
       },
     ]);
     expect(
@@ -811,6 +823,7 @@ describe('Client', () => {
             rowCount: 1,
             rows: [{id: 1}],
             tables: [],
+            keys: {},
           });
         } else if (message.method === 'close') {
           respondOk(worker, message, undefined);
@@ -990,12 +1003,96 @@ describe('Client', () => {
     worker.respond({
       v: PROTOCOL_VERSION,
       event: 'tablesChanged',
-      payload: {revision: 5, tables: ['posts']},
+      payload: {revision: 5, tables: ['posts'], keys: {}},
     });
 
-    expect(posts).toHaveBeenCalledWith({revision: 5, tables: ['posts']});
+    expect(posts).toHaveBeenCalledWith({revision: 5, tables: ['posts'], keys: {}});
     expect(users).not.toHaveBeenCalled();
     expect(client.getRevision()).toBe(5);
+    await client.close();
+  });
+
+  it('unions changed keys across coalesced events and drops unreportable tables', async () => {
+    const worker = respondingWorker();
+    const client = await create({worker});
+    const listener = vi.fn();
+    client.subscribe({}, listener);
+
+    // Two events arriving before the listener runs must merge into one key set, and a key
+    // touched by both must be reported once.
+    worker.respond({
+      v: PROTOCOL_VERSION,
+      event: 'tablesChanged',
+      payload: {revision: 5, tables: ['posts'], keys: {posts: [{id: 1}]}},
+    });
+    worker.respond({
+      v: PROTOCOL_VERSION,
+      event: 'tablesChanged',
+      payload: {
+        revision: 6,
+        tables: ['posts', 'users'],
+        keys: {posts: [{id: 1}, {id: 2}], users: [{id: 7}]},
+      },
+    });
+
+    expect(listener).toHaveBeenLastCalledWith({
+      revision: 6,
+      tables: ['posts', 'users'],
+      keys: {posts: [{id: 1}, {id: 2}], users: [{id: 7}]},
+    });
+    await client.close();
+  });
+
+  it('withholds a table whose keys any coalesced event could not report', async () => {
+    const worker = respondingWorker();
+    const client = await create({worker});
+    const listener = vi.fn();
+    client.subscribe({}, listener);
+
+    worker.respond({
+      v: PROTOCOL_VERSION,
+      event: 'tablesChanged',
+      payload: {revision: 5, tables: ['posts'], keys: {posts: [{id: 1}]}},
+    });
+    // A write too large to name its keys poisons the table for the whole coalesced event:
+    // a subscriber must not read a partial list as a complete one.
+    worker.respond({
+      v: PROTOCOL_VERSION,
+      event: 'tablesChanged',
+      payload: {revision: 6, tables: ['posts'], keys: {}},
+    });
+
+    expect(listener).toHaveBeenLastCalledWith({
+      revision: 6,
+      tables: ['posts'],
+      keys: {},
+    });
+    await client.close();
+  });
+
+  it('reports no keys alongside a reset, which requires a full re-query', async () => {
+    const worker = respondingWorker();
+    const client = await create({worker});
+    const listener = vi.fn();
+    client.subscribe({}, listener);
+
+    worker.respond({
+      v: PROTOCOL_VERSION,
+      event: 'tablesChanged',
+      payload: {revision: 5, tables: ['posts'], keys: {posts: [{id: 1}]}},
+    });
+    worker.respond({
+      v: PROTOCOL_VERSION,
+      event: 'resync',
+      payload: {revision: 6, tables: [], keys: {}},
+    });
+
+    expect(listener).toHaveBeenLastCalledWith({
+      revision: 6,
+      tables: [],
+      keys: {},
+      reset: true,
+    });
     await client.close();
   });
 

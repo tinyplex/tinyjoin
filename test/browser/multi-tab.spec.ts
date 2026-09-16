@@ -63,7 +63,9 @@ test('shares writes, subscriptions, and client-scoped prepared handles across ta
           alias,
         ),
       )
-      .toEqual({revision: 3, tables: ['items']});
+      // The other tab's write arrives here naming the row it changed, so a subscriber can
+      // refresh that row instead of re-reading the table.
+      .toEqual({revision: 3, tables: ['items'], keys: {items: [{id: 2}]}});
     expect(
       await page.evaluate(
         ({alias, sql}) => window.__tinyjoinMultiTab.query(alias, sql),
@@ -116,7 +118,7 @@ test('shares writes, subscriptions, and client-scoped prepared handles across ta
     .poll(() =>
       second.evaluate(() => window.__tinyjoinMultiTab.events('another').at(-1)),
     )
-    .toEqual({revision: 4, tables: ['items']});
+    .toEqual({revision: 4, tables: ['items'], keys: {items: [{id: 3}]}});
 });
 
 test('serializes other clients around a complete transaction callback', async ({
