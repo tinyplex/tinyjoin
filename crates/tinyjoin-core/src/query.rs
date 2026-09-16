@@ -9,8 +9,8 @@ use crate::storage::{
 };
 use crate::{
     ColumnDefinition, ColumnType, ComparisonOperator, EngineError, NullOrder, OrderBy,
-    OrderDirection, Predicate, QueryResult, Result, ResultField, Row, SelectPlan, TableDefinition,
-    VisitControl, VisitOutcome,
+    OrderDirection, Predicate, QueryResult, Result, ResultField, Row, SelectColumn, SelectPlan,
+    TableDefinition, VisitControl, VisitOutcome,
 };
 
 const MAX_SQL_BYTES: usize = 64 * 1024;
@@ -65,7 +65,7 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &SelectPlan) -> Result<
     }
 
     let schema = storage.table_schema(&plan.table)?;
-    let fields = projection_fields(&schema, plan.columns.as_deref())?;
+    let fields = select_fields(&schema, plan.columns.as_deref())?;
     if let Some(predicate) = &plan.predicate {
         validate_predicate_columns(predicate, &schema, &plan.table)?;
         validate_predicate_types(predicate, &schema, &plan.table)?;
@@ -124,6 +124,54 @@ pub(crate) fn projection_fields(
     }
 }
 
+/// Result fields for a single-table projection. Output names must be distinct because a result row
+/// is a JSON object, but one source column may be returned under several names.
+fn select_fields(
+    schema: &TableDefinition,
+    columns: Option<&[SelectColumn]>,
+) -> Result<Vec<ResultField>> {
+    let Some(columns) = columns else {
+        return projection_fields(schema, None);
+    };
+    let mut outputs = HashSet::with_capacity(columns.len());
+    columns
+        .iter()
+        .map(|item| {
+            if !outputs.insert(item.output.as_str()) {
+                return Err(EngineError::invalid_query(format!(
+                    "SELECT produces output column `{}` more than once; use distinct AS aliases",
+                    item.output
+                )));
+            }
+            column_definition(schema, &item.column, &schema.name)
+                .map(|definition| ResultField::new(&item.output, definition.data_type))
+        })
+        .collect()
+}
+
+/// An explicit projection prepared once per query rather than once per row.
+struct Projection<'a> {
+    columns: &'a [SelectColumn],
+    /// Whether each item is the last to read its source column, so that its value can be moved
+    /// out of the owned row instead of cloned.
+    moves: Vec<bool>,
+}
+
+impl<'a> Projection<'a> {
+    fn new(columns: Option<&'a [SelectColumn]>) -> Option<Self> {
+        columns.map(|columns| {
+            let mut seen = HashSet::with_capacity(columns.len());
+            let mut moves = columns
+                .iter()
+                .rev()
+                .map(|item| seen.insert(item.column.as_str()))
+                .collect::<Vec<_>>();
+            moves.reverse();
+            Self { columns, moves }
+        })
+    }
+}
+
 pub(crate) fn validate_named_columns(schema: &TableDefinition, columns: &[String]) -> Result<()> {
     let mut names = HashSet::with_capacity(columns.len());
     for column in columns {
@@ -146,6 +194,7 @@ fn execute_unordered(
     let mut skipped_matches = 0_usize;
     let mut result_bytes = 0_usize;
     let mut rows = Vec::new();
+    let projection = Projection::new(plan.columns.as_deref());
     visit_candidate_rows(storage, plan, schema, &mut |row| {
         count_scanned_row(&mut scanned)?;
         if !matches_predicate(row, plan.predicate.as_ref(), &plan.table)? {
@@ -163,11 +212,7 @@ fn execute_unordered(
         ensure_result_budget(next_result_bytes)?;
         let clone_peak = checked_result_add(result_bytes, owned_row_bytes(row)?)?;
         ensure_result_budget(clone_peak)?;
-        rows.push(project_row(
-            row.clone(),
-            plan.columns.as_deref(),
-            &plan.table,
-        )?);
+        rows.push(project_row(row.clone(), projection.as_ref(), &plan.table)?);
         result_bytes = next_result_bytes;
         if plan.limit.is_some_and(|limit| rows.len() == limit) {
             Ok(VisitControl::Stop)
@@ -209,6 +254,7 @@ fn execute_ordered(
     let mut remaining_ordered_bytes = ordered_bytes;
     let mut result_bytes = 0_usize;
     let mut projected_rows = Vec::new();
+    let projection = Projection::new(plan.columns.as_deref());
     for (index, row) in rows.into_iter().enumerate() {
         if index >= plan.offset && projected_rows.len() == take {
             break;
@@ -230,7 +276,7 @@ fn execute_ordered(
             remaining_ordered_bytes,
             next_result_bytes,
         )?)?;
-        projected_rows.push(project_row(row, plan.columns.as_deref(), &plan.table)?);
+        projected_rows.push(project_row(row, projection.as_ref(), &plan.table)?);
         result_bytes = next_result_bytes;
     }
     Ok(projected_rows)
@@ -320,17 +366,17 @@ fn result_limit_exceeded() -> EngineError {
     )
 }
 
-fn projected_row_bytes(row: &Row, columns: Option<&[String]>, table: &str) -> Result<usize> {
+fn projected_row_bytes(row: &Row, columns: Option<&[SelectColumn]>, table: &str) -> Result<usize> {
     let Some(columns) = columns else {
         return owned_row_bytes(row);
     };
     let mut bytes = 32_usize;
-    for column in columns {
+    for SelectColumn { column, output } in columns {
         let value = row
             .get(column)
             .ok_or_else(|| EngineError::column_not_found(column, table))?;
         bytes = checked_result_add(bytes, 64)?;
-        bytes = checked_result_add(bytes, checked_result_mul(column.len(), 2)?)?;
+        bytes = checked_result_add(bytes, checked_result_mul(output.len(), 2)?)?;
         bytes = checked_result_add(bytes, checked_result_mul(owned_value_bytes(value)?, 2)?)?;
     }
     Ok(bytes)
@@ -814,12 +860,23 @@ impl<'a> SqlParser<'a> {
         } else {
             None
         };
-        let order_by = if self.consume_keyword("order") {
+        let mut order_by = if self.consume_keyword("order") {
             self.expect_keyword("by")?;
             self.parse_order_by()?
         } else {
             Vec::new()
         };
+        // As in PostgreSQL, an ORDER BY name refers to an output column before a source column,
+        // so an alias can be ordered by and can shadow the column it renames.
+        for order in &mut order_by {
+            if let Some(item) = columns
+                .iter()
+                .flatten()
+                .find(|item| item.output == order.column)
+            {
+                order.column.clone_from(&item.column);
+            }
+        }
         let limit = if self.consume_keyword("limit") {
             Some(self.parse_limit()?)
         } else {
@@ -846,7 +903,7 @@ impl<'a> SqlParser<'a> {
         })
     }
 
-    fn parse_projection(&mut self) -> Result<Option<Vec<String>>> {
+    fn parse_projection(&mut self) -> Result<Option<Vec<SelectColumn>>> {
         if self.consume(TokenMatcher::Star) {
             return Ok(None);
         }
@@ -858,7 +915,13 @@ impl<'a> SqlParser<'a> {
                     "A projection cannot contain more than {MAX_PROJECTION_COLUMNS} columns"
                 )));
             }
-            columns.push(self.parse_identifier()?);
+            let column = self.parse_identifier()?;
+            let output = if self.consume_keyword("as") {
+                self.parse_identifier()?
+            } else {
+                column.clone()
+            };
+            columns.push(SelectColumn { column, output });
             if !self.consume(TokenMatcher::Comma) {
                 break;
             }
@@ -1966,16 +2029,20 @@ fn collect_guaranteed_equalities(predicate: Option<&Predicate>, values: &mut Row
     }
 }
 
-pub(crate) fn project_row(mut row: Row, columns: Option<&[String]>, table: &str) -> Result<Row> {
-    let Some(columns) = columns else {
+fn project_row(mut row: Row, projection: Option<&Projection<'_>>, table: &str) -> Result<Row> {
+    let Some(projection) = projection else {
         return Ok(row);
     };
     let mut projected = Map::new();
-    for column in columns {
-        let value = row
-            .remove(column)
-            .ok_or_else(|| EngineError::column_not_found(column, table))?;
-        projected.insert(column.clone(), value);
+    for (SelectColumn { column, output }, moves) in projection.columns.iter().zip(&projection.moves)
+    {
+        let value = if *moves {
+            row.remove(column)
+        } else {
+            row.get(column).cloned()
+        }
+        .ok_or_else(|| EngineError::column_not_found(column, table))?;
+        projected.insert(output.clone(), value);
     }
     Ok(projected)
 }
@@ -2000,6 +2067,13 @@ mod tests {
             .as_object()
             .expect("test row must be an object")
             .clone()
+    }
+
+    fn select_column(column: &str) -> SelectColumn {
+        SelectColumn {
+            column: column.to_owned(),
+            output: column.to_owned(),
+        }
     }
 
     fn engine() -> Engine<InMemoryStorage> {
@@ -2316,6 +2390,81 @@ mod tests {
                 .rows
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn projection_aliases_rename_outputs_and_can_be_ordered_by() {
+        let database = engine();
+        let result = database
+            .query_sql(
+                "SELECT id AS post_id, title, id AS \"Copy\" FROM posts WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            result.fields,
+            vec![
+                ResultField::new("post_id", ColumnType::Integer),
+                ResultField::new("title", ColumnType::Text),
+                ResultField::new("Copy", ColumnType::Integer),
+            ]
+        );
+        assert_eq!(
+            result.rows,
+            vec![row(json!({"post_id": 1, "title": "one", "Copy": 1}))]
+        );
+
+        // An output name wins over a source column of the same name, so swapped aliases order by
+        // the renamed column; a source column that is not projected can still be ordered by.
+        assert_eq!(
+            database
+                .query_sql(
+                    "SELECT title AS id, id AS title FROM posts ORDER BY id DESC",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![
+                row(json!({"id": "two", "title": 2})),
+                row(json!({"id": "three", "title": 3})),
+                row(json!({"id": "one", "title": 1})),
+            ]
+        );
+        assert_eq!(
+            database
+                .query_sql(
+                    "SELECT title AS name FROM posts ORDER BY user_id DESC, name LIMIT 2",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![row(json!({"name": "two"})), row(json!({"name": "one"}))]
+        );
+
+        let empty = database
+            .query_sql("SELECT deleted AS gone FROM posts LIMIT 0", &[])
+            .unwrap();
+        assert_eq!(
+            empty.fields,
+            vec![ResultField::new("gone", ColumnType::Boolean)]
+        );
+        assert!(empty.rows.is_empty());
+
+        for (sql, code) in [
+            ("SELECT id AS x, title AS x FROM posts", "INVALID_QUERY"),
+            ("SELECT id, title AS id FROM posts LIMIT 0", "INVALID_QUERY"),
+            ("SELECT missing AS x FROM posts", "COLUMN_NOT_FOUND"),
+            ("SELECT id AS FROM posts", "SQL_PARSE_ERROR"),
+            ("SELECT id AS select FROM posts", "SQL_PARSE_ERROR"),
+            ("SELECT id post_id FROM posts", "UNSUPPORTED_SQL"),
+            ("SELECT id AS x FROM posts ORDER BY y", "COLUMN_NOT_FOUND"),
+        ] {
+            assert_eq!(
+                database.query_sql(sql, &[]).unwrap_err().code,
+                code,
+                "{sql}"
+            );
+        }
     }
 
     #[test]
@@ -2846,7 +2995,7 @@ mod tests {
             parse_sql("SELECT ID FROM POSTS", &[]).unwrap(),
             SelectPlan {
                 table: "posts".to_owned(),
-                columns: Some(vec!["id".to_owned()]),
+                columns: Some(vec![select_column("id")]),
                 predicate: None,
                 order_by: vec![],
                 limit: None,
@@ -2857,7 +3006,7 @@ mod tests {
             parse_sql("SELECT \"ID\" FROM \"Posts\"", &[]).unwrap(),
             SelectPlan {
                 table: "Posts".to_owned(),
-                columns: Some(vec!["ID".to_owned()]),
+                columns: Some(vec![select_column("ID")]),
                 predicate: None,
                 order_by: vec![],
                 limit: None,
@@ -2878,7 +3027,7 @@ mod tests {
             .unwrap(),
             SelectPlan {
                 table: "public.posts".to_owned(),
-                columns: Some(vec!["display\"name".to_owned()]),
+                columns: Some(vec![select_column("display\"name")]),
                 predicate: Some(Predicate::And {
                     predicates: vec![
                         Predicate::Comparison {
@@ -2933,7 +3082,7 @@ mod tests {
             parse_sql("SELECT \"from\", \"select\" FROM posts", &[])
                 .unwrap()
                 .columns,
-            Some(vec!["from".to_owned(), "select".to_owned()])
+            Some(vec![select_column("from"), select_column("select")])
         );
     }
 

@@ -150,10 +150,18 @@ pub(crate) struct OrderBy {
     pub(crate) nulls: NullOrder,
 }
 
+/// One item of an explicit single-table projection: a source column and the name it is returned
+/// under, which is the column's own name unless `AS` renamed it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SelectColumn {
+    pub(crate) column: String,
+    pub(crate) output: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SelectPlan {
     pub(crate) table: String,
-    pub(crate) columns: Option<Vec<String>>,
+    pub(crate) columns: Option<Vec<SelectColumn>>,
     pub(crate) predicate: Option<Predicate>,
     pub(crate) order_by: Vec<OrderBy>,
     pub(crate) limit: Option<usize>,

@@ -155,9 +155,9 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 
 | Keyword or form | Status | TinyJoin form and boundary |
 | --- | --- | --- |
-| `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or a left-deep join over two to eight typed table sources. A simple single-table projection is `*` or distinct plain column names. Join projections require explicit columns: neither `*` nor `table.*` is supported. Duplicate output names return `INVALID_QUERY`, including for empty results and `LIMIT 0`. There is no `SELECT` without `FROM`. |
+| `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or a left-deep join over two to eight typed table sources. A simple single-table projection is `*` or a list of plain column names, each optionally renamed with `AS`. Join projections require explicit columns: neither `*` nor `table.*` is supported. Duplicate output names return `INVALID_QUERY`, including for empty results and `LIMIT 0`. There is no `SELECT` without `FROM`. |
 | `WHERE` | Supported | Predicates described below, with SQL three-valued null logic. |
-| `ORDER BY` | Narrow | Up to 32 plain columns for simple queries, projected output names for grouped/aggregate queries, and projected output names or qualified/unambiguous source columns for joins; `ASC`/`DESC` and `NULLS FIRST`/`LAST`. JSON values cannot be ordered. |
+| `ORDER BY` | Narrow | Up to 32 plain columns or projected output names for simple queries, projected output names for grouped/aggregate queries, and projected output names or qualified/unambiguous source columns for joins; `ASC`/`DESC` and `NULLS FIRST`/`LAST`. An output name takes precedence over a source column with the same name. JSON values cannot be ordered. |
 | `LIMIT`, `OFFSET` | Supported | Non-negative integer literal or `$n` parameter. `LIMIT` is at most 100,000; `OFFSET` and `OFFSET + LIMIT` are at most 4,294,967,295. `OFFSET` may appear alone; when both occur, `LIMIT` must precede `OFFSET`. |
 | `GROUP BY` | Narrow | Up to 32 plain boolean, integer, float, or text columns (not JSON) on one typed table. Every selected non-aggregate column must be grouped explicitly. |
 | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` | Narrow | Every aggregate query requires a typed column catalog, including `COUNT(*)`. Functions accept `COUNT(*)` or one plain column argument. `SUM`/`AVG` accept integer or float; `MIN`/`MAX` accept integer, float, or text. Up to 64 aggregate calls. |
@@ -165,7 +165,7 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 | `JOIN`, `INNER JOIN` | Narrow | Adds one typed table to a left-deep chain of at most eight sources. Each `ON` has one or more column equalities joined by `AND`, with at most 32 across the query; every equality connects the incoming source to an earlier source. |
 | `LEFT [OUTER] JOIN` | Narrow | The same bounded chain; an unmatched incoming source is represented by `NULL` columns. A later inner join can remove that null-extended row. |
 | `RIGHT`, `FULL`, `CROSS`, `NATURAL`, `USING`, `LATERAL` | No | No additional join families, parenthesized/derived relations, or join reordering. |
-| `AS` | Narrow | Output aliases on `SELECT` items in grouped/aggregate queries, plus table and projection-output aliases in joins. Ordinary single-table projections do not accept aliases. |
+| `AS` | Narrow | Output aliases on `SELECT` items in single-table, grouped/aggregate, and join queries, plus table aliases in joins. A projection alias requires the `AS` keyword, and one column may be returned under several aliases. Single-table queries do not accept table aliases. |
 | `DISTINCT`, `WITH`, subqueries, `UNION`/`INTERSECT`/`EXCEPT` | No | No CTEs, subqueries, set operations, or distinct-row projection. |
 | `CREATE TABLE [IF NOT EXISTS]` | Narrow | Typed columns and a required inline or table-level primary key. Up to 256 columns. |
 | `PRIMARY KEY` | Narrow | One inline single-column declaration or one table-level column list (single or composite). It implies `NOT NULL`; JSON keys are rejected. |

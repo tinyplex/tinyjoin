@@ -18,6 +18,13 @@ same type checking and `NULL` behavior as those two comparisons, and it is
 inclusive at both ends. There is no `SYMMETRIC` form, so a range whose bounds
 are reversed matches nothing rather than being swapped.
 
+A single-table `SELECT` can now rename its columns with `AS`, as aggregate and
+join queries already could: `SELECT id AS task_id, title FROM tasks`. The alias
+becomes the result field name, `ORDER BY` can refer to it, and one column may be
+returned under several names. As in PostgreSQL, an `ORDER BY` name matches an
+output alias before a source column of the same name. Output names must still be
+distinct.
+
 ## v0.2.0
 
 Subscriptions and statement results now report **which rows changed**, not only

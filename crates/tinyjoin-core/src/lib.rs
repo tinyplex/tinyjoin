@@ -44,7 +44,7 @@ pub use error::{EngineError, Result};
 pub use model::{ApplyOutcome, ExecuteResult, MAX_CHANGED_KEYS_PER_TABLE, ResultField, Row};
 pub(crate) use model::{
     ColumnDefinition, ColumnType, ComparisonOperator, IndexDefinition, NullOrder, OrderBy,
-    OrderDirection, Predicate, QueryResult, RowChange, SelectPlan, TableDefinition,
+    OrderDirection, Predicate, QueryResult, RowChange, SelectColumn, SelectPlan, TableDefinition,
 };
 #[cfg(test)]
 pub(crate) use page::BitmapSlot;

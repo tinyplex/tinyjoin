@@ -678,6 +678,30 @@ mod tests {
             vec![row(json!({"id": 2, "title": "updated"}))]
         );
 
+        let aliased = engine
+            .prepare_sql(
+                "SELECT title AS name, id AS task FROM tasks WHERE id <= $1 ORDER BY task DESC",
+            )
+            .unwrap();
+        for _ in 0..2 {
+            let result = engine.execute_prepared(aliased, &[json!(2)]).unwrap();
+            assert_eq!(
+                result
+                    .fields
+                    .iter()
+                    .map(|field| field.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["name", "task"]
+            );
+            assert_eq!(
+                result.rows,
+                vec![
+                    row(json!({"name": "updated", "task": 2})),
+                    row(json!({"name": "one", "task": 1}))
+                ]
+            );
+        }
+
         let aggregate = engine
             .prepare_sql(
                 "SELECT done, COUNT(*) AS count FROM tasks WHERE id >= $1 \
