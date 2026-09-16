@@ -177,7 +177,8 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 | `DROP INDEX [IF EXISTS]` | Supported | Drops one globally named index. |
 | `INSERT ... VALUES` | Narrow | Optional column list, up to 4,096 literal/parameter rows, per-cell `DEFAULT`, and optional `RETURNING`. |
 | `INSERT ... DEFAULT VALUES` | Supported | Inserts one row using defaults and `NULL` values. |
-| `INSERT ... SELECT`, `ON CONFLICT`, `MERGE` | No | No query-sourced insert, upsert clause, or merge statement. |
+| `INSERT ... ON CONFLICT` | Narrow | `ON CONFLICT [(columns)] DO NOTHING` or `ON CONFLICT (columns) DO UPDATE SET column = value, ...`, before any `RETURNING`. See [upserts](#upserts). |
+| `INSERT ... SELECT`, `MERGE` | No | No query-sourced insert or merge statement. |
 | `UPDATE ... SET ... [WHERE ...]` | Narrow | Assigns literals, parameters, or `DEFAULT`; optional `RETURNING`. No expressions or `UPDATE ... FROM`. |
 | `DELETE FROM ... [WHERE ...]` | Narrow | Optional `RETURNING`. No `DELETE ... USING`. |
 | `RETURNING` | Narrow | `*` or a list of distinct plain columns; no expressions or aliases. Duplicate names return `INVALID_QUERY` before any rows are changed, even when no rows match. |
@@ -260,6 +261,45 @@ serial/identity, enum/domain, and user-defined types. Type modifiers such as
   `public.tasks` are different TinyJoin table names.
 - There is no `CREATE SCHEMA`, `search_path`, `information_schema`, or
   `pg_catalog`. Index names are global catalog keys.
+
+## Upserts
+
+`INSERT ... ON CONFLICT` inserts each proposed row unless it conflicts with an
+*arbiter*: the primary key or a unique index named by the conflict target.
+The target lists exactly the columns of the primary key or of one unique
+index, in any order. `DO NOTHING` may omit the target, in which case the
+primary key and every unique index of the table are arbiters.
+
+```sql
+INSERT INTO settings (name, value) VALUES ($1, $2)
+ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value;
+```
+
+As in PostgreSQL, proposed rows are handled one at a time, so a row can
+conflict with a stored row or with a row written earlier in the same
+statement:
+
+- `DO NOTHING` skips a conflicting row.
+- `DO UPDATE` applies its `SET` assignments to the conflicting stored row. A
+  statement that would update one row twice, or update a row it inserted, fails
+  with `CONSTRAINT_VIOLATION` and changes nothing.
+- A conflict on a constraint that is not an arbiter fails the statement as an
+  ordinary insert would.
+
+Each `SET` value is a literal, a parameter, `DEFAULT`, or `EXCLUDED.column`,
+which is the proposed row's value after column defaults. The existing row's
+columns cannot be read, so there is no `SET count = count + 1`, and `DO UPDATE`
+cannot change a row's primary key, although assigning it the same value is
+allowed. `NULL` never conflicts with a unique index.
+
+A primary-key arbiter uses direct key lookup. A unique-index arbiter reads the
+index postings, except inside a callback transaction, where staged rows are not
+yet indexed and each statement scans the table once instead.
+
+`RETURNING`, the affected-row count, and [changed keys](/guides/transactions-and-changes/#refreshing-individual-rows)
+cover inserted and updated rows only. A statement that skips every row reports
+no changed table. `ON CONFLICT ON CONSTRAINT`, a partial-index `WHERE` in the
+target, and `DO UPDATE ... WHERE` are rejected.
 
 ## Constraints and indexes
 

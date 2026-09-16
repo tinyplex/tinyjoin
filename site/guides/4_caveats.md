@@ -33,7 +33,8 @@ The omissions most likely to matter are:
   general expression language.
 - No `LIKE`/`ILIKE`, `ANY`/`ALL`, or JSON path operators, so substring search
   and pattern matching have to happen outside SQL.
-- No `ON CONFLICT` upsert, `INSERT ... SELECT`, `MERGE`, or `UPDATE ... FROM`.
+- No `INSERT ... SELECT`, `MERGE`, or `UPDATE ... FROM`, and an `ON CONFLICT`
+  upsert cannot compute a value from the row it updates.
 - No sequences, `SERIAL`, or generated identity. Generate text identifiers in
   the client.
 - No `NUMERIC`/`DECIMAL`, date, time, interval, `UUID`, `BYTEA`, array, enum,

@@ -505,12 +505,9 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
 
     fn indexes_for_table(&self, table: &str) -> Result<Vec<IndexDefinition>> {
         self.ensure_base_revision()?;
-        if self.transaction.is_some() {
-            self.storage.table_schema(table)?;
-            Ok(Vec::new())
-        } else {
-            self.storage.indexes_for_table(table)
-        }
+        // A transaction stages rows but never DDL, so the committed definitions stay accurate.
+        // Only their postings are stale, which is why `visit_index` declines inside a transaction.
+        self.storage.indexes_for_table(table)
     }
 
     fn visit_index(

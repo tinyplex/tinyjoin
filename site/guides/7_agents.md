@@ -65,6 +65,9 @@ and has no OPFS, filesystem persistence, or remote synchronization. See the
 - Give every SQL-created table a primary key.
 - Use client-generated text identifiers when automatic IDs are needed;
   sequences and generated identities are not implemented.
+- Write upserts as `INSERT ... ON CONFLICT (id) DO UPDATE SET column =
+  EXCLUDED.column` rather than reading before writing. `SET` cannot read the
+  existing row's values.
 - Keep schema setup idempotent with `IF NOT EXISTS` where appropriate.
 - Treat a row generic as a TypeScript assertion, not runtime validation.
 - Consult the

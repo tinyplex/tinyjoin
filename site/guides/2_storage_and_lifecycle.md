@@ -303,8 +303,10 @@ reopening, query that record and compare the intended values. A matching
 record means the operation already happened; a missing record may allow a
 deliberate retry with the **same identifier**. An unexpected record needs
 application reconciliation. Generating a fresh identifier on every retry can
-apply an operation twice. TinyJoin has no automatic replay or `ON CONFLICT`
-clause, so this policy belongs to the application.
+apply an operation twice. TinyJoin has no automatic replay, so this policy
+belongs to the application. Recording the identifier with
+`ON CONFLICT DO NOTHING` skips an operation that is already recorded, but it
+does not compare the recorded values with the intended ones.
 
 The `retryable` property only says that a later attempt or reopen may succeed.
 It is not a guarantee that replaying a write is safe, nor that the current

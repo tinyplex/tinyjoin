@@ -8,7 +8,9 @@ use crate::query::{
     parameter_index, prepared_parameter_marker, tokenize, validate_bound_parameter_bytes,
     validate_sql_input, validate_sql_parameters,
 };
-use crate::statement::{SqlValue, Statement, WriteStatement};
+use crate::statement::{
+    ConflictAction, ConflictValue, OnConflict, SqlValue, Statement, WriteStatement,
+};
 use crate::{EngineError, Result};
 
 pub type PreparedStatementId = u32;
@@ -232,10 +234,25 @@ impl ParameterLayout {
 fn bind_write_statement(statement: &WriteStatement, params: &[Value]) -> Result<WriteStatement> {
     let mut statement = statement.clone();
     match &mut statement {
-        WriteStatement::Insert { values, .. } => {
+        WriteStatement::Insert {
+            values,
+            on_conflict,
+            ..
+        } => {
             for row in values {
                 for value in row {
                     bind_sql_value(value, params)?;
+                }
+            }
+            if let Some(OnConflict {
+                action: ConflictAction::Update(assignments),
+                ..
+            }) = on_conflict
+            {
+                for (_, value) in assignments {
+                    if let ConflictValue::Value(value) = value {
+                        bind_sql_value(value, params)?;
+                    }
                 }
             }
         }

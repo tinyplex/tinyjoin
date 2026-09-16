@@ -621,6 +621,252 @@ impl Generator {
     }
 }
 
+/// The `ON CONFLICT` clauses the generated upsert test draws from, over `items (id, email, v)`
+/// with a unique index on `email`.
+#[derive(Clone, Copy, Debug)]
+enum Upsert {
+    NothingOnId,
+    NothingOnEmail,
+    NothingOnAny,
+    UpdateValueOnId,
+    UpdateValueOnEmail,
+    UpdateEmailOnId,
+    MoveEmailOnEmail,
+}
+
+/// The row-at-a-time behaviors a generated run must reach before its agreement means anything.
+#[derive(Debug, Default)]
+struct UpsertCoverage {
+    inserted: usize,
+    updated: usize,
+    skipped_stored: usize,
+    skipped_written: usize,
+    updated_twice: usize,
+    duplicate_key: usize,
+    duplicate_email: usize,
+    reused_moved_email: usize,
+}
+
+type ModelRow = (i64, Option<i64>, i64);
+
+impl Upsert {
+    const ALL: [Self; 7] = [
+        Self::NothingOnId,
+        Self::NothingOnEmail,
+        Self::NothingOnAny,
+        Self::UpdateValueOnId,
+        Self::UpdateValueOnEmail,
+        Self::UpdateEmailOnId,
+        Self::MoveEmailOnEmail,
+    ];
+
+    fn sql(self) -> &'static str {
+        match self {
+            Self::NothingOnId => "ON CONFLICT (id) DO NOTHING",
+            Self::NothingOnEmail => "ON CONFLICT (email) DO NOTHING",
+            Self::NothingOnAny => "ON CONFLICT DO NOTHING",
+            Self::UpdateValueOnId => "ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v",
+            Self::UpdateValueOnEmail => "ON CONFLICT (email) DO UPDATE SET v = EXCLUDED.v",
+            Self::UpdateEmailOnId => {
+                "ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, v = EXCLUDED.v"
+            }
+            // Moves the conflicting row to a different unique value, leaving its old one free.
+            Self::MoveEmailOnEmail => "ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.v",
+        }
+    }
+
+    /// Applies one statement to a sorted model of `(id, email, v)` rows, inserting proposed rows
+    /// one at a time as PostgreSQL does. Returns how many rows the statement reports, or `None`
+    /// when it fails, in which case the model is unchanged.
+    fn apply(
+        self,
+        model: &mut Vec<ModelRow>,
+        proposed: &[ModelRow],
+        coverage: &mut UpsertCoverage,
+    ) -> Option<usize> {
+        let (on_id, on_email, update) = match self {
+            Self::NothingOnId => (true, false, false),
+            Self::NothingOnEmail => (false, true, false),
+            Self::NothingOnAny => (true, true, false),
+            Self::UpdateValueOnId | Self::UpdateEmailOnId => (true, false, true),
+            Self::UpdateValueOnEmail | Self::MoveEmailOnEmail => (false, true, true),
+        };
+        let mut next = model.clone();
+        let mut written = Vec::new();
+        let mut moved = Vec::new();
+        let mut reported = 0;
+        for &(id, email, v) in proposed {
+            let id_conflict = on_id
+                .then(|| next.iter().position(|row| row.0 == id))
+                .flatten();
+            let email_conflict = email
+                .filter(|_| on_email)
+                .and_then(|email| next.iter().position(|row| row.1 == Some(email)));
+            match id_conflict.or(email_conflict) {
+                Some(index) if !update => {
+                    if written.contains(&next[index].0) {
+                        coverage.skipped_written += 1;
+                    } else {
+                        coverage.skipped_stored += 1;
+                    }
+                    continue;
+                }
+                Some(index) => {
+                    if written.contains(&next[index].0) {
+                        coverage.updated_twice += 1;
+                        return None;
+                    }
+                    match self {
+                        Self::UpdateEmailOnId => next[index].1 = email,
+                        Self::MoveEmailOnEmail => {
+                            moved.extend(next[index].1);
+                            next[index].1 = Some(v);
+                        }
+                        _ => {}
+                    }
+                    if !matches!(self, Self::MoveEmailOnEmail) {
+                        next[index].2 = v;
+                    }
+                    written.push(next[index].0);
+                    coverage.updated += 1;
+                }
+                None => {
+                    if next.iter().any(|row| row.0 == id) {
+                        coverage.duplicate_key += 1;
+                        return None;
+                    }
+                    if email.is_some_and(|email| moved.contains(&email)) {
+                        coverage.reused_moved_email += 1;
+                    }
+                    next.push((id, email, v));
+                    written.push(id);
+                    coverage.inserted += 1;
+                }
+            }
+            reported += 1;
+        }
+        let emails = next.iter().filter_map(|row| row.1).collect::<Vec<_>>();
+        if (1..emails.len()).any(|index| emails[..index].contains(&emails[index])) {
+            coverage.duplicate_email += 1;
+            return None;
+        }
+        next.sort_unstable();
+        *model = next;
+        Some(reported)
+    }
+}
+
+#[test]
+fn generated_upserts_agree_with_a_row_at_a_time_model() {
+    let mut coverage = UpsertCoverage::default();
+    for seed in [3, 0x5eed, 0xface_feed] {
+        for transaction in [false, true] {
+            let mut generator = Generator(seed);
+            let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+            engine
+                .exec_sql(
+                    "CREATE TABLE items (id INTEGER PRIMARY KEY, email INTEGER, v INTEGER NOT NULL);\
+                     CREATE UNIQUE INDEX items_email ON items (email)",
+                )
+                .unwrap();
+            if transaction {
+                engine.begin_transaction().unwrap();
+            }
+            let mut model: Vec<ModelRow> = Vec::new();
+            for case in 0..400 {
+                let context = format!("seed={seed:#x}, transaction={transaction}, case={case}");
+                // Periodically free keys so that inserts and in-statement collisions stay common.
+                if case % 8 == 7 {
+                    let id = generator.pick(8) as i64;
+                    engine
+                        .execute_sql("DELETE FROM items WHERE id >= $1", &[json!(id)])
+                        .unwrap();
+                    model.retain(|row| row.0 < id);
+                }
+                let upsert = Upsert::ALL[generator.pick(Upsert::ALL.len())];
+                let mut proposed: Vec<ModelRow> = Vec::new();
+                for _ in 0..1 + generator.pick(3) {
+                    let id = match proposed.last() {
+                        Some(previous) if generator.pick(3) == 0 => previous.0,
+                        _ => generator.pick(8) as i64,
+                    };
+                    let email = generator.pick(8);
+                    proposed.push((
+                        id,
+                        (email < 5).then_some(email as i64),
+                        generator.pick(6) as i64,
+                    ));
+                }
+                let placeholders = (0..proposed.len())
+                    .map(|row| format!("(${}, ${}, ${})", row * 3 + 1, row * 3 + 2, row * 3 + 3))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "INSERT INTO items VALUES {placeholders} {} RETURNING id",
+                    upsert.sql()
+                );
+                let params = proposed
+                    .iter()
+                    .flat_map(|(id, email, v)| [json!(id), json!(email), json!(v)])
+                    .collect::<Vec<_>>();
+                let context = format!("{context}, {upsert:?}, rows={proposed:?}, model={model:?}");
+                let expected = upsert.apply(&mut model, &proposed, &mut coverage);
+                match (expected, execute(&mut engine, case % 2 == 1, &sql, &params)) {
+                    (Some(reported), Ok(result)) => {
+                        assert_eq!(result.row_count, reported, "{context}");
+                        assert_eq!(result.rows.len(), reported, "{context}");
+                    }
+                    (None, Err(error)) => {
+                        assert_eq!(error.code, "CONSTRAINT_VIOLATION", "{context}");
+                    }
+                    (expected, result) => {
+                        panic!("{context}: expected {expected:?}, engine returned {result:?}")
+                    }
+                }
+                let expected_rows = model
+                    .iter()
+                    .map(|(id, email, v)| row(json!({"id": id, "email": email, "v": v})))
+                    .collect::<Vec<_>>();
+                assert_eq!(rows(&mut engine), expected_rows, "{context}");
+            }
+            if transaction {
+                engine.commit_transaction().unwrap();
+            }
+            let expected_rows = model
+                .iter()
+                .map(|(id, email, v)| row(json!({"id": id, "email": email, "v": v})))
+                .collect::<Vec<_>>();
+            let mut reopened = PagedEngine::open(engine.into_device()).unwrap();
+            assert_eq!(rows(&mut reopened), expected_rows, "seed={seed:#x}");
+        }
+    }
+    let UpsertCoverage {
+        inserted,
+        updated,
+        skipped_stored,
+        skipped_written,
+        updated_twice,
+        duplicate_key,
+        duplicate_email,
+        reused_moved_email,
+    } = coverage;
+    assert!(
+        [
+            inserted,
+            updated,
+            skipped_stored,
+            skipped_written,
+            updated_twice,
+            duplicate_key,
+            duplicate_email,
+            reused_moved_email,
+        ]
+        .iter()
+        .all(|count| *count > 0),
+        "{coverage:?}"
+    );
+}
+
 #[test]
 fn generated_structured_parameters_remain_data_across_prepared_reuse_and_reopen() {
     // Actual singleton marker lookalikes are caller data, including when nested.

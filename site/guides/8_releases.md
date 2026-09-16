@@ -35,6 +35,21 @@ must list its columns explicitly and cannot contain JSON columns or aggregates,
 and `DISTINCT ON` and aggregate `DISTINCT`, such as `COUNT(DISTINCT column)`,
 remain unsupported. A column named `distinct` remains usable.
 
+`INSERT ... ON CONFLICT` makes an upsert one atomic statement rather than an
+`UPDATE` followed by a conditional `INSERT` inside a transaction, which held
+every tab sharing the database for the duration. `ON CONFLICT (id) DO NOTHING`
+skips conflicting rows, and
+`ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value` rewrites the stored
+row. The target is the primary key or the columns of one unique index, and
+`DO NOTHING` may omit it to treat every unique constraint as an arbiter. Rows
+are handled one at a time as in PostgreSQL, so a statement that would update
+the same row twice fails with `CONSTRAINT_VIOLATION`. `SET` accepts literals,
+parameters, `DEFAULT`, and `EXCLUDED` columns, but cannot read the existing row
+or change its primary key, and `DO UPDATE ... WHERE` is not supported.
+`RETURNING`, the row count, and changed keys include only inserted and updated
+rows, so a statement that skips every row reports no change. See
+[upserts](/guides/sql-compatibility/#upserts).
+
 ## v0.2.0
 
 Subscriptions and statement results now report **which rows changed**, not only

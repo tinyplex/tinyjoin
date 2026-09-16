@@ -64,6 +64,7 @@ pub(crate) enum WriteStatement {
         table: String,
         columns: Option<Vec<String>>,
         values: Vec<Vec<SqlValue>>,
+        on_conflict: Option<OnConflict>,
         returning: Option<Vec<String>>,
     },
     Update {
@@ -83,6 +84,29 @@ pub(crate) enum WriteStatement {
 pub(crate) enum SqlValue {
     Value(Value),
     Default,
+}
+
+/// An `INSERT ... ON CONFLICT` clause.
+#[derive(Clone, Debug)]
+pub(crate) struct OnConflict {
+    /// The conflict target's columns. `None` means every unique constraint is an arbiter, which
+    /// only `DO NOTHING` permits.
+    pub(crate) target: Option<Vec<String>>,
+    pub(crate) action: ConflictAction,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ConflictAction {
+    Nothing,
+    Update(Vec<(String, ConflictValue)>),
+}
+
+/// A `DO UPDATE SET` value: an ordinary literal, parameter, or `DEFAULT`, or a column of the row
+/// proposed for insertion, spelled `EXCLUDED.column`.
+#[derive(Clone, Debug)]
+pub(crate) enum ConflictValue {
+    Value(SqlValue),
+    Excluded(String),
 }
 
 #[derive(Debug)]
@@ -312,12 +336,14 @@ pub(crate) fn plan_dml(
             table,
             columns,
             values,
+            on_conflict,
             returning,
         } => plan_insert(
             storage,
             table,
             columns.as_deref(),
             values,
+            on_conflict.as_ref(),
             returning.as_deref(),
         ),
         WriteStatement::Update {
@@ -592,6 +618,7 @@ fn plan_insert(
     table: &str,
     columns: Option<&[String]>,
     value_rows: &[Vec<SqlValue>],
+    on_conflict: Option<&OnConflict>,
     returning: Option<&[String]>,
 ) -> Result<PlannedDml> {
     let schema = storage.table_schema(table)?;
@@ -607,8 +634,12 @@ fn plan_insert(
     };
     validate_named_columns(&schema, &columns)?;
     validate_projection(&schema, returning)?;
+    let mut conflicts = on_conflict
+        .map(|clause| ConflictPlan::new(storage, &schema, clause))
+        .transpose()?;
 
-    let mut keys = HashSet::with_capacity(value_rows.len());
+    // Canonical primary keys of every row this statement writes, whether inserted or updated.
+    let mut written = HashSet::with_capacity(value_rows.len());
     let mut changes = Vec::with_capacity(value_rows.len());
     let mut returned = Vec::with_capacity(returning.map_or(0, |_| value_rows.len()));
     let mut work_bytes = 0usize;
@@ -637,22 +668,52 @@ fn plan_insert(
             }
         }
         let row = normalize_row(&schema, row)?;
-        let key = row_key(&schema, &row)?;
-        let key_charge = checked_dml_add(checked_dml_mul(key.len(), 2)?, 64)?;
+        // `row_key` also enforces the stored key bound; the canonical key detects SQL-equal keys.
+        let storage_key = row_key(&schema, &row)?;
+        let key_charge = checked_dml_add(checked_dml_mul(storage_key.len(), 2)?, 64)?;
         work_bytes = checked_dml_add(work_bytes, key_charge)?;
         ensure_dml_work_bytes(work_bytes)?;
-        if !keys.insert(key) {
-            return Err(EngineError::constraint_violation(format!(
-                "INSERT into `{table}` would duplicate a primary key"
-            )));
-        }
-        if storage.lookup_primary_key(table, &row)?.is_some() {
-            return Err(EngineError::constraint_violation(format!(
-                "INSERT into `{table}` would duplicate a primary key"
-            )));
-        }
+        let key = primary_conflict_key(&schema, &row)?;
+
+        let conflict = match &mut conflicts {
+            Some(conflicts) => {
+                conflicts.find(storage, &schema, &row, &key, &written, &mut work_bytes)?
+            }
+            None => Conflict::None,
+        };
+        let updates = conflicts.as_ref().and_then(ConflictPlan::updates);
+        let (row, key) = match conflict {
+            Conflict::None => {
+                if written.contains(&key) || storage.lookup_primary_key(table, &row)?.is_some() {
+                    return Err(EngineError::constraint_violation(format!(
+                        "INSERT into `{table}` would duplicate a primary key"
+                    )));
+                }
+                (row, key)
+            }
+            Conflict::Written | Conflict::Existing(_) if updates.is_none() => continue,
+            Conflict::Written => {
+                return Err(EngineError::constraint_violation(format!(
+                    "INSERT ... ON CONFLICT DO UPDATE cannot affect a row in `{table}` a second time"
+                )));
+            }
+            Conflict::Existing(existing) => {
+                let row = updated_conflict_row(
+                    &schema,
+                    updates.expect("DO NOTHING was handled above"),
+                    existing,
+                    &row,
+                )?;
+                let key = primary_conflict_key(&schema, &row)?;
+                (row, key)
+            }
+        };
         work_bytes = retain_dml_row(work_bytes, &row)?;
         work_bytes = retain_dml_change(work_bytes, table)?;
+        if let Some(conflicts) = &mut conflicts {
+            conflicts.record(&schema, &row, &mut work_bytes)?;
+        }
+        written.insert(key);
         if let Some(columns) = returning {
             result_bytes = retain_returned_row(result_bytes, &row, columns)?;
             returned.push(project_returning_row(&row, columns, table)?);
@@ -669,11 +730,348 @@ fn plan_insert(
             command: "INSERT",
             row_count,
             rows: returned,
-            tables: vec![table.to_owned()],
-            mutated: true,
+            tables: (row_count > 0)
+                .then(|| table.to_owned())
+                .into_iter()
+                .collect(),
+            mutated: row_count > 0,
         },
         changes,
     })
+}
+
+fn primary_conflict_key(schema: &TableDefinition, row: &Row) -> Result<String> {
+    conflict_key(schema, &schema.primary_key, row)?.ok_or_else(|| {
+        EngineError::invalid_change(format!(
+            "A primary-key column in `{}` cannot be null",
+            schema.name
+        ))
+    })
+}
+
+/// Encodes the values of `columns` so that SQL-equal values encode identically, or `None` when
+/// any of them is `NULL`, which can never conflict with anything.
+fn conflict_key(schema: &TableDefinition, columns: &[String], row: &Row) -> Result<Option<String>> {
+    let mut parts = Vec::with_capacity(columns.len());
+    for column in columns {
+        let definition = schema
+            .columns
+            .iter()
+            .find(|definition| definition.name == *column)
+            .ok_or_else(|| EngineError::column_not_found(column, &schema.name))?;
+        let value = row
+            .get(column)
+            .ok_or_else(|| EngineError::column_not_found(column, &schema.name))?;
+        if value == &Value::Null {
+            return Ok(None);
+        }
+        parts.push(crate::aggregate::group_key_part(
+            definition.data_type,
+            value,
+            column,
+        )?);
+    }
+    crate::aggregate::encode_group_key(&parts).map(Some)
+}
+
+enum Conflict {
+    None,
+    /// The proposed row conflicts with a row this statement already inserted or updated.
+    Written,
+    Existing(Row),
+}
+
+/// One arbiter unique index, with the keys this statement has written into it.
+struct ConflictIndex {
+    definition: crate::IndexDefinition,
+    written: HashSet<String>,
+    /// Existing primary keys by index key, collected with one scan when the storage view cannot
+    /// visit this index directly, as inside a transaction.
+    scanned: Option<HashMap<String, Row>>,
+}
+
+/// A validated `ON CONFLICT` clause for one table.
+///
+/// PostgreSQL inserts proposed rows one at a time, so a row conflicts both with committed rows and
+/// with rows earlier in the same statement. Only arbiters are consulted: a conflict on any other
+/// unique constraint still fails the statement when the write-set is validated.
+struct ConflictPlan {
+    primary: bool,
+    indexes: Vec<ConflictIndex>,
+    updates: Option<Vec<(String, ResolvedConflictValue)>>,
+}
+
+enum ResolvedConflictValue {
+    Value(Value),
+    Excluded(String),
+}
+
+impl ConflictPlan {
+    fn new(
+        storage: &dyn StorageReader,
+        schema: &TableDefinition,
+        clause: &OnConflict,
+    ) -> Result<Self> {
+        let unique_indexes = storage
+            .indexes_for_table(&schema.name)?
+            .into_iter()
+            .filter(|index| index.unique);
+        let same_columns = |left: &[String], right: &[String]| {
+            let left = left.iter().collect::<HashSet<_>>();
+            left.len() == right.len() && right.iter().all(|column| left.contains(column))
+        };
+        let (primary, indexes) = match &clause.target {
+            None => (true, unique_indexes.collect::<Vec<_>>()),
+            Some(target) => {
+                validate_named_columns(schema, target)?;
+                if same_columns(target, &schema.primary_key) {
+                    (true, vec![])
+                } else {
+                    let index = unique_indexes
+                        .filter(|index| same_columns(target, &index.columns))
+                        .min_by(|left, right| left.name.cmp(&right.name))
+                        .ok_or_else(|| {
+                            EngineError::invalid_query(format!(
+                                "ON CONFLICT ({}) does not match the primary key or a unique index of `{}`",
+                                target.join(", "),
+                                schema.name
+                            ))
+                        })?;
+                    (false, vec![index])
+                }
+            }
+        };
+        let updates = match &clause.action {
+            ConflictAction::Nothing => None,
+            ConflictAction::Update(assignments) => {
+                validate_named_columns(
+                    schema,
+                    &assignments
+                        .iter()
+                        .map(|(column, _)| column.clone())
+                        .collect::<Vec<_>>(),
+                )?;
+                Some(
+                    assignments
+                        .iter()
+                        .map(|(column, value)| {
+                            let definition = schema
+                                .columns
+                                .iter()
+                                .find(|definition| definition.name == *column)
+                                .expect("assignment columns were validated above");
+                            Ok((
+                                column.clone(),
+                                match value {
+                                    ConflictValue::Value(SqlValue::Value(value)) => {
+                                        validate_value(definition, value, &schema.name)?;
+                                        ResolvedConflictValue::Value(value.clone())
+                                    }
+                                    ConflictValue::Value(SqlValue::Default) => {
+                                        ResolvedConflictValue::Value(column_default(
+                                            schema, column,
+                                        )?)
+                                    }
+                                    ConflictValue::Excluded(source) => {
+                                        column_default(schema, source)?;
+                                        ResolvedConflictValue::Excluded(source.clone())
+                                    }
+                                },
+                            ))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                )
+            }
+        };
+        Ok(Self {
+            primary,
+            indexes: indexes
+                .into_iter()
+                .map(|definition| ConflictIndex {
+                    definition,
+                    written: HashSet::new(),
+                    scanned: None,
+                })
+                .collect(),
+            updates,
+        })
+    }
+
+    fn updates(&self) -> Option<&[(String, ResolvedConflictValue)]> {
+        self.updates.as_deref()
+    }
+
+    fn find(
+        &mut self,
+        storage: &dyn StorageReader,
+        schema: &TableDefinition,
+        row: &Row,
+        key: &str,
+        written: &HashSet<String>,
+        work_bytes: &mut usize,
+    ) -> Result<Conflict> {
+        if self.primary && written.contains(key) {
+            return Ok(Conflict::Written);
+        }
+        let mut index_keys = Vec::with_capacity(self.indexes.len());
+        for index in &self.indexes {
+            let index_key = conflict_key(schema, &index.definition.columns, row)?;
+            if index_key
+                .as_ref()
+                .is_some_and(|index_key| index.written.contains(index_key))
+            {
+                return Ok(Conflict::Written);
+            }
+            index_keys.push(index_key);
+        }
+        if self.primary
+            && let Some(existing) = storage.lookup_primary_key(&schema.name, row)?
+        {
+            return Ok(Conflict::Existing(existing));
+        }
+        for (index, index_key) in self.indexes.iter_mut().zip(index_keys) {
+            let Some(index_key) = index_key else {
+                continue;
+            };
+            for existing in index.existing(storage, schema, row, &index_key, work_bytes)? {
+                // A row this statement already rewrote was checked above through its new values.
+                if !written.contains(&primary_conflict_key(schema, &existing)?) {
+                    return Ok(Conflict::Existing(existing));
+                }
+            }
+        }
+        Ok(Conflict::None)
+    }
+
+    /// Remembers the arbiter index keys of a row this statement writes.
+    fn record(
+        &mut self,
+        schema: &TableDefinition,
+        row: &Row,
+        work_bytes: &mut usize,
+    ) -> Result<()> {
+        for index in &mut self.indexes {
+            if let Some(index_key) = conflict_key(schema, &index.definition.columns, row)? {
+                *work_bytes = checked_dml_add(
+                    *work_bytes,
+                    checked_dml_add(checked_dml_mul(index_key.len(), 2)?, 64)?,
+                )?;
+                ensure_dml_work_bytes(*work_bytes)?;
+                index.written.insert(index_key);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Applies `DO UPDATE SET` to the conflicting row, reading `EXCLUDED` from the proposed row.
+fn updated_conflict_row(
+    schema: &TableDefinition,
+    updates: &[(String, ResolvedConflictValue)],
+    existing: Row,
+    proposed: &Row,
+) -> Result<Row> {
+    let existing_key = primary_conflict_key(schema, &existing)?;
+    let mut row = existing;
+    for (column, value) in updates {
+        let value = match value {
+            ResolvedConflictValue::Value(value) => value.clone(),
+            ResolvedConflictValue::Excluded(source) => proposed
+                .get(source)
+                .cloned()
+                .ok_or_else(|| EngineError::column_not_found(source, &schema.name))?,
+        };
+        row.insert(column.clone(), value);
+    }
+    let row = normalize_row(schema, row)?;
+    if primary_conflict_key(schema, &row)? != existing_key {
+        return Err(EngineError::unsupported_sql(format!(
+            "INSERT ... ON CONFLICT DO UPDATE cannot change the primary key of a row in `{}`",
+            schema.name
+        )));
+    }
+    Ok(row)
+}
+
+impl ConflictIndex {
+    fn existing(
+        &mut self,
+        storage: &dyn StorageReader,
+        schema: &TableDefinition,
+        row: &Row,
+        index_key: &str,
+        work_bytes: &mut usize,
+    ) -> Result<Vec<Row>> {
+        if self.scanned.is_none() {
+            let lookup = self
+                .definition
+                .columns
+                .iter()
+                .map(|column| (column.clone(), row[column].clone()))
+                .collect::<Row>();
+            let mut rows = Vec::new();
+            if storage
+                .visit_index(
+                    &schema.name,
+                    &self.definition.columns,
+                    &lookup,
+                    &mut |row| {
+                        rows.push(row.clone());
+                        Ok(VisitControl::Continue)
+                    },
+                )?
+                .is_some()
+            {
+                return Ok(rows);
+            }
+            self.scanned = Some(self.scan(storage, schema, work_bytes)?);
+        }
+        match self
+            .scanned
+            .as_ref()
+            .expect("the scan was collected above")
+            .get(index_key)
+        {
+            Some(primary_key) => Ok(storage
+                .lookup_primary_key(&schema.name, primary_key)?
+                .into_iter()
+                .collect()),
+            None => Ok(vec![]),
+        }
+    }
+
+    fn scan(
+        &self,
+        storage: &dyn StorageReader,
+        schema: &TableDefinition,
+        work_bytes: &mut usize,
+    ) -> Result<HashMap<String, Row>> {
+        let mut scanned = 0usize;
+        let mut keys = HashMap::new();
+        let outcome = storage.visit_table(&schema.name, &mut |row| {
+            scanned = scanned.saturating_add(1);
+            if scanned > MAX_DML_SCAN_ROWS {
+                return Err(dml_limit_error(format!(
+                    "A data-modification statement cannot scan more than {MAX_DML_SCAN_ROWS} rows"
+                )));
+            }
+            if let Some(index_key) = conflict_key(schema, &self.definition.columns, row)? {
+                let primary_key = primary_key_row(schema, row)?;
+                *work_bytes = checked_dml_add(
+                    *work_bytes,
+                    checked_dml_add(
+                        checked_dml_mul(index_key.len(), 2)?,
+                        checked_dml_add(estimated_row_bytes(&primary_key)?, 64)?,
+                    )?,
+                )?;
+                ensure_dml_work_bytes(*work_bytes)?;
+                keys.insert(index_key, primary_key);
+            }
+            Ok(VisitControl::Continue)
+        })?;
+        require_complete_dml_scan(outcome, &schema.name)?;
+        Ok(keys)
+    }
 }
 
 fn plan_update(
@@ -1434,13 +1832,102 @@ impl<'a> MutationParser<'a> {
             }
             rows
         };
+        let on_conflict = if self.consume_keyword("on") {
+            Some(self.parse_on_conflict()?)
+        } else {
+            None
+        };
         let returning = self.parse_returning()?;
         Ok(WriteStatement::Insert {
             table,
             columns,
             values,
+            on_conflict,
             returning,
         })
+    }
+
+    fn parse_on_conflict(&mut self) -> Result<OnConflict> {
+        self.expect_keyword("conflict")?;
+        if self.consume_keyword("on") {
+            return Err(EngineError::unsupported_sql(
+                "ON CONFLICT ON CONSTRAINT is not supported; name the conflict target columns",
+            ));
+        }
+        let target = if self.consume(TokenMatcher::LParen) {
+            let columns = self.parse_identifier_list(TokenMatcher::RParen)?;
+            self.expect(
+                TokenMatcher::RParen,
+                "Expected `)` after ON CONFLICT columns",
+            )?;
+            Some(columns)
+        } else {
+            None
+        };
+        if self.consume_keyword("where") {
+            return Err(EngineError::unsupported_sql(
+                "ON CONFLICT does not support a partial-index WHERE clause",
+            ));
+        }
+        self.expect_keyword("do")?;
+        if self.consume_keyword("nothing") {
+            return Ok(OnConflict {
+                target,
+                action: ConflictAction::Nothing,
+            });
+        }
+        self.expect_keyword("update")?;
+        if target.is_none() {
+            return Err(EngineError::invalid_query(
+                "ON CONFLICT DO UPDATE requires a conflict target such as `ON CONFLICT (id)`",
+            ));
+        }
+        self.expect_keyword("set")?;
+        let mut assignments = Vec::new();
+        loop {
+            if assignments.len() >= MAX_COLUMNS {
+                return Err(EngineError::invalid_query(format!(
+                    "ON CONFLICT DO UPDATE cannot assign more than {MAX_COLUMNS} columns"
+                )));
+            }
+            let column = self.parse_identifier()?;
+            self.expect(
+                TokenMatcher::Eq,
+                "Expected `=` in ON CONFLICT DO UPDATE assignment",
+            )?;
+            let value = if self.consume_excluded_qualifier() {
+                ConflictValue::Excluded(self.parse_identifier()?)
+            } else {
+                ConflictValue::Value(self.parse_sql_value(true)?)
+            };
+            assignments.push((column, value));
+            if !self.consume(TokenMatcher::Comma) {
+                break;
+            }
+        }
+        if self.consume_keyword("where") {
+            return Err(EngineError::unsupported_sql(
+                "ON CONFLICT DO UPDATE does not support a WHERE clause",
+            ));
+        }
+        Ok(OnConflict {
+            target,
+            action: ConflictAction::Update(assignments),
+        })
+    }
+
+    /// Consumes `EXCLUDED.`, the qualifier naming the row proposed for insertion.
+    fn consume_excluded_qualifier(&mut self) -> bool {
+        let excluded = matches!(
+            self.tokens.get(self.position),
+            Some(Token::Identifier { value, quoted })
+                if (*quoted && value == "excluded")
+                    || (!*quoted && value.eq_ignore_ascii_case("excluded"))
+        ) && matches!(self.tokens.get(self.position + 1), Some(Token::Dot));
+        if excluded {
+            self.position += 2;
+        }
+        excluded
     }
 
     fn parse_update(&mut self) -> Result<WriteStatement> {
@@ -2266,3 +2753,7 @@ mod tests {
         .unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "on_conflict_tests.rs"]
+mod on_conflict_tests;
