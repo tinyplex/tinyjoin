@@ -138,3 +138,34 @@ always re-queries. See [tab handover](/guides/storage-and-lifecycle/#tab-handove
 
 This explicit re-query model keeps TinyJoin independent of UI frameworks and
 lets an application choose its own caching or rendering policy.
+
+## Refreshing individual rows
+
+An event also names the primary keys that changed, keyed by table, so a
+listener can refresh individual rows rather than re-reading a whole table:
+
+```ts
+const unsubscribe = db.subscribe({tables: ['tasks']}, async (event) => {
+  const keys = event.keys.tasks;
+  if (!keys) {
+    render(await db.query('SELECT * FROM tasks ORDER BY id'));
+    return;
+  }
+  for (const {id} of keys) {
+    refreshRow(await db.query('SELECT * FROM tasks WHERE id = $1', [id]));
+  }
+});
+```
+
+Each key is an object holding only that table's primary-key columns, so a
+composite key arrives as one object with one property per column. Keys are
+reported for writes from any connected Client, which makes a change made in
+another tab resolvable to individual rows.
+
+Reporting is a bounded best effort, and `tables` stays authoritative. A table
+appears in `keys` only when every key it changed fits the bound of 1,000 keys
+per table. A table listed in `tables` but absent from `keys` changed more rows
+than an event can name, so its rows cannot be identified and it must be
+re-queried. `keys` is always empty alongside `reset: true` for the same reason.
+Always handle the absent case, as the example above does: a listener that
+assumes keys are present will silently miss large writes.
