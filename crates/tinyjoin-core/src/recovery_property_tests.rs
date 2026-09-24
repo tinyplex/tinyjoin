@@ -137,7 +137,7 @@ impl PageDevice for FaultDevice {
             let length = state.working.len();
             state.durable.resize(length, [0; PAGE_SIZE]);
             for id in 0..length {
-                if (id as u64 + state.salt) % 3 != 0 {
+                if !(id as u64 + state.salt).is_multiple_of(3) {
                     state.durable[id] = state.working[id];
                 }
             }

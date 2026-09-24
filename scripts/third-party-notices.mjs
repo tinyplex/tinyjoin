@@ -18,6 +18,10 @@ const rustNoticeHashes = new Map([
     '1.91.1',
     '3aa41caccecaeddad6fcf2f36ce14146ab7baae57064b05b12ecc6b52d5e917f',
   ],
+  [
+    '1.98.1',
+    '68129500b616d5838629e68f55ff3aed5e096dacf60ce9eb41bbe599a563afa6',
+  ],
 ]);
 
 export async function assertThirdPartyNotices() {

@@ -1,4 +1,4 @@
-import {existsSync} from 'node:fs';
+import {existsSync, statSync} from 'node:fs';
 import {cp, mkdir, mkdtemp, readdir, rm} from 'node:fs/promises';
 import {spawnSync} from 'node:child_process';
 import {tmpdir} from 'node:os';
@@ -12,21 +12,35 @@ const pathKey =
 const rustupExecutable = findExecutable(
   process.platform === 'win32' ? ['rustup.exe', 'rustup'] : ['rustup'],
 );
-const rustupTools = rustupExecutable
-  ? [
-      capture(rustupExecutable, ['which', 'rustc']),
-      capture(rustupExecutable, ['which', 'cargo']),
-    ]
-  : [];
+// Prefer rustup's own cargo and rustc proxies: they select the pinned
+// toolchain and set the library path its tools need, such as the shared
+// libLLVM that rust-lld loads on macOS. The resolved toolchain binaries are the
+// fallback when the proxies do not sit beside rustup.
+const rustupProxyDirectories =
+  rustupExecutable &&
+  ['cargo', 'rustc'].every((tool) => isRustupProxy(tool, rustupExecutable))
+    ? [dirname(rustupExecutable)]
+    : [];
+const rustupTools =
+  rustupExecutable && rustupProxyDirectories.length === 0
+    ? [
+        capture(rustupExecutable, ['which', 'rustc']),
+        capture(rustupExecutable, ['which', 'cargo']),
+      ]
+    : [];
 const rustupToolchainDirectories =
   rustupTools.length === 2 &&
   rustupTools.every((tool) => tool.ok && existsSync(tool.output))
     ? [...new Set(rustupTools.map((tool) => dirname(tool.output)))]
     : [];
-const rustEnvironment = rustupToolchainDirectories.length > 0
+const rustDirectories = [
+  ...rustupProxyDirectories,
+  ...rustupToolchainDirectories,
+];
+const rustEnvironment = rustDirectories.length > 0
   ? {
       ...process.env,
-      [pathKey]: [...rustupToolchainDirectories, process.env[pathKey]]
+      [pathKey]: [...rustDirectories, process.env[pathKey]]
         .filter(Boolean)
         .join(delimiter),
     }
@@ -54,7 +68,7 @@ rustfmt, and the WASM target from rust-toolchain.toml.
 
   if (rustup.ok) {
     const cause =
-      rustupToolchainDirectories.length > 0
+      rustDirectories.length > 0
         ? "the pinned toolchain's target is missing"
         : 'the repository toolchain could not be resolved';
     console.error(`rustup is installed, but ${cause}.
@@ -170,6 +184,18 @@ function capture(command, args, environment = process.env) {
     ok: result.status === 0,
     output: result.status === 0 ? result.stdout.trim() : '',
   };
+}
+
+function isRustupProxy(tool, rustup) {
+  const name = process.platform === 'win32' ? `${tool}.exe` : tool;
+  try {
+    // Proxies are symbolic or hard links to rustup itself.
+    const proxy = statSync(resolve(dirname(rustup), name));
+    const target = statSync(rustup);
+    return proxy.dev === target.dev && proxy.ino === target.ino;
+  } catch {
+    return false;
+  }
 }
 
 function findExecutable(names) {
