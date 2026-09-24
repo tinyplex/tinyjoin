@@ -65,8 +65,11 @@ Pattern matching always scans candidate rows rather than using an index.
 Worker protocol stays at version 8 and the page format stays at format 2, so an
 existing database opens with no migration and no OPFS namespace change. The new
 syntax was previously rejected, so statements that already worked keep their
-results. The WebAssembly engine grows by about 11 KiB compressed to carry the
-new SQL.
+results.
+
+The engine is now built with Rust 1.98.1 rather than 1.91.1. That more than
+offsets the new SQL, so the compressed WebAssembly engine is about 5 KiB
+smaller than in v0.2.0.
 
 ## v0.2.0
 
