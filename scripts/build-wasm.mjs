@@ -1,50 +1,13 @@
-import {existsSync, statSync} from 'node:fs';
+import {existsSync} from 'node:fs';
 import {cp, mkdir, mkdtemp, readdir, rm} from 'node:fs/promises';
 import {spawnSync} from 'node:child_process';
 import {tmpdir} from 'node:os';
-import {delimiter, dirname, join, resolve} from 'node:path';
+import {dirname, join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {resolveRustEnvironment} from './rust-environment.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const pathKey =
-  Object.keys(process.env).find((key) => key.toLowerCase() === 'path') ??
-  'PATH';
-const rustupExecutable = findExecutable(
-  process.platform === 'win32' ? ['rustup.exe', 'rustup'] : ['rustup'],
-);
-// Prefer rustup's own cargo and rustc proxies: they select the pinned
-// toolchain and set the library path its tools need, such as the shared
-// libLLVM that rust-lld loads on macOS. The resolved toolchain binaries are the
-// fallback when the proxies do not sit beside rustup.
-const rustupProxyDirectories =
-  rustupExecutable &&
-  ['cargo', 'rustc'].every((tool) => isRustupProxy(tool, rustupExecutable))
-    ? [dirname(rustupExecutable)]
-    : [];
-const rustupTools =
-  rustupExecutable && rustupProxyDirectories.length === 0
-    ? [
-        capture(rustupExecutable, ['which', 'rustc']),
-        capture(rustupExecutable, ['which', 'cargo']),
-      ]
-    : [];
-const rustupToolchainDirectories =
-  rustupTools.length === 2 &&
-  rustupTools.every((tool) => tool.ok && existsSync(tool.output))
-    ? [...new Set(rustupTools.map((tool) => dirname(tool.output)))]
-    : [];
-const rustDirectories = [
-  ...rustupProxyDirectories,
-  ...rustupToolchainDirectories,
-];
-const rustEnvironment = rustDirectories.length > 0
-  ? {
-      ...process.env,
-      [pathKey]: [...rustDirectories, process.env[pathKey]]
-        .filter(Boolean)
-        .join(delimiter),
-    }
-  : process.env;
+const {rustDirectories, rustEnvironment} = resolveRustEnvironment(root);
 
 const target = 'wasm32-unknown-unknown';
 const targetLibDir = capture(
@@ -184,35 +147,4 @@ function capture(command, args, environment = process.env) {
     ok: result.status === 0,
     output: result.status === 0 ? result.stdout.trim() : '',
   };
-}
-
-function isRustupProxy(tool, rustup) {
-  const name = process.platform === 'win32' ? `${tool}.exe` : tool;
-  try {
-    // Proxies are symbolic or hard links to rustup itself.
-    const proxy = statSync(resolve(dirname(rustup), name));
-    const target = statSync(rustup);
-    return proxy.dev === target.dev && proxy.ino === target.ino;
-  } catch {
-    return false;
-  }
-}
-
-function findExecutable(names) {
-  const path = process.env[pathKey];
-  if (!path) {
-    return undefined;
-  }
-  for (const directory of path.split(delimiter)) {
-    if (!directory) {
-      continue;
-    }
-    for (const name of names) {
-      const candidate = resolve(directory.replace(/^"|"$/g, ''), name);
-      if (existsSync(candidate)) {
-        return candidate;
-      }
-    }
-  }
-  return undefined;
 }
