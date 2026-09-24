@@ -7,13 +7,16 @@ body {
   flex-direction: column;
   align-items: stretch;
   height: 100vh;
+  height: 100dvh;
   margin: 0;
 
   > header {
+    flex-shrink: 0;
     height: 5rem;
     display: flex;
     align-items: center;
     justify-content: space-between;
+    position: relative;
 
     > a {
       min-width: 15rem;

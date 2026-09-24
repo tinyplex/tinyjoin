@@ -16,6 +16,7 @@ body > header {
     > span {
       font-weight: 800;
       font-size: 2.8rem;
+      letter-spacing: -0.02em;
       line-height: 1em;
       color: @text2Color;
 
@@ -50,7 +51,32 @@ body > header {
         border: 1px solid @borderColor;
         padding: 0.5rem;
         font-size: 1rem;
+        border-radius: @radius;
+
+        &:focus ~ kbd,
+        &:not(:placeholder-shown) ~ kbd {
+          display: none;
+        }
+      }
+
+      kbd {
+        position: absolute;
+        top: 50%;
+        right: 0.5rem;
+        transform: translateY(-50%);
+        padding: 0 0.3rem;
+        font-family: inherit;
+        font-size: 0.75rem;
+        line-height: 1.25rem;
+        color: @textColor;
+        background: @backColor;
+        border: 1px solid @borderColor;
         border-radius: 0.25rem;
+        pointer-events: none;
+
+        @media (hover: none) {
+          display: none;
+        }
       }
 
       ol {
@@ -69,7 +95,7 @@ body > header {
         background: @back2Color;
         border: 1px solid @borderColor;
         box-shadow: @shadow;
-        border-radius: 0.25rem;
+        border-radius: @radius;
         z-index: 2;
 
         &.show {
@@ -116,6 +142,10 @@ body > header {
         display: inline;
         margin-right: 2rem;
       }
+
+      a {
+        font-weight: 500;
+      }
     }
   }
 
@@ -139,6 +169,37 @@ body > header {
   a[aria-current='page'] {
     color: @accentColor;
     font-weight: 720;
+  }
+}
+
+// Documentation pages trade some of the wordmark's height for content.
+body:not(.home) > header > a {
+  > img {
+    width: 2.5rem;
+    height: 2.5rem;
+  }
+
+  > span {
+    font-size: 2.3rem;
+  }
+}
+
+@media (min-width: 60rem) {
+  body:not(.home) > header {
+    height: 4rem;
+  }
+}
+
+@media not all and (min-width: 25rem) {
+  body > header > a {
+    > img {
+      width: 2.4rem;
+      height: 2.4rem;
+    }
+
+    > span {
+      font-size: 2.1rem;
+    }
   }
 }
 

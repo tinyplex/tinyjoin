@@ -84,7 +84,7 @@ export const Page = () => {
         ) : null}
         <script src="/js/site.js" />
       </head>
-      <body>
+      <body className={isHome ? 'home' : undefined}>
         <a className="skip" href={isHome ? '#home' : '#content'}>
           Skip to content
         </a>

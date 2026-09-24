@@ -1,3 +1,5 @@
+import {enhanceMain} from './enhance.ts';
+
 const SITE = 'TinyJoin';
 
 const isInternal = (link: HTMLAnchorElement): boolean =>
@@ -58,6 +60,7 @@ export const navLoad = () => {
     main.innerHTML = html;
     currentUrl = url;
     setTitle(main);
+    enhanceMain();
     if (push) {
       history.pushState({}, '', url.href);
     }

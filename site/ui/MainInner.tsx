@@ -25,7 +25,7 @@ export const MainInner = () => {
         </nav>
         <NodeSection node={node} />
       </article>
-      <aside aria-hidden="true" />
+      <aside aria-label="On this page" />
     </>
   );
 };

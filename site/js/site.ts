@@ -1,3 +1,4 @@
+import {enhanceLoad} from './enhance.ts';
 import {navLoad} from './nav.ts';
 import {searchLoad} from './search.ts';
 
@@ -73,6 +74,7 @@ window.addEventListener('DOMContentLoaded', () => {
 
   searchLoad();
   navLoad();
+  enhanceLoad();
   updateTheme();
 });
 

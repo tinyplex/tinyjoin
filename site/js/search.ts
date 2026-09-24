@@ -59,8 +59,10 @@ export const searchLoad = () => {
   input.setAttribute('aria-controls', 'search-results');
   input.setAttribute('aria-expanded', 'false');
   input.setAttribute('aria-label', 'Search the documentation');
-  input.placeholder =
-    (navigator.platform.startsWith('Mac') ? '⌘' : 'ctrl-') + 'K Search';
+  input.placeholder = 'Search';
+  const shortcut = document.createElement('kbd');
+  shortcut.setAttribute('aria-hidden', 'true');
+  shortcut.textContent = navigator.platform.startsWith('Mac') ? '⌘K' : 'Ctrl K';
   const results = document.createElement('ol');
   results.id = 'search-results';
   results.setAttribute('role', 'listbox');
@@ -69,7 +71,7 @@ export const searchLoad = () => {
   status.className = 'search-status';
   status.setAttribute('role', 'status');
   status.setAttribute('aria-atomic', 'true');
-  search.append(input, results, status);
+  search.append(input, results, status, shortcut);
 
   let pages: Page[] = [];
 

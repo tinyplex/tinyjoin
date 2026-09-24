@@ -39,11 +39,18 @@ h6 {
   line-height: 1.2;
   color: @text2Color;
   clear: both;
+  text-wrap: balance;
 
   a {
     color: inherit;
     font-weight: inherit !important;
   }
+}
+
+h1,
+h2,
+h3 {
+  letter-spacing: -0.02em;
 }
 
 h1 {
@@ -82,15 +89,21 @@ h6 {
 p {
   margin: 1.15rem 0;
   clear: both;
+  text-wrap: pretty;
 }
 
 p code,
 article ul code {
-  background: @back2Color;
-  border: 1px solid @borderColor;
+  background: @back3Color;
   padding: 0.05em 0.3em;
   border-radius: 0.25rem;
   text-decoration-color: transparent;
+}
+
+p a > code,
+article ul a > code {
+  background: none;
+  padding: 0;
 }
 
 .table {
