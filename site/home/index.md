@@ -30,6 +30,24 @@
 | Engine WASM    |      {{sizes.wasm.gzip}} |
 | **Everything** | **{{sizes.total.gzip}}** |
 
+> ## Measured against the alternatives
+>
+> We benchmark TinyJoin against SQLite's official WebAssembly build and PGlite,
+> each running in a Worker and saving to OPFS in the same browser. TinyJoin is
+> the smallest download and the quickest to create a new database, though
+> SQLite reopens an existing one faster. See [how we measure](/guides/benchmarks/).
+
+{{benchmarks.home-startup}}
+
+> ## With plenty of speed still to find
+>
+> Reads and writes are another story, for now. The engine is young, and most
+> workloads run slower than in SQLite or PGlite - by orders of magnitude for
+> updates and deletes inside a large transaction. We publish every result, so
+> you can watch the gap close.
+
+{{benchmarks.home-crud}}
+
 > ## Your first _TinyJoin_ app
 >
 > Scaffold a complete local todo app in JS or TS - and with its relational data

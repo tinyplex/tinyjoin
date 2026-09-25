@@ -1,5 +1,8 @@
 # Workload measurements
 
+Comparisons with SQLite and PGlite live in [`compare/`](compare/README.md).
+The measurements below are TinyJoin's own diagnostics.
+
 ## Prelaunch performance improvements
 
 The quick profile compares the same 250-operation mixed transaction and

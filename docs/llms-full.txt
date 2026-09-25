@@ -1675,6 +1675,293 @@ Worker, and WASM files even when the first visit only opens a memory database.
 Caching the entry script or the files observed during one online visit is not
 sufficient for a later persistent open without a network.
 
+# Benchmarks
+
+Source: https://tinyjoin.org/guides/benchmarks/
+
+TinyJoin is measured against the two databases most often chosen for the same
+job: SQLite's official WebAssembly build and PGlite. All three run in a
+dedicated Worker, store their data in the origin private file system (OPFS),
+and are driven from the page by the same workloads in the same Chromium.
+
+These numbers are published to track progress, not to win an argument.
+TinyJoin's engine is young. It is already small and quick to open, but most
+reads and writes are currently much slower than in either alternative, and
+closing that gap is ongoing work. The suite is designed to be rerun after
+every optimization.
+
+Measured on 2026-09-25 with headless Chromium 153.0.8010.12 on macOS (25.5.0), Apple M2, 8 logical CPUs, 16 GiB RAM. Each value is the median of 5 samples. The shortest time in each row is bold, and each bar
+is scaled to the slowest engine in its row.
+
+## Measured results
+
+### Download and startup
+
+| Median time | TinyJoin | SQLite | PGlite |
+| --- | ---: | ---: | ---: |
+| Download (gzip) | **296 KiB** | 457 KiB | 5.6 MiB |
+| Load, create an empty database, and read from it | **74.4 ms** | 105 ms | 2.00 s |
+| Reopen a 10,000-row database in a new session and count it | 190 ms | **54.7 ms** | 320 ms |
+
+Download size counts every file a page fetched to open a database, compressed
+with gzip at level 9: JavaScript for the page and the Worker, WebAssembly, and
+PGlite's file system image. First open starts before the engine is fetched and
+ends when the first query on a new, empty database returns. Reopen runs in a new
+browser session with a warm HTTP cache: it loads the engine again, opens an
+existing database, and counts its rows.
+
+### Create
+
+| Median time | TinyJoin | SQLite | PGlite |
+| --- | ---: | ---: | ---: |
+| 1,000 INSERTs, each committed alone | 2.24 s | 1.78 s | **687 ms** |
+| One transaction of 10,000 INSERTs | 2.50 s | **251 ms** | 1.85 s |
+| One transaction of 10,000 INSERTs, indexed text column | 4.18 s | **272 ms** | 2.01 s |
+| One transaction of 50 INSERTs, 200 rows each | 2.76 s | **83.0 ms** | 207 ms |
+
+### Read
+
+| Median time | TinyJoin | SQLite | PGlite |
+| --- | ---: | ---: | ---: |
+| 1,000 SELECTs by primary key | 200 ms | **47.0 ms** | 244 ms |
+| 100 range aggregates, no index | 6.89 s | **65.6 ms** | 119 ms |
+| 100 LIKE aggregates on a text column | 6.91 s | **177 ms** | 244 ms |
+| 100 range aggregates, indexed column | 6.04 s | **4.30 ms** | 25.4 ms |
+| Read all 10,000 rows in order | 136 ms | **58.3 ms** | 67.0 ms |
+| 10 GROUP BY aggregates over 10,000 rows | 683 ms | 40.4 ms | **30.3 ms** |
+| 100 joins: one customer’s orders from 5,000 | 5.23 s | **29.9 ms** | 59.0 ms |
+
+### Update
+
+| Median time | TinyJoin | SQLite | PGlite |
+| --- | ---: | ---: | ---: |
+| One transaction of 1,000 UPDATEs by primary key | 39.0 s | **36.2 ms** | 206 ms |
+| One transaction of 100 range UPDATEs, no index | 13.0 s | **72.7 ms** | 140 ms |
+| One transaction of 1,000 upserts, half of them new | 37.0 s | **27.2 ms** | 181 ms |
+
+### Delete
+
+| Median time | TinyJoin | SQLite | PGlite |
+| --- | ---: | ---: | ---: |
+| One transaction of 1,000 DELETEs by primary key | 34.3 s | **31.0 ms** | 216 ms |
+| One DELETE matching a LIKE pattern | 629 ms | 11.2 ms | **6.60 ms** |
+| One DELETE of 8,000 rows by indexed range | 2.46 s | 11.6 ms | **9.90 ms** |
+
+### Schema
+
+| Median time | TinyJoin | SQLite | PGlite |
+| --- | ---: | ---: | ---: |
+| Create two indexes over 10,000 rows | 4.04 s | **28.5 ms** | 32.5 ms |
+
+## What the results show
+
+In the v0.3.0 results above, TinyJoin is the smallest download and the quickest
+to create a new database: PGlite initializes a new PostgreSQL cluster on first
+open. Nearly everything after that is slower in TinyJoin, and the gaps point
+directly at the work ahead.
+
+- **Updates, deletes, and upserts inside a transaction** are the largest gap,
+  at three orders of magnitude. Once a transaction contains anything but
+  appended rows, TinyJoin validates the complete write set after every
+  statement, so the cost of each statement grows with the transaction.
+  Append-only inserts already validate incrementally.
+- **Range predicates do not use secondary indexes.** Only equality does, so the
+  indexed range aggregates take as long as the unindexed ones, while SQLite
+  and PGlite answer them from the index.
+- **Scans are slow.** Every unindexed query, `LIKE` predicate, `GROUP BY`, and
+  bulk `DELETE` reads all 10,000 rows, and TinyJoin reads rows far more slowly
+  than either engine. Creating an index over those rows is also slow.
+- **Joins run as nested loops** without index lookups, repeating that scan
+  cost for every row of the outer table.
+- **Multi-row inserts are no faster than single-row inserts.** In SQLite and
+  PGlite, batching rows into fewer statements is the quickest way to load
+  data; in TinyJoin, it currently saves nothing.
+- **Reopening validates the stored trees**, so a populated database takes
+  longer to reopen in TinyJoin than in SQLite.
+
+The closest results are the ones dominated by messages between the page and
+the Worker: point reads by primary key, reading every row, and committing
+single-row writes one at a time. There, TinyJoin is within a small factor of
+both engines, and reads single rows faster than PGlite.
+
+## Features are not equivalent
+
+The workloads use only SQL that all three engines accept, which is TinyJoin's
+bounded dialect. That favors TinyJoin: SQLite and PGlite do far more, and an
+application that needs what they add should use them. The
+[caveats](https://tinyjoin.org/guides/caveats/) and the
+[SQL compatibility contract](https://tinyjoin.org/guides/sql-compatibility/) describe TinyJoin's
+boundaries in full.
+
+| | TinyJoin | SQLite | PGlite |
+| --- | --- | --- | --- |
+| SQL dialect | A bounded, PostgreSQL-shaped subset | SQLite | PostgreSQL |
+| Subqueries, CTEs, set operations | No | Yes | Yes |
+| Expressions, casts, scalar functions | No | Yes | Yes |
+| `HAVING`, window functions | No | Yes | Yes |
+| Views, triggers | No | Yes | Yes |
+| Joins | Up to eight sources, evaluated as written, without index lookups | Query planner, with indexes | Query planner, with indexes |
+| `INSERT ... SELECT`, `UPDATE ... FROM` | No | Yes | Yes |
+| Upserts | `ON CONFLICT`, assigning values from `EXCLUDED` | Yes | Yes |
+| Types | Boolean, safe integer, float, text, JSON | Dynamic: integer, real, text, blob | The PostgreSQL type system |
+| JSON | Stored, returned, and compared for equality | JSON functions | `json` and `jsonb` operators and functions |
+| Full-text search | No | FTS5 | `tsvector` |
+| Extensions | No | Compiled in only | PostgreSQL contrib extensions |
+| Transactions | A callback API | SQL, with savepoints | SQL, with savepoints |
+| Worker | create() owns it | The Worker1 API, or the application's own | `PGliteWorker`, or the application's own |
+| Tabs sharing a database | Automatic, with owner handover | Not with `opfs-sahpool`, which is exclusive | `PGliteWorker` leader election |
+| Change notifications | Changed tables and primary keys | Update hooks in the C API | Live queries, `LISTEN`/`NOTIFY` |
+| Node.js | In memory | In memory | In memory or on disk |
+| Maturity | Experimental, v0.x | Decades of production use | The PostgreSQL engine, in a v0.x package |
+
+## How the benchmark works
+
+### The engines
+
+| Engine | Package | Version | Storage |
+| --- | --- | --- | --- |
+| TinyJoin | `tinyjoin` | 0.3.0 | `opfs://` |
+| SQLite | `@sqlite.org/sqlite-wasm` | 3.53.4-build1 (3.53.4) | `opfs-sahpool` |
+| PGlite | `@electric-sql/pglite` | 0.5.8 (PostgreSQL 18.3) | `opfs-ahp://` |
+
+SQLite uses `opfs-sahpool`, the SQLite project's fastest OPFS file system. Like
+TinyJoin's storage, it holds its files exclusively, and it needs no
+cross-origin isolation headers. PGlite uses `opfs-ahp`, its OPFS file system.
+Every engine keeps its default durability: no relaxed flushing, no
+`PRAGMA synchronous`, and no in-memory journal.
+
+### One page, three Workers
+
+A single Vite production build contains a small harness and one chunk per
+engine, so a page downloads only the engine it opens. Each engine is reached
+through the same five calls: exec() for a parameter-free script, query() for
+one statement, prepare() and run() for a repeated statement, and
+transaction() for a callback.
+
+- TinyJoin's adapter maps those calls onto create() and the Client API, which
+  owns its Worker.
+- SQLite and PGlite each run in a Worker of a few dozen lines, answering one
+  message per statement. The SQLite Worker caches prepared statements by SQL
+  text; PGlite receives the SQL text with every statement.
+- A transaction is one round trip per statement for every engine: SQLite and
+  PGlite send `BEGIN` and `COMMIT` as statements, and TinyJoin sends each
+  statement inside transaction().
+
+Every query result is delivered to the page as an array of row objects, so
+timings include the message from the Worker, as an application would
+experience it.
+
+### Isolated samples
+
+Every sample launches Chromium with a fresh profile in a new temporary
+directory. The profile is on disk, not an incognito context, whose storage would
+be held in memory. No engine ever sees another's files or warm caches, and a
+sample that exceeds the time limit can be killed without affecting the next.
+Engines take turns within each round of samples, so gradual changes in machine
+load affect them equally.
+
+In each sample, the harness opens a new database, runs the workload's untimed
+setup, and then times only the workload itself with performance.now(). Setup
+loads rows as multi-row `INSERT` statements in one transaction.
+
+### Checked results
+
+Every workload ends with an untimed check, such as a row count, a column sum,
+or a total accumulated from the query results. The runner compares the checks
+of all three engines, and fails if any disagree, so every engine is known to
+have done the same work.
+
+### Workloads
+
+All tables have an integer primary key. The main table has 10,000 rows with a
+sequential integer, a random integer below 100,000, that number spelled out in
+English words, and one of 100 group numbers. The data is generated from a fixed
+seed, so it is identical for every engine and every run.
+
+| Workload | Group | Speed test origin |
+| --- | --- | --- |
+| `cold-open`: Load, create an empty database, and read from it | Startup |  |
+| `reopen`: Reopen a 10,000-row database in a new session and count it | Startup |  |
+| `insert-autocommit`: 1,000 INSERTs, each committed alone | Create | Test 1 |
+| `insert-transaction`: One transaction of 10,000 INSERTs | Create | Test 2 |
+| `insert-indexed`: One transaction of 10,000 INSERTs, indexed text column | Create | Test 3 |
+| `insert-batch`: One transaction of 50 INSERTs, 200 rows each | Create |  |
+| `select-pk`: 1,000 SELECTs by primary key | Read |  |
+| `select-scan`: 100 range aggregates, no index | Read | Test 4 |
+| `select-like`: 100 LIKE aggregates on a text column | Read | Test 5 |
+| `select-indexed`: 100 range aggregates, indexed column | Read | Test 7 |
+| `select-all`: Read all 10,000 rows in order | Read |  |
+| `group-by`: 10 GROUP BY aggregates over 10,000 rows | Read |  |
+| `join`: 100 joins: one customer’s orders from 5,000 | Read |  |
+| `update-pk`: One transaction of 1,000 UPDATEs by primary key | Update | Test 9 |
+| `update-scan`: One transaction of 100 range UPDATEs, no index | Update | Test 8 |
+| `upsert`: One transaction of 1,000 upserts, half of them new | Update |  |
+| `delete-pk`: One transaction of 1,000 DELETEs by primary key | Delete |  |
+| `delete-like`: One DELETE matching a LIKE pattern | Delete | Test 12 |
+| `delete-range`: One DELETE of 8,000 rows by indexed range | Delete | Test 13 |
+| `create-index`: Create two indexes over 10,000 rows | Schema | Test 6 |
+
+Several workloads are adapted from the classic SQLite database speed
+comparison, which [PGlite](https://pglite.dev/benchmarks) also publishes
+results for. The adaptations add a primary key to every table, use smaller
+counts, and replace the forms TinyJoin cannot run: arithmetic in `UPDATE ...
+SET` becomes a literal assignment, and the `INSERT ... SELECT` tests are
+omitted.
+
+The join places 5,000 orders across 100 customers. With 10,000 orders, the
+query would exceed TinyJoin's 1,000,000-comparison
+[join budget](https://tinyjoin.org/guides/sql-compatibility/#join-work-budgets) and fail, because
+TinyJoin's nested loop does not use the index on `customer_id`.
+
+A sample that runs longer than 60 seconds is abandoned and reported as such,
+and that engine skips the workload's remaining samples.
+
+### What this does not measure
+
+- One desktop machine and one browser. Mobile devices, Firefox, and Safari
+  are not measured.
+- Assets are served over loopback HTTP, so download sizes are counted, but
+  network transfer time is not.
+- Other configurations can be faster or slower: SQLite's `opfs` file system,
+  community builds such as wa-sqlite, PGlite with IndexedDB or
+  `relaxedDurability`, and TinyJoin with in-memory storage.
+- Concurrency across tabs, very large databases, and long-lived storage
+  fragmentation.
+
+## Reproducing the results
+
+The benchmark lives in `benchmarks/compare` in the
+[repository](https://github.com/tinyplex/tinyjoin). SQLite and PGlite are
+installed there, pinned by its own lockfile, rather than in the project's
+dependencies. The runner installs them on first use.
+
+```sh
+npm ci
+npm run build
+npm run bench:compare -- --publish
+npm run build:docs
+```
+
+Use the Node.js version in `.node-version`, since compressed sizes depend on
+its zlib. A full run takes about half an hour on the machine above. Close
+other applications and avoid concurrent builds or tests while it runs.
+
+`--publish` requires the full suite and writes every sample, the environment,
+and the list of downloaded files to `site/data/benchmarks.json`, from which the
+documentation build renders these tables.
+
+When working on TinyJoin's performance, run a subset instead. The runner prints
+each engine's median and TinyJoin's ratio to the fastest:
+
+```sh
+npm run build
+npm run bench:compare -- --engines tinyjoin,sqlite --workloads update-pk,delete-pk --samples 3
+```
+
+`--storage memory` runs the same workloads without OPFS, which separates the
+engine's own cost from storage. `--out` saves a report to compare against a
+later build, and `--help` lists every option.
+
 # Agents guide
 
 Source: https://tinyjoin.org/guides/agents-guide/
@@ -1850,6 +2137,11 @@ npm run test:browser
 npm run test:package
 npm run check:size
 ```
+
+`npm run bench:compare` compares the built runtime with SQLite and PGlite in
+Chromium; pass `--engines`, `--workloads`, and `--samples` to measure one
+change quickly. Only a full `--publish` run updates
+`site/data/benchmarks.json`, which the benchmarks guide and homepage render.
 
 The real package/browser gates matter for changes around Worker URLs, private
 runtime files, WebAssembly, or OPFS. The current automated browser claim is

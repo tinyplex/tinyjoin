@@ -5,6 +5,11 @@ import {relative, resolve} from 'node:path';
 import type {Docs, Node} from 'tinydocs';
 import {createDocs, getSorter} from 'tinydocs';
 import {writePackageDocumentation} from '../scripts/package-documentation.mjs';
+import {
+  BAR_PATTERN,
+  BAR_REPLACEMENT,
+  getBenchmarkRenderer,
+} from './benchmarks.ts';
 import {MainInner} from './ui/MainInner.tsx';
 import {MarkdownPage} from './ui/MarkdownPage.tsx';
 import {Page} from './ui/Page.tsx';
@@ -40,6 +45,7 @@ const sortGuides = getSorter([
   'Custom Workers',
   'Node',
   'Offline',
+  'Benchmarks',
   '*',
   'Agents guide',
   'Releases',
@@ -126,6 +132,7 @@ export const build = async (
   publicMarkdownDir = repositoryRoot,
   packageDir = resolve(typesDir, '..'),
 ): Promise<void> => {
+  const renderBenchmarks = getBenchmarkRenderer();
   const docs = createDocs('https://tinyjoin.org', outDir)
     .addJsFile('site/js/site.ts')
     .addLessFile('site/less/index.less')
@@ -133,6 +140,10 @@ export const build = async (
     .addDir('site/extras')
     .addReflectionTransform(hideInheritedErrorMembers)
     .addNodeTransform(collapseEmptyGroups)
+    .addNodeTransform((node) => {
+      node.summary &&= renderBenchmarks(node.summary);
+      node.body &&= renderBenchmarks(node.body);
+    })
     .addNodeTransform((node) => {
       if (node.url === '/guides/') {
         node.children.sort((left, right) => sortGuides(left.name, right.name));
@@ -150,6 +161,7 @@ export const build = async (
   for (const [pattern, replacement] of sizeReplacers) {
     docs.addReplacer(pattern, replacement);
   }
+  docs.addReplacer(BAR_PATTERN, BAR_REPLACEMENT);
 
   await docs.generateNodes({
     group: getSorter(GROUPS),
@@ -159,7 +171,8 @@ export const build = async (
 
   docs
     .addStringFile(
-      getFullReference(docs, typesDir, sizeReplacers),
+      // The plain-text reference keeps benchmark values, without their bars.
+      getFullReference(docs, typesDir, [...sizeReplacers, [BAR_PATTERN, '$2']]),
       'llms-full.txt',
     )
     .addPageForEachNode('/', Page)

@@ -137,6 +137,29 @@ article ul a > code {
       font-weight: 720;
       text-align: left;
     }
+
+    // A benchmark value, over a thin bar scaled within its row. TinyJoin is
+    // always the first engine column; the others share one quiet ink.
+    .bar {
+      display: block;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+
+      &::after {
+        background: color-mix(in srgb, @textColor 45%, transparent);
+        border-radius: 0 2px 2px 0;
+        content: '';
+        display: block;
+        height: 4px;
+        margin-top: 0.1rem;
+        min-width: 2px;
+        width: var(--bar);
+      }
+    }
+
+    td:nth-child(2) .bar::after {
+      background: @accentColor;
+    }
   }
 }
 

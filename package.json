@@ -26,6 +26,7 @@
     }
   },
   "scripts": {
+    "bench:compare": "node benchmarks/compare/run.mjs",
     "build": "node scripts/build.mjs",
     "build:docs": "npm run build && npm run build:docs:built",
     "build:docs:built": "node scripts/build-docs.mjs",

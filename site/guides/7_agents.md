@@ -172,6 +172,11 @@ npm run test:package
 npm run check:size
 ```
 
+`npm run bench:compare` compares the built runtime with SQLite and PGlite in
+Chromium; pass `--engines`, `--workloads`, and `--samples` to measure one
+change quickly. Only a full `--publish` run updates
+`site/data/benchmarks.json`, which the benchmarks guide and homepage render.
+
 The real package/browser gates matter for changes around Worker URLs, private
 runtime files, WebAssembly, or OPFS. The current automated browser claim is
 Chromium only; do not infer Firefox or WebKit support from a TypeScript or Vite
