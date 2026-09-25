@@ -177,7 +177,7 @@ await writePackageDocumentation(root, dist);
 
 async function copyPublicMarkdown() {
   await copyFile(
-    resolve(root, 'site/guides/7_agents.md'),
+    resolve(root, 'site/guides/10_agents.md'),
     resolve(root, 'AGENTS.md'),
   );
   const markdown = [
