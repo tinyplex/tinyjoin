@@ -2849,6 +2849,33 @@ pub(crate) fn validate_like(
     Ok(())
 }
 
+/// Where `literal` first occurs in `text`, as bytes, folding ASCII letters when
+/// `case_insensitive`. Scanning for its first byte and comparing the rest from each one found is
+/// quick for the short literals of LIKE patterns, and it needs no setup for each text searched.
+fn find_literal(text: &[u8], literal: &str, case_insensitive: bool) -> Option<usize> {
+    let literal = literal.as_bytes();
+    let (&first, rest) = literal.split_first()?;
+    let last_start = text.len().checked_sub(literal.len())?;
+    let mut start = 0;
+    while start <= last_start {
+        let starts = &text[start..=last_start];
+        let offset = if case_insensitive {
+            starts
+                .iter()
+                .position(|byte| byte.eq_ignore_ascii_case(&first))
+        } else {
+            starts.iter().position(|byte| *byte == first)
+        }?;
+        let at = start + offset;
+        let candidate = &text[at + 1..at + literal.len()];
+        if candidate == rest || case_insensitive && candidate.eq_ignore_ascii_case(rest) {
+            return Some(at);
+        }
+        start = at + 1;
+    }
+    None
+}
+
 #[derive(Clone, Copy)]
 enum LikeElement {
     AnyCharacter,
@@ -2975,13 +3002,10 @@ impl LikePattern {
         };
         for index in (1..last).filter(|index| !self.segments[*index].is_empty()) {
             let found = match &self.literals[index] {
-                Some(literal) if !case_insensitive => text[cursor..]
-                    .find(literal.as_str())
-                    .map(|offset| cursor + offset + literal.len()),
-                Some(literal) => text.as_bytes()[cursor..]
-                    .windows(literal.len())
-                    .position(|bytes| same(bytes, literal))
-                    .map(|offset| cursor + offset + literal.len()),
+                Some(literal) => {
+                    find_literal(&text.as_bytes()[cursor..], literal, case_insensitive)
+                        .map(|offset| cursor + offset + literal.len())
+                }
                 None => text[cursor..]
                     .char_indices()
                     .map(|(offset, _)| cursor + offset)
