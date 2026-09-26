@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashSet},
+    rc::Rc,
 };
 
 #[cfg(test)]
@@ -29,8 +30,9 @@ pub(crate) struct PagedStorage<D: PageDevice> {
     pager: RefCell<Pager<D>>,
     revision: u64,
     next_tree_id: TreeId,
-    tables: BTreeMap<String, PagedTable>,
-    indexes: BTreeMap<String, PagedIndex>,
+    // Shared with each script candidate, which copies them only if it changes the catalog.
+    tables: Rc<BTreeMap<String, PagedTable>>,
+    indexes: Rc<BTreeMap<String, PagedIndex>>,
     recovery_required: bool,
     #[cfg(test)]
     validated_row_count: std::cell::Cell<usize>,
@@ -109,8 +111,8 @@ impl<D: PageDevice> PagedStorage<D> {
                 pager: RefCell::new(pager),
                 revision,
                 next_tree_id: FIRST_USER_TREE_ID,
-                tables: BTreeMap::new(),
-                indexes: BTreeMap::new(),
+                tables: Rc::default(),
+                indexes: Rc::default(),
                 recovery_required: false,
                 #[cfg(test)]
                 validated_row_count: std::cell::Cell::new(0),
@@ -123,8 +125,8 @@ impl<D: PageDevice> PagedStorage<D> {
             pager: RefCell::new(pager),
             revision,
             next_tree_id,
-            tables,
-            indexes,
+            tables: Rc::new(tables),
+            indexes: Rc::new(indexes),
             recovery_required: false,
             #[cfg(test)]
             validated_row_count: std::cell::Cell::new(0),

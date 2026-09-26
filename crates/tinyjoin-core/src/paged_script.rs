@@ -1,6 +1,7 @@
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
+    rc::Rc,
 };
 
 use crate::{
@@ -37,8 +38,8 @@ pub(crate) struct ScriptPublication {
     pub(crate) committed: bool,
     pub(crate) revision: u64,
     pub(crate) next_tree_id: TreeId,
-    pub(crate) tables: BTreeMap<String, PagedTable>,
-    pub(crate) indexes: BTreeMap<String, PagedIndex>,
+    pub(crate) tables: Rc<BTreeMap<String, PagedTable>>,
+    pub(crate) indexes: Rc<BTreeMap<String, PagedIndex>>,
     pub(crate) results: Vec<ExecuteResult>,
 }
 
@@ -52,8 +53,9 @@ struct PagedScriptCandidate<'a, D: PageDevice> {
     catalog_root: Option<PageId>,
     base_revision: u64,
     next_tree_id: TreeId,
-    tables: BTreeMap<String, PagedTable>,
-    indexes: BTreeMap<String, PagedIndex>,
+    // Shared with the storage until this candidate changes them.
+    tables: Rc<BTreeMap<String, PagedTable>>,
+    indexes: Rc<BTreeMap<String, PagedIndex>>,
     base_tables: BTreeSet<String>,
     base_indexes: BTreeSet<String>,
     mutated: bool,
@@ -65,8 +67,8 @@ pub(crate) fn execute<D: PageDevice>(
     pager: &mut Pager<D>,
     base_revision: u64,
     next_tree_id: TreeId,
-    tables: BTreeMap<String, PagedTable>,
-    indexes: BTreeMap<String, PagedIndex>,
+    tables: Rc<BTreeMap<String, PagedTable>>,
+    indexes: Rc<BTreeMap<String, PagedIndex>>,
     statements: Vec<Statement>,
 ) -> Result<ScriptPublication> {
     if statements.is_empty() {
@@ -89,8 +91,8 @@ pub(crate) fn execute_row_changes<D: PageDevice>(
     pager: &mut Pager<D>,
     base_revision: u64,
     next_tree_id: TreeId,
-    tables: BTreeMap<String, PagedTable>,
-    indexes: BTreeMap<String, PagedIndex>,
+    tables: Rc<BTreeMap<String, PagedTable>>,
+    indexes: Rc<BTreeMap<String, PagedIndex>>,
     changes: &[RowChange],
 ) -> Result<ScriptPublication> {
     let mut candidate = begin_candidate(pager, base_revision, next_tree_id, tables, indexes)?;
@@ -106,8 +108,8 @@ fn begin_candidate<'a, D: PageDevice>(
     pager: &'a mut Pager<D>,
     base_revision: u64,
     next_tree_id: TreeId,
-    tables: BTreeMap<String, PagedTable>,
-    indexes: BTreeMap<String, PagedIndex>,
+    tables: Rc<BTreeMap<String, PagedTable>>,
+    indexes: Rc<BTreeMap<String, PagedIndex>>,
 ) -> Result<PagedScriptCandidate<'a, D>> {
     let catalog_root = pager.catalog_root_page_id();
     let transaction = pager.begin_write()?;
@@ -195,7 +197,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                         )));
                     }
                     let tree_id = self.allocate_tree_id()?;
-                    self.tables.insert(
+                    Rc::make_mut(&mut self.tables).insert(
                         schema.name.clone(),
                         PagedTable {
                             schema: schema.clone(),
@@ -342,7 +344,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 entry_count = entry_count.checked_add(1).ok_or_else(batch_too_large)?;
             }
         }
-        self.indexes.insert(
+        Rc::make_mut(&mut self.indexes).insert(
             definition.name.clone(),
             PagedIndex {
                 definition: definition.clone(),
@@ -355,9 +357,11 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
     }
 
     fn drop_index(&mut self, name: &str) -> Result<()> {
-        let index = self.indexes.remove(name).ok_or_else(|| {
-            EngineError::new("INDEX_NOT_FOUND", format!("Index `{name}` is not defined"))
-        })?;
+        let index = Rc::make_mut(&mut self.indexes)
+            .remove(name)
+            .ok_or_else(|| {
+                EngineError::new("INDEX_NOT_FOUND", format!("Index `{name}` is not defined"))
+            })?;
         if let Some(root) = index.root_page_id {
             Btree::reclaim(&mut self.transaction.borrow_mut(), root, index.tree_id)?;
         }
@@ -374,8 +378,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         for index_name in index_names {
             self.drop_index(&index_name)?;
         }
-        let table = self
-            .tables
+        let table = Rc::make_mut(&mut self.tables)
             .remove(name)
             .ok_or_else(|| EngineError::table_not_found(name))?;
         if let Some(root) = table.root_page_id {
@@ -392,7 +395,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             .ok_or_else(|| EngineError::table_not_found(table_name))?;
         let schema = schema_with_added_column(&table.schema, column)?;
         let Some(old_root) = table.root_page_id else {
-            self.tables
+            Rc::make_mut(&mut self.tables)
                 .get_mut(table_name)
                 .expect("the altered table was resolved above")
                 .schema = schema;
@@ -443,8 +446,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             }
             Btree::reclaim(&mut transaction, old_root, table.tree_id)?;
         }
-        let table = self
-            .tables
+        let table = Rc::make_mut(&mut self.tables)
             .get_mut(table_name)
             .expect("the altered table was resolved above");
         table.schema = schema;
@@ -607,8 +609,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         changes: &BTreeMap<String, BTreeMap<Vec<u8>, ScriptRowChange>>,
     ) -> Result<()> {
         for (table_name, table_changes) in changes {
-            let table = self
-                .tables
+            let table = Rc::make_mut(&mut self.tables)
                 .get_mut(table_name)
                 .expect("every changed table was resolved above");
             let mut transaction = self.transaction.borrow_mut();
@@ -654,8 +655,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 "table row",
             )?;
 
-            for index in self
-                .indexes
+            for index in Rc::make_mut(&mut self.indexes)
                 .values_mut()
                 .filter(|index| index.definition.table == *table_name)
             {
