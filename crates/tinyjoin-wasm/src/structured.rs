@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, mem::size_of};
+use std::{cell::RefCell, collections::BTreeMap, mem::size_of};
 
 use js_sys::{Array, Object, Reflect};
 use serde::Deserialize;
@@ -186,13 +186,13 @@ fn envelope(status: u32, disposition: u32, payload: JsValue) -> Result<JsValue> 
 fn build_apply_outcome(outcome: &ApplyOutcome) -> Result<JsValue> {
     safe_number(outcome.revision)?;
     let value = record();
-    set(
+    set_fixed(
         &value,
         "revision",
         &JsValue::from_f64(outcome.revision as f64),
     )?;
-    set(&value, "tables", &build_strings(&outcome.tables)?.into())?;
-    set(&value, "keys", &build_changed_keys(&outcome.keys)?)?;
+    set_fixed(&value, "tables", &build_strings(&outcome.tables)?.into())?;
+    set_fixed(&value, "keys", &build_changed_keys(&outcome.keys)?)?;
     Ok(value.into())
 }
 
@@ -201,26 +201,34 @@ fn build_execute_result(result: &ExecuteResult) -> Result<JsValue> {
     let row_count = u64::try_from(result.row_count).map_err(|_| serialization())?;
     safe_number(row_count)?;
     let value = record();
-    set(&value, "command", &JsValue::from_str(&result.command))?;
-    set(
+    set_fixed(&value, "command", &JsValue::from_str(&result.command))?;
+    set_fixed(
         &value,
         "revision",
         &JsValue::from_f64(result.revision as f64),
     )?;
-    set(&value, "rowCount", &JsValue::from_f64(row_count as f64))?;
-    set(&value, "fields", &build_fields(&result.fields)?.into())?;
-    set(&value, "rows", &build_rows(&result.rows)?.into())?;
-    set(&value, "tables", &build_strings(&result.tables)?.into())?;
-    set(&value, "keys", &build_changed_keys(&result.keys)?)?;
+    set_fixed(&value, "rowCount", &JsValue::from_f64(row_count as f64))?;
+    let mut columns = ColumnNames::default();
+    set_fixed(
+        &value,
+        "fields",
+        &build_fields(&result.fields, &mut columns)?.into(),
+    )?;
+    set_fixed(&value, "rows", &build_rows(&result.rows, columns)?.into())?;
+    set_fixed(&value, "tables", &build_strings(&result.tables)?.into())?;
+    set_fixed(&value, "keys", &build_changed_keys(&result.keys)?)?;
     Ok(value.into())
 }
 
-fn build_fields(fields: &[ResultField]) -> Result<Array> {
+/// Builds the result's fields, keeping their names for the rows' keys.
+fn build_fields(fields: &[ResultField], columns: &mut ColumnNames) -> Result<Array> {
     let values = array(fields.len())?;
     for (index, field) in fields.iter().enumerate() {
         let value = record();
-        set(&value, "name", &JsValue::from_str(&field.name))?;
-        set(
+        let name = JsValue::from_str(&field.name);
+        set_fixed(&value, "name", &name)?;
+        columns.fields.push((field.name.clone(), name));
+        set_fixed(
             &value,
             "dataTypeID",
             &JsValue::from_f64(f64::from(field.data_type_id)),
@@ -235,17 +243,56 @@ fn build_fields(fields: &[ResultField]) -> Result<Array> {
 fn build_changed_keys(keys: &BTreeMap<String, Vec<Row>>) -> Result<JsValue> {
     let value = record();
     for (table, rows) in keys {
-        set(&value, table, &build_rows(rows)?.into())?;
+        set(
+            &value,
+            table,
+            &build_rows(rows, ColumnNames::default())?.into(),
+        )?;
     }
     Ok(value.into())
 }
 
-fn build_rows(rows: &[Row]) -> Result<Array> {
+fn build_rows(rows: &[Row], mut columns: ColumnNames) -> Result<Array> {
     let values = array(rows.len())?;
     for (index, row) in rows.iter().enumerate() {
-        values.set(index as u32, build_row(row, 0)?.into());
+        let value = record();
+        for (position, (key, child)) in row.iter().enumerate() {
+            set_value(&value, columns.get(position, key), &build_value(child, 1)?)?;
+        }
+        values.set(index as u32, value.into());
     }
     Ok(values)
+}
+
+/// The column names of a result's rows, as JS strings. Every row of a result names the same
+/// columns in the same order, so each name crosses into JS once per result, not once per cell,
+/// and a name the result's fields already carried is not converted again.
+#[derive(Default)]
+struct ColumnNames {
+    fields: Vec<(String, JsValue)>,
+    positions: Vec<(String, JsValue)>,
+}
+
+impl ColumnNames {
+    /// The name of the column at `position` in a row, which fills positions in order.
+    fn get(&mut self, position: usize, key: &str) -> &JsValue {
+        if self
+            .positions
+            .get(position)
+            .is_none_or(|(name, _)| name != key)
+        {
+            let value = match self.fields.iter().find(|(name, _)| name == key) {
+                Some((_, value)) => value.clone(),
+                None => JsValue::from_str(key),
+            };
+            let name = (key.to_owned(), value);
+            match self.positions.get_mut(position) {
+                Some(slot) => *slot = name,
+                None => self.positions.push(name),
+            }
+        }
+        &self.positions[position].1
+    }
 }
 
 fn build_row(row: &Row, depth: usize) -> Result<Object> {
@@ -310,7 +357,31 @@ fn record() -> Object {
 }
 
 fn set(target: &Object, key: &str, value: &JsValue) -> Result<()> {
-    match Reflect::set(target.as_ref(), &JsValue::from_str(key), value) {
+    set_value(target, &JsValue::from_str(key), value)
+}
+
+thread_local! {
+    /// JS strings for the keys every response uses, made once.
+    static FIXED_KEYS: RefCell<Vec<(&'static str, JsValue)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Sets one of the keys every response uses, converting it to a JS string only once.
+fn set_fixed(target: &Object, key: &'static str, value: &JsValue) -> Result<()> {
+    FIXED_KEYS.with(|keys| {
+        let mut keys = keys.borrow_mut();
+        let index = match keys.iter().position(|(name, _)| *name == key) {
+            Some(index) => index,
+            None => {
+                keys.push((key, JsValue::from_str(key)));
+                keys.len() - 1
+            }
+        };
+        set_value(target, &keys[index].1, value)
+    })
+}
+
+fn set_value(target: &Object, key: &JsValue, value: &JsValue) -> Result<()> {
+    match Reflect::set(target.as_ref(), key, value) {
         Ok(true) => Ok(()),
         _ => Err(serialization()),
     }
