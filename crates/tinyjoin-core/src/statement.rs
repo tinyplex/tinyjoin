@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 use std::str::FromStr;
 
 use serde_json::{Map, Number, Value};
@@ -198,14 +199,20 @@ pub(crate) fn execute<S: StorageDriver>(
     }
 }
 
-/// Orders a table's changed keys canonically.
+/// The canonical form of a changed key, which orders a table's changed keys and finds repeats.
 ///
 /// Changed keys are a set: the paged and in-memory engines reach the same set by different routes
 /// (one applies a whole transaction write-set, the other accumulates statement by statement), so
 /// the reported order must not depend on which engine produced it. `Row` is a sorted map, so its
-/// serialization is canonical and usable as the sort key.
+/// serialization is canonical, and two keys serialize alike exactly when they are equal.
+fn canonical_key(key: &Row) -> String {
+    serde_json::to_string(key).expect("a map with string keys always serializes")
+}
+
+#[cfg(test)]
+/// Orders a table's changed keys canonically.
 fn sort_changed_keys(keys: &mut [Row]) {
-    keys.sort_by_cached_key(|key| Value::Object(key.clone()).to_string());
+    keys.sort_by_cached_key(canonical_key);
 }
 
 #[cfg(test)]
@@ -224,55 +231,84 @@ pub(crate) fn changed_keys(
     storage: &dyn StorageReader,
     changes: &[RowChange],
 ) -> Result<BTreeMap<String, Vec<Row>>> {
-    let mut primary_keys: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    // `None` marks a table that overflowed and must report nothing.
-    let mut collected: BTreeMap<String, Option<Vec<Row>>> = BTreeMap::new();
+    let mut schemas: BTreeMap<String, Rc<TableDefinition>> = BTreeMap::new();
+    let mut collector = KeyCollector::default();
     for change in changes {
         let (table, row) = match change {
             RowChange::Upsert { table, row } => (table, row),
             RowChange::Delete { table, key } => (table, key),
         };
-        let entry = collected
-            .entry(table.clone())
-            .or_insert_with(|| Some(vec![]));
-        let Some(keys) = entry else {
+        let Some(keys) = collector.room(table) else {
             continue;
         };
-        if keys.len() >= MAX_CHANGED_KEYS_PER_TABLE {
-            *entry = None;
-            continue;
-        }
-        let columns = match primary_keys.get(table) {
-            Some(columns) => columns,
-            None => {
-                let schema = storage.table_schema(table)?;
-                primary_keys
-                    .entry(table.clone())
-                    .or_insert(schema.primary_key)
-            }
+        let schema = match schemas.get(table) {
+            Some(schema) => schema,
+            None => schemas
+                .entry(table.clone())
+                .or_insert(storage.table_schema(table)?),
         };
         let mut key = Row::new();
-        for column in columns {
+        for column in &schema.primary_key {
             // A planned change always carries its table's key columns; a row that somehow does not
             // is reported without them rather than failing an otherwise valid write.
             if let Some(value) = row.get(column) {
                 key.insert(column.clone(), value.clone());
             }
         }
-        // One statement can touch a key more than once; a subscriber only needs to know it moved.
-        if !keys.contains(&key) {
-            keys.push(key);
+        insert_changed_key(keys, key);
+    }
+    Ok(collector.finish())
+}
+
+/// Collects primary keys already projected from their rows, as [`changed_keys`] reports them.
+pub(crate) fn collect_changed_keys<'a>(
+    keys: impl IntoIterator<Item = (&'a str, &'a Row)>,
+) -> BTreeMap<String, Vec<Row>> {
+    let mut collector = KeyCollector::default();
+    for (table, key) in keys {
+        if let Some(keys) = collector.room(table) {
+            insert_changed_key(keys, key.clone());
         }
     }
-    Ok(collected
-        .into_iter()
-        .filter_map(|(table, keys)| {
-            keys.map(|mut keys| {
-                sort_changed_keys(&mut keys);
-                (table, keys)
-            })
-        })
-        .collect())
+    collector.finish()
+}
+
+/// Each table's changed keys by their canonical form, or `None` for a table that overflowed and
+/// must report nothing.
+#[derive(Default)]
+struct KeyCollector(BTreeMap<String, Option<BTreeMap<String, Row>>>);
+
+impl KeyCollector {
+    /// The keys collected for `table`, if it has room for one more change.
+    fn room(&mut self, table: &str) -> Option<&mut BTreeMap<String, Row>> {
+        if !self.0.contains_key(table) {
+            self.0.insert(table.to_owned(), Some(BTreeMap::new()));
+        }
+        let entry = self.0.get_mut(table).expect("the table was added above");
+        if entry
+            .as_ref()
+            .is_some_and(|keys| keys.len() >= MAX_CHANGED_KEYS_PER_TABLE)
+        {
+            *entry = None;
+        }
+        entry.as_mut()
+    }
+
+    fn finish(self) -> BTreeMap<String, Vec<Row>> {
+        let mut finished = BTreeMap::new();
+        for (table, keys) in self.0 {
+            if let Some(keys) = keys {
+                finished.insert(table, keys.into_values().collect());
+            }
+        }
+        finished
+    }
+}
+
+/// Adds a key once: one statement can touch a key more than once, and a subscriber only needs to
+/// know it moved.
+fn insert_changed_key(keys: &mut BTreeMap<String, Row>, key: Row) {
+    keys.entry(canonical_key(&key)).or_insert(key);
 }
 
 #[cfg(test)]
@@ -2236,7 +2272,7 @@ mod tests {
             self.inner.visit_index(table, columns, key, visitor)
         }
 
-        fn table_schema(&self, table: &str) -> Result<TableDefinition> {
+        fn table_schema(&self, table: &str) -> Result<std::rc::Rc<TableDefinition>> {
             self.inner.table_schema(table)
         }
 

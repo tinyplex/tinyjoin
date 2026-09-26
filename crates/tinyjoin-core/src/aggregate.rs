@@ -2215,7 +2215,7 @@ mod tests {
             self.inner.indexes_for_table(table)
         }
 
-        fn table_schema(&self, table: &str) -> crate::Result<crate::TableDefinition> {
+        fn table_schema(&self, table: &str) -> crate::Result<std::rc::Rc<crate::TableDefinition>> {
             self.inner.table_schema(table)
         }
 

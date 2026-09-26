@@ -218,9 +218,7 @@ fn staged_totals_match_full_validation_for_unique_and_mixed_statements() {
     let expected = PagedReadView::new(&storage, Some(&fast))
         .scan_table("items")
         .unwrap();
-    storage
-        .commit_transaction_changes(&fast.changes(), fast.touched_tables())
-        .unwrap();
+    storage.commit_transaction(&fast).unwrap();
     let reopened = PagedStorage::open(storage.into_device()).unwrap();
     assert_eq!(reopened.scan_table("items").unwrap(), expected);
 }

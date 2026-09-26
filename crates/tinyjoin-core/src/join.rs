@@ -93,7 +93,7 @@ pub(crate) struct JoinPlan {
 #[derive(Clone)]
 struct Relation {
     source: Source,
-    schema: TableDefinition,
+    schema: std::rc::Rc<TableDefinition>,
 }
 
 struct OrderedJoinedRow {
@@ -2026,7 +2026,7 @@ mod tests {
             self.inner.visit_index(table, columns, key, visitor)
         }
 
-        fn table_schema(&self, table: &str) -> Result<TableDefinition> {
+        fn table_schema(&self, table: &str) -> Result<std::rc::Rc<TableDefinition>> {
             self.inner.table_schema(table)
         }
 

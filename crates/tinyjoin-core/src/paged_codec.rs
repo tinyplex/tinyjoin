@@ -125,8 +125,10 @@ pub(crate) fn encode_canonical_json(value: &Value) -> Result<Vec<u8>> {
 }
 
 /// Encodes the complete primary-key tuple for a row or lookup object.
+///
+/// The schema is one the catalog already validated, when it was created or read, so it is not
+/// checked again for every key.
 pub(crate) fn encode_primary_key(schema: &TableDefinition, row: &Row) -> Result<Vec<u8>> {
-    validate_schema_shape(schema)?;
     let key = encode_columns(schema, &schema.primary_key, row, NullPolicy::Reject)?
         .expect("rejecting nulls always returns a tuple");
     validate_key_size(&key)?;
@@ -136,13 +138,13 @@ pub(crate) fn encode_primary_key(schema: &TableDefinition, row: &Row) -> Result<
 /// Encodes an index tuple, which prefixes every entry for that tuple.
 ///
 /// `None` follows PostgreSQL's default index semantics for a tuple containing SQL NULL: it is not
-/// represented in the index and cannot satisfy an equality lookup.
+/// represented in the index and cannot satisfy an equality lookup. As for primary keys, the schema
+/// and index definition are ones the catalog already validated.
 pub(crate) fn encode_secondary_index_prefix(
     schema: &TableDefinition,
     definition: &IndexDefinition,
     row: &Row,
 ) -> Result<Option<Vec<u8>>> {
-    validate_index_identity(schema, definition)?;
     let Some(key) = encode_columns(schema, &definition.columns, row, NullPolicy::Omit)? else {
         return Ok(None);
     };
@@ -2468,29 +2470,5 @@ mod tests {
                 .code,
             "INVALID_PAGED_ARGUMENT"
         );
-    }
-
-    #[test]
-    fn secondary_indexes_cross_validate_their_resolved_table_schema() {
-        let schema = typed_schema(
-            vec!["id"],
-            vec![("id", ColumnType::Integer), ("rating", ColumnType::Float)],
-        );
-        for columns in [vec!["missing".to_owned()], vec!["rating".to_owned()]] {
-            let definition = IndexDefinition {
-                name: "items_lookup".to_owned(),
-                table: "items".to_owned(),
-                columns,
-                unique: false,
-            };
-            assert!(
-                encode_secondary_index_prefix(
-                    &schema,
-                    &definition,
-                    &row(json!({"id": 1, "rating": 1.0})),
-                )
-                .is_err()
-            );
-        }
     }
 }

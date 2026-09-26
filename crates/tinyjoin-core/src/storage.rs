@@ -3,6 +3,7 @@ use std::cell::Cell;
 #[cfg(test)]
 use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashSet};
+use std::rc::Rc;
 
 use serde_json::Value;
 
@@ -175,7 +176,8 @@ pub(crate) trait StorageReader {
         })?;
         Ok(outcome.map(|_| rows))
     }
-    fn table_schema(&self, table: &str) -> Result<TableDefinition>;
+    /// The table's schema, shared rather than copied.
+    fn table_schema(&self, table: &str) -> Result<Rc<TableDefinition>>;
     fn revision(&self) -> u64;
 }
 
@@ -727,10 +729,10 @@ impl StorageReader for InMemoryStorage {
         Ok(outcome.map(|_| rows))
     }
 
-    fn table_schema(&self, table: &str) -> Result<TableDefinition> {
+    fn table_schema(&self, table: &str) -> Result<Rc<TableDefinition>> {
         self.tables
             .get(table)
-            .map(|table| table.schema.clone())
+            .map(|table| Rc::new(table.schema.clone()))
             .ok_or_else(|| EngineError::table_not_found(table))
     }
 
@@ -1655,7 +1657,7 @@ mod tests {
     #[test]
     fn row_write_preflight_preserves_cumulative_count_and_byte_boundaries() {
         let schema = users_storage().table_schema("users").unwrap();
-        let schemas = BTreeMap::from([("users", &schema)]);
+        let schemas = BTreeMap::from([("users", &*schema)]);
         let changes = vec![RowChange::Upsert {
             table: "users".to_owned(),
             row: row(json!({"id": 1, "email": "one"})),

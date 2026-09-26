@@ -7,6 +7,7 @@ use crate::{
     EngineError, IndexDefinition, PageDevice, PagedStorage, Result, Row, RowChange, StorageReader,
     TableDefinition, TreeId, VisitControl, VisitOutcome,
     paged_codec::encode_primary_key,
+    paged_script::{ChangedRow, ChangedRows},
     paged_storage::{ChangeCost, PagedWriteUsage},
     row::RowRef,
     storage::{KeyOrder, KeyRange, estimated_row_bytes},
@@ -79,9 +80,42 @@ impl PagedTransaction {
         self.touched_tables.clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn changes(&self) -> Vec<RowChange> {
         changes_from_entries(self.entries.iter().flat_map(|(table, entries)| {
             entries.values().map(move |entry| (table.as_str(), entry))
+        }))
+    }
+
+    /// The rows this transaction changes, by table and encoded primary key, each with the committed
+    /// row it replaces. A row changed back to its committed state is left out.
+    pub(crate) fn changed_rows(&self) -> ChangedRows {
+        let mut changed = ChangedRows::new();
+        for (table, entries) in &self.entries {
+            let mut rows = BTreeMap::new();
+            for (key, entry) in entries {
+                if entry.base != entry.next {
+                    let row = ChangedRow {
+                        old: entry.base.clone(),
+                        next: entry.next.clone(),
+                    };
+                    rows.insert(key.clone(), row);
+                }
+            }
+            if !rows.is_empty() {
+                changed.insert(table.clone(), rows);
+            }
+        }
+        changed
+    }
+
+    /// The primary keys of the rows [`Self::changed_rows`] reports, as a commit reports them.
+    pub(crate) fn changed_keys(&self) -> BTreeMap<String, Vec<Row>> {
+        crate::statement::collect_changed_keys(self.entries.iter().flat_map(|(table, entries)| {
+            entries
+                .values()
+                .filter(|entry| entry.base != entry.next)
+                .map(move |entry| (table.as_str(), &entry.key))
         }))
     }
 
@@ -325,6 +359,7 @@ impl PagedTransaction {
 #[path = "paged_transaction_validation_tests.rs"]
 mod validation_tests;
 
+#[cfg(test)]
 fn changes_from_entries<'a>(
     entries: impl Iterator<Item = (&'a str, &'a OverlayEntry)>,
 ) -> Vec<RowChange> {
@@ -632,7 +667,7 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
             })
     }
 
-    fn table_schema(&self, table: &str) -> Result<TableDefinition> {
+    fn table_schema(&self, table: &str) -> Result<std::rc::Rc<TableDefinition>> {
         self.ensure_base_revision()?;
         self.storage.table_schema(table)
     }

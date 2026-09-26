@@ -218,11 +218,7 @@ impl<D: PageDevice> PagedEngine<D> {
                 keys: BTreeMap::new(),
             });
         }
-        let changes = transaction.changes();
-        let touched_tables = transaction.touched_tables();
-        let outcome = self
-            .storage
-            .commit_transaction_changes(&changes, touched_tables)?;
+        let outcome = self.storage.commit_transaction(transaction)?;
         self.transaction = None;
         Ok(outcome)
     }

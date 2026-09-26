@@ -42,9 +42,10 @@ pub(crate) struct PagedStorage<D: PageDevice> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PagedTable {
-    /// The table's columns. [`Self::set_schema`] changes them, keeping `layout` in step.
-    pub(crate) schema: TableDefinition,
-    // Shared, since the catalog is copied whenever a statement changes it.
+    /// The table's columns. [`Self::set_schema`] changes them, keeping `layout` in step. Both are
+    /// shared, since the catalog is copied whenever a statement changes it, and readers hold the
+    /// schema while they run.
+    pub(crate) schema: Rc<TableDefinition>,
     layout: Rc<RecordLayout>,
     pub(crate) tree_id: TreeId,
     pub(crate) root_page_id: Option<PageId>,
@@ -63,7 +64,7 @@ impl PagedTable {
     ) -> Result<Self> {
         Ok(Self {
             layout: Rc::new(RecordLayout::new(&schema)?),
-            schema,
+            schema: Rc::new(schema),
             tree_id,
             root_page_id,
             row_count,
@@ -73,7 +74,7 @@ impl PagedTable {
 
     pub(crate) fn set_schema(&mut self, schema: TableDefinition) -> Result<()> {
         self.layout = Rc::new(RecordLayout::new(&schema)?);
-        self.schema = schema;
+        self.schema = Rc::new(schema);
         Ok(())
     }
 
@@ -272,23 +273,6 @@ impl<D: PageDevice> PagedStorage<D> {
             .map(|(_, results)| results)
     }
 
-    fn execute_row_changes(&mut self, changes: &[RowChange]) -> Result<u64> {
-        self.ensure_ready()?;
-        let publication = {
-            let mut pager = self.pager.borrow_mut();
-            crate::paged_script::execute_row_changes(
-                &mut pager,
-                self.revision,
-                self.next_tree_id,
-                self.tables.clone(),
-                self.indexes.clone(),
-                changes,
-            )
-        };
-        self.accept_script_publication(publication)
-            .map(|(revision, _)| revision)
-    }
-
     fn accept_script_publication(
         &mut self,
         publication: Result<crate::paged_script::ScriptPublication>,
@@ -376,7 +360,7 @@ impl<D: PageDevice> PagedStorage<D> {
             .values()
             .filter(|index| index.definition.table == table_name)
             .collect::<Vec<_>>();
-        let schemas = BTreeMap::from([(table_name, &table.schema)]);
+        let schemas = BTreeMap::from([(table_name, &*table.schema)]);
         let definitions = indexes
             .iter()
             .map(|index| &index.definition)
@@ -653,19 +637,29 @@ impl<D: PageDevice> PagedStorage<D> {
         Ok((retained_bytes, changed_prefixes))
     }
 
-    pub(crate) fn commit_transaction_changes(
+    /// Commits a transaction's staged rows, which remain staged if the commit fails.
+    pub(crate) fn commit_transaction(
         &mut self,
-        changes: &[RowChange],
-        touched_tables: BTreeSet<String>,
+        transaction: &crate::paged_transaction::PagedTransaction,
     ) -> Result<ApplyOutcome> {
-        // Keys are projected before the write-set is applied, while every schema the changes
-        // refer to is still readable from this storage.
-        let keys = crate::statement::changed_keys(self, changes)?;
-        let revision = self.execute_row_changes(changes)?;
+        self.ensure_ready()?;
+        let changes = transaction.changed_rows();
+        let publication = {
+            let mut pager = self.pager.borrow_mut();
+            crate::paged_script::execute_changed_rows(
+                &mut pager,
+                self.revision,
+                self.next_tree_id,
+                self.tables.clone(),
+                self.indexes.clone(),
+                &changes,
+            )
+        };
+        let (revision, _) = self.accept_script_publication(publication)?;
         Ok(ApplyOutcome {
             revision,
-            tables: touched_tables.into_iter().collect(),
-            keys,
+            tables: transaction.touched_tables().into_iter().collect(),
+            keys: transaction.changed_keys(),
         })
     }
 
@@ -689,7 +683,7 @@ fn preflight_batch(
 ) -> Result<PagedWriteUsage> {
     let schemas = tables
         .iter()
-        .map(|(name, table)| (name.as_str(), &table.schema))
+        .map(|(name, table)| (name.as_str(), &*table.schema))
         .collect();
     let definitions = indexes
         .values()
@@ -1160,11 +1154,11 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
         Ok(Some(VisitOutcome::Complete))
     }
 
-    fn table_schema(&self, table: &str) -> Result<TableDefinition> {
+    fn table_schema(&self, table: &str) -> Result<Rc<TableDefinition>> {
         self.ensure_ready()?;
         self.tables
             .get(table)
-            .map(|table| table.schema.clone())
+            .map(|table| Rc::clone(&table.schema))
             .ok_or_else(|| EngineError::table_not_found(table))
     }
 
@@ -1950,6 +1944,59 @@ mod tests {
     }
 
     #[test]
+    fn reopening_rejects_an_index_on_a_float_or_missing_column() {
+        // Keys are encoded without checking their schema again, so the catalog must refuse an
+        // index that CREATE INDEX would have refused.
+        for column in ["rating", "missing"] {
+            let mut paged = PagedStorage::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+            execute_sql(
+                &mut paged,
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, rating FLOAT)",
+                &[],
+            )
+            .unwrap();
+            let tree_id = paged.next_tree_id;
+            let mut pager = Pager::open_or_create(paged.into_device()).unwrap();
+            let mut root = pager.catalog_root_page_id().unwrap();
+            let revision = pager.database_revision();
+            let mut transaction = pager.begin_write().unwrap();
+            for (key, value) in [
+                encode_catalog_header_record(&CatalogHeader {
+                    next_tree_id: tree_id + 1,
+                    table_count: 1,
+                    index_count: 1,
+                })
+                .unwrap(),
+                encode_catalog_index_record(&CatalogIndexRecord {
+                    definition: IndexDefinition {
+                        name: "items_lookup".to_owned(),
+                        table: "items".to_owned(),
+                        columns: vec![column.to_owned()],
+                        unique: false,
+                    },
+                    tree_id,
+                    root_page_id: None,
+                    entry_count: 0,
+                })
+                .unwrap(),
+            ] {
+                root = Btree::upsert(&mut transaction, root, CATALOG_TREE_ID, &key, &value)
+                    .unwrap()
+                    .root_page_id;
+            }
+            transaction
+                .commit(revision, EMPTY_HASH, Some(root))
+                .unwrap();
+            let error = match PagedStorage::open(pager.into_device()) {
+                Ok(_) => panic!("an index on column `{column}` must fail closed"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, "STORAGE_CORRUPT");
+            assert!(error.message.contains("items_lookup"), "{}", error.message);
+        }
+    }
+
+    #[test]
     fn rootless_live_pages_are_not_an_empty_database() {
         let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
         let mut transaction = pager.begin_write().unwrap();
@@ -2081,7 +2128,7 @@ mod tests {
         .unwrap()
         .root_page_id;
         let (key, value) = crate::paged_codec::encode_catalog_table_record(&CatalogTableRecord {
-            schema: table.schema,
+            schema: TableDefinition::clone(&table.schema),
             tree_id: table.tree_id,
             root_page_id: Some(table_root),
             row_count: table.row_count as u64,

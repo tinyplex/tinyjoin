@@ -46,10 +46,15 @@ pub(crate) struct ScriptPublication {
     pub(crate) results: Vec<ExecuteResult>,
 }
 
-struct ScriptRowChange {
-    old: Option<Row>,
-    next: Option<Row>,
+/// A row a write changes: the row its key held, and the row it holds after, where `None` is no
+/// row.
+pub(crate) struct ChangedRow {
+    pub(crate) old: Option<Row>,
+    pub(crate) next: Option<Row>,
 }
+
+/// Changed rows by table and encoded primary key.
+pub(crate) type ChangedRows = BTreeMap<String, BTreeMap<Vec<u8>, ChangedRow>>;
 
 struct PagedScriptCandidate<'a, D: PageDevice> {
     transaction: RefCell<PagerWriteTransaction<'a, D>>,
@@ -91,17 +96,31 @@ pub(crate) fn execute<D: PageDevice>(
     finish_candidate(candidate, execution)
 }
 
-pub(crate) fn execute_row_changes<D: PageDevice>(
+/// Commits the rows a transaction staged. Staging validated them, statement by statement, against
+/// the limits and unique indexes a script's writes are checked against, and found the rows they
+/// replace; the transaction's base revision is this one, so both still hold.
+pub(crate) fn execute_changed_rows<D: PageDevice>(
     pager: &mut Pager<D>,
     base_revision: u64,
     next_tree_id: TreeId,
     tables: Rc<BTreeMap<String, PagedTable>>,
     indexes: Rc<BTreeMap<String, PagedIndex>>,
-    changes: &[RowChange],
+    changes: &ChangedRows,
 ) -> Result<ScriptPublication> {
     let mut candidate = begin_candidate(pager, base_revision, next_tree_id, tables, indexes)?;
     let execution = (|| {
-        candidate.apply_changes(changes)?;
+        for (table, rows) in changes {
+            let index_count = candidate
+                .indexes
+                .values()
+                .filter(|index| index.definition.table == *table)
+                .count();
+            candidate.charge_operations(
+                rows.len()
+                    .saturating_mul(index_count.saturating_mul(2).saturating_add(1)),
+            )?;
+        }
+        candidate.apply_row_changes(changes)?;
         candidate.mutated = true;
         Ok(vec![])
     })();
@@ -387,7 +406,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         let schemas = self
             .tables
             .iter()
-            .map(|(name, table)| (name.as_str(), &table.schema))
+            .map(|(name, table)| (name.as_str(), &*table.schema))
             .collect();
         let definitions = self
             .indexes
@@ -409,7 +428,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
 
         let mut duplicate_upserts = BTreeMap::<String, BTreeSet<Vec<u8>>>::new();
         let mut retained_bytes = 0usize;
-        let mut changes = BTreeMap::<String, BTreeMap<Vec<u8>, ScriptRowChange>>::new();
+        let mut changes = ChangedRows::new();
         for change in input_changes {
             let (table_name, input, is_delete) = match change {
                 RowChange::Upsert { table, row } => (table, row, false),
@@ -458,7 +477,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 .and_then(|bytes| bytes.checked_add(96))
                 .ok_or_else(batch_too_large)?;
             ensure_batch_bytes(retained_bytes)?;
-            table_changes.insert(key, ScriptRowChange { old, next });
+            table_changes.insert(key, ChangedRow { old, next });
         }
         self.validate_changed_unique_indexes(&changes, retained_bytes)?;
         self.apply_row_changes(&changes)
@@ -466,7 +485,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
 
     fn validate_changed_unique_indexes(
         &self,
-        changes: &BTreeMap<String, BTreeMap<Vec<u8>, ScriptRowChange>>,
+        changes: &ChangedRows,
         mut retained_bytes: usize,
     ) -> Result<()> {
         for (table_name, table_changes) in changes {
@@ -529,14 +548,11 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         Ok(())
     }
 
-    fn apply_row_changes(
-        &mut self,
-        changes: &BTreeMap<String, BTreeMap<Vec<u8>, ScriptRowChange>>,
-    ) -> Result<()> {
+    fn apply_row_changes(&mut self, changes: &ChangedRows) -> Result<()> {
         for (table_name, table_changes) in changes {
             let table = Rc::make_mut(&mut self.tables)
                 .get_mut(table_name)
-                .expect("every changed table was resolved above");
+                .ok_or_else(|| EngineError::table_not_found(table_name))?;
             let mut transaction = self.transaction.borrow_mut();
             // The changes are keyed by encoded primary key, so they are already in tree order.
             let values = table_changes
@@ -746,7 +762,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 .is_none_or(|base| !same_table_record(base, table))
             {
                 let (key, value) = encode_catalog_table_record(&CatalogTableRecord {
-                    schema: table.schema.clone(),
+                    schema: crate::TableDefinition::clone(&table.schema),
                     tree_id: table.tree_id,
                     root_page_id: table.root_page_id,
                     row_count: table.row_count as u64,
@@ -1221,10 +1237,10 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
         Ok(Some(VisitOutcome::Complete))
     }
 
-    fn table_schema(&self, table: &str) -> Result<crate::TableDefinition> {
+    fn table_schema(&self, table: &str) -> Result<Rc<crate::TableDefinition>> {
         self.tables
             .get(table)
-            .map(|table| table.schema.clone())
+            .map(|table| Rc::clone(&table.schema))
             .ok_or_else(|| EngineError::table_not_found(table))
     }
 

@@ -3160,9 +3160,9 @@ mod tests {
             panic!("simple queries must use visit_index")
         }
 
-        fn table_schema(&self, table: &str) -> Result<TableDefinition> {
+        fn table_schema(&self, table: &str) -> Result<std::rc::Rc<TableDefinition>> {
             if table == self.schema.name {
-                Ok(self.schema.clone())
+                Ok(std::rc::Rc::new(self.schema.clone()))
             } else {
                 Err(EngineError::table_not_found(table))
             }
