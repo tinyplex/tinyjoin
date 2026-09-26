@@ -1420,6 +1420,35 @@ pub(crate) struct RowWriteUsage {
     bytes: usize,
 }
 
+impl RowWriteUsage {
+    /// This usage with `other`'s added, failing as [`preflight_row_write_set`] would once either
+    /// total passes its limit.
+    pub(crate) fn plus(self, other: Self) -> Result<Self> {
+        let changes = checked_row_write_add(self.changes, other.changes)?;
+        if changes > MAX_ROW_WRITE_CHANGES {
+            return Err(row_write_limit_error(format!(
+                "A row write-set cannot contain more than {MAX_ROW_WRITE_CHANGES} changes"
+            )));
+        }
+        let bytes = checked_row_write_add(self.bytes, other.bytes)?;
+        if bytes > MAX_ROW_WRITE_BYTES {
+            return Err(EngineError::new(
+                "TRANSACTION_TOO_LARGE",
+                format!("A row write-set cannot retain more than {MAX_ROW_WRITE_BYTES} bytes"),
+            ));
+        }
+        Ok(Self { changes, bytes })
+    }
+
+    /// This usage without `other`'s, which it includes.
+    pub(crate) fn minus(self, other: Self) -> Self {
+        Self {
+            changes: self.changes - other.changes,
+            bytes: self.bytes - other.bytes,
+        }
+    }
+}
+
 pub(crate) fn preflight_row_write_set(
     changes: &[RowChange],
     schemas: &BTreeMap<&str, &TableDefinition>,

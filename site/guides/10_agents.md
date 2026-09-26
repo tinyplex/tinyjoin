@@ -93,9 +93,9 @@ An uncaught callback error before commit discards staged work. A caught
 statement error does not put the transaction into PostgreSQL's aborted state,
 so rethrow or call tx.rollback() when earlier staged changes must also be discarded.
 
-Append-only inserts validate incrementally; updates, deletes, or revisiting a
-staged key switch to full write-set validation per statement. Keep mixed
-transactions bounded and prefer multi-row writes where practical.
+Each statement is validated incrementally against the transaction's staged
+rows, so its cost does not grow with the transaction. Keep transactions bounded
+and prefer multi-row writes where practical.
 
 Subscriptions report changed tables. Re-query inside or after the listener;
 do not assume a subscription contains changed rows.

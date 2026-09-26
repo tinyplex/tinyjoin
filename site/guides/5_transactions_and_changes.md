@@ -84,9 +84,10 @@ the outcome of an in-flight write.
 ## Inserting many rows
 
 Prepare a parameterized `INSERT` once and execute it through the transaction
-object. Transactions that only append new primary keys validate each new
-statement incrementally, including unique-index constraints. Final commit
-still validates and publishes the complete write set.
+object. Each statement is validated against totals the transaction keeps for
+its staged rows, including unique-index constraints, so it costs what its own
+rows cost however many rows are already staged, whether it inserts, updates or
+deletes. Final commit still validates and publishes the complete write set.
 
 ```ts
 const insert = await db.prepare('INSERT INTO tasks (id, title) VALUES ($1, $2)');
@@ -101,16 +102,16 @@ try {
 }
 ```
 
-Updating, deleting, or revisiting a staged key switches that transaction to
-complete write-set validation after each statement. Many individual writes
-on that path can have quadratic staging cost. Repeated tx.exec() calls also
-copy the current transaction state for script rollback. Keep transactions
-bounded and prefer multi-row statements when the application can form them
-within the [SQL limits](/guides/sql-compatibility/#hard-limits).
+Repeated tx.exec() calls copy the current transaction state for script
+rollback. Keep transactions bounded and prefer multi-row statements when the
+application can form them within the
+[SQL limits](/guides/sql-compatibility/#hard-limits).
 
 These limits apply cumulatively across the transaction, even when each
-individual statement is small. Transaction reads use the staged row view;
-secondary-index query acceleration is currently disabled inside callbacks.
+individual statement is small. Transaction reads use the staged row view. A
+table with staged changes is read without its secondary indexes or key order,
+because its staged rows are not yet indexed; other tables are read as they would
+be outside the transaction.
 
 ## Re-query after a commit
 

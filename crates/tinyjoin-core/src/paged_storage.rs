@@ -111,6 +111,7 @@ pub(crate) struct PagedIndex {
     pub(crate) entry_count: usize,
 }
 
+#[cfg(test)]
 struct PagedRowChange {
     next: Option<Row>,
 }
@@ -124,21 +125,70 @@ pub(crate) struct PagedWriteUsage {
     operations: usize,
 }
 
-/// A flat set avoids retaining a catalog name or another container per appended row.
-/// The existing unique-prefix charge (prefix + primary key + 64 bytes) covers this
-/// smaller key: one tree ID, one exact-length boxed prefix, and its B-tree entry.
+impl PagedWriteUsage {
+    /// This usage with `other`'s added, failing as the write-set validator would once any budget
+    /// passes its limit.
+    pub(crate) fn plus(self, other: Self) -> Result<Self> {
+        let usage = Self {
+            row_write: self.row_write.plus(other.row_write)?,
+            input_bytes: self
+                .input_bytes
+                .checked_add(other.input_bytes)
+                .ok_or_else(batch_too_large)?,
+            prepared_bytes: self
+                .prepared_bytes
+                .checked_add(other.prepared_bytes)
+                .ok_or_else(batch_too_large)?,
+            operations: self
+                .operations
+                .checked_add(other.operations)
+                .ok_or_else(batch_too_large)?,
+        };
+        if usage.operations > MAX_PAGED_BATCH_OPERATIONS {
+            return Err(operation_limit());
+        }
+        ensure_batch_bytes(usage.input_bytes)?;
+        ensure_batch_bytes(usage.prepared_bytes)?;
+        Ok(usage)
+    }
+
+    /// This usage without `other`'s, which it includes.
+    pub(crate) fn minus(self, other: Self) -> Self {
+        Self {
+            row_write: self.row_write.minus(other.row_write),
+            input_bytes: self.input_bytes - other.input_bytes,
+            prepared_bytes: self.prepared_bytes - other.prepared_bytes,
+            operations: self.operations - other.operations,
+        }
+    }
+}
+
+/// A unique-index value that one changed row claims, and the committed rows already holding it,
+/// by primary key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UniqueClaim {
+    pub(crate) tree_id: TreeId,
+    pub(crate) prefix: Box<[u8]>,
+    pub(crate) owners: Vec<Vec<u8>>,
+}
+
+/// What one change adds to a write set: its usage, and the unique-index values it claims.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ChangeCost {
+    pub(crate) usage: PagedWriteUsage,
+    pub(crate) claims: Vec<UniqueClaim>,
+}
+
+/// The unique-index values a write set claims.
+#[cfg(test)]
 pub(crate) type UniquePrefixes = BTreeSet<(TreeId, Box<[u8]>)>;
 
+/// What validating a whole write set at once finds, which a transaction's statement-by-statement
+/// totals must equal.
+#[cfg(test)]
 pub(crate) struct ValidatedRowWrites {
     pub(crate) usage: PagedWriteUsage,
     pub(crate) unique_prefixes: UniquePrefixes,
-}
-
-/// Only valid while every preceding change appended a previously absent primary key.
-pub(crate) struct AppendWriteContext<'a> {
-    pub(crate) usage: PagedWriteUsage,
-    pub(crate) unique_prefixes: &'a UniquePrefixes,
-    pub(crate) touched_tables: &'a BTreeSet<String>,
 }
 
 const MAX_PAGED_BATCH_OPERATIONS: usize = 1_000_000;
@@ -303,17 +353,176 @@ impl<D: PageDevice> PagedStorage<D> {
         Ok(())
     }
 
-    pub(crate) fn validate_row_write_set(
+    /// Validates one change of a transaction's write set, whose committed row is `base`, and
+    /// measures what it adds to the write set's usage exactly as [`Self::validate_row_write_set`]
+    /// does for each change. The catalog operations charged once per changed table are left to
+    /// [`Self::write_set_usage`], and conflicts between claims to the caller.
+    pub(crate) fn change_cost(
         &self,
-        input_changes: &[RowChange],
-        append: Option<AppendWriteContext<'_>>,
-    ) -> Result<ValidatedRowWrites> {
+        table_name: &str,
+        change: &RowChange,
+        base: Option<&Row>,
+    ) -> Result<ChangeCost> {
         self.ensure_ready()?;
         #[cfg(test)]
         self.validated_row_count
+            .set(self.validated_row_count.get() + 1);
+        let table = self
+            .tables
+            .get(table_name)
+            .ok_or_else(|| EngineError::table_not_found(table_name))?;
+        let indexes = self
+            .indexes
+            .values()
+            .filter(|index| index.definition.table == table_name)
+            .collect::<Vec<_>>();
+        let schemas = BTreeMap::from([(table_name, &table.schema)]);
+        let definitions = indexes
+            .iter()
+            .map(|index| &index.definition)
+            .collect::<Vec<_>>();
+        let row_write = preflight_row_write_set(
+            std::slice::from_ref(change),
+            &schemas,
+            &definitions,
+            RowWriteUsage::default(),
+        )?;
+        let (input, is_delete) = match change {
+            RowChange::Upsert { row, .. } => (row, false),
+            RowChange::Delete { key, .. } => (key, true),
+        };
+        let input_bytes = table_name
+            .len()
+            .checked_add(estimated_row_bytes(input)?)
+            .and_then(|bytes| bytes.checked_add(64))
+            .ok_or_else(batch_too_large)?;
+        let row = if is_delete {
+            input.clone()
+        } else {
+            normalize_row(&table.schema, input.clone())?
+        };
+        let key = encode_primary_key(&table.schema, &row)?;
+        let base_bytes = base.map_or(Ok(0), estimated_row_bytes)?;
+        let next_bytes = if is_delete {
+            0
+        } else {
+            estimated_row_bytes(&row)?
+        };
+        let mut prepared_bytes = key
+            .len()
+            .checked_add(base_bytes)
+            .and_then(|bytes| bytes.checked_add(next_bytes))
+            .and_then(|bytes| bytes.checked_add(96))
+            .ok_or_else(batch_too_large)?;
+        let mut claims = Vec::new();
+        if !is_delete {
+            for index in indexes.iter().filter(|index| index.definition.unique) {
+                let Some(prefix) =
+                    encode_secondary_index_prefix(&table.schema, &index.definition, &row)?
+                else {
+                    continue;
+                };
+                prepared_bytes = prepared_bytes
+                    .checked_add(prefix.len() + key.len() + 64)
+                    .ok_or_else(batch_too_large)?;
+                let owners =
+                    committed_index_primary_keys(&mut self.pager.borrow_mut(), index, &prefix)?;
+                for owner in &owners {
+                    prepared_bytes = prepared_bytes
+                        .checked_add(owner.len())
+                        .ok_or_else(batch_too_large)?;
+                }
+                claims.push(UniqueClaim {
+                    tree_id: index.tree_id,
+                    prefix: prefix.into_boxed_slice(),
+                    owners,
+                });
+            }
+        }
+        ensure_batch_bytes(input_bytes)?;
+        ensure_batch_bytes(prepared_bytes)?;
+        Ok(ChangeCost {
+            usage: PagedWriteUsage {
+                row_write,
+                input_bytes,
+                prepared_bytes,
+                operations: 1 + 2 * indexes.len(),
+            },
+            claims,
+        })
+    }
+
+    /// The unique-index values a stored row holds, which a claim by another row conflicts with
+    /// unless this row gives them up.
+    pub(crate) fn unique_values(
+        &self,
+        table_name: &str,
+        row: &Row,
+    ) -> Result<Vec<(TreeId, Vec<u8>)>> {
+        let table = self
+            .tables
+            .get(table_name)
+            .ok_or_else(|| EngineError::table_not_found(table_name))?;
+        let mut values = Vec::new();
+        for index in self
+            .indexes
+            .values()
+            .filter(|index| index.definition.table == table_name && index.definition.unique)
+        {
+            if let Some(prefix) =
+                encode_secondary_index_prefix(&table.schema, &index.definition, row)?
+            {
+                values.push((index.tree_id, prefix));
+            }
+        }
+        Ok(values)
+    }
+
+    /// The error for two rows holding one value of the unique index `tree_id`.
+    pub(crate) fn unique_violation_in(&self, tree_id: TreeId) -> EngineError {
+        let name = self
+            .indexes
+            .values()
+            .find(|index| index.tree_id == tree_id)
+            .map_or("unknown", |index| index.definition.name.as_str());
+        unique_violation(name)
+    }
+
+    /// A write set's complete usage: the sum of its changes' costs, and the catalog operations
+    /// charged once for each changed table. Fails once any budget passes its limit.
+    pub(crate) fn write_set_usage<'t>(
+        &self,
+        changes: PagedWriteUsage,
+        changed_tables: impl Iterator<Item = &'t str>,
+    ) -> Result<PagedWriteUsage> {
+        let mut operations = 0usize;
+        for table in changed_tables {
+            let index_count = self
+                .indexes
+                .values()
+                .filter(|index| index.definition.table == table)
+                .count();
+            operations = operations
+                .checked_add(1 + index_count)
+                .ok_or_else(batch_too_large)?;
+        }
+        changes.plus(PagedWriteUsage {
+            operations,
+            ..PagedWriteUsage::default()
+        })
+    }
+
+    /// Validates a whole write set at once: the reference for the totals a transaction keeps as
+    /// it stages each statement.
+    #[cfg(test)]
+    pub(crate) fn validate_row_write_set(
+        &self,
+        input_changes: &[RowChange],
+    ) -> Result<ValidatedRowWrites> {
+        self.ensure_ready()?;
+        self.validated_row_count
             .set(self.validated_row_count.get() + input_changes.len());
-        let mut usage =
-            preflight_batch(input_changes, &self.tables, &self.indexes, append.as_ref())?;
+        let mut usage = preflight_batch(input_changes, &self.tables, &self.indexes)?;
         self.validate_sql_row_change_sequence(input_changes)?;
         let mut retained_bytes = usage.prepared_bytes;
         let mut tables = BTreeMap::<String, BTreeMap<Vec<u8>, PagedRowChange>>::new();
@@ -363,11 +572,8 @@ impl<D: PageDevice> PagedStorage<D> {
             table_changes.insert(key, PagedRowChange { next });
         }
 
-        let (prepared_bytes, unique_prefixes) = self.validate_changed_unique_indexes(
-            &tables,
-            retained_bytes,
-            append.as_ref().map(|context| context.unique_prefixes),
-        )?;
+        let (prepared_bytes, unique_prefixes) =
+            self.validate_changed_unique_indexes(&tables, retained_bytes)?;
         usage.prepared_bytes = prepared_bytes;
         Ok(ValidatedRowWrites {
             usage,
@@ -375,11 +581,11 @@ impl<D: PageDevice> PagedStorage<D> {
         })
     }
 
+    #[cfg(test)]
     fn validate_changed_unique_indexes(
         &self,
         tables: &BTreeMap<String, BTreeMap<Vec<u8>, PagedRowChange>>,
         mut retained_bytes: usize,
-        previous_prefixes: Option<&UniquePrefixes>,
     ) -> Result<(usize, UniquePrefixes)> {
         let mut changed_prefixes = UniquePrefixes::new();
         for (table_name, changes) in tables {
@@ -403,9 +609,7 @@ impl<D: PageDevice> PagedStorage<D> {
                         .ok_or_else(batch_too_large)?;
                     ensure_batch_bytes(retained_bytes)?;
                     let claim = (index.tree_id, prefix.into_boxed_slice());
-                    if changed_prefixes.contains(&claim)
-                        || previous_prefixes.is_some_and(|prefixes| prefixes.contains(&claim))
-                    {
+                    if changed_prefixes.contains(&claim) {
                         return Err(unique_violation(&index.definition.name));
                     }
 
@@ -477,11 +681,11 @@ impl<D: PageDevice> PagedStorage<D> {
     }
 }
 
+#[cfg(test)]
 fn preflight_batch(
     changes: &[RowChange],
     tables: &BTreeMap<String, PagedTable>,
     indexes: &BTreeMap<String, PagedIndex>,
-    append: Option<&AppendWriteContext<'_>>,
 ) -> Result<PagedWriteUsage> {
     let schemas = tables
         .iter()
@@ -491,7 +695,7 @@ fn preflight_batch(
         .values()
         .map(|index| &index.definition)
         .collect::<Vec<_>>();
-    let mut usage = append.map_or(PagedWriteUsage::default(), |context| context.usage);
+    let mut usage = PagedWriteUsage::default();
     usage.row_write = preflight_row_write_set(changes, &schemas, &definitions, usage.row_write)?;
     let mut bytes = usage.input_bytes;
     let mut operations = usage.operations;
@@ -525,9 +729,7 @@ fn preflight_batch(
             .and_then(|bytes| bytes.checked_add(64))
             .ok_or_else(batch_too_large)?;
         ensure_batch_bytes(bytes)?;
-        if !append.is_some_and(|context| context.touched_tables.contains(table)) {
-            changed_tables.insert(table.as_str());
-        }
+        changed_tables.insert(table.as_str());
     }
     let affected_index_count = changed_tables.iter().try_fold(0usize, |count, table| {
         count
@@ -555,6 +757,7 @@ fn operation_limit() -> EngineError {
     )
 }
 
+#[cfg(test)]
 fn lookup_encoded_primary_key<D: PageDevice>(
     pager: &mut Pager<D>,
     table: &PagedTable,
@@ -1428,7 +1631,7 @@ mod tests {
     }
 
     #[test]
-    fn append_validation_charges_catalog_operations_once_per_table() {
+    fn write_set_usage_charges_catalog_operations_once_per_table() {
         let mut storage = PagedStorage::open(MemoryPageDevice::new(0).unwrap()).unwrap();
         for sql in [
             "CREATE TABLE first_table (id INTEGER PRIMARY KEY, value TEXT)",
@@ -1443,40 +1646,42 @@ mod tests {
             table: table.to_owned(),
             row: row(json!({"id": id, "value": value})),
         };
-        let first = vec![change("first_table", 1, "one")];
-        let initial = storage.validate_row_write_set(&first, None).unwrap();
-        // One row and two maintained indexes, then one table and two catalog indexes.
-        assert_eq!(initial.usage.operations, 5 + 3);
-        let touched_tables = BTreeSet::from(["first_table".to_owned()]);
-        let second = vec![
+        let changes = vec![
+            change("first_table", 1, "one"),
             change("first_table", 2, "two"),
-            change("first_table", 3, "three"),
             change("second_table", 1, "one"),
         ];
-        let appended = storage
-            .validate_row_write_set(
-                &second,
-                Some(AppendWriteContext {
-                    usage: initial.usage,
-                    unique_prefixes: &initial.unique_prefixes,
-                    touched_tables: &touched_tables,
-                }),
-            )
+        let mut usage = PagedWriteUsage::default();
+        let mut claims = UniquePrefixes::new();
+        for change in &changes {
+            let RowChange::Upsert { table, .. } = change else {
+                unreachable!()
+            };
+            let cost = storage.change_cost(table, change, None).unwrap();
+            // One row and two maintained indexes, or one row and one index.
+            assert_eq!(
+                cost.usage.operations,
+                if table == "first_table" { 5 } else { 3 }
+            );
+            usage = usage.plus(cost.usage).unwrap();
+            claims.extend(
+                cost.claims
+                    .into_iter()
+                    .map(|claim| (claim.tree_id, claim.prefix)),
+            );
+        }
+        let usage = storage
+            .write_set_usage(usage, ["first_table", "second_table"].into_iter())
             .unwrap();
-        assert_eq!(appended.usage.operations, 3 * 5 + 3 + 3 + 2);
-        let all = first.into_iter().chain(second).collect::<Vec<_>>();
-        let complete = storage.validate_row_write_set(&all, None).unwrap();
-        assert_eq!(appended.usage, complete.usage);
-        let prefixes = initial
-            .unique_prefixes
-            .into_iter()
-            .chain(appended.unique_prefixes)
-            .collect::<UniquePrefixes>();
-        assert_eq!(prefixes, complete.unique_prefixes);
+        // Then each table once, with its two or one catalog indexes.
+        assert_eq!(usage.operations, 2 * 5 + 3 + 3 + 2);
+        let complete = storage.validate_row_write_set(&changes).unwrap();
+        assert_eq!(usage, complete.usage);
+        assert_eq!(claims, complete.unique_prefixes);
     }
 
     #[test]
-    fn append_validation_preserves_exact_paged_byte_and_operation_boundaries() {
+    fn write_set_usage_preserves_exact_paged_byte_and_operation_boundaries() {
         let mut storage = PagedStorage::open(MemoryPageDevice::new(0).unwrap()).unwrap();
         for sql in [
             "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)",
@@ -1484,23 +1689,13 @@ mod tests {
         ] {
             execute_sql(&mut storage, sql, &[]).unwrap();
         }
-        let changes = vec![RowChange::Upsert {
+        let change = RowChange::Upsert {
             table: "items".to_owned(),
             row: row(json!({"id": 1, "value": "one"})),
-        }];
-        let touched_tables = BTreeSet::from(["items".to_owned()]);
-        let unique_prefixes = UniquePrefixes::new();
-        let context = |usage| AppendWriteContext {
-            usage,
-            unique_prefixes: &unique_prefixes,
-            touched_tables: &touched_tables,
         };
-        let addition = storage
-            .validate_row_write_set(&changes, Some(context(PagedWriteUsage::default())))
-            .unwrap()
-            .usage;
+        let addition = storage.change_cost("items", &change, None).unwrap().usage;
         // Seed each independent budget just below its limit, leaving the other two empty.
-        // This checks that the existing validators enforce cumulative, inclusive bounds.
+        // This checks that the totals enforce cumulative, inclusive bounds.
         for budget in 0..3 {
             for extra in [0, 1] {
                 let mut usage = PagedWriteUsage::default();
@@ -1514,13 +1709,13 @@ mod tests {
                         usage.operations = MAX_PAGED_BATCH_OPERATIONS - addition.operations + extra
                     }
                 }
-                let result = storage.validate_row_write_set(&changes, Some(context(usage)));
+                let result = usage.plus(addition);
                 if extra == 0 {
                     let result = result.unwrap();
                     match budget {
-                        0 => assert_eq!(result.usage.input_bytes, MAX_PAGED_BATCH_BYTES),
-                        1 => assert_eq!(result.usage.prepared_bytes, MAX_PAGED_BATCH_BYTES),
-                        _ => assert_eq!(result.usage.operations, MAX_PAGED_BATCH_OPERATIONS),
+                        0 => assert_eq!(result.input_bytes, MAX_PAGED_BATCH_BYTES),
+                        1 => assert_eq!(result.prepared_bytes, MAX_PAGED_BATCH_BYTES),
+                        _ => assert_eq!(result.operations, MAX_PAGED_BATCH_OPERATIONS),
                     }
                 } else {
                     assert_eq!(result.err().unwrap().code, "TRANSACTION_TOO_LARGE");

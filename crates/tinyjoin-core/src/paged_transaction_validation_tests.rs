@@ -1,6 +1,7 @@
 use serde_json::{Value, json};
 
 use super::*;
+use crate::paged_storage::UniquePrefixes;
 use crate::{MemoryPageDevice, PagedEngine};
 
 fn row(value: Value) -> Row {
@@ -40,64 +41,113 @@ fn delete(id: i64) -> RowChange {
     }
 }
 
+/// Stages a statement by validating the whole write set it leaves, as the reference for the
+/// totals [`PagedTransaction::stage`] keeps.
+fn stage_with_full_validation(
+    storage: &PagedStorage<MemoryPageDevice>,
+    transaction: &mut PagedTransaction,
+    changes: Vec<RowChange>,
+) -> Result<()> {
+    transaction.ensure_base_revision(storage)?;
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let patch = transaction.patch(storage, changes)?;
+    let mut entries = transaction.entries.clone();
+    for (table, patched) in &patch.entries {
+        entries.entry(table.clone()).or_default().extend(
+            patched
+                .iter()
+                .map(|(key, entry)| (key.clone(), entry.clone())),
+        );
+    }
+    let (mut keys, mut bytes) = (0, 0);
+    for (table, entries) in &entries {
+        for (key, entry) in entries {
+            retain_entry(&mut keys, &mut bytes, retained_bytes(table, key, entry)?)?;
+        }
+    }
+    storage.validate_row_write_set(&changes_from_entries(entries.iter().flat_map(
+        |(table, entries)| entries.values().map(move |entry| (table.as_str(), entry)),
+    )))?;
+    for (table, patched) in patch.entries {
+        transaction.touched_tables.insert(table.clone());
+        transaction
+            .entries
+            .entry(table)
+            .or_default()
+            .extend(patched);
+    }
+    Ok(())
+}
+
 fn compare_stage(
     storage: &PagedStorage<MemoryPageDevice>,
-    fast: &mut PagedTransaction,
-    fallback: &mut PagedTransaction,
+    staged: &mut PagedTransaction,
+    reference: &mut PagedTransaction,
     changes: Vec<RowChange>,
 ) -> Option<String> {
-    let before = fast.changes();
-    let touched = fast.touched_tables();
-    let eligible = fast.append_validation.is_some();
-    let actual = fast.stage(storage, changes.clone());
-    let reference = fallback.stage(storage, changes);
+    let before = staged.changes();
+    let touched = staged.touched_tables();
+    let actual = staged.stage(storage, changes.clone());
+    let expected = stage_with_full_validation(storage, reference, changes);
     assert_eq!(
         actual.as_ref().err().map(|error| &error.code),
-        reference.as_ref().err().map(|error| &error.code)
+        expected.as_ref().err().map(|error| &error.code)
     );
-    assert_eq!(fast.changes(), fallback.changes());
-    assert_eq!(fast.touched_tables(), fallback.touched_tables());
+    assert_eq!(staged.changes(), reference.changes());
+    assert_eq!(staged.touched_tables(), reference.touched_tables());
     for table in ["items", "other"] {
         assert_eq!(
-            PagedReadView::new(storage, Some(fast))
+            PagedReadView::new(storage, Some(staged))
                 .scan_table(table)
                 .unwrap(),
-            PagedReadView::new(storage, Some(fallback))
+            PagedReadView::new(storage, Some(reference))
                 .scan_table(table)
                 .unwrap()
         );
     }
     if actual.is_err() {
-        assert_eq!(fast.changes(), before);
-        assert_eq!(fast.touched_tables(), touched);
-        assert_eq!(fast.append_validation.is_some(), eligible);
-    } else if let Some(cache) = &fast.append_validation {
-        // The uncached validator is an independent oracle for all three retention estimates
-        // and row/index/catalog operations, including catalog costs charged once per table.
-        let full = storage
-            .validate_row_write_set(&fast.changes(), None)
-            .unwrap();
-        assert_eq!(cache.usage, full.usage);
-        assert_eq!(cache.unique_prefixes, full.unique_prefixes);
-        let mut keys = 0;
-        let mut bytes = 0;
-        for (table, entries) in &fast.entries {
-            for (key, entry) in entries {
-                retain_entry(table, key, entry, &mut keys, &mut bytes).unwrap();
-            }
-        }
-        assert_eq!(cache.overlay_keys, keys);
-        assert_eq!(cache.overlay_bytes, bytes);
+        assert_eq!(staged.changes(), before);
+        assert_eq!(staged.touched_tables(), touched);
     }
+    // The whole-write-set validator is an independent oracle for every total the transaction keeps
+    // statement by statement: the three retention estimates, row, index and catalog operations,
+    // unique claims, and the overlay's own retention.
+    let totals = &staged.totals;
+    let full = storage.validate_row_write_set(&staged.changes()).unwrap();
+    let usage = storage
+        .write_set_usage(
+            totals.usage,
+            totals
+                .changed_tables
+                .iter()
+                .filter(|(_, count)| **count > 0)
+                .map(|(table, _)| table.as_str()),
+        )
+        .unwrap();
+    assert_eq!(usage, full.usage);
+    assert_eq!(
+        totals.claims.keys().cloned().collect::<UniquePrefixes>(),
+        full.unique_prefixes
+    );
+    let (mut keys, mut bytes) = (0, 0);
+    for (table, entries) in &staged.entries {
+        for (key, entry) in entries {
+            keys += 1;
+            bytes += retained_bytes(table, key, entry).unwrap();
+        }
+    }
+    assert_eq!(totals.overlay_keys, keys);
+    assert_eq!(totals.overlay_bytes, bytes);
     actual.err().map(|error| error.code)
 }
 
 #[test]
-fn append_and_forced_fallback_have_identical_unique_and_mixed_statement_semantics() {
+fn staged_totals_match_full_validation_for_unique_and_mixed_statements() {
     let mut storage = storage();
     let mut fast = PagedTransaction::new(storage.revision());
     let mut fallback = PagedTransaction::new(storage.revision());
-    fallback.append_validation = None;
     let appends = [
         vec![upsert("items", json!(1), json!("one"), "")],
         vec![
@@ -112,7 +162,6 @@ fn append_and_forced_fallback_have_identical_unique_and_mixed_statement_semantic
             compare_stage(&storage, &mut fast, &mut fallback, patch),
             None
         );
-        assert!(fast.append_validation.is_some());
     }
     for patch in [
         vec![
@@ -125,14 +174,13 @@ fn append_and_forced_fallback_have_identical_unique_and_mixed_statement_semantic
             upsert("items", json!(4), json!("four"), ""),
             upsert("items", json!(4.0), json!("different"), ""),
         ],
-        // A failed update of an already staged key must not disable append eligibility.
+        // A failed update of an already staged key must leave its claim in place.
         vec![upsert("items", json!(1), json!("base"), "")],
     ] {
         assert_eq!(
             compare_stage(&storage, &mut fast, &mut fallback, patch).as_deref(),
             Some("CONSTRAINT_VIOLATION")
         );
-        assert!(fast.append_validation.is_some());
     }
     assert_eq!(
         compare_stage(
@@ -143,9 +191,8 @@ fn append_and_forced_fallback_have_identical_unique_and_mixed_statement_semantic
         ),
         None
     );
-    assert!(fast.append_validation.is_some());
 
-    // The first successful mixed patch drops the cache only after full validation succeeds.
+    // A delete releases the committed row's unique value for another row in the same statement.
     assert_eq!(
         compare_stage(
             &storage,
@@ -155,7 +202,6 @@ fn append_and_forced_fallback_have_identical_unique_and_mixed_statement_semantic
         ),
         None
     );
-    assert!(fast.append_validation.is_none());
     for patch in [
         vec![upsert("items", json!(1), json!("updated"), "")],
         vec![upsert("items", json!(6), json!("one"), "")],
@@ -168,7 +214,6 @@ fn append_and_forced_fallback_have_identical_unique_and_mixed_statement_semantic
             compare_stage(&storage, &mut fast, &mut fallback, patch),
             None
         );
-        assert!(fast.append_validation.is_none());
     }
     let expected = PagedReadView::new(&storage, Some(&fast))
         .scan_table("items")
@@ -181,11 +226,10 @@ fn append_and_forced_fallback_have_identical_unique_and_mixed_statement_semantic
 }
 
 #[test]
-fn append_budget_failures_match_full_validation_and_do_not_consume_capacity() {
+fn budget_failures_match_full_validation_and_do_not_consume_capacity() {
     let storage = storage();
     let mut fast = PagedTransaction::new(storage.revision());
     let mut fallback = PagedTransaction::new(storage.revision());
-    fallback.append_validation = None;
     let large = "x".repeat(500_000);
     let mut failed_id = None;
     for id in 1..20 {
@@ -205,11 +249,9 @@ fn append_budget_failures_match_full_validation_and_do_not_consume_capacity() {
             failed_id = Some(id);
             break;
         }
-        assert!(fast.append_validation.is_some());
     }
     let id = failed_id.expect("individually valid rows must reach a cumulative byte limit");
     assert!(id > 2);
-    assert!(fast.append_validation.is_some());
     // Retry the rejected row key and unique prefix with a small value: neither was reserved.
     assert_eq!(
         compare_stage(
@@ -225,7 +267,6 @@ fn append_budget_failures_match_full_validation_and_do_not_consume_capacity() {
         ),
         None
     );
-    assert!(fast.append_validation.is_some());
     assert_eq!(
         compare_stage(
             &storage,
@@ -244,7 +285,7 @@ fn append_budget_failures_match_full_validation_and_do_not_consume_capacity() {
 }
 
 #[test]
-fn transaction_script_savepoints_restore_append_claims_and_mixed_fallback_state() {
+fn transaction_script_savepoints_restore_staged_rows_and_claims() {
     let mut engine = PagedEngine::open(storage().into_device()).unwrap();
     engine.begin_transaction().unwrap();
     engine
@@ -256,7 +297,7 @@ fn transaction_script_savepoints_restore_append_claims_and_mixed_fallback_state(
         .execute_sql("INSERT INTO items VALUES (2, 'two', 1, 'retained')", &[])
         .unwrap();
     assert_eq!(engine.exec_sql("UPDATE items SET email = 'changed' WHERE id = 1; INSERT INTO items VALUES (3, 'two', 1, 'conflict');").unwrap_err().code, "CONSTRAINT_VIOLATION");
-    // A failed script that entered mixed-DML fallback must restore the original rows and claims.
+    // A failed script with mixed changes must restore the original rows and claims.
     engine
         .execute_sql(
             "INSERT INTO items VALUES (3, 'changed', 1, 'after rollback')",
@@ -286,4 +327,70 @@ fn transaction_script_savepoints_restore_append_claims_and_mixed_fallback_state(
             row(json!({"id": 5.0, "email": "five"})),
         ]
     );
+}
+
+/// Generated sequences of inserts, updates, deletes and reverts over two unique indexes, including
+/// swaps of unique values and rows changed back to their committed state, stage exactly as
+/// validating the whole write set does.
+#[test]
+fn generated_mixed_statements_stage_as_full_validation_does() {
+    struct Random(u64);
+    impl Random {
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as usize) % bound
+        }
+    }
+    let mut storage = storage();
+    let mut engine = PagedEngine::open(storage.into_device()).unwrap();
+    engine
+        .exec_sql(
+            "INSERT INTO items VALUES (1, 'a', 1, 'p'), (2, 'b', 1, 'p'), (3, 'c', 2, 'p'), \
+             (4, NULL, 2, 'p'), (5, 'e', NULL, 'p')",
+        )
+        .unwrap();
+    storage = PagedStorage::open(engine.into_device()).unwrap();
+    let emails = [
+        json!("a"),
+        json!("b"),
+        json!("c"),
+        json!("e"),
+        json!("f"),
+        Value::Null,
+    ];
+    let mut random = Random(0x5e7);
+    let mut failures = 0;
+    for _ in 0..200 {
+        let mut staged = PagedTransaction::new(storage.revision());
+        let mut reference = PagedTransaction::new(storage.revision());
+        for _ in 0..12 {
+            let changes = (0..1 + random.below(3))
+                .map(|_| {
+                    let id = 1 + random.below(7) as i64;
+                    if random.below(4) == 0 {
+                        delete(id)
+                    } else {
+                        let email = emails[random.below(emails.len())].clone();
+                        let group = [json!(1), json!(2), Value::Null][random.below(3)].clone();
+                        RowChange::Upsert {
+                            table: "items".to_owned(),
+                            row: row(json!({
+                                "id": crate::storage::float_value(&json!(id)),
+                                "email": email,
+                                "group_id": group,
+                                "payload": "p",
+                            })),
+                        }
+                    }
+                })
+                .collect::<Vec<_>>();
+            if compare_stage(&storage, &mut staged, &mut reference, changes).is_some() {
+                failures += 1;
+            }
+        }
+    }
+    assert!(failures > 20, "only {failures} statements failed");
 }
