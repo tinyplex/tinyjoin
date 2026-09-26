@@ -526,14 +526,22 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
         };
         let entries = transaction.table_entries(table);
         let schema = self.storage.table_schema(table)?;
+        // Committed rows and staged entries are both in key order, so the staged entry for each
+        // committed row, if any, is found by walking the two together.
+        let mut staged = entries.map(|entries| entries.iter().peekable());
         let outcome = self.storage.visit_table(table, &mut |row| {
             self.charge_work(1)?;
-            if let Some(entries) = entries
-                && entries
-                    .get(row.encoded_key()?.as_ref())
-                    .is_some_and(|entry| entry.base != entry.next)
-            {
-                return Ok(VisitControl::Continue);
+            if let Some(staged) = &mut staged {
+                let key = row.encoded_key()?;
+                while staged
+                    .next_if(|(staged, _)| staged.as_slice() < key.as_ref())
+                    .is_some()
+                {}
+                if staged.peek().is_some_and(|(staged, entry)| {
+                    staged.as_slice() == key.as_ref() && entry.base != entry.next
+                }) {
+                    return Ok(VisitControl::Continue);
+                }
             }
             visitor(row)
         })?;
