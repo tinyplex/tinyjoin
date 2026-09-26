@@ -59,8 +59,9 @@ struct PagedScriptCandidate<'a, D: PageDevice> {
     // Shared with the storage until this candidate changes them.
     tables: Rc<BTreeMap<String, PagedTable>>,
     indexes: Rc<BTreeMap<String, PagedIndex>>,
-    base_tables: BTreeSet<String>,
-    base_indexes: BTreeSet<String>,
+    // The catalog as this candidate found it.
+    base_tables: Rc<BTreeMap<String, PagedTable>>,
+    base_indexes: Rc<BTreeMap<String, PagedIndex>>,
     mutated: bool,
     operations: Cell<usize>,
     result_bytes: usize,
@@ -121,8 +122,8 @@ fn begin_candidate<'a, D: PageDevice>(
         catalog_root,
         base_revision,
         next_tree_id,
-        base_tables: tables.keys().cloned().collect(),
-        base_indexes: indexes.keys().cloned().collect(),
+        base_tables: Rc::clone(&tables),
+        base_indexes: Rc::clone(&indexes),
         tables,
         indexes,
         mutated: false,
@@ -714,71 +715,45 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 + self.tables.len()
                 + self.indexes.len(),
         )?;
-        let header = encode_catalog_header_record(&CatalogHeader {
+        // Records of dropped tables and indexes are deleted. Every other record is written only
+        // when it changed, and the header, which is cheap to encode, is left to the batch, which
+        // keeps a value it already holds.
+        let mut changes = Vec::new();
+        for name in self.base_indexes.keys() {
+            if !self.indexes.contains_key(name) {
+                changes.push((encode_catalog_index_key(name)?, None));
+            }
+        }
+        for name in self.base_tables.keys() {
+            if !self.tables.contains_key(name) {
+                changes.push((encode_catalog_table_key(name)?, None));
+            }
+        }
+        let dropped = changes.len();
+        let (key, value) = encode_catalog_header_record(&CatalogHeader {
             next_tree_id: self.next_tree_id,
             table_count: u32::try_from(self.tables.len())
                 .map_err(|_| limit_error("The catalog contains too many tables"))?,
             index_count: u32::try_from(self.indexes.len())
                 .map_err(|_| limit_error("The catalog contains too many indexes"))?,
         })?;
-        let mut transaction = self.transaction.borrow_mut();
-        let mut root = match self.catalog_root {
-            Some(root) => root,
-            None => Btree::create(&mut transaction, CATALOG_TREE_ID)?,
-        };
-        let final_indexes = self.indexes.keys().cloned().collect::<BTreeSet<_>>();
-        let final_tables = self.tables.keys().cloned().collect::<BTreeSet<_>>();
-        for name in self.base_indexes.difference(&final_indexes) {
-            let deleted = Btree::delete(
-                &mut transaction,
-                root,
-                CATALOG_TREE_ID,
-                &encode_catalog_index_key(name)?,
-            )?;
-            if !deleted.removed {
-                return Err(storage_corrupt(format!(
-                    "Catalog record for dropped index `{name}` is missing"
-                )));
-            }
-            root = deleted
-                .root_page_id
-                .ok_or_else(|| storage_corrupt("Dropping an index removed the catalog header"))?;
-        }
-        for name in self.base_tables.difference(&final_tables) {
-            let deleted = Btree::delete(
-                &mut transaction,
-                root,
-                CATALOG_TREE_ID,
-                &encode_catalog_table_key(name)?,
-            )?;
-            if !deleted.removed {
-                return Err(storage_corrupt(format!(
-                    "Catalog record for dropped table `{name}` is missing"
-                )));
-            }
-            root = deleted
-                .root_page_id
-                .ok_or_else(|| storage_corrupt("Dropping a table removed the catalog header"))?;
-        }
-        root = Btree::upsert(
-            &mut transaction,
-            root,
-            CATALOG_TREE_ID,
-            &header.0,
-            &header.1,
-        )?
-        .root_page_id;
+        changes.push((key, Some(value)));
         let mut database_hash = EMPTY_HASH;
-        for table in self.tables.values() {
-            let (key, value) = encode_catalog_table_record(&CatalogTableRecord {
-                schema: table.schema.clone(),
-                tree_id: table.tree_id,
-                root_page_id: table.root_page_id,
-                row_count: table.row_count as u64,
-                hash: table.hash,
-            })?;
-            root =
-                Btree::upsert(&mut transaction, root, CATALOG_TREE_ID, &key, &value)?.root_page_id;
+        for (name, table) in self.tables.iter() {
+            if self
+                .base_tables
+                .get(name)
+                .is_none_or(|base| !same_table_record(base, table))
+            {
+                let (key, value) = encode_catalog_table_record(&CatalogTableRecord {
+                    schema: table.schema.clone(),
+                    tree_id: table.tree_id,
+                    root_page_id: table.root_page_id,
+                    row_count: table.row_count as u64,
+                    hash: table.hash,
+                })?;
+                changes.push((key, Some(value)));
+            }
             // Binding each table's fingerprint to its name keeps two tables from cancelling each
             // other out, and makes exchanging the contents of two tables a visible change.
             // A table's columns are part of its identity: packed rows do not name their columns,
@@ -792,21 +767,64 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 ),
             );
         }
-        for index in self.indexes.values() {
-            let (key, value) = encode_catalog_index_record(&CatalogIndexRecord {
-                definition: index.definition.clone(),
-                tree_id: index.tree_id,
-                root_page_id: index.root_page_id,
-                entry_count: index.entry_count as u64,
-            })?;
-            root =
-                Btree::upsert(&mut transaction, root, CATALOG_TREE_ID, &key, &value)?.root_page_id;
+        for (name, index) in self.indexes.iter() {
+            if self
+                .base_indexes
+                .get(name)
+                .is_none_or(|base| !same_index_record(base, index))
+            {
+                let (key, value) = encode_catalog_index_record(&CatalogIndexRecord {
+                    definition: index.definition.clone(),
+                    tree_id: index.tree_id,
+                    root_page_id: index.root_page_id,
+                    entry_count: index.entry_count as u64,
+                })?;
+                changes.push((key, Some(value)));
+            }
+        }
+        changes.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let batch = changes
+            .iter()
+            .map(|(key, value)| BatchChange {
+                key,
+                value: value.as_deref(),
+            })
+            .collect::<Vec<_>>();
+        let applied = Btree::apply(
+            &mut self.transaction.borrow_mut(),
+            self.catalog_root,
+            CATALOG_TREE_ID,
+            &batch,
+        )?;
+        if applied.removed != dropped {
+            return Err(storage_corrupt(
+                "The catalog is missing the record of a dropped table or index",
+            ));
         }
         Ok(CatalogPublication {
-            root_page_id: root,
+            root_page_id: applied
+                .root_page_id
+                .ok_or_else(|| storage_corrupt("The catalog has no header"))?,
             database_hash,
         })
     }
+}
+
+/// Whether two versions of a table have the same catalog record.
+fn same_table_record(left: &PagedTable, right: &PagedTable) -> bool {
+    left.tree_id == right.tree_id
+        && left.root_page_id == right.root_page_id
+        && left.row_count == right.row_count
+        && left.hash == right.hash
+        && left.schema == right.schema
+}
+
+/// Whether two versions of an index have the same catalog record.
+fn same_index_record(left: &PagedIndex, right: &PagedIndex) -> bool {
+    left.tree_id == right.tree_id
+        && left.root_page_id == right.root_page_id
+        && left.entry_count == right.entry_count
+        && left.definition == right.definition
 }
 
 /// How many bytes of entries an index build sorts in memory before writing them to its tree.

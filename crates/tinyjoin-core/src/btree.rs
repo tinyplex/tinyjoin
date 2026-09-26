@@ -63,6 +63,7 @@ const MAX_OVERFLOW_PAGE_COUNT: usize = MAX_BTREE_VALUE_BYTES.div_ceil(MAX_OVERFL
 pub(crate) struct Btree;
 
 /// The outcome of one [`Btree::upsert`].
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BtreeUpsert {
     pub(crate) root_page_id: PageId,
@@ -71,6 +72,7 @@ pub(crate) struct BtreeUpsert {
 }
 
 /// The outcome of one [`Btree::delete`].
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BtreeDelete {
     /// The candidate root, or `None` once the last entry has been removed.
@@ -106,6 +108,7 @@ impl Btree {
     /// Creates an empty leaf and returns its candidate root page ID.
     ///
     /// No fingerprint is reported: an empty tree always has [`EMPTY_HASH`].
+    #[cfg(test)]
     pub(crate) fn create<D: PageDevice>(
         transaction: &mut PagerWriteTransaction<'_, D>,
         tree_id: TreeId,
@@ -149,10 +152,13 @@ impl Btree {
     }
 
     /// Inserts or replaces an inline value and returns the candidate root and its fingerprint.
+    /// Commits write through [`Self::apply`]; tests build trees one change at a time with this and
+    /// [`Self::delete`], and check batches against them.
     ///
     /// On error, the pager transaction is marked failed and must be aborted. Allocation or device
     /// failures may have left unreachable candidate pages which must not be published as part of
     /// another operation.
+    #[cfg(test)]
     pub(crate) fn upsert<D: PageDevice>(
         transaction: &mut PagerWriteTransaction<'_, D>,
         root_page_id: PageId,
@@ -222,6 +228,7 @@ impl Btree {
     /// descendants are pruned; an internal page may retain one child and no separator, and an
     /// empty tree is represented by `None`. Separator keys are advanced when the first key in a
     /// right subtree changes. On error, the pager transaction is marked failed and must be aborted.
+    #[cfg(test)]
     pub(crate) fn delete<D: PageDevice>(
         transaction: &mut PagerWriteTransaction<'_, D>,
         root_page_id: PageId,
@@ -264,9 +271,10 @@ impl Btree {
     /// Each page the batch reaches is read and written once, however many of its changes land on
     /// it, and a page that overflows is divided into as many pages as it needs at once. A page that
     /// takes only appends past its last key is filled before the next is started, so tables
-    /// loaded in key order keep full pages; otherwise its entries are spread evenly. As in
-    /// [`Self::delete`], emptied pages are pruned and pages are not rebalanced. A missing root
-    /// starts an empty tree. On error, the pager transaction is marked failed and must be aborted.
+    /// loaded in key order keep full pages; otherwise its entries are spread evenly. Emptied pages
+    /// are pruned, and pages are not rebalanced. An upsert of the value an entry already holds
+    /// inline leaves its page as it was. A missing root starts an empty tree. On error, the pager
+    /// transaction is marked failed and must be aborted.
     pub(crate) fn apply<D: PageDevice>(
         transaction: &mut PagerWriteTransaction<'_, D>,
         root_page_id: Option<PageId>,
@@ -1344,6 +1352,7 @@ struct InternalEntry {
 }
 
 impl InternalNode {
+    #[cfg(test)]
     fn child_index_for(&self, key: &[u8]) -> usize {
         self.entries
             .partition_point(|entry| entry.key.as_slice() <= key)
@@ -1364,6 +1373,7 @@ impl InternalNode {
         }
     }
 
+    #[cfg(test)]
     fn replace_child(&mut self, index: usize, page_id: PageId, child_hash: u64) -> Result<()> {
         if index == 0 {
             self.leftmost_child = page_id;
@@ -1676,6 +1686,7 @@ impl Node {
         })
     }
 
+    #[cfg(test)]
     fn encoded_size(&self) -> Result<usize> {
         let cells_size = match &self.kind {
             NodeKind::Leaf(entries) => entries.iter().try_fold(0usize, |size, entry| {
@@ -1700,11 +1711,13 @@ impl Node {
             .ok_or_else(|| limit_error("B-tree node size overflowed"))
     }
 
+    #[cfg(test)]
     fn fits(&self) -> Result<bool> {
         Ok(self.encoded_size()? <= MAX_PAGE_PAYLOAD_SIZE)
     }
 }
 
+#[cfg(test)]
 struct InsertedPage {
     page_id: PageId,
     hash: u64,
@@ -1809,6 +1822,13 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
                 merged.push(entry);
             }
             if let Some(entry) = entries.next_if(|entry| entry.key.as_slice() == change.key) {
+                // An upsert of the value an entry already holds inline changes nothing.
+                if let (LeafValue::Inline(held), Some(value)) = (&entry.value, change.value)
+                    && held.as_slice() == value
+                {
+                    merged.push(entry);
+                    continue;
+                }
                 release_leaf_value(
                     self.transaction,
                     self.tree_id,
@@ -2113,6 +2133,7 @@ fn divide(sizes: &[usize], fill: bool) -> Result<Vec<usize>> {
     }
 }
 
+#[cfg(test)]
 struct PageSplit {
     separator: Vec<u8>,
     right_page_id: PageId,
@@ -2120,6 +2141,7 @@ struct PageSplit {
     left_level: u8,
 }
 
+#[cfg(test)]
 struct DeletedPage {
     page_id: Option<PageId>,
     /// The fingerprint of the surviving subtree, or `None` when no entry matched and the subtree
@@ -2130,6 +2152,7 @@ struct DeletedPage {
     first_key: Option<Vec<u8>>,
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn delete_recursive<D: PageDevice>(
     transaction: &mut PagerWriteTransaction<'_, D>,
@@ -2287,6 +2310,7 @@ fn release_node_page<D: PageDevice>(
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn insert_recursive<D: PageDevice>(
     transaction: &mut PagerWriteTransaction<'_, D>,
@@ -2380,6 +2404,7 @@ fn insert_recursive<D: PageDevice>(
     materialize_node(transaction, page_id, owned, node)
 }
 
+#[cfg(test)]
 fn materialize_node<D: PageDevice>(
     transaction: &mut PagerWriteTransaction<'_, D>,
     old_page_id: PageId,
@@ -2428,6 +2453,7 @@ fn materialize_node<D: PageDevice>(
     })
 }
 
+#[cfg(test)]
 fn split_node(node: Node) -> Result<(Node, Node, Vec<u8>)> {
     match node.kind {
         NodeKind::Leaf(entries) => {
@@ -2473,6 +2499,7 @@ fn split_node(node: Node) -> Result<(Node, Node, Vec<u8>)> {
     }
 }
 
+#[cfg(test)]
 fn choose_leaf_split(entries: &[LeafEntry]) -> Result<usize> {
     if entries.len() < 2 {
         return Err(limit_error("A single leaf entry cannot fit in a page"));
@@ -2492,6 +2519,7 @@ fn choose_leaf_split(entries: &[LeafEntry]) -> Result<usize> {
         .ok_or_else(|| limit_error("Leaf entries cannot be divided into bounded pages"))
 }
 
+#[cfg(test)]
 fn choose_internal_split(entries: &[InternalEntry]) -> Result<usize> {
     if entries.len() < 3 {
         return Err(limit_error(
@@ -2513,6 +2541,7 @@ fn choose_internal_split(entries: &[InternalEntry]) -> Result<usize> {
         .ok_or_else(|| limit_error("Internal separators cannot be divided into bounded pages"))
 }
 
+#[cfg(test)]
 fn internal_entries_size(entries: &[InternalEntry]) -> Result<usize> {
     entries.iter().try_fold(
         NODE_HEADER_SIZE + entries.len() * SLOT_SIZE,
