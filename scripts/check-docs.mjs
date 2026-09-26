@@ -48,13 +48,12 @@ export async function checkDocs(
   );
   const favicon = await readFile(resolve(docs, 'favicon.svg'), 'utf8');
   const stylesheet = await readFile(resolve(docs, 'css/index.css'), 'utf8');
-  for (const [name, html] of [
-    ['homepage', homepage],
-    ['benchmarks guide', await readFile(resolve(docs, 'guides/benchmarks/index.html'), 'utf8')],
-  ]) {
-    if (!html.includes('<span class="bar" style="--bar:')) {
-      errors.push(`The ${name} must render the published benchmark results`);
-    }
+  const benchmarksGuide = await readFile(
+    resolve(docs, 'guides/benchmarks/index.html'),
+    'utf8',
+  );
+  if (!benchmarksGuide.includes('<figure class="chart"')) {
+    errors.push('The benchmarks guide must chart the published results');
   }
   if (!homepage.includes('<nav id="actions" aria-label="Get started">')) {
     errors.push('The homepage must contain its explicitly scoped action links');
@@ -137,7 +136,7 @@ export async function checkDocs(
       errors.push(`Malformed TinyDocs API autolink in ${sourcePath}`);
     }
     // The agents guide names the placeholder form itself, with <group>.
-    if (/\{\{(?:(?:sizes|benchmarks)\.[a-z-]+[.}]|\/?bar\b)/.test(html)) {
+    if (/\{\{(?:sizes|benchmarks)\.[a-z-]+[.}]/.test(html)) {
       errors.push(`Unreplaced measurement placeholder in ${sourcePath}`);
     }
 

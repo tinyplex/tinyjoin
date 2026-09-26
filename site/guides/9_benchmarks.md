@@ -11,8 +11,11 @@ reads and writes are currently much slower than in either alternative, and
 closing that gap is ongoing work. The suite is designed to be rerun after
 every optimization.
 
-{{benchmarks.environment}} The shortest time in each row is bold, and each bar
-is scaled to the slowest engine in its row.
+{{benchmarks.environment}}
+
+Every chart has a linear axis from zero, so bar lengths compare directly. Where
+TinyJoin is a thousand times slower, the other engines' bars are slivers, and
+their values are printed beside them. In each group, the best value is bold.
 
 ## Measured results
 
@@ -20,12 +23,13 @@ is scaled to the slowest engine in its row.
 
 {{benchmarks.startup}}
 
-Download size counts every file a page fetched to open a database, compressed
-with gzip at level 9: JavaScript for the page and the Worker, WebAssembly, and
-PGlite's file system image. First open starts before the engine is fetched and
-ends when the first query on a new, empty database returns. Reopen runs in a new
-browser session with a warm HTTP cache: it loads the engine again, opens an
-existing database, and counts its rows.
+Download size counts every file a page fetched to open a database: JavaScript
+for the page and the Worker, WebAssembly, and PGlite's file system image. It is
+shown uncompressed, compressed with gzip at level 9, and compressed with Brotli
+at quality 11, since servers send either. First open starts before the engine
+is fetched and ends when the first query on a new, empty database returns.
+Reopen runs in a new browser session with a warm HTTP cache: it loads the engine
+again, opens an existing database, and counts its rows.
 
 ### Create
 

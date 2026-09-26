@@ -47,6 +47,8 @@
     "esbuild",
     "fptoint",
     "fract",
+    "gridline",
+    "gridlines",
     "ILIKE",
     "importmap",
     "jamesgpearce",

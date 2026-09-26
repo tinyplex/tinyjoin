@@ -28,6 +28,10 @@ html {
   --hue-5: hsl(5, 74%, 59%);
   --hue-5-2: hsl(344, 84%, 43%);
   --hue-6: hsl(35, 99%, 36%);
+  // Benchmark chart series, validated together for color vision deficiency.
+  --series-tinyjoin: @accentColorLight;
+  --series-sqlite: #eb6834;
+  --series-pglite: #1baf7a;
 }
 
 .darkTheme() {
@@ -57,6 +61,8 @@ html {
   --hue-5: hsl(355, 65%, 65%);
   --hue-5-2: hsl(5, 48%, 51%);
   --hue-6: hsl(29, 54%, 61%);
+  --series-sqlite: #d95926;
+  --series-pglite: #199e70;
 }
 
 html.dark {
@@ -99,3 +105,4 @@ html.dark {
 @import 'pre.less';
 @import 'theme.less';
 @import 'home.less';
+@import 'chart.less';
