@@ -82,13 +82,21 @@ impl<D: PageDevice> PagedEngine<D> {
 
     fn execute_parsed_statement(&mut self, statement: Statement) -> Result<ExecuteResult> {
         if self.transaction.is_none() {
-            return self
-                .storage
-                .execute_script(vec![statement])?
-                .pop()
-                .ok_or_else(|| {
-                    EngineError::new("INTERNAL_ERROR", "SQL statement produced no result")
-                });
+            if matches!(statement, Statement::Write(_)) {
+                return self
+                    .storage
+                    .execute_script(vec![statement])?
+                    .pop()
+                    .ok_or_else(|| {
+                        EngineError::new("INTERNAL_ERROR", "SQL statement produced no result")
+                    });
+            }
+            // A read changes nothing, so it reads the committed view without opening a write
+            // candidate, and its result is bounded as a one-statement script's would be.
+            self.storage.ensure_readiness()?;
+            let result = self.execute_statement(statement, None)?;
+            crate::paged_script::retain_result(&mut 7, &result)?;
+            return Ok(result);
         }
         self.execute_statement(statement, None)
     }
