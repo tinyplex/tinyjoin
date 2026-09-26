@@ -1,6 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     rc::Rc,
 };
 
@@ -462,35 +462,40 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             }
             let next = (!is_delete).then_some(row);
             let table_changes = changes.entry(table_name.clone()).or_default();
-            if let Some(existing) = table_changes.get_mut(&key) {
-                let previous_bytes = existing.next.as_ref().map_or(Ok(0), estimated_row_bytes)?;
-                let next_bytes = next.as_ref().map_or(Ok(0), estimated_row_bytes)?;
-                retained_bytes = retained_bytes
-                    .checked_sub(previous_bytes)
-                    .and_then(|bytes| bytes.checked_add(next_bytes))
-                    .ok_or_else(batch_too_large)?;
-                ensure_batch_bytes(retained_bytes)?;
-                existing.next = next;
-                continue;
-            }
+            let slot = match table_changes.entry(key) {
+                Entry::Occupied(mut existing) => {
+                    let existing = existing.get_mut();
+                    let previous_bytes =
+                        existing.next.as_ref().map_or(Ok(0), estimated_row_bytes)?;
+                    let next_bytes = next.as_ref().map_or(Ok(0), estimated_row_bytes)?;
+                    retained_bytes = retained_bytes
+                        .checked_sub(previous_bytes)
+                        .and_then(|bytes| bytes.checked_add(next_bytes))
+                        .ok_or_else(batch_too_large)?;
+                    ensure_batch_bytes(retained_bytes)?;
+                    existing.next = next;
+                    continue;
+                }
+                Entry::Vacant(slot) => slot,
+            };
             let old = match held {
                 PreviousRow::Read(row) => {
                     // Charged as the lookup it replaces.
                     self.charge_operations(1)?;
                     row
                 }
-                PreviousRow::Unread => self.lookup_encoded_primary_key(table_name, &key)?,
+                PreviousRow::Unread => self.lookup_encoded_primary_key(table_name, slot.key())?,
             };
             let old_bytes = old.as_ref().map_or(Ok(0), estimated_row_bytes)?;
             let next_bytes = next.as_ref().map_or(Ok(0), estimated_row_bytes)?;
             retained_bytes = retained_bytes
-                .checked_add(key.len())
+                .checked_add(slot.key().len())
                 .and_then(|bytes| bytes.checked_add(old_bytes))
                 .and_then(|bytes| bytes.checked_add(next_bytes))
                 .and_then(|bytes| bytes.checked_add(96))
                 .ok_or_else(batch_too_large)?;
             ensure_batch_bytes(retained_bytes)?;
-            table_changes.insert(key, ChangedRow { old, next });
+            slot.insert(ChangedRow { old, next });
         }
         self.validate_changed_unique_indexes(&changes, retained_bytes)?;
         self.apply_row_changes(&changes)
