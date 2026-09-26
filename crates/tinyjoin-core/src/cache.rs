@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    hash::{BuildHasherDefault, Hasher},
+};
 
 use crate::{
     AllocationBitmap, EngineError, FIRST_DATA_PAGE_ID, PAGE_SIZE, PageDevice, PageId, Result,
@@ -30,6 +33,39 @@ pub(crate) const MAX_PAGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 #[cfg(test)]
 pub(crate) const DEFAULT_PAGE_CACHE_PAGES: usize = DEFAULT_PAGE_CACHE_BYTES / PAGE_SIZE;
 
+/// A multiplicative hash for page-keyed maps.
+///
+/// Page IDs and candidate numbers are integers the engine assigns, not keys an adversary chooses,
+/// so these maps do not need SipHash's flooding resistance. Its cost dominated cache lookups.
+#[derive(Default)]
+struct PageKeyHasher(u64);
+
+impl Hasher for PageKeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.write_u64(u64::from(*byte));
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+
+    fn write_isize(&mut self, value: isize) {
+        self.write_u64(value as u64);
+    }
+}
+
+type PageKeyMap<K, V> = HashMap<K, V, BuildHasherDefault<PageKeyHasher>>;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum Owner {
     Committed,
@@ -55,8 +91,8 @@ struct Reservation {
 pub(crate) struct PageCache<D: PageDevice> {
     device: D,
     entries: Vec<CacheEntry>,
-    lookup: HashMap<(Owner, PageId), usize>,
-    reservations: HashMap<PageId, Reservation>,
+    lookup: PageKeyMap<(Owner, PageId), usize>,
+    reservations: PageKeyMap<PageId, Reservation>,
     /// Owners with pages which reached the device but have not been covered by a successful
     /// device-wide durability barrier. A PageDevice flush is global, so one successful flush can
     /// make writes from several interleaved owners durable at once.
@@ -83,8 +119,8 @@ impl<D: PageDevice> PageCache<D> {
         Ok(Self {
             device,
             entries: Vec::with_capacity(capacity),
-            lookup: HashMap::with_capacity(capacity),
-            reservations: HashMap::new(),
+            lookup: PageKeyMap::with_capacity_and_hasher(capacity, Default::default()),
+            reservations: PageKeyMap::default(),
             unflushed_owners: HashSet::new(),
             capacity,
             hand: 0,
@@ -243,8 +279,7 @@ impl<D: PageDevice> PageCache<D> {
     ) -> Result<()> {
         self.ensure_reserved_by(candidate, id)?;
         self.reservations.remove(&id);
-        self.entries
-            .retain(|entry| entry.owner != Owner::Candidate(candidate) || entry.id != id);
+        self.remove_entry((Owner::Candidate(candidate), id));
         if !self
             .reservations
             .values()
@@ -252,7 +287,6 @@ impl<D: PageDevice> PageCache<D> {
         {
             self.unflushed_owners.remove(&Owner::Candidate(candidate));
         }
-        self.rebuild_lookup();
         Ok(())
     }
 
@@ -303,33 +337,47 @@ impl<D: PageDevice> PageCache<D> {
                 )));
             }
         }
-        let mut deallocated = HashSet::new();
+        let mut deallocated = Vec::new();
         for entry in &self.entries {
             if entry.owner == Owner::Committed && !next_bitmap.is_allocated(entry.id)? {
-                deallocated.insert(entry.id);
+                deallocated.push(entry.id);
             }
         }
-        self.entries
-            .retain(|entry| entry.owner != Owner::Committed || !deallocated.contains(&entry.id));
-        for entry in &mut self.entries {
-            if entry.owner == owner {
+        for id in deallocated {
+            self.remove_entry((Owner::Committed, id));
+        }
+        // Candidate pages are cached only under reserved IDs, so re-keying each reserved ID moves
+        // every candidate entry into the committed view without scanning the cache.
+        for (id, _) in candidate_ids {
+            if let Some(index) = self.lookup.remove(&(owner, id)) {
+                let entry = &mut self.entries[index];
                 entry.owner = Owner::Committed;
                 entry.referenced = true;
+                self.lookup.insert((Owner::Committed, id), index);
             }
         }
         self.reservations
             .retain(|_, reservation| reservation.candidate != candidate);
-        self.rebuild_lookup();
+        self.debug_assert_no_entries(owner);
         Ok(())
     }
 
     pub(crate) fn invalidate_candidate(&mut self, candidate: CandidateId) {
-        self.unflushed_owners.remove(&Owner::Candidate(candidate));
-        self.entries
-            .retain(|entry| entry.owner != Owner::Candidate(candidate));
-        self.reservations
-            .retain(|_, reservation| reservation.candidate != candidate);
-        self.rebuild_lookup();
+        let owner = Owner::Candidate(candidate);
+        self.unflushed_owners.remove(&owner);
+        // Only reserved IDs can hold candidate entries, so a read-only candidate, which reserves
+        // nothing, is released without touching the cache.
+        let reserved = self
+            .reservations
+            .iter()
+            .filter(|(_, reservation)| reservation.candidate == candidate)
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for id in reserved {
+            self.reservations.remove(&id);
+            self.remove_entry((owner, id));
+        }
+        self.debug_assert_no_entries(owner);
     }
 
     #[cfg(test)]
@@ -461,16 +509,32 @@ impl<D: PageDevice> PageCache<D> {
         Ok(())
     }
 
-    fn rebuild_lookup(&mut self) {
-        self.lookup.clear();
-        for (index, entry) in self.entries.iter().enumerate() {
-            self.lookup.insert((entry.owner, entry.id), index);
+    /// Removes one cached entry, if present, moving the last entry into its slot so that only one
+    /// lookup index changes.
+    fn remove_entry(&mut self, key: (Owner, PageId)) {
+        let Some(index) = self.lookup.remove(&key) else {
+            return;
+        };
+        self.entries.swap_remove(index);
+        if let Some(moved) = self.entries.get(index) {
+            self.lookup.insert((moved.owner, moved.id), index);
         }
-        if self.entries.is_empty() {
+        if self.hand >= self.entries.len() {
             self.hand = 0;
-        } else {
-            self.hand %= self.entries.len();
         }
+    }
+
+    /// Confirms in debug builds that an owner has no cached pages left and that the lookup still
+    /// indexes every entry, since both are maintained incrementally.
+    fn debug_assert_no_entries(&self, owner: Owner) {
+        debug_assert!(self.entries.iter().all(|entry| entry.owner != owner));
+        debug_assert_eq!(self.lookup.len(), self.entries.len());
+        debug_assert!(
+            self.entries
+                .iter()
+                .enumerate()
+                .all(|(index, entry)| self.lookup.get(&(entry.owner, entry.id)) == Some(&index))
+        );
     }
 }
 
