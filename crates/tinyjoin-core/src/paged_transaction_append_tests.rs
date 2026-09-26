@@ -25,6 +25,8 @@ fn storage() -> PagedStorage<MemoryPageDevice> {
 }
 
 fn upsert(table: &str, id: Value, email: Value, payload: &str) -> RowChange {
+    // SQL planning normalizes a FLOAT key to binary64 before staging it.
+    let id = crate::storage::float_value(&id);
     RowChange::Upsert {
         table: table.to_owned(),
         row: row(json!({"id": id, "email": email, "group_id": 1, "payload": payload})),
@@ -276,12 +278,12 @@ fn transaction_script_savepoints_restore_append_claims_and_mixed_fallback_state(
             .unwrap()
             .rows,
         vec![
-            row(json!({"id": 0, "email": "base"})),
-            row(json!({"id": 1, "email": "updated"})),
-            row(json!({"id": 2, "email": "two"})),
-            row(json!({"id": 3, "email": "changed"})),
-            row(json!({"id": 4, "email": "one"})),
-            row(json!({"id": 5, "email": "five"})),
+            row(json!({"id": 0.0, "email": "base"})),
+            row(json!({"id": 1.0, "email": "updated"})),
+            row(json!({"id": 2.0, "email": "two"})),
+            row(json!({"id": 3.0, "email": "changed"})),
+            row(json!({"id": 4.0, "email": "one"})),
+            row(json!({"id": 5.0, "email": "five"})),
         ]
     );
 }

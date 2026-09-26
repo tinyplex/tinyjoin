@@ -19,7 +19,7 @@ use crate::{
     },
     paged_storage::{
         PagedIndex, PagedTable, adjusted_count, batch_too_large, ensure_batch_bytes, limit_error,
-        storage_corrupt, unique_violation, validated_row,
+        storage_corrupt, stored_row, unique_violation,
     },
     statement::{PlannedDml, Statement, WriteStatement},
     storage::{
@@ -303,7 +303,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 Btree::cursor_in_transaction(&mut transaction, table_root, table.tree_id)?;
             while let Some((primary_key, value)) = rows.next_in_transaction(&mut transaction)? {
                 self.charge_operations(1)?;
-                let row = validated_row(&table.schema, &primary_key, &value)?;
+                let row = stored_row(&table.schema, &primary_key, &value)?;
                 let Some(index_key) =
                     encode_secondary_index_entry_key(&table.schema, definition, &row)?
                 else {
@@ -391,71 +391,16 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         let table = self
             .tables
             .get(table_name)
-            .cloned()
             .ok_or_else(|| EngineError::table_not_found(table_name))?;
         let schema = schema_with_added_column(&table.schema, column)?;
-        let Some(old_root) = table.root_page_id else {
-            Rc::make_mut(&mut self.tables)
-                .get_mut(table_name)
-                .expect("the altered table was resolved above")
-                .schema = schema;
-            return Ok(());
-        };
-
-        let new_tree_id = self.allocate_tree_id()?;
-        let mut new_root = None;
-        let mut new_hash = EMPTY_HASH;
-        let mut rewritten = 0usize;
-        {
-            let mut transaction = self.transaction.borrow_mut();
-            let mut rows = Btree::cursor_in_transaction(&mut transaction, old_root, table.tree_id)?;
-            while let Some((primary_key, value)) = rows.next_in_transaction(&mut transaction)? {
-                self.charge_operations(2)?;
-                let mut row = validated_row(&table.schema, &primary_key, &value)?;
-                row.insert(
-                    column.name.clone(),
-                    column.default.clone().unwrap_or(serde_json::Value::Null),
-                );
-                let row = normalize_row(&schema, row)?;
-                let next_key = encode_primary_key(&schema, &row)?;
-                if next_key != primary_key {
-                    return Err(storage_corrupt(format!(
-                        "ALTER TABLE changed a primary key in `{table_name}`"
-                    )));
-                }
-                let root = match new_root {
-                    Some(root) => root,
-                    None => Btree::create(&mut transaction, new_tree_id)?,
-                };
-                let upserted = Btree::upsert(
-                    &mut transaction,
-                    root,
-                    new_tree_id,
-                    &primary_key,
-                    &encode_row(&row)?,
-                )?;
-                new_root = Some(upserted.root_page_id);
-                new_hash = upserted.hash;
-                rewritten = rewritten.checked_add(1).ok_or_else(batch_too_large)?;
-            }
-            if rewritten != table.row_count {
-                return Err(storage_corrupt(format!(
-                    "Table `{table_name}` catalog count {} does not match {rewritten} rewritten rows",
-                    table.row_count
-                )));
-            }
-            Btree::reclaim(&mut transaction, old_root, table.tree_id)?;
-        }
-        let table = Rc::make_mut(&mut self.tables)
+        // A row record omits trailing columns that equal their defaults, so every stored row
+        // already encodes the new column's default and none is rewritten. The table's fingerprint
+        // still changes, because the database fingerprint covers each table's columns.
+        Rc::make_mut(&mut self.tables)
             .get_mut(table_name)
-            .expect("the altered table was resolved above");
-        table.schema = schema;
-        table.tree_id = new_tree_id;
-        table.root_page_id = new_root;
-        // Adding a column rewrites every row, so the table's rows have genuinely changed even
-        // though no statement touched them.
-        table.hash = new_hash;
-        Ok(())
+            .expect("the altered table was resolved above")
+            .schema = schema;
+        self.charge_operations(1)
     }
 
     fn apply_changes(&mut self, input_changes: &[RowChange]) -> Result<()> {
@@ -625,7 +570,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                             root,
                             table.tree_id,
                             key,
-                            &encode_row(row)?,
+                            &encode_row(&table.schema, row)?,
                         )?;
                         table.root_page_id = Some(upserted.root_page_id);
                         table.hash = upserted.hash;
@@ -723,7 +668,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         };
         self.charge_operations(1)?;
         get_in_transaction(&mut self.transaction.borrow_mut(), root, table.tree_id, key)?
-            .map(|value| validated_row(&table.schema, key, &value))
+            .map(|value| stored_row(&table.schema, key, &value))
             .transpose()
     }
 
@@ -853,9 +798,15 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 Btree::upsert(&mut transaction, root, CATALOG_TREE_ID, &key, &value)?.root_page_id;
             // Binding each table's fingerprint to its name keeps two tables from cancelling each
             // other out, and makes exchanging the contents of two tables a visible change.
+            // A table's columns are part of its identity: packed rows do not name their columns,
+            // so two tables whose columns differ are different data even when their row bytes
+            // match.
             database_hash = combine(
                 database_hash,
-                identify(table.schema.name.as_bytes(), table.hash),
+                identify(
+                    table.schema.name.as_bytes(),
+                    combine(table.hash, columns_fingerprint(&table.schema)?),
+                ),
             );
         }
         for index in self.indexes.values() {
@@ -964,7 +915,7 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
                 break;
             };
             self.charge_operations(1)?;
-            let row = validated_row(&table.schema, &key, &value)?;
+            let row = stored_row(&table.schema, &key, &value)?;
             if visitor(&row)? == VisitControl::Stop {
                 return Ok(VisitOutcome::Stopped);
             }
@@ -1081,7 +1032,7 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
                 ))
             })?;
             self.charge_operations(1)?;
-            let row = validated_row(&table_data.schema, primary_key, &row_value)?;
+            let row = stored_row(&table_data.schema, primary_key, &row_value)?;
             if visitor(&row)? == VisitControl::Stop {
                 return Ok(Some(VisitOutcome::Stopped));
             }
@@ -1099,4 +1050,16 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
     fn revision(&self) -> u64 {
         self.base_revision
     }
+}
+
+/// A fingerprint of a table's column definitions: their names, types, nullability, defaults, and
+/// order, and which of them form the primary key.
+fn columns_fingerprint(schema: &crate::TableDefinition) -> Result<u64> {
+    let columns = serde_json::json!({
+        "columns": schema.columns,
+        "primaryKey": schema.primary_key,
+    });
+    let mut hasher = crate::hash::Hasher::new();
+    hasher.write_bytes(&crate::paged_codec::encode_canonical_json(&columns)?);
+    Ok(hasher.finish())
 }

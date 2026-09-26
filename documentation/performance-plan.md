@@ -264,8 +264,7 @@ A table entry's value holds only the non-key columns, in schema order:
 
 | Part | Size | Content |
 | --- | --- | --- |
-| Version | 1 byte | `2` |
-| Flags | 1 byte | Offset width, whether a null bitmap follows, and reserved sync bits. Unknown bits are rejected. |
+| Flags | 1 byte | Offset width, whether a null bitmap follows, and reserved sync bits. Unknown bits are rejected. The page format versions the layout, so records carry no version byte. |
 | Column count | 1 byte | The number of stored columns: at most 255, since every table has a key column |
 | Sync metadata | 0 bytes until sync ships | Present only when a sync flag is set (S5) |
 | Null bitmap | ⌈n / 8⌉ bytes, or none | Present only when a stored column is `NULL` |
@@ -285,7 +284,7 @@ Values are encoded by column type:
 
 Reading column *i* takes two offset loads and a slice. There is no parsing and
 no allocation, and a text value is a `&str` borrowed straight from the page.
-The benchmark row shrinks from 87 bytes to 50, and its key from 11 bytes to 8.
+The benchmark row shrinks from 87 bytes to 49, and its key from 11 bytes to 8.
 
 Each value has exactly one valid encoding, so records are canonical by
 construction. Checking a record means checking its bounds and minimal forms,

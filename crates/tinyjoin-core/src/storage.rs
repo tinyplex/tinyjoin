@@ -791,7 +791,7 @@ fn index_lookup_key(
     let Some(bytes) = storage_tuple_bytes(schema, &definition.columns, row, true)? else {
         return Ok(None);
     };
-    ensure_storage_key_bytes(checked_row_write_add(bytes, 1)?)?;
+    ensure_storage_key_bytes(bytes)?;
     index_key_from_stored_row(schema, definition, row)
 }
 
@@ -901,15 +901,27 @@ pub(crate) fn normalize_row(schema: &TableDefinition, mut row: Row) -> Result<Ro
             let value = column.default.clone().unwrap_or(Value::Null);
             row.insert(column.name.clone(), value);
         }
-        validate_value(
-            column,
-            row.get(&column.name)
-                .expect("the catalog column was populated above"),
-            &schema.name,
-        )?;
+        let value = row
+            .get_mut(&column.name)
+            .expect("the catalog column was populated above");
+        validate_value(column, value, &schema.name)?;
+        // A FLOAT is one binary64 number, however its JSON was spelled, so `1` and `1.0` store
+        // and compare as the same value.
+        if column.data_type == ColumnType::Float && !value.is_null() {
+            *value = float_value(value);
+        }
     }
     validate_row_value_limits(&row).map_err(|error| EngineError::invalid_change(error.message))?;
     Ok(row)
+}
+
+/// A number as the binary64 value a FLOAT column holds. Numbers JavaScript can represent convert
+/// exactly; any other value is returned unchanged.
+pub(crate) fn float_value(value: &Value) -> Value {
+    match value.as_f64().and_then(serde_json::Number::from_f64) {
+        Some(number) if !value.is_f64() => Value::Number(number),
+        _ => value.clone(),
+    }
 }
 
 pub(crate) fn validate_value(column: &ColumnDefinition, value: &Value, table: &str) -> Result<()> {
@@ -1203,10 +1215,7 @@ pub(crate) fn validate_secondary_storage_key_bound(
     };
     let primary_bytes = storage_tuple_bytes(schema, &schema.primary_key, row, false)?
         .ok_or_else(|| EngineError::invalid_change("A primary key cannot contain null"))?;
-    ensure_storage_key_bytes(checked_row_write_add(
-        checked_row_write_add(index_bytes, 1)?,
-        primary_bytes,
-    )?)
+    ensure_storage_key_bytes(checked_row_write_add(index_bytes, primary_bytes)?)
 }
 
 fn storage_tuple_bytes(
@@ -1238,21 +1247,37 @@ fn storage_tuple_bytes(
             .find(|column| column.name == *name)
             .ok_or_else(|| EngineError::column_not_found(name, &schema.name))?
             .data_type;
-        let payload = match data_type {
-            ColumnType::Boolean => 1,
-            ColumnType::Integer | ColumnType::Float => 8,
-            ColumnType::Text => value.as_str().map(str::len).ok_or_else(|| {
+        bytes = checked_row_write_add(bytes, key_component_bytes(schema, name, data_type, value)?)?;
+        ensure_storage_key_bytes(bytes)?;
+    }
+    Ok(Some(bytes))
+}
+
+/// The encoded size of one page format 3 key component: fixed-width scalars, and text with each
+/// zero byte escaped and a two-byte terminator. JSON cannot be a key column.
+fn key_component_bytes(
+    schema: &TableDefinition,
+    name: &str,
+    data_type: ColumnType,
+    value: &Value,
+) -> Result<usize> {
+    match data_type {
+        ColumnType::Boolean => Ok(1),
+        ColumnType::Integer | ColumnType::Float => Ok(8),
+        ColumnType::Text => value
+            .as_str()
+            .map(|text| text.len() + text.bytes().filter(|byte| *byte == 0).count() + 2)
+            .ok_or_else(|| {
                 EngineError::type_mismatch(format!(
                     "Key column `{name}` in `{}` expects text",
                     schema.name
                 ))
-            })?,
-            ColumnType::Json => validate_json_value(value)?,
-        };
-        bytes = checked_row_write_add(bytes, checked_row_write_add(3, payload)?)?;
-        ensure_storage_key_bytes(bytes)?;
+            }),
+        ColumnType::Json => Err(EngineError::type_mismatch(format!(
+            "JSON column `{name}` in `{}` cannot be part of a key",
+            schema.name
+        ))),
     }
-    Ok(Some(bytes))
 }
 
 fn ensure_storage_key_bytes(bytes: usize) -> Result<()> {
@@ -1443,18 +1468,8 @@ fn validate_prospective_storage_keys(
                 .find(|column| column.name == *name)
                 .ok_or_else(|| EngineError::column_not_found(name, &schema.name))?
                 .data_type;
-            let payload = match data_type {
-                ColumnType::Boolean => 1,
-                ColumnType::Integer | ColumnType::Float => 8,
-                ColumnType::Text => value.as_str().map(str::len).ok_or_else(|| {
-                    EngineError::type_mismatch(format!(
-                        "Key column `{name}` in `{}` expects text",
-                        schema.name
-                    ))
-                })?,
-                ColumnType::Json => validate_json_value(value)?,
-            };
-            bytes = checked_row_write_add(bytes, checked_row_write_add(3, payload)?)?;
+            bytes =
+                checked_row_write_add(bytes, key_component_bytes(schema, name, data_type, value)?)?;
             ensure_storage_key_bytes(bytes)?;
         }
         Ok(Some(bytes))
@@ -1470,10 +1485,7 @@ fn validate_prospective_storage_keys(
         let Some(index_bytes) = tuple_bytes(&definition.columns, true)? else {
             continue;
         };
-        ensure_storage_key_bytes(checked_row_write_add(
-            checked_row_write_add(index_bytes, 1)?,
-            primary_bytes,
-        )?)?;
+        ensure_storage_key_bytes(checked_row_write_add(index_bytes, primary_bytes)?)?;
     }
     Ok(())
 }

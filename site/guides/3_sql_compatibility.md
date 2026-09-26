@@ -523,10 +523,11 @@ An ordered query can reach its materialization limit before applying a small
 left-deep chain, not separately to each step and not just to returned rows. The
 candidate limit is enforced by a runtime counter, including comparisons that
 fail the join condition. The
-1,024-byte secondary-index key limit covers the complete encoded indexed tuple,
-separator, and primary-key tuple together, not each component independently.
-An individual JSON value remains subject to the smaller budget for the row that
-contains it.
+1,024-byte secondary-index key limit covers the complete encoded indexed tuple
+and primary-key tuple together, not each component independently. A boolean
+component takes 1 byte, an integer or float 8, and text its UTF-8 bytes plus 2,
+and 1 more for each zero byte. An individual JSON value remains subject to the
+smaller budget for the row that contains it.
 
 Every occurrence of a parameter in a statement counts toward the expanded
 binding budget. Repeating one large `$1` value many times can therefore fail

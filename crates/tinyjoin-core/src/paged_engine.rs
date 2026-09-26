@@ -1439,7 +1439,7 @@ mod tests {
                 .query_sql("SELECT id, label FROM aliases ORDER BY id", &[])
                 .unwrap()
                 .rows,
-            vec![row(json!({"id": 2, "label": "prior"}))]
+            vec![row(json!({"id": 2.0, "label": "prior"}))]
         );
         let committed = engine.commit_transaction().unwrap();
         assert_eq!(committed.revision, revision + 1);
@@ -1451,7 +1451,7 @@ mod tests {
                 .query_sql("SELECT id, label FROM aliases ORDER BY id", &[])
                 .unwrap()
                 .rows,
-            vec![row(json!({"id": 2, "label": "prior"}))]
+            vec![row(json!({"id": 2.0, "label": "prior"}))]
         );
     }
 

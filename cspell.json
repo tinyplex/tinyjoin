@@ -88,6 +88,7 @@
     "rlib",
     "rparen",
     "rsplit",
+    "rusage",
     "rustc",
     "RUSTFLAGS",
     "rustup",
@@ -113,6 +114,7 @@
     "underflowed",
     "unflushed",
     "unindexed",
+    "uninit",
     "unorderable",
     "unrevisioned",
     "unstub",
@@ -120,7 +122,8 @@
     "upserted",
     "upserts",
     "VARCHAR",
-    "Wordmark"
+    "Wordmark",
+    "xorshift"
   ],
   "ignoreWords": [],
   "import": [],

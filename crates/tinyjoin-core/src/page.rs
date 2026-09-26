@@ -41,7 +41,9 @@ const PAGE_FLAGS: u16 = 0;
 const PAGE_CRC_OFFSET: usize = 28;
 
 const SUPERBLOCK_MAGIC: &[u8; 8] = b"TGRSUPR\0";
-const SUPERBLOCK_FORMAT_VERSION: u16 = 2;
+// Page format 3 stores rows as packed records and keys in an order-preserving encoding. Earlier
+// databases are refused with UNSUPPORTED_PAGE rather than read under the wrong layout.
+const SUPERBLOCK_FORMAT_VERSION: u16 = 3;
 const SUPERBLOCK_FLAGS: u16 = 0;
 const SUPERBLOCK_PAYLOAD_SIZE: usize = 96;
 
@@ -1106,7 +1108,10 @@ mod tests {
         let expected = Superblock::new(SuperblockSlot::A);
         let page = expected.encode_page().unwrap();
         for (offset, value, code) in [
-            (8, 3, "UNSUPPORTED_PAGE"),
+            // Page format 2 databases, from v0.1.0 through v0.3.0, are refused, as is a future
+            // format.
+            (8, 2, "UNSUPPORTED_PAGE"),
+            (8, 4, "UNSUPPORTED_PAGE"),
             (10, 1, "UNSUPPORTED_PAGE"),
             (12, 1, "UNSUPPORTED_PAGE"),
             (16, 1, "UNSUPPORTED_PAGE"),
@@ -1468,7 +1473,7 @@ mod tests {
         }
 
         let mut unsupported_superblock_payload = newer.superblock;
-        mutate_payload(&mut unsupported_superblock_payload, 8, 3);
+        mutate_payload(&mut unsupported_superblock_payload, 8, 2);
         let unsupported = RawMetadataSlot::new(
             &unsupported_superblock_payload,
             [

@@ -14,7 +14,7 @@ use crate::{
     paged_codec::{
         CATALOG_TREE_ID, CatalogIndexRecord, CatalogKey, CatalogTableRecord, FIRST_USER_TREE_ID,
         decode_catalog_header_record, decode_catalog_index_record, decode_catalog_key,
-        decode_catalog_table_record, decode_row, encode_primary_key,
+        decode_catalog_table_record, decode_row, decode_row_strictly, encode_primary_key,
         encode_secondary_index_entry_key, encode_secondary_index_prefix,
         secondary_index_entry_matches_prefix, secondary_index_primary_key,
         secondary_index_primary_key_for_definition,
@@ -509,7 +509,7 @@ fn lookup_encoded_primary_key<D: PageDevice>(
         return Ok(None);
     };
     Btree::get(pager, root, table.tree_id, key)?
-        .map(|value| validated_row(&table.schema, key, &value))
+        .map(|value| stored_row(&table.schema, key, &value))
         .transpose()
 }
 
@@ -644,7 +644,7 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
             let Some((key, value)) = next else {
                 break;
             };
-            let row = validated_row(&table.schema, &key, &value)?;
+            let row = stored_row(&table.schema, &key, &value)?;
             if visitor(&row)? == VisitControl::Stop {
                 return Ok(VisitOutcome::Stopped);
             }
@@ -676,7 +676,7 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
             table.tree_id,
             &encoded_key,
         )?
-        .map(|value| validated_row(&table.schema, &encoded_key, &value))
+        .map(|value| stored_row(&table.schema, &encoded_key, &value))
         .transpose()
     }
 
@@ -777,7 +777,7 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
                     index.definition.name
                 ))
             })?;
-            let row = validated_row(&table_data.schema, primary_key, &row_value)?;
+            let row = stored_row(&table_data.schema, primary_key, &row_value)?;
             if encode_secondary_index_entry_key(&table_data.schema, &index.definition, &row)?
                 .as_deref()
                 != Some(entry_key.as_slice())
@@ -1046,7 +1046,8 @@ fn validate_index_tree<D: PageDevice>(
                     record.definition.name
                 ))
             })?;
-        let row = validated_row(&table.schema, primary_key, &row_value)?;
+        // Every table row was validated strictly before its indexes are checked.
+        let row = stored_row(&table.schema, primary_key, &row_value)?;
         let expected = encode_secondary_index_entry_key(&table.schema, &record.definition, &row)?;
         if expected.as_deref() != Some(entry_key.as_slice()) {
             return Err(storage_corrupt(format!(
@@ -1110,7 +1111,7 @@ fn expected_index_entry_count<D: PageDevice>(
     let mut count = 0_u64;
     let mut cursor = Btree::cursor(pager, root, table.tree_id)?;
     while let Some((key, value)) = cursor.next(pager)? {
-        let row = validated_row(&table.schema, &key, &value)?;
+        let row = stored_row(&table.schema, &key, &value)?;
         if encode_secondary_index_entry_key(&table.schema, definition, &row)?.is_some() {
             count = count
                 .checked_add(1)
@@ -1120,8 +1121,19 @@ fn expected_index_entry_count<D: PageDevice>(
     Ok(count)
 }
 
+/// Decodes a stored row for a read.
+///
+/// Pages are verified as they are loaded, and every row was checked when it was written or when
+/// the database was opened, so reads skip the canonical-encoding and schema checks that
+/// [`validated_row`] makes.
+pub(crate) fn stored_row(schema: &TableDefinition, key: &[u8], value: &[u8]) -> Result<Row> {
+    decode_row(schema, key, value)
+}
+
+/// Decodes a stored row, rejecting any encoding this engine would not have written and any row
+/// that does not match its schema. Opening a database checks every row this way.
 pub(crate) fn validated_row(schema: &TableDefinition, key: &[u8], value: &[u8]) -> Result<Row> {
-    let row = decode_row(value)?;
+    let row = decode_row_strictly(schema, key, value)?;
     let normalized = normalize_row(schema, row.clone()).map_err(|error| {
         storage_corrupt(format!(
             "Stored row in `{}` does not match its schema: {}",
@@ -1134,12 +1146,6 @@ pub(crate) fn validated_row(schema: &TableDefinition, key: &[u8], value: &[u8]) 
             schema.name
         )));
     }
-    if encode_primary_key(schema, &row).map_err(as_storage_corruption)? != key {
-        return Err(storage_corrupt(format!(
-            "Stored row in `{}` does not match its B-tree key",
-            schema.name
-        )));
-    }
     Ok(row)
 }
 
@@ -1149,10 +1155,6 @@ pub(crate) fn limit_error(message: impl Into<String>) -> EngineError {
 
 pub(crate) fn storage_corrupt(message: impl Into<String>) -> EngineError {
     EngineError::new("STORAGE_CORRUPT", message)
-}
-
-fn as_storage_corruption(error: EngineError) -> EngineError {
-    storage_corrupt(error.message)
 }
 
 #[cfg(test)]
@@ -1687,7 +1689,7 @@ mod tests {
         let mut transaction = pager.begin_write().unwrap();
         let invalid_row = row(json!({"id": 10, "author_id": 1, "state": "draft", "rank": null}));
         let primary_key = encode_primary_key(&table.schema, &invalid_row).unwrap();
-        let row_value = crate::paged_codec::encode_row(&invalid_row).unwrap();
+        let row_value = crate::paged_codec::encode_row(&table.schema, &invalid_row).unwrap();
         let table_root = Btree::upsert(
             &mut transaction,
             table.root_page_id.unwrap(),

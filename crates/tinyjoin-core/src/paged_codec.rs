@@ -17,18 +17,27 @@ pub(crate) const MAX_STORED_COUNT: u64 = u32::MAX as u64;
 const CATALOG_HEADER_KEY: u8 = 0x00;
 const CATALOG_TABLE_KEY: u8 = 0x10;
 const CATALOG_INDEX_KEY: u8 = 0x20;
-const INDEX_PRIMARY_KEY_SEPARATOR: u8 = 0xff;
+// Keys in page format 3: every component compares correctly as raw bytes and delimits itself, so
+// a tuple is its components concatenated, and a B-tree orders keys as SQL orders their values.
+// BOOLEAN is one byte, INTEGER and FLOAT eight sortable big-endian bytes, and TEXT its UTF-8
+// bytes, with each 0x00 written as 0x00 0xff, followed by 0x00 0x01. Byte order is then Unicode
+// code-point order. JSON cannot be a key column.
+const TEXT_ESCAPED_ZERO: u8 = 0xff;
+const TEXT_TERMINATOR: u8 = 0x01;
 
-const COMPONENT_BOOLEAN: u8 = 0x01;
-const COMPONENT_INTEGER: u8 = 0x02;
-const COMPONENT_FLOAT: u8 = 0x03;
-const COMPONENT_TEXT: u8 = 0x04;
-const COMPONENT_JSON: u8 = 0x05;
+// Rows in page format 3: a flags byte, the stored column count, a null bitmap if any stored
+// column is NULL, the end offset of every stored column but the last, then the packed values.
+// Primary-key columns live only in the B-tree key, and trailing columns that equal their defaults
+// are not stored.
+const RECORD_OFFSET_WIDTH: u8 = 0b0000_0011;
+const RECORD_HAS_NULLS: u8 = 0b0000_0100;
+/// Reserved for sync metadata: a row HLC, a column exception list, and a tombstone. A record with
+/// any of these bits, or an unknown one, is rejected until a sync protocol defines them.
+const RECORD_RESERVED: u8 = 0b1111_1000;
+const RECORD_HEADER_BYTES: usize = 2;
 
 const RECORD_VERSION: u8 = 1;
 const RECORD_FLAGS: u8 = 0;
-const RECORD_PREFIX_BYTES: usize = 4;
-const ROW_HEADER_BYTES: usize = 8;
 const CATALOG_HEADER_BYTES: usize = 20;
 const CATALOG_ITEM_HEADER_BYTES: usize = 40;
 const NO_PAGE_ID: PageId = u64::MAX;
@@ -36,6 +45,7 @@ pub(crate) const MAX_TREE_ID: TreeId = u64::MAX - 1;
 const MAX_JSON_DEPTH: usize = 64;
 const MAX_JSON_NODES: usize = 1_000_000;
 const MAX_COLUMNS: usize = 256;
+const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CatalogHeader {
@@ -82,12 +92,12 @@ pub(crate) fn secondary_index_primary_key_for_definition<'a>(
     validate_index_identity(schema, definition).map_err(as_storage_corruption)?;
     validate_key_size(entry).map_err(as_storage_corruption)?;
     let offset = validate_tuple_prefix(schema, &definition.columns, entry, 0)?;
-    if entry.get(offset) != Some(&INDEX_PRIMARY_KEY_SEPARATOR) || offset + 1 == entry.len() {
+    if offset == entry.len() {
         return Err(storage_corrupt(
-            "A secondary-index entry does not contain its tuple boundary and primary key",
+            "A secondary-index entry does not contain a primary key after its tuple",
         ));
     }
-    let primary_key = &entry[offset + 1..];
+    let primary_key = &entry[offset..];
     let end = validate_tuple_prefix(schema, &schema.primary_key, primary_key, 0)?;
     if end != primary_key.len() {
         return Err(storage_corrupt(
@@ -120,7 +130,7 @@ pub(crate) fn encode_primary_key(schema: &TableDefinition, row: &Row) -> Result<
     Ok(key)
 }
 
-/// Encodes an index tuple followed by the boundary byte used for prefix seeks.
+/// Encodes an index tuple, which prefixes every entry for that tuple.
 ///
 /// `None` follows PostgreSQL's default index semantics for a tuple containing SQL NULL: it is not
 /// represented in the index and cannot satisfy an equality lookup.
@@ -130,15 +140,14 @@ pub(crate) fn encode_secondary_index_prefix(
     row: &Row,
 ) -> Result<Option<Vec<u8>>> {
     validate_index_identity(schema, definition)?;
-    let Some(mut key) = encode_columns(schema, &definition.columns, row, NullPolicy::Omit)? else {
+    let Some(key) = encode_columns(schema, &definition.columns, row, NullPolicy::Omit)? else {
         return Ok(None);
     };
-    key.push(INDEX_PRIMARY_KEY_SEPARATOR);
     validate_key_size(&key)?;
     Ok(Some(key))
 }
 
-/// Encodes one secondary-index entry as `indexed tuple || 0xff || primary-key tuple`.
+/// Encodes one secondary-index entry as `indexed tuple || primary-key tuple`.
 pub(crate) fn encode_secondary_index_entry_key(
     schema: &TableDefinition,
     definition: &IndexDefinition,
@@ -152,8 +161,10 @@ pub(crate) fn encode_secondary_index_entry_key(
     Ok(Some(key))
 }
 
+/// Reports whether an index entry holds the tuple `prefix` encodes. Components delimit themselves,
+/// so an entry for any other tuple cannot begin with these bytes.
 pub(crate) fn secondary_index_entry_matches_prefix(entry: &[u8], prefix: &[u8]) -> bool {
-    prefix.last() == Some(&INDEX_PRIMARY_KEY_SEPARATOR) && entry.starts_with(prefix)
+    entry.len() > prefix.len() && entry.starts_with(prefix)
 }
 
 /// Returns the encoded primary key carried by an index entry already matched to `prefix`.
@@ -167,41 +178,360 @@ pub(crate) fn secondary_index_primary_key<'a>(entry: &'a [u8], prefix: &[u8]) ->
     Ok(&entry[prefix.len()..])
 }
 
-pub(crate) fn encode_row(row: &Row) -> Result<Vec<u8>> {
-    let body = encode_canonical_json(&Value::Object(row.clone()))?;
-    let total = ROW_HEADER_BYTES
-        .checked_add(body.len())
-        .ok_or_else(|| value_too_large("Encoded row length overflowed"))?;
+/// Encodes a normalized row as a page format 3 record. The primary key is not repeated: it is the
+/// entry's B-tree key.
+pub(crate) fn encode_row(schema: &TableDefinition, row: &Row) -> Result<Vec<u8>> {
+    let stored = stored_columns(schema);
+    let mut data = Vec::new();
+    let mut ends = Vec::with_capacity(stored.len());
+    let mut nulls = Vec::with_capacity(stored.len());
+    for column in &stored {
+        let value = row.get(&column.name).ok_or_else(|| {
+            codec_argument(format!(
+                "Row for `{}` is missing column `{}`",
+                schema.name, column.name
+            ))
+        })?;
+        nulls.push(value.is_null());
+        if !value.is_null() {
+            encode_value(column, value, &mut data, &schema.name)?;
+        }
+        ends.push(data.len());
+    }
+
+    // Omit trailing columns that equal their defaults. A column's default is a literal no later
+    // statement can change, so this is canonical, and ADD COLUMN needs no rewrite.
+    let mut count = stored.len();
+    while count > 0 {
+        let start = if count >= 2 { ends[count - 2] } else { 0 };
+        let stored_value = (!nulls[count - 1]).then(|| &data[start..ends[count - 1]]);
+        if !is_default(stored[count - 1], stored_value, &schema.name)? {
+            break;
+        }
+        count -= 1;
+    }
+    data.truncate(if count == 0 { 0 } else { ends[count - 1] });
+
+    let largest_offset = if count >= 2 { ends[count - 2] } else { 0 };
+    let (width_code, width) = offset_width(largest_offset);
+    let has_nulls = nulls[..count].iter().any(|null| *null);
+    let bitmap_bytes = if has_nulls { count.div_ceil(8) } else { 0 };
+    let total = RECORD_HEADER_BYTES + bitmap_bytes + count.saturating_sub(1) * width + data.len();
     if total > MAX_PAGED_VALUE_BYTES {
         return Err(value_too_large(format!(
             "An encoded row cannot exceed {MAX_PAGED_VALUE_BYTES} bytes"
         )));
     }
-    let mut bytes = Vec::with_capacity(total);
-    append_record_prefix(&mut bytes);
-    bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(&body);
-    Ok(bytes)
+    let mut record = Vec::with_capacity(total);
+    record.push(width_code | if has_nulls { RECORD_HAS_NULLS } else { 0 });
+    record.push(u8::try_from(count).map_err(|_| {
+        codec_argument(format!(
+            "Table `{}` cannot store more than 255 non-key columns",
+            schema.name
+        ))
+    })?);
+    if has_nulls {
+        let mut bitmap = vec![0u8; bitmap_bytes];
+        for (index, _) in nulls[..count].iter().enumerate().filter(|(_, null)| **null) {
+            bitmap[index / 8] |= 1 << (index % 8);
+        }
+        record.extend_from_slice(&bitmap);
+    }
+    for end in &ends[..count.saturating_sub(1)] {
+        record.extend_from_slice(&(*end as u32).to_le_bytes()[..width]);
+    }
+    record.extend_from_slice(&data);
+    Ok(record)
 }
 
-pub(crate) fn decode_row(bytes: &[u8]) -> Result<Row> {
-    if bytes.len() < ROW_HEADER_BYTES || bytes.len() > MAX_PAGED_VALUE_BYTES {
-        return Err(storage_corrupt(format!(
-            "An encoded row must contain between {ROW_HEADER_BYTES} and {MAX_PAGED_VALUE_BYTES} bytes"
-        )));
+/// Decodes a stored table entry for a read: the primary key from its B-tree key, and every other
+/// column from its record, in schema order.
+///
+/// Stored pages are verified as they are loaded, and rows were checked when written or when the
+/// database was opened, so this checks only what reading safely requires. [`decode_row_strictly`]
+/// also rejects every non-canonical encoding.
+pub(crate) fn decode_row(schema: &TableDefinition, key: &[u8], value: &[u8]) -> Result<Row> {
+    decode_entry(schema, key, value, false)
+}
+
+/// Decodes a stored table entry, rejecting any encoding this engine would not have written.
+pub(crate) fn decode_row_strictly(
+    schema: &TableDefinition,
+    key: &[u8],
+    value: &[u8],
+) -> Result<Row> {
+    decode_entry(schema, key, value, true)
+}
+
+fn decode_entry(schema: &TableDefinition, key: &[u8], value: &[u8], strict: bool) -> Result<Row> {
+    let mut row = Row::new();
+    let mut offset = 0;
+    for name in &schema.primary_key {
+        let data_type = schema_column_type(schema, name).map_err(as_storage_corruption)?;
+        let end = component_end(key, offset, data_type)?;
+        row.insert(
+            name.clone(),
+            decode_component(&key[offset..end], data_type)?,
+        );
+        offset = end;
     }
-    validate_record_prefix(bytes, "row")?;
-    let body_length = read_u32(bytes, RECORD_PREFIX_BYTES) as usize;
-    if ROW_HEADER_BYTES.checked_add(body_length) != Some(bytes.len()) {
+    if offset != key.len() {
         return Err(storage_corrupt(
-            "Encoded row length does not match its header",
+            "A stored row key contains trailing bytes after its primary key",
         ));
     }
-    let value = decode_canonical_json(&bytes[ROW_HEADER_BYTES..], "row")?;
-    match value {
-        Value::Object(row) => Ok(row),
-        _ => Err(storage_corrupt("Encoded row JSON must be an object")),
+
+    let [flags, count, ..] = *value else {
+        return Err(storage_corrupt("A stored row record is truncated"));
+    };
+    if flags & RECORD_RESERVED != 0 || flags & RECORD_OFFSET_WIDTH == 3 {
+        return Err(storage_version(format!(
+            "Row record flags {flags:#04x} are not supported"
+        )));
     }
+    let stored = stored_columns(schema);
+    let count = count as usize;
+    if count > stored.len() {
+        return Err(storage_corrupt(
+            "A stored row record has more columns than its table",
+        ));
+    }
+    let width = 1 << (flags & RECORD_OFFSET_WIDTH);
+    let bitmap_bytes = if flags & RECORD_HAS_NULLS != 0 {
+        count.div_ceil(8)
+    } else {
+        0
+    };
+    let offsets_start = RECORD_HEADER_BYTES + bitmap_bytes;
+    let data_start = offsets_start + count.saturating_sub(1) * width;
+    if data_start > value.len() {
+        return Err(storage_corrupt("A stored row record is truncated"));
+    }
+    let bitmap = &value[RECORD_HEADER_BYTES..offsets_start];
+    let data = &value[data_start..];
+    let mut start = 0;
+    for (index, column) in stored.iter().enumerate() {
+        if index >= count {
+            row.insert(column.name.clone(), stored_default(column));
+            continue;
+        }
+        let end = if index + 1 == count {
+            data.len()
+        } else {
+            let at = offsets_start + index * width;
+            let mut bytes = [0; 4];
+            bytes[..width].copy_from_slice(&value[at..at + width]);
+            u32::from_le_bytes(bytes) as usize
+        };
+        if end < start || end > data.len() {
+            return Err(storage_corrupt(
+                "A stored row record has invalid column offsets",
+            ));
+        }
+        let bytes = &data[start..end];
+        start = end;
+        let null = bitmap
+            .get(index / 8)
+            .is_some_and(|byte| byte & (1 << (index % 8)) != 0);
+        let decoded = if null {
+            if !bytes.is_empty() {
+                return Err(storage_corrupt("A stored NULL column has a value"));
+            }
+            Value::Null
+        } else {
+            decode_value(column.data_type, bytes, strict)?
+        };
+        row.insert(column.name.clone(), decoded);
+    }
+
+    if strict {
+        let largest_offset = if count >= 2 {
+            let at = offsets_start + (count - 2) * width;
+            let mut bytes = [0; 4];
+            bytes[..width].copy_from_slice(&value[at..at + width]);
+            u32::from_le_bytes(bytes) as usize
+        } else {
+            0
+        };
+        let bit = |index: usize| {
+            bitmap
+                .get(index / 8)
+                .is_some_and(|byte| byte & (1 << (index % 8)) != 0)
+        };
+        let has_nulls = (0..count).any(bit);
+        let unused_bits = (count..bitmap.len() * 8).any(bit);
+        if offset_width(largest_offset).0 != flags & RECORD_OFFSET_WIDTH
+            || (flags & RECORD_HAS_NULLS != 0) != has_nulls
+            || unused_bits
+        {
+            return Err(storage_corrupt("A stored row record is not canonical"));
+        }
+        if count > 0 {
+            let column = stored[count - 1];
+            let mut last = Vec::new();
+            let last_value = match row.get(&column.name) {
+                Some(value) if !value.is_null() => {
+                    encode_value(column, value, &mut last, &schema.name)
+                        .map_err(as_storage_corruption)?;
+                    Some(last.as_slice())
+                }
+                _ => None,
+            };
+            if is_default(column, last_value, &schema.name).map_err(as_storage_corruption)? {
+                return Err(storage_corrupt(
+                    "A stored row record keeps a trailing default column",
+                ));
+            }
+        }
+    }
+    Ok(row)
+}
+
+/// A table's non-key columns, in schema order: the columns a row record stores.
+fn stored_columns(schema: &TableDefinition) -> Vec<&crate::ColumnDefinition> {
+    schema
+        .columns
+        .iter()
+        .filter(|column| !schema.primary_key.contains(&column.name))
+        .collect()
+}
+
+/// The value a row holds for a column its record omits: the column's default, normalized as it
+/// would be if it had been stored.
+fn stored_default(column: &crate::ColumnDefinition) -> Value {
+    match &column.default {
+        None => Value::Null,
+        Some(value) if column.data_type == ColumnType::Float => crate::storage::float_value(value),
+        Some(value) => value.clone(),
+    }
+}
+
+/// Reports whether a column's encoded value, or `None` for NULL, is its default's encoding. Encoded
+/// bytes decide, so values SQL considers equal but stores differently, such as `-0.0` and `0.0`,
+/// stay distinct.
+fn is_default(
+    column: &crate::ColumnDefinition,
+    encoded: Option<&[u8]>,
+    table: &str,
+) -> Result<bool> {
+    match (
+        column.default.as_ref().filter(|value| !value.is_null()),
+        encoded,
+    ) {
+        (None, encoded) => Ok(encoded.is_none()),
+        (Some(_), None) => Ok(false),
+        (Some(default), Some(encoded)) => {
+            let mut bytes = Vec::new();
+            encode_value(column, default, &mut bytes, table)?;
+            Ok(bytes == encoded)
+        }
+    }
+}
+
+/// The smallest offset width, and its flag code, that can hold `largest` bytes.
+fn offset_width(largest: usize) -> (u8, usize) {
+    if largest <= 0xff {
+        (0, 1)
+    } else if largest <= 0xffff {
+        (1, 2)
+    } else {
+        (2, 4)
+    }
+}
+
+fn encode_value(
+    column: &crate::ColumnDefinition,
+    value: &Value,
+    data: &mut Vec<u8>,
+    table: &str,
+) -> Result<()> {
+    match column.data_type {
+        ColumnType::Boolean => {
+            let value = value
+                .as_bool()
+                .ok_or_else(|| value_type_mismatch(table, &column.name, "boolean"))?;
+            data.push(u8::from(value));
+        }
+        ColumnType::Integer => {
+            let value = safe_integer(value)
+                .ok_or_else(|| value_type_mismatch(table, &column.name, "integer"))?;
+            let length = integer_length(value);
+            data.extend_from_slice(&value.to_le_bytes()[..length]);
+        }
+        ColumnType::Float => {
+            let value = value
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| value_type_mismatch(table, &column.name, "finite float"))?;
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        ColumnType::Text => {
+            let value = value
+                .as_str()
+                .ok_or_else(|| value_type_mismatch(table, &column.name, "text"))?;
+            data.extend_from_slice(value.as_bytes());
+        }
+        ColumnType::Json => data.extend_from_slice(&encode_canonical_json(value)?),
+    }
+    Ok(())
+}
+
+/// The fewest little-endian bytes whose sign extension is `value`; zero needs none.
+fn integer_length(value: i64) -> usize {
+    if value == 0 {
+        return 0;
+    }
+    (1..=8)
+        .find(|length| {
+            let shift = 64 - 8 * length;
+            (value << shift) >> shift == value
+        })
+        .expect("eight bytes hold every integer")
+}
+
+fn decode_value(data_type: ColumnType, bytes: &[u8], strict: bool) -> Result<Value> {
+    let value = match data_type {
+        ColumnType::Boolean => match bytes {
+            [0] => Value::Bool(false),
+            [1] => Value::Bool(true),
+            _ => return Err(storage_corrupt("A stored boolean is not canonical")),
+        },
+        ColumnType::Integer => {
+            if bytes.len() > 7 {
+                return Err(storage_corrupt("A stored integer is too long"));
+            }
+            let mut raw = [0; 8];
+            raw[..bytes.len()].copy_from_slice(bytes);
+            let shift = 64 - 8 * bytes.len() as u32;
+            let value = if bytes.is_empty() {
+                0
+            } else {
+                (i64::from_le_bytes(raw) << shift) >> shift
+            };
+            if value.unsigned_abs() > MAX_SAFE_INTEGER
+                || strict && integer_length(value) != bytes.len()
+            {
+                return Err(storage_corrupt("A stored integer is not canonical"));
+            }
+            Value::from(value)
+        }
+        ColumnType::Float => {
+            let bytes = <[u8; 8]>::try_from(bytes)
+                .map_err(|_| storage_corrupt("A stored float is not eight bytes"))?;
+            serde_json::Number::from_f64(f64::from_le_bytes(bytes))
+                .map(Value::Number)
+                .ok_or_else(|| storage_corrupt("A stored float is not finite"))?
+        }
+        ColumnType::Text => Value::String(
+            std::str::from_utf8(bytes)
+                .map_err(|_| storage_corrupt("A stored text value is not valid UTF-8"))?
+                .to_owned(),
+        ),
+        ColumnType::Json if strict => decode_canonical_json(bytes, "JSON column")?,
+        ColumnType::Json => serde_json::from_slice(bytes)
+            .map_err(|error| storage_corrupt(format!("A stored JSON value is invalid: {error}")))?,
+    };
+    Ok(value)
 }
 
 pub(crate) fn encode_catalog_header_record(header: &CatalogHeader) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -424,13 +754,13 @@ fn encode_component(
             let value = value
                 .as_bool()
                 .ok_or_else(|| key_type_mismatch(table, column, "boolean"))?;
-            append_component(key, COMPONENT_BOOLEAN, &[u8::from(value)])
+            key.push(u8::from(value));
         }
         ColumnType::Integer => {
             let value =
                 safe_integer(value).ok_or_else(|| key_type_mismatch(table, column, "integer"))?;
             let sortable = (value as u64) ^ (1_u64 << 63);
-            append_component(key, COMPONENT_INTEGER, &sortable.to_be_bytes())
+            key.extend_from_slice(&sortable.to_be_bytes());
         }
         ColumnType::Float => {
             let Value::Number(number) = value else {
@@ -440,9 +770,9 @@ fn encode_component(
                 .as_f64()
                 .filter(|value| value.is_finite())
                 .ok_or_else(|| key_type_mismatch(table, column, "finite float"))?;
-            // SQL comparison already operates in f64 space. Normalize both the JSON spelling and
-            // signed zero before deriving lexicographically sortable IEEE-754 bytes, so a B-tree
-            // cannot admit two primary keys which SQL considers equal.
+            // SQL comparison already operates in f64 space. Normalize signed zero before deriving
+            // lexicographically sortable IEEE-754 bytes, so a B-tree cannot admit two primary
+            // keys which SQL considers equal.
             let normalized = if value == 0.0 { 0.0 } else { value };
             let bits = normalized.to_bits();
             let sortable = if bits & (1_u64 << 63) == 0 {
@@ -450,47 +780,115 @@ fn encode_component(
             } else {
                 !bits
             };
-            append_component(key, COMPONENT_FLOAT, &sortable.to_be_bytes())
+            key.extend_from_slice(&sortable.to_be_bytes());
         }
         ColumnType::Text => {
             let value = value
                 .as_str()
                 .ok_or_else(|| key_type_mismatch(table, column, "text"))?;
-            append_component(key, COMPONENT_TEXT, value.as_bytes())
+            for byte in value.bytes() {
+                key.push(byte);
+                if byte == 0 {
+                    key.push(TEXT_ESCAPED_ZERO);
+                }
+            }
+            key.extend_from_slice(&[0, TEXT_TERMINATOR]);
         }
-        ColumnType::Json => append_component(key, COMPONENT_JSON, &encode_canonical_json(value)?),
+        ColumnType::Json => {
+            return Err(codec_argument(format!(
+                "JSON column `{column}` in `{table}` cannot be part of a key"
+            )));
+        }
     }
-}
-
-fn append_component(key: &mut Vec<u8>, tag: u8, payload: &[u8]) -> Result<()> {
-    let length = u16::try_from(payload.len()).map_err(|_| {
-        value_too_large("A single key component cannot exceed 65,535 encoded bytes")
-    })?;
-    key.push(tag);
-    key.extend_from_slice(&length.to_be_bytes());
-    key.extend_from_slice(payload);
     Ok(())
 }
 
-fn component_end(key: &[u8], offset: usize) -> Result<usize> {
-    let header_end = offset
-        .checked_add(3)
-        .filter(|end| *end <= key.len())
-        .ok_or_else(|| storage_corrupt("A storage key component header is truncated"))?;
-    if !matches!(
-        key[offset],
-        COMPONENT_BOOLEAN | COMPONENT_INTEGER | COMPONENT_FLOAT | COMPONENT_TEXT | COMPONENT_JSON
-    ) {
-        return Err(storage_version(format!(
-            "Storage key component tag {:#04x} is not supported",
-            key[offset]
-        )));
+/// Returns where the key component starting at `offset` ends.
+fn component_end(key: &[u8], offset: usize, data_type: ColumnType) -> Result<usize> {
+    let fixed = |length: usize| {
+        offset
+            .checked_add(length)
+            .filter(|end| *end <= key.len())
+            .ok_or_else(|| storage_corrupt("A storage key component is truncated"))
+    };
+    match data_type {
+        ColumnType::Boolean => fixed(1),
+        ColumnType::Integer | ColumnType::Float => fixed(8),
+        ColumnType::Text => {
+            let mut index = offset;
+            loop {
+                let zero = key
+                    .get(index..)
+                    .and_then(|rest| rest.iter().position(|byte| *byte == 0))
+                    .ok_or_else(|| storage_corrupt("A text key component is not terminated"))?
+                    + index;
+                match key.get(zero + 1) {
+                    Some(&TEXT_TERMINATOR) => return Ok(zero + 2),
+                    Some(&TEXT_ESCAPED_ZERO) => index = zero + 2,
+                    _ => {
+                        return Err(storage_corrupt(
+                            "A text key component contains an invalid escape",
+                        ));
+                    }
+                }
+            }
+        }
+        ColumnType::Json => Err(storage_corrupt("A storage key cannot contain JSON")),
     }
-    let length = u16::from_be_bytes([key[offset + 1], key[offset + 2]]) as usize;
-    header_end
-        .checked_add(length)
-        .filter(|end| *end <= key.len())
-        .ok_or_else(|| storage_corrupt("A storage key component payload is truncated"))
+}
+
+/// Decodes one complete key component, rejecting any encoding the encoder would not produce.
+fn decode_component(bytes: &[u8], data_type: ColumnType) -> Result<Value> {
+    let sortable = || {
+        <[u8; 8]>::try_from(bytes)
+            .map(u64::from_be_bytes)
+            .map_err(|_| storage_corrupt("A storage key component has the wrong length"))
+    };
+    match data_type {
+        ColumnType::Boolean => match bytes {
+            [0] => Ok(Value::Bool(false)),
+            [1] => Ok(Value::Bool(true)),
+            _ => Err(storage_corrupt("A boolean key component is not canonical")),
+        },
+        ColumnType::Integer => {
+            let value = (sortable()? ^ (1_u64 << 63)) as i64;
+            if value.unsigned_abs() > MAX_SAFE_INTEGER {
+                return Err(storage_corrupt("An integer key component is out of range"));
+            }
+            Ok(Value::from(value))
+        }
+        ColumnType::Float => {
+            if !valid_encoded_float_component(bytes) {
+                return Err(storage_corrupt("A float key component is not canonical"));
+            }
+            let sortable = sortable()?;
+            let bits = if sortable & (1_u64 << 63) != 0 {
+                sortable ^ (1_u64 << 63)
+            } else {
+                !sortable
+            };
+            serde_json::Number::from_f64(f64::from_bits(bits))
+                .map(Value::Number)
+                .ok_or_else(|| storage_corrupt("A float key component is not finite"))
+        }
+        ColumnType::Text => {
+            let payload = &bytes[..bytes.len() - 2];
+            let mut text = Vec::with_capacity(payload.len());
+            let mut escaped = false;
+            for byte in payload {
+                if escaped {
+                    escaped = false;
+                } else {
+                    text.push(*byte);
+                    escaped = *byte == 0;
+                }
+            }
+            String::from_utf8(text)
+                .map(Value::String)
+                .map_err(|_| storage_corrupt("A text key component is not valid UTF-8"))
+        }
+        ColumnType::Json => Err(storage_corrupt("A storage key cannot contain JSON")),
+    }
 }
 
 fn validate_tuple_prefix(
@@ -500,31 +898,12 @@ fn validate_tuple_prefix(
     mut offset: usize,
 ) -> Result<usize> {
     for column in columns {
-        let start = offset;
-        offset = component_end(key, offset)?;
-        let payload = &key[start + 3..offset];
-        validate_encoded_component(key[start], payload, schema_column_type(schema, column)?)?;
+        let data_type = schema_column_type(schema, column)?;
+        let end = component_end(key, offset, data_type)?;
+        decode_component(&key[offset..end], data_type)?;
+        offset = end;
     }
     Ok(offset)
-}
-
-fn validate_encoded_component(tag: u8, payload: &[u8], data_type: ColumnType) -> Result<()> {
-    let valid = match data_type {
-        ColumnType::Boolean => tag == COMPONENT_BOOLEAN && matches!(payload, [0] | [1]),
-        ColumnType::Integer => tag == COMPONENT_INTEGER && payload.len() == 8,
-        ColumnType::Float => tag == COMPONENT_FLOAT && valid_encoded_float_component(payload),
-        ColumnType::Text => tag == COMPONENT_TEXT && std::str::from_utf8(payload).is_ok(),
-        ColumnType::Json => {
-            tag == COMPONENT_JSON && decode_canonical_json(payload, "JSON key component").is_ok()
-        }
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(storage_corrupt(
-            "A storage key component does not match its schema or canonical encoding",
-        ))
-    }
 }
 
 fn valid_encoded_float_component(payload: &[u8]) -> bool {
@@ -550,7 +929,6 @@ fn schema_column_type(schema: &TableDefinition, column: &str) -> Result<ColumnTy
 }
 
 fn safe_integer(value: &Value) -> Option<i64> {
-    const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
     value
         .as_u64()
         .filter(|number| *number <= MAX_SAFE_INTEGER)
@@ -1008,6 +1386,10 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
+fn value_type_mismatch(table: &str, column: &str, expected: &str) -> EngineError {
+    EngineError::type_mismatch(format!("Column `{column}` in `{table}` expects {expected}"))
+}
+
 fn key_type_mismatch(table: &str, column: &str, expected: &str) -> EngineError {
     EngineError::type_mismatch(format!(
         "Key column `{column}` in `{table}` expects {expected}"
@@ -1138,35 +1520,52 @@ mod tests {
         assert_eq!(
             encoded,
             [
-                &[
-                    0x02, 0x00, 0x08, 0x7f, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01
-                ][..],
-                &[
-                    0x02, 0x00, 0x08, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-                ],
-                &[
-                    0x02, 0x00, 0x08, 0x80, 0x1f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
-                ],
-                &[0x01, 0x00, 0x01, 0x00],
-                &[0x01, 0x00, 0x01, 0x01],
+                &[0x7f, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01][..],
+                &[0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+                &[0x80, 0x1f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+                &[0x00],
+                &[0x01],
             ]
             .concat()
         );
     }
 
     #[test]
-    fn text_components_are_utf8_length_delimited_and_composites_do_not_collide() {
+    fn text_components_are_escaped_terminated_and_ordered_by_code_point() {
         let schema = typed_schema(
             vec!["a", "b"],
             vec![("a", ColumnType::Text), ("b", ColumnType::Text)],
         );
-        let left = encode_primary_key(&schema, &row(json!({"a": "ab", "b": "c"}))).unwrap();
-        let right = encode_primary_key(&schema, &row(json!({"a": "a", "b": "bc"}))).unwrap();
-        assert_ne!(left, right);
+        let key =
+            |a: &str, b: &str| encode_primary_key(&schema, &row(json!({"a": a, "b": b}))).unwrap();
+        assert_ne!(key("ab", "c"), key("a", "bc"));
 
-        let unicode = encode_primary_key(&schema, &row(json!({"a": "a\u{0}é", "b": "λ"}))).unwrap();
-        assert_eq!(&unicode[..7], &[COMPONENT_TEXT, 0, 4, b'a', 0, 0xc3, 0xa9]);
-        assert_eq!(&unicode[7..], &[COMPONENT_TEXT, 0, 2, 0xce, 0xbb]);
+        let unicode = key("a\u{0}é", "λ");
+        assert_eq!(&unicode[..7], &[b'a', 0x00, 0xff, 0xc3, 0xa9, 0x00, 0x01]);
+        assert_eq!(&unicode[7..], &[0xce, 0xbb, 0x00, 0x01]);
+
+        // Byte order is SQL's code-point order, with shorter prefixes first, and a composite
+        // orders by its first column before its second.
+        let ordered = [
+            key("", "z"),
+            key("a", "z"),
+            key("a\u{0}", "a"),
+            key("a\u{1}", "a"),
+            key("ab", "a"),
+            key("b", ""),
+            key("b", "a"),
+            key("é", "a"),
+            key("λ", "a"),
+        ];
+        assert!(ordered.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let decoded = decode_row(
+            &schema,
+            &unicode,
+            &encode_row(&schema, &row(json!({"a": "a\u{0}é", "b": "λ"}))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded, row(json!({"a": "a\u{0}é", "b": "λ"})));
     }
 
     #[test]
@@ -1179,14 +1578,7 @@ mod tests {
             Value::Number(Number::from_f64(1.0).unwrap()),
         );
         let float = encode_primary_key(&float_schema, &float_row).unwrap();
-        assert_eq!(
-            integer,
-            [
-                vec![COMPONENT_FLOAT, 0, 8],
-                0xbff0_0000_0000_0000_u64.to_be_bytes().to_vec()
-            ]
-            .concat()
-        );
+        assert_eq!(integer, 0xbff0_0000_0000_0000_u64.to_be_bytes().to_vec());
         assert_eq!(integer, float);
 
         let positive_zero = encode_primary_key(&float_schema, &row(json!({"id": 0.0}))).unwrap();
@@ -1216,16 +1608,27 @@ mod tests {
         let entry = encode_secondary_index_entry_key(&schema, &definition, &item)
             .unwrap()
             .unwrap();
-        assert_eq!(prefix.last(), Some(&INDEX_PRIMARY_KEY_SEPARATOR));
+        let primary_key = encode_primary_key(&schema, &item).unwrap();
+        assert_eq!(entry, [prefix.clone(), primary_key.clone()].concat());
         assert!(secondary_index_entry_matches_prefix(&entry, &prefix));
         assert_eq!(
             secondary_index_primary_key(&entry, &prefix).unwrap(),
-            encode_primary_key(&schema, &item).unwrap()
+            primary_key
         );
         assert_eq!(
             secondary_index_primary_key_for_definition(&schema, &definition, &entry).unwrap(),
-            encode_primary_key(&schema, &item).unwrap()
+            primary_key
         );
+
+        // A longer tuple beginning with the same text is a different tuple.
+        let longer = encode_secondary_index_entry_key(
+            &schema,
+            &definition,
+            &row(json!({"id": 7, "tenant": "tinyjoin"})),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!secondary_index_entry_matches_prefix(&longer, &prefix));
 
         let mut null = item;
         null.insert("tenant".to_owned(), Value::Null);
@@ -1240,7 +1643,7 @@ mod tests {
     }
 
     #[test]
-    fn index_entry_parser_does_not_confuse_separator_bytes_inside_payloads() {
+    fn index_entry_parser_finds_the_primary_key_after_any_tuple_payload() {
         let schema = typed_schema(
             vec!["id"],
             vec![("id", ColumnType::Text), ("value", ColumnType::Text)],
@@ -1251,7 +1654,7 @@ mod tests {
             columns: vec!["value".to_owned()],
             unique: true,
         };
-        let item = row(json!({"id": "primary", "value": "insideÿpayload"}));
+        let item = row(json!({"id": "primary", "value": "inside\u{0}\u{ff}payload"}));
         let entry = encode_secondary_index_entry_key(&schema, &definition, &item)
             .unwrap()
             .unwrap();
@@ -1283,19 +1686,39 @@ mod tests {
                 .code,
             "PAGED_STORAGE_CORRUPT"
         );
+
+        let mut bad_escape = encode_primary_key(&schema, &row(json!({"id": "a\u{0}b"}))).unwrap();
+        bad_escape[2] = 0x02;
+        let index_prefix = encode_secondary_index_prefix(
+            &schema,
+            &definition,
+            &row(json!({"id": "x", "value": "v"})),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            secondary_index_primary_key_for_definition(
+                &schema,
+                &definition,
+                &[index_prefix, bad_escape].concat()
+            )
+            .unwrap_err()
+            .code,
+            "PAGED_STORAGE_CORRUPT"
+        );
     }
 
     #[test]
     fn key_and_integer_bounds_are_exact() {
         let schema = typed_schema(vec!["id"], vec![("id", ColumnType::Text)]);
-        let accepted = "a".repeat(MAX_BTREE_KEY_BYTES - 3);
+        let accepted = "a".repeat(MAX_BTREE_KEY_BYTES - 2);
         assert_eq!(
             encode_primary_key(&schema, &row(json!({"id": accepted})))
                 .unwrap()
                 .len(),
             MAX_BTREE_KEY_BYTES
         );
-        let rejected = "a".repeat(MAX_BTREE_KEY_BYTES - 2);
+        let rejected = "a".repeat(MAX_BTREE_KEY_BYTES - 1);
         assert_eq!(
             encode_primary_key(&schema, &row(json!({"id": rejected})))
                 .unwrap_err()
@@ -1313,57 +1736,224 @@ mod tests {
         );
     }
 
-    #[test]
-    fn row_codec_is_canonical_and_accepts_exactly_one_mebibyte() {
-        let content = "a".repeat(MAX_PAGED_VALUE_BYTES - ROW_HEADER_BYTES - 8);
-        let encoded = encode_row(&row(json!({"x": content}))).unwrap();
-        assert_eq!(encoded.len(), MAX_PAGED_VALUE_BYTES);
-        assert_eq!(
-            decode_row(&encoded).unwrap()["x"].as_str().unwrap().len(),
-            content.len()
-        );
-
-        let too_large = "a".repeat(content.len() + 1);
-        assert_eq!(
-            encode_row(&row(json!({"x": too_large}))).unwrap_err().code,
-            "PAGED_VALUE_TOO_LARGE"
-        );
-
-        let first = row(json!({"z": {"b": 2, "a": 1}, "a": true}));
-        let second = row(json!({"a": true, "z": {"a": 1, "b": 2}}));
-        assert_eq!(encode_row(&first).unwrap(), encode_row(&second).unwrap());
+    fn benchmark_schema() -> TableDefinition {
+        typed_schema(
+            vec!["id"],
+            vec![
+                ("id", ColumnType::Integer),
+                ("a", ColumnType::Integer),
+                ("b", ColumnType::Integer),
+                ("c", ColumnType::Text),
+                ("g", ColumnType::Integer),
+            ],
+        )
     }
 
     #[test]
-    fn row_decoder_rejects_noncanonical_non_object_and_header_corruption() {
-        let mut encoded = encode_row(&row(json!({"a": 1, "b": 2}))).unwrap();
-        let body = br#"{"b":2,"a":1}"#;
-        encoded.truncate(ROW_HEADER_BYTES);
-        encoded[4..8].copy_from_slice(&(body.len() as u32).to_le_bytes());
-        encoded.extend_from_slice(body);
+    fn row_records_pack_columns_behind_an_offset_table() {
+        let schema = benchmark_schema();
+        let stored = row(json!({
+            "id": 18,
+            "a": 17,
+            "b": 8493,
+            "c": "eight thousand four hundred ninety three",
+            "g": 94
+        }));
+        let record = encode_row(&schema, &stored).unwrap();
+        // Flags (one-byte offsets, no nulls), four stored columns, the ends of `a`, `b` and `c`,
+        // then 17, 8493 and 94 as minimal little-endian integers around the text.
         assert_eq!(
-            decode_row(&encoded).unwrap_err().code,
-            "PAGED_STORAGE_CORRUPT"
+            record,
+            [
+                &[0x00, 4, 1, 3, 43, 0x11, 0x2d, 0x21][..],
+                b"eight thousand four hundred ninety three",
+                &[0x5e],
+            ]
+            .concat()
         );
+        assert_eq!(record.len(), 49);
+        let key = encode_primary_key(&schema, &stored).unwrap();
+        assert_eq!(decode_row(&schema, &key, &record).unwrap(), stored);
+        assert_eq!(decode_row_strictly(&schema, &key, &record).unwrap(), stored);
 
-        let mut scalar = Vec::new();
-        append_record_prefix(&mut scalar);
-        scalar.extend_from_slice(&4_u32.to_le_bytes());
-        scalar.extend_from_slice(b"null");
-        assert_eq!(
-            decode_row(&scalar).unwrap_err().code,
-            "PAGED_STORAGE_CORRUPT"
-        );
-
-        for (offset, replacement, code) in [
-            (0, 2, "PAGED_STORAGE_VERSION_UNSUPPORTED"),
-            (1, 1, "PAGED_STORAGE_VERSION_UNSUPPORTED"),
-            (2, 1, "PAGED_STORAGE_CORRUPT"),
+        // Integers take the fewest bytes that sign-extend to them; zero takes none.
+        for (value, length) in [
+            (0_i64, 0),
+            (1, 1),
+            (-1, 1),
+            (127, 1),
+            (128, 2),
+            (-128, 1),
+            (-129, 2),
+            (9_007_199_254_740_991, 7),
+            (-9_007_199_254_740_991, 7),
         ] {
-            let mut corrupt = encode_row(&row(json!({"id": 1}))).unwrap();
-            corrupt[offset] = replacement;
-            assert_eq!(decode_row(&corrupt).unwrap_err().code, code);
+            let row = row(json!({"id": 1, "a": value, "b": 0, "c": "", "g": 1}));
+            let record = encode_row(&schema, &row).unwrap();
+            assert_eq!(record[2] as usize, length, "{value}");
+            let key = encode_primary_key(&schema, &row).unwrap();
+            assert_eq!(decode_row_strictly(&schema, &key, &record).unwrap(), row);
         }
+    }
+
+    #[test]
+    fn row_records_omit_trailing_defaults_and_mark_nulls() {
+        let mut schema = typed_schema(
+            vec!["id"],
+            vec![
+                ("id", ColumnType::Integer),
+                ("note", ColumnType::Text),
+                ("score", ColumnType::Float),
+                ("done", ColumnType::Boolean),
+            ],
+        );
+        for column in &mut schema.columns[1..] {
+            column.nullable = true;
+        }
+        schema.columns[2].default = Some(json!(0.0));
+        schema.columns[3].default = Some(json!(false));
+        let key = encode_primary_key(&schema, &row(json!({"id": 1}))).unwrap();
+        let round_trip = |value: Value| {
+            let row = row(value);
+            let record = encode_row(&schema, &row).unwrap();
+            assert_eq!(decode_row_strictly(&schema, &key, &record).unwrap(), row);
+            record
+        };
+
+        // Every trailing column equals its default, so nothing but the header is stored.
+        assert_eq!(
+            round_trip(json!({"id": 1, "note": null, "score": 0.0, "done": false})),
+            [0x00, 0]
+        );
+        // A NULL before a stored column is marked in the bitmap and takes no bytes.
+        assert_eq!(
+            round_trip(json!({"id": 1, "note": null, "score": 2.5, "done": false})),
+            [&[RECORD_HAS_NULLS, 2, 0b01, 0][..], &2.5_f64.to_le_bytes()].concat()
+        );
+        // Negative zero is a different stored value from a zero default.
+        assert_eq!(
+            round_trip(json!({"id": 1, "note": "x", "score": -0.0, "done": false})),
+            [&[0x00, 2, 1, b'x'][..], &(-0.0_f64).to_le_bytes()].concat()
+        );
+        round_trip(json!({"id": 1, "note": null, "score": null, "done": true}));
+
+        // An omitted column reads as its default, normalized as a stored value would be.
+        schema.columns[2].default = Some(json!(1));
+        assert_eq!(
+            decode_row(&schema, &key, &[0x00, 0]).unwrap()["score"],
+            json!(1.0)
+        );
+    }
+
+    #[test]
+    fn row_records_are_bounded_at_one_mebibyte() {
+        let schema = typed_schema(
+            vec!["id"],
+            vec![("id", ColumnType::Integer), ("x", ColumnType::Text)],
+        );
+        let content = "a".repeat(MAX_PAGED_VALUE_BYTES - RECORD_HEADER_BYTES);
+        let encoded = encode_row(&schema, &row(json!({"id": 1, "x": content}))).unwrap();
+        assert_eq!(encoded.len(), MAX_PAGED_VALUE_BYTES);
+        let key = encode_primary_key(&schema, &row(json!({"id": 1}))).unwrap();
+        assert_eq!(
+            decode_row(&schema, &key, &encoded).unwrap()["x"]
+                .as_str()
+                .unwrap()
+                .len(),
+            content.len()
+        );
+        let too_large = "a".repeat(content.len() + 1);
+        assert_eq!(
+            encode_row(&schema, &row(json!({"id": 1, "x": too_large})))
+                .unwrap_err()
+                .code,
+            "PAGED_VALUE_TOO_LARGE"
+        );
+    }
+
+    #[test]
+    fn strict_row_decoding_rejects_every_noncanonical_record() {
+        let schema = benchmark_schema();
+        let stored = row(json!({"id": 1, "a": 5, "b": 300, "c": "text", "g": 1}));
+        let key = encode_primary_key(&schema, &stored).unwrap();
+        let record = encode_row(&schema, &stored).unwrap();
+        assert_eq!(record[..5], [0x00, 4, 1, 3, 7]);
+
+        let variant = |edit: &dyn Fn(&mut Vec<u8>)| {
+            let mut bytes = record.clone();
+            edit(&mut bytes);
+            bytes
+        };
+        for (description, corrupt, code) in [
+            (
+                "a reserved sync flag",
+                variant(&|bytes| bytes[0] |= 0b1000),
+                "PAGED_STORAGE_VERSION_UNSUPPORTED",
+            ),
+            (
+                "an unknown offset width",
+                variant(&|bytes| bytes[0] |= 0b11),
+                "PAGED_STORAGE_VERSION_UNSUPPORTED",
+            ),
+            (
+                "more columns than the table",
+                variant(&|bytes| bytes[1] = 5),
+                "PAGED_STORAGE_CORRUPT",
+            ),
+            (
+                "offsets past the data",
+                variant(&|bytes| bytes[4] = 200),
+                "PAGED_STORAGE_CORRUPT",
+            ),
+            (
+                "decreasing offsets",
+                variant(&|bytes| bytes[3] = 0),
+                "PAGED_STORAGE_CORRUPT",
+            ),
+            ("a truncated header", vec![0x00], "PAGED_STORAGE_CORRUPT"),
+            (
+                "a truncated offset table",
+                vec![0x00, 4, 1],
+                "PAGED_STORAGE_CORRUPT",
+            ),
+        ] {
+            assert_eq!(
+                decode_row(&schema, &key, &corrupt).unwrap_err().code,
+                code,
+                "{description}"
+            );
+        }
+
+        // Readable but not what the encoder writes: only strict decoding refuses these.
+        let wide_offsets = [&[0x01, 4, 1, 0, 3, 0, 7, 0][..], &record[5..]].concat();
+        let padded_integer = [&[0x00, 4, 2, 4, 8, 0x05, 0x00][..], &record[6..]].concat();
+        let needless_bitmap = [&[RECORD_HAS_NULLS, 4, 0][..], &record[2..]].concat();
+        let kept_default = {
+            let mut schema = schema.clone();
+            schema.columns[4].default = Some(json!(1));
+            (schema, record.clone())
+        };
+        for (description, corrupt) in [
+            ("oversized offsets", wide_offsets),
+            ("a padded integer", padded_integer),
+            ("an empty null bitmap", needless_bitmap),
+        ] {
+            decode_row(&schema, &key, &corrupt).unwrap();
+            assert_eq!(
+                decode_row_strictly(&schema, &key, &corrupt)
+                    .unwrap_err()
+                    .code,
+                "PAGED_STORAGE_CORRUPT",
+                "{description}"
+            );
+        }
+        let (defaulted, record) = kept_default;
+        assert_eq!(
+            decode_row_strictly(&defaulted, &key, &record)
+                .unwrap_err()
+                .code,
+            "PAGED_STORAGE_CORRUPT"
+        );
     }
 
     #[test]
