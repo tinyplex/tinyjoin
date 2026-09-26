@@ -1604,16 +1604,16 @@ impl CanonicalJsonEncoder {
                 self.append(b"]")?;
             }
             Value::Object(values) => {
+                // Without serde_json's preserve_order feature a Map is a BTreeMap, so its
+                // entries come in the canonical order of their keys.
                 self.append(b"{")?;
-                let mut keys = values.keys().collect::<Vec<_>>();
-                keys.sort_unstable();
-                for (index, key) in keys.into_iter().enumerate() {
+                for (index, (key, value)) in values.iter().enumerate() {
                     if index != 0 {
                         self.append(b",")?;
                     }
                     self.append_json_string(key)?;
                     self.append(b":")?;
-                    self.encode(&values[key], depth + 1)?;
+                    self.encode(value, depth + 1)?;
                 }
                 self.append(b"}")?;
             }

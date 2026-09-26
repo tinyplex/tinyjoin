@@ -2588,6 +2588,13 @@ fn compare_to_value(
 
 fn sort_rows(rows: &mut [Row], order_by: &[OrderBy], table: &str) -> Result<()> {
     validate_order_values(rows, order_by, table)?;
+    sort_rows_by(rows, order_by);
+    Ok(())
+}
+
+/// Sorts rows that each hold every ORDER BY column. Queries and aggregates both sort here, so the
+/// sort's code is built once.
+pub(crate) fn sort_rows_by(rows: &mut [Row], order_by: &[OrderBy]) {
     rows.sort_by(|left, right| {
         for order in order_by {
             match compare_order_column(left, right, order) {
@@ -2597,7 +2604,6 @@ fn sort_rows(rows: &mut [Row], order_by: &[OrderBy], table: &str) -> Result<()> 
         }
         Ordering::Equal
     });
-    Ok(())
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

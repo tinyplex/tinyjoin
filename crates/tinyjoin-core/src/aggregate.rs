@@ -8,7 +8,8 @@ use serde_json::{Map, Number, Value};
 
 use crate::query::{
     Filter, ParseMode, Token, bind_parameter, is_distinct_keyword_at, is_reserved_keyword,
-    pagination_value, parse_predicate_at, validate_predicate_columns, validate_predicate_types,
+    pagination_value, parse_predicate_at, sort_rows_by, validate_predicate_columns,
+    validate_predicate_types,
 };
 use crate::row::{RowRef, ValueRef};
 use crate::storage::StorageReader;
@@ -255,7 +256,7 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &AggregatePlan) -> Resu
         rows.push(row);
     }
     if !plan.order_by.is_empty() {
-        sort_rows(&mut rows, &plan.order_by);
+        sort_rows_by(&mut rows, &plan.order_by);
     }
     let rows = rows
         .into_iter()
@@ -1216,61 +1217,6 @@ pub(crate) fn group_key_part(data_type: ColumnType, value: &Value, column: &str)
 pub(crate) fn encode_group_key(parts: &[String]) -> Result<String> {
     serde_json::to_string(parts)
         .map_err(|error| EngineError::invalid_query(format!("Could not encode group key: {error}")))
-}
-
-fn sort_rows(rows: &mut [Row], order_by: &[OrderBy]) {
-    rows.sort_by(|left, right| {
-        for order in order_by {
-            let ordering = compare_order_values(
-                left.get(&order.column).expect("order output was validated"),
-                right
-                    .get(&order.column)
-                    .expect("order output was validated"),
-                order,
-            );
-            if ordering != Ordering::Equal {
-                return ordering;
-            }
-        }
-        Ordering::Equal
-    });
-}
-
-fn compare_order_values(left: &Value, right: &Value, order: &OrderBy) -> Ordering {
-    let nulls_first = match order.nulls {
-        NullOrder::First => true,
-        NullOrder::Last => false,
-        NullOrder::Default => order.direction == OrderDirection::Desc,
-    };
-    let ordering = match (left, right) {
-        (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Null, _) => {
-            if nulls_first {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        }
-        (_, Value::Null) => {
-            if nulls_first {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
-        (Value::Number(left), Value::Number(right)) => left
-            .as_f64()
-            .partial_cmp(&right.as_f64())
-            .unwrap_or(Ordering::Equal),
-        (Value::String(left), Value::String(right)) => left.cmp(right),
-        (Value::Bool(left), Value::Bool(right)) => left.cmp(right),
-        _ => Ordering::Equal,
-    };
-    if order.direction == OrderDirection::Desc && left != &Value::Null && right != &Value::Null {
-        ordering.reverse()
-    } else {
-        ordering
-    }
 }
 
 fn compare_typed(data_type: ColumnType, left: &Value, right: &Value) -> Ordering {
