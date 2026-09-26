@@ -1062,22 +1062,33 @@ impl<'a> NodeView<'a> {
         self.bytes.into_owned()
     }
 
+    #[inline(always)]
     fn cell_offset(&self, index: usize) -> Result<usize> {
         if index >= self.item_count {
-            return Err(invalid_btree(storage_diagnostic!(
-                "B-tree page {} has no cell {index}",
-                self.page_id
-            )));
+            return Err(self.cell_error(index));
         }
         let bytes = &*self.bytes;
         let offset = read_u16(bytes, NODE_HEADER_SIZE + index * SLOT_SIZE) as usize;
         if offset < self.free_end || offset >= bytes.len() {
-            return Err(invalid_btree(storage_diagnostic!(
-                "B-tree page {} cell {index} lies outside its cell area",
-                self.page_id
-            )));
+            return Err(self.cell_error(index));
         }
         Ok(offset)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn cell_error(&self, index: usize) -> EngineError {
+        if index >= self.item_count {
+            invalid_btree(storage_diagnostic!(
+                "B-tree page {} has no cell {index}",
+                self.page_id
+            ))
+        } else {
+            invalid_btree(storage_diagnostic!(
+                "B-tree page {} cell {index} lies outside its cell area",
+                self.page_id
+            ))
+        }
     }
 
     fn leaf_cell(&self, index: usize) -> Result<(&[u8], CellValue<'_>)> {
@@ -3289,16 +3300,25 @@ fn validate_cell_floor(page_id: PageId, actual: usize, expected: usize) -> Resul
     Ok(())
 }
 
+/// Where a cell field of `length` bytes at `offset` ends, if it ends within `bound`. Every cell
+/// read checks its fields this way, so the check is inlined and its error kept out of line.
+#[inline(always)]
 fn checked_end(offset: usize, length: usize, bound: usize) -> Result<usize> {
-    let end = offset
-        .checked_add(length)
-        .ok_or_else(|| invalid_btree("B-tree cell offset overflowed"))?;
-    if end > bound {
-        return Err(invalid_btree(storage_diagnostic!(
-            "B-tree cell range {offset}..{end} exceeds page payload {bound}"
-        )));
+    match offset.checked_add(length) {
+        Some(end) if end <= bound => Ok(end),
+        _ => Err(cell_range_error(offset, length, bound)),
     }
-    Ok(end)
+}
+
+#[cold]
+#[inline(never)]
+fn cell_range_error(offset: usize, length: usize, bound: usize) -> EngineError {
+    match offset.checked_add(length) {
+        None => invalid_btree("B-tree cell offset overflowed"),
+        Some(end) => invalid_btree(storage_diagnostic!(
+            "B-tree cell range {offset}..{end} exceeds page payload {bound}"
+        )),
+    }
 }
 
 fn validate_sorted_leaf_entries(entries: &[LeafEntry], leaf_generation: u64) -> Result<()> {
