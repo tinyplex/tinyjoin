@@ -1,5 +1,7 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashSet, btree_map::Entry};
+use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::str::FromStr;
 
 use serde_json::{Map, Number, Value};
@@ -174,7 +176,7 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &AggregatePlan) -> Resu
     };
     let mut working_bytes = global.as_ref().map_or(Ok(0), GroupState::estimated_bytes)?;
     ensure_work_budget(working_bytes, MAX_AGGREGATE_WORK_BYTES)?;
-    let mut groups = BTreeMap::<String, GroupState>::new();
+    let mut groups = Groups::default();
     let mut scanned = 0_usize;
     let filter = Filter::new(plan.predicate.as_ref(), &schema, &plan.table)?;
     let group_columns = plan
@@ -200,59 +202,38 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &AggregatePlan) -> Resu
             }
             if filter.matches(row)? {
                 if let Some(state) = &mut global {
-                    let before = state.estimated_bytes()?;
-                    let after = state.estimated_bytes_after(row)?;
-                    let next_total = replace_budget_charge(
-                        working_bytes,
-                        before,
-                        after,
-                        MAX_AGGREGATE_WORK_BYTES,
-                    )?;
-                    state.update(row)?;
-                    working_bytes = next_total;
+                    working_bytes = state.update_within(row, working_bytes)?;
                     return Ok(VisitControl::Continue);
+                }
+                if let Some(index) = groups.find(&group_columns, row)? {
+                    let state = &mut groups.entries[index].state;
+                    working_bytes = state.update_within(row, working_bytes)?;
+                    return Ok(VisitControl::Continue);
+                }
+                let group_count = groups.entries.len();
+                if group_count >= MAX_GROUPS {
+                    return Err(EngineError::invalid_query(format!(
+                        "A grouped query cannot produce more than {MAX_GROUPS} groups"
+                    )));
+                }
+                if (group_count + 1).saturating_mul(aggregate_count) > MAX_AGGREGATE_CELLS {
+                    return Err(EngineError::invalid_query(format!(
+                        "A grouped query cannot materialize more than {MAX_AGGREGATE_CELLS} aggregate cells"
+                    )));
                 }
                 ensure_group_key_input_budget(&group_columns, row)?;
                 let key = group_key(&group_columns, row)?;
-                let group_count = groups.len();
-                match groups.entry(key) {
-                    Entry::Vacant(entry) => {
-                        if group_count >= MAX_GROUPS {
-                            return Err(EngineError::invalid_query(format!(
-                                "A grouped query cannot produce more than {MAX_GROUPS} groups"
-                            )));
-                        }
-                        if (group_count + 1).saturating_mul(aggregate_count) > MAX_AGGREGATE_CELLS {
-                            return Err(EngineError::invalid_query(format!(
-                                "A grouped query cannot materialize more than {MAX_AGGREGATE_CELLS} aggregate cells"
-                            )));
-                        }
-                        let key_bytes = checked_mul(entry.key().len(), 2)?;
-                        let state = GroupState::new(plan, &schema, Some(row))?;
-                        let charge = checked_add(
-                            checked_add(256, key_bytes)?,
-                            state.estimated_bytes_after(row)?,
-                        )?;
-                        let next_total = checked_add(working_bytes, charge)?;
-                        ensure_work_budget(next_total, MAX_AGGREGATE_WORK_BYTES)?;
-                        let mut state = state;
-                        state.update(row)?;
-                        working_bytes = next_total;
-                        entry.insert(state);
-                    }
-                    Entry::Occupied(mut entry) => {
-                        let before = entry.get().estimated_bytes()?;
-                        let after = entry.get().estimated_bytes_after(row)?;
-                        let next_total = replace_budget_charge(
-                            working_bytes,
-                            before,
-                            after,
-                            MAX_AGGREGATE_WORK_BYTES,
-                        )?;
-                        entry.get_mut().update(row)?;
-                        working_bytes = next_total;
-                    }
-                }
+                let key_bytes = checked_mul(key.len(), 2)?;
+                let mut state = GroupState::new(plan, &schema, Some(row))?;
+                let charge = checked_add(
+                    checked_add(256, key_bytes)?,
+                    state.estimated_bytes_after(row)?,
+                )?;
+                let next_total = checked_add(working_bytes, charge)?;
+                ensure_work_budget(next_total, MAX_AGGREGATE_WORK_BYTES)?;
+                state.update(row)?;
+                working_bytes = next_total;
+                groups.insert(&group_columns, row, key, state)?;
             }
             Ok(VisitControl::Continue)
         },
@@ -261,7 +242,7 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &AggregatePlan) -> Resu
     let states = if let Some(global) = global {
         vec![global]
     } else {
-        groups.into_values().collect()
+        groups.into_states()
     };
     let mut result_bytes = 0_usize;
     let mut rows = Vec::with_capacity(states.len());
@@ -466,6 +447,8 @@ impl SourceColumn {
 struct GroupState {
     grouped_values: Row,
     aggregates: Vec<AggregateAccumulator>,
+    /// Whether the state's size is settled once it exists: only an extremum's value can grow.
+    settled: bool,
 }
 
 impl GroupState {
@@ -492,9 +475,13 @@ impl GroupState {
                 }
             }
         }
+        let settled = aggregates
+            .iter()
+            .all(|aggregate| !matches!(aggregate, AggregateAccumulator::Extremum { .. }));
         Ok(Self {
             grouped_values,
             aggregates,
+            settled,
         })
     }
 
@@ -503,6 +490,20 @@ impl GroupState {
             aggregate.update(row)?;
         }
         Ok(())
+    }
+
+    /// Adds a row to the state, charging any growth to a work budget that holds `total` bytes, and
+    /// returns the budget's new total.
+    fn update_within(&mut self, row: &RowRef<'_>, total: usize) -> Result<usize> {
+        if self.settled {
+            self.update(row)?;
+            return Ok(total);
+        }
+        let before = self.estimated_bytes()?;
+        let after = self.estimated_bytes_after(row)?;
+        let total = replace_budget_charge(total, before, after, MAX_AGGREGATE_WORK_BYTES)?;
+        self.update(row)?;
+        Ok(total)
     }
 
     fn estimated_bytes_after(&self, row: &RowRef<'_>) -> Result<usize> {
@@ -974,6 +975,178 @@ fn integer_value(value: &Value) -> Result<i128> {
         .map(i128::from)
         .or_else(|| value.as_u64().map(i128::from))
         .ok_or_else(|| EngineError::type_mismatch("Expected a typed integer value"))
+}
+
+/// A query's groups, found for each row by the values of its grouping columns without encoding
+/// them, and ordered in the end by their encoded keys, as a map of those keys would order them.
+#[derive(Default)]
+struct Groups {
+    entries: Vec<Group>,
+    /// Each group's position, by the hash of its grouped values.
+    index: HashMap<u64, Vec<usize>, BuildHasherDefault<GroupHasher>>,
+}
+
+struct Group {
+    values: Vec<GroupValue<'static>>,
+    /// The group's encoded key as bytes, which order as the key does.
+    key: Vec<u8>,
+    state: GroupState,
+}
+
+impl Groups {
+    /// The position of the group `row` belongs to, if it exists.
+    fn find(&self, columns: &[SourceColumn], row: &RowRef<'_>) -> Result<Option<usize>> {
+        let Some(candidates) = self.index.get(&group_hash(columns, row)?) else {
+            return Ok(None);
+        };
+        for index in candidates {
+            let mut same = true;
+            for (column, value) in columns.iter().zip(&self.entries[*index].values) {
+                if group_value(column, row.get(column.index)?)? != *value {
+                    same = false;
+                    break;
+                }
+            }
+            if same {
+                return Ok(Some(*index));
+            }
+        }
+        Ok(None)
+    }
+
+    fn insert(
+        &mut self,
+        columns: &[SourceColumn],
+        row: &RowRef<'_>,
+        key: String,
+        state: GroupState,
+    ) -> Result<()> {
+        let mut values = Vec::with_capacity(columns.len());
+        for column in columns {
+            values.push(group_value(column, row.get(column.index)?)?.into_owned());
+        }
+        self.index
+            .entry(group_hash(columns, row)?)
+            .or_default()
+            .push(self.entries.len());
+        self.entries.push(Group {
+            values,
+            key: key.into_bytes(),
+            state,
+        });
+        Ok(())
+    }
+
+    fn into_states(self) -> Vec<GroupState> {
+        // Sorting (key, position) pairs shares its code with the sort that builds indexes.
+        let mut order = Vec::with_capacity(self.entries.len());
+        let mut states = Vec::with_capacity(self.entries.len());
+        for (position, group) in self.entries.into_iter().enumerate() {
+            order.push((group.key, position));
+            states.push(Some(group.state));
+        }
+        order.sort_unstable();
+        order
+            .into_iter()
+            .filter_map(|(_, position)| states[position].take())
+            .collect()
+    }
+}
+
+/// A grouped value as [`group_key_part`] encodes it: two values group together exactly when they
+/// encode alike.
+#[derive(Debug, Hash, PartialEq)]
+enum GroupValue<'a> {
+    Null,
+    Boolean(bool),
+    Integer(i128),
+    Float(u64),
+    Text(Cow<'a, str>),
+}
+
+impl GroupValue<'_> {
+    fn into_owned(self) -> GroupValue<'static> {
+        match self {
+            Self::Null => GroupValue::Null,
+            Self::Boolean(value) => GroupValue::Boolean(value),
+            Self::Integer(value) => GroupValue::Integer(value),
+            Self::Float(bits) => GroupValue::Float(bits),
+            Self::Text(text) => GroupValue::Text(Cow::Owned(text.into_owned())),
+        }
+    }
+}
+
+fn group_value<'a>(column: &SourceColumn, value: ValueRef<'a>) -> Result<GroupValue<'a>> {
+    let float = |number: f64| GroupValue::Float(if number == 0.0 { 0.0 } else { number }.to_bits());
+    Ok(match (column.data_type, value) {
+        (_, ValueRef::Null) => GroupValue::Null,
+        (ColumnType::Boolean, ValueRef::Boolean(value)) => GroupValue::Boolean(value),
+        (ColumnType::Integer, ValueRef::Integer(value)) => GroupValue::Integer(i128::from(value)),
+        (ColumnType::Float, ValueRef::Float(value)) => float(value),
+        (ColumnType::Text, ValueRef::Text(text)) => GroupValue::Text(text),
+        (data_type, ValueRef::Json(value)) => match (data_type, value.as_ref()) {
+            (_, Value::Null) => GroupValue::Null,
+            (ColumnType::Boolean, Value::Bool(value)) => GroupValue::Boolean(*value),
+            (ColumnType::Integer, value) => GroupValue::Integer(integer_value(value)?),
+            (ColumnType::Float, Value::Number(value)) => {
+                float(value.as_f64().expect("typed float was validated"))
+            }
+            (ColumnType::Text, Value::String(text)) => GroupValue::Text(Cow::Owned(text.clone())),
+            _ => return Err(incompatible_group_value(&column.name)),
+        },
+        _ => return Err(incompatible_group_value(&column.name)),
+    })
+}
+
+fn incompatible_group_value(column: &str) -> EngineError {
+    EngineError::type_mismatch(format!(
+        "Column `{column}` contains a value incompatible with its catalog type"
+    ))
+}
+
+fn group_hash(columns: &[SourceColumn], row: &RowRef<'_>) -> Result<u64> {
+    let mut hasher = GroupHasher::default();
+    for column in columns {
+        group_value(column, row.get(column.index)?)?.hash(&mut hasher);
+    }
+    Ok(hasher.finish())
+}
+
+/// A quick multiplicative hasher for grouped values, and for the hashes that index them.
+#[derive(Default)]
+struct GroupHasher(u64);
+
+impl Hasher for GroupHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.write_u64(u64::from(*byte));
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.write_u64(u64::from(value));
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+
+    fn write_isize(&mut self, value: isize) {
+        self.write_u64(value as u64);
+    }
+
+    fn write_i128(&mut self, value: i128) {
+        self.write_u64(value as u64);
+        self.write_u64((value >> 64) as u64);
+    }
 }
 
 fn group_key(columns: &[SourceColumn], row: &RowRef<'_>) -> Result<String> {
@@ -1505,7 +1678,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::row::RowRef;
-    use crate::{Engine, Row, RowChange, StorageDriver, StorageReader};
+    use crate::{ColumnType, Engine, Row, RowChange, StorageDriver, StorageReader};
 
     fn row(value: Value) -> Row {
         value
@@ -1551,6 +1724,125 @@ mod tests {
             )
             .unwrap();
         engine
+    }
+
+    #[test]
+    fn groups_and_orders_rows_as_their_encoded_keys_do() {
+        // Groups are found by their values, but come out in the order of their encoded keys, as
+        // a map of those keys orders them: the result must match that model exactly.
+        let mut engine = Engine::default();
+        engine
+            .execute_sql(
+                "CREATE TABLE grouped (id INTEGER PRIMARY KEY, i INTEGER, t TEXT, b BOOLEAN, \
+                 f DOUBLE PRECISION)",
+                &[],
+            )
+            .unwrap();
+        let texts = [
+            None,
+            Some("a"),
+            Some("b"),
+            Some("é"),
+            Some("a\"b"),
+            Some(""),
+            Some("10"),
+        ];
+        let floats = [None, Some(0.0), Some(-0.0), Some(1.5), Some(-2.25)];
+        let mut rows = Vec::new();
+        for id in 0..300_i64 {
+            let i = (id % 7 != 0).then_some((id * 37) % 11 - 5);
+            let t = texts[(id * 13 % 7) as usize];
+            let b = (id % 5 != 0).then_some(id % 3 == 0);
+            let f = floats[(id * 7 % 5) as usize];
+            rows.push((id, i, t, b, f));
+        }
+        let literal = |value: Option<String>| value.unwrap_or_else(|| "NULL".to_owned());
+        let values = rows
+            .iter()
+            .map(|(id, i, t, b, f)| {
+                format!(
+                    "({id}, {}, {}, {}, {})",
+                    literal(i.map(|i| i.to_string())),
+                    literal(t.map(|t| format!("'{}'", t.replace('\'', "''")))),
+                    literal(b.map(|b| b.to_string())),
+                    literal(f.map(|f| format!("{f:?}"))),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        engine
+            .execute_sql(
+                &format!("INSERT INTO grouped (id, i, t, b, f) VALUES {values}"),
+                &[],
+            )
+            .unwrap();
+
+        let value = |value: Option<serde_json::Value>| value.unwrap_or(Value::Null);
+        for (columns, types) in [
+            (vec!["i", "t"], vec![ColumnType::Integer, ColumnType::Text]),
+            (
+                vec!["b", "f", "t"],
+                vec![ColumnType::Boolean, ColumnType::Float, ColumnType::Text],
+            ),
+            (vec!["f"], vec![ColumnType::Float]),
+        ] {
+            let mut model = std::collections::BTreeMap::<String, (Vec<Value>, i64)>::new();
+            for (_, i, t, b, f) in &rows {
+                let row_values = columns
+                    .iter()
+                    .map(|column| match *column {
+                        "i" => value(i.map(|i| json!(i))),
+                        "t" => value(t.map(|t| json!(t))),
+                        "b" => value(b.map(|b| json!(b))),
+                        _ => value(f.map(|f| json!(f))),
+                    })
+                    .collect::<Vec<_>>();
+                let parts = columns
+                    .iter()
+                    .zip(&types)
+                    .zip(&row_values)
+                    .map(|((column, data_type), value)| {
+                        super::group_key_part(*data_type, value, column).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                model
+                    .entry(super::encode_group_key(&parts).unwrap())
+                    .or_insert((row_values, 0))
+                    .1 += 1;
+            }
+            let listed = columns.join(", ");
+            let result = engine
+                .query_sql(
+                    &format!("SELECT {listed}, COUNT(*) AS rows FROM grouped GROUP BY {listed}"),
+                    &[],
+                )
+                .unwrap();
+            let expected = model
+                .into_values()
+                .map(|(values, count)| {
+                    let mut row = columns
+                        .iter()
+                        .map(|column| column.to_string())
+                        .zip(values)
+                        .collect::<Row>();
+                    row.insert("rows".to_owned(), json!(count));
+                    row
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(result.rows.len(), expected.len(), "{listed}");
+            for (actual, expected) in result.rows.iter().zip(&expected) {
+                for (column, expected) in expected {
+                    let actual = &actual[column];
+                    // A group's FLOAT zero is whichever zero came first; both are one group.
+                    let same = actual == expected
+                        || actual
+                            .as_f64()
+                            .zip(expected.as_f64())
+                            .is_some_and(|(a, e)| a == e);
+                    assert!(same, "{listed}: {column} {actual} != {expected}");
+                }
+            }
+        }
     }
 
     #[test]

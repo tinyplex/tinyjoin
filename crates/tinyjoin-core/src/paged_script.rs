@@ -877,7 +877,9 @@ impl IndexBuild<'_> {
         if entries.is_empty() {
             return Ok(());
         }
-        entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        // Each entry ends with its row's primary key, so no two are equal, and the pairs sort as
+        // their entries do.
+        entries.sort_unstable();
         if self.definition.unique {
             // Entries for one tuple sort together, so a repeated tuple has its neighbor's prefix.
             for pair in entries.windows(2) {
