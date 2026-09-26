@@ -245,7 +245,15 @@ export const createDatabaseBroker = (
   };
 
   return {
-    receive: (message: RoutedRequest): void => {
+    /**
+     * Queues a request. The local client's coordinator passes the size it
+     * measured, and holds its statement text itself, so that request is not
+     * measured twice.
+     */
+    receive: (
+      message: RoutedRequest,
+      bytes = requestBytes(message, MAX_QUEUED_BYTES),
+    ): void => {
       if (closed) return;
       let connection = connections.get(message.client);
       if (!connection) {
@@ -304,7 +312,6 @@ export const createDatabaseBroker = (
         (transaction?.client === message.client &&
           (message.request.method === 'commitTransaction' ||
             message.request.method === 'rollbackTransaction'));
-      const bytes = requestBytes(message, MAX_QUEUED_BYTES);
       if (
         bytes > MAX_QUEUED_BYTES ||
         queue.length >= MAX_PENDING_REQUESTS + (priority ? 8 : 0) ||

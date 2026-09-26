@@ -1,35 +1,48 @@
-import type {WorkerLike} from '../client/client.js';
-import {createWorkerRpc, type WorkerRpc} from '../client/rpc.js';
-import {startWorker, type WorkerScope} from './host.js';
+import {objFreeze} from '../common.js';
+import {workerTerminated, type WorkerRpc} from '../client/rpc.js';
+import {
+  PROTOCOL_VERSION,
+  type WorkerEvent,
+  type WorkerRequest,
+} from '../protocol.js';
+import {startWorker} from './host.js';
 
-/** Connects the coordinator to the engine host without another Worker or clone. */
+/**
+ * Connects the coordinator to an engine host in the same Worker. A request is
+ * a call rather than a message, and neither side validates what the other
+ * built: every request from outside the Worker was validated as it arrived.
+ */
 export const createLocalRpc = (): WorkerRpc => {
-  const listeners = new Set<(event: MessageEvent<unknown>) => void>();
-  let receive: ((event: MessageEvent<unknown>) => void) | undefined;
-  const scope: WorkerScope = {
-    postMessage: (data) => {
-      for (const listener of listeners)
-        listener({data} as MessageEvent<unknown>);
+  const listeners = new Set<(event: WorkerEvent) => void>();
+  let disposed = false;
+  let nextId = 1;
+  // The host posts only its change events: requests settle directly.
+  const host = startWorker({
+    scope: {
+      postMessage: (message) => {
+        for (const listener of listeners) listener(message as WorkerEvent);
+      },
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      close: () => undefined,
     },
-    addEventListener: (_type, listener) => {
-      receive = listener;
+  });
+  return objFreeze<WorkerRpc>({
+    request: (method, params) =>
+      (disposed
+        ? Promise.reject(workerTerminated())
+        : host.request({
+            v: PROTOCOL_VERSION,
+            id: nextId++,
+            method,
+            params,
+          } as WorkerRequest)) as never,
+    onEvent: (listener) => {
+      listeners.add(listener);
     },
-    removeEventListener: () => {
-      receive = undefined;
+    dispose: () => {
+      disposed = true;
+      listeners.clear();
     },
-    close: () => undefined,
-  };
-  const worker: WorkerLike = {
-    postMessage: (data) => receive?.({data} as MessageEvent<unknown>),
-    addEventListener: (type, listener) => {
-      if (type === 'message')
-        listeners.add(listener as (event: MessageEvent<unknown>) => void);
-    },
-    removeEventListener: (type, listener) => {
-      if (type === 'message')
-        listeners.delete(listener as (event: MessageEvent<unknown>) => void);
-    },
-  };
-  startWorker({scope});
-  return createWorkerRpc(worker, 'header');
+  });
 };

@@ -8,6 +8,7 @@ import {
   mergeChangedKeys,
   type PendingChangedKeys,
 } from '../common.js';
+import {ClientError} from '../client/error.js';
 import {
   PROTOCOL_VERSION,
   isWorkerRequest,
@@ -45,6 +46,12 @@ export interface StartWorkerOptions {
 }
 
 export interface WorkerController {
+  /**
+   * Serves a request from code in this Worker, in order with every other
+   * request, without a message or protocol validation. It settles with the
+   * result, or rejects with the error a response message would have carried.
+   */
+  request(request: WorkerRequest): Promise<unknown>;
   close(): Promise<void>;
 }
 
@@ -72,6 +79,8 @@ export const startWorker = (
   let activeTransactionId: string | undefined;
   let nextTransactionId = 1;
   let requestTail: Promise<void> = Promise.resolve();
+  let queuedRequests = 0;
+  let openEngine: WorkerEngine | undefined;
 
   // A script's statements each report their own keys; union them under the same bound the
   // engine and the event merge use, so one overflowing statement does not silently truncate.
@@ -262,7 +271,7 @@ export const startWorker = (
       configuredStorage = storage;
       enginePromise ??= (options.durableEngineFactory ?? createDefaultEngine)(
         storage,
-      );
+      ).then((engine) => (openEngine = engine));
       return enginePromise;
     }
     if (!enginePromise) {
@@ -286,27 +295,16 @@ export const startWorker = (
   const settledEngine = async (): Promise<WorkerEngine | undefined> =>
     enginePromise ? await enginePromise : undefined;
 
-  const respond = async (request: WorkerRequest): Promise<void> => {
+  // Runs one request against the engine, which init opens and close releases.
+  const serve = async (request: WorkerRequest): Promise<unknown> => {
     let engine: WorkerEngine | undefined;
     try {
       if (request.method === 'close') {
         await releaseResources(await settledEngine());
-        respondWith({
-          v: PROTOCOL_VERSION,
-          id: request.id,
-          ok: true,
-          result: undefined,
-        });
-        queueMicrotask(() => scope.close());
-        return;
+        return undefined;
       }
       engine = await engineForRequest(request);
-      respondWith({
-        v: PROTOCOL_VERSION,
-        id: request.id,
-        ok: true,
-        result: handleRequest(request, engine),
-      });
+      return handleRequest(request, engine);
     } catch (error) {
       if (request.method === 'init') {
         // The database never opened, so release whatever it had taken. Neither
@@ -319,17 +317,78 @@ export const startWorker = (
           // Preserve the initialization error.
         }
       }
-      respondWith({
-        v: PROTOCOL_VERSION,
-        id: request.id,
-        ok: false,
-        error: serializeError(error),
-      });
-      if (request.method === 'close' || request.method === 'init') {
-        queueMicrotask(() => scope.close());
-      }
+      throw error;
     }
   };
+
+  // Serves requests one at a time, in the order they arrive, and passes each
+  // outcome to `settle`, which must not throw. Once the engine is open, a
+  // request with nothing ahead of it is served at once.
+  const schedule = (
+    request: WorkerRequest,
+    settle: (ok: boolean, value: unknown) => void,
+  ): void => {
+    if (
+      queuedRequests === 0 &&
+      openEngine &&
+      request.method !== 'init' &&
+      request.method !== 'close'
+    ) {
+      let result: unknown;
+      try {
+        result = handleRequest(request, openEngine);
+      } catch (error) {
+        settle(false, error);
+        return;
+      }
+      settle(true, result);
+      return;
+    }
+    queuedRequests += 1;
+    requestTail = requestTail
+      .then(() => serve(request))
+      .then(
+        (result) => {
+          queuedRequests -= 1;
+          settle(true, result);
+        },
+        (error: unknown) => {
+          queuedRequests -= 1;
+          settle(false, error);
+        },
+      );
+  };
+
+  // Posts a request's response. A close, or an init that failed, then closes
+  // the Worker.
+  const respond =
+    (request: WorkerRequest) =>
+    (ok: boolean, value: unknown): void => {
+      if (ok) {
+        try {
+          respondWith({
+            v: PROTOCOL_VERSION,
+            id: request.id,
+            ok: true,
+            result: value,
+          });
+        } catch (error) {
+          ok = false;
+          value = error;
+        }
+      }
+      if (!ok) {
+        respondWith({
+          v: PROTOCOL_VERSION,
+          id: request.id,
+          ok: false,
+          error: serializeError(value),
+        });
+      }
+      if (request.method === 'close' || (request.method === 'init' && !ok)) {
+        queueMicrotask(() => scope.close());
+      }
+    };
 
   const onMessage = (event: MessageEvent<unknown>): void => {
     if (!isWorkerRequest(event.data)) {
@@ -347,12 +406,18 @@ export const startWorker = (
       });
       return;
     }
-    const request = event.data;
-    requestTail = requestTail.then(() => respond(request));
+    schedule(event.data, respond(event.data));
   };
 
   scope.addEventListener('message', onMessage);
   return {
+    request: (request: WorkerRequest): Promise<unknown> =>
+      new Promise((resolve, reject) =>
+        schedule(request, (ok, value) =>
+          ok ? resolve(value) : reject(new ClientError(serializeError(value))),
+        ),
+      ),
+
     close: async (): Promise<void> => {
       try {
         await releaseResources(await settledEngine());

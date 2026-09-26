@@ -226,7 +226,7 @@ const startCoordinator = (
         : {}),
     };
     entry.epoch = leader.epoch;
-    if (owner) owner.receive(message);
+    if (owner) owner.receive(message, entry.bytes);
     else outgoing?.postMessage(message);
   };
   const announce = (message: Announcement): void => {

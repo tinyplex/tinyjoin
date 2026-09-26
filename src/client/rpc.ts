@@ -30,9 +30,11 @@ type PendingRequest = {
   reject(error: unknown): void;
 };
 
-const TERMINATED = 'WORKER_TERMINATED';
-const TERMINATED_MESSAGE = 'The TinyJoin worker has been closed';
 const MISMATCH = 'PROTOCOL_MISMATCH';
+
+/** The error for a request made after its connection was disposed. */
+export const workerTerminated = (): ClientError =>
+  clientError('WORKER_TERMINATED', 'The TinyJoin worker has been closed');
 
 /**
  * Carries the RPC protocol over one Worker.
@@ -59,7 +61,7 @@ export const createWorkerRpc = (
     worker.removeEventListener('messageerror', onMessageError);
     worker.removeEventListener('error', onError);
     worker.terminate?.();
-    const reason = error ?? clientError(TERMINATED, TERMINATED_MESSAGE);
+    const reason = error ?? workerTerminated();
     for (const request of pending.values()) {
       request.reject(reason);
     }
@@ -133,7 +135,7 @@ export const createWorkerRpc = (
       params: RpcMethods[Method]['request'],
     ): Promise<RpcMethods[Method]['response']> => {
       if (disposed) {
-        return Promise.reject(clientError(TERMINATED, TERMINATED_MESSAGE));
+        return Promise.reject(workerTerminated());
       }
       const id = nextId++;
       const message = {v: PROTOCOL_VERSION, id, method, params} as WorkerRequest;

@@ -982,4 +982,54 @@ describe('startWorker', () => {
 
     expect(order).toEqual(['engine', 'response', 'scope']);
   });
+
+  it('serves direct requests in order, without messages', async () => {
+    const scope = new FakeScope();
+    const engine = mockEngine();
+    let open!: (engine: WorkerEngine) => void;
+    const host = startWorker({
+      scope,
+      durableEngineFactory: () =>
+        new Promise((resolve) => {
+          open = resolve;
+        }),
+    });
+    const update = (sql: string) =>
+      host.request({
+        v: PROTOCOL_VERSION,
+        id: 1,
+        method: 'executeSql',
+        params: {sql, params: []},
+      });
+
+    const initialized = host.request({
+      v: PROTOCOL_VERSION,
+      id: 1,
+      method: 'init',
+      params: {storage: {kind: 'memory'}},
+    });
+    const queued = update('UPDATE posts SET title = 1');
+    await Promise.resolve();
+    expect(engine.executeSql).not.toHaveBeenCalled();
+    open(engine);
+    await expect(initialized).resolves.toEqual({revision: 0});
+    await expect(queued).resolves.toMatchObject({revision: 1});
+
+    // With the engine open and nothing ahead of it, a request is served at once.
+    const immediate = update('UPDATE posts SET title = 2');
+    expect(engine.executeSql).toHaveBeenCalledTimes(2);
+    await expect(immediate).resolves.toMatchObject({revision: 2});
+    await expect(
+      host.request({
+        v: PROTOCOL_VERSION,
+        id: 1,
+        method: 'commitTransaction',
+        params: {transactionId: 'tx-9'},
+      }),
+    ).rejects.toMatchObject({
+      code: 'TRANSACTION_NOT_ACTIVE',
+      retryable: false,
+    });
+    expect(scope.posted.filter((message) => 'id' in message)).toEqual([]);
+  });
 });
