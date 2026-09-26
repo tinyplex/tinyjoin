@@ -1,5 +1,6 @@
 import {asCodedError} from '../common.js';
 import type {WorkerRpc} from '../client/rpc.js';
+import type {LocalRpc} from './local-rpc.js';
 import {
   PROTOCOL_VERSION,
   type SerializedError,
@@ -25,7 +26,7 @@ type Queued = {message: RoutedRequest; bytes: number};
 
 /** Schedules complete transaction callbacks, not just individual RPC messages. */
 export const createDatabaseBroker = (
-  rpc: WorkerRpc,
+  rpc: WorkerRpc & Partial<Pick<LocalRpc, 'requestNow'>>,
   epoch: string,
   localClient: string,
   localResponse: (response: WorkerResponse) => void,
@@ -179,6 +180,72 @@ export const createDatabaseBroker = (
     }
   };
 
+  // A request's outcome, replied to its client, retiring the owner if it left
+  // the engine beyond use.
+  const settle = (message: RoutedRequest, result: unknown): void => {
+    noteResult(result);
+    reply(message.client, {
+      v: PROTOCOL_VERSION,
+      id: message.request.id,
+      ok: true,
+      result,
+    });
+  };
+  const settleError = (message: RoutedRequest, error: unknown): void => {
+    const serialized =
+      asCodedError(error) ??
+      coordinationError(
+        'WORKER_OPERATION_FAILED',
+        error instanceof Error ? error.message : String(error),
+      );
+    fail(message, serialized);
+    if (
+      [
+        'RECOVERY_REQUIRED',
+        'STORAGE_COMMIT_OUTCOME_UNKNOWN',
+        'STORAGE_ENGINE_POISONED',
+      ].includes(serialized.code)
+    )
+      onFailure(serialized);
+  };
+
+  // Serves a statement at once, when nothing is waiting and the host can too,
+  // exactly as handle() would once pump() reached it. Reports whether it did.
+  const serveNow = (message: RoutedRequest): boolean => {
+    const {client, request} = message;
+    if (
+      !rpc.requestNow ||
+      busy ||
+      queue.length > 0 ||
+      abandoned.size > 0 ||
+      (request.method !== 'executeSql' &&
+        request.method !== 'executePrepared' &&
+        request.method !== 'execSql') ||
+      (transaction !== undefined && transaction.client !== client)
+    )
+      return false;
+    let params = request.params;
+    if (params.transactionId !== undefined) {
+      // A stale token is left for handle() to report.
+      if (params.transactionId !== `${epoch}/${transaction?.token}`)
+        return false;
+      params = {...params, transactionId: transaction!.token};
+    }
+    if (request.method === 'executePrepared') {
+      const statementId = connections
+        .get(client)
+        ?.prepared.get(request.params.statementId);
+      // A statement to prepare again is left for handle() too.
+      if (statementId === undefined) return false;
+      params = {...params, statementId} as typeof params;
+    }
+    const served = rpc.requestNow(request.method, params as never);
+    if (!served) return false;
+    if (served.ok) settle(message, served.value);
+    else settleError(message, served.error);
+    return true;
+  };
+
   const pump = async (): Promise<void> => {
     if (busy || closed) return;
     busy = true;
@@ -206,30 +273,9 @@ export const createDatabaseBroker = (
           continue;
         }
         try {
-          const result = await handle(message);
-          noteResult(result);
-          reply(message.client, {
-            v: PROTOCOL_VERSION,
-            id: message.request.id,
-            ok: true,
-            result,
-          });
+          settle(message, await handle(message));
         } catch (error) {
-          const serialized =
-            asCodedError(error) ??
-            coordinationError(
-              'WORKER_OPERATION_FAILED',
-              error instanceof Error ? error.message : String(error),
-            );
-          fail(message, serialized);
-          if (
-            [
-              'RECOVERY_REQUIRED',
-              'STORAGE_COMMIT_OUTCOME_UNKNOWN',
-              'STORAGE_ENGINE_POISONED',
-            ].includes(serialized.code)
-          )
-            onFailure(serialized);
+          settleError(message, error);
         }
       }
     } catch {
@@ -326,6 +372,7 @@ export const createDatabaseBroker = (
         );
         return;
       }
+      if (serveNow(message)) return;
       queue.push({message, bytes});
       queuedBytes += bytes;
       void pump();

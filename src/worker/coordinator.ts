@@ -1,5 +1,4 @@
 import {asCodedError, isRecord} from '../common.js';
-import type {WorkerRpc} from '../client/rpc.js';
 import {
   PROTOCOL_VERSION,
   isWorkerEvent,
@@ -25,7 +24,7 @@ import {
   type RoutedRequest,
 } from './coordination-protocol.js';
 import {startWorker, type WorkerScope} from './host.js';
-import {createLocalRpc} from './local-rpc.js';
+import {createLocalRpc, type LocalRpc} from './local-rpc.js';
 import {requestBytes} from './request-size.js';
 
 type Pending = {request: WorkerRequest; bytes: number; epoch?: string};
@@ -94,7 +93,7 @@ const startCoordinator = (
   let outgoing: BroadcastChannel | undefined;
   let ownerInbox: BroadcastChannel | undefined;
   let owner: ReturnType<typeof createDatabaseBroker> | undefined;
-  let engine: WorkerRpc | undefined;
+  let engine: LocalRpc | undefined;
   let releaseLeader: (() => void) | undefined;
   let releaseClient: (() => void) | undefined;
   let closed = false;

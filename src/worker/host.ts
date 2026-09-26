@@ -45,6 +45,11 @@ export interface StartWorkerOptions {
   durableEngineFactory?: WorkerEngineFactory;
 }
 
+/** A request's outcome: its result, or the error a response would carry. */
+export type Served =
+  | {ok: true; value: unknown}
+  | {ok: false; error: ClientError};
+
 export interface WorkerController {
   /**
    * Serves a request from code in this Worker, in order with every other
@@ -52,6 +57,12 @@ export interface WorkerController {
    * result, or rejects with the error a response message would have carried.
    */
   request(request: WorkerRequest): Promise<unknown>;
+  /**
+   * Serves a request as request() does, but at once, and returns its outcome.
+   * `undefined` means it cannot be served before earlier requests, and has not
+   * been.
+   */
+  requestNow(request: WorkerRequest): Served | undefined;
   close(): Promise<void>;
 }
 
@@ -326,27 +337,38 @@ export const startWorker = (
     }
   };
 
+  // Once the engine is open, a request with nothing ahead of it can be served
+  // at once: this reports whether it was, and passes the outcome to `settle`.
+  const serveNow = (
+    request: WorkerRequest,
+    settle: (ok: boolean, value: unknown) => void,
+  ): boolean => {
+    if (
+      queuedRequests !== 0 ||
+      !openEngine ||
+      request.method === 'init' ||
+      request.method === 'close'
+    ) {
+      return false;
+    }
+    let result: unknown;
+    try {
+      result = handleRequest(request, openEngine);
+    } catch (error) {
+      settle(false, error);
+      return true;
+    }
+    settle(true, result);
+    return true;
+  };
+
   // Serves requests one at a time, in the order they arrive, and passes each
-  // outcome to `settle`, which must not throw. Once the engine is open, a
-  // request with nothing ahead of it is served at once.
+  // outcome to `settle`, which must not throw.
   const schedule = (
     request: WorkerRequest,
     settle: (ok: boolean, value: unknown) => void,
   ): void => {
-    if (
-      queuedRequests === 0 &&
-      openEngine &&
-      request.method !== 'init' &&
-      request.method !== 'close'
-    ) {
-      let result: unknown;
-      try {
-        result = handleRequest(request, openEngine);
-      } catch (error) {
-        settle(false, error);
-        return;
-      }
-      settle(true, result);
+    if (serveNow(request, settle)) {
       return;
     }
     queuedRequests += 1;
@@ -422,6 +444,16 @@ export const startWorker = (
           ok ? resolve(value) : reject(new ClientError(serializeError(value))),
         ),
       ),
+
+    requestNow: (request: WorkerRequest): Served | undefined => {
+      let served: Served | undefined;
+      serveNow(request, (ok, value) => {
+        served = ok
+          ? {ok, value}
+          : {ok, error: new ClientError(serializeError(value))};
+      });
+      return served;
+    },
 
     close: async (): Promise<void> => {
       try {

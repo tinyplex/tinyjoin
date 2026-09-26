@@ -22,7 +22,9 @@ const epoch = 'test-owner';
 const owner = 'local-client';
 const follower = 'remote-client';
 
-function harness(options: {rollbackFailure?: boolean} = {}) {
+function harness(
+  options: {rollbackFailure?: boolean; servesNow?: boolean} = {},
+) {
   const responses = new Map<string, WorkerResponse[]>();
   const lifetimes = new Map<string, () => void>();
   const channels: FakeChannel[] = [];
@@ -91,10 +93,17 @@ function harness(options: {rollbackFailure?: boolean} = {}) {
       return undefined;
     },
   );
-  const rpc: WorkerRpc = {
+  // A host that serves statements at once, as the owner's own host does.
+  const requestNow = vi.fn((method: RpcMethod, params: unknown) =>
+    method === 'executeSql'
+      ? {ok: true as const, value: {command: 'SELECT', params}}
+      : undefined,
+  );
+  const rpc: WorkerRpc & {requestNow?: typeof requestNow} = {
     request: request as WorkerRpc['request'],
     onEvent: vi.fn(),
     dispose: vi.fn(),
+    ...(options.servesNow ? {requestNow} : {}),
   };
   const onFailure = vi.fn((_error: SerializedError) => broker.close());
   const broker = createDatabaseBroker(
@@ -108,6 +117,7 @@ function harness(options: {rollbackFailure?: boolean} = {}) {
   );
   return {
     request,
+    requestNow,
     onFailure,
     send(client: string, request: WorkerRequest): void {
       broker.receive({
@@ -156,6 +166,45 @@ const query = (
     params,
     ...(inTransaction ? {transactionId: `${epoch}/tx-1`} : {}),
   },
+});
+
+describe('database broker scheduling', () => {
+  it('serves a statement at once only when nothing waits ahead of it', async () => {
+    const broker = harness({servesNow: true});
+    try {
+      // Nothing waits, so the statement is answered before the call returns.
+      broker.send(owner, query(1, [1]));
+      expect(broker.response(owner, 1)).toMatchObject({ok: true});
+
+      // A transaction's own statement is served at once too, with its engine
+      // token in place of the one its client holds.
+      broker.send(follower, begin(2));
+      await vi.waitFor(() =>
+        expect(broker.response(follower, 2)).toMatchObject({ok: true}),
+      );
+      broker.send(follower, query(3, [3], true));
+      expect(broker.response(follower, 3)).toMatchObject({ok: true});
+      expect(broker.requestNow).toHaveBeenLastCalledWith('executeSql', {
+        sql: 'SELECT id FROM items WHERE id = $1',
+        params: [3],
+        transactionId: 'tx-1',
+      });
+
+      // Another client's statement waits for the transaction, and then the
+      // transaction's next statement waits behind it in the queue.
+      broker.send(owner, query(4, [4]));
+      broker.send(follower, query(5, [5], true));
+      expect(broker.response(owner, 4)).toBeUndefined();
+      expect(broker.response(follower, 5)).toBeUndefined();
+      await vi.waitFor(() =>
+        expect(broker.response(follower, 5)).toMatchObject({ok: true}),
+      );
+      expect(broker.response(owner, 4)).toBeUndefined();
+      expect(broker.requestNow).toHaveBeenCalledTimes(2);
+    } finally {
+      broker.close();
+    }
+  });
 });
 
 describe('database broker failure and resource boundaries', () => {

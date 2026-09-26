@@ -1028,6 +1028,15 @@ describe('startWorker', () => {
     const queued = update('UPDATE posts SET title = 1');
     await Promise.resolve();
     expect(engine.executeSql).not.toHaveBeenCalled();
+    // Nothing can be served at once while init waits for the engine.
+    const now = (sql: string) =>
+      host.requestNow({
+        v: PROTOCOL_VERSION,
+        id: 1,
+        method: 'executeSql',
+        params: {sql, params: []},
+      });
+    expect(now('SELECT 1')).toBeUndefined();
     open(engine);
     await expect(initialized).resolves.toEqual({revision: 0});
     await expect(queued).resolves.toMatchObject({revision: 1});
@@ -1036,6 +1045,18 @@ describe('startWorker', () => {
     const immediate = update('UPDATE posts SET title = 2');
     expect(engine.executeSql).toHaveBeenCalledTimes(2);
     await expect(immediate).resolves.toMatchObject({revision: 2});
+    expect(now('UPDATE posts SET title = 3')).toMatchObject({
+      ok: true,
+      value: {revision: 3},
+    });
+    expect(
+      host.requestNow({
+        v: PROTOCOL_VERSION,
+        id: 1,
+        method: 'rollbackTransaction',
+        params: {transactionId: 'tx-9'},
+      }),
+    ).toMatchObject({ok: false, error: {code: 'TRANSACTION_NOT_ACTIVE'}});
     await expect(
       host.request({
         v: PROTOCOL_VERSION,
