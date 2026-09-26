@@ -60,7 +60,7 @@ than in either, and `GROUP BY` is about as quick.
   sort their entries first, and commits write each page once and flush twice
   rather than three times.
 
-The compressed download grows by 28 KiB, to 323 KiB.
+The compressed download is now {{sizes.total.gzip}}, up from 295 KiB in v0.3.0.
 
 ## v0.3.0
 
