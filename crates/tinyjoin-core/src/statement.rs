@@ -9,6 +9,7 @@ use crate::query::{
     Filter, ParseMode, Token, bind_parameter, is_reserved_keyword, parse_predicate_at,
     primary_key_lookup, tokenize, validate_named_columns, validate_parameter_expansion,
     validate_predicate_columns, validate_predicate_types, validate_sql_input,
+    visit_indexed_candidates,
 };
 use crate::row::RowRef;
 use crate::storage::{
@@ -1337,7 +1338,8 @@ fn plan_delete(
 }
 
 /// Predicate and assignment validation precedes this lookup, and the caller still checks the
-/// complete predicate. Only exact complete primary keys can skip the streaming table scan.
+/// complete predicate. Candidates are narrowed as a query's are, except that a primary key too large
+/// to store is scanned for rather than looked up.
 fn visit_dml_candidates(
     storage: &dyn StorageReader,
     schema: &TableDefinition,
@@ -1355,7 +1357,7 @@ fn visit_dml_candidates(
             _ => Ok(VisitOutcome::Complete),
         };
     }
-    storage.visit_table(&schema.name, visitor)
+    visit_indexed_candidates(storage, &schema.name, predicate, schema, visitor)
 }
 
 fn validate_projection(schema: &TableDefinition, returning: Option<&[String]>) -> Result<()> {
@@ -2381,7 +2383,8 @@ mod tests {
                 ("(id = 1 AND value = 'one') AND id = 2", 0, (0, 1)),
                 ("id = 1 OR id = 2", 2, (1, 0)),
                 ("id = 1.0", 1, (1, 0)),
-                ("id = NULL", 0, (1, 0)),
+                // A comparison with NULL matches no row, so nothing is read.
+                ("id = NULL", 0, (0, 0)),
                 ("value = 'one'", 1, (1, 0)),
             ] {
                 let mut storage = storage();

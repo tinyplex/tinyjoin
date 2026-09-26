@@ -4,9 +4,10 @@ use std::str::FromStr;
 
 use serde_json::{Map, Number, Value};
 
+use crate::paged_codec::{encode_key_bound, encode_text_prefix_bounds};
 use crate::row::{Columns, RowRef, ValueRef};
 use crate::storage::{
-    StorageReader, estimated_row_bytes, estimated_value_bytes, validate_json_value,
+    KeyRange, StorageReader, estimated_row_bytes, estimated_value_bytes, validate_json_value,
 };
 use crate::{
     ColumnDefinition, ColumnType, ComparisonOperator, EngineError, NullOrder, OrderBy,
@@ -365,12 +366,218 @@ pub(crate) fn visit_predicate_candidates(
             _ => Ok(VisitOutcome::Complete),
         };
     }
+    visit_indexed_candidates(storage, table, predicate, schema, visitor)
+}
+
+/// [`visit_predicate_candidates`] once no complete primary key applies. It reads, in order of
+/// preference: an index whose every column the predicate fixes, a range of an index's leading
+/// column, a range of the leading primary-key column, and otherwise the whole table.
+///
+/// Rows come in primary-key order from every path but the equality index, which returns rows with
+/// equal indexed values, and so in primary-key order too.
+pub(crate) fn visit_indexed_candidates(
+    storage: &dyn StorageReader,
+    table: &str,
+    predicate: Option<&Predicate>,
+    schema: &crate::TableDefinition,
+    visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+) -> Result<VisitOutcome> {
     if let Some((columns, key)) = secondary_index_key(storage, table, predicate, schema)?
         && let Some(outcome) = storage.visit_index(table, &columns, &key, visitor)?
     {
         return Ok(outcome);
     }
-    storage.visit_table(table, visitor)
+    let Some(predicate) = predicate else {
+        return storage.visit_table(table, visitor);
+    };
+    // Each row an index range finds costs a lookup, so a range is worth reading only while it
+    // covers a small part of the table. Beyond that, reading in key order is cheaper.
+    let limit = storage.table_row_count(table)? / 4;
+    for definition in storage.indexes_for_table(table)? {
+        // A row is indexed only when every indexed column is non-null, so a range of the leading
+        // column finds every row in it only if no other indexed column can be null.
+        let complete = definition.columns[1..].iter().all(|name| {
+            schema
+                .columns
+                .iter()
+                .any(|column| column.name == *name && !column.nullable)
+        });
+        if !complete {
+            continue;
+        }
+        match column_range(
+            predicate,
+            column_definition(schema, &definition.columns[0], table)?,
+        )? {
+            ColumnRange::Unbounded => {}
+            ColumnRange::Empty => return Ok(VisitOutcome::Complete),
+            ColumnRange::Bounded(range) => {
+                if let Some(outcome) =
+                    storage.visit_index_range(table, &definition.columns, &range, limit, visitor)?
+                {
+                    return Ok(outcome);
+                }
+            }
+        }
+    }
+    let key = column_definition(schema, &schema.primary_key[0], table)?;
+    match column_range(predicate, key)? {
+        ColumnRange::Unbounded => storage.visit_table(table, visitor),
+        ColumnRange::Empty => Ok(VisitOutcome::Complete),
+        ColumnRange::Bounded(range) => storage.visit_table_range(table, &range, visitor),
+    }
+}
+
+/// The key range of one column that a predicate's AND-ed terms allow.
+enum ColumnRange {
+    /// No term bounds the column.
+    Unbounded,
+    /// No row can satisfy the terms, such as an INTEGER column equal to 2.5.
+    Empty,
+    Bounded(KeyRange),
+}
+
+/// Bounds a column from the comparisons and prefix `LIKE` patterns among a predicate's top-level
+/// AND-ed terms. Every bound is inclusive and so may admit a row that its term rejects, which the
+/// caller's filter then does; exclusive integer bounds become the next integer.
+fn column_range(predicate: &Predicate, column: &ColumnDefinition) -> Result<ColumnRange> {
+    let mut range = KeyRange::default();
+    if !narrow_range(predicate, column, &mut range)? {
+        return Ok(ColumnRange::Empty);
+    }
+    Ok(match (&range.lower, &range.upper) {
+        (None, None) => ColumnRange::Unbounded,
+        (Some(lower), Some(upper)) if lower > upper => ColumnRange::Empty,
+        _ => ColumnRange::Bounded(range),
+    })
+}
+
+/// Tightens `range` with each AND-ed term that bounds `column`, returning `false` once a term can
+/// match no row.
+fn narrow_range(
+    predicate: &Predicate,
+    column: &ColumnDefinition,
+    range: &mut KeyRange,
+) -> Result<bool> {
+    let (lower, upper) = match predicate {
+        Predicate::And { predicates } => {
+            for predicate in predicates {
+                if !narrow_range(predicate, column, range)? {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        Predicate::Comparison {
+            column: name,
+            operator,
+            value,
+        } if *name == column.name => {
+            if value.is_null() {
+                // A comparison with NULL is never true, so neither is the conjunction.
+                return Ok(false);
+            }
+            match comparison_bounds(column.data_type, *operator, value)? {
+                Some(Some(bounds)) => bounds,
+                Some(None) => return Ok(false),
+                None => return Ok(true),
+            }
+        }
+        Predicate::Like {
+            column: name,
+            pattern: Value::String(pattern),
+            escape,
+            case_insensitive: false,
+        } if *name == column.name && column.data_type == ColumnType::Text => {
+            let escape = match escape {
+                None => Some('\\'),
+                Some(Value::String(escape)) => escape.chars().next(),
+                Some(_) => return Ok(true),
+            };
+            let prefix = LikePattern::new(pattern, escape, false).literal_prefix();
+            if prefix.is_empty() {
+                return Ok(true);
+            }
+            let (lower, upper) = encode_text_prefix_bounds(&prefix)?;
+            (Some(lower), Some(upper))
+        }
+        _ => return Ok(true),
+    };
+    // A cursor cannot start at a key longer than any stored key, and neither bound is needed.
+    if let Some(lower) = lower.filter(|lower| lower.len() <= crate::MAX_BTREE_KEY_BYTES)
+        && range.lower.as_ref().is_none_or(|current| lower > *current)
+    {
+        range.lower = Some(lower);
+    }
+    if let Some(upper) = upper
+        && range.upper.as_ref().is_none_or(|current| upper < *current)
+    {
+        range.upper = Some(upper);
+    }
+    Ok(true)
+}
+
+type KeyBounds = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// The encoded bounds one comparison places on a column: `None` if it places none, and
+/// `Some(None)` if it can match no value of the column's type.
+fn comparison_bounds(
+    data_type: ColumnType,
+    operator: ComparisonOperator,
+    value: &Value,
+) -> Result<Option<Option<KeyBounds>>> {
+    if operator == ComparisonOperator::Neq {
+        return Ok(None);
+    }
+    let bound = |value: Value| encode_key_bound(data_type, &value);
+    let bounds = match data_type {
+        ColumnType::Integer => {
+            // Integers compare with numbers as f64 values do, and every stored integer is exact
+            // in f64, so each bound is the nearest integer on its side of the value.
+            let Some(value) = value.as_f64() else {
+                return Ok(None);
+            };
+            let (low, high) = match operator {
+                ComparisonOperator::Eq => (value.ceil(), value.floor()),
+                ComparisonOperator::Gt => (value.floor() + 1.0, f64::INFINITY),
+                ComparisonOperator::Gte => (value.ceil(), f64::INFINITY),
+                ComparisonOperator::Lt => (f64::NEG_INFINITY, value.ceil() - 1.0),
+                ComparisonOperator::Lte => (f64::NEG_INFINITY, value.floor()),
+                ComparisonOperator::Neq => unreachable!("handled above"),
+            };
+            const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+            if low > high || low > MAX_SAFE_INTEGER || high < -MAX_SAFE_INTEGER {
+                return Ok(Some(None));
+            }
+            (
+                (low > -MAX_SAFE_INTEGER)
+                    .then(|| bound(Value::from(low as i64)))
+                    .transpose()?,
+                (high < MAX_SAFE_INTEGER)
+                    .then(|| bound(Value::from(high as i64)))
+                    .transpose()?,
+            )
+        }
+        ColumnType::Float | ColumnType::Text | ColumnType::Boolean => {
+            let comparable = match data_type {
+                ColumnType::Float => value.as_f64().map(Value::from),
+                ColumnType::Text => value.is_string().then(|| value.clone()),
+                _ => value.is_boolean().then(|| value.clone()),
+            };
+            let Some(value) = comparable else {
+                return Ok(None);
+            };
+            let value = bound(value)?;
+            match operator {
+                ComparisonOperator::Eq => (Some(value.clone()), Some(value)),
+                ComparisonOperator::Gt | ComparisonOperator::Gte => (Some(value), None),
+                ComparisonOperator::Lt | ComparisonOperator::Lte => (None, Some(value)),
+                ComparisonOperator::Neq => unreachable!("handled above"),
+            }
+        }
+        ColumnType::Json => return Ok(None),
+    };
+    Ok(Some(Some(bounds)))
 }
 
 fn secondary_index_key(
@@ -2436,6 +2643,17 @@ impl LikePattern {
             segments,
             case_insensitive,
         }
+    }
+
+    /// The characters every match starts with: those before the first wildcard.
+    fn literal_prefix(&self) -> String {
+        self.segments[0]
+            .iter()
+            .map_while(|element| match element {
+                LikeElement::Character(character) => Some(*character),
+                LikeElement::AnyCharacter => None,
+            })
+            .collect()
     }
 
     fn matches(&self, text: &str) -> bool {

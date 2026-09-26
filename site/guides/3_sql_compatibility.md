@@ -206,7 +206,7 @@ each statement retains the ordinary parser limits below.
 | `IN (...)`, `NOT IN (...)` | Supported | One to 1,024 literals or parameters with SQL null behavior. |
 | `BETWEEN`, `NOT BETWEEN` | Narrow | `column BETWEEN low AND high` means exactly `column >= low AND column <= high`, and `NOT BETWEEN` means `column < low OR column > high`, with those comparisons' type and null rules. Each bound is a literal or parameter. There is no `SYMMETRIC` form, so a reversed range matches nothing. |
 | Arithmetic, concatenation, casts, scalar functions | No | Values are not a general expression language. |
-| `LIKE`, `NOT LIKE`, `ILIKE`, `NOT ILIKE` | Narrow | Matches a whole text column value against a literal or parameter pattern, where `%` matches any run of characters and `_` exactly one character; a non-text column is rejected. Backslash makes the next pattern character literal unless `ESCAPE` names another single character, or `''` for none; a pattern ending in its escape character is rejected. `ILIKE` folds only ASCII letters, as PostgreSQL does under the C locale. A `NULL` operand is unknown. Pattern matches never use an index. |
+| `LIKE`, `NOT LIKE`, `ILIKE`, `NOT ILIKE` | Narrow | Matches a whole text column value against a literal or parameter pattern, where `%` matches any run of characters and `_` exactly one character; a non-text column is rejected. Backslash makes the next pattern character literal unless `ESCAPE` names another single character, or `''` for none; a pattern ending in its escape character is rejected. `ILIKE` folds only ASCII letters, as PostgreSQL does under the C locale. A `NULL` operand is unknown. A `LIKE` pattern that begins with literal characters, such as `'abc%'`, reads only the part of an index or primary key that can match; other patterns scan. |
 | `IS DISTINCT FROM`, `SIMILAR TO`, `ANY`, `ALL` | No | These PostgreSQL predicate families are not implemented. |
 | JSON/path operators | No | JSON can be stored, returned, and compared for structural equality only. |
 
@@ -294,8 +294,9 @@ cannot change a row's primary key, although assigning it the same value is
 allowed. `NULL` never conflicts with a unique index.
 
 A primary-key arbiter uses direct key lookup. A unique-index arbiter reads the
-index postings, except inside a callback transaction, where staged rows are not
-yet indexed and each statement scans the table once instead.
+index postings, except inside a callback transaction that has staged changes to
+the table, where those rows are not yet indexed and each statement scans the
+table once instead.
 
 `RETURNING`, the affected-row count, and [changed keys](/guides/transactions-and-changes/#refreshing-individual-rows)
 cover inserted and updated rows only. A statement that skips every row reports
@@ -321,13 +322,26 @@ primary keys as stable, opaque identifiers.
 
 Composite primary and secondary indexes are supported. A unique index omits a
 key containing `NULL`, so multiple null-containing keys are allowed, matching
-PostgreSQL's default `NULLS DISTINCT` behavior. Simple `SELECT`, `UPDATE`, and
-`DELETE` use direct lookup for complete primary-key equality when the key types
-and values permit an exact lookup. This also sees staged changes inside a
-transaction, and the complete predicate is still checked. `SELECT` can use
-secondary-index postings for complete equality on every indexed column. Other
-`UPDATE` and `DELETE` predicates scan; partial composite matches, ranges,
-pattern matches, `OR`, and `NOT` also fall back to scans.
+PostgreSQL's default `NULLS DISTINCT` behavior.
+
+Single-table `SELECT`, aggregates, `UPDATE`, and `DELETE` read only the rows
+their `WHERE` clause can match when its `AND`-ed terms allow, and still check
+the complete predicate on every row they read:
+
+- complete primary-key equality is a direct lookup, when the key types and
+  values permit an exact one, and sees staged changes inside a transaction;
+- complete equality on every column of a secondary index reads that index's
+  postings;
+- comparisons, `BETWEEN`, and `LIKE` patterns that begin with literal
+  characters read a range of an index's first column, while the range holds at
+  most a quarter of the table's rows, or else a range of the primary key's first
+  column. An index is used for a range only if its other columns are
+  `NOT NULL`, since a row with a `NULL` indexed value is not indexed.
+
+Inside a callback transaction, a table with staged changes narrows only by a
+direct primary-key lookup, because its staged rows are not yet indexed or in key
+order. `OR`, `NOT`, `IN`, and partial composite equality do not narrow the rows
+read, and neither does a join.
 
 ## Aggregates and joins
 

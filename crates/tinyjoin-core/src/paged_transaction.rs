@@ -9,7 +9,7 @@ use crate::{
     paged_codec::encode_primary_key,
     paged_storage::{AppendWriteContext, PagedWriteUsage, UniquePrefixes},
     row::RowRef,
-    storage::estimated_row_bytes,
+    storage::{KeyRange, estimated_row_bytes},
 };
 
 const MAX_TRANSACTION_KEYS: usize = 100_000;
@@ -403,6 +403,16 @@ impl<'a, D: PageDevice> PagedReadView<'a, D> {
             None => Ok(()),
         }
     }
+
+    /// Whether the committed table is exactly what this view sees, so that its key order and
+    /// indexes apply: no transaction has staged a change to it.
+    fn reads_committed(&self, table: &str) -> bool {
+        self.transaction.is_none_or(|transaction| {
+            transaction
+                .table_entries(table)
+                .is_none_or(|entries| entries.values().all(|entry| entry.base == entry.next))
+        })
+    }
 }
 
 impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
@@ -457,6 +467,24 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
         Ok(VisitOutcome::Complete)
     }
 
+    fn visit_table_range(
+        &self,
+        table: &str,
+        range: &KeyRange,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        self.ensure_base_revision()?;
+        if !self.reads_committed(table) {
+            // Staged rows follow the committed ones rather than taking their places in key order,
+            // so a transaction which changed the table visits every row.
+            return self.visit_table(table, visitor);
+        }
+        self.storage.visit_table_range(table, range, &mut |row| {
+            self.charge_work(1)?;
+            visitor(row)
+        })
+    }
+
     fn table_row_count(&self, table: &str) -> Result<usize> {
         self.ensure_base_revision()?;
         let mut count = self.storage.table_row_count(table)?;
@@ -507,7 +535,8 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
     fn indexes_for_table(&self, table: &str) -> Result<Vec<IndexDefinition>> {
         self.ensure_base_revision()?;
         // A transaction stages rows but never DDL, so the committed definitions stay accurate.
-        // Only their postings are stale, which is why `visit_index` declines inside a transaction.
+        // Only the postings for a table it changed are stale, which is why index visits then
+        // decline.
         self.storage.indexes_for_table(table)
     }
 
@@ -519,15 +548,34 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<Option<VisitOutcome>> {
         self.ensure_base_revision()?;
-        if self.transaction.is_some() {
+        if !self.reads_committed(table) {
             self.storage.table_schema(table)?;
-            Ok(None)
-        } else {
-            self.storage.visit_index(table, columns, key, &mut |row| {
+            return Ok(None);
+        }
+        self.storage.visit_index(table, columns, key, &mut |row| {
+            self.charge_work(2)?;
+            visitor(row)
+        })
+    }
+
+    fn visit_index_range(
+        &self,
+        table: &str,
+        columns: &[String],
+        range: &KeyRange,
+        limit: usize,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<Option<VisitOutcome>> {
+        self.ensure_base_revision()?;
+        if !self.reads_committed(table) {
+            self.storage.table_schema(table)?;
+            return Ok(None);
+        }
+        self.storage
+            .visit_index_range(table, columns, range, limit, &mut |row| {
                 self.charge_work(2)?;
                 visitor(row)
             })
-        }
     }
 
     fn table_schema(&self, table: &str) -> Result<TableDefinition> {

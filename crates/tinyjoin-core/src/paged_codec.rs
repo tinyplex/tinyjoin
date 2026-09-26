@@ -164,6 +164,48 @@ pub(crate) fn encode_secondary_index_entry_key(
     Ok(Some(key))
 }
 
+/// Encodes one value as a key component of `data_type`, to bound a range of keys. Components compare
+/// as their values do, so a key lies between two bounds exactly when its component does.
+pub(crate) fn encode_key_bound(data_type: ColumnType, value: &Value) -> Result<Vec<u8>> {
+    let mut bound = Vec::new();
+    encode_component(&mut bound, data_type, value, "", "")?;
+    Ok(bound)
+}
+
+/// Encodes the smallest and largest components of `data_type` text that start with `prefix`: the
+/// prefix's escaped bytes, and those followed by `0xff`, which UTF-8 never contains.
+pub(crate) fn encode_text_prefix_bounds(prefix: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut lower = encode_key_bound(ColumnType::Text, &Value::from(prefix))?;
+    lower.truncate(lower.len() - 2);
+    let mut upper = lower.clone();
+    upper.push(0xff);
+    Ok((lower, upper))
+}
+
+/// The first component of a key: a table key's leading primary-key column, or an index entry's
+/// leading indexed column.
+pub(crate) fn leading_key_component(key: &[u8], data_type: ColumnType) -> Result<&[u8]> {
+    Ok(&key[..component_end(key, 0, data_type)?])
+}
+
+/// The primary key an index entry carries after its indexed components, whose types are
+/// `indexed_types`.
+pub(crate) fn index_entry_primary_key<'a>(
+    entry: &'a [u8],
+    indexed_types: &[ColumnType],
+) -> Result<&'a [u8]> {
+    let mut offset = 0;
+    for data_type in indexed_types {
+        offset = component_end(entry, offset, *data_type)?;
+    }
+    if offset == entry.len() {
+        return Err(storage_corrupt(
+            "A secondary-index entry does not contain a primary key after its tuple",
+        ));
+    }
+    Ok(&entry[offset..])
+}
+
 /// Reports whether an index entry holds the tuple `prefix` encodes. Components delimit themselves,
 /// so an entry for any other tuple cannot begin with these bytes.
 pub(crate) fn secondary_index_entry_matches_prefix(entry: &[u8], prefix: &[u8]) -> bool {
@@ -283,6 +325,11 @@ enum ColumnSlot {
 }
 
 impl RecordLayout {
+    /// The type of each primary-key column, in key order.
+    pub(crate) fn key_types(&self) -> &[ColumnType] {
+        &self.key_types
+    }
+
     pub(crate) fn new(schema: &TableDefinition) -> Result<Self> {
         let key_types = schema
             .primary_key

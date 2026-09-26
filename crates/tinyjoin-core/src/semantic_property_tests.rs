@@ -1175,3 +1175,244 @@ fn deterministic_sql_mutations_never_panic_or_partially_apply_failed_scripts() {
         );
     }
 }
+
+/// Range reads through secondary indexes and primary keys must return what a full scan returns,
+/// in the same order, with aggregates bit for bit. `indexed` holds the same rows as `plain`, with
+/// an index on every indexable column the predicates bound, so each generated predicate is answered
+/// once through a range and once by scanning. The tables are large enough that a range covering a
+/// small part of either is read through its index.
+#[test]
+fn generated_ranges_agree_with_full_scans() {
+    const COLUMNS: &str = "id INTEGER PRIMARY KEY, i INTEGER, f FLOAT, t TEXT, b BOOLEAN, \
+        n INTEGER NOT NULL";
+    let texts = [
+        "", "a", "ab", "abc", "abd", "ab%c", "b", "ba", "é", "🦀", "a\u{0}b", "\u{0}", "zz",
+    ];
+    let floats = [-1.5, -0.0, 0.0, 0.5, 2.0, 1e10];
+    let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+    engine
+        .exec_sql(&format!(
+            "CREATE TABLE plain ({COLUMNS}); CREATE TABLE indexed ({COLUMNS}); \
+             CREATE INDEX indexed_i ON indexed (i); CREATE INDEX indexed_t ON indexed (t); \
+             CREATE INDEX indexed_b ON indexed (b); \
+             CREATE INDEX indexed_n_i ON indexed (n, i); CREATE INDEX indexed_i_n ON indexed (i, n)"
+        ))
+        .unwrap();
+    let mut generator = Generator(0x5eed);
+    engine.begin_transaction().unwrap();
+    for id in 1..=300 {
+        let mut maybe = |value: Value| {
+            if generator.pick(8) == 0 {
+                Value::Null
+            } else {
+                value
+            }
+        };
+        let row = [
+            json!(id),
+            maybe(json!(generator_value(id, 41) - 20)),
+            maybe(json!(floats[id as usize % floats.len()])),
+            maybe(json!(texts[(id as usize * 7) % texts.len()])),
+            maybe(json!(id % 3 == 0)),
+            json!(id % 10),
+        ];
+        for table in ["plain", "indexed"] {
+            engine
+                .execute_sql(
+                    &format!("INSERT INTO {table} VALUES ($1, $2, $3, $4, $5, $6)"),
+                    &row,
+                )
+                .unwrap();
+        }
+    }
+    engine.commit_transaction().unwrap();
+
+    let parameters = [
+        json!(-3),
+        json!(0),
+        json!(2.5),
+        json!(7.0),
+        json!(-0.0),
+        json!(1e20),
+        json!(-1e20),
+        json!(0.5),
+        json!("ab"),
+        json!("abd"),
+        json!("é"),
+        json!(true),
+        Value::Null,
+    ];
+    let terms = [
+        "i > $1",
+        "i >= $1",
+        "i < $1",
+        "i <= $1",
+        "i = $1",
+        "i BETWEEN $1 AND $2",
+        "f > $1",
+        "f >= $1",
+        "f < $1",
+        "f <= $1",
+        "f = $1",
+        "f BETWEEN $1 AND $2",
+        "t > $1",
+        "t >= $1",
+        "t < $1",
+        "t <= $1",
+        "t = $1",
+        "t BETWEEN $1 AND $2",
+        "t LIKE 'ab%'",
+        "t LIKE 'a\\_b%'",
+        "t LIKE 'é%'",
+        "t LIKE '%b'",
+        "t ILIKE 'AB%'",
+        "b = $1",
+        "n >= 7",
+        "n = 3",
+        "id > 290",
+        "id <= 12",
+        "id BETWEEN 100 AND 110",
+        "i <> 3",
+        "t IS NULL",
+        "(i < 0 OR i > 10)",
+        "i BETWEEN -3 AND -1",
+        "i > 17",
+        "i < -18",
+        "i >= 2.5 AND i <= 4",
+        "t > 'é'",
+        "t < 'a'",
+        "t LIKE 'abd%'",
+        "t BETWEEN 'ab' AND 'abc'",
+        "b = false AND i > 15",
+    ];
+    let generate = |generator: &mut Generator| {
+        let condition = (0..1 + generator.pick(3))
+            .map(|_| terms[generator.pick(terms.len())])
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let arity = (1..=2)
+            .filter(|index| condition.contains(&format!("${index}")))
+            .max()
+            .unwrap_or(0);
+        let params = (0..arity)
+            .map(|_| parameters[generator.pick(parameters.len())].clone())
+            .collect::<Vec<_>>();
+        (condition, params)
+    };
+    let compare_reads = |engine: &Database, case: usize, condition: &str, params: &[Value]| {
+        let mut succeeded = 0;
+        for statement in [
+            "SELECT id FROM {table} WHERE {condition}",
+            "SELECT count(*) AS c, sum(f) AS s, min(t) AS m FROM {table} WHERE {condition}",
+            "SELECT id, t FROM {table} WHERE {condition} ORDER BY id LIMIT 5",
+            "SELECT n, count(*) AS c FROM {table} WHERE {condition} GROUP BY n",
+        ] {
+            let sql = |table: &str| {
+                statement
+                    .replace("{table}", table)
+                    .replace("{condition}", condition)
+            };
+            match (
+                engine.query_sql(&sql("plain"), params),
+                engine.query_sql(&sql("indexed"), params),
+            ) {
+                (Ok(plain), Ok(indexed)) => {
+                    assert_eq!(
+                        plain.rows,
+                        indexed.rows,
+                        "case {case}: {} {params:?}",
+                        sql("?")
+                    );
+                    succeeded += 1;
+                }
+                (Err(plain), Err(indexed)) => {
+                    assert_eq!(plain.code, indexed.code, "case {case}: {}", sql("?"))
+                }
+                (plain, indexed) => panic!(
+                    "case {case}: {} {params:?}: {plain:?} but indexed {indexed:?}",
+                    sql("?")
+                ),
+            }
+        }
+        succeeded
+    };
+    let mut checked = 0;
+    for case in 0..250 {
+        let (condition, params) = generate(&mut generator);
+        checked += compare_reads(&engine, case, &condition, &params);
+        // Writes narrow their rows the same way. Each is undone afterwards, row by row.
+        let mut deleted = Vec::new();
+        let mut updated = Vec::new();
+        for table in ["plain", "indexed"] {
+            let result = engine.execute_sql(
+                &format!("DELETE FROM {table} WHERE {condition} RETURNING *"),
+                &params,
+            );
+            let rows = result
+                .as_ref()
+                .map_or_else(|_| Vec::new(), |result| result.rows.clone());
+            for row in &rows {
+                let values = ["id", "i", "f", "t", "b", "n"].map(|column| row[column].clone());
+                engine
+                    .execute_sql(
+                        &format!("INSERT INTO {table} VALUES ($1, $2, $3, $4, $5, $6)"),
+                        &values,
+                    )
+                    .unwrap();
+            }
+            deleted.push(result.map(|_| ids(&rows)).map_err(|error| error.code));
+
+            let result = engine.execute_sql(
+                &format!("UPDATE {table} SET n = n + 1 WHERE {condition} RETURNING id"),
+                &params,
+            );
+            let rows = result
+                .as_ref()
+                .map_or_else(|_| Vec::new(), |result| result.rows.clone());
+            for row in &rows {
+                engine
+                    .execute_sql(
+                        &format!("UPDATE {table} SET n = n - 1 WHERE id = $1"),
+                        &[row["id"].clone()],
+                    )
+                    .unwrap();
+            }
+            updated.push(result.map(|_| ids(&rows)).map_err(|error| error.code));
+        }
+        assert_eq!(
+            deleted[0], deleted[1],
+            "case {case}: DELETE WHERE {condition} {params:?}"
+        );
+        assert_eq!(
+            updated[0], updated[1],
+            "case {case}: UPDATE WHERE {condition} {params:?}"
+        );
+    }
+    assert!(checked > 500, "only {checked} statements succeeded");
+
+    // Inside a transaction, a table it has not changed is still read through its ranges and
+    // indexes, while one it has changed is scanned along with its staged rows.
+    for staged in [false, true] {
+        engine.begin_transaction().unwrap();
+        if staged {
+            for table in ["plain", "indexed"] {
+                engine
+                    .execute_sql(
+                        &format!("INSERT INTO {table} VALUES (1000, 3, 0.5, 'abc', true, 3)"),
+                        &[],
+                    )
+                    .unwrap();
+            }
+        }
+        for case in 0..60 {
+            let (condition, params) = generate(&mut generator);
+            compare_reads(&engine, case, &condition, &params);
+        }
+        engine.rollback_transaction().unwrap();
+    }
+}
+
+/// A fixed pseudo-random value in `0..bound` for row `id`.
+fn generator_value(id: i64, bound: i64) -> i64 {
+    (id * 7919 + id * id * 31) % bound
+}

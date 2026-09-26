@@ -32,6 +32,28 @@ pub(crate) enum VisitOutcome {
     Stopped,
 }
 
+/// Inclusive bounds on the leading component of a table's keys or an index's entries, either of
+/// which may be absent. Bounds are drawn from a predicate, and may admit rows it rejects but never
+/// exclude a row it accepts.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct KeyRange {
+    pub(crate) lower: Option<Vec<u8>>,
+    pub(crate) upper: Option<Vec<u8>>,
+}
+
+impl KeyRange {
+    /// Where a visit in key order starts.
+    pub(crate) fn start(&self) -> &[u8] {
+        self.lower.as_deref().unwrap_or_default()
+    }
+
+    /// Whether a key whose leading component is `component` lies at or below the upper bound. A
+    /// visit in key order stops at the first key that does not.
+    pub(crate) fn admits(&self, component: &[u8]) -> bool {
+        self.upper.as_deref().is_none_or(|upper| component <= upper)
+    }
+}
+
 /// Read-only relational storage used by query planning and execution.
 ///
 /// Keeping this contract independent of mutation lets a page-backed reader
@@ -61,6 +83,17 @@ pub(crate) trait StorageReader {
         table: &str,
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome>;
+    /// Visits the rows whose leading primary-key column lies within `range`, which may include rows
+    /// outside it. Readers without ordered keys visit every row.
+    fn visit_table_range(
+        &self,
+        table: &str,
+        range: &KeyRange,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        let _ = range;
+        self.visit_table(table, visitor)
+    }
     fn table_row_count(&self, table: &str) -> Result<usize>;
     /// Collecting helper for operators that require all table rows at once.
     #[cfg(test)]
@@ -82,6 +115,20 @@ pub(crate) trait StorageReader {
         key: &Row,
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<Option<VisitOutcome>>;
+    /// Visits, in primary-key order, the rows whose leading indexed column lies within `range`,
+    /// using the index on `columns`. Returns `None`, having visited nothing, when the reader cannot
+    /// use that index or more than `limit` entries lie within the range.
+    fn visit_index_range(
+        &self,
+        table: &str,
+        columns: &[String],
+        range: &KeyRange,
+        limit: usize,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<Option<VisitOutcome>> {
+        let _ = (table, columns, range, limit, visitor);
+        Ok(None)
+    }
     /// Collecting helper for callers that require all matching index rows.
     #[cfg(test)]
     fn lookup_index(&self, table: &str, columns: &[String], key: &Row) -> Result<Option<Vec<Row>>> {

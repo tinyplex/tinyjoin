@@ -9,18 +9,19 @@ use crate::paged_codec::{
     CatalogHeader, encode_catalog_header_record, encode_catalog_index_record,
 };
 use crate::{
-    ApplyOutcome, Btree, EngineError, ExecuteResult, IndexDefinition, PageDevice, PageId, Pager,
-    Result, Row, RowChange, StorageReader, TableDefinition, TreeId, VisitControl, VisitOutcome,
+    ApplyOutcome, Btree, ColumnType, EngineError, ExecuteResult, IndexDefinition, PageDevice,
+    PageId, Pager, Result, Row, RowChange, StorageReader, TableDefinition, TreeId, VisitControl,
+    VisitOutcome,
     paged_codec::{
         CATALOG_TREE_ID, CatalogIndexRecord, CatalogKey, CatalogTableRecord, FIRST_USER_TREE_ID,
         RecordLayout, StoredRecord, decode_catalog_header_record, decode_catalog_index_record,
         decode_catalog_key, decode_catalog_table_record, encode_primary_key,
-        encode_secondary_index_entry_key, encode_secondary_index_prefix,
-        secondary_index_entry_matches_prefix, secondary_index_primary_key,
+        encode_secondary_index_entry_key, encode_secondary_index_prefix, index_entry_primary_key,
+        leading_key_component, secondary_index_entry_matches_prefix, secondary_index_primary_key,
         secondary_index_primary_key_for_definition,
     },
     row::RowRef,
-    storage::{RowWriteUsage, normalize_row, preflight_row_write_set},
+    storage::{KeyRange, RowWriteUsage, normalize_row, preflight_row_write_set},
 };
 /// A relational view over the crash-safe paged B-tree store.
 ///
@@ -79,6 +80,26 @@ impl PagedTable {
     /// One of this table's stored entries, read in place.
     pub(crate) fn record<'a>(&'a self, key: &'a [u8], value: &'a [u8]) -> Result<StoredRecord<'a>> {
         StoredRecord::new(&self.schema, &self.layout, key, value)
+    }
+
+    /// The type of the leading primary-key column, which orders this table's keys.
+    pub(crate) fn leading_key_type(&self) -> ColumnType {
+        self.layout.key_types()[0]
+    }
+
+    /// The types of `columns`, in the order given.
+    pub(crate) fn column_types(&self, columns: &[String]) -> Result<Vec<ColumnType>> {
+        columns
+            .iter()
+            .map(|name| {
+                self.schema
+                    .columns
+                    .iter()
+                    .find(|column| column.name == *name)
+                    .map(|column| column.data_type)
+                    .ok_or_else(|| EngineError::column_not_found(name, &self.schema.name))
+            })
+            .collect()
     }
 }
 
@@ -686,6 +707,42 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
         Ok(VisitOutcome::Complete)
     }
 
+    fn visit_table_range(
+        &self,
+        table: &str,
+        range: &KeyRange,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        self.ensure_ready()?;
+        let table = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::table_not_found(table))?;
+        let Some(root) = table.root_page_id else {
+            return Ok(VisitOutcome::Complete);
+        };
+        let key_type = table.leading_key_type();
+        let mut cursor = Btree::cursor_from(
+            &mut self.pager.borrow_mut(),
+            root,
+            table.tree_id,
+            range.start(),
+        )?;
+        loop {
+            let next = cursor.next_entry(&mut self.pager.borrow_mut())?;
+            let Some((key, value)) = next else {
+                break;
+            };
+            if !range.admits(leading_key_component(key, key_type)?) {
+                break;
+            }
+            if visitor(&RowRef::record(table.record(key, &value)?))? == VisitControl::Stop {
+                return Ok(VisitOutcome::Stopped);
+            }
+        }
+        Ok(VisitOutcome::Complete)
+    }
+
     fn table_row_count(&self, table: &str) -> Result<usize> {
         self.ensure_ready()?;
         self.tables
@@ -813,6 +870,74 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
             })?;
             let row = RowRef::record(table_data.record(primary_key, &row_value)?);
             if visitor(&row)? == VisitControl::Stop {
+                return Ok(Some(VisitOutcome::Stopped));
+            }
+        }
+        Ok(Some(VisitOutcome::Complete))
+    }
+
+    fn visit_index_range(
+        &self,
+        table: &str,
+        columns: &[String],
+        range: &KeyRange,
+        limit: usize,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<Option<VisitOutcome>> {
+        self.ensure_ready()?;
+        let table_data = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::table_not_found(table))?;
+        let Some(index) = self
+            .indexes
+            .values()
+            .find(|index| index.definition.table == table && index.definition.columns == columns)
+        else {
+            return Ok(None);
+        };
+        let Some(index_root) = index.root_page_id else {
+            return Ok(Some(VisitOutcome::Complete));
+        };
+        let table_root = table_data.root_page_id.ok_or_else(|| {
+            storage_corrupt(format!(
+                "Non-empty index `{}` references empty table `{table}`",
+                index.definition.name
+            ))
+        })?;
+        let types = table_data.column_types(columns)?;
+        // Rows are visited in primary-key order, as a table visit would find them.
+        let mut primary_keys = BTreeSet::new();
+        {
+            let mut pager = self.pager.borrow_mut();
+            let mut cursor =
+                Btree::cursor_from(&mut pager, index_root, index.tree_id, range.start())?;
+            while let Some((entry, value)) = cursor.next_entry(&mut pager)? {
+                if !range.admits(leading_key_component(entry, types[0])?) {
+                    break;
+                }
+                if primary_keys.len() == limit {
+                    return Ok(None);
+                }
+                primary_keys.insert(ranged_index_primary_key(
+                    &index.definition,
+                    entry,
+                    &value,
+                    &types,
+                )?);
+            }
+        }
+        for primary_key in &primary_keys {
+            let value = Btree::get(
+                &mut self.pager.borrow_mut(),
+                table_root,
+                table_data.tree_id,
+                primary_key,
+            )?
+            .ok_or_else(|| dangling_index_entry(&index.definition))?;
+            if visitor(&RowRef::record(table_data.record(primary_key, &value)?))?
+                == VisitControl::Stop
+            {
                 return Ok(Some(VisitOutcome::Stopped));
             }
         }
@@ -1172,6 +1297,29 @@ pub(crate) fn validated_row(
         )));
     }
     Ok(row)
+}
+
+/// The primary key of an index entry within a range visit, checking only what the visit relies on.
+pub(crate) fn ranged_index_primary_key(
+    definition: &IndexDefinition,
+    entry: &[u8],
+    value: &[u8],
+    types: &[ColumnType],
+) -> Result<Vec<u8>> {
+    if !value.is_empty() {
+        return Err(storage_corrupt(format!(
+            "Secondary index `{}` contains a non-empty value",
+            definition.name
+        )));
+    }
+    Ok(index_entry_primary_key(entry, types)?.to_vec())
+}
+
+pub(crate) fn dangling_index_entry(definition: &IndexDefinition) -> EngineError {
+    storage_corrupt(format!(
+        "Secondary index `{}` contains a dangling primary key",
+        definition.name
+    ))
 }
 
 pub(crate) fn limit_error(message: impl Into<String>) -> EngineError {
