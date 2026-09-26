@@ -1,10 +1,26 @@
 use std::{cell::RefCell, collections::BTreeMap, mem::size_of};
 
-use js_sys::{Array, Object, Reflect};
+use js_sys::{Array, Object};
 use serde::Deserialize;
 use serde_json::{Map, Number, Value};
 use tinyjoin_core::{ApplyOutcome, EngineError, ExecuteResult, Result, ResultField, Row};
-use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
+
+// Responses are built from records and arrays the bridge has just created, whose properties are
+// all plain data, so setting one cannot throw. These bindings therefore leave out wasm-bindgen's
+// exception wrapper, and take numbers and strings as themselves, so that setting one crosses into
+// JS once rather than first creating the value there.
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = Reflect, js_name = set)]
+    fn reflect_set(target: &Object, key: &JsValue, value: &JsValue) -> bool;
+    #[wasm_bindgen(js_namespace = Reflect, js_name = set)]
+    fn reflect_set_number(target: &Object, key: &JsValue, value: f64) -> bool;
+    #[wasm_bindgen(js_namespace = Reflect, js_name = set)]
+    fn reflect_set_str(target: &Object, key: &JsValue, value: &str) -> bool;
+    #[wasm_bindgen(js_namespace = Reflect, js_name = set)]
+    fn reflect_set_index_number(target: &Array, index: u32, value: f64) -> bool;
+}
 
 pub(crate) const VERSION: u32 = 2;
 
@@ -176,9 +192,9 @@ fn success(committed: bool, payload: JsValue) -> Result<JsValue> {
 
 fn envelope(status: u32, disposition: u32, payload: JsValue) -> Result<JsValue> {
     let response = Array::new_with_length(4);
-    response.set(0, JsValue::from_f64(f64::from(VERSION)));
-    response.set(1, JsValue::from_f64(f64::from(status)));
-    response.set(2, JsValue::from_f64(f64::from(disposition)));
+    for (index, value) in [VERSION, status, disposition].into_iter().enumerate() {
+        reflect_set_index_number(&response, index as u32, f64::from(value));
+    }
     response.set(3, payload);
     Ok(response.into())
 }
@@ -201,13 +217,11 @@ fn build_execute_result(result: &ExecuteResult) -> Result<JsValue> {
     let row_count = u64::try_from(result.row_count).map_err(|_| serialization())?;
     safe_number(row_count)?;
     let value = record();
-    set_fixed(&value, "command", &JsValue::from_str(&result.command))?;
-    set_fixed(
-        &value,
-        "revision",
-        &JsValue::from_f64(result.revision as f64),
-    )?;
-    set_fixed(&value, "rowCount", &JsValue::from_f64(row_count as f64))?;
+    set_fixed_with(&value, "command", |target, key| {
+        reflect_set_str(target, key, &result.command)
+    })?;
+    set_fixed_number(&value, "revision", result.revision as f64)?;
+    set_fixed_number(&value, "rowCount", row_count as f64)?;
     let mut columns = ColumnNames::default();
     set_fixed(
         &value,
@@ -228,11 +242,7 @@ fn build_fields(fields: &[ResultField], columns: &mut ColumnNames) -> Result<Arr
         let name = JsValue::from_str(&field.name);
         set_fixed(&value, "name", &name)?;
         columns.fields.push((field.name.clone(), name));
-        set_fixed(
-            &value,
-            "dataTypeID",
-            &JsValue::from_f64(f64::from(field.data_type_id)),
-        )?;
+        set_fixed_number(&value, "dataTypeID", f64::from(field.data_type_id))?;
         values.set(index as u32, value.into());
     }
     Ok(values)
@@ -257,11 +267,21 @@ fn build_rows(rows: &[Row], mut columns: ColumnNames) -> Result<Array> {
     for (index, row) in rows.iter().enumerate() {
         let value = record();
         for (position, (key, child)) in row.iter().enumerate() {
-            set_value(&value, columns.get(position, key), &build_value(child, 1)?)?;
+            set_cell(&value, columns.get(position, key), child)?;
         }
         values.set(index as u32, value.into());
     }
     Ok(values)
+}
+
+/// Sets a row's cell, passing a number or string straight into the property.
+fn set_cell(row: &Object, key: &JsValue, value: &Value) -> Result<()> {
+    let set = match value {
+        Value::Number(number) => reflect_set_number(row, key, number_f64(number)?),
+        Value::String(text) => reflect_set_str(row, key, text),
+        value => reflect_set(row, key, &build_value(value, 1)?),
+    };
+    if set { Ok(()) } else { Err(serialization()) }
 }
 
 /// The column names of a result's rows, as JS strings. Every row of a result names the same
@@ -327,15 +347,19 @@ fn build_value(value: &Value, depth: usize) -> Result<JsValue> {
 }
 
 fn number_value(number: &Number) -> Result<JsValue> {
+    Ok(JsValue::from_f64(number_f64(number)?))
+}
+
+/// A JSON number as the JS number a response carries: an integer within JavaScript's safe range,
+/// or a finite float.
+fn number_f64(number: &Number) -> Result<f64> {
     checked_number(number)?;
     if let Some(value) = number.as_i64() {
-        Ok(JsValue::from_f64(value as f64))
+        Ok(value as f64)
     } else if let Some(value) = number.as_u64() {
-        Ok(JsValue::from_f64(value as f64))
+        Ok(value as f64)
     } else {
-        Ok(JsValue::from_f64(
-            number.as_f64().ok_or_else(serialization)?,
-        ))
+        number.as_f64().ok_or_else(serialization)
     }
 }
 
@@ -367,7 +391,23 @@ thread_local! {
 
 /// Sets one of the keys every response uses, converting it to a JS string only once.
 fn set_fixed(target: &Object, key: &'static str, value: &JsValue) -> Result<()> {
-    FIXED_KEYS.with(|keys| {
+    set_fixed_with(target, key, |target, key| reflect_set(target, key, value))
+}
+
+fn set_fixed_number(target: &Object, key: &'static str, value: f64) -> Result<()> {
+    set_fixed_with(target, key, |target, key| {
+        reflect_set_number(target, key, value)
+    })
+}
+
+/// Sets one of the keys every response uses with `set`, which reports whether the property was
+/// set.
+fn set_fixed_with(
+    target: &Object,
+    key: &'static str,
+    set: impl FnOnce(&Object, &JsValue) -> bool,
+) -> Result<()> {
+    let set = FIXED_KEYS.with(|keys| {
         let mut keys = keys.borrow_mut();
         let index = match keys.iter().position(|(name, _)| *name == key) {
             Some(index) => index,
@@ -376,14 +416,16 @@ fn set_fixed(target: &Object, key: &'static str, value: &JsValue) -> Result<()> 
                 keys.len() - 1
             }
         };
-        set_value(target, &keys[index].1, value)
-    })
+        set(target, &keys[index].1)
+    });
+    if set { Ok(()) } else { Err(serialization()) }
 }
 
 fn set_value(target: &Object, key: &JsValue, value: &JsValue) -> Result<()> {
-    match Reflect::set(target.as_ref(), key, value) {
-        Ok(true) => Ok(()),
-        _ => Err(serialization()),
+    if reflect_set(target, key, value) {
+        Ok(())
+    } else {
+        Err(serialization())
     }
 }
 
