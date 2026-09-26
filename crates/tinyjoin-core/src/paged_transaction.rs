@@ -48,6 +48,9 @@ struct OverlayEntry {
     key: Row,
     base: Option<Row>,
     next: Option<Row>,
+    /// Whether `next` differs from `base`, the committed row, as staging found once, so that
+    /// reading the overlay compares no rows.
+    changed: bool,
     /// What the entry retains in the overlay.
     retained: usize,
     /// What the entry costs the write set, while its row differs from the committed one.
@@ -95,7 +98,7 @@ impl PagedTransaction {
         for (table, entries) in &self.entries {
             let mut rows = BTreeMap::new();
             for (key, entry) in entries {
-                if entry.base != entry.next {
+                if entry.changed {
                     let row = ChangedRow {
                         old: entry.base.clone(),
                         next: entry.next.clone(),
@@ -115,7 +118,7 @@ impl PagedTransaction {
         crate::statement::collect_changed_keys(self.entries.iter().flat_map(|(table, entries)| {
             entries
                 .values()
-                .filter(|entry| entry.base != entry.next)
+                .filter(|entry| entry.changed)
                 .map(move |entry| (table.as_str(), &entry.key))
         }))
     }
@@ -193,6 +196,7 @@ impl PagedTransaction {
                             key,
                             next: base.clone(),
                             base,
+                            changed: false,
                             retained: 0,
                             cost: None,
                         }
@@ -204,6 +208,11 @@ impl PagedTransaction {
                 .get_mut(&encoded_key)
                 .expect("the statement patch entry was installed above")
                 .next = next;
+        }
+        for entries in patch.entries.values_mut() {
+            for entry in entries.values_mut() {
+                entry.changed = entry.base != entry.next;
+            }
         }
         Ok(patch)
     }
@@ -265,7 +274,7 @@ impl PagedTransaction {
                     &mut totals.overlay_bytes,
                     entry.retained,
                 )?;
-                entry.cost = if entry.base == entry.next {
+                entry.cost = if !entry.changed {
                     None
                 } else {
                     let change = match &entry.next {
@@ -374,7 +383,7 @@ fn changes_from_entries<'a>(
     entries: impl Iterator<Item = (&'a str, &'a OverlayEntry)>,
 ) -> Vec<RowChange> {
     entries
-        .filter(|(_, entry)| entry.base != entry.next)
+        .filter(|(_, entry)| entry.changed)
         .map(|(table, entry)| match &entry.next {
             Some(row) => RowChange::Upsert {
                 table: table.to_owned(),
@@ -480,8 +489,10 @@ impl<'a, D: PageDevice> PagedReadView<'a, D> {
     fn reads_committed(&self, table: &str) -> bool {
         self.transaction.is_none_or(|transaction| {
             transaction
-                .table_entries(table)
-                .is_none_or(|entries| entries.values().all(|entry| entry.base == entry.next))
+                .totals
+                .changed_tables
+                .get(table)
+                .is_none_or(|count| *count == 0)
         })
     }
 }
@@ -520,7 +531,7 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
                     .is_some()
                 {}
                 if staged.peek().is_some_and(|(staged, entry)| {
-                    staged.as_slice() == key.as_ref() && entry.base != entry.next
+                    staged.as_slice() == key.as_ref() && entry.changed
                 }) {
                     return Ok(VisitControl::Continue);
                 }
@@ -533,7 +544,7 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
         if let Some(entries) = entries {
             for entry in entries.values() {
                 self.charge_work(1)?;
-                if entry.base == entry.next {
+                if !entry.changed {
                     continue;
                 }
                 if let Some(row) = &entry.next
@@ -834,6 +845,7 @@ mod tests {
             key: row(json!({"id": 1})),
             base: None,
             next: Some(row(json!({"id": 1, "name": "one"}))),
+            changed: true,
             retained: 0,
             cost: None,
         }
