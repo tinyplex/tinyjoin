@@ -983,10 +983,12 @@ pub(crate) fn normalize_row(schema: &TableDefinition, mut row: Row) -> Result<Ro
         }
     }
 
+    let mut changed = false;
     for column in &schema.columns {
         if !row.contains_key(&column.name) {
             let value = column.default.clone().unwrap_or(Value::Null);
             row.insert(column.name.clone(), value);
+            changed = true;
         }
         let value = row
             .get_mut(&column.name)
@@ -995,10 +997,18 @@ pub(crate) fn normalize_row(schema: &TableDefinition, mut row: Row) -> Result<Ro
         // A FLOAT is one binary64 number, however its JSON was spelled, so `1` and `1.0` store
         // and compare as the same value.
         if column.data_type == ColumnType::Float && !value.is_null() {
-            *value = float_value(value);
+            let float = float_value(value);
+            if float != *value {
+                *value = float;
+                changed = true;
+            }
         }
     }
-    validate_row_value_limits(&row).map_err(|error| EngineError::invalid_change(error.message))?;
+    // Only a default or a respelled FLOAT changes the row's size from the one checked above.
+    if changed {
+        validate_row_value_limits(&row)
+            .map_err(|error| EngineError::invalid_change(error.message))?;
+    }
     Ok(row)
 }
 
@@ -1110,16 +1120,13 @@ fn validate_primary_key_values(schema: &TableDefinition, row: &Row) -> Result<()
 }
 
 pub(crate) fn estimated_row_bytes(row: &Row) -> Result<usize> {
-    validate_row_value_limits(row)?;
-    // The row limit is below the value limit and row values nest one level deeper, so a row which
-    // passes has only valid values; they need no separate validation for the estimate.
     let mut bytes = 32usize;
     for (key, value) in row {
         bytes = checked_row_write_add(bytes, 64)?;
         bytes = checked_row_write_add(bytes, checked_row_write_mul(key.len(), 2)?)?;
         bytes = checked_row_write_add(
             bytes,
-            checked_row_write_mul(estimated_value_bytes_at_depth(value, 0)?, 2)?,
+            checked_row_write_mul(estimated_value_bytes_at_depth(value, 1)?, 2)?,
         )?;
     }
     Ok(bytes)
@@ -1131,7 +1138,11 @@ pub(crate) fn estimated_value_bytes(value: &Value) -> Result<usize> {
 }
 
 fn estimated_value_bytes_at_depth(value: &Value, depth: usize) -> Result<usize> {
-    debug_assert!(depth <= MAX_JSON_DEPTH);
+    if depth > MAX_JSON_DEPTH {
+        return Err(row_write_limit_error(format!(
+            "JSON cannot nest more than {MAX_JSON_DEPTH} levels"
+        )));
+    }
     match value {
         Value::Null | Value::Bool(_) | Value::Number(_) => Ok(16),
         Value::String(value) => checked_row_write_add(24, value.len()),
