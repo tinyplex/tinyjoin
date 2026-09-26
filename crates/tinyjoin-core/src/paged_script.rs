@@ -910,12 +910,12 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
         let mut cursor =
             Btree::cursor_in_transaction(&mut self.transaction.borrow_mut(), root, table.tree_id)?;
         loop {
-            let next = cursor.next_in_transaction(&mut self.transaction.borrow_mut())?;
+            let next = cursor.next_entry_in_transaction(&mut self.transaction.borrow_mut())?;
             let Some((key, value)) = next else {
                 break;
             };
             self.charge_operations(1)?;
-            let row = stored_row(&table.schema, &key, &value)?;
+            let row = stored_row(&table.schema, key, &value)?;
             if visitor(&row)? == VisitControl::Stop {
                 return Ok(VisitOutcome::Stopped);
             }
@@ -994,12 +994,12 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
             &prefix,
         )?;
         loop {
-            let next = cursor.next_in_transaction(&mut self.transaction.borrow_mut())?;
+            let next = cursor.next_entry_in_transaction(&mut self.transaction.borrow_mut())?;
             let Some((entry_key, value)) = next else {
                 break;
             };
             self.charge_operations(1)?;
-            if !secondary_index_entry_matches_prefix(&entry_key, &prefix) {
+            if !secondary_index_entry_matches_prefix(entry_key, &prefix) {
                 break;
             }
             if !value.is_empty() {
@@ -1011,9 +1011,9 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
             let primary_key = secondary_index_primary_key_for_definition(
                 &table_data.schema,
                 &index.definition,
-                &entry_key,
+                entry_key,
             )?;
-            if secondary_index_primary_key(&entry_key, &prefix)? != primary_key {
+            if secondary_index_primary_key(entry_key, &prefix)? != primary_key {
                 return Err(storage_corrupt(format!(
                     "Secondary index `{}` tuple boundary is inconsistent",
                     index.definition.name

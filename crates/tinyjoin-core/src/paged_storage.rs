@@ -523,8 +523,8 @@ fn committed_index_primary_keys<D: PageDevice>(
     };
     let mut cursor = Btree::cursor_from(pager, root, index.tree_id, prefix)?;
     let mut primary_keys = Vec::new();
-    while let Some((entry_key, value)) = cursor.next(pager)? {
-        if !secondary_index_entry_matches_prefix(&entry_key, prefix) {
+    while let Some((entry_key, value)) = cursor.next_entry(pager)? {
+        if !secondary_index_entry_matches_prefix(entry_key, prefix) {
             break;
         }
         if !value.is_empty() {
@@ -533,7 +533,7 @@ fn committed_index_primary_keys<D: PageDevice>(
                 index.definition.name
             )));
         }
-        primary_keys.push(secondary_index_primary_key(&entry_key, prefix)?.to_vec());
+        primary_keys.push(secondary_index_primary_key(entry_key, prefix)?.to_vec());
         if index.definition.unique && primary_keys.len() > 1 {
             return Err(storage_corrupt(format!(
                 "Unique index `{}` contains duplicate values",
@@ -640,11 +640,11 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
         };
         let mut cursor = Btree::cursor(&mut self.pager.borrow_mut(), root, table.tree_id)?;
         loop {
-            let next = cursor.next(&mut self.pager.borrow_mut())?;
+            let next = cursor.next_entry(&mut self.pager.borrow_mut())?;
             let Some((key, value)) = next else {
                 break;
             };
-            let row = stored_row(&table.schema, &key, &value)?;
+            let row = stored_row(&table.schema, key, &value)?;
             if visitor(&row)? == VisitControl::Stop {
                 return Ok(VisitOutcome::Stopped);
             }
@@ -741,11 +741,11 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
             &prefix,
         )?;
         loop {
-            let next = cursor.next(&mut self.pager.borrow_mut())?;
+            let next = cursor.next_entry(&mut self.pager.borrow_mut())?;
             let Some((entry_key, value)) = next else {
                 break;
             };
-            if !secondary_index_entry_matches_prefix(&entry_key, &prefix) {
+            if !secondary_index_entry_matches_prefix(entry_key, &prefix) {
                 break;
             }
             if !value.is_empty() {
@@ -757,9 +757,9 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
             let primary_key = secondary_index_primary_key_for_definition(
                 &table_data.schema,
                 &index.definition,
-                &entry_key,
+                entry_key,
             )?;
-            if secondary_index_primary_key(&entry_key, &prefix)? != primary_key {
+            if secondary_index_primary_key(entry_key, &prefix)? != primary_key {
                 return Err(storage_corrupt(format!(
                     "Secondary index `{}` tuple boundary is inconsistent",
                     index.definition.name
@@ -780,7 +780,7 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
             let row = stored_row(&table_data.schema, primary_key, &row_value)?;
             if encode_secondary_index_entry_key(&table_data.schema, &index.definition, &row)?
                 .as_deref()
-                != Some(entry_key.as_slice())
+                != Some(entry_key)
             {
                 return Err(storage_corrupt(format!(
                     "Secondary index `{}` entry does not match its table row",
@@ -816,7 +816,7 @@ fn load_and_validate_catalog<D: PageDevice>(
     let mut header = None;
     let mut table_records = BTreeMap::new();
     let mut index_records = BTreeMap::new();
-    let mut cursor = Btree::cursor(pager, catalog_root_page_id, CATALOG_TREE_ID)?;
+    let mut cursor = Btree::validating_cursor(pager, catalog_root_page_id, CATALOG_TREE_ID)?;
     while let Some((key, value)) = cursor.next(pager)? {
         match decode_catalog_key(&key)? {
             CatalogKey::Header => {
@@ -981,7 +981,7 @@ fn validate_table_tree<D: PageDevice>(
         };
     };
     let mut count = 0_u64;
-    let mut cursor = Btree::cursor(pager, root, record.tree_id)?;
+    let mut cursor = Btree::validating_cursor(pager, root, record.tree_id)?;
     while let Some((key, value)) = cursor.next(pager)? {
         validated_row(&record.schema, &key, &value)?;
         count = count
@@ -1026,7 +1026,7 @@ fn validate_index_tree<D: PageDevice>(
     })?;
     let mut count = 0_u64;
     let mut unique_prefixes = HashSet::new();
-    let mut cursor = Btree::cursor(pager, root, record.tree_id)?;
+    let mut cursor = Btree::validating_cursor(pager, root, record.tree_id)?;
     while let Some((entry_key, value)) = cursor.next(pager)? {
         if !value.is_empty() {
             return Err(storage_corrupt(format!(
