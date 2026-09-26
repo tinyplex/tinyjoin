@@ -16,9 +16,9 @@ use crate::{
     VisitOutcome,
     paged_codec::{
         CATALOG_TREE_ID, CatalogIndexRecord, CatalogKey, CatalogTableRecord, FIRST_USER_TREE_ID,
-        RecordLayout, StoredRecord, decode_catalog_header_record, decode_catalog_index_record,
-        decode_catalog_key, decode_catalog_table_record, encode_catalog_schema,
-        encode_catalog_table_record_with_schema, encode_primary_key,
+        IndexEntry, IndexEntryLayout, RecordLayout, StoredRecord, decode_catalog_header_record,
+        decode_catalog_index_record, decode_catalog_key, decode_catalog_table_record,
+        encode_catalog_schema, encode_catalog_table_record_with_schema, encode_primary_key,
         encode_secondary_index_entry_key, encode_secondary_index_prefix, index_entry_primary_key,
         leading_key_component, secondary_index_entry_matches_prefix, secondary_index_primary_key,
         secondary_index_primary_key_for_definition,
@@ -26,6 +26,9 @@ use crate::{
     row::{HeldRow, RowRef},
     storage::{KeyOrder, KeyRange, RowWriteUsage, normalize_row, preflight_row_write},
 };
+/// A callback for each key and value of a B-tree entry, which says whether to go on.
+pub(crate) type EntryVisitor<'a> = dyn FnMut(&[u8], &[u8]) -> Result<VisitControl> + 'a;
+
 /// A relational view over the crash-safe paged B-tree store.
 ///
 /// Table definitions and row changes publish directly through the pager's atomic generation
@@ -291,6 +294,32 @@ impl<D: PageDevice> PagedStorage<D> {
 
     pub(crate) fn into_device(self) -> D {
         self.pager.into_inner().into_device()
+    }
+
+    /// Calls `each` with every entry of an index tree whose leading component, of type `leading`,
+    /// lies within `range`, in index order, until it stops.
+    fn walk_index_range(
+        &self,
+        root: PageId,
+        tree_id: TreeId,
+        leading: ColumnType,
+        range: &KeyRange,
+        each: &mut EntryVisitor<'_>,
+    ) -> Result<VisitOutcome> {
+        let mut cursor =
+            Btree::cursor_from(&mut self.pager.borrow_mut(), root, tree_id, range.start())?;
+        loop {
+            let next = cursor.next_entry(&mut self.pager.borrow_mut())?;
+            let Some((entry, value)) = next else {
+                return Ok(VisitOutcome::Complete);
+            };
+            if !range.contains(leading_key_component(entry, leading)?) {
+                return Ok(VisitOutcome::Complete);
+            }
+            if each(entry, &value)? == VisitControl::Stop {
+                return Ok(VisitOutcome::Stopped);
+            }
+        }
     }
 
     /// The fingerprint of every row in this database, as published in the superblock.
@@ -1181,24 +1210,28 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
         let types = table_data.column_types(columns)?;
         // Rows are visited in primary-key order, as a table visit would find them.
         let mut primary_keys = BTreeSet::new();
-        {
-            let mut pager = self.pager.borrow_mut();
-            let mut cursor =
-                Btree::cursor_from(&mut pager, index_root, index.tree_id, range.start())?;
-            while let Some((entry, value)) = cursor.next_entry(&mut pager)? {
-                if !range.contains(leading_key_component(entry, types[0])?) {
-                    break;
-                }
+        let mut over_limit = false;
+        self.walk_index_range(
+            index_root,
+            index.tree_id,
+            types[0],
+            range,
+            &mut |entry, value| {
                 if primary_keys.len() == limit {
-                    return Ok(None);
+                    over_limit = true;
+                    return Ok(VisitControl::Stop);
                 }
                 primary_keys.insert(ranged_index_primary_key(
                     &index.definition,
                     entry,
-                    &value,
+                    value,
                     &types,
                 )?);
-            }
+                Ok(VisitControl::Continue)
+            },
+        )?;
+        if over_limit {
+            return Ok(None);
         }
         for primary_key in &primary_keys {
             let value = Btree::get(
@@ -1215,6 +1248,40 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
             }
         }
         Ok(Some(VisitOutcome::Complete))
+    }
+
+    fn visit_index_entries(
+        &self,
+        table: &str,
+        columns: &[String],
+        range: &KeyRange,
+        layout: &IndexEntryLayout,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<Option<VisitOutcome>> {
+        self.ensure_ready()?;
+        let table_data = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::table_not_found(table))?;
+        let Some(index) = self
+            .indexes
+            .values()
+            .find(|index| index.definition.table == table && index.definition.columns == columns)
+        else {
+            return Ok(None);
+        };
+        let Some(index_root) = index.root_page_id else {
+            return Ok(Some(VisitOutcome::Complete));
+        };
+        let leading = table_data.column_types(&columns[..1])?[0];
+        self.walk_index_range(
+            index_root,
+            index.tree_id,
+            leading,
+            range,
+            &mut |entry, _| visitor(&RowRef::index(IndexEntry::new(entry, layout))),
+        )
+        .map(Some)
     }
 
     fn table_schema(&self, table: &str) -> Result<Rc<TableDefinition>> {

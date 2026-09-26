@@ -5,23 +5,24 @@ use std::{
 };
 
 use crate::{
-    Btree, EngineError, ExecuteResult, PageDevice, PageId, Pager, PagerWriteTransaction,
-    QueryResult, Result, Row, RowChange, StorageReader, TreeId, VisitControl, VisitOutcome,
+    Btree, ColumnType, EngineError, ExecuteResult, PageDevice, PageId, Pager,
+    PagerWriteTransaction, QueryResult, Result, Row, RowChange, StorageReader, TreeId,
+    VisitControl, VisitOutcome,
     btree::BatchChange,
     hash::{EMPTY_HASH, combine, identify},
     paged_codec::{
-        CATALOG_TREE_ID, CatalogHeader, CatalogIndexRecord, MAX_CATALOG_INDEXES,
-        MAX_CATALOG_TABLES, MAX_TREE_ID, encode_catalog_header_record, encode_catalog_index_key,
-        encode_catalog_index_record, encode_catalog_table_key, encode_primary_key,
-        encode_record_index_entry, encode_row, encode_secondary_index_entry_key,
-        encode_secondary_index_prefix, index_column_positions, leading_key_component,
-        secondary_index_entry_matches_prefix, secondary_index_primary_key,
+        CATALOG_TREE_ID, CatalogHeader, CatalogIndexRecord, IndexEntry, IndexEntryLayout,
+        MAX_CATALOG_INDEXES, MAX_CATALOG_TABLES, MAX_TREE_ID, encode_catalog_header_record,
+        encode_catalog_index_key, encode_catalog_index_record, encode_catalog_table_key,
+        encode_primary_key, encode_record_index_entry, encode_row,
+        encode_secondary_index_entry_key, encode_secondary_index_prefix, index_column_positions,
+        leading_key_component, secondary_index_entry_matches_prefix, secondary_index_primary_key,
         secondary_index_primary_key_for_definition,
     },
     paged_storage::{
-        PagedIndex, PagedTable, adjusted_count, batch_too_large, dangling_index_entry,
-        ensure_batch_bytes, limit_error, ranged_index_primary_key, storage_corrupt,
-        unique_violation,
+        EntryVisitor, PagedIndex, PagedTable, adjusted_count, batch_too_large,
+        dangling_index_entry, ensure_batch_bytes, limit_error, ranged_index_primary_key,
+        storage_corrupt, unique_violation,
     },
     row::{HeldRow, RowRef},
     statement::{PlannedDml, PreviousRow, Statement, WriteStatement},
@@ -749,6 +750,36 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         Ok(primary_keys)
     }
 
+    /// Calls `each` with every entry of an index tree whose leading component, of type `leading`,
+    /// lies within `range`, in index order, until it stops.
+    fn walk_index_range(
+        &self,
+        root: PageId,
+        tree_id: TreeId,
+        leading: ColumnType,
+        range: &KeyRange,
+        each: &mut EntryVisitor<'_>,
+    ) -> Result<VisitOutcome> {
+        let mut cursor = Btree::cursor_from_in_transaction(
+            &mut self.transaction.borrow_mut(),
+            root,
+            tree_id,
+            range.start(),
+        )?;
+        loop {
+            let next = cursor.next_entry_in_transaction(&mut self.transaction.borrow_mut())?;
+            let Some((entry, value)) = next else {
+                return Ok(VisitOutcome::Complete);
+            };
+            if !range.contains(leading_key_component(entry, leading)?) {
+                return Ok(VisitOutcome::Complete);
+            }
+            if each(entry, &value)? == VisitControl::Stop {
+                return Ok(VisitOutcome::Stopped);
+            }
+        }
+    }
+
     fn charge_operations(&self, count: usize) -> Result<()> {
         crate::sql_script::charge_operations(&self.operations, count)
     }
@@ -1240,29 +1271,29 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
         let types = table_data.column_types(columns)?;
         // Rows are visited in primary-key order, as a table visit would find them.
         let mut primary_keys = BTreeSet::new();
-        {
-            let mut transaction = self.transaction.borrow_mut();
-            let mut cursor = Btree::cursor_from_in_transaction(
-                &mut transaction,
-                index_root,
-                index.tree_id,
-                range.start(),
-            )?;
-            while let Some((entry, value)) = cursor.next_entry_in_transaction(&mut transaction)? {
-                if !range.contains(leading_key_component(entry, types[0])?) {
-                    break;
-                }
+        let mut over_limit = false;
+        self.walk_index_range(
+            index_root,
+            index.tree_id,
+            types[0],
+            range,
+            &mut |entry, value| {
                 if primary_keys.len() == limit {
-                    return Ok(None);
+                    over_limit = true;
+                    return Ok(VisitControl::Stop);
                 }
                 self.charge_operations(1)?;
                 primary_keys.insert(ranged_index_primary_key(
                     &index.definition,
                     entry,
-                    &value,
+                    value,
                     &types,
                 )?);
-            }
+                Ok(VisitControl::Continue)
+            },
+        )?;
+        if over_limit {
+            return Ok(None);
         }
         for primary_key in &primary_keys {
             let value = Btree::get_in_transaction(
@@ -1280,6 +1311,42 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
             }
         }
         Ok(Some(VisitOutcome::Complete))
+    }
+
+    fn visit_index_entries(
+        &self,
+        table: &str,
+        columns: &[String],
+        range: &KeyRange,
+        layout: &IndexEntryLayout,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<Option<VisitOutcome>> {
+        let table_data = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::table_not_found(table))?;
+        let Some(index) = self
+            .indexes
+            .values()
+            .find(|index| index.definition.table == table && index.definition.columns == columns)
+        else {
+            return Ok(None);
+        };
+        let Some(index_root) = index.root_page_id else {
+            return Ok(Some(VisitOutcome::Complete));
+        };
+        let leading = table_data.column_types(&columns[..1])?[0];
+        self.walk_index_range(
+            index_root,
+            index.tree_id,
+            leading,
+            range,
+            &mut |entry, _| {
+                self.charge_operations(1)?;
+                visitor(&RowRef::index(IndexEntry::new(entry, layout)))
+            },
+        )
+        .map(Some)
     }
 
     fn table_schema(&self, table: &str) -> Result<Rc<crate::TableDefinition>> {

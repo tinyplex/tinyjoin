@@ -2,6 +2,8 @@
 //!
 //! Storage hands each visited row to its visitor as a [`RowRef`]: either a map the engine already
 //! holds, such as a row staged in a transaction, or a stored record read in place from its leaf.
+//! A query that reads only columns an index holds can instead visit the index's entries, as rows
+//! holding just those columns.
 //! A record decodes a column only when it is read, so a scan that tests one column of each row
 //! decodes one value per row, and allocates nothing for it. Executors resolve the columns they
 //! read to schema positions once per statement, and read rows by position.
@@ -10,7 +12,7 @@ use std::borrow::Cow;
 
 use serde_json::Value;
 
-use crate::paged_codec::{StoredEntry, StoredRecord, encode_primary_key};
+use crate::paged_codec::{IndexEntry, StoredEntry, StoredRecord, encode_primary_key};
 use crate::storage::estimated_row_bytes;
 use crate::{ColumnType, EngineError, Result, Row, TableDefinition};
 
@@ -98,6 +100,7 @@ enum Source<'a> {
         schema: &'a TableDefinition,
     },
     Record(StoredRecord<'a>),
+    Index(IndexEntry<'a>),
 }
 
 impl<'a> RowRef<'a> {
@@ -109,6 +112,12 @@ impl<'a> RowRef<'a> {
     /// A stored entry, read in place.
     pub(crate) fn record(record: StoredRecord<'a>) -> Self {
         Self(Source::Record(record))
+    }
+
+    /// A secondary-index entry, which holds only the index's columns and the primary key. Only
+    /// the columns it holds can be read.
+    pub(crate) fn index(entry: IndexEntry<'a>) -> Self {
+        Self(Source::Index(entry))
     }
 
     /// The value of the column at `index`, in schema order.
@@ -126,6 +135,7 @@ impl<'a> RowRef<'a> {
                     .ok_or_else(|| EngineError::column_not_found(&column.name, &schema.name))
             }
             Source::Record(record) => record.column(index),
+            Source::Index(entry) => entry.column(index),
         }
     }
 
@@ -134,14 +144,16 @@ impl<'a> RowRef<'a> {
         match &self.0 {
             Source::Map { row, .. } => Ok((*row).clone()),
             Source::Record(record) => record.to_row(),
+            Source::Index(_) => Err(partial_row()),
         }
     }
 
     /// The row as a writer keeps it: a copy of a record's stored entry, or of a map.
-    pub(crate) fn hold(&self) -> HeldRow {
+    pub(crate) fn hold(&self) -> Result<HeldRow> {
         match &self.0 {
-            Source::Map { row, .. } => HeldRow::Map((*row).clone()),
-            Source::Record(record) => HeldRow::Stored(record.to_entry()),
+            Source::Map { row, .. } => Ok(HeldRow::Map((*row).clone())),
+            Source::Record(record) => Ok(HeldRow::Stored(record.to_entry())),
+            Source::Index(_) => Err(partial_row()),
         }
     }
 
@@ -150,6 +162,7 @@ impl<'a> RowRef<'a> {
         match &self.0 {
             Source::Map { row, .. } => estimated_row_bytes(row),
             Source::Record(record) => Ok(record.entry_len()),
+            Source::Index(_) => Err(partial_row()),
         }
     }
 
@@ -158,6 +171,7 @@ impl<'a> RowRef<'a> {
         let schema = match &self.0 {
             Source::Map { row, schema } => return crate::statement::primary_key_row(schema, row),
             Source::Record(record) => record.schema(),
+            Source::Index(_) => return Err(partial_row()),
         };
         let mut key = Row::new();
         for (position, column) in schema.columns.iter().enumerate() {
@@ -173,8 +187,18 @@ impl<'a> RowRef<'a> {
         match &self.0 {
             Source::Map { row, schema } => encode_primary_key(schema, row).map(Cow::Owned),
             Source::Record(record) => Ok(Cow::Borrowed(record.key())),
+            Source::Index(_) => Err(partial_row()),
         }
     }
+}
+
+/// The failure of reading a whole row from an index entry, which only a read of the columns the
+/// entry holds can use.
+fn partial_row() -> EngineError {
+    EngineError::new(
+        "INVALID_PAGED_ARGUMENT",
+        "An index entry holds only its index's columns and the primary key",
+    )
 }
 
 impl Columns for RowRef<'_> {

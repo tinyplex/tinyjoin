@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use serde_json::Value;
 
-use crate::paged_codec::StoredRecord;
+use crate::paged_codec::{IndexEntryLayout, StoredRecord};
 use crate::row::RowRef;
 use crate::{
     ColumnDefinition, ColumnType, EngineError, IndexDefinition, Result, Row, RowChange,
@@ -165,6 +165,21 @@ pub(crate) trait StorageReader {
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<Option<VisitOutcome>> {
         let _ = (table, columns, range, limit, visitor);
+        Ok(None)
+    }
+    /// Visits, in index order, the entries of the index on `columns` whose leading indexed column
+    /// lies within `range`, each as a row holding only the columns `layout` places, without
+    /// reading the rows themselves. Returns `None`, having visited nothing, when the reader cannot
+    /// use that index.
+    fn visit_index_entries(
+        &self,
+        table: &str,
+        columns: &[String],
+        range: &KeyRange,
+        layout: &IndexEntryLayout,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<Option<VisitOutcome>> {
+        let _ = (table, columns, range, layout, visitor);
         Ok(None)
     }
     /// Collecting helper for callers that require all matching index rows.

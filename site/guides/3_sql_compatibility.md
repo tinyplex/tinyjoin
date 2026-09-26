@@ -339,6 +339,11 @@ the complete predicate on every row they read:
   column. An index is used for a range only if its other columns are
   `NOT NULL`, since a row with a `NULL` indexed value is not indexed.
 
+An aggregate that reads only an index's columns and the primary key, in its
+select list, `GROUP BY`, and `WHERE` clause, answers a range of that index from
+its entries alone, without reading any rows, however much of the table the
+range holds.
+
 Inside a callback transaction, a table with staged changes narrows only by a
 direct primary-key lookup, because its staged rows are not yet indexed or in key
 order. `OR`, `NOT`, `IN`, and partial composite equality do not narrow the rows

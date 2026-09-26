@@ -1943,6 +1943,9 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
             && changes.iter().all(|change| change.value.is_some());
         let mut cells = Vec::with_capacity(count + changes.len());
         let mut delta = EMPTY_HASH;
+        // The cells removed outright, whose fingerprints matter only if the leaf keeps others: a
+        // leaf that empties is released, and its parent drops the fingerprint it records for it.
+        let mut removed = Vec::new();
         let mut changed = false;
         let mut index = 0;
         let mut previous: Option<&[u8]> = None;
@@ -1981,7 +1984,10 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
                     cells.push(LeafCell::Kept(index - 1));
                     continue;
                 }
-                delta = combine(delta, cell_hash(change.key, &held));
+                match change.value {
+                    Some(_) => delta = combine(delta, cell_hash(change.key, &held)),
+                    None => removed.push(index - 1),
+                }
                 if let CellValue::Overflow(descriptor) = held {
                     release_leaf_value(
                         self.transaction,
@@ -2021,6 +2027,10 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
         if cells.is_empty() {
             release_node_page(self.transaction, page_id, owned)?;
             return Ok(Some(Vec::new()));
+        }
+        for index in removed {
+            let (key, value) = node.leaf_cell(index)?;
+            delta = combine(delta, cell_hash(key, &value));
         }
         let first_key = match &cells[0] {
             LeafCell::Kept(index) => node.leaf_key(*index)?,

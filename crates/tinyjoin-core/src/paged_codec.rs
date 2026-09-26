@@ -199,6 +199,72 @@ pub(crate) fn index_column_positions(
     Ok(positions)
 }
 
+/// Where a secondary index's entries hold their row's columns: an entry's key is the indexed
+/// columns' components, then the primary key's, and holds no other column.
+pub(crate) struct IndexEntryLayout {
+    /// Each schema column's component, in key order, if an entry holds the column.
+    slots: Vec<Option<usize>>,
+    /// Each component's type, in key order.
+    types: Vec<ColumnType>,
+}
+
+impl IndexEntryLayout {
+    pub(crate) fn new(schema: &TableDefinition, definition: &IndexDefinition) -> Result<Self> {
+        let mut slots = vec![None; schema.columns.len()];
+        let mut types = Vec::with_capacity(definition.columns.len() + schema.primary_key.len());
+        for name in definition.columns.iter().chain(&schema.primary_key) {
+            let position = schema
+                .columns
+                .iter()
+                .position(|column| column.name == *name)
+                .ok_or_else(|| EngineError::column_not_found(name, &schema.name))?;
+            slots[position].get_or_insert(types.len());
+            types.push(schema.columns[position].data_type);
+        }
+        Ok(Self { slots, types })
+    }
+
+    /// Whether an entry holds each column at `positions`.
+    pub(crate) fn covers(&self, positions: &[usize]) -> bool {
+        positions
+            .iter()
+            .all(|position| self.slots.get(*position).is_some_and(Option::is_some))
+    }
+}
+
+/// A secondary-index entry, read as the columns its key holds.
+#[derive(Clone, Copy)]
+pub(crate) struct IndexEntry<'a> {
+    key: &'a [u8],
+    layout: &'a IndexEntryLayout,
+}
+
+impl<'a> IndexEntry<'a> {
+    pub(crate) fn new(key: &'a [u8], layout: &'a IndexEntryLayout) -> Self {
+        Self { key, layout }
+    }
+
+    /// The value of the column at schema position `index`, which the entry must hold.
+    pub(crate) fn column(&self, index: usize) -> Result<ValueRef<'a>> {
+        let component = self
+            .layout
+            .slots
+            .get(index)
+            .copied()
+            .flatten()
+            .ok_or_else(|| {
+                codec_argument(format!("An index entry does not hold column {index}"))
+            })?;
+        let mut start = 0;
+        for data_type in &self.layout.types[..component] {
+            start = component_end(self.key, start, *data_type)?;
+        }
+        let data_type = self.layout.types[component];
+        let end = component_end(self.key, start, data_type)?;
+        decode_component(&self.key[start..end], data_type)
+    }
+}
+
 /// Encodes a stored row's secondary-index entry, as [`encode_secondary_index_entry`] encodes the
 /// row the record decodes to, reading only the indexed columns, at `positions`. The entry ends with
 /// the record's key, which is the row's encoded primary key.

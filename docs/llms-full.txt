@@ -652,6 +652,11 @@ the complete predicate on every row they read:
   column. An index is used for a range only if its other columns are
   `NOT NULL`, since a row with a `NULL` indexed value is not indexed.
 
+An aggregate that reads only an index's columns and the primary key, in its
+select list, `GROUP BY`, and `WHERE` clause, answers a range of that index from
+its entries alone, without reading any rows, however much of the table the
+range holds.
+
 Inside a callback transaction, a table with staged changes narrows only by a
 direct primary-key lookup, because its staged rows are not yet indexed or in key
 order. `OR`, `NOT`, `IN`, and partial composite equality do not narrow the rows
@@ -2255,7 +2260,8 @@ than about four times as long, and reading every row, `LIKE` scans, and
   more than half a minute.
 - Comparisons, `BETWEEN`, and `LIKE` patterns that start with literal
   characters read a range of an index or of the primary key, rather than every
-  row. See [constraints and indexes](https://tinyjoin.org/guides/sql-compatibility/#constraints-and-indexes)
+  row. An aggregate that reads only the index's columns is answered from the
+  index alone. See [constraints and indexes](https://tinyjoin.org/guides/sql-compatibility/#constraints-and-indexes)
   for when a range is used.
 - Joins find each table's matching rows by key lookup, through an index, or in
   a hash table, rather than comparing every pair of rows. The join budget now
@@ -2279,7 +2285,7 @@ than about four times as long, and reading every row, `LIKE` scans, and
 - On the tab that owns a database, statements reach the engine as calls rather
   than as messages checked again at every layer.
 
-The compressed download is now 325 KiB, up from 295 KiB in v0.3.0.
+The compressed download is now 327 KiB, up from 295 KiB in v0.3.0.
 
 ## v0.3.0
 

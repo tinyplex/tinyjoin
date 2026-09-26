@@ -7,7 +7,7 @@ use std::{
 use crate::{
     EngineError, IndexDefinition, PageDevice, PagedStorage, Result, Row, RowChange, StorageReader,
     TableDefinition, TreeId, VisitControl, VisitOutcome,
-    paged_codec::encode_primary_key,
+    paged_codec::{IndexEntryLayout, encode_primary_key},
     paged_script::{ChangedRow, ChangedRows},
     paged_storage::{ChangeCost, PagedWriteUsage},
     row::{HeldRow, RowRef},
@@ -671,6 +671,26 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
         self.storage
             .visit_index_range(table, columns, range, limit, &mut |row| {
                 self.charge_work(2)?;
+                visitor(row)
+            })
+    }
+
+    fn visit_index_entries(
+        &self,
+        table: &str,
+        columns: &[String],
+        range: &KeyRange,
+        layout: &IndexEntryLayout,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<Option<VisitOutcome>> {
+        self.ensure_base_revision()?;
+        if !self.reads_committed(table) {
+            self.storage.table_schema(table)?;
+            return Ok(None);
+        }
+        self.storage
+            .visit_index_entries(table, columns, range, layout, &mut |row| {
+                self.charge_work(1)?;
                 visitor(row)
             })
     }

@@ -187,12 +187,13 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &AggregatePlan) -> Resu
         .collect::<Result<Vec<_>>>()?;
     // Grouping never stops early, so narrowing only removes rows the predicate would reject
     // anyway; the per-row filter below remains the authority on membership.
-    crate::query::visit_predicate_candidates(
+    let read = read_columns(plan, &schema)?;
+    crate::query::visit_aggregate_candidates(
         storage,
         &plan.table,
         plan.predicate.as_ref(),
         &schema,
-        crate::storage::KeyOrder::Ascending,
+        &read,
         &mut |row| {
             scanned = scanned.saturating_add(1);
             if scanned > MAX_SCAN_ROWS {
@@ -269,6 +270,53 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &AggregatePlan) -> Resu
         fields,
         rows,
     })
+}
+
+/// The schema position of every column the plan reads from a row: its groups', its items', and its
+/// predicate's.
+fn read_columns(plan: &AggregatePlan, schema: &TableDefinition) -> Result<Vec<usize>> {
+    fn predicate_columns<'a>(predicate: &'a Predicate, names: &mut Vec<&'a str>) {
+        match predicate {
+            Predicate::Comparison { column, .. }
+            | Predicate::IsNull { column, .. }
+            | Predicate::In { column, .. }
+            | Predicate::Like { column, .. } => names.push(column),
+            Predicate::And { predicates } | Predicate::Or { predicates } => {
+                for predicate in predicates {
+                    predicate_columns(predicate, names);
+                }
+            }
+            Predicate::Not { predicate } => predicate_columns(predicate, names),
+        }
+    }
+    let mut names: Vec<&str> = plan.group_by.iter().map(String::as_str).collect();
+    for item in &plan.items {
+        match &item.expression {
+            SelectExpression::Column(column)
+            | SelectExpression::Aggregate {
+                argument: AggregateArgument::Column(column),
+                ..
+            } => names.push(column),
+            SelectExpression::Aggregate {
+                argument: AggregateArgument::Star,
+                ..
+            } => {}
+        }
+    }
+    if let Some(predicate) = &plan.predicate {
+        predicate_columns(predicate, &mut names);
+    }
+    let mut positions = Vec::with_capacity(names.len());
+    for name in names {
+        positions.push(
+            schema
+                .columns
+                .iter()
+                .position(|column| column.name == name)
+                .ok_or_else(|| EngineError::column_not_found(name, &plan.table))?,
+        );
+    }
+    Ok(positions)
 }
 
 fn result_fields(plan: &AggregatePlan, schema: &TableDefinition) -> Result<Vec<ResultField>> {
@@ -2545,5 +2593,196 @@ mod tests {
             )
             .unwrap();
         assert_eq!(scanned.rows, narrowed.rows);
+    }
+
+    /// Paged storage, counting the rows and the index entries a query reads.
+    struct EntryProbe {
+        storage: crate::PagedStorage<crate::MemoryPageDevice>,
+        rows: std::cell::Cell<usize>,
+        entries: std::cell::Cell<usize>,
+    }
+
+    impl EntryProbe {
+        fn new(sql: &str) -> Self {
+            let mut storage =
+                crate::PagedStorage::open(crate::MemoryPageDevice::new(0).unwrap()).unwrap();
+            let statements = sql
+                .split(';')
+                .map(|sql| crate::statement::parse(sql, &[]))
+                .collect::<crate::Result<Vec<_>>>()
+                .unwrap();
+            storage.execute_script(statements).unwrap();
+            Self {
+                storage,
+                rows: std::cell::Cell::new(0),
+                entries: std::cell::Cell::new(0),
+            }
+        }
+
+        /// The query's rows, and how many rows and index entries it read.
+        fn query(&self, sql: &str) -> (Vec<Row>, usize, usize) {
+            self.rows.set(0);
+            self.entries.set(0);
+            let crate::statement::Statement::Aggregate(plan) =
+                crate::statement::parse(sql, &[]).unwrap()
+            else {
+                panic!("not an aggregate: {sql}");
+            };
+            let rows = super::execute(self, &plan).unwrap().rows;
+            (rows, self.rows.get(), self.entries.get())
+        }
+
+        fn counted<'v>(
+            &'v self,
+            visitor: &'v mut dyn FnMut(&RowRef<'_>) -> crate::Result<crate::VisitControl>,
+        ) -> impl FnMut(&RowRef<'_>) -> crate::Result<crate::VisitControl> + 'v {
+            move |row| {
+                self.rows.set(self.rows.get() + 1);
+                visitor(row)
+            }
+        }
+    }
+
+    impl StorageReader for EntryProbe {
+        fn visit_table(
+            &self,
+            table: &str,
+            visitor: &mut dyn FnMut(&RowRef<'_>) -> crate::Result<crate::VisitControl>,
+        ) -> crate::Result<crate::VisitOutcome> {
+            self.storage.visit_table(table, &mut self.counted(visitor))
+        }
+
+        fn visits_in_key_order(&self, table: &str) -> bool {
+            self.storage.visits_in_key_order(table)
+        }
+
+        fn visit_table_range(
+            &self,
+            table: &str,
+            range: &crate::storage::KeyRange,
+            order: crate::storage::KeyOrder,
+            visitor: &mut dyn FnMut(&RowRef<'_>) -> crate::Result<crate::VisitControl>,
+        ) -> crate::Result<crate::VisitOutcome> {
+            self.storage
+                .visit_table_range(table, range, order, &mut self.counted(visitor))
+        }
+
+        fn table_row_count(&self, table: &str) -> crate::Result<usize> {
+            self.storage.table_row_count(table)
+        }
+
+        fn lookup_primary_key(&self, table: &str, key: &Row) -> crate::Result<Option<Row>> {
+            self.storage.lookup_primary_key(table, key)
+        }
+
+        fn index_definition(&self, name: &str) -> Option<crate::IndexDefinition> {
+            self.storage.index_definition(name)
+        }
+
+        fn indexes_for_table(&self, table: &str) -> crate::Result<Vec<crate::IndexDefinition>> {
+            self.storage.indexes_for_table(table)
+        }
+
+        fn visit_index(
+            &self,
+            table: &str,
+            columns: &[String],
+            key: &Row,
+            visitor: &mut dyn FnMut(&RowRef<'_>) -> crate::Result<crate::VisitControl>,
+        ) -> crate::Result<Option<crate::VisitOutcome>> {
+            self.storage
+                .visit_index(table, columns, key, &mut self.counted(visitor))
+        }
+
+        fn visit_index_range(
+            &self,
+            table: &str,
+            columns: &[String],
+            range: &crate::storage::KeyRange,
+            limit: usize,
+            visitor: &mut dyn FnMut(&RowRef<'_>) -> crate::Result<crate::VisitControl>,
+        ) -> crate::Result<Option<crate::VisitOutcome>> {
+            self.storage
+                .visit_index_range(table, columns, range, limit, &mut self.counted(visitor))
+        }
+
+        fn visit_index_entries(
+            &self,
+            table: &str,
+            columns: &[String],
+            range: &crate::storage::KeyRange,
+            layout: &crate::paged_codec::IndexEntryLayout,
+            visitor: &mut dyn FnMut(&RowRef<'_>) -> crate::Result<crate::VisitControl>,
+        ) -> crate::Result<Option<crate::VisitOutcome>> {
+            self.storage
+                .visit_index_entries(table, columns, range, layout, &mut |row| {
+                    self.entries.set(self.entries.get() + 1);
+                    visitor(row)
+                })
+        }
+
+        fn table_schema(&self, table: &str) -> crate::Result<std::rc::Rc<crate::TableDefinition>> {
+            self.storage.table_schema(table)
+        }
+
+        fn revision(&self) -> u64 {
+            self.storage.revision()
+        }
+    }
+
+    #[test]
+    fn an_index_holding_every_column_a_query_reads_answers_it_from_its_entries() {
+        let mut sql = String::from(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, b INTEGER, c TEXT NOT NULL, f FLOAT, g INTEGER); \
+             CREATE INDEX t_b ON t (b); CREATE INDEX t_c ON t (c)",
+        );
+        for id in 0..60 {
+            let b = if id % 7 == 0 {
+                "NULL".to_owned()
+            } else {
+                (id % 45).to_string()
+            };
+            // Text with an embedded NUL exercises the key encoding's escape.
+            let c = format!("{}{}", ["alpha", "b\u{0}eta", "gamma"][id % 3], id % 5);
+            sql.push_str(&format!(
+                "; INSERT INTO t VALUES ({id}, {b}, '{c}', {}, {})",
+                f64::from(id as u32) / 4.0 - 3.0,
+                id % 4
+            ));
+        }
+        let probe = EntryProbe::new(&sql);
+        for (covered, scanned) in [
+            (
+                "SELECT count(*) AS n, sum(b) AS s, avg(b) AS a, min(b) AS lo, max(b) AS hi \
+                 FROM t WHERE b >= 10 AND b < 40",
+                "SELECT count(*) AS n, sum(b) AS s, avg(b) AS a, min(b) AS lo, max(b) AS hi \
+                 FROM t WHERE (b >= 10 AND b < 40) OR g = 99",
+            ),
+            (
+                "SELECT b, count(*) AS n, max(id) AS top FROM t WHERE b >= 30 GROUP BY b ORDER BY b",
+                "SELECT b, count(*) AS n, max(id) AS top FROM t WHERE b >= 30 OR g = 99 \
+                 GROUP BY b ORDER BY b",
+            ),
+            (
+                "SELECT min(c) AS lo, max(c) AS hi, count(*) AS n FROM t WHERE c >= 'b'",
+                "SELECT min(c) AS lo, max(c) AS hi, count(*) AS n FROM t WHERE c >= 'b' OR g = 99",
+            ),
+        ] {
+            let (rows, read, entries) = probe.query(covered);
+            assert_eq!(read, 0, "{covered}");
+            assert!(entries > 0, "{covered}");
+            let (expected, read, entries) = probe.query(scanned);
+            assert_eq!((read, entries), (60, 0), "{scanned}");
+            assert_eq!(rows, expected, "{covered}");
+            assert!(
+                rows.iter()
+                    .any(|row| row.values().any(|value| !value.is_null()))
+            );
+        }
+
+        // A column the index does not hold is read from the rows.
+        let (_, read, entries) = probe.query("SELECT sum(g) AS s FROM t WHERE b >= 10 AND b < 40");
+        assert!(read > 0);
+        assert_eq!(entries, 0);
     }
 }

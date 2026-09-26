@@ -58,7 +58,8 @@ than about four times as long, and reading every row, `LIKE` scans, and
   more than half a minute.
 - Comparisons, `BETWEEN`, and `LIKE` patterns that start with literal
   characters read a range of an index or of the primary key, rather than every
-  row. See [constraints and indexes](/guides/sql-compatibility/#constraints-and-indexes)
+  row. An aggregate that reads only the index's columns is answered from the
+  index alone. See [constraints and indexes](/guides/sql-compatibility/#constraints-and-indexes)
   for when a range is used.
 - Joins find each table's matching rows by key lookup, through an index, or in
   a hash table, rather than comparing every pair of rows. The join budget now

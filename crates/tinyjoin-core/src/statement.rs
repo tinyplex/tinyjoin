@@ -1260,7 +1260,11 @@ fn plan_update(
 
         let old_key = row_key(&schema, &row)?;
         let old_primary_key = primary_key_row(&schema, &row)?;
-        let old_row = kept.fits(read.held_bytes()?).then(|| read.hold());
+        let old_row = if kept.fits(read.held_bytes()?) {
+            Some(read.hold()?)
+        } else {
+            None
+        };
         let mut new_row = row;
         for (column, value) in &resolved_assignments {
             new_row.insert(column.clone(), value.clone());
@@ -1436,7 +1440,7 @@ fn plan_delete(
             key,
         });
         previous.push(if kept.fits(row.held_bytes()?) {
-            PreviousRow::Read(Some(row.hold()))
+            PreviousRow::Read(Some(row.hold()?))
         } else {
             PreviousRow::Unread
         });

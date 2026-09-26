@@ -4,7 +4,7 @@ use std::str::FromStr;
 
 use serde_json::{Map, Number, Value};
 
-use crate::paged_codec::{encode_key_bound, encode_text_prefix_bounds};
+use crate::paged_codec::{IndexEntryLayout, encode_key_bound, encode_text_prefix_bounds};
 use crate::row::{Columns, RowRef, ValueRef};
 use crate::storage::{
     KeyOrder, KeyRange, StorageReader, estimated_row_bytes, estimated_value_bytes,
@@ -526,6 +526,67 @@ fn visit_secondary_index(
                     return Ok(Some(outcome));
                 }
             }
+        }
+    }
+    Ok(None)
+}
+
+/// Visits a predicate's candidates in any order, as [`visit_predicate_candidates`] does, but from
+/// the entries of an index holding every column at `read`, the columns the caller reads, when one
+/// serves the predicate.
+pub(crate) fn visit_aggregate_candidates(
+    storage: &dyn StorageReader,
+    table: &str,
+    predicate: Option<&Predicate>,
+    schema: &crate::TableDefinition,
+    read: &[usize],
+    visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+) -> Result<VisitOutcome> {
+    match visit_covered_candidates(storage, table, predicate, schema, read, visitor)? {
+        Some(outcome) => Ok(outcome),
+        None => visit_predicate_candidates(
+            storage,
+            table,
+            predicate,
+            schema,
+            KeyOrder::Ascending,
+            visitor,
+        ),
+    }
+}
+
+/// Visits a predicate's candidates as the entries of an index holding every column at `needed`,
+/// when the predicate bounds the index's leading column, without reading the rows at all. Entries
+/// come in index order, and the caller's filter still decides membership. `None` means no such
+/// index serves, and the caller reads rows instead.
+fn visit_covered_candidates(
+    storage: &dyn StorageReader,
+    table: &str,
+    predicate: Option<&Predicate>,
+    schema: &crate::TableDefinition,
+    needed: &[usize],
+    visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+) -> Result<Option<VisitOutcome>> {
+    let Some(predicate) = predicate else {
+        return Ok(None);
+    };
+    for definition in ranged_indexes(storage, table, schema)? {
+        let range = match column_range(
+            predicate,
+            column_definition(schema, &definition.columns[0], table)?,
+        )? {
+            ColumnRange::Unbounded => continue,
+            ColumnRange::Empty => return Ok(Some(VisitOutcome::Complete)),
+            ColumnRange::Bounded(range) => range,
+        };
+        let layout = IndexEntryLayout::new(schema, &definition)?;
+        if !layout.covers(needed) {
+            continue;
+        }
+        if let Some(outcome) =
+            storage.visit_index_entries(table, &definition.columns, &range, &layout, visitor)?
+        {
+            return Ok(Some(outcome));
         }
     }
     Ok(None)
