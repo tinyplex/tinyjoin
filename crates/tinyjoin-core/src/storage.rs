@@ -144,6 +144,22 @@ pub(crate) trait StorageReader {
         Ok(rows)
     }
     fn lookup_primary_key(&self, table: &str, key: &Row) -> Result<Option<Row>>;
+    /// Visits the row whose primary key is `key`, if there is one, as [`Self::lookup_primary_key`]
+    /// finds it. Readers that store records visit it in place, without decoding it into a map.
+    fn visit_primary_key(
+        &self,
+        table: &str,
+        key: &Row,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        let schema = self.table_schema(table)?;
+        match self.lookup_primary_key(table, key)? {
+            Some(row) if visitor(&RowRef::map(&row, &schema))? == VisitControl::Stop => {
+                Ok(VisitOutcome::Stopped)
+            }
+            _ => Ok(VisitOutcome::Complete),
+        }
+    }
     fn index_definition(&self, name: &str) -> Option<IndexDefinition>;
     fn indexes_for_table(&self, table: &str) -> Result<Vec<IndexDefinition>>;
     fn visit_index(

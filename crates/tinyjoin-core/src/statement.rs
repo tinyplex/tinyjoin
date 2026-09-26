@@ -1477,12 +1477,7 @@ fn visit_dml_candidates(
     if let Some(key) = primary_key_lookup(predicate, schema)
         && validate_primary_storage_key_bound(schema, &key).is_ok()
     {
-        return match storage.lookup_primary_key(&schema.name, &key)? {
-            Some(row) if visitor(&RowRef::map(&row, schema))? == VisitControl::Stop => {
-                Ok(VisitOutcome::Stopped)
-            }
-            _ => Ok(VisitOutcome::Complete),
-        };
+        return storage.visit_primary_key(&schema.name, &key, visitor);
     }
     visit_indexed_candidates(
         storage,

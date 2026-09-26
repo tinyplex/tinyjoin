@@ -1073,6 +1073,38 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
         .transpose()
     }
 
+    fn visit_primary_key(
+        &self,
+        table: &str,
+        key: &Row,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        self.ensure_ready()?;
+        let table = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::table_not_found(table))?;
+        let encoded_key = encode_primary_key(&table.schema, key)?;
+        let Some(root) = table.root_page_id else {
+            return Ok(VisitOutcome::Complete);
+        };
+        let value = Btree::get(
+            &mut self.pager.borrow_mut(),
+            root,
+            table.tree_id,
+            &encoded_key,
+        )?;
+        match value {
+            Some(value)
+                if visitor(&RowRef::record(table.record(&encoded_key, &value)?))?
+                    == VisitControl::Stop =>
+            {
+                Ok(VisitOutcome::Stopped)
+            }
+            _ => Ok(VisitOutcome::Complete),
+        }
+    }
+
     fn index_definition(&self, name: &str) -> Option<IndexDefinition> {
         // StorageReader cannot express failure on this metadata probe. After an ambiguous commit
         // this may report the last confirmed definition, but every operation which can consume it

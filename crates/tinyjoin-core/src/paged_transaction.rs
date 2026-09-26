@@ -625,6 +625,32 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
         self.storage.lookup_primary_key(table, key)
     }
 
+    fn visit_primary_key(
+        &self,
+        table: &str,
+        key: &Row,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        self.ensure_base_revision()?;
+        self.charge_work(1)?;
+        if let Some(transaction) = self.transaction {
+            let schema = self.storage.table_schema(table)?;
+            let encoded_key = encode_primary_key(&schema, key)?;
+            if let Some(entry) = transaction
+                .table_entries(table)
+                .and_then(|entries| entries.get(&encoded_key))
+            {
+                return match &entry.next {
+                    Some(row) if visitor(&RowRef::map(row, &schema))? == VisitControl::Stop => {
+                        Ok(VisitOutcome::Stopped)
+                    }
+                    _ => Ok(VisitOutcome::Complete),
+                };
+            }
+        }
+        self.storage.visit_primary_key(table, key, visitor)
+    }
+
     fn index_definition(&self, name: &str) -> Option<IndexDefinition> {
         self.storage.index_definition(name)
     }

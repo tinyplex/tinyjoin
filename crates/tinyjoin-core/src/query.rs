@@ -422,12 +422,7 @@ pub(crate) fn visit_predicate_candidates(
     visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
 ) -> Result<VisitOutcome> {
     if let Some(key) = primary_key_lookup(predicate, schema) {
-        return match storage.lookup_primary_key(table, &key)? {
-            Some(row) if visitor(&RowRef::map(&row, schema))? == VisitControl::Stop => {
-                Ok(VisitOutcome::Stopped)
-            }
-            _ => Ok(VisitOutcome::Complete),
-        };
+        return storage.visit_primary_key(table, &key, visitor);
     }
     visit_indexed_candidates(storage, table, predicate, schema, order, visitor)
 }

@@ -1139,6 +1139,28 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
             .transpose()
     }
 
+    fn visit_primary_key(
+        &self,
+        table: &str,
+        key: &Row,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        let table_data = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::table_not_found(table))?;
+        let key = encode_primary_key(&table_data.schema, key)?;
+        match self.lookup_record(table, &key)? {
+            Some(value)
+                if visitor(&RowRef::record(table_data.record(&key, &value)?))?
+                    == VisitControl::Stop =>
+            {
+                Ok(VisitOutcome::Stopped)
+            }
+            _ => Ok(VisitOutcome::Complete),
+        }
+    }
+
     fn index_definition(&self, name: &str) -> Option<crate::IndexDefinition> {
         self.indexes.get(name).map(|index| index.definition.clone())
     }
