@@ -13,7 +13,7 @@ use crate::{
         CATALOG_TREE_ID, CatalogHeader, CatalogIndexRecord, CatalogTableRecord,
         MAX_CATALOG_INDEXES, MAX_CATALOG_TABLES, MAX_TREE_ID, encode_catalog_header_record,
         encode_catalog_index_key, encode_catalog_index_record, encode_catalog_table_key,
-        encode_catalog_table_record, encode_primary_key, encode_row,
+        encode_catalog_table_record, encode_primary_key, encode_row, encode_secondary_index_entry,
         encode_secondary_index_entry_key, encode_secondary_index_prefix, leading_key_component,
         secondary_index_entry_matches_prefix, secondary_index_primary_key,
         secondary_index_primary_key_for_definition,
@@ -290,55 +290,39 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             .cloned()
             .ok_or_else(|| EngineError::table_not_found(&definition.table))?;
         let tree_id = self.allocate_tree_id()?;
-        let mut root_page_id = None;
-        let mut entry_count = 0usize;
+        let mut index = IndexBuild {
+            definition,
+            tree_id,
+            root_page_id: None,
+            entry_count: 0,
+        };
         if let Some(table_root) = table.root_page_id {
             let mut transaction = self.transaction.borrow_mut();
             let mut rows =
                 Btree::cursor_in_transaction(&mut transaction, table_root, table.tree_id)?;
+            let mut entries = Vec::new();
+            let mut bytes = 0usize;
             while let Some((primary_key, value)) = rows.next_in_transaction(&mut transaction)? {
                 self.charge_operations(1)?;
                 let row = table.record(&primary_key, &value)?.to_row()?;
-                let Some(index_key) =
-                    encode_secondary_index_entry_key(&table.schema, definition, &row)?
+                let Some(entry) = encode_secondary_index_entry(&table.schema, definition, &row)?
                 else {
                     continue;
                 };
-                if definition.unique
-                    && let Some(prefix) =
-                        encode_secondary_index_prefix(&table.schema, definition, &row)?
-                    && let Some(root) = root_page_id
-                {
-                    let mut existing = Btree::cursor_from_in_transaction(
-                        &mut transaction,
-                        root,
-                        tree_id,
-                        &prefix,
-                    )?;
-                    if let Some((existing_key, existing_value)) =
-                        existing.next_in_transaction(&mut transaction)?
-                    {
-                        if !existing_value.is_empty() {
-                            return Err(storage_corrupt(format!(
-                                "New secondary index `{}` contains a non-empty value",
-                                definition.name
-                            )));
-                        }
-                        if secondary_index_entry_matches_prefix(&existing_key, &prefix) {
-                            return Err(unique_violation(&definition.name));
-                        }
-                    }
+                bytes += entry.0.len() + 48;
+                entries.push(entry);
+                if bytes >= INDEX_BUILD_CHUNK_BYTES {
+                    index.write(&mut transaction, &mut entries)?;
+                    bytes = 0;
                 }
-                let root = match root_page_id {
-                    Some(root) => root,
-                    None => Btree::create(&mut transaction, tree_id)?,
-                };
-                root_page_id = Some(
-                    Btree::upsert(&mut transaction, root, tree_id, &index_key, &[])?.root_page_id,
-                );
-                entry_count = entry_count.checked_add(1).ok_or_else(batch_too_large)?;
             }
+            index.write(&mut transaction, &mut entries)?;
         }
+        let IndexBuild {
+            root_page_id,
+            entry_count,
+            ..
+        } = index;
         Rc::make_mut(&mut self.indexes).insert(
             definition.name.clone(),
             PagedIndex {
@@ -822,6 +806,77 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             root_page_id: root,
             database_hash,
         })
+    }
+}
+
+/// How many bytes of entries an index build sorts in memory before writing them to its tree.
+#[cfg(not(test))]
+const INDEX_BUILD_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+/// Small enough that tests build indexes over a few hundred rows in several chunks.
+#[cfg(test)]
+const INDEX_BUILD_CHUNK_BYTES: usize = 16 * 1024;
+
+/// A new index, built from its table's rows a sorted chunk of entries at a time.
+struct IndexBuild<'a> {
+    definition: &'a crate::IndexDefinition,
+    tree_id: TreeId,
+    root_page_id: Option<PageId>,
+    entry_count: usize,
+}
+
+impl IndexBuild<'_> {
+    /// Sorts a chunk of entries, each with the length of its indexed tuple, checks that a unique
+    /// index holds no tuple twice, and writes the chunk to the tree in one batch.
+    fn write<D: PageDevice>(
+        &mut self,
+        transaction: &mut PagerWriteTransaction<'_, D>,
+        entries: &mut Vec<(Vec<u8>, usize)>,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        if self.definition.unique {
+            // Entries for one tuple sort together, so a repeated tuple has its neighbor's prefix.
+            for pair in entries.windows(2) {
+                if secondary_index_entry_matches_prefix(&pair[1].0, &pair[0].0[..pair[0].1]) {
+                    return Err(unique_violation(&self.definition.name));
+                }
+            }
+            if let Some(root) = self.root_page_id {
+                for (key, tuple) in entries.iter() {
+                    let prefix = &key[..*tuple];
+                    let mut existing =
+                        Btree::cursor_from_in_transaction(transaction, root, self.tree_id, prefix)?;
+                    if let Some((existing_key, _)) = existing.next_in_transaction(transaction)?
+                        && secondary_index_entry_matches_prefix(&existing_key, prefix)
+                    {
+                        return Err(unique_violation(&self.definition.name));
+                    }
+                }
+            }
+        }
+        let batch = entries
+            .iter()
+            .map(|(key, _)| BatchChange {
+                key,
+                value: Some(&[]),
+            })
+            .collect::<Vec<_>>();
+        let applied = Btree::apply(transaction, self.root_page_id, self.tree_id, &batch)?;
+        if applied.inserted != entries.len() {
+            return Err(storage_corrupt(format!(
+                "Rows of one table share an entry in new index `{}`",
+                self.definition.name
+            )));
+        }
+        self.root_page_id = applied.root_page_id;
+        self.entry_count = self
+            .entry_count
+            .checked_add(entries.len())
+            .ok_or_else(batch_too_large)?;
+        entries.clear();
+        Ok(())
     }
 }
 

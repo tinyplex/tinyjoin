@@ -156,12 +156,23 @@ pub(crate) fn encode_secondary_index_entry_key(
     definition: &IndexDefinition,
     row: &Row,
 ) -> Result<Option<Vec<u8>>> {
+    Ok(encode_secondary_index_entry(schema, definition, row)?.map(|(key, _)| key))
+}
+
+/// Encodes one secondary-index entry, as [`encode_secondary_index_entry_key`] does, with the length
+/// of its indexed tuple.
+pub(crate) fn encode_secondary_index_entry(
+    schema: &TableDefinition,
+    definition: &IndexDefinition,
+    row: &Row,
+) -> Result<Option<(Vec<u8>, usize)>> {
     let Some(mut key) = encode_secondary_index_prefix(schema, definition, row)? else {
         return Ok(None);
     };
+    let tuple = key.len();
     key.extend_from_slice(&encode_primary_key(schema, row)?);
     validate_key_size(&key)?;
-    Ok(Some(key))
+    Ok(Some((key, tuple)))
 }
 
 /// Encodes one value as a key component of `data_type`, to bound a range of keys. Components compare

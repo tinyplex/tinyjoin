@@ -935,6 +935,98 @@ mod tests {
     }
 
     #[test]
+    fn index_builds_sort_chunks_of_entries_and_find_duplicates_across_them() {
+        // Enough rows that a build sorts and writes its entries in several chunks, with codes
+        // scattered so that each chunk lands between the entries of earlier ones.
+        let code = |id: i64| (id % 7 != 0).then_some(id * 7_919 % 2_003);
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .execute_sql(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, code INTEGER, label TEXT NOT NULL)",
+                &[],
+            )
+            .unwrap();
+        for first in (1..=2_000).step_by(200) {
+            let values = (first..first + 200)
+                .map(|id| {
+                    let code = code(id).map_or("NULL".to_string(), |code| code.to_string());
+                    format!("({id}, {code}, 'label {}')", id % 50)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            engine
+                .execute_sql(
+                    &format!("INSERT INTO items (id, code, label) VALUES {values}"),
+                    &[],
+                )
+                .unwrap();
+        }
+        let ids = |engine: &PagedEngine<MemoryPageDevice>, sql: &str| {
+            engine
+                .query_sql(sql, &[])
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|row| row["id"].as_i64().unwrap())
+                .collect::<Vec<_>>()
+        };
+        let in_range = (1..=2_000)
+            .filter(|id| code(*id).is_some_and(|code| (100..300).contains(&code)))
+            .collect::<Vec<_>>();
+        let labelled = (1..=2_000).filter(|id| id % 50 == 7).collect::<Vec<_>>();
+        let ranged = "SELECT id FROM items WHERE code >= 100 AND code < 300 ORDER BY id";
+        let equal = "SELECT id FROM items WHERE label = 'label 7' ORDER BY id";
+
+        for index in [
+            "CREATE UNIQUE INDEX items_code ON items (code)",
+            "CREATE INDEX items_label ON items (label)",
+        ] {
+            engine.execute_sql(index, &[]).unwrap();
+        }
+        assert_eq!(ids(&engine, ranged), in_range);
+        assert_eq!(ids(&engine, equal), labelled);
+
+        // Rows 1 and 1,999 fall in different chunks; rows 2 and 3 in the same one.
+        engine.execute_sql("DROP INDEX items_code", &[]).unwrap();
+        for (duplicate, of) in [(1_999, 1), (3, 2)] {
+            engine
+                .execute_sql(
+                    &format!(
+                        "UPDATE items SET code = {} WHERE id = {duplicate}",
+                        code(of).unwrap()
+                    ),
+                    &[],
+                )
+                .unwrap();
+            let revision = engine.revision();
+            assert_eq!(
+                engine
+                    .execute_sql("CREATE UNIQUE INDEX items_code ON items (code)", &[])
+                    .unwrap_err()
+                    .code,
+                "CONSTRAINT_VIOLATION"
+            );
+            assert_eq!(engine.revision(), revision);
+            engine
+                .execute_sql(
+                    &format!(
+                        "UPDATE items SET code = {} WHERE id = {duplicate}",
+                        code(duplicate).unwrap()
+                    ),
+                    &[],
+                )
+                .unwrap();
+        }
+        engine
+            .execute_sql("CREATE UNIQUE INDEX items_code ON items (code)", &[])
+            .unwrap();
+
+        let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        assert_eq!(ids(&reopened, ranged), in_range);
+        assert_eq!(ids(&reopened, equal), labelled);
+    }
+
+    #[test]
     fn page_native_drop_index_and_table_match_in_memory_and_reopen() {
         let source = source();
         let mut expected = Engine::new(source.clone());
