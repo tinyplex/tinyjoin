@@ -79,39 +79,32 @@ export const createOpfsPageDevice = (
     return size;
   };
 
-  const readPageCount = (): number => {
-    const size = readByteLength();
-    if (size % PAGE_SIZE !== 0) {
-      throw corrupt('is not aligned to its page size');
-    }
-    return size / PAGE_SIZE;
-  };
-
   const truncateTo = (bytes: number): void => {
     handle.truncate(bytes);
     handle.flush();
   };
 
-  // A crash can leave a partly written trailing page. Dropping it is always
-  // safe, because a page only becomes reachable once the superblock names it.
-  const repairTornTail = (): void => {
+  // Returns the file's page count. A crash can leave a partly written
+  // trailing page. Dropping it is always safe, because a page only becomes
+  // reachable once the superblock names it.
+  const repairTornTail = (): number => {
     const size = readByteLength();
     const alignedSize = size - (size % PAGE_SIZE);
-    if (alignedSize === size) {
-      return;
+    if (alignedSize !== size) {
+      try {
+        truncateTo(alignedSize);
+      } catch (error) {
+        throw new StorageError(
+          UNKNOWN_OUTCOME,
+          pageStorageError(
+            error,
+            WRITE_FAILED,
+            'TinyJoin could not repair a torn trailing database page',
+          ).message,
+        );
+      }
     }
-    try {
-      truncateTo(alignedSize);
-    } catch (error) {
-      throw new StorageError(
-        UNKNOWN_OUTCOME,
-        pageStorageError(
-          error,
-          WRITE_FAILED,
-          'TinyJoin could not repair a torn trailing database page',
-        ).message,
-      );
-    }
+    return alignedSize / PAGE_SIZE;
   };
 
   const rollbackAppend = (originalPageCount: number): void => {
@@ -125,8 +118,11 @@ export const createOpfsPageDevice = (
     }
   };
 
+  // The handle is exclusive, so only this device changes the file's length:
+  // it is read once, at open, and followed from then on.
+  let pageCount: number;
   try {
-    repairTornTail();
+    pageCount = repairTornTail();
   } catch (error) {
     // Construction takes ownership of the handle immediately. If validation
     // or repair fails, close that handle without allowing a cleanup failure
@@ -143,14 +139,14 @@ export const createOpfsPageDevice = (
   return objFreeze({
     pageCount: (): number => {
       assertOpen(closed);
-      return readPageCount();
+      return pageCount;
     },
 
     readPage: (low: number, high: number, target: Uint8Array): number => {
       assertOpen(closed);
       const pageId = pageIdFromWords(low, high, false);
       assertExactPage(target, 'The read target');
-      if (pageId >= readPageCount()) {
+      if (pageId >= pageCount) {
         throw unallocated(pageId);
       }
       transferExactly(
@@ -166,7 +162,7 @@ export const createOpfsPageDevice = (
       assertOpen(closed);
       const pageId = pageIdFromWords(low, high, true);
       assertExactPage(source, 'The page source');
-      const count = readPageCount();
+      const count = pageCount;
       if (pageId > count) {
         throw new RangeError(
           `Page ${pageId} cannot be written before page ${count} is allocated`,
@@ -182,6 +178,7 @@ export const createOpfsPageDevice = (
             source,
             'write',
           );
+          pageCount = count + 1;
         } else {
           writeExistingExactly(handle, at, source);
         }

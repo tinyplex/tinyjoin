@@ -26,6 +26,7 @@ class FakeSyncHandle implements SyncPageAccessHandle {
   sizeError: unknown;
   truncateError: unknown;
   truncateCalls = 0;
+  sizeCalls = 0;
   lastReadBuffer: Uint8Array | undefined;
   lastWriteBuffer: Uint8Array | undefined;
   readonly bytes = new Map<number, number>();
@@ -45,6 +46,7 @@ class FakeSyncHandle implements SyncPageAccessHandle {
   }
 
   getSize(): number {
+    this.sizeCalls += 1;
     if (this.sizeError !== undefined) {
       throw this.sizeError;
     }
@@ -138,19 +140,36 @@ describe('page device bounds', () => {
     expect(() => device.writePage(1, 0, page(1))).toThrow(RangeError);
     expect(handle.writeCalls).toBe(0);
 
-    handle.size = MAX_DATABASE_BYTES;
-    expect(device.pageCount()).toBe(MAX_PAGES);
-    expect(device.writePage(MAX_PAGES - 1, 0, page(2))).toBe(PAGE_SIZE);
-    expect(handle.size).toBe(MAX_DATABASE_BYTES);
-    expect(() => device.writePage(MAX_PAGES, 0, page(3))).toThrow(
+    const full = new FakeSyncHandle();
+    full.size = MAX_DATABASE_BYTES;
+    const fullDevice = createOpfsPageDevice(full);
+    expect(fullDevice.pageCount()).toBe(MAX_PAGES);
+    expect(fullDevice.writePage(MAX_PAGES - 1, 0, page(2))).toBe(PAGE_SIZE);
+    expect(full.size).toBe(MAX_DATABASE_BYTES);
+    expect(() => fullDevice.writePage(MAX_PAGES, 0, page(3))).toThrow(
       expect.objectContaining({code: 'STORAGE_DATABASE_TOO_LARGE'}),
     );
-    expect(handle.size).toBe(MAX_DATABASE_BYTES);
+    expect(full.size).toBe(MAX_DATABASE_BYTES);
 
     const memory = createMemoryPageDevice();
     expect(() => memory.writePage(MAX_PAGES, 0, page(3))).toThrow(
       expect.objectContaining({code: 'STORAGE_DATABASE_TOO_LARGE'}),
     );
+  });
+
+  it('reads the file length once and follows its own appends', () => {
+    const handle = new FakeSyncHandle();
+    handle.size = PAGE_SIZE;
+    const device = createOpfsPageDevice(handle);
+    const opened = handle.sizeCalls;
+    expect(device.writePage(1, 0, page(1))).toBe(PAGE_SIZE);
+    expect(device.writePage(2, 0, page(2))).toBe(PAGE_SIZE);
+    expect(device.writePage(0, 0, page(3))).toBe(PAGE_SIZE);
+    device.readPage(2, 0, page(0));
+    expect(device.pageCount()).toBe(3);
+    expect(handle.size).toBe(3 * PAGE_SIZE);
+    expect(() => device.readPage(3, 0, page(0))).toThrow();
+    expect(handle.sizeCalls).toBe(opened);
   });
 
   it('requires exact pages', () => {
@@ -258,6 +277,7 @@ describe('OPFS page device', () => {
     expect(writeHandle.size).toBe(0);
     expect(writeHandle.truncateCalls).toBe(1);
     expect(writeHandle.flushCalls).toBe(1);
+    expect(writeDevice.pageCount()).toBe(0);
   });
 
   it('reports a read failure after a direct target was only partly filled', () => {
