@@ -323,8 +323,22 @@ impl<D: PageDevice> PageCache<D> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn flush_candidate(&mut self, candidate: CandidateId) -> Result<()> {
         self.flush_owner(Owner::Candidate(candidate))
+    }
+
+    /// Writes a candidate's dirty pages to the device without flushing it, so that a commit can
+    /// make them durable in the same flush as its other pages.
+    pub(crate) fn write_candidate_pages(&mut self, candidate: CandidateId) -> Result<()> {
+        self.write_owner(Owner::Candidate(candidate))
+    }
+
+    /// Flushes the device, making every page written through it durable.
+    pub(crate) fn flush_device(&mut self) -> Result<()> {
+        self.device.flush()?;
+        self.unflushed_owners.clear();
+        Ok(())
     }
 
     pub(crate) fn install_candidate(
@@ -540,7 +554,7 @@ impl<D: PageDevice> PageCache<D> {
         ))
     }
 
-    fn flush_owner(&mut self, owner: Owner) -> Result<()> {
+    fn write_owner(&mut self, owner: Owner) -> Result<()> {
         for entry in &mut self.entries {
             if entry.owner == owner && entry.dirty {
                 entry.seal();
@@ -549,9 +563,13 @@ impl<D: PageDevice> PageCache<D> {
                 self.unflushed_owners.insert(entry.owner);
             }
         }
-        self.device.flush()?;
-        self.unflushed_owners.clear();
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn flush_owner(&mut self, owner: Owner) -> Result<()> {
+        self.write_owner(owner)?;
+        self.flush_device()
     }
 
     /// Removes one cached entry, if present, moving the last entry into its slot so that only one

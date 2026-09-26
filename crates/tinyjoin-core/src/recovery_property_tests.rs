@@ -428,7 +428,7 @@ fn check_recovery(mode: Execution) {
             &format!("seed={seed}, mode={mode:?}, successful probe"),
         );
         let trace = probe.0.borrow().trace.clone();
-        assert!(trace.iter().filter(|io| matches!(io, Io::Flush)).count() >= 3);
+        assert!(trace.iter().filter(|io| matches!(io, Io::Flush)).count() >= 2);
         assert!(trace.iter().any(|io| matches!(io, Io::Write(id) if *id >= FIRST_DATA_PAGE_ID && (*id as usize) < baseline.len())), "the candidate must exercise reused data pages");
 
         for operation in 1..=trace.len() {

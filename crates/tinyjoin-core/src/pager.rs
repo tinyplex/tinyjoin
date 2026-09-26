@@ -398,10 +398,11 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
 
     /// Publishes this candidate in the only crash-safe order:
     ///
-    /// 1. write and flush candidate data pages;
-    /// 2. write the inactive bitmap chunks and flush them;
-    /// 3. write the inactive superblock and flush it;
-    /// 4. install the candidate cache view and swap the in-memory active root.
+    /// 1. write the candidate data pages and the inactive bitmap chunks, and flush them together:
+    ///    only the new superblock refers to any of them, so they need not be durable in any order
+    ///    among themselves, only before it;
+    /// 2. write the inactive superblock and flush it;
+    /// 3. install the candidate cache view and swap the in-memory active root.
     pub(crate) fn commit(
         mut self,
         database_revision: u64,
@@ -444,7 +445,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
             Err(error) => return self.fail_before_superblock(error),
         };
 
-        if let Err(error) = self.pager.cache.flush_candidate(self.candidate) {
+        if let Err(error) = self.pager.cache.write_candidate_pages(self.candidate) {
             return self.fail_before_superblock(error);
         }
         for (chunk, bytes) in bitmap_pages.iter().enumerate() {
@@ -456,7 +457,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
                 return self.fail_before_superblock(error);
             }
         }
-        if let Err(error) = self.pager.device.flush() {
+        if let Err(error) = self.pager.cache.flush_device() {
             return self.fail_before_superblock(error);
         }
 
@@ -1160,9 +1161,9 @@ mod tests {
 
     #[test]
     fn every_pre_superblock_publication_cut_reopens_the_old_root() {
-        // commit operations: data write, data flush, three bitmap writes, bitmap flush,
-        // superblock write, superblock flush.
-        for operation in 1..=6 {
+        // commit operations: data write, three bitmap writes, one flush for both, superblock
+        // write, superblock flush.
+        for operation in 1..=5 {
             for timing in [FailureTiming::Before, FailureTiming::After] {
                 let (device, old_root) = committed_fault_device();
                 let mut pager = Pager::open_or_create(device.clone()).unwrap();
@@ -1189,10 +1190,10 @@ mod tests {
     #[test]
     fn ambiguous_superblock_cuts_poison_and_reopen_the_old_or_new_valid_root() {
         for (operation, timing, expected_value) in [
+            (6, FailureTiming::Before, 1),
+            (6, FailureTiming::After, 1),
             (7, FailureTiming::Before, 1),
-            (7, FailureTiming::After, 1),
-            (8, FailureTiming::Before, 1),
-            (8, FailureTiming::After, 2),
+            (7, FailureTiming::After, 2),
         ] {
             let (device, old_root) = committed_fault_device();
             let mut pager = Pager::open_or_create(device.clone()).unwrap();

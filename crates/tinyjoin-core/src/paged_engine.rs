@@ -1362,7 +1362,7 @@ mod tests {
                 &[],
             )
             .unwrap();
-        control.arm_after_flush(3);
+        control.arm_after_flush(2);
         assert_eq!(
             engine.commit_transaction().unwrap_err().code,
             "RECOVERY_REQUIRED"
@@ -1477,7 +1477,7 @@ mod tests {
         let control = device.clone();
         let mut engine = page_native_fixture(device).unwrap();
         assert!(!engine.in_transaction());
-        control.arm_after_flush(3);
+        control.arm_after_flush(2);
         assert_eq!(
             engine
                 .execute_sql(
