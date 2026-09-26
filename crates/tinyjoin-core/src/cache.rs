@@ -542,10 +542,7 @@ impl<D: PageDevice> PageCache<D> {
                 continue;
             }
             if entry.dirty {
-                entry.seal();
-                self.device.write_page(entry.id, entry.bytes.as_slice())?;
-                entry.dirty = false;
-                self.unflushed_owners.insert(entry.owner);
+                self.write_entry(index)?;
             }
             return Ok(index);
         }
@@ -554,15 +551,31 @@ impl<D: PageDevice> PageCache<D> {
         ))
     }
 
+    /// Writes an owner's dirty pages in cache order. Until the cache fills, that is the order a
+    /// candidate wrote its pages in, and it writes the pages it allocates past the end of the
+    /// file in the order it allocated them, so they extend the file one after another.
     fn write_owner(&mut self, owner: Owner) -> Result<()> {
-        for entry in &mut self.entries {
+        for index in 0..self.entries.len() {
+            let entry = &self.entries[index];
             if entry.owner == owner && entry.dirty {
-                entry.seal();
-                self.device.write_page(entry.id, entry.bytes.as_slice())?;
-                entry.dirty = false;
-                self.unflushed_owners.insert(entry.owner);
+                self.write_entry(index)?;
             }
         }
+        Ok(())
+    }
+
+    /// Writes a dirty entry to the device. A page past the end of the file is preceded by
+    /// zero-filled placeholders for the pages before it, which keeps the device dense when a page
+    /// is written ahead of the pages allocated before it; those pages are written over later.
+    fn write_entry(&mut self, index: usize) -> Result<()> {
+        let entry = &mut self.entries[index];
+        entry.seal();
+        for placeholder in self.device.page_count()..entry.id {
+            self.device.write_page(placeholder, &[0; PAGE_SIZE])?;
+        }
+        self.device.write_page(entry.id, entry.bytes.as_slice())?;
+        entry.dirty = false;
+        self.unflushed_owners.insert(entry.owner);
         Ok(())
     }
 

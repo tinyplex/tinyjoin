@@ -262,9 +262,10 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
     /// Allocates the next safe page ID, wrapping once to reuse lower free pages.
     ///
     /// Pages freed by this same transaction are not reusable until a later generation because
-    /// they remain reachable from the currently active root. When allocation extends the physical
-    /// file, a zero-filled placeholder is appended immediately so later cache eviction can write
-    /// candidate pages in any order without violating a dense PageDevice contract.
+    /// they remain reachable from the currently active root. A page past the end of the physical
+    /// file extends it only when it is written: the page cache writes a candidate's pages in page
+    /// order, and puts zero-filled placeholders before a page it must write early, so the
+    /// PageDevice stays dense without writing any page twice.
     pub(crate) fn allocate_page(&mut self) -> Result<PageId> {
         self.ensure_open()?;
         let start = self.next_allocation_page_id;
@@ -291,14 +292,15 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
             id + 1
         };
 
-        let page_count = self.pager.device.page_count();
-        if id > page_count {
+        let end = self
+            .pager
+            .device
+            .page_count()
+            .max(self.new_pages.last().map_or(0, |last| last + 1));
+        if id > end {
             return Err(pager_error(storage_diagnostic!(
-                "Allocator selected non-dense page {id} after a {page_count}-page physical file"
+                "Allocator selected non-dense page {id} after a {end}-page file"
             )));
-        }
-        if id == page_count {
-            self.pager.device.write_page(id, &[0; PAGE_SIZE])?;
         }
         self.pager.cache.reserve_candidate_page(
             self.candidate,
@@ -842,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn abort_leaves_an_unreachable_orphan_which_can_be_reused() {
+    fn abort_writes_nothing_and_its_page_is_reused() {
         let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
         let orphan;
         {
@@ -856,7 +858,8 @@ mod tests {
             pager.read_page(orphan).unwrap_err().code,
             "PAGE_NOT_ALLOCATED"
         );
-        assert_eq!(pager.physical_page_count(), orphan + 1);
+        // A page past the end of the file reaches it only when written, so the file did not grow.
+        assert_eq!(pager.physical_page_count(), orphan);
 
         let mut transaction = pager.begin_write().unwrap();
         assert_eq!(transaction.allocate_page().unwrap(), orphan);
@@ -931,6 +934,55 @@ mod tests {
         transaction.free_shared_page(root).unwrap();
         transaction.commit(3, EMPTY_HASH, Some(disposable)).unwrap();
         assert_eq!(pager.read_page(disposable).unwrap().payload, vec![9]);
+    }
+
+    #[test]
+    fn new_pages_written_in_allocation_order_extend_the_file_once_each() {
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let end = pager.physical_page_count();
+        let mut transaction = pager.begin_write().unwrap();
+        let pages = [(); 3].map(|_| transaction.allocate_page().unwrap());
+        for (value, page) in pages.iter().enumerate() {
+            transaction
+                .write_new_page(&leaf(*page, value as u8))
+                .unwrap();
+        }
+        transaction.commit(1, EMPTY_HASH, Some(pages[0])).unwrap();
+        let device = pager.into_device();
+        let data_writes = device
+            .writes()
+            .iter()
+            .filter(|id| **id >= end)
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(data_writes, pages);
+    }
+
+    #[test]
+    fn a_page_written_early_keeps_the_file_dense() {
+        // Writing three new pages in reverse order makes the cache write the last of them first,
+        // behind zero-filled placeholders that the others then overwrite. With room for only two
+        // pages, eviction writes one early during the transaction instead.
+        for capacity in [2 * PAGE_SIZE, crate::cache::DEFAULT_PAGE_CACHE_BYTES] {
+            let mut pager =
+                Pager::with_cache_capacity(MemoryPageDevice::new(0).unwrap(), capacity).unwrap();
+            let mut transaction = pager.begin_write().unwrap();
+            let pages = [(); 3].map(|_| transaction.allocate_page().unwrap());
+            for (value, page) in pages.iter().enumerate().rev() {
+                transaction
+                    .write_new_page(&leaf(*page, value as u8))
+                    .unwrap();
+            }
+            transaction.commit(1, EMPTY_HASH, Some(pages[0])).unwrap();
+            assert_eq!(pager.physical_page_count(), pages[2] + 1);
+            let mut reopened = Pager::open_or_create(pager.into_device()).unwrap();
+            for (value, page) in pages.iter().enumerate() {
+                assert_eq!(
+                    reopened.read_page(*page).unwrap().payload,
+                    vec![value as u8]
+                );
+            }
+        }
     }
 
     #[test]

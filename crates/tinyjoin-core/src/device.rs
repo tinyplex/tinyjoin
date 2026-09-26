@@ -27,6 +27,8 @@ pub trait PageDevice {
 pub(crate) struct MemoryPageDevice {
     pages: Vec<[u8; PAGE_SIZE]>,
     flush_count: u64,
+    /// The page each write went to, in order.
+    writes: Vec<PageId>,
 }
 
 #[cfg(test)]
@@ -40,6 +42,7 @@ impl MemoryPageDevice {
         Ok(Self {
             pages: vec![[0; PAGE_SIZE]; page_count as usize],
             flush_count: 0,
+            writes: Vec::new(),
         })
     }
 
@@ -53,6 +56,11 @@ impl MemoryPageDevice {
 
     pub(crate) fn flush_count(&self) -> u64 {
         self.flush_count
+    }
+
+    /// The page each write went to, in order.
+    pub(crate) fn writes(&self) -> &[PageId] {
+        &self.writes
     }
 }
 
@@ -83,6 +91,7 @@ impl PageDevice for MemoryPageDevice {
         }
         let page = &mut self.pages[id as usize];
         page.copy_from_slice(source);
+        self.writes.push(id);
         Ok(())
     }
 
