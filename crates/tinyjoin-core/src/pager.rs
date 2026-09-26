@@ -313,10 +313,10 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
                 page.id
             )));
         }
-        let bytes = page.encode()?;
+        let bytes = page.encode_unsealed()?;
         self.pager
             .cache
-            .write_candidate_page(self.candidate, page.id, &bytes)?;
+            .write_unsealed_candidate_page(self.candidate, page.id, &bytes)?;
         self.written_pages.insert(page.id);
         Ok(())
     }

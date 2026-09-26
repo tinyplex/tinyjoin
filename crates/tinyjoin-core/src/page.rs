@@ -1,7 +1,4 @@
-use crate::{
-    EngineError, Result,
-    checksum::{crc32, crc32_update},
-};
+use crate::{EngineError, Result, checksum::crc32_update};
 
 // Keep browser corruption diagnostics static and let the stable error code
 // carry the precise class. Native builds retain the detailed values.
@@ -78,6 +75,14 @@ impl TryFrom<u8> for PageType {
     }
 }
 
+/// Writes a physical page's checksum, which covers the page with its own field read as zero.
+pub(crate) fn seal(bytes: &mut [u8; PAGE_SIZE]) {
+    let checksum = crc32_update(u32::MAX, &bytes[..PAGE_CRC_OFFSET]);
+    let checksum = crc32_update(checksum, &[0; 4]);
+    let checksum = !crc32_update(checksum, &bytes[PAGE_CRC_OFFSET + 4..]);
+    bytes[PAGE_CRC_OFFSET..PAGE_CRC_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Page {
     pub id: PageId,
@@ -103,6 +108,14 @@ impl Page {
     }
 
     pub(crate) fn encode(&self) -> Result<[u8; PAGE_SIZE]> {
+        let mut bytes = self.encode_unsealed()?;
+        seal(&mut bytes);
+        Ok(bytes)
+    }
+
+    /// Encodes the page with its checksum field zero, for a page that is [sealed](seal) only when
+    /// it is written to the device. A page rewritten many times before then is checksummed once.
+    pub(crate) fn encode_unsealed(&self) -> Result<[u8; PAGE_SIZE]> {
         validate_page_id(self.id)?;
         if self.payload.len() > MAX_PAGE_PAYLOAD_SIZE {
             return Err(invalid_page(format!(
@@ -121,8 +134,6 @@ impl Page {
         bytes[24..28].copy_from_slice(&(self.payload.len() as u32).to_le_bytes());
         bytes[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + self.payload.len()]
             .copy_from_slice(&self.payload);
-        let checksum = crc32(&bytes);
-        bytes[PAGE_CRC_OFFSET..PAGE_CRC_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
         Ok(bytes)
     }
 
@@ -1008,7 +1019,7 @@ mod tests {
 
     fn rewrite_crc(bytes: &mut [u8; PAGE_SIZE]) {
         bytes[PAGE_CRC_OFFSET..PAGE_CRC_OFFSET + 4].fill(0);
-        let checksum = crc32(bytes);
+        let checksum = crate::checksum::crc32(bytes);
         bytes[PAGE_CRC_OFFSET..PAGE_CRC_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
     }
 

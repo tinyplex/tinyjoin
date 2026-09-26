@@ -66,6 +66,15 @@ impl Hasher for PageKeyHasher {
 
 type PageKeyMap<K, V> = HashMap<K, V, BuildHasherDefault<PageKeyHasher>>;
 
+impl CacheEntry {
+    fn seal(&mut self) {
+        if self.unsealed {
+            crate::page::seal(&mut self.bytes);
+            self.unsealed = false;
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum Owner {
     Committed,
@@ -79,6 +88,8 @@ struct CacheEntry {
     bytes: Box<[u8; PAGE_SIZE]>,
     referenced: bool,
     dirty: bool,
+    /// Whether the page still needs its checksum, which it receives when written to the device.
+    unsealed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -254,14 +265,36 @@ impl<D: PageDevice> PageCache<D> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn write_candidate_page(
         &mut self,
         candidate: CandidateId,
         id: PageId,
         bytes: &[u8],
     ) -> Result<()> {
+        self.write_candidate(candidate, id, bytes, false)
+    }
+
+    /// Writes a candidate page whose checksum field is still zero. The cache seals it only when it
+    /// writes the page to the device, so a page rewritten many times is checksummed once.
+    pub(crate) fn write_unsealed_candidate_page(
+        &mut self,
+        candidate: CandidateId,
+        id: PageId,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.write_candidate(candidate, id, bytes, true)
+    }
+
+    fn write_candidate(
+        &mut self,
+        candidate: CandidateId,
+        id: PageId,
+        bytes: &[u8],
+        unsealed: bool,
+    ) -> Result<()> {
         self.ensure_reserved_by(candidate, id)?;
-        self.write_owned(Owner::Candidate(candidate), id, bytes)?;
+        self.write_owned(Owner::Candidate(candidate), id, bytes, unsealed)?;
         self.reservations
             .get_mut(&id)
             .expect("the candidate reservation was checked")
@@ -430,11 +463,18 @@ impl<D: PageDevice> PageCache<D> {
             bytes,
             referenced: true,
             dirty: false,
+            unsealed: false,
         })?;
         Ok(&self.entries[index].bytes)
     }
 
-    fn write_owned(&mut self, owner: Owner, id: PageId, bytes: &[u8]) -> Result<()> {
+    fn write_owned(
+        &mut self,
+        owner: Owner,
+        id: PageId,
+        bytes: &[u8],
+        unsealed: bool,
+    ) -> Result<()> {
         if bytes.len() != PAGE_SIZE {
             return Err(cache_error(storage_diagnostic!(
                 "Cached pages must be exactly {PAGE_SIZE} bytes, not {}",
@@ -442,9 +482,11 @@ impl<D: PageDevice> PageCache<D> {
             )));
         }
         if let Some(index) = self.lookup.get(&(owner, id)).copied() {
-            self.entries[index].bytes.copy_from_slice(bytes);
-            self.entries[index].referenced = true;
-            self.entries[index].dirty = true;
+            let entry = &mut self.entries[index];
+            entry.bytes.copy_from_slice(bytes);
+            entry.referenced = true;
+            entry.dirty = true;
+            entry.unsealed = unsealed;
             return Ok(());
         }
         self.insert(CacheEntry {
@@ -453,6 +495,7 @@ impl<D: PageDevice> PageCache<D> {
             bytes: Box::new(bytes.try_into().expect("validated page length")),
             referenced: true,
             dirty: true,
+            unsealed,
         })?;
         Ok(())
     }
@@ -485,6 +528,7 @@ impl<D: PageDevice> PageCache<D> {
                 continue;
             }
             if entry.dirty {
+                entry.seal();
                 self.device.write_page(entry.id, entry.bytes.as_slice())?;
                 entry.dirty = false;
                 self.unflushed_owners.insert(entry.owner);
@@ -499,6 +543,7 @@ impl<D: PageDevice> PageCache<D> {
     fn flush_owner(&mut self, owner: Owner) -> Result<()> {
         for entry in &mut self.entries {
             if entry.owner == owner && entry.dirty {
+                entry.seal();
                 self.device.write_page(entry.id, entry.bytes.as_slice())?;
                 entry.dirty = false;
                 self.unflushed_owners.insert(entry.owner);
