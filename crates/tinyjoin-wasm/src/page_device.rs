@@ -23,8 +23,8 @@ extern "C" {
         destination: &mut [u8],
     ) -> std::result::Result<JsValue, JsValue>;
 
-    #[wasm_bindgen(method, structural, catch, js_name = writePage)]
-    fn raw_write_page(
+    #[wasm_bindgen(method, structural, catch, js_name = writePages)]
+    fn raw_write_pages(
         this: &RawPageDevice,
         page_id_low: u32,
         page_id_high: u32,
@@ -126,30 +126,41 @@ impl PageDevice for WasmPageDevice {
 
     fn write_page(&mut self, id: PageId, source: &[u8]) -> Result<()> {
         validate_buffer(source.len())?;
-        if id >= MAX_PAGE_COUNT {
+        self.write_pages(id, source)
+    }
+
+    fn write_pages(&mut self, first: PageId, source: &[u8]) -> Result<()> {
+        if source.is_empty() || !source.len().is_multiple_of(PAGE_SIZE) {
+            return Err(device_error(format!(
+                "Page device buffers must hold whole {PAGE_SIZE}-byte pages, not {} bytes",
+                source.len()
+            )));
+        }
+        let end = first + (source.len() / PAGE_SIZE) as PageId;
+        if end > MAX_PAGE_COUNT {
             return Err(EngineError::new(
                 "STORAGE_DATABASE_TOO_LARGE",
                 format!("The TinyJoin database cannot exceed {MAX_PAGE_COUNT} pages"),
             ));
         }
-        if id > self.page_count {
-            return Err(out_of_range(id, self.page_count));
+        if first > self.page_count {
+            return Err(out_of_range(first, self.page_count));
         }
-        let appending = id == self.page_count;
-        let (low, high) = split_page_id(id);
+        let (low, high) = split_page_id(first);
         let transferred = self
             .device
-            .raw_write_page(low, high, source)
-            .map_err(|error| js_device_error(error, "TinyJoin could not write a database page"))?;
+            .raw_write_pages(low, high, source)
+            .map_err(|error| js_device_error(error, "TinyJoin could not write database pages"))?;
 
-        // A conforming JS device has completed the page write before it
+        // A conforming JS device has completed every page write before it
         // returns. Keep the cached count coherent even if its byte-count return
         // value violates the bridge contract; callers must treat that error as
         // fatal and reopen the database.
-        if appending {
-            self.page_count += 1;
+        self.page_count = self.page_count.max(end);
+        if transferred.as_f64() == Some(source.len() as f64) {
+            return Ok(());
         }
-        validate_write_transfer_count(transferred)
+        Err(invalid_write_transfer_count(source.len()))
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -186,18 +197,11 @@ fn validate_transfer_count(value: JsValue, operation: &str) -> Result<()> {
     )))
 }
 
-fn validate_write_transfer_count(value: JsValue) -> Result<()> {
-    if value.as_f64() == Some(PAGE_SIZE as f64) {
-        return Ok(());
-    }
-    Err(invalid_write_transfer_count())
-}
-
-fn invalid_write_transfer_count() -> EngineError {
+fn invalid_write_transfer_count(expected: usize) -> EngineError {
     EngineError::new(
         "STORAGE_COMMIT_OUTCOME_UNKNOWN",
         format!(
-            "JavaScript PageDevice.writePage() returned an invalid byte count; expected exactly {PAGE_SIZE}",
+            "JavaScript PageDevice.writePages() returned an invalid byte count; expected exactly {expected}",
         ),
     )
     .with_retryable(false)
@@ -310,7 +314,7 @@ mod tests {
 
     #[test]
     fn invalid_write_counts_are_explicitly_fatal() {
-        let error = invalid_write_transfer_count();
+        let error = invalid_write_transfer_count(PAGE_SIZE);
         assert_eq!(error.code, "STORAGE_COMMIT_OUTCOME_UNKNOWN");
         assert_eq!(error.retryable, Some(false));
     }

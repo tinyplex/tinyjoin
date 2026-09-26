@@ -413,7 +413,7 @@ class CallbackPageDevice implements PageDevice {
     return target.byteLength;
   }
 
-  writePage(_low: number, _high: number, source: Uint8Array): number {
+  writePages(_low: number, _high: number, source: Uint8Array): number {
     this.callback?.();
     this.written.push(source.slice());
     return source.byteLength;
@@ -456,7 +456,7 @@ class CallbackRawEngine implements RawStructuredWasmEngine {
         this.device.readPage(0, 0, target);
         this.observedRead = target[0];
       } else if (this.transfer === 'write') {
-        this.device.writePage(0, 0, new Uint8Array(4096).fill(9));
+        this.device.writePages(0, 0, new Uint8Array(8192).fill(9));
       } else {
         this.device.flush();
       }

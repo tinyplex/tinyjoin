@@ -29,6 +29,8 @@ macro_rules! storage_diagnostic {
 pub(crate) type CandidateId = u64;
 
 pub(crate) const DEFAULT_PAGE_CACHE_BYTES: usize = 16 * 1024 * 1024;
+/// The most consecutive pages written in one call, which bounds the buffer that gathers them.
+const MAX_WRITE_RUN_PAGES: usize = 256;
 pub(crate) const MAX_PAGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 #[cfg(test)]
 pub(crate) const DEFAULT_PAGE_CACHE_PAGES: usize = DEFAULT_PAGE_CACHE_BYTES / PAGE_SIZE;
@@ -553,14 +555,46 @@ impl<D: PageDevice> PageCache<D> {
 
     /// Writes an owner's dirty pages in cache order. Until the cache fills, that is the order a
     /// candidate wrote its pages in, and it writes the pages it allocates past the end of the
-    /// file in the order it allocated them, so they extend the file one after another.
+    /// file in the order it allocated them, so they extend the file one after another. Each run of
+    /// consecutive pages, up to [`MAX_WRITE_RUN_PAGES`], is written in one call.
     fn write_owner(&mut self, owner: Owner) -> Result<()> {
+        let mut run: Vec<usize> = Vec::new();
+        let mut bytes = Vec::new();
         for index in 0..self.entries.len() {
             let entry = &self.entries[index];
-            if entry.owner == owner && entry.dirty {
-                self.write_entry(index)?;
+            if entry.owner != owner || !entry.dirty {
+                continue;
             }
+            let follows = run
+                .last()
+                .is_some_and(|last| self.entries[*last].id + 1 == entry.id);
+            if !follows || run.len() == MAX_WRITE_RUN_PAGES {
+                self.write_run(&mut run, &mut bytes)?;
+            }
+            let entry = &mut self.entries[index];
+            entry.seal();
+            bytes.extend_from_slice(entry.bytes.as_slice());
+            run.push(index);
         }
+        self.write_run(&mut run, &mut bytes)
+    }
+
+    /// Writes a run of dirty entries holding consecutive pages, whose bytes are `bytes`, and
+    /// empties both. An empty run writes nothing.
+    fn write_run(&mut self, run: &mut Vec<usize>, bytes: &mut Vec<u8>) -> Result<()> {
+        let Some(first) = run.first().map(|index| self.entries[*index].id) else {
+            return Ok(());
+        };
+        for placeholder in self.device.page_count()..first {
+            self.device.write_page(placeholder, &[0; PAGE_SIZE])?;
+        }
+        self.device.write_pages(first, bytes)?;
+        for index in run.drain(..) {
+            let entry = &mut self.entries[index];
+            entry.dirty = false;
+            self.unflushed_owners.insert(entry.owner);
+        }
+        bytes.clear();
         Ok(())
     }
 

@@ -450,14 +450,12 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
         if let Err(error) = self.pager.cache.write_candidate_pages(self.candidate) {
             return self.fail_before_superblock(error);
         }
-        for (chunk, bytes) in bitmap_pages.iter().enumerate() {
-            if let Err(error) = self
-                .pager
-                .device
-                .write_page(pending.superblock.bitmap_slot.page_id(chunk), bytes)
-            {
-                return self.fail_before_superblock(error);
-            }
+        // A slot's chunks are consecutive pages, so they are written in one call.
+        if let Err(error) = self.pager.device.write_pages(
+            pending.superblock.bitmap_slot.page_id(0),
+            bitmap_pages.as_flattened(),
+        ) {
+            return self.fail_before_superblock(error);
         }
         if let Err(error) = self.pager.cache.flush_device() {
             return self.fail_before_superblock(error);
@@ -574,6 +572,10 @@ impl<D: PageDevice> PageDevice for SharedPageDevice<D> {
 
     fn write_page(&mut self, id: PageId, source: &[u8]) -> Result<()> {
         self.borrow_mut().write_page(id, source)
+    }
+
+    fn write_pages(&mut self, first: PageId, source: &[u8]) -> Result<()> {
+        self.borrow_mut().write_pages(first, source)
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -767,6 +769,7 @@ mod tests {
     use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
     use super::*;
+    use crate::page::BITMAP_CHUNK_COUNT;
     use crate::{BitmapSlot, MAX_PAGE_CACHE_BYTES, MemoryPageDevice, PageType};
 
     fn leaf(id: PageId, value: u8) -> Page {
@@ -947,6 +950,7 @@ mod tests {
                 .write_new_page(&leaf(*page, value as u8))
                 .unwrap();
         }
+        let before = pager_write_calls(&transaction);
         transaction.commit(1, EMPTY_HASH, Some(pages[0])).unwrap();
         let device = pager.into_device();
         let data_writes = device
@@ -956,6 +960,21 @@ mod tests {
             .copied()
             .collect::<Vec<_>>();
         assert_eq!(data_writes, pages);
+        // The consecutive pages go in one call, then the bitmap chunks in one, then the
+        // superblock.
+        let bitmap = BitmapSlot::B.page_id(0);
+        assert_eq!(
+            device.write_calls()[before..],
+            [
+                (pages[0], 3),
+                (bitmap, BITMAP_CHUNK_COUNT),
+                (SuperblockSlot::B.page_id(), 1)
+            ]
+        );
+    }
+
+    fn pager_write_calls(transaction: &PagerWriteTransaction<'_, MemoryPageDevice>) -> usize {
+        transaction.pager.device.0.borrow().write_calls().len()
     }
 
     #[test]

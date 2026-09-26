@@ -26,10 +26,12 @@ class Device {
     this.reads++;
     return destination.length;
   }
-  writePage(low, high, source) {
+  writePages(low, high, source) {
     if (high !== 0) throw new Error('Unexpected high page word');
-    this.pages[low] = source.slice();
-    this.writes++;
+    for (let offset = 0; offset < source.length; offset += 4096) {
+      this.pages[low + offset / 4096] = source.slice(offset, offset + 4096);
+      this.writes++;
+    }
     return source.length;
   }
   flush() { this.flushes++; }

@@ -44,15 +44,24 @@ class MemoryPageDevice implements PageDevice {
     return PAGE_SIZE;
   }
 
-  writePage(low: number, high: number, source: Uint8Array): number {
+  writePages(low: number, high: number, source: Uint8Array): number {
     this.#assertOpen();
-    this.#assertPageBuffer(source);
-    if (high !== 0 || low > this.#shared.pages.length) {
-      throw new RangeError('The requested memory page cannot be written');
+    if (
+      source.byteLength === 0 ||
+      source.byteLength % PAGE_SIZE !== 0 ||
+      high !== 0 ||
+      low > this.#shared.pages.length
+    ) {
+      throw new RangeError('The requested memory pages cannot be written');
     }
     // Consume the borrowed WASM view synchronously. Never retain it.
-    this.#shared.pages[low] = source.slice();
-    return PAGE_SIZE;
+    for (let offset = 0; offset < source.byteLength; offset += PAGE_SIZE) {
+      this.#shared.pages[low + offset / PAGE_SIZE] = source.slice(
+        offset,
+        offset + PAGE_SIZE,
+      );
+    }
+    return source.byteLength;
   }
 
   flush(): void {

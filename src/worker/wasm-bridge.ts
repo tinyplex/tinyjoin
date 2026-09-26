@@ -318,8 +318,8 @@ const guardWasmPageDevice = (device: PageDevice): PageDevice =>
     pageCount: () => inPageDeviceCallback(() => device.pageCount()),
     readPage: (low: number, high: number, target: Uint8Array) =>
       inPageDeviceCallback(() => device.readPage(low, high, target)),
-    writePage: (low: number, high: number, source: Uint8Array) =>
-      inPageDeviceCallback(() => device.writePage(low, high, source)),
+    writePages: (low: number, high: number, source: Uint8Array) =>
+      inPageDeviceCallback(() => device.writePages(low, high, source)),
     flush: () => inPageDeviceCallback(() => device.flush()),
     close: () => inPageDeviceCallback(() => device.close()),
   });

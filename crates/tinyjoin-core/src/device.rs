@@ -1,6 +1,6 @@
 #[cfg(test)]
-use crate::{EngineError, MAX_PAGE_COUNT, PAGE_SIZE};
-use crate::{PageId, Result};
+use crate::{EngineError, MAX_PAGE_COUNT};
+use crate::{PAGE_SIZE, PageId, Result};
 
 /// Synchronous durable storage used by the copy-on-write pager.
 ///
@@ -19,6 +19,17 @@ pub trait PageDevice {
     fn page_count(&self) -> PageId;
     fn read_page(&mut self, id: PageId, destination: &mut [u8]) -> Result<()>;
     fn write_page(&mut self, id: PageId, source: &[u8]) -> Result<()>;
+
+    /// Writes `source`, a whole number of pages, to consecutive pages from `first`, as that many
+    /// [`Self::write_page`] calls in order would, and may make them as one call to storage. A
+    /// failure may have written any of the pages, but no other.
+    fn write_pages(&mut self, first: PageId, source: &[u8]) -> Result<()> {
+        for (offset, page) in source.chunks(PAGE_SIZE).enumerate() {
+            self.write_page(first + offset as PageId, page)?;
+        }
+        Ok(())
+    }
+
     fn flush(&mut self) -> Result<()>;
 }
 
@@ -29,6 +40,8 @@ pub(crate) struct MemoryPageDevice {
     flush_count: u64,
     /// The page each write went to, in order.
     writes: Vec<PageId>,
+    /// The first page and page count of each call that wrote pages, in order.
+    calls: Vec<(PageId, usize)>,
 }
 
 #[cfg(test)]
@@ -43,6 +56,7 @@ impl MemoryPageDevice {
             pages: vec![[0; PAGE_SIZE]; page_count as usize],
             flush_count: 0,
             writes: Vec::new(),
+            calls: Vec::new(),
         })
     }
 
@@ -61,6 +75,11 @@ impl MemoryPageDevice {
     /// The page each write went to, in order.
     pub(crate) fn writes(&self) -> &[PageId] {
         &self.writes
+    }
+
+    /// The first page and page count of each call that wrote pages, in order.
+    pub(crate) fn write_calls(&self) -> &[(PageId, usize)] {
+        &self.calls
     }
 }
 
@@ -92,6 +111,22 @@ impl PageDevice for MemoryPageDevice {
         let page = &mut self.pages[id as usize];
         page.copy_from_slice(source);
         self.writes.push(id);
+        self.calls.push((id, 1));
+        Ok(())
+    }
+
+    fn write_pages(&mut self, first: PageId, source: &[u8]) -> Result<()> {
+        if source.is_empty() || !source.len().is_multiple_of(PAGE_SIZE) {
+            return Err(device_error(format!(
+                "Page device buffers must hold whole {PAGE_SIZE}-byte pages, not {} bytes",
+                source.len()
+            )));
+        }
+        for (offset, page) in source.chunks(PAGE_SIZE).enumerate() {
+            self.write_page(first + offset as PageId, page)?;
+            self.calls.pop();
+        }
+        self.calls.push((first, source.len() / PAGE_SIZE));
         Ok(())
     }
 

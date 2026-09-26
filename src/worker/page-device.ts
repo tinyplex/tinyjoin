@@ -23,11 +23,13 @@ export interface PageDevice {
    */
   readPage(pageIdLow: number, pageIdHigh: number, target: Uint8Array): number;
   /**
-   * Appends a page or replaces one in place. An existing page may only be an
+   * Writes `source`, a whole number of pages, to consecutive pages from the
+   * given one, replacing pages in place and then appending the rest, and
+   * returns the number of bytes written. An existing page may only be an
    * inactive copy-on-write page; never overwrite metadata or data reachable
    * from the active superblock.
    */
-  writePage(pageIdLow: number, pageIdHigh: number, source: Uint8Array): number;
+  writePages(pageIdLow: number, pageIdHigh: number, source: Uint8Array): number;
   flush(): void;
   close(): void;
 }
@@ -48,9 +50,9 @@ export interface SyncPageAccessHandle {
 /**
  * A bounded random-access page device over an OPFS synchronous access handle.
  *
- * Full-page writes may replace an existing inactive copy-on-write page or
- * append exactly one page. In-place writes must never target metadata or data
- * reachable from the active superblock. This keeps the file dense and page
+ * Full-page writes may replace existing inactive copy-on-write pages or append
+ * pages to the end of the file. In-place writes must never target metadata or
+ * data reachable from the active superblock. This keeps the file dense and page
  * aligned, and prevents a bad page id from allocating a large sparse file.
  */
 export const createOpfsPageDevice = (
@@ -158,37 +160,33 @@ export const createOpfsPageDevice = (
       return PAGE_SIZE;
     },
 
-    writePage: (low: number, high: number, source: Uint8Array): number => {
+    writePages: (low: number, high: number, source: Uint8Array): number => {
       assertOpen(closed);
-      const pageId = pageIdFromWords(low, high, true);
-      assertExactPage(source, 'The page source');
+      const pageId = firstWrittenPage(low, high, source);
       const count = pageCount;
       if (pageId > count) {
-        throw new RangeError(
-          `Page ${pageId} cannot be written before page ${count} is allocated`,
-        );
+        throw gap(pageId, count);
       }
       const at = pageId * PAGE_SIZE;
-      const appending = pageId === count;
-      try {
-        if (appending) {
+      const inPlace = Math.min(source.byteLength, (count - pageId) * PAGE_SIZE);
+      if (inPlace > 0) {
+        writeExistingExactly(handle, at, source.subarray(0, inPlace));
+      }
+      if (inPlace < source.byteLength) {
+        try {
           transferExactly(
             (view, offset) => handle.write(view, {at: offset}),
-            at,
-            source,
+            at + inPlace,
+            source.subarray(inPlace),
             'write',
           );
-          pageCount = count + 1;
-        } else {
-          writeExistingExactly(handle, at, source);
-        }
-      } catch (error) {
-        if (appending) {
+          pageCount = pageId + source.byteLength / PAGE_SIZE;
+        } catch (error) {
           rollbackAppend(count);
+          throw error;
         }
-        throw error;
       }
-      return PAGE_SIZE;
+      return source.byteLength;
     },
 
     flush: (): void => {
@@ -245,17 +243,19 @@ export const createMemoryPageDevice = (): PageDevice => {
       return PAGE_SIZE;
     },
 
-    writePage: (low: number, high: number, source: Uint8Array): number => {
+    writePages: (low: number, high: number, source: Uint8Array): number => {
       assertOpen(closed);
-      const pageId = pageIdFromWords(low, high, true);
-      assertExactPage(source, 'The page source');
+      const pageId = firstWrittenPage(low, high, source);
       if (pageId > pages.length) {
-        throw new RangeError(
-          `Page ${pageId} cannot be written before page ${pages.length} is allocated`,
+        throw gap(pageId, pages.length);
+      }
+      for (let offset = 0; offset < source.byteLength; offset += PAGE_SIZE) {
+        pages[pageId + offset / PAGE_SIZE] = source.slice(
+          offset,
+          offset + PAGE_SIZE,
         );
       }
-      pages[pageId] = source.slice();
-      return PAGE_SIZE;
+      return source.byteLength;
     },
 
     flush: (): void => assertOpen(closed),
@@ -279,6 +279,11 @@ const corrupt = (problem: string): StorageError =>
 
 const unallocated = (pageId: number): RangeError =>
   new RangeError(`Page ${pageId} has not been allocated`);
+
+const gap = (pageId: number, count: number): RangeError =>
+  new RangeError(
+    `Page ${pageId} cannot be written before page ${count} is allocated`,
+  );
 
 const assertOpen = (closed: boolean): void => {
   if (closed) {
@@ -305,16 +310,37 @@ const pageIdFromWords = (
   if (high !== 0 || low > maximum) {
     throw new RangeError(`Page id must be between 0 and ${maximum}`);
   }
-  if (low === MAX_PAGES) {
+  return low;
+};
+
+const isUint32 = (value: number): boolean => isCountWithin(value, 0, MAX_U32);
+
+/**
+ * Resolves the first page a write names, after checking that its source holds
+ * one or more whole pages that all fit within the database.
+ */
+const firstWrittenPage = (
+  low: number,
+  high: number,
+  source: Uint8Array,
+): number => {
+  const pageId = pageIdFromWords(low, high, true);
+  if (!(source instanceof Uint8Array)) {
+    throw new TypeError('The page source must be a Uint8Array');
+  }
+  if (source.byteLength === 0 || source.byteLength % PAGE_SIZE !== 0) {
+    throw new RangeError(
+      `The page source must contain whole ${PAGE_SIZE}-byte pages`,
+    );
+  }
+  if (pageId + source.byteLength / PAGE_SIZE > MAX_PAGES) {
     throw new StorageError(
       TOO_LARGE,
       `The TinyJoin database cannot exceed ${MAX_DATABASE_BYTES} bytes`,
     );
   }
-  return low;
+  return pageId;
 };
-
-const isUint32 = (value: number): boolean => isCountWithin(value, 0, MAX_U32);
 
 const assertExactPage = (bytes: Uint8Array, label: string): void => {
   if (!(bytes instanceof Uint8Array)) {

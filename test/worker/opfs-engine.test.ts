@@ -11,7 +11,9 @@ import type {OpfsPageStorageSession} from '../../src/worker/page-storage.ts';
 const pageDevice = {
   pageCount: vi.fn(() => 0),
   readPage: vi.fn(() => 4096),
-  writePage: vi.fn(() => 4096),
+  writePages: vi.fn(
+    (_low: number, _high: number, source: Uint8Array) => source.byteLength,
+  ),
   flush: vi.fn(),
   close: vi.fn(),
 } satisfies PageDevice;

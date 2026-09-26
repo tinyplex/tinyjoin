@@ -76,11 +76,13 @@ class MemoryPageDevice implements PageDevice {
     return destination.byteLength;
   }
 
-  writePage(low: number, high: number, source: Uint8Array): number {
+  writePages(low: number, high: number, source: Uint8Array): number {
     if (high !== 0 || low > this.pages.length) {
       throw new Error('invalid test page write');
     }
-    this.pages[low] = source.slice();
+    for (let offset = 0; offset < source.byteLength; offset += 4096) {
+      this.pages[low + offset / 4096] = source.slice(offset, offset + 4096);
+    }
     return source.byteLength;
   }
 
