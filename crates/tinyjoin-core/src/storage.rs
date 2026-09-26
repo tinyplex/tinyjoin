@@ -1012,13 +1012,15 @@ fn validate_primary_key_values(schema: &TableDefinition, row: &Row) -> Result<()
 
 pub(crate) fn estimated_row_bytes(row: &Row) -> Result<usize> {
     validate_row_value_limits(row)?;
+    // The row limit is below the value limit and row values nest one level deeper, so a row which
+    // passes has only valid values; they need no separate validation for the estimate.
     let mut bytes = 32usize;
     for (key, value) in row {
         bytes = checked_row_write_add(bytes, 64)?;
         bytes = checked_row_write_add(bytes, checked_row_write_mul(key.len(), 2)?)?;
         bytes = checked_row_write_add(
             bytes,
-            checked_row_write_mul(estimated_value_bytes(value)?, 2)?,
+            checked_row_write_mul(estimated_value_bytes_at_depth(value, 0)?, 2)?,
         )?;
     }
     Ok(bytes)
@@ -1099,7 +1101,7 @@ fn encoded_json_bytes(value: &Value, depth: usize) -> Result<usize> {
         Value::Null => Ok(4),
         Value::Bool(false) => Ok(5),
         Value::Bool(true) => Ok(4),
-        Value::Number(number) => Ok(number.to_string().len()),
+        Value::Number(number) => Ok(encoded_json_number_bytes(number)),
         Value::String(value) => encoded_json_string_bytes(value),
         Value::Array(values) => {
             let mut bytes = 2usize;
@@ -1136,15 +1138,49 @@ fn encoded_json_bytes(value: &Value, depth: usize) -> Result<usize> {
     }
 }
 
+/// The length of a number as serde_json writes it, without allocating the text.
+fn encoded_json_number_bytes(number: &serde_json::Number) -> usize {
+    if let Some(value) = number.as_u64() {
+        decimal_digits(value)
+    } else if let Some(value) = number.as_i64() {
+        1 + decimal_digits(value.unsigned_abs())
+    } else {
+        struct ByteCounter(usize);
+        impl std::fmt::Write for ByteCounter {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                self.0 += text.len();
+                Ok(())
+            }
+        }
+        let mut counter = ByteCounter(0);
+        std::fmt::Write::write_fmt(&mut counter, format_args!("{number}"))
+            .expect("counting formatted bytes cannot fail");
+        counter.0
+    }
+}
+
+fn decimal_digits(mut value: u64) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+/// The length of a string as JSON text. Only ASCII quotes, backslashes and control characters are
+/// escaped, so every other byte of UTF-8, including each byte of a multi-byte character, is
+/// written as itself.
 fn encoded_json_string_bytes(value: &str) -> Result<usize> {
-    value.chars().try_fold(2usize, |bytes, character| {
-        let escaped = match character {
-            '"' | '\\' | '\u{0008}' | '\u{000c}' | '\n' | '\r' | '\t' => 2,
-            '\u{0000}'..='\u{001f}' => 6,
-            character => character.len_utf8(),
-        };
-        checked_row_write_add(bytes, escaped)
-    })
+    let mut escapes = 0usize;
+    for byte in value.bytes() {
+        match byte {
+            b'"' | b'\\' | 0x08 | 0x0c | b'\n' | b'\r' | b'\t' => escapes += 1,
+            0x00..=0x1f => escapes += 5,
+            _ => {}
+        }
+    }
+    checked_row_write_add(value.len(), escapes).and_then(|bytes| checked_row_write_add(bytes, 2))
 }
 
 pub(crate) fn validate_primary_storage_key_bound(
@@ -1663,5 +1699,39 @@ mod tests {
         assert_eq!(visited, vec![json!(1)]);
         assert_eq!(storage.table_row_count("users").unwrap(), 2);
         assert_eq!(storage.visitor_counts(), (1, 0));
+    }
+
+    #[test]
+    fn encoded_json_lengths_match_serde_json_text() {
+        let values = [
+            json!(null),
+            json!(true),
+            json!(false),
+            json!(0),
+            json!(7),
+            json!(-7),
+            json!(u64::MAX),
+            json!(i64::MIN),
+            json!(9_007_199_254_740_991_i64),
+            json!(0.5),
+            json!(-0.0),
+            json!(1e300),
+            json!(-2.5e-8),
+            json!(123_456.789),
+            json!(""),
+            json!("plain"),
+            json!("quote \" backslash \\ newline \n tab \t return \r"),
+            json!("\u{0000}\u{0001}\u{0008}\u{000c}\u{001f}\u{007f}"),
+            json!("caf\u{e9} \u{1f600} \u{4e2d}\u{6587}"),
+            json!([1, "two", [3.5, null], {"four": false}]),
+            json!({"b": "\"", "a": [-1, 2.25]}),
+        ];
+        for value in values {
+            assert_eq!(
+                encoded_json_bytes(&value, 0).unwrap(),
+                serde_json::to_string(&value).unwrap().len(),
+                "{value}"
+            );
+        }
     }
 }
