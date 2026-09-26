@@ -111,17 +111,42 @@ impl<D: PageDevice> PageCache<D> {
         &self.device
     }
 
+    #[cfg(test)]
     pub(crate) fn read_page(&mut self, id: PageId) -> Result<&[u8; PAGE_SIZE]> {
-        self.ensure_not_reserved(id)?;
-        self.read_owned(Owner::Committed, id)
+        self.read_page_verified(id, |_| Ok(()))
     }
 
-    /// Reads a page ID allocated exclusively to this copy-on-write candidate.
-    /// Shared committed page IDs must be read with [`Self::read_page`].
+    /// Reads a committed page, running `verify` only when the page is loaded from the device.
+    ///
+    /// Bytes are cached only after they pass, so a page which fails verification is reported on
+    /// every read rather than served from the cache. Bytes written through the cache were produced
+    /// by the engine and are trusted as written.
+    pub(crate) fn read_page_verified(
+        &mut self,
+        id: PageId,
+        verify: impl FnOnce(&[u8; PAGE_SIZE]) -> Result<()>,
+    ) -> Result<&[u8; PAGE_SIZE]> {
+        self.ensure_not_reserved(id)?;
+        self.read_owned(Owner::Committed, id, verify)
+    }
+
+    #[cfg(test)]
     pub(crate) fn read_candidate_page(
         &mut self,
         candidate: CandidateId,
         id: PageId,
+    ) -> Result<&[u8; PAGE_SIZE]> {
+        self.read_candidate_page_verified(candidate, id, |_| Ok(()))
+    }
+
+    /// Reads a page ID allocated exclusively to this copy-on-write candidate, verifying it as
+    /// [`Self::read_page_verified`] does if an eviction sent it to the device.
+    /// Shared committed page IDs must be read with [`Self::read_page_verified`].
+    pub(crate) fn read_candidate_page_verified(
+        &mut self,
+        candidate: CandidateId,
+        id: PageId,
+        verify: impl FnOnce(&[u8; PAGE_SIZE]) -> Result<()>,
     ) -> Result<&[u8; PAGE_SIZE]> {
         self.ensure_reserved_by(candidate, id)?;
         if !self
@@ -134,7 +159,7 @@ impl<D: PageDevice> PageCache<D> {
                 "Candidate {candidate} must initialize reserved page {id} before reading it"
             )));
         }
-        self.read_owned(Owner::Candidate(candidate), id)
+        self.read_owned(Owner::Candidate(candidate), id, verify)
     }
 
     /// Reserves an unallocated data page exclusively for a copy-on-write candidate.
@@ -338,13 +363,19 @@ impl<D: PageDevice> PageCache<D> {
         }
     }
 
-    fn read_owned(&mut self, owner: Owner, id: PageId) -> Result<&[u8; PAGE_SIZE]> {
+    fn read_owned(
+        &mut self,
+        owner: Owner,
+        id: PageId,
+        verify: impl FnOnce(&[u8; PAGE_SIZE]) -> Result<()>,
+    ) -> Result<&[u8; PAGE_SIZE]> {
         if let Some(index) = self.lookup.get(&(owner, id)).copied() {
             self.entries[index].referenced = true;
             return Ok(&self.entries[index].bytes);
         }
         let mut bytes = Box::new([0; PAGE_SIZE]);
         self.device.read_page(id, bytes.as_mut_slice())?;
+        verify(&bytes)?;
         let index = self.insert(CacheEntry {
             id,
             owner,

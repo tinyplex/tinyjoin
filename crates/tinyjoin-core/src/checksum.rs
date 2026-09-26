@@ -17,16 +17,33 @@ const TABLE: [u32; 256] = {
 };
 
 pub(crate) fn crc32(bytes: &[u8]) -> u32 {
-    let mut checksum = u32::MAX;
+    !crc32_update(u32::MAX, bytes)
+}
+
+/// Continues a CRC-32 over further bytes. Start from `u32::MAX` and complement the result, as
+/// [`crc32`] does, to checksum a message supplied in parts.
+pub(crate) fn crc32_update(mut checksum: u32, bytes: &[u8]) -> u32 {
     for byte in bytes {
         checksum = (checksum >> 8) ^ TABLE[((checksum ^ u32::from(*byte)) & 255) as usize];
     }
-    !checksum
+    checksum
 }
 
 #[cfg(test)]
 mod tests {
-    use super::crc32;
+    use super::{crc32, crc32_update};
+
+    #[test]
+    fn checksums_a_message_supplied_in_parts() {
+        let bytes = b"The quick brown fox jumps over the lazy dog";
+        for split in 0..=bytes.len() {
+            let (left, right) = bytes.split_at(split);
+            assert_eq!(
+                !crc32_update(crc32_update(u32::MAX, left), right),
+                crc32(bytes)
+            );
+        }
+    }
 
     #[test]
     fn matches_the_standard_check_value() {

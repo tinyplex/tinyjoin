@@ -1,4 +1,7 @@
-use crate::{EngineError, Result, checksum::crc32};
+use crate::{
+    EngineError, Result,
+    checksum::{crc32, crc32_update},
+};
 
 // Keep browser corruption diagnostics static and let the stable error code
 // carry the precise class. Native builds retain the detailed values.
@@ -122,6 +125,16 @@ impl Page {
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
+        Self::verify(bytes)?;
+        Self::decode_verified(bytes)
+    }
+
+    /// Checks a physical page's checksum and every envelope field.
+    ///
+    /// The page cache runs this once, when it loads a page from the device, and keeps only pages
+    /// which pass. Pages the engine encodes are correct as written, so cached pages are decoded
+    /// with [`Self::decode_verified`] instead of being checked again on every access.
+    pub(crate) fn verify(bytes: &[u8]) -> Result<()> {
         if bytes.len() != PAGE_SIZE {
             return Err(invalid_page(storage_diagnostic!(
                 "A physical page must be exactly {PAGE_SIZE} bytes, not {}",
@@ -131,12 +144,13 @@ impl Page {
         // Treat the envelope fields as authoritative only after the physical
         // page checksum succeeds. A torn write can otherwise turn a version
         // byte into an apparently coherent unsupported format and prevent
-        // recovery from the other metadata slot.
+        // recovery from the other metadata slot. The checksum covers the page
+        // with its own field read as zero.
         let expected_checksum = read_u32(bytes, PAGE_CRC_OFFSET);
-        let mut checksum_bytes = [0; PAGE_SIZE];
-        checksum_bytes.copy_from_slice(bytes);
-        checksum_bytes[PAGE_CRC_OFFSET..PAGE_CRC_OFFSET + 4].fill(0);
-        if crc32(&checksum_bytes) != expected_checksum {
+        let checksum = crc32_update(u32::MAX, &bytes[..PAGE_CRC_OFFSET]);
+        let checksum = crc32_update(checksum, &[0; 4]);
+        let checksum = !crc32_update(checksum, &bytes[PAGE_CRC_OFFSET + 4..]);
+        if checksum != expected_checksum {
             return Err(invalid_page("Page checksum does not match"));
         }
         if &bytes[..8] != PAGE_MAGIC {
@@ -156,7 +170,7 @@ impl Page {
         }
         let id = read_u64(bytes, 12);
         validate_page_id(id)?;
-        let page_type = PageType::try_from(bytes[20])?;
+        PageType::try_from(bytes[20])?;
         if bytes[21..24].iter().any(|byte| *byte != 0) {
             return Err(invalid_page("Page header reserved bytes must be zero"));
         }
@@ -170,11 +184,29 @@ impl Page {
         if bytes[payload_end..].iter().any(|byte| *byte != 0) {
             return Err(invalid_page("Page padding bytes must be zero"));
         }
+        Ok(())
+    }
 
+    /// Decodes a page which [`Self::verify`] accepted, or which the engine encoded itself.
+    ///
+    /// Only the bounds needed to slice the payload safely are checked again.
+    pub(crate) fn decode_verified(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != PAGE_SIZE {
+            return Err(invalid_page(storage_diagnostic!(
+                "A physical page must be exactly {PAGE_SIZE} bytes, not {}",
+                bytes.len()
+            )));
+        }
+        let payload_length = read_u32(bytes, 24) as usize;
+        if payload_length > MAX_PAGE_PAYLOAD_SIZE {
+            return Err(invalid_page(storage_diagnostic!(
+                "Page payload length {payload_length} exceeds the {MAX_PAGE_PAYLOAD_SIZE}-byte limit"
+            )));
+        }
         Ok(Self {
-            id,
-            page_type,
-            payload: bytes[PAGE_HEADER_SIZE..payload_end].to_vec(),
+            id: read_u64(bytes, 12),
+            page_type: PageType::try_from(bytes[20])?,
+            payload: bytes[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + payload_length].to_vec(),
         })
     }
 }

@@ -137,8 +137,10 @@ impl<D: PageDevice> Pager<D> {
         if !self.active.allocation_bitmap.is_allocated(id)? {
             return Err(page_not_allocated(id));
         }
-        let bytes = self.cache.read_page(id)?;
-        decode_expected_page(id, bytes)
+        let bytes = self
+            .cache
+            .read_page_verified(id, |bytes| verify_expected_page(id, bytes))?;
+        decode_verified_page(id, bytes)
     }
 
     pub(crate) fn begin_write(&mut self) -> Result<PagerWriteTransaction<'_, D>> {
@@ -325,16 +327,19 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
         if !self.next_bitmap.is_allocated(id)? {
             return Err(page_not_allocated(id));
         }
+        let verify = |bytes: &[u8; PAGE_SIZE]| verify_expected_page(id, bytes);
         let bytes = if self.new_pages.contains(&id) {
-            self.pager.cache.read_candidate_page(self.candidate, id)?
+            self.pager
+                .cache
+                .read_candidate_page_verified(self.candidate, id, verify)?
         } else if self.pager.active.allocation_bitmap.is_allocated(id)? {
-            self.pager.cache.read_page(id)?
+            self.pager.cache.read_page_verified(id, verify)?
         } else {
             return Err(pager_error(storage_diagnostic!(
                 "Page {id} is allocated in the candidate bitmap without candidate ownership"
             )));
         };
-        decode_expected_page(id, bytes)
+        decode_verified_page(id, bytes)
     }
 
     /// Removes a page shared from the active generation from the candidate root.
@@ -704,14 +709,27 @@ fn ensure_data_page(id: PageId) -> Result<()> {
     Ok(())
 }
 
-fn decode_expected_page(id: PageId, bytes: &[u8; PAGE_SIZE]) -> Result<Page> {
-    let page = Page::decode(bytes)?;
+/// Verifies a data page as it enters the cache from the device, including that its envelope names
+/// the physical page it was read from.
+fn verify_expected_page(id: PageId, bytes: &[u8; PAGE_SIZE]) -> Result<()> {
+    Page::verify(bytes)?;
+    let page = Page::decode_verified(bytes)?;
     if page.id != id {
         return Err(pager_error(format!(
             "Physical page {id} contains an envelope for page {}",
             page.id
         )));
     }
+    Ok(())
+}
+
+/// Decodes a cached data page, which was verified when it was loaded or encoded by this engine.
+fn decode_verified_page(id: PageId, bytes: &[u8; PAGE_SIZE]) -> Result<Page> {
+    let page = Page::decode_verified(bytes)?;
+    debug_assert_eq!(
+        page.id, id,
+        "cached pages keep the envelope they were verified with"
+    );
     Ok(page)
 }
 
