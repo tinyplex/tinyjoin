@@ -5,7 +5,8 @@
 //! in seconds instead of a browser run. Every workload reports the best time of several runs and
 //! its heap allocations, which are deterministic and make a sensitive regression signal.
 //!
-//! Setup is untimed. Workloads that write start each run from a fresh copy of the same device.
+//! Setup is untimed. Each run starts from a fresh copy of the same device, and opening it is untimed
+//! too, except in the workloads that measure opening.
 
 use serde_json::{Value, json};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -275,7 +276,14 @@ struct Workload {
     id: &'static str,
     label: &'static str,
     setup: fn() -> MemoryDevice,
-    run: fn(MemoryDevice) -> usize,
+    run: Run,
+}
+
+enum Run {
+    /// Runs against an engine opened on the device before timing starts.
+    Engine(fn(&mut Engine) -> usize),
+    /// Runs on the device itself, so that opening it is timed.
+    Device(fn(MemoryDevice) -> usize),
 }
 
 fn workloads() -> Vec<Workload> {
@@ -284,192 +292,165 @@ fn workloads() -> Vec<Workload> {
             id: "insert-autocommit",
             label: "1,000 INSERTs, each committed alone",
             setup: empty_table,
-            run: |device| {
-                let mut engine = open(device);
-                let insert = prepared(&mut engine, INSERT_ONE);
+            run: Run::Engine(|engine| {
+                let insert = prepared(engine, INSERT_ONE);
                 let mut random = Random(1);
                 for id in 1..=1000 {
-                    rows(&mut engine, insert, &row(id, &mut random));
+                    rows(engine, insert, &row(id, &mut random));
                 }
                 1000
-            },
+            }),
         },
         Workload {
             id: "insert-transaction",
             label: "One transaction of 10,000 INSERTs",
             setup: empty_table,
-            run: |device| {
-                let mut engine = open(device);
-                let insert = prepared(&mut engine, INSERT_ONE);
+            run: Run::Engine(|engine| {
+                let insert = prepared(engine, INSERT_ONE);
                 let mut random = Random(1);
-                in_transaction(&mut engine, |engine| {
+                in_transaction(engine, |engine| {
                     for id in 1..=ROWS {
                         rows(engine, insert, &row(id, &mut random));
                     }
                 });
                 ROWS as usize
-            },
+            }),
         },
         Workload {
             id: "insert-batch",
             label: "One transaction of 50 INSERTs, 200 rows each",
             setup: empty_table,
-            run: |_| {
+            run: Run::Device(|_| {
                 table("");
                 ROWS as usize
-            },
+            }),
         },
         Workload {
             id: "select-pk",
             label: "1,000 SELECTs by primary key",
             setup: || table(""),
-            run: |device| {
-                let mut engine = open(device);
-                let select = prepared(&mut engine, "SELECT * FROM t WHERE id = $1");
+            run: Run::Engine(|engine| {
+                let select = prepared(engine, "SELECT * FROM t WHERE id = $1");
                 spread(1000)
-                    .map(|id| rows(&mut engine, select, &[json!(id)]))
+                    .map(|id| rows(engine, select, &[json!(id)]))
                     .sum()
-            },
+            }),
         },
         Workload {
             id: "select-scan",
             label: "100 range aggregates, no index",
             setup: || table(""),
-            run: |device| {
-                let mut engine = open(device);
+            run: Run::Engine(|engine| {
                 let select = prepared(
-                    &mut engine,
+                    engine,
                     "SELECT count(*) AS n, avg(b) AS m FROM t WHERE b >= $1 AND b < $2",
                 );
                 (0..100)
-                    .map(|i| {
-                        rows(
-                            &mut engine,
-                            select,
-                            &[json!(i * 100), json!(i * 100 + 1000)],
-                        )
-                    })
+                    .map(|i| rows(engine, select, &[json!(i * 100), json!(i * 100 + 1000)]))
                     .sum()
-            },
+            }),
         },
         Workload {
             id: "select-like",
             label: "100 LIKE aggregates on a text column",
             setup: || table(""),
-            run: |device| {
-                let mut engine = open(device);
+            run: Run::Engine(|engine| {
                 let select = prepared(
-                    &mut engine,
+                    engine,
                     "SELECT count(*) AS n, avg(b) AS m FROM t WHERE c LIKE $1",
                 );
                 (1..=100)
-                    .map(|i| rows(&mut engine, select, &[json!(format!("%{}%", words(i)))]))
+                    .map(|i| rows(engine, select, &[json!(format!("%{}%", words(i)))]))
                     .sum()
-            },
+            }),
         },
         Workload {
             id: "select-indexed",
             label: "100 range aggregates, indexed column",
             setup: || table("CREATE INDEX t_b ON t (b)"),
-            run: |device| {
-                let mut engine = open(device);
+            run: Run::Engine(|engine| {
                 let select = prepared(
-                    &mut engine,
+                    engine,
                     "SELECT count(*) AS n, avg(b) AS m FROM t WHERE b >= $1 AND b < $2",
                 );
                 (0..100)
-                    .map(|i| {
-                        rows(
-                            &mut engine,
-                            select,
-                            &[json!(i * 1000), json!(i * 1000 + 100)],
-                        )
-                    })
+                    .map(|i| rows(engine, select, &[json!(i * 1000), json!(i * 1000 + 100)]))
                     .sum()
-            },
+            }),
         },
         Workload {
             id: "select-all",
             label: "Read all 10,000 rows in order",
             setup: || table(""),
-            run: |device| {
-                let mut engine = open(device);
-                let select = prepared(&mut engine, "SELECT * FROM t ORDER BY id");
-                rows(&mut engine, select, &[])
-            },
+            run: Run::Engine(|engine| {
+                let select = prepared(engine, "SELECT * FROM t ORDER BY id");
+                rows(engine, select, &[])
+            }),
         },
         Workload {
             id: "order-limit",
             label: "100 SELECTs of the first 10 rows in order",
             setup: || table(""),
-            run: |device| {
-                let mut engine = open(device);
-                let select = prepared(&mut engine, "SELECT * FROM t ORDER BY id LIMIT 10");
-                (0..100).map(|_| rows(&mut engine, select, &[])).sum()
-            },
+            run: Run::Engine(|engine| {
+                let select = prepared(engine, "SELECT * FROM t ORDER BY id LIMIT 10");
+                (0..100).map(|_| rows(engine, select, &[])).sum()
+            }),
         },
         Workload {
             id: "count",
             label: "100 counts of 10,000 rows",
             setup: || table(""),
-            run: |device| {
-                let mut engine = open(device);
-                let select = prepared(&mut engine, "SELECT count(*) AS n FROM t");
-                (0..100).map(|_| rows(&mut engine, select, &[])).sum()
-            },
+            run: Run::Engine(|engine| {
+                let select = prepared(engine, "SELECT count(*) AS n FROM t");
+                (0..100).map(|_| rows(engine, select, &[])).sum()
+            }),
         },
         Workload {
             id: "group-by",
             label: "10 GROUP BY aggregates over 10,000 rows",
             setup: || table(""),
-            run: |device| {
-                let mut engine = open(device);
+            run: Run::Engine(|engine| {
                 let select = prepared(
-                    &mut engine,
+                    engine,
                     "SELECT g, count(*) AS n, sum(b) AS s FROM t GROUP BY g ORDER BY g",
                 );
-                (0..10).map(|_| rows(&mut engine, select, &[])).sum()
-            },
+                (0..10).map(|_| rows(engine, select, &[])).sum()
+            }),
         },
         Workload {
             id: "join",
             label: "100 joins: one customer's orders from 5,000",
             setup: join_tables,
-            run: |device| {
-                let mut engine = open(device);
+            run: Run::Engine(|engine| {
                 let select = prepared(
-                    &mut engine,
+                    engine,
                     "SELECT o.id AS id, c.name AS name, o.total AS total FROM customers AS c \
                      JOIN orders AS o ON o.customer_id = c.id WHERE c.id = $1 ORDER BY o.id",
                 );
-                (1..=100)
-                    .map(|id| rows(&mut engine, select, &[json!(id)]))
-                    .sum()
-            },
+                (1..=100).map(|id| rows(engine, select, &[json!(id)])).sum()
+            }),
         },
         Workload {
             id: "update-pk",
             label: "One transaction of 1,000 UPDATEs by primary key",
             setup: || table(""),
-            run: |device| {
-                let mut engine = open(device);
-                let update = prepared(&mut engine, "UPDATE t SET c = $1 WHERE id = $2");
-                in_transaction(&mut engine, |engine| {
+            run: Run::Engine(|engine| {
+                let update = prepared(engine, "UPDATE t SET c = $1 WHERE id = $2");
+                in_transaction(engine, |engine| {
                     for id in spread(1000) {
                         rows(engine, update, &[json!("updated"), json!(id)]);
                     }
                 });
                 1000
-            },
+            }),
         },
         Workload {
             id: "update-scan",
             label: "One transaction of 100 range UPDATEs, no index",
             setup: || table(""),
-            run: |device| {
-                let mut engine = open(device);
-                let update = prepared(&mut engine, "UPDATE t SET c = $1 WHERE b >= $2 AND b < $3");
-                in_transaction(&mut engine, |engine| {
+            run: Run::Engine(|engine| {
+                let update = prepared(engine, "UPDATE t SET c = $1 WHERE b >= $2 AND b < $3");
+                in_transaction(engine, |engine| {
                     for i in 0..100 {
                         rows(
                             engine,
@@ -479,60 +460,56 @@ fn workloads() -> Vec<Workload> {
                     }
                 });
                 100
-            },
+            }),
         },
         Workload {
             id: "upsert",
             label: "One transaction of 1,000 upserts, half of them new",
             setup: || table(""),
-            run: |device| {
-                let mut engine = open(device);
+            run: Run::Engine(|engine| {
                 let upsert = prepared(
-                    &mut engine,
+                    engine,
                     &format!("{INSERT_ONE} ON CONFLICT (id) DO UPDATE SET c = EXCLUDED.c"),
                 );
                 let mut random = Random(3);
-                in_transaction(&mut engine, |engine| {
+                in_transaction(engine, |engine| {
                     for id in ROWS - 499..=ROWS + 500 {
                         rows(engine, upsert, &row(id, &mut random));
                     }
                 });
                 1000
-            },
+            }),
         },
         Workload {
             id: "delete-pk",
             label: "One transaction of 1,000 DELETEs by primary key",
             setup: || table(""),
-            run: |device| {
-                let mut engine = open(device);
-                let delete = prepared(&mut engine, "DELETE FROM t WHERE id = $1");
-                in_transaction(&mut engine, |engine| {
+            run: Run::Engine(|engine| {
+                let delete = prepared(engine, "DELETE FROM t WHERE id = $1");
+                in_transaction(engine, |engine| {
                     for id in spread(1000) {
                         rows(engine, delete, &[json!(id)]);
                     }
                 });
                 1000
-            },
+            }),
         },
         Workload {
             id: "delete-like",
             label: "One DELETE matching a LIKE pattern",
             setup: || table(""),
-            run: |device| {
-                let mut engine = open(device);
+            run: Run::Engine(|engine| {
                 engine
                     .execute_sql("DELETE FROM t WHERE c LIKE $1", &[json!("%fifty%")])
                     .unwrap()
                     .row_count
-            },
+            }),
         },
         Workload {
             id: "delete-range",
             label: "One DELETE of 8,000 rows by indexed range",
             setup: || table("CREATE INDEX t_a ON t (a)"),
-            run: |device| {
-                let mut engine = open(device);
+            run: Run::Engine(|engine| {
                 engine
                     .execute_sql(
                         "DELETE FROM t WHERE a >= $1 AND a < $2",
@@ -540,37 +517,36 @@ fn workloads() -> Vec<Workload> {
                     )
                     .unwrap()
                     .row_count
-            },
+            }),
         },
         Workload {
             id: "create-index",
             label: "Create two indexes over 10,000 rows",
             setup: || table(""),
-            run: |device| {
-                let mut engine = open(device);
+            run: Run::Engine(|engine| {
                 engine
                     .exec_sql("CREATE INDEX t_b ON t (b); CREATE INDEX t_c ON t (c)")
                     .unwrap()
                     .len()
-            },
+            }),
         },
         Workload {
             id: "reopen",
             label: "Reopen a 10,000-row database",
             setup: || table(""),
-            run: |device| {
+            run: Run::Device(|device| {
                 open(device);
                 1
-            },
+            }),
         },
         Workload {
             id: "reopen-indexed",
             label: "Reopen a 10,000-row database with one index",
             setup: || table("CREATE INDEX t_b ON t (b)"),
-            run: |device| {
+            run: Run::Device(|device| {
                 open(device);
                 1
-            },
+            }),
         },
     ]
 }
@@ -611,10 +587,14 @@ fn main() {
         let mut count = 0;
         for _ in 0..runs {
             let copy = device.clone();
+            let mut engine = matches!(workload.run, Run::Engine(_)).then(|| open(copy.clone()));
             let before = ALLOCATIONS.load(Ordering::Relaxed);
             let retired = instructions();
             let start = Instant::now();
-            count = (workload.run)(copy);
+            count = match workload.run {
+                Run::Engine(run) => run(engine.as_mut().expect("the engine was opened above")),
+                Run::Device(run) => run(copy),
+            };
             best = best.min(start.elapsed().as_secs_f64() * 1000.0);
             fewest_instructions = fewest_instructions.min(instructions() - retired);
             allocations = ALLOCATIONS.load(Ordering::Relaxed) - before;
