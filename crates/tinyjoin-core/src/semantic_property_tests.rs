@@ -515,6 +515,36 @@ fn like_model(text: &[char], pattern: &[char], escape: Option<char>, fold: bool)
     }
 }
 
+/// The engine's `LIKE` matcher, including its literal-segment searches, against the model on
+/// generated texts and patterns over characters that exercise wildcards, escapes, ASCII folding,
+/// and multi-byte UTF-8.
+#[test]
+fn generated_like_patterns_agree_with_the_model() {
+    let alphabet = ['a', 'b', 'A', 'B', 'é', 'É', '🦀', '%', '_', '\\', '#'];
+    let mut generator = Generator(0x11ce);
+    let string = |generator: &mut Generator, length: usize| {
+        (0..generator.pick(length))
+            .map(|_| alphabet[generator.pick(alphabet.len())])
+            .collect::<String>()
+    };
+    for case in 0..20_000 {
+        let text = string(&mut generator, 9);
+        let mut pattern = string(&mut generator, 7);
+        let escape = [None, Some('\\'), Some('#')][generator.pick(3)];
+        // A pattern cannot end in its escape character.
+        while escape.is_some() && pattern.ends_with(escape.unwrap()) {
+            pattern.pop();
+        }
+        let fold = generator.pick(2) == 1;
+        let chars = |value: &str| value.chars().collect::<Vec<_>>();
+        assert_eq!(
+            crate::query::like_matches(&text, &pattern, escape, fold),
+            like_model(&chars(&text), &chars(&pattern), escape, fold),
+            "case {case}: {text:?} LIKE {pattern:?} ESCAPE {escape:?}, fold {fold}"
+        );
+    }
+}
+
 fn like_truth(value: &Value, pattern: &Value, escape: Option<&Value>, fold: bool) -> Truth {
     let escape = match escape {
         None => Some('\\'),

@@ -2603,7 +2603,12 @@ enum LikeElement {
 
 /// Matches a validated `LIKE` pattern against all of `text`.
 #[cfg(test)]
-fn like_matches(text: &str, pattern: &str, escape: Option<char>, case_insensitive: bool) -> bool {
+pub(crate) fn like_matches(
+    text: &str,
+    pattern: &str,
+    escape: Option<char>,
+    case_insensitive: bool,
+) -> bool {
     LikePattern::new(pattern, escape, case_insensitive).matches(text)
 }
 
@@ -2618,6 +2623,10 @@ fn like_matches(text: &str, pattern: &str, escape: Option<char>, case_insensitiv
 /// the work proportional to the text length times the longest segment, with no backtracking.
 struct LikePattern {
     segments: Vec<Vec<LikeElement>>,
+    /// Each segment's text when it has no `_`, which is matched as bytes. Folding ASCII letters byte
+    /// by byte is exactly `ILIKE`'s folding, and UTF-8 bytes equal to a whole string of characters
+    /// can only begin at a character boundary.
+    literals: Vec<Option<String>>,
     case_insensitive: bool,
 }
 
@@ -2639,8 +2648,21 @@ impl LikePattern {
                 segment.push(LikeElement::Character(character));
             }
         }
+        let literals = segments
+            .iter()
+            .map(|segment| {
+                segment
+                    .iter()
+                    .map(|element| match element {
+                        LikeElement::Character(character) => Some(*character),
+                        LikeElement::AnyCharacter => None,
+                    })
+                    .collect()
+            })
+            .collect();
         Self {
             segments,
+            literals,
             case_insensitive,
         }
     }
@@ -2658,10 +2680,26 @@ impl LikePattern {
 
     fn matches(&self, text: &str) -> bool {
         let case_insensitive = self.case_insensitive;
-        let matches_at = |start: usize, segment: &[LikeElement]| -> Option<usize> {
+        let same = |bytes: &[u8], literal: &str| {
+            if case_insensitive {
+                bytes.eq_ignore_ascii_case(literal.as_bytes())
+            } else {
+                bytes == literal.as_bytes()
+            }
+        };
+        // Where segment `index`, starting at byte `start`, ends.
+        let matches_at = |start: usize, index: usize| -> Option<usize> {
+            if let Some(literal) = &self.literals[index] {
+                let end = start + literal.len();
+                return text
+                    .as_bytes()
+                    .get(start..end)
+                    .is_some_and(|bytes| same(bytes, literal))
+                    .then_some(end);
+            }
             let mut end = start;
             let mut remaining = text[start..].chars();
-            for element in segment {
+            for element in &self.segments[index] {
                 let character = remaining.next()?;
                 if let LikeElement::Character(expected) = element
                     && *expected != character
@@ -2674,34 +2712,42 @@ impl LikePattern {
             Some(end)
         };
 
-        let (first, rest) = self
-            .segments
-            .split_first()
-            .expect("there is always a segment");
-        let Some((last, middle)) = rest.split_last() else {
-            return matches_at(0, first) == Some(text.len());
-        };
-        let Some(mut cursor) = matches_at(0, first) else {
+        let last = self.segments.len() - 1;
+        if last == 0 {
+            return matches_at(0, 0) == Some(text.len());
+        }
+        let Some(mut cursor) = matches_at(0, 0) else {
             return false;
         };
-        for segment in middle.iter().filter(|segment| !segment.is_empty()) {
-            let found = text[cursor..]
-                .char_indices()
-                .map(|(offset, _)| cursor + offset)
-                .find_map(|start| matches_at(start, segment));
+        for index in (1..last).filter(|index| !self.segments[*index].is_empty()) {
+            let found = match &self.literals[index] {
+                Some(literal) if !case_insensitive => text[cursor..]
+                    .find(literal.as_str())
+                    .map(|offset| cursor + offset + literal.len()),
+                Some(literal) => text.as_bytes()[cursor..]
+                    .windows(literal.len())
+                    .position(|bytes| same(bytes, literal))
+                    .map(|offset| cursor + offset + literal.len()),
+                None => text[cursor..]
+                    .char_indices()
+                    .map(|(offset, _)| cursor + offset)
+                    .find_map(|start| matches_at(start, index)),
+            };
             let Some(end) = found else {
                 return false;
             };
             cursor = end;
         }
         // The last segment is anchored to the end of the text, a fixed number of characters back.
-        let start = if last.is_empty() {
-            text.len()
-        } else {
-            match text.char_indices().rev().nth(last.len() - 1) {
+        let start = match &self.literals[last] {
+            Some(literal) => match text.len().checked_sub(literal.len()) {
+                Some(start) => start,
+                None => return false,
+            },
+            None => match text.char_indices().rev().nth(self.segments[last].len() - 1) {
                 Some((start, _)) => start,
                 None => return false,
-            }
+            },
         };
         start >= cursor && matches_at(start, last) == Some(text.len())
     }
