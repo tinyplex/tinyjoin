@@ -2282,6 +2282,13 @@ enum FilterNode<'a> {
         operator: ComparisonOperator,
         value: &'a Value,
     },
+    /// Adjacent comparisons of one column under `AND`, such as a range's two bounds, which read
+    /// the column once.
+    Comparisons {
+        column: usize,
+        name: &'a str,
+        tests: Vec<(ComparisonOperator, &'a Value)>,
+    },
     IsNull {
         column: usize,
         negated: bool,
@@ -2390,7 +2397,48 @@ impl<'a> FilterNode<'a> {
                     },
                 }
             }
-            Predicate::And { predicates } => Self::And(children(predicates)?),
+            Predicate::And { predicates } => {
+                let mut nodes: Vec<Self> = Vec::with_capacity(predicates.len());
+                for node in children(predicates)? {
+                    let Self::Comparison {
+                        column,
+                        name,
+                        operator,
+                        value,
+                    } = node
+                    else {
+                        nodes.push(node);
+                        continue;
+                    };
+                    match nodes.last_mut() {
+                        Some(Self::Comparisons {
+                            column: previous,
+                            tests,
+                            ..
+                        }) if *previous == column => tests.push((operator, value)),
+                        Some(Self::Comparison {
+                            column: previous,
+                            operator: first,
+                            value: bound,
+                            ..
+                        }) if *previous == column => {
+                            let tests = vec![(*first, *bound), (operator, value)];
+                            *nodes.last_mut().expect("matched above") = Self::Comparisons {
+                                column,
+                                name,
+                                tests,
+                            };
+                        }
+                        _ => nodes.push(Self::Comparison {
+                            column,
+                            name,
+                            operator,
+                            value,
+                        }),
+                    }
+                }
+                Self::And(nodes)
+            }
             Predicate::Or { predicates } => Self::Or(children(predicates)?),
             Predicate::Not { predicate } => Self::Not(Box::new(Self::new(predicate, position)?)),
         })
@@ -2404,6 +2452,23 @@ impl<'a> FilterNode<'a> {
                 operator,
                 value,
             } => compare_to_value(&row.column(*column)?, value, *operator, table, name),
+            // The comparisons combine as they would under `AND`, in order.
+            Self::Comparisons {
+                column,
+                name,
+                tests,
+            } => {
+                let actual = row.column(*column)?;
+                let mut unknown = false;
+                for (operator, value) in tests {
+                    match compare_to_value(&actual, value, *operator, table, name)? {
+                        Truth::False => return Ok(Truth::False),
+                        Truth::Unknown => unknown = true,
+                        Truth::True => {}
+                    }
+                }
+                Ok(if unknown { Truth::Unknown } else { Truth::True })
+            }
             Self::IsNull { column, negated } => Ok(if row.column(*column)?.is_null() ^ negated {
                 Truth::True
             } else {
