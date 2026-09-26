@@ -461,7 +461,15 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 .tables
                 .get(table_name)
                 .ok_or_else(|| EngineError::table_not_found(table_name))?;
-            let key = encode_primary_key(&table.schema, &row)?;
+            // A stored row planning held is the row the change's key holds, so its entry's key is
+            // the change's encoded key.
+            let key = match &held {
+                PreviousRow::Read(Some(HeldRow::Stored(entry))) => {
+                    debug_assert_eq!(entry.key(), encode_primary_key(&table.schema, &row)?);
+                    entry.key().to_vec()
+                }
+                _ => encode_primary_key(&table.schema, &row)?,
+            };
             if !is_delete
                 && !duplicate_upserts
                     .entry(table_name.clone())

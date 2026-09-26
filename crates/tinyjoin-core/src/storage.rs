@@ -1133,15 +1133,18 @@ pub(crate) fn estimated_row_bytes(row: &Row) -> Result<usize> {
     Ok(bytes)
 }
 
-/// [`estimated_row_bytes`] for the row a stored record decodes to, reading each column in place.
-/// The decoded row holds every column of its schema, and each value's estimate is the one its
-/// decoded JSON value has.
+/// [`estimated_row_bytes`] for the row a stored record decodes to, reading columns in place. The
+/// decoded row holds every column of its schema. A boolean, number, or NULL is estimated at 16
+/// bytes whatever its value, so only text and JSON values are read.
 pub(crate) fn estimated_record_bytes(record: &StoredRecord<'_>) -> Result<usize> {
     let mut bytes = 32usize;
     for (position, column) in record.schema().columns.iter().enumerate() {
-        let value = record
-            .column(position)?
-            .owned_bytes(|value| estimated_value_bytes_at_depth(value, 1))?;
+        let value = match column.data_type {
+            ColumnType::Text | ColumnType::Json => record
+                .column(position)?
+                .owned_bytes(|value| estimated_value_bytes_at_depth(value, 1))?,
+            ColumnType::Boolean | ColumnType::Integer | ColumnType::Float => 16,
+        };
         bytes = checked_row_write_add(bytes, 64)?;
         bytes = checked_row_write_add(bytes, checked_row_write_mul(column.name.len(), 2)?)?;
         bytes = checked_row_write_add(bytes, checked_row_write_mul(value, 2)?)?;
