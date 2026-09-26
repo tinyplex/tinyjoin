@@ -2284,11 +2284,13 @@ enum FilterNode<'a> {
         value: &'a Value,
     },
     /// Adjacent comparisons of one column under `AND`, such as a range's two bounds, which read
-    /// the column once.
+    /// the column once. When every bound is a number, `bounds` holds them as `f64`, as they
+    /// compare, so a numeric column is compared without converting them for every row.
     Comparisons {
         column: usize,
         name: &'a str,
         tests: Vec<(ComparisonOperator, &'a Value)>,
+        bounds: Vec<(ComparisonOperator, f64)>,
     },
     IsNull {
         column: usize,
@@ -2428,6 +2430,7 @@ impl<'a> FilterNode<'a> {
                                 column,
                                 name,
                                 tests,
+                                bounds: Vec::new(),
                             };
                         }
                         _ => nodes.push(Self::Comparison {
@@ -2438,7 +2441,17 @@ impl<'a> FilterNode<'a> {
                         }),
                     }
                 }
-                Self::And(nodes)
+                for node in &mut nodes {
+                    if let Self::Comparisons { tests, bounds, .. } = node {
+                        *bounds = numeric_bounds(tests);
+                    }
+                }
+                // AND over one node is that node.
+                if nodes.len() == 1 {
+                    nodes.pop().expect("one node")
+                } else {
+                    Self::And(nodes)
+                }
             }
             Predicate::Or { predicates } => Self::Or(children(predicates)?),
             Predicate::Not { predicate } => Self::Not(Box::new(Self::new(predicate, position)?)),
@@ -2458,8 +2471,22 @@ impl<'a> FilterNode<'a> {
                 column,
                 name,
                 tests,
+                bounds,
             } => {
                 let actual = row.column(*column)?;
+                let number = match actual {
+                    ValueRef::Integer(value) => Some(value as f64),
+                    ValueRef::Float(value) => Some(value),
+                    _ => None,
+                };
+                if let Some(left) = number
+                    && !bounds.is_empty()
+                    && let Some(matched) = bounds.iter().try_fold(true, |matched, (op, right)| {
+                        Some(matched && accepts(*op, left.partial_cmp(right)?))
+                    })
+                {
+                    return Ok(if matched { Truth::True } else { Truth::False });
+                }
                 let mut unknown = false;
                 for (operator, value) in tests {
                     match compare_to_value(&actual, value, *operator, table, name)? {
@@ -2542,6 +2569,34 @@ impl<'a> FilterNode<'a> {
                 Truth::Unknown => Truth::Unknown,
             }),
         }
+    }
+}
+
+/// Each bound of a run of comparisons as the `f64` a number compares as, or none unless every bound
+/// is a number.
+fn numeric_bounds(tests: &[(ComparisonOperator, &Value)]) -> Vec<(ComparisonOperator, f64)> {
+    let mut bounds = Vec::with_capacity(tests.len());
+    for (operator, value) in tests {
+        match value {
+            Value::Number(number) => match number.as_f64() {
+                Some(bound) => bounds.push((*operator, bound)),
+                None => return Vec::new(),
+            },
+            _ => return Vec::new(),
+        }
+    }
+    bounds
+}
+
+/// Whether a value ordered as `ordering` against a bound satisfies `operator`.
+fn accepts(operator: ComparisonOperator, ordering: Ordering) -> bool {
+    match operator {
+        ComparisonOperator::Eq => ordering == Ordering::Equal,
+        ComparisonOperator::Neq => ordering != Ordering::Equal,
+        ComparisonOperator::Lt => ordering == Ordering::Less,
+        ComparisonOperator::Lte => ordering != Ordering::Greater,
+        ComparisonOperator::Gt => ordering == Ordering::Greater,
+        ComparisonOperator::Gte => ordering != Ordering::Less,
     }
 }
 
@@ -4298,23 +4353,36 @@ mod tests {
                 &escapes,
                 &operators,
             );
-            if validate_predicate_types(&predicate, &schema, "t").is_err() {
-                continue;
+            // Adjacent comparisons of one column, as a range writes them, combine into one node.
+            let column = &schema.columns[random.below(schema.columns.len())].name;
+            let range = Predicate::And {
+                predicates: (0..2 + random.below(2))
+                    .map(|_| Predicate::Comparison {
+                        column: column.clone(),
+                        operator: random.pick(&operators),
+                        value: random.pick(&parameters),
+                    })
+                    .collect(),
+            };
+            for predicate in [predicate, range] {
+                if validate_predicate_types(&predicate, &schema, "t").is_err() {
+                    continue;
+                }
+                checked += 1;
+                let expected = outcome(matches_predicate(&stored, Some(&predicate), "t"));
+                let filter = Filter::new(Some(&predicate), &schema, "t").unwrap();
+                let map = RowRef::map(&stored, &schema);
+                assert_eq!(
+                    outcome(filter.matches(&map)),
+                    expected,
+                    "{predicate:?} on {stored:?}"
+                );
+                assert_eq!(
+                    outcome(filter.matches(&record)),
+                    expected,
+                    "{predicate:?} on {stored:?}"
+                );
             }
-            checked += 1;
-            let expected = outcome(matches_predicate(&stored, Some(&predicate), "t"));
-            let filter = Filter::new(Some(&predicate), &schema, "t").unwrap();
-            let map = RowRef::map(&stored, &schema);
-            assert_eq!(
-                outcome(filter.matches(&map)),
-                expected,
-                "{predicate:?} on {stored:?}"
-            );
-            assert_eq!(
-                outcome(filter.matches(&record)),
-                expected,
-                "{predicate:?} on {stored:?}"
-            );
         }
         assert!(
             checked > 1_000,
