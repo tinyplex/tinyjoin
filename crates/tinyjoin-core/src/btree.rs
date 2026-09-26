@@ -313,7 +313,7 @@ impl Btree {
             };
             batch.generation = batch.transaction.generation()?;
             let (pieces, level) = match root_page_id {
-                Some(root) => match batch.apply(root, changes, 0, None, None)? {
+                Some(root) => match batch.apply(root, changes, 0, None, None, None)? {
                     None => {
                         return Ok(BtreeBatch {
                             root_page_id,
@@ -325,14 +325,18 @@ impl Btree {
                     Some(applied) => applied,
                 },
                 None => {
-                    let mut entries = Vec::new();
+                    let mut cells = Vec::new();
                     for change in changes {
                         if let Some(value) = change.value {
-                            entries.push(batch.leaf_entry(change.key, value)?);
+                            let value = batch.new_value(change.key, value)?;
+                            cells.push(LeafCell::New {
+                                key: change.key,
+                                value,
+                            });
                         }
                     }
-                    batch.inserted = entries.len();
-                    if entries.is_empty() {
+                    batch.inserted = cells.len();
+                    if cells.is_empty() {
                         return Ok(BtreeBatch {
                             root_page_id: None,
                             hash: None,
@@ -340,7 +344,7 @@ impl Btree {
                             removed: 0,
                         });
                     }
-                    (batch.write_leaves(None, entries, true)?, 0)
+                    (batch.write_leaf_cells(None, None, &cells, true, None)?, 0)
                 }
             };
             let (root_page_id, hash) = batch.root(pieces, level)?;
@@ -874,6 +878,15 @@ enum CellValue<'a> {
     Overflow(OverflowDescriptor),
 }
 
+impl CellValue<'_> {
+    fn encoded_len(&self) -> usize {
+        match self {
+            Self::Inline(value) => value.len(),
+            Self::Overflow(_) => OVERFLOW_DESCRIPTOR_SIZE,
+        }
+    }
+}
+
 /// A reading of one B-tree page that decodes only the cells a reader visits.
 ///
 /// Pages are verified as they enter the page cache, and nodes are fully validated when written
@@ -1013,6 +1026,32 @@ impl<'a> NodeView<'a> {
     /// The number of entries: leaf cells, or an internal node's keyed children.
     fn len(&self) -> usize {
         self.item_count
+    }
+
+    /// The bytes of the leaf cell at `index`, header, key and value.
+    fn leaf_cell_bytes(&self, index: usize) -> Result<&[u8]> {
+        let bytes = &*self.bytes;
+        let offset = self.cell_offset(index)?;
+        let header_end = checked_end(offset, LEAF_CELL_HEADER_SIZE, bytes.len())?;
+        let key_length = read_u16(bytes, offset) as usize;
+        let value_length = read_u32(bytes, offset + 4) as usize;
+        let key_end = checked_end(header_end, key_length, bytes.len())?;
+        Ok(&bytes[offset..checked_end(key_end, value_length, bytes.len())?])
+    }
+
+    /// The fingerprint recorded for the child at `index`, where 0 is the leftmost child.
+    fn child_hash(&self, index: usize) -> Result<u64> {
+        let bytes = &*self.bytes;
+        if index == 0 {
+            return Ok(read_u64(bytes, 40));
+        }
+        let offset = self.cell_offset(index - 1)?;
+        checked_end(offset, INTERNAL_CELL_HEADER_SIZE, bytes.len())?;
+        Ok(read_u64(bytes, offset + 12))
+    }
+
+    fn into_payload(self) -> Vec<u8> {
+        self.bytes.into_owned()
     }
 
     fn cell_offset(&self, index: usize) -> Result<usize> {
@@ -1438,6 +1477,7 @@ impl InternalNode {
 }
 
 impl Node {
+    #[cfg(test)]
     fn leaf(tree_id: TreeId, generation: u64, entries: Vec<LeafEntry>) -> Self {
         Self {
             tree_id,
@@ -1813,9 +1853,17 @@ struct BatchWriter<'t, 'p, D: PageDevice> {
     removed: usize,
 }
 
+/// One entry of a leaf the batch writer writes: a cell kept, byte for byte, from the page it
+/// rewrites, or a new one.
+enum LeafCell<'a> {
+    Kept(usize),
+    New { key: &'a [u8], value: CellValue<'a> },
+}
+
 impl<D: PageDevice> BatchWriter<'_, '_, D> {
-    /// Applies the changes that fall beneath one node. Returns `None` when they leave it as it
-    /// was, and otherwise the pages that replace it, which are none once it is empty.
+    /// Applies the changes that fall beneath one node, whose fingerprint its parent records as
+    /// `hash`, if it has a parent. Returns `None` when they leave it as it was, and otherwise the
+    /// pages that replace it, which are none once it is empty.
     fn apply(
         &mut self,
         page_id: PageId,
@@ -1823,6 +1871,7 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
         depth: usize,
         expected_level: Option<u8>,
         parent_generation: Option<u64>,
+        hash: Option<u64>,
     ) -> Result<Option<(Vec<Piece>, u8)>> {
         let tree_id = self.tree_id;
         if depth >= MAX_TREE_DEPTH {
@@ -1836,152 +1885,238 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
             )));
         }
         let owned = self.transaction.owns_page(page_id);
-        let node = Node::decode_in_place(
-            self.transaction.read_page_in_place(page_id)?,
-            tree_id,
-            self.generation,
-            owned,
-        )?;
+        // A copy, since writing the node's replacements changes the page cache it came from.
+        let node = {
+            let page = self.transaction.read_page_in_place(page_id)?;
+            NodeView::from_payload(
+                page.id,
+                page.page_type,
+                Cow::Owned(page.payload.to_vec()),
+                tree_id,
+                self.generation,
+                owned,
+            )?
+        };
         validate_expected_level(page_id, node.level, expected_level)?;
         validate_child_generation(page_id, node.generation, parent_generation)?;
-        let (level, node_generation) = (node.level, node.generation);
-        let pieces = match node.kind {
-            NodeKind::Leaf(entries) => {
-                self.apply_leaf(page_id, owned, node_generation, entries, changes)?
-            }
-            NodeKind::Internal(internal) => self.apply_internal(
-                page_id,
-                owned,
-                level,
-                node_generation,
-                internal,
-                changes,
-                depth,
-            )?,
+        let level = node.level;
+        let pieces = if node.leaf {
+            self.apply_leaf(page_id, owned, &node, hash, changes)?
+        } else {
+            self.apply_internal(page_id, owned, node, changes, depth)?
         };
         Ok(pieces.map(|pieces| (pieces, level)))
     }
 
+    /// Merges changes into a leaf without decoding its cells: kept cells are copied as they are,
+    /// and the leaf's fingerprint, when its parent gave it, changes by exactly the entries that
+    /// were removed, replaced and added.
     fn apply_leaf(
         &mut self,
         page_id: PageId,
         owned: bool,
-        leaf_generation: u64,
-        entries: Vec<LeafEntry>,
+        node: &NodeView<'_>,
+        hash: Option<u64>,
         changes: &[BatchChange<'_>],
     ) -> Result<Option<Vec<Piece>>> {
-        let first_key = entries.first().map(|entry| entry.key.clone());
-        let appends = entries
-            .last()
-            .is_none_or(|last| changes[0].key > last.key.as_slice())
+        let count = node.len();
+        let appends = (count == 0 || changes[0].key > node.leaf_key(count - 1)?)
             && changes.iter().all(|change| change.value.is_some());
-        let mut merged = Vec::with_capacity(entries.len() + changes.len());
+        let mut cells = Vec::with_capacity(count + changes.len());
+        let mut delta = EMPTY_HASH;
         let mut changed = false;
-        let mut entries = entries.into_iter().peekable();
-        for change in changes {
-            while let Some(entry) = entries.next_if(|entry| entry.key.as_slice() < change.key) {
-                merged.push(entry);
+        let mut index = 0;
+        let mut previous: Option<&[u8]> = None;
+        let mut kept_until = |index: &mut usize, bound: Option<&[u8]>, cells: &mut Vec<_>| {
+            while *index < count {
+                let key = node.leaf_key(*index)?;
+                if bound.is_some_and(|bound| key >= bound) {
+                    break;
+                }
+                if previous.is_some_and(|previous| previous >= key) {
+                    return Err(invalid_btree(storage_diagnostic!(
+                        "B-tree leaf {page_id} keys are not strictly increasing"
+                    )));
+                }
+                previous = Some(key);
+                cells.push(LeafCell::Kept(*index));
+                *index += 1;
             }
-            if let Some(entry) = entries.next_if(|entry| entry.key.as_slice() == change.key) {
+            Ok(())
+        };
+        for change in changes {
+            kept_until(&mut index, Some(change.key), &mut cells)?;
+            let held = match index < count {
+                true => {
+                    let (key, value) = node.leaf_cell(index)?;
+                    (key == change.key).then_some(value)
+                }
+                false => None,
+            };
+            if let Some(held) = held {
+                index += 1;
                 // An upsert of the value an entry already holds inline changes nothing.
-                if let (LeafValue::Inline(held), Some(value)) = (&entry.value, change.value)
-                    && held.as_slice() == value
+                if let (CellValue::Inline(held), Some(value)) = (&held, change.value)
+                    && *held == value
                 {
-                    merged.push(entry);
+                    cells.push(LeafCell::Kept(index - 1));
                     continue;
                 }
-                release_leaf_value(
-                    self.transaction,
-                    self.tree_id,
-                    self.generation,
-                    leaf_generation,
-                    &entry.value,
-                )?;
+                delta = combine(delta, cell_hash(change.key, &held));
+                if let CellValue::Overflow(descriptor) = held {
+                    release_leaf_value(
+                        self.transaction,
+                        self.tree_id,
+                        self.generation,
+                        node.generation,
+                        &LeafValue::Overflow(descriptor),
+                    )?;
+                }
                 changed = true;
                 match change.value {
-                    Some(value) => merged.push(self.leaf_entry(change.key, value)?),
+                    Some(value) => {
+                        let value = self.new_value(change.key, value)?;
+                        delta = combine(delta, cell_hash(change.key, &value));
+                        cells.push(LeafCell::New {
+                            key: change.key,
+                            value,
+                        });
+                    }
                     None => self.removed += 1,
                 }
             } else if let Some(value) = change.value {
                 changed = true;
                 self.inserted += 1;
-                merged.push(self.leaf_entry(change.key, value)?);
+                let value = self.new_value(change.key, value)?;
+                delta = combine(delta, cell_hash(change.key, &value));
+                cells.push(LeafCell::New {
+                    key: change.key,
+                    value,
+                });
             }
         }
-        merged.extend(entries);
+        kept_until(&mut index, None, &mut cells)?;
         if !changed {
             return Ok(None);
         }
-        if merged.is_empty() {
+        if cells.is_empty() {
             release_node_page(self.transaction, page_id, owned)?;
             return Ok(Some(Vec::new()));
         }
-        let first_changed = first_key.as_deref() != Some(merged[0].key.as_slice());
-        let mut pieces = self.write_leaves(Some((page_id, owned)), merged, appends)?;
+        let first_key = match &cells[0] {
+            LeafCell::Kept(index) => node.leaf_key(*index)?,
+            LeafCell::New { key, .. } => key,
+        };
+        let first_changed = count == 0 || first_key != node.leaf_key(0)?;
+        let mut pieces = self.write_leaf_cells(
+            Some((page_id, owned)),
+            Some(node),
+            &cells,
+            appends,
+            hash.map(|hash| combine(hash, delta)),
+        )?;
         if !first_changed {
             pieces[0].first_key = None;
         }
         Ok(Some(pieces))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Applies changes to the children of an internal node. When every child it changed is still
+    /// one page with the same first key, only the node's references to them change, and the node
+    /// is rewritten from its own bytes; otherwise its children are listed and redistributed.
     fn apply_internal(
         &mut self,
         page_id: PageId,
         owned: bool,
-        level: u8,
-        node_generation: u64,
-        internal: InternalNode,
+        node: NodeView<'static>,
         changes: &[BatchChange<'_>],
         depth: usize,
     ) -> Result<Option<Vec<Piece>>> {
-        let mut original = Vec::with_capacity(internal.entries.len() + 1);
-        original.push(Child {
-            separator: None,
-            page_id: internal.leftmost_child,
-            hash: internal.leftmost_child_hash,
-        });
-        original.extend(internal.entries.into_iter().map(|entry| Child {
-            separator: Some(entry.key),
-            page_id: entry.right_child,
-            hash: entry.child_hash,
-        }));
-        // A child takes the changes below the next child's separator.
-        let mut ends = Vec::with_capacity(original.len());
+        let count = node.len() + 1;
+        let mut applied = Vec::new();
         let mut start = 0;
-        for next in original.iter().skip(1) {
-            let separator = next.separator.as_deref().unwrap_or_default();
-            start += changes[start..].partition_point(|change| change.key < separator);
-            ends.push(start);
-        }
-        ends.push(changes.len());
-
-        let mut children = Vec::with_capacity(original.len() + 1);
-        let mut changed = false;
-        let mut start = 0;
-        for (child, end) in original.into_iter().zip(ends) {
-            let taken = &changes[start..end];
-            start = end;
-            if taken.is_empty() {
-                children.push(child);
-                continue;
+        for child in 0..count {
+            // A child takes the changes below the next child's separator.
+            let end = if child + 1 < count {
+                let separator = node.internal_key(child)?;
+                start + changes[start..].partition_point(|change| change.key < separator)
+            } else {
+                changes.len()
+            };
+            if end > start
+                && let Some((pieces, _)) = self.apply(
+                    node.child(child)?,
+                    &changes[start..end],
+                    depth + 1,
+                    Some(node.level - 1),
+                    Some(node.generation),
+                    Some(node.child_hash(child)?),
+                )?
+            {
+                applied.push((child, pieces));
             }
-            let Some((pieces, _)) = self.apply(
-                child.page_id,
-                taken,
-                depth + 1,
-                Some(level - 1),
-                Some(node_generation),
-            )?
-            else {
-                children.push(child);
+            start = end;
+        }
+        if applied.is_empty() {
+            return Ok(None);
+        }
+
+        if applied
+            .iter()
+            .all(|(_, pieces)| pieces.len() == 1 && pieces[0].first_key.is_none())
+        {
+            let mut hash = EMPTY_HASH;
+            for child in 0..count {
+                hash = combine(hash, node.child_hash(child)?);
+            }
+            let mut references = Vec::with_capacity(applied.len());
+            for (child, pieces) in &applied {
+                let piece = &pieces[0];
+                hash = combine(combine(hash, node.child_hash(*child)?), piece.hash);
+                // The leftmost child's reference is in the header; each other's follows its
+                // cell's key length and flags.
+                let at = match child {
+                    0 => 32,
+                    child => node.cell_offset(child - 1)? + 4,
+                };
+                references.push((at, piece.page_id, piece.hash));
+            }
+            let mut payload = node.into_payload();
+            for (at, child_page_id, child_hash) in references {
+                payload[at..at + 8].copy_from_slice(&child_page_id.to_le_bytes());
+                payload[at + 8..at + 16].copy_from_slice(&child_hash.to_le_bytes());
+            }
+            payload[16..24].copy_from_slice(&self.generation.to_le_bytes());
+            let replacing = Some((page_id, owned));
+            let written = self.page_for(0, replacing)?;
+            self.write_payload(written, PageType::BtreeInternal, payload)?;
+            self.release_replaced(replacing)?;
+            return Ok(Some(vec![Piece {
+                first_key: None,
+                page_id: written,
+                hash,
+            }]));
+        }
+
+        let mut applied = applied.into_iter().peekable();
+        let mut children = Vec::with_capacity(count + 1);
+        for child in 0..count {
+            let separator = match child {
+                0 => None,
+                child => Some(node.internal_key(child - 1)?.to_vec()),
+            };
+            let Some((_, pieces)) = applied.next_if(|(index, _)| *index == child) else {
+                children.push(Child {
+                    separator,
+                    page_id: node.child(child)?,
+                    hash: node.child_hash(child)?,
+                });
                 continue;
             };
-            changed = true;
             for (index, piece) in pieces.into_iter().enumerate() {
                 let separator = match piece.first_key {
                     Some(key) => Some(key),
-                    None if index == 0 => child.separator.clone(),
+                    None if index == 0 => separator.clone(),
                     None => return Err(invalid_btree("A divided B-tree page has no first key")),
                 };
                 children.push(Child {
@@ -1991,9 +2126,6 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
                 });
             }
         }
-        if !changed {
-            return Ok(None);
-        }
         if children.is_empty() {
             release_node_page(self.transaction, page_id, owned)?;
             return Ok(Some(Vec::new()));
@@ -2001,52 +2133,119 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
         // The first child is the leftmost. A separator it carries, from a removed child before it
         // or a first key that changed, is the node's new first key.
         let first_key = children[0].separator.take();
-        let mut pieces = self.write_internals(Some((page_id, owned)), level, children)?;
+        let mut pieces = self.write_internals(Some((page_id, owned)), node.level, children)?;
         pieces[0].first_key = first_key;
         Ok(Some(pieces))
     }
 
-    /// A leaf entry for an upserted value, stored in overflow pages when it is large.
-    fn leaf_entry(&mut self, key: &[u8], value: &[u8]) -> Result<LeafEntry> {
-        Ok(LeafEntry {
-            key: key.to_vec(),
-            value: store_leaf_value(self.transaction, self.tree_id, self.generation, key, value)?,
-        })
+    /// The cell value for an upserted value, stored in overflow pages when it is large.
+    fn new_value<'a>(&mut self, key: &[u8], value: &'a [u8]) -> Result<CellValue<'a>> {
+        if value.len() <= MAX_BTREE_INLINE_VALUE_BYTES
+            && key.len() + value.len() <= MAX_BTREE_INLINE_ENTRY_BYTES
+        {
+            return Ok(CellValue::Inline(value));
+        }
+        store_overflow_value(self.transaction, self.tree_id, self.generation, value)
+            .map(CellValue::Overflow)
     }
 
-    /// Writes leaf entries into as many pages as they need, the first in place of `replacing`.
-    /// Every piece reports its first key.
-    fn write_leaves(
+    /// Writes leaf cells into as many pages as they need, the first in place of `replacing`, and
+    /// reports each page with its first key. Kept cells are copied from `source`. When the cells
+    /// fit one page and `hash` is given, it is that page's fingerprint; otherwise each page's is
+    /// computed from its entries.
+    fn write_leaf_cells(
         &mut self,
         replacing: Option<(PageId, bool)>,
-        entries: Vec<LeafEntry>,
+        source: Option<&NodeView<'_>>,
+        cells: &[LeafCell<'_>],
         fill: bool,
+        hash: Option<u64>,
     ) -> Result<Vec<Piece>> {
-        let sizes = entries
-            .iter()
-            .map(|entry| {
-                SLOT_SIZE + LEAF_CELL_HEADER_SIZE + entry.key.len() + entry.value.encoded_len()
-            })
-            .collect::<Vec<_>>();
-        let mut entries = entries.into_iter();
-        let mut pieces = Vec::new();
-        for (index, count) in divide(&sizes, fill)?.into_iter().enumerate() {
-            let entries = entries.by_ref().take(count).collect::<Vec<_>>();
-            let first_key = entries[0].key.clone();
+        let kept = |index: usize| {
+            source
+                .ok_or_else(|| invalid_btree("A kept B-tree cell has no source page"))?
+                .leaf_cell_bytes(index)
+        };
+        let mut sizes = Vec::with_capacity(cells.len());
+        for cell in cells {
+            sizes.push(
+                SLOT_SIZE
+                    + match cell {
+                        LeafCell::Kept(index) => kept(*index)?.len(),
+                        LeafCell::New { key, value } => {
+                            LEAF_CELL_HEADER_SIZE + key.len() + value.encoded_len()
+                        }
+                    },
+            );
+        }
+        let divisions = divide(&sizes, fill)?;
+        let known = hash.filter(|_| divisions.len() == 1);
+        let mut pieces = Vec::with_capacity(divisions.len());
+        let mut start = 0;
+        for (index, count) in divisions.into_iter().enumerate() {
+            let mut payload = vec![0; MAX_PAGE_PAYLOAD_SIZE];
+            let mut free_end = MAX_PAGE_PAYLOAD_SIZE;
+            let mut hash = EMPTY_HASH;
+            let mut first_key = Vec::new();
+            for (slot, cell) in cells[start..start + count].iter().enumerate() {
+                let key = match cell {
+                    LeafCell::Kept(index) => {
+                        let bytes = kept(*index)?;
+                        free_end -= bytes.len();
+                        payload[free_end..free_end + bytes.len()].copy_from_slice(bytes);
+                        let (key, value) = source
+                            .expect("a kept cell was read from its source above")
+                            .leaf_cell(*index)?;
+                        if known.is_none() {
+                            hash = combine(hash, cell_hash(key, &value));
+                        }
+                        key
+                    }
+                    LeafCell::New { key, value } => {
+                        free_end -= LEAF_CELL_HEADER_SIZE + key.len() + value.encoded_len();
+                        write_leaf_cell(&mut payload[free_end..], key, value);
+                        if known.is_none() {
+                            hash = combine(hash, cell_hash(key, value));
+                        }
+                        key
+                    }
+                };
+                if slot == 0 {
+                    first_key = key.to_vec();
+                }
+                let at = NODE_HEADER_SIZE + slot * SLOT_SIZE;
+                payload[at..at + SLOT_SIZE].copy_from_slice(&(free_end as u16).to_le_bytes());
+            }
+            start += count;
+            write_node_header(
+                &mut payload,
+                self.tree_id,
+                self.generation,
+                0,
+                count,
+                free_end,
+                (NO_PAGE_ID, EMPTY_HASH),
+            );
             let page_id = self.page_for(index, replacing)?;
-            let hash = write_node(
-                self.transaction,
-                page_id,
-                &Node::leaf(self.tree_id, self.generation, entries),
-            )?;
+            self.write_payload(page_id, PageType::BtreeLeaf, payload)?;
             pieces.push(Piece {
                 first_key: Some(first_key),
                 page_id,
-                hash,
+                hash: known.unwrap_or(hash),
             });
         }
         self.release_replaced(replacing)?;
         Ok(pieces)
+    }
+
+    fn write_payload(
+        &mut self,
+        page_id: PageId,
+        page_type: PageType,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        self.transaction
+            .write_new_page(&Page::new(page_id, page_type, payload)?)
     }
 
     /// Writes the children of an internal node at `level` into as many pages as they need, the
@@ -2624,6 +2823,7 @@ fn write_node<D: PageDevice>(
     Ok(subtree_hash)
 }
 
+#[cfg(test)]
 fn store_leaf_value<D: PageDevice>(
     transaction: &mut PagerWriteTransaction<'_, D>,
     tree_id: TreeId,
@@ -2636,7 +2836,16 @@ fn store_leaf_value<D: PageDevice>(
     {
         return Ok(LeafValue::Inline(value.to_vec()));
     }
+    store_overflow_value(transaction, tree_id, generation, value).map(LeafValue::Overflow)
+}
 
+/// Writes a value to a chain of overflow pages and returns the descriptor a leaf cell holds.
+fn store_overflow_value<D: PageDevice>(
+    transaction: &mut PagerWriteTransaction<'_, D>,
+    tree_id: TreeId,
+    generation: u64,
+    value: &[u8],
+) -> Result<OverflowDescriptor> {
     let chunk_count = value.len().div_ceil(MAX_OVERFLOW_CHUNK_BYTES);
     if chunk_count == 0 || chunk_count > MAX_OVERFLOW_PAGE_COUNT {
         return Err(limit_error(format!(
@@ -2663,12 +2872,12 @@ fn store_leaf_value<D: PageDevice>(
         };
         transaction.write_new_page(&overflow.encode(page_id)?)?;
     }
-    Ok(LeafValue::Overflow(OverflowDescriptor {
+    Ok(OverflowDescriptor {
         first_page_id: page_ids[0],
         generation,
         total_length: value.len() as u32,
         checksum,
-    }))
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -2888,20 +3097,82 @@ fn encode_internal_cell(entry: &InternalEntry) -> Result<Vec<u8>> {
 /// and overflow representations from the key and value lengths alone, so two databases holding the
 /// same entry always store it the same way and therefore always fingerprint it the same way.
 fn leaf_entry_hash(entry: &LeafEntry) -> u64 {
+    let value = match &entry.value {
+        LeafValue::Inline(value) => CellValue::Inline(value),
+        LeafValue::Overflow(descriptor) => CellValue::Overflow(descriptor.clone()),
+    };
+    cell_hash(&entry.key, &value)
+}
+
+/// Fingerprints one entry, as [`leaf_entry_hash`] does, from its key and the value its cell holds.
+fn cell_hash(key: &[u8], value: &CellValue<'_>) -> u64 {
     let mut hasher = Hasher::new();
-    hasher.write_bytes(&entry.key);
-    match &entry.value {
-        LeafValue::Inline(value) => {
+    hasher.write_bytes(key);
+    match value {
+        CellValue::Inline(value) => {
             hasher.write_u8(0);
             hasher.write_bytes(value);
         }
-        LeafValue::Overflow(descriptor) => {
+        CellValue::Overflow(descriptor) => {
             hasher.write_u8(1);
             hasher.write_u64(u64::from(descriptor.total_length));
             hasher.write_u64(u64::from(descriptor.checksum));
         }
     }
     hasher.finish()
+}
+
+/// Writes a leaf cell holding `key` and `value` at the start of `destination`.
+fn write_leaf_cell(destination: &mut [u8], key: &[u8], value: &CellValue<'_>) {
+    let flags = match value {
+        CellValue::Inline(_) => INLINE_CELL_FLAGS,
+        CellValue::Overflow(_) => OVERFLOW_CELL_FLAGS,
+    };
+    destination[..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+    destination[2..4].copy_from_slice(&flags.to_le_bytes());
+    destination[4..8].copy_from_slice(&(value.encoded_len() as u32).to_le_bytes());
+    let key_end = LEAF_CELL_HEADER_SIZE + key.len();
+    destination[LEAF_CELL_HEADER_SIZE..key_end].copy_from_slice(key);
+    match value {
+        CellValue::Inline(value) => {
+            destination[key_end..key_end + value.len()].copy_from_slice(value);
+        }
+        CellValue::Overflow(descriptor) => {
+            destination[key_end..key_end + 8]
+                .copy_from_slice(&descriptor.first_page_id.to_le_bytes());
+            destination[key_end + 8..key_end + 16]
+                .copy_from_slice(&descriptor.generation.to_le_bytes());
+            destination[key_end + 16..key_end + 20]
+                .copy_from_slice(&descriptor.total_length.to_le_bytes());
+            destination[key_end + 20..key_end + 24]
+                .copy_from_slice(&descriptor.checksum.to_le_bytes());
+        }
+    }
+}
+
+/// Writes a node's header: `count` cells whose area starts at `free_end`, and for an internal
+/// node, its leftmost child and that child's fingerprint.
+fn write_node_header(
+    payload: &mut [u8],
+    tree_id: TreeId,
+    generation: u64,
+    level: u8,
+    count: usize,
+    free_end: usize,
+    (leftmost_child, leftmost_child_hash): (PageId, u64),
+) {
+    payload[..4].copy_from_slice(NODE_MAGIC);
+    payload[4..6].copy_from_slice(&NODE_FORMAT_VERSION.to_le_bytes());
+    payload[6] = level;
+    payload[7] = NODE_FLAGS;
+    payload[8..16].copy_from_slice(&tree_id.to_le_bytes());
+    payload[16..24].copy_from_slice(&generation.to_le_bytes());
+    payload[24..26].copy_from_slice(&(count as u16).to_le_bytes());
+    let free_start = NODE_HEADER_SIZE + count * SLOT_SIZE;
+    payload[26..28].copy_from_slice(&(free_start as u16).to_le_bytes());
+    payload[28..30].copy_from_slice(&(free_end as u16).to_le_bytes());
+    payload[32..40].copy_from_slice(&leftmost_child.to_le_bytes());
+    payload[40..48].copy_from_slice(&leftmost_child_hash.to_le_bytes());
 }
 
 fn decode_leaf_cell(
