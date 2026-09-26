@@ -6,9 +6,10 @@ use serde_json::{Map, Number, Value};
 
 use crate::aggregate::{encode_group_key, group_key_part};
 use crate::query::{
-    ParseMode, Token, bind_parameter, is_distinct_keyword_at, is_reserved_keyword,
-    matches_predicate, pagination_value, parse_predicate_at,
+    Filter, ParseMode, Token, bind_parameter, is_distinct_keyword_at, is_reserved_keyword,
+    pagination_value, parse_predicate_at,
 };
+use crate::row::{Columns, ValueRef};
 use crate::storage::StorageReader;
 use crate::{
     ColumnDefinition, ColumnType, ComparisonOperator, EngineError, NullOrder, OrderDirection,
@@ -204,10 +205,27 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &JoinPlan) -> Result<Qu
     }
     preflight_build_rows(&counts)?;
 
+    // The WHERE clause reads each relation's columns in place, numbered relation by relation.
+    let offsets = relations
+        .iter()
+        .scan(0, |next, relation| {
+            let offset = *next;
+            *next += relation.schema.columns.len();
+            Some(offset)
+        })
+        .collect::<Vec<_>>();
+    let filter = JoinFilter {
+        filter: Filter::resolved(plan.predicate.as_ref(), "joined row", &|column| {
+            let (source, index, _) = resolve_column(&parse_column_ref_text(column), &relations)?;
+            Ok(offsets[source] + index)
+        })?,
+        offsets: &offsets,
+    };
+
     let rows = if plan.order_by.is_empty() {
-        execute_unordered(storage, plan, &relations, &conditions)?
+        execute_unordered(storage, plan, &relations, &conditions, &filter)?
     } else {
-        execute_ordered(storage, plan, &relations, &conditions)?
+        execute_ordered(storage, plan, &relations, &conditions, &filter)?
     };
 
     Ok(QueryResult {
@@ -233,6 +251,7 @@ fn execute_unordered(
     plan: &JoinPlan,
     relations: &[Relation],
     conditions: &[Vec<ResolvedCondition>],
+    filter: &JoinFilter<'_>,
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
     let mut skipped = 0_usize;
@@ -244,7 +263,7 @@ fn execute_unordered(
         relations,
         conditions,
         &mut |bindings, budget| {
-            if !matches_joined_predicate(bindings, plan, relations, budget)?
+            if !filter.matches(bindings, relations)?
                 || !first_distinct_row(&mut seen, bindings, plan, relations, budget)?
             {
                 return Ok(VisitControl::Continue);
@@ -276,6 +295,7 @@ fn execute_ordered(
     plan: &JoinPlan,
     relations: &[Relation],
     conditions: &[Vec<ResolvedCondition>],
+    filter: &JoinFilter<'_>,
 ) -> Result<Vec<Row>> {
     let mut joined_rows = Vec::new();
     let mut seen = HashSet::new();
@@ -287,7 +307,7 @@ fn execute_ordered(
         &mut |bindings, budget| {
             // DISTINCT may keep the first of several equal rows because every ordering key is a
             // projected value, which validation guarantees, so equal rows also sort equally.
-            if !matches_joined_predicate(bindings, plan, relations, budget)?
+            if !filter.matches(bindings, relations)?
                 || !first_distinct_row(&mut seen, bindings, plan, relations, budget)?
             {
                 return Ok(VisitControl::Continue);
@@ -347,8 +367,9 @@ fn visit_joined_rows(
             if build_count > MAX_JOIN_BUILD_ROWS {
                 return Err(build_rows_limit_error());
             }
-            budget.retain(owned_row_bytes(row)?)?;
-            rows.push(row.clone());
+            let row = row.to_row()?;
+            budget.retain(owned_row_bytes(&row)?)?;
+            rows.push(row);
             Ok(VisitControl::Continue)
         })?;
         if outcome != VisitOutcome::Complete {
@@ -366,8 +387,9 @@ fn visit_joined_rows(
             return Ok(VisitControl::Stop);
         }
         count_scanned_row(&mut scanned)?;
+        let probe = probe.to_row()?;
         let mut bindings = [None; MAX_JOIN_SOURCES];
-        bindings[0] = Some(probe);
+        bindings[0] = Some(&probe);
         if visit_extensions(
             storage,
             0,
@@ -492,18 +514,40 @@ fn first_distinct_row(
     Ok(true)
 }
 
-fn matches_joined_predicate(
-    bindings: &[Option<&Row>],
-    plan: &JoinPlan,
-    relations: &[Relation],
-    budget: &WorkBudget,
-) -> Result<bool> {
-    let Some(predicate) = &plan.predicate else {
-        return Ok(true);
-    };
-    budget.ensure_transient(flattened_row_bytes(bindings, relations)?)?;
-    let flattened = flattened_row(bindings, relations);
-    matches_predicate(&flattened, Some(predicate), "joined row")
+/// A join's WHERE clause, and where each relation's columns start in the numbering it uses.
+struct JoinFilter<'a> {
+    filter: Filter<'a>,
+    offsets: &'a [usize],
+}
+
+impl JoinFilter<'_> {
+    fn matches(&self, bindings: &[Option<&Row>], relations: &[Relation]) -> Result<bool> {
+        self.filter.matches(&JoinedRow {
+            bindings,
+            relations,
+            offsets: self.offsets,
+        })
+    }
+}
+
+/// One combination of joined rows, whose columns are numbered relation by relation. A relation
+/// with no row, as in an unmatched `LEFT JOIN`, reads as `NULL`.
+struct JoinedRow<'a> {
+    bindings: &'a [Option<&'a Row>],
+    relations: &'a [Relation],
+    offsets: &'a [usize],
+}
+
+impl Columns for JoinedRow<'_> {
+    fn column(&self, index: usize) -> Result<ValueRef<'_>> {
+        let source = self.offsets.partition_point(|offset| *offset <= index) - 1;
+        let definition = &self.relations[source].schema.columns[index - self.offsets[source]];
+        Ok(self.bindings[source]
+            .and_then(|row| row.get(&definition.name))
+            .map_or(ValueRef::Null, |value| {
+                ValueRef::from_value(value, definition.data_type)
+            }))
+    }
 }
 
 #[derive(Clone)]
@@ -819,40 +863,6 @@ fn compatible_join_types(left: ColumnType, right: ColumnType) -> bool {
         )
 }
 
-fn flattened_row(bindings: &[Option<&Row>], relations: &[Relation]) -> Row {
-    let mut flattened = Map::new();
-    for (source, relation) in relations.iter().enumerate() {
-        for definition in &relation.schema.columns {
-            let value = bindings[source]
-                .and_then(|row| row.get(&definition.name))
-                .cloned()
-                .unwrap_or(Value::Null);
-            flattened.insert(
-                format!("{}.{}", relation.source.alias, definition.name),
-                value.clone(),
-            );
-            if column_is_unique(&definition.name, relations) {
-                flattened.insert(definition.name.clone(), value);
-            }
-        }
-    }
-    flattened
-}
-
-fn column_is_unique(column: &str, relations: &[Relation]) -> bool {
-    relations
-        .iter()
-        .filter(|relation| {
-            relation
-                .schema
-                .columns
-                .iter()
-                .any(|definition| definition.name == column)
-        })
-        .count()
-        == 1
-}
-
 fn project_joined_row(
     bindings: &[Option<&Row>],
     plan: &JoinPlan,
@@ -1000,25 +1010,6 @@ fn projected_row_bytes(
 
 fn ordered_row_bytes(projected_bytes: usize, key_bytes: usize) -> Result<usize> {
     checked_add(checked_add(64, projected_bytes)?, key_bytes)
-}
-
-fn flattened_row_bytes(bindings: &[Option<&Row>], relations: &[Relation]) -> Result<usize> {
-    let mut bytes = 32_usize;
-    for (source, relation) in relations.iter().enumerate() {
-        for definition in &relation.schema.columns {
-            bytes = checked_add(bytes, 128)?;
-            bytes = checked_add(
-                bytes,
-                checked_mul(relation.source.alias.len() + 1 + definition.name.len(), 2)?,
-            )?;
-            bytes = checked_add(bytes, checked_mul(definition.name.len(), 2)?)?;
-            let value = bindings[source]
-                .and_then(|row| row.get(&definition.name))
-                .unwrap_or(&Value::Null);
-            bytes = checked_add(bytes, checked_mul(owned_value_bytes(value)?, 4)?)?;
-        }
-    }
-    Ok(bytes)
 }
 
 fn owned_row_bytes(row: &Row) -> Result<usize> {
@@ -1558,16 +1549,17 @@ mod tests {
         fn visit_table(
             &self,
             table: &str,
-            visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+            visitor: &mut dyn FnMut(&crate::row::RowRef<'_>) -> Result<VisitControl>,
         ) -> Result<VisitOutcome> {
             if matches!(self.fault, ReaderFault::StopRight) && table == "right_items" {
                 return Ok(VisitOutcome::Stopped);
             }
             if matches!(self.fault, ReaderFault::OmitLeftJoinKey) && table == "left_items" {
+                let schema = self.inner.table_schema(table)?;
                 return self.inner.visit_table(table, &mut |row| {
-                    let mut malformed = row.clone();
+                    let mut malformed = row.to_row()?;
                     malformed.remove("k1");
-                    visitor(&malformed)
+                    visitor(&crate::row::RowRef::map(&malformed, &schema))
                 });
             }
             self.inner.visit_table(table, visitor)
@@ -1601,7 +1593,7 @@ mod tests {
             table: &str,
             columns: &[String],
             key: &Row,
-            visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+            visitor: &mut dyn FnMut(&crate::row::RowRef<'_>) -> Result<VisitControl>,
         ) -> Result<Option<VisitOutcome>> {
             self.inner.visit_index(table, columns, key, visitor)
         }

@@ -4,6 +4,7 @@ use std::str::FromStr;
 
 use serde_json::{Map, Number, Value};
 
+use crate::row::{Columns, RowRef, ValueRef};
 use crate::storage::{
     StorageReader, estimated_row_bytes, estimated_value_bytes, validate_json_value,
 };
@@ -149,26 +150,57 @@ fn select_fields(
         .collect()
 }
 
-/// An explicit projection prepared once per query rather than once per row.
+/// An explicit projection resolved once per query rather than once per row: each item's output
+/// name and the schema position of its source column.
 struct Projection<'a> {
-    columns: &'a [SelectColumn],
-    /// Whether each item is the last to read its source column, so that its value can be moved
-    /// out of the owned row instead of cloned.
-    moves: Vec<bool>,
+    items: Vec<(&'a str, usize)>,
 }
 
 impl<'a> Projection<'a> {
-    fn new(columns: Option<&'a [SelectColumn]>) -> Option<Self> {
-        columns.map(|columns| {
-            let mut seen = HashSet::with_capacity(columns.len());
-            let mut moves = columns
-                .iter()
-                .rev()
-                .map(|item| seen.insert(item.column.as_str()))
-                .collect::<Vec<_>>();
-            moves.reverse();
-            Self { columns, moves }
-        })
+    fn new(
+        columns: Option<&'a [SelectColumn]>,
+        schema: &TableDefinition,
+        table: &str,
+    ) -> Result<Option<Self>> {
+        let Some(columns) = columns else {
+            return Ok(None);
+        };
+        let items = columns
+            .iter()
+            .map(|item| {
+                schema
+                    .columns
+                    .iter()
+                    .position(|definition| definition.name == item.column)
+                    .map(|position| (item.output.as_str(), position))
+                    .ok_or_else(|| EngineError::column_not_found(&item.column, table))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Some(Self { items }))
+    }
+
+    /// The estimated bytes of the projected row, computed before building it.
+    fn estimated_bytes(&self, row: &RowRef<'_>) -> Result<usize> {
+        let mut bytes = 32_usize;
+        for (output, column) in &self.items {
+            let value_bytes = row.get(*column)?.owned_bytes(owned_value_bytes)?;
+            bytes = checked_result_add(bytes, 64)?;
+            bytes = checked_result_add(bytes, checked_result_mul(output.len(), 2)?)?;
+            bytes = checked_result_add(bytes, checked_result_mul(value_bytes, 2)?)?;
+        }
+        Ok(bytes)
+    }
+
+    fn project(&self, row: &RowRef<'_>) -> Result<Row> {
+        let mut projected = Map::new();
+        for (output, column) in &self.items {
+            projected.insert((*output).to_owned(), row.get(*column)?.into_value());
+        }
+        Ok(projected)
+    }
+
+    fn project_owned(&self, row: &Row, schema: &TableDefinition) -> Result<Row> {
+        self.project(&RowRef::map(row, schema))
     }
 }
 
@@ -194,10 +226,11 @@ fn execute_unordered(
     let mut skipped_matches = 0_usize;
     let mut result_bytes = 0_usize;
     let mut rows = Vec::new();
-    let projection = Projection::new(plan.columns.as_deref());
+    let filter = Filter::new(plan.predicate.as_ref(), schema, &plan.table)?;
+    let projection = Projection::new(plan.columns.as_deref(), schema, &plan.table)?;
     visit_candidate_rows(storage, plan, schema, &mut |row| {
         count_scanned_row(&mut scanned)?;
-        if !matches_predicate(row, plan.predicate.as_ref(), &plan.table)? {
+        if !filter.matches(row)? {
             return Ok(VisitControl::Continue);
         }
         if skipped_matches < plan.offset {
@@ -207,13 +240,21 @@ fn execute_unordered(
         if rows.len() == MAX_RESULT_ROWS {
             return Err(result_limit_exceeded());
         }
-        let projected_bytes = projected_row_bytes(row, plan.columns.as_deref(), &plan.table)?;
-        let next_result_bytes = checked_result_add(result_bytes, projected_bytes)?;
-        ensure_result_budget(next_result_bytes)?;
-        let clone_peak = checked_result_add(result_bytes, owned_row_bytes(row)?)?;
-        ensure_result_budget(clone_peak)?;
-        rows.push(project_row(row.clone(), projection.as_ref(), &plan.table)?);
-        result_bytes = next_result_bytes;
+        // An explicit projection is charged before it is built, from the columns it reads.
+        let projected = match &projection {
+            Some(projection) => {
+                result_bytes = checked_result_add(result_bytes, projection.estimated_bytes(row)?)?;
+                ensure_result_budget(result_bytes)?;
+                projection.project(row)?
+            }
+            None => {
+                let row = row.to_row()?;
+                result_bytes = checked_result_add(result_bytes, owned_row_bytes(&row)?)?;
+                ensure_result_budget(result_bytes)?;
+                row
+            }
+        };
+        rows.push(projected);
         if plan.limit.is_some_and(|limit| rows.len() == limit) {
             Ok(VisitControl::Stop)
         } else {
@@ -231,9 +272,10 @@ fn execute_ordered(
     let mut scanned = 0_usize;
     let mut ordered_bytes = 0_usize;
     let mut rows = Vec::new();
+    let filter = Filter::new(plan.predicate.as_ref(), schema, &plan.table)?;
     visit_candidate_rows(storage, plan, schema, &mut |row| {
         count_scanned_row(&mut scanned)?;
-        if matches_predicate(row, plan.predicate.as_ref(), &plan.table)? {
+        if filter.matches(row)? {
             if rows.len() == MAX_ORDERED_ROWS {
                 return Err(EngineError::new(
                     "QUERY_WORK_LIMIT_EXCEEDED",
@@ -242,9 +284,10 @@ fn execute_ordered(
                     ),
                 ));
             }
-            let next_ordered_bytes = checked_result_add(ordered_bytes, owned_row_bytes(row)?)?;
+            let row = row.to_row()?;
+            let next_ordered_bytes = checked_result_add(ordered_bytes, owned_row_bytes(&row)?)?;
             ensure_result_budget(next_ordered_bytes)?;
-            rows.push(row.clone());
+            rows.push(row);
             ordered_bytes = next_ordered_bytes;
         }
         Ok(VisitControl::Continue)
@@ -254,7 +297,7 @@ fn execute_ordered(
     let mut remaining_ordered_bytes = ordered_bytes;
     let mut result_bytes = 0_usize;
     let mut projected_rows = Vec::new();
-    let projection = Projection::new(plan.columns.as_deref());
+    let projection = Projection::new(plan.columns.as_deref(), schema, &plan.table)?;
     for (index, row) in rows.into_iter().enumerate() {
         if index >= plan.offset && projected_rows.len() == take {
             break;
@@ -269,14 +312,20 @@ fn execute_ordered(
         if projected_rows.len() == MAX_RESULT_ROWS {
             return Err(result_limit_exceeded());
         }
-        let projected_bytes = projected_row_bytes(&row, plan.columns.as_deref(), &plan.table)?;
+        let projected_bytes = match &projection {
+            Some(projection) => projection.estimated_bytes(&RowRef::map(&row, schema))?,
+            None => row_bytes,
+        };
         let next_result_bytes = checked_result_add(result_bytes, projected_bytes)?;
         ensure_result_budget(next_result_bytes)?;
         ensure_result_budget(checked_result_add(
             remaining_ordered_bytes,
             next_result_bytes,
         )?)?;
-        projected_rows.push(project_row(row, projection.as_ref(), &plan.table)?);
+        projected_rows.push(match &projection {
+            Some(projection) => projection.project_owned(&row, schema)?,
+            None => row,
+        });
         result_bytes = next_result_bytes;
     }
     Ok(projected_rows)
@@ -286,7 +335,7 @@ fn visit_candidate_rows(
     storage: &dyn StorageReader,
     plan: &SelectPlan,
     schema: &crate::TableDefinition,
-    visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+    visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
 ) -> Result<VisitOutcome> {
     visit_predicate_candidates(
         storage,
@@ -306,11 +355,13 @@ pub(crate) fn visit_predicate_candidates(
     table: &str,
     predicate: Option<&Predicate>,
     schema: &crate::TableDefinition,
-    visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+    visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
 ) -> Result<VisitOutcome> {
     if let Some(key) = primary_key_lookup(predicate, schema) {
         return match storage.lookup_primary_key(table, &key)? {
-            Some(row) if visitor(&row)? == VisitControl::Stop => Ok(VisitOutcome::Stopped),
+            Some(row) if visitor(&RowRef::map(&row, schema))? == VisitControl::Stop => {
+                Ok(VisitOutcome::Stopped)
+            }
             _ => Ok(VisitOutcome::Complete),
         };
     }
@@ -364,22 +415,6 @@ fn result_limit_exceeded() -> EngineError {
         "RESULT_LIMIT_EXCEEDED",
         format!("A query cannot return more than {MAX_RESULT_ROWS} rows"),
     )
-}
-
-fn projected_row_bytes(row: &Row, columns: Option<&[SelectColumn]>, table: &str) -> Result<usize> {
-    let Some(columns) = columns else {
-        return owned_row_bytes(row);
-    };
-    let mut bytes = 32_usize;
-    for SelectColumn { column, output } in columns {
-        let value = row
-            .get(column)
-            .ok_or_else(|| EngineError::column_not_found(column, table))?;
-        bytes = checked_result_add(bytes, 64)?;
-        bytes = checked_result_add(bytes, checked_result_mul(output.len(), 2)?)?;
-        bytes = checked_result_add(bytes, checked_result_mul(owned_value_bytes(value)?, 2)?)?;
-    }
-    Ok(bytes)
 }
 
 fn owned_row_bytes(row: &Row) -> Result<usize> {
@@ -1647,6 +1682,9 @@ pub(crate) fn pagination_value(value: &Value, mode: ParseMode) -> Result<usize> 
         .ok_or_else(|| EngineError::invalid_query("LIMIT and OFFSET must be non-negative integers"))
 }
 
+/// Evaluates a predicate over a row held as a map, directly from its SQL form. Executors evaluate
+/// a [`Filter`] instead, and this reference evaluator is kept to check that they agree.
+#[cfg(test)]
 pub(crate) fn matches_predicate(
     row: &Row,
     predicate: Option<&Predicate>,
@@ -1665,6 +1703,7 @@ enum Truth {
     Unknown,
 }
 
+#[cfg(test)]
 fn evaluate_predicate(row: &Row, predicate: &Predicate, table: &str) -> Result<Truth> {
     match predicate {
         Predicate::Comparison {
@@ -1827,6 +1866,262 @@ fn comparison_error(table: &str, column: &str) -> EngineError {
     EngineError::type_mismatch(format!(
         "Values compared with column `{column}` in `{table}` must have compatible scalar types"
     ))
+}
+
+/// A `WHERE` predicate resolved to column positions, for evaluating against rows as storage
+/// presents them.
+///
+/// Column names are resolved and `LIKE` patterns compiled once per statement, and each row decodes
+/// only the columns the predicate reads, without copying text. Tests check that it agrees with the
+/// reference evaluator, `matches_predicate`, on every row.
+pub(crate) struct Filter<'a> {
+    node: Option<FilterNode<'a>>,
+    table: &'a str,
+}
+
+enum FilterNode<'a> {
+    Comparison {
+        column: usize,
+        name: &'a str,
+        operator: ComparisonOperator,
+        value: &'a Value,
+    },
+    IsNull {
+        column: usize,
+        negated: bool,
+    },
+    In {
+        column: usize,
+        name: &'a str,
+        values: &'a [Value],
+    },
+    /// `pattern` is `None` when the pattern or its escape is `NULL`, which leaves every row's
+    /// result unknown.
+    Like {
+        column: usize,
+        pattern: Option<LikePattern>,
+    },
+    And(Vec<FilterNode<'a>>),
+    Or(Vec<FilterNode<'a>>),
+    Not(Box<FilterNode<'a>>),
+}
+
+impl<'a> Filter<'a> {
+    /// Resolves a predicate that has already been validated against `schema`.
+    pub(crate) fn new(
+        predicate: Option<&'a Predicate>,
+        schema: &TableDefinition,
+        table: &'a str,
+    ) -> Result<Self> {
+        Self::resolved(predicate, table, &|column| {
+            schema
+                .columns
+                .iter()
+                .position(|definition| definition.name == column)
+                .ok_or_else(|| EngineError::column_not_found(column, table))
+        })
+    }
+
+    /// Resolves a validated predicate whose columns `position` places. `table` names the rows in
+    /// errors.
+    pub(crate) fn resolved(
+        predicate: Option<&'a Predicate>,
+        table: &'a str,
+        position: &dyn Fn(&str) -> Result<usize>,
+    ) -> Result<Self> {
+        Ok(Self {
+            node: predicate
+                .map(|predicate| FilterNode::new(predicate, position))
+                .transpose()?,
+            table,
+        })
+    }
+
+    pub(crate) fn matches(&self, row: &dyn Columns) -> Result<bool> {
+        match &self.node {
+            None => Ok(true),
+            Some(node) => Ok(node.evaluate(row, self.table)? == Truth::True),
+        }
+    }
+}
+
+impl<'a> FilterNode<'a> {
+    fn new(predicate: &'a Predicate, position: &dyn Fn(&str) -> Result<usize>) -> Result<Self> {
+        let children = |predicates: &'a [Predicate]| {
+            predicates
+                .iter()
+                .map(|predicate| Self::new(predicate, position))
+                .collect::<Result<Vec<_>>>()
+        };
+        Ok(match predicate {
+            Predicate::Comparison {
+                column,
+                operator,
+                value,
+            } => Self::Comparison {
+                column: position(column)?,
+                name: column,
+                operator: *operator,
+                value,
+            },
+            Predicate::IsNull { column, negated } => Self::IsNull {
+                column: position(column)?,
+                negated: *negated,
+            },
+            Predicate::In { column, values } => Self::In {
+                column: position(column)?,
+                name: column,
+                values,
+            },
+            Predicate::Like {
+                column,
+                pattern,
+                escape,
+                case_insensitive,
+            } => {
+                let escape = match escape {
+                    None => Some(Some('\\')),
+                    Some(Value::String(escape)) => Some(escape.chars().next()),
+                    Some(_) => None,
+                };
+                Self::Like {
+                    column: position(column)?,
+                    pattern: match (pattern, escape) {
+                        (Value::String(pattern), Some(escape)) => {
+                            Some(LikePattern::new(pattern, escape, *case_insensitive))
+                        }
+                        _ => None,
+                    },
+                }
+            }
+            Predicate::And { predicates } => Self::And(children(predicates)?),
+            Predicate::Or { predicates } => Self::Or(children(predicates)?),
+            Predicate::Not { predicate } => Self::Not(Box::new(Self::new(predicate, position)?)),
+        })
+    }
+
+    fn evaluate(&self, row: &dyn Columns, table: &str) -> Result<Truth> {
+        match self {
+            Self::Comparison {
+                column,
+                name,
+                operator,
+                value,
+            } => compare_to_value(&row.column(*column)?, value, *operator, table, name),
+            Self::IsNull { column, negated } => Ok(if row.column(*column)?.is_null() ^ negated {
+                Truth::True
+            } else {
+                Truth::False
+            }),
+            Self::In {
+                column,
+                name,
+                values,
+            } => {
+                let actual = row.column(*column)?;
+                let mut unknown = false;
+                for value in *values {
+                    match compare_to_value(&actual, value, ComparisonOperator::Eq, table, name)? {
+                        Truth::True => return Ok(Truth::True),
+                        Truth::Unknown => unknown = true,
+                        Truth::False => {}
+                    }
+                }
+                Ok(if unknown {
+                    Truth::Unknown
+                } else {
+                    Truth::False
+                })
+            }
+            Self::Like { column, pattern } => {
+                let Some(pattern) = pattern else {
+                    return Ok(Truth::Unknown);
+                };
+                let matched = match row.column(*column)? {
+                    ValueRef::Text(text) => pattern.matches(&text),
+                    ValueRef::Json(value) => match value.as_ref() {
+                        Value::String(text) => pattern.matches(text),
+                        // Validation admits only text and NULL operands, so anything else is NULL.
+                        _ => return Ok(Truth::Unknown),
+                    },
+                    _ => return Ok(Truth::Unknown),
+                };
+                Ok(if matched { Truth::True } else { Truth::False })
+            }
+            Self::And(nodes) => {
+                let mut unknown = false;
+                for node in nodes {
+                    match node.evaluate(row, table)? {
+                        Truth::False => return Ok(Truth::False),
+                        Truth::Unknown => unknown = true,
+                        Truth::True => {}
+                    }
+                }
+                Ok(if unknown { Truth::Unknown } else { Truth::True })
+            }
+            Self::Or(nodes) => {
+                let mut unknown = false;
+                for node in nodes {
+                    match node.evaluate(row, table)? {
+                        Truth::True => return Ok(Truth::True),
+                        Truth::Unknown => unknown = true,
+                        Truth::False => {}
+                    }
+                }
+                Ok(if unknown {
+                    Truth::Unknown
+                } else {
+                    Truth::False
+                })
+            }
+            Self::Not(node) => Ok(match node.evaluate(row, table)? {
+                Truth::True => Truth::False,
+                Truth::False => Truth::True,
+                Truth::Unknown => Truth::Unknown,
+            }),
+        }
+    }
+}
+
+/// [`evaluate_comparison`] for a column value read from a row. Numbers compare as `f64`, as they
+/// do there, and values of different kinds are unequal but cannot be ordered.
+fn compare_to_value(
+    left: &ValueRef<'_>,
+    right: &Value,
+    operator: ComparisonOperator,
+    table: &str,
+    column: &str,
+) -> Result<Truth> {
+    let ordering = match (left, right) {
+        (ValueRef::Json(left), right) => {
+            return evaluate_comparison(left, right, operator, table, column);
+        }
+        (ValueRef::Null, _) | (_, Value::Null) => return Ok(Truth::Unknown),
+        (ValueRef::Integer(left), Value::Number(right)) => right
+            .as_f64()
+            .and_then(|right| (*left as f64).partial_cmp(&right)),
+        (ValueRef::Float(left), Value::Number(right)) => {
+            right.as_f64().and_then(|right| left.partial_cmp(&right))
+        }
+        (ValueRef::Text(left), Value::String(right)) => Some(left.as_ref().cmp(right.as_str())),
+        (ValueRef::Boolean(left), Value::Bool(right)) => Some(left.cmp(right)),
+        _ => None,
+    };
+    let matched = match operator {
+        ComparisonOperator::Eq => ordering == Some(Ordering::Equal),
+        ComparisonOperator::Neq => ordering != Some(Ordering::Equal),
+        operator => {
+            let ordering = ordering.ok_or_else(|| comparison_error(table, column))?;
+            match operator {
+                ComparisonOperator::Lt => ordering == Ordering::Less,
+                ComparisonOperator::Lte => ordering != Ordering::Greater,
+                ComparisonOperator::Gt => ordering == Ordering::Greater,
+                ComparisonOperator::Gte => ordering != Ordering::Less,
+                ComparisonOperator::Eq | ComparisonOperator::Neq => unreachable!("handled above"),
+            }
+        }
+    };
+    Ok(if matched { Truth::True } else { Truth::False })
 }
 
 fn sort_rows(rows: &mut [Row], order_by: &[OrderBy], table: &str) -> Result<()> {
@@ -2100,6 +2395,13 @@ enum LikeElement {
 }
 
 /// Matches a validated `LIKE` pattern against all of `text`.
+#[cfg(test)]
+fn like_matches(text: &str, pattern: &str, escape: Option<char>, case_insensitive: bool) -> bool {
+    LikePattern::new(pattern, escape, case_insensitive).matches(text)
+}
+
+/// A validated `LIKE` pattern, split at its unescaped `%` wildcards once so that it can match any
+/// number of texts.
 ///
 /// `ILIKE` folds only ASCII letters, as PostgreSQL does under the C locale. That matches the
 /// code-point collation TinyJoin uses everywhere else and avoids shipping Unicode case tables.
@@ -2107,66 +2409,84 @@ enum LikeElement {
 /// Between unescaped `%` wildcards, each segment matches a fixed number of characters, so taking
 /// the leftmost match of every middle segment always leaves the most room for the rest. That keeps
 /// the work proportional to the text length times the longest segment, with no backtracking.
-fn like_matches(text: &str, pattern: &str, escape: Option<char>, case_insensitive: bool) -> bool {
-    let mut segments = vec![Vec::new()];
-    let mut characters = pattern.chars();
-    while let Some(character) = characters.next() {
-        let segment = segments.last_mut().expect("there is always a segment");
-        if Some(character) == escape {
-            if let Some(escaped) = characters.next() {
-                segment.push(LikeElement::Character(escaped));
+struct LikePattern {
+    segments: Vec<Vec<LikeElement>>,
+    case_insensitive: bool,
+}
+
+impl LikePattern {
+    fn new(pattern: &str, escape: Option<char>, case_insensitive: bool) -> Self {
+        let mut segments = vec![Vec::new()];
+        let mut characters = pattern.chars();
+        while let Some(character) = characters.next() {
+            let segment = segments.last_mut().expect("there is always a segment");
+            if Some(character) == escape {
+                if let Some(escaped) = characters.next() {
+                    segment.push(LikeElement::Character(escaped));
+                }
+            } else if character == '%' {
+                segments.push(Vec::new());
+            } else if character == '_' {
+                segment.push(LikeElement::AnyCharacter);
+            } else {
+                segment.push(LikeElement::Character(character));
             }
-        } else if character == '%' {
-            segments.push(Vec::new());
-        } else if character == '_' {
-            segment.push(LikeElement::AnyCharacter);
-        } else {
-            segment.push(LikeElement::Character(character));
+        }
+        Self {
+            segments,
+            case_insensitive,
         }
     }
-    let matches_at = |start: usize, segment: &[LikeElement]| -> Option<usize> {
-        let mut end = start;
-        let mut remaining = text[start..].chars();
-        for element in segment {
-            let character = remaining.next()?;
-            if let LikeElement::Character(expected) = element
-                && *expected != character
-                && !(case_insensitive && expected.eq_ignore_ascii_case(&character))
-            {
-                return None;
-            }
-            end += character.len_utf8();
-        }
-        Some(end)
-    };
 
-    let (first, rest) = segments.split_first().expect("there is always a segment");
-    let Some((last, middle)) = rest.split_last() else {
-        return matches_at(0, first) == Some(text.len());
-    };
-    let Some(mut cursor) = matches_at(0, first) else {
-        return false;
-    };
-    for segment in middle.iter().filter(|segment| !segment.is_empty()) {
-        let found = text[cursor..]
-            .char_indices()
-            .map(|(offset, _)| cursor + offset)
-            .find_map(|start| matches_at(start, segment));
-        let Some(end) = found else {
+    fn matches(&self, text: &str) -> bool {
+        let case_insensitive = self.case_insensitive;
+        let matches_at = |start: usize, segment: &[LikeElement]| -> Option<usize> {
+            let mut end = start;
+            let mut remaining = text[start..].chars();
+            for element in segment {
+                let character = remaining.next()?;
+                if let LikeElement::Character(expected) = element
+                    && *expected != character
+                    && !(case_insensitive && expected.eq_ignore_ascii_case(&character))
+                {
+                    return None;
+                }
+                end += character.len_utf8();
+            }
+            Some(end)
+        };
+
+        let (first, rest) = self
+            .segments
+            .split_first()
+            .expect("there is always a segment");
+        let Some((last, middle)) = rest.split_last() else {
+            return matches_at(0, first) == Some(text.len());
+        };
+        let Some(mut cursor) = matches_at(0, first) else {
             return false;
         };
-        cursor = end;
-    }
-    // The last segment is anchored to the end of the text, a fixed number of characters back.
-    let start = if last.is_empty() {
-        text.len()
-    } else {
-        match text.char_indices().rev().nth(last.len() - 1) {
-            Some((start, _)) => start,
-            None => return false,
+        for segment in middle.iter().filter(|segment| !segment.is_empty()) {
+            let found = text[cursor..]
+                .char_indices()
+                .map(|(offset, _)| cursor + offset)
+                .find_map(|start| matches_at(start, segment));
+            let Some(end) = found else {
+                return false;
+            };
+            cursor = end;
         }
-    };
-    start >= cursor && matches_at(start, last) == Some(text.len())
+        // The last segment is anchored to the end of the text, a fixed number of characters back.
+        let start = if last.is_empty() {
+            text.len()
+        } else {
+            match text.char_indices().rev().nth(last.len() - 1) {
+                Some((start, _)) => start,
+                None => return false,
+            }
+        };
+        start >= cursor && matches_at(start, last) == Some(text.len())
+    }
 }
 
 fn validate_comparison_value(
@@ -2253,24 +2573,6 @@ fn collect_guaranteed_equalities(predicate: Option<&Predicate>, values: &mut Row
         }
         _ => {}
     }
-}
-
-fn project_row(mut row: Row, projection: Option<&Projection<'_>>, table: &str) -> Result<Row> {
-    let Some(projection) = projection else {
-        return Ok(row);
-    };
-    let mut projected = Map::new();
-    for (SelectColumn { column, output }, moves) in projection.columns.iter().zip(&projection.moves)
-    {
-        let value = if *moves {
-            row.remove(column)
-        } else {
-            row.get(column).cloned()
-        }
-        .ok_or_else(|| EngineError::column_not_found(column, table))?;
-        projected.insert(output.clone(), value);
-    }
-    Ok(projected)
 }
 
 fn unsupported_shape() -> EngineError {
@@ -2389,7 +2691,7 @@ mod tests {
         fn visit_table(
             &self,
             table: &str,
-            visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+            visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
         ) -> Result<VisitOutcome> {
             if table != self.schema.name {
                 return Err(EngineError::table_not_found(table));
@@ -2398,7 +2700,7 @@ mod tests {
                 .chain(self.table_rows.iter())
             {
                 self.table_visits.set(self.table_visits.get() + 1);
-                if visitor(row)? == VisitControl::Stop {
+                if visitor(&RowRef::map(row, &self.schema))? == VisitControl::Stop {
                     return Ok(VisitOutcome::Stopped);
                 }
             }
@@ -2444,7 +2746,7 @@ mod tests {
             table: &str,
             columns: &[String],
             _key: &Row,
-            visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+            visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
         ) -> Result<Option<VisitOutcome>> {
             if table != self.schema.name {
                 return Err(EngineError::table_not_found(table));
@@ -2460,7 +2762,7 @@ mod tests {
             };
             for row in postings {
                 self.index_visits.set(self.index_visits.get() + 1);
-                if visitor(row)? == VisitControl::Stop {
+                if visitor(&RowRef::map(row, &self.schema))? == VisitControl::Stop {
                     return Ok(Some(VisitOutcome::Stopped));
                 }
             }
@@ -3241,6 +3543,237 @@ mod tests {
     }
 
     #[test]
+    fn filters_agree_with_predicate_evaluation_on_maps_and_stored_records() {
+        use crate::paged_codec::{RecordLayout, StoredRecord, encode_primary_key, encode_row};
+
+        struct Random(u64);
+        impl Random {
+            fn below(&mut self, bound: usize) -> usize {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                (self.0 % bound as u64) as usize
+            }
+            fn pick<T: Clone>(&mut self, values: &[T]) -> T {
+                values[self.below(values.len())].clone()
+            }
+        }
+
+        let column = |name: &str, data_type, default| ColumnDefinition {
+            name: name.to_owned(),
+            data_type,
+            nullable: name != "id",
+            default,
+        };
+        let schema = TableDefinition {
+            name: "t".to_owned(),
+            primary_key: vec!["id".to_owned()],
+            columns: vec![
+                column("id", ColumnType::Integer, None),
+                column("b", ColumnType::Boolean, None),
+                column("i", ColumnType::Integer, None),
+                column("f", ColumnType::Float, None),
+                column("s", ColumnType::Text, None),
+                column("j", ColumnType::Json, None),
+                column("d", ColumnType::Integer, Some(json!(7))),
+            ],
+        };
+        let values = [
+            vec![json!(1), json!(-4), json!(9_007_199_254_740_991_i64)],
+            vec![Value::Null, json!(false), json!(true)],
+            vec![
+                Value::Null,
+                json!(-3),
+                json!(0),
+                json!(5),
+                json!(4_294_967_296_i64),
+            ],
+            vec![
+                Value::Null,
+                json!(-1.5),
+                json!(0.0),
+                json!(-0.0),
+                json!(2.0),
+                json!(1e300),
+            ],
+            vec![
+                Value::Null,
+                json!(""),
+                json!("a"),
+                json!("abc"),
+                json!("a%b"),
+                json!("é🦀"),
+                json!("x\u{0}y"),
+            ],
+            vec![
+                Value::Null,
+                json!(1),
+                json!(1.0),
+                json!("a"),
+                json!([]),
+                json!({"k": [1, null]}),
+                json!(true),
+            ],
+            vec![Value::Null, json!(7), json!(3)],
+        ];
+        let parameters = [
+            Value::Null,
+            json!(false),
+            json!(true),
+            json!(-3),
+            json!(0),
+            json!(-0.0),
+            json!(2.0),
+            json!(1.5),
+            json!(5),
+            json!(""),
+            json!("a"),
+            json!("abc"),
+            json!("b"),
+            json!("é🦀"),
+            json!([]),
+            json!({"k": [1, null]}),
+        ];
+        let patterns = [
+            json!("%"),
+            json!("a%"),
+            json!("%b%"),
+            json!("_"),
+            json!("a\\%b"),
+            json!("a#%b"),
+            json!("%🦀"),
+            json!("x_y"),
+            Value::Null,
+        ];
+        let escapes = [None, Some(json!("")), Some(json!("#")), Some(Value::Null)];
+        let operators = [
+            ComparisonOperator::Eq,
+            ComparisonOperator::Neq,
+            ComparisonOperator::Lt,
+            ComparisonOperator::Lte,
+            ComparisonOperator::Gt,
+            ComparisonOperator::Gte,
+        ];
+
+        fn predicate(
+            random: &mut Random,
+            depth: usize,
+            schema: &TableDefinition,
+            parameters: &[Value],
+            patterns: &[Value],
+            escapes: &[Option<Value>],
+            operators: &[ComparisonOperator],
+        ) -> Predicate {
+            let column = schema.columns[random.below(schema.columns.len())]
+                .name
+                .clone();
+            match random.below(if depth == 0 { 4 } else { 7 }) {
+                0 => Predicate::Comparison {
+                    column,
+                    operator: random.pick(operators),
+                    value: random.pick(parameters),
+                },
+                1 => Predicate::IsNull {
+                    column,
+                    negated: random.below(2) == 1,
+                },
+                2 => Predicate::In {
+                    column,
+                    values: (0..random.below(4))
+                        .map(|_| random.pick(parameters))
+                        .collect(),
+                },
+                3 => Predicate::Like {
+                    column: "s".to_owned(),
+                    pattern: random.pick(patterns),
+                    escape: random.pick(escapes),
+                    case_insensitive: random.below(2) == 1,
+                },
+                kind => {
+                    let mut child = || {
+                        predicate(
+                            random,
+                            depth - 1,
+                            schema,
+                            parameters,
+                            patterns,
+                            escapes,
+                            operators,
+                        )
+                    };
+                    match kind {
+                        4 => Predicate::And {
+                            predicates: vec![child(), child()],
+                        },
+                        5 => Predicate::Or {
+                            predicates: vec![child(), child()],
+                        },
+                        _ => Predicate::Not {
+                            predicate: Box::new(child()),
+                        },
+                    }
+                }
+            }
+        }
+
+        let outcome = |result: Result<bool>| result.map_err(|error| error.code);
+        let layout = RecordLayout::new(&schema).unwrap();
+        let mut random = Random(0x2545_f491_4f6c_dd1d);
+        let mut checked = 0;
+        for _ in 0..4_000 {
+            let stored = schema
+                .columns
+                .iter()
+                .zip(&values)
+                .map(|(column, values)| (column.name.clone(), random.pick(values)))
+                .collect::<Row>();
+            let stored = crate::storage::normalize_row(&schema, stored).unwrap();
+            let key = encode_primary_key(&schema, &stored).unwrap();
+            let record = encode_row(&schema, &stored).unwrap();
+            let record =
+                RowRef::record(StoredRecord::new(&schema, &layout, &key, &record).unwrap());
+            assert_eq!(record.to_row().unwrap(), stored);
+            for (index, column) in schema.columns.iter().enumerate() {
+                assert_eq!(
+                    record.get(index).unwrap().into_value(),
+                    stored[&column.name]
+                );
+            }
+
+            let predicate = predicate(
+                &mut random,
+                3,
+                &schema,
+                &parameters,
+                &patterns,
+                &escapes,
+                &operators,
+            );
+            if validate_predicate_types(&predicate, &schema, "t").is_err() {
+                continue;
+            }
+            checked += 1;
+            let expected = outcome(matches_predicate(&stored, Some(&predicate), "t"));
+            let filter = Filter::new(Some(&predicate), &schema, "t").unwrap();
+            let map = RowRef::map(&stored, &schema);
+            assert_eq!(
+                outcome(filter.matches(&map)),
+                expected,
+                "{predicate:?} on {stored:?}"
+            );
+            assert_eq!(
+                outcome(filter.matches(&record)),
+                expected,
+                "{predicate:?} on {stored:?}"
+            );
+        }
+        assert!(
+            checked > 1_000,
+            "only {checked} generated predicates were valid"
+        );
+    }
+
+    #[test]
     fn cumulative_borrowed_results_reject_the_first_row_over_the_byte_budget() {
         let repeated_row = row(json!({
             "id": 1,
@@ -3249,15 +3782,19 @@ mod tests {
             "payload": "x".repeat(128 * 1024),
         }));
         let plan = parse_sql("SELECT payload FROM items", &[]).unwrap();
-        let projected_bytes =
-            projected_row_bytes(&repeated_row, plan.columns.as_deref(), "items").unwrap();
-        let clone_bytes = owned_row_bytes(&repeated_row).unwrap();
-        let accepted_rows = (MAX_QUERY_RESULT_BYTES - clone_bytes) / projected_bytes + 1;
-        assert!((accepted_rows - 1) * projected_bytes + clone_bytes <= MAX_QUERY_RESULT_BYTES);
-        assert!(accepted_rows * projected_bytes + clone_bytes > MAX_QUERY_RESULT_BYTES);
-
-        let mut accepted = VisitorOnlyStorage::new(repeated_row.clone(), accepted_rows);
+        let mut accepted = VisitorOnlyStorage::new(repeated_row.clone(), 0);
         accepted.add_payload_column();
+        // Only the projected column is charged, since the rest of the row is never copied.
+        let projected_bytes = Projection::new(plan.columns.as_deref(), &accepted.schema, "items")
+            .unwrap()
+            .unwrap()
+            .estimated_bytes(&RowRef::map(&repeated_row, &accepted.schema))
+            .unwrap();
+        assert_eq!(projected_bytes, 32 + 64 + 2 * 7 + 2 * (24 + 128 * 1024));
+        let accepted_rows = MAX_QUERY_RESULT_BYTES / projected_bytes;
+        assert!(accepted_rows * projected_bytes <= MAX_QUERY_RESULT_BYTES);
+        assert!((accepted_rows + 1) * projected_bytes > MAX_QUERY_RESULT_BYTES);
+        accepted.repetitions = accepted_rows;
         assert_eq!(execute(&accepted, &plan).unwrap().rows.len(), accepted_rows);
         assert_eq!(accepted.table_visits.get(), accepted_rows);
 

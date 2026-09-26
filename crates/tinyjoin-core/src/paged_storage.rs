@@ -13,12 +13,13 @@ use crate::{
     Result, Row, RowChange, StorageReader, TableDefinition, TreeId, VisitControl, VisitOutcome,
     paged_codec::{
         CATALOG_TREE_ID, CatalogIndexRecord, CatalogKey, CatalogTableRecord, FIRST_USER_TREE_ID,
-        decode_catalog_header_record, decode_catalog_index_record, decode_catalog_key,
-        decode_catalog_table_record, decode_row, decode_row_strictly, encode_primary_key,
+        RecordLayout, StoredRecord, decode_catalog_header_record, decode_catalog_index_record,
+        decode_catalog_key, decode_catalog_table_record, encode_primary_key,
         encode_secondary_index_entry_key, encode_secondary_index_prefix,
         secondary_index_entry_matches_prefix, secondary_index_primary_key,
         secondary_index_primary_key_for_definition,
     },
+    row::RowRef,
     storage::{RowWriteUsage, normalize_row, preflight_row_write_set},
 };
 /// A relational view over the crash-safe paged B-tree store.
@@ -40,12 +41,45 @@ pub(crate) struct PagedStorage<D: PageDevice> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PagedTable {
+    /// The table's columns. [`Self::set_schema`] changes them, keeping `layout` in step.
     pub(crate) schema: TableDefinition,
+    // Shared, since the catalog is copied whenever a statement changes it.
+    layout: Rc<RecordLayout>,
     pub(crate) tree_id: TreeId,
     pub(crate) root_page_id: Option<PageId>,
     pub(crate) row_count: usize,
     /// The fingerprint of every row in this table.
     pub(crate) hash: u64,
+}
+
+impl PagedTable {
+    pub(crate) fn new(
+        schema: TableDefinition,
+        tree_id: TreeId,
+        root_page_id: Option<PageId>,
+        row_count: usize,
+        hash: u64,
+    ) -> Result<Self> {
+        Ok(Self {
+            layout: Rc::new(RecordLayout::new(&schema)?),
+            schema,
+            tree_id,
+            root_page_id,
+            row_count,
+            hash,
+        })
+    }
+
+    pub(crate) fn set_schema(&mut self, schema: TableDefinition) -> Result<()> {
+        self.layout = Rc::new(RecordLayout::new(&schema)?);
+        self.schema = schema;
+        Ok(())
+    }
+
+    /// One of this table's stored entries, read in place.
+    pub(crate) fn record<'a>(&'a self, key: &'a [u8], value: &'a [u8]) -> Result<StoredRecord<'a>> {
+        StoredRecord::new(&self.schema, &self.layout, key, value)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -509,7 +543,7 @@ fn lookup_encoded_primary_key<D: PageDevice>(
         return Ok(None);
     };
     Btree::get(pager, root, table.tree_id, key)?
-        .map(|value| stored_row(&table.schema, key, &value))
+        .map(|value| table.record(key, &value)?.to_row())
         .transpose()
 }
 
@@ -628,7 +662,7 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
     fn visit_table(
         &self,
         table: &str,
-        visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
         self.ensure_ready()?;
         let table = self
@@ -644,7 +678,7 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
             let Some((key, value)) = next else {
                 break;
             };
-            let row = stored_row(&table.schema, key, &value)?;
+            let row = RowRef::record(table.record(key, &value)?);
             if visitor(&row)? == VisitControl::Stop {
                 return Ok(VisitOutcome::Stopped);
             }
@@ -676,7 +710,7 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
             table.tree_id,
             &encoded_key,
         )?
-        .map(|value| stored_row(&table.schema, &encoded_key, &value))
+        .map(|value| table.record(&encoded_key, &value)?.to_row())
         .transpose()
     }
 
@@ -705,7 +739,7 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
         table: &str,
         columns: &[String],
         key: &Row,
-        visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<Option<VisitOutcome>> {
         self.ensure_ready()?;
         let table_data = self
@@ -777,16 +811,7 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
                     index.definition.name
                 ))
             })?;
-            let row = stored_row(&table_data.schema, primary_key, &row_value)?;
-            if encode_secondary_index_entry_key(&table_data.schema, &index.definition, &row)?
-                .as_deref()
-                != Some(entry_key)
-            {
-                return Err(storage_corrupt(format!(
-                    "Secondary index `{}` entry does not match its table row",
-                    index.definition.name
-                )));
-            }
+            let row = RowRef::record(table_data.record(primary_key, &row_value)?);
             if visitor(&row)? == VisitControl::Stop {
                 return Ok(Some(VisitOutcome::Stopped));
             }
@@ -884,13 +909,13 @@ fn load_and_validate_catalog<D: PageDevice>(
                 .map_err(|_| storage_corrupt("A table row count cannot fit in memory"))?;
             Ok((
                 name,
-                PagedTable {
-                    schema: record.schema,
-                    tree_id: record.tree_id,
-                    root_page_id: record.root_page_id,
+                PagedTable::new(
+                    record.schema,
+                    record.tree_id,
+                    record.root_page_id,
                     row_count,
-                    hash: record.hash,
-                },
+                    record.hash,
+                )?,
             ))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
@@ -980,10 +1005,11 @@ fn validate_table_tree<D: PageDevice>(
             )))
         };
     };
+    let layout = RecordLayout::new(&record.schema)?;
     let mut count = 0_u64;
     let mut cursor = Btree::validating_cursor(pager, root, record.tree_id)?;
-    while let Some((key, value)) = cursor.next(pager)? {
-        validated_row(&record.schema, &key, &value)?;
+    while let Some((key, value)) = cursor.next_entry(pager)? {
+        validated_row(&record.schema, &layout, key, &value)?;
         count = count
             .checked_add(1)
             .ok_or_else(|| storage_corrupt("A table row count overflowed"))?;
@@ -1024,6 +1050,7 @@ fn validate_index_tree<D: PageDevice>(
             record.definition.name
         ))
     })?;
+    let layout = RecordLayout::new(&table.schema)?;
     let mut count = 0_u64;
     let mut unique_prefixes = HashSet::new();
     let mut cursor = Btree::validating_cursor(pager, root, record.tree_id)?;
@@ -1047,7 +1074,7 @@ fn validate_index_tree<D: PageDevice>(
                 ))
             })?;
         // Every table row was validated strictly before its indexes are checked.
-        let row = stored_row(&table.schema, primary_key, &row_value)?;
+        let row = StoredRecord::new(&table.schema, &layout, primary_key, &row_value)?.to_row()?;
         let expected = encode_secondary_index_entry_key(&table.schema, &record.definition, &row)?;
         if expected.as_deref() != Some(entry_key.as_slice()) {
             return Err(storage_corrupt(format!(
@@ -1108,10 +1135,11 @@ fn expected_index_entry_count<D: PageDevice>(
     {
         return Ok(table.row_count);
     }
+    let layout = RecordLayout::new(&table.schema)?;
     let mut count = 0_u64;
     let mut cursor = Btree::cursor(pager, root, table.tree_id)?;
-    while let Some((key, value)) = cursor.next(pager)? {
-        let row = stored_row(&table.schema, &key, &value)?;
+    while let Some((key, value)) = cursor.next_entry(pager)? {
+        let row = StoredRecord::new(&table.schema, &layout, key, &value)?.to_row()?;
         if encode_secondary_index_entry_key(&table.schema, definition, &row)?.is_some() {
             count = count
                 .checked_add(1)
@@ -1121,19 +1149,16 @@ fn expected_index_entry_count<D: PageDevice>(
     Ok(count)
 }
 
-/// Decodes a stored row for a read.
-///
-/// Pages are verified as they are loaded, and every row was checked when it was written or when
-/// the database was opened, so reads skip the canonical-encoding and schema checks that
-/// [`validated_row`] makes.
-pub(crate) fn stored_row(schema: &TableDefinition, key: &[u8], value: &[u8]) -> Result<Row> {
-    decode_row(schema, key, value)
-}
-
 /// Decodes a stored row, rejecting any encoding this engine would not have written and any row
-/// that does not match its schema. Opening a database checks every row this way.
-pub(crate) fn validated_row(schema: &TableDefinition, key: &[u8], value: &[u8]) -> Result<Row> {
-    let row = decode_row_strictly(schema, key, value)?;
+/// that does not match its schema. Opening a database checks every row this way. Reads check only
+/// what reading safely requires, since pages are verified as they are loaded.
+pub(crate) fn validated_row(
+    schema: &TableDefinition,
+    layout: &RecordLayout,
+    key: &[u8],
+    value: &[u8],
+) -> Result<Row> {
+    let row = StoredRecord::new(schema, layout, key, value)?.to_row_strictly()?;
     let normalized = normalize_row(schema, row.clone()).map_err(|error| {
         storage_corrupt(format!(
             "Stored row in `{}` does not match its schema: {}",
@@ -1410,7 +1435,7 @@ mod tests {
                     &["state".to_owned(), "rank".to_owned()],
                     &row(json!({"state": "live", "rank": 1})),
                     &mut |row| {
-                        ids.push(row["id"].as_i64().unwrap());
+                        ids.push(row.to_row()?["id"].as_i64().unwrap());
                         Ok(VisitControl::Continue)
                     },
                 )
@@ -1665,7 +1690,7 @@ mod tests {
                 &["category".to_owned(), "label".to_owned()],
                 &row(json!({"category": "same", "label": "present"})),
                 &mut |item| {
-                    matches.push(item.clone());
+                    matches.push(item.to_row()?);
                     Ok(VisitControl::Continue)
                 },
             )

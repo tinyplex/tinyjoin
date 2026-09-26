@@ -1,6 +1,9 @@
+use std::borrow::Cow;
+
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
+use crate::row::ValueRef;
 use crate::{
     ColumnType, EngineError, FIRST_DATA_PAGE_ID, IndexDefinition, MAX_PAGE_COUNT, PageId, Result,
     Row, TableDefinition,
@@ -244,122 +247,283 @@ pub(crate) fn encode_row(schema: &TableDefinition, row: &Row) -> Result<Vec<u8>>
     Ok(record)
 }
 
-/// Decodes a stored table entry for a read: the primary key from its B-tree key, and every other
-/// column from its record, in schema order.
-///
-/// Stored pages are verified as they are loaded, and rows were checked when written or when the
-/// database was opened, so this checks only what reading safely requires. [`decode_row_strictly`]
-/// also rejects every non-canonical encoding.
+/// Decodes a whole stored table entry, as [`StoredRecord::to_row`] does.
+#[cfg(test)]
 pub(crate) fn decode_row(schema: &TableDefinition, key: &[u8], value: &[u8]) -> Result<Row> {
-    decode_entry(schema, key, value, false)
+    StoredRecord::new(schema, &RecordLayout::new(schema)?, key, value)?.to_row()
 }
 
-/// Decodes a stored table entry, rejecting any encoding this engine would not have written.
+/// Decodes a whole stored table entry, as [`StoredRecord::to_row_strictly`] does.
+#[cfg(test)]
 pub(crate) fn decode_row_strictly(
     schema: &TableDefinition,
     key: &[u8],
     value: &[u8],
 ) -> Result<Row> {
-    decode_entry(schema, key, value, true)
+    StoredRecord::new(schema, &RecordLayout::new(schema)?, key, value)?.to_row_strictly()
 }
 
-fn decode_entry(schema: &TableDefinition, key: &[u8], value: &[u8], strict: bool) -> Result<Row> {
-    let mut row = Row::new();
-    let mut offset = 0;
-    for name in &schema.primary_key {
-        let data_type = schema_column_type(schema, name).map_err(as_storage_corruption)?;
-        let end = component_end(key, offset, data_type)?;
-        row.insert(
-            name.clone(),
-            decode_component(&key[offset..end], data_type)?,
-        );
-        offset = end;
+/// Where each of a table's columns lives in its stored entries: in the B-tree key for a
+/// primary-key column, and at a position in the record for any other. It is worked out once for
+/// each version of a table's schema, rather than for every row.
+#[derive(Clone, Debug)]
+pub(crate) struct RecordLayout {
+    /// Each column's place, in schema order.
+    slots: Vec<ColumnSlot>,
+    /// The type of each primary-key component, in key order.
+    key_types: Vec<ColumnType>,
+    /// The schema position of each stored column, in record order.
+    stored: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ColumnSlot {
+    Key(usize),
+    Stored(usize),
+}
+
+impl RecordLayout {
+    pub(crate) fn new(schema: &TableDefinition) -> Result<Self> {
+        let key_types = schema
+            .primary_key
+            .iter()
+            .map(|name| schema_column_type(schema, name).map_err(as_storage_corruption))
+            .collect::<Result<Vec<_>>>()?;
+        let mut slots = Vec::with_capacity(schema.columns.len());
+        let mut stored = Vec::with_capacity(schema.columns.len().saturating_sub(key_types.len()));
+        for (index, column) in schema.columns.iter().enumerate() {
+            match schema
+                .primary_key
+                .iter()
+                .position(|name| *name == column.name)
+            {
+                Some(position) => slots.push(ColumnSlot::Key(position)),
+                None => {
+                    slots.push(ColumnSlot::Stored(stored.len()));
+                    stored.push(index);
+                }
+            }
+        }
+        Ok(Self {
+            slots,
+            key_types,
+            stored,
+        })
     }
-    if offset != key.len() {
-        return Err(storage_corrupt(
-            "A stored row key contains trailing bytes after its primary key",
-        ));
+}
+
+/// A stored table entry read in place. Each column is decoded only when it is read, straight from
+/// the entry's key and record, and a text value borrows its bytes.
+///
+/// Stored pages are verified as they are loaded, and rows were checked when written or when the
+/// database was opened, so a read checks only what reading safely requires: opening a record
+/// checks its header, and reading a column checks that column's bounds and encoding.
+/// [`Self::to_row_strictly`] also rejects every encoding this engine would not have written.
+#[derive(Clone, Copy)]
+pub(crate) struct StoredRecord<'a> {
+    schema: &'a TableDefinition,
+    layout: &'a RecordLayout,
+    key: &'a [u8],
+    value: &'a [u8],
+    count: usize,
+    width: usize,
+    bitmap: &'a [u8],
+    offsets_start: usize,
+    data: &'a [u8],
+}
+
+impl<'a> StoredRecord<'a> {
+    /// Opens an entry of `schema`'s table, whose columns are placed as `layout` says.
+    pub(crate) fn new(
+        schema: &'a TableDefinition,
+        layout: &'a RecordLayout,
+        key: &'a [u8],
+        value: &'a [u8],
+    ) -> Result<Self> {
+        debug_assert_eq!(layout.slots.len(), schema.columns.len());
+        let [flags, count, ..] = *value else {
+            return Err(storage_corrupt("A stored row record is truncated"));
+        };
+        if flags & RECORD_RESERVED != 0 || flags & RECORD_OFFSET_WIDTH == 3 {
+            return Err(storage_version(format!(
+                "Row record flags {flags:#04x} are not supported"
+            )));
+        }
+        let count = count as usize;
+        if count > layout.stored.len() {
+            return Err(storage_corrupt(
+                "A stored row record has more columns than its table",
+            ));
+        }
+        let width = 1 << (flags & RECORD_OFFSET_WIDTH);
+        let bitmap_bytes = if flags & RECORD_HAS_NULLS != 0 {
+            count.div_ceil(8)
+        } else {
+            0
+        };
+        let offsets_start = RECORD_HEADER_BYTES + bitmap_bytes;
+        let data_start = offsets_start + count.saturating_sub(1) * width;
+        if data_start > value.len() {
+            return Err(storage_corrupt("A stored row record is truncated"));
+        }
+        Ok(Self {
+            schema,
+            layout,
+            key,
+            value,
+            count,
+            width,
+            bitmap: &value[RECORD_HEADER_BYTES..offsets_start],
+            offsets_start,
+            data: &value[data_start..],
+        })
     }
 
-    let [flags, count, ..] = *value else {
-        return Err(storage_corrupt("A stored row record is truncated"));
-    };
-    if flags & RECORD_RESERVED != 0 || flags & RECORD_OFFSET_WIDTH == 3 {
-        return Err(storage_version(format!(
-            "Row record flags {flags:#04x} are not supported"
-        )));
+    /// The entry's B-tree key, which is its encoded primary key.
+    pub(crate) fn key(&self) -> &'a [u8] {
+        self.key
     }
-    let stored = stored_columns(schema);
-    let count = count as usize;
-    if count > stored.len() {
-        return Err(storage_corrupt(
-            "A stored row record has more columns than its table",
-        ));
-    }
-    let width = 1 << (flags & RECORD_OFFSET_WIDTH);
-    let bitmap_bytes = if flags & RECORD_HAS_NULLS != 0 {
-        count.div_ceil(8)
-    } else {
-        0
-    };
-    let offsets_start = RECORD_HEADER_BYTES + bitmap_bytes;
-    let data_start = offsets_start + count.saturating_sub(1) * width;
-    if data_start > value.len() {
-        return Err(storage_corrupt("A stored row record is truncated"));
-    }
-    let bitmap = &value[RECORD_HEADER_BYTES..offsets_start];
-    let data = &value[data_start..];
-    let mut start = 0;
-    for (index, column) in stored.iter().enumerate() {
-        if index >= count {
-            row.insert(column.name.clone(), stored_default(column));
-            continue;
+
+    /// The value of the column at `index`, in schema order.
+    pub(crate) fn column(&self, index: usize) -> Result<ValueRef<'a>> {
+        match self.layout.slots.get(index) {
+            Some(ColumnSlot::Key(position)) => self.key_component(*position),
+            Some(ColumnSlot::Stored(position)) => {
+                self.stored_column(*position, &self.schema.columns[index])
+            }
+            None => Err(codec_argument(format!(
+                "Table `{}` has no column {index}",
+                self.schema.name
+            ))),
         }
-        let end = if index + 1 == count {
-            data.len()
+    }
+
+    /// Decodes every column, the primary key from the key and the rest from the record.
+    pub(crate) fn to_row(self) -> Result<Row> {
+        self.decode(false)
+    }
+
+    /// Decodes every column, rejecting any encoding this engine would not have written.
+    pub(crate) fn to_row_strictly(self) -> Result<Row> {
+        self.decode(true)
+    }
+
+    fn decode(&self, strict: bool) -> Result<Row> {
+        let mut row = Row::new();
+        let mut offset = 0;
+        for (name, data_type) in self.schema.primary_key.iter().zip(&self.layout.key_types) {
+            let end = component_end(self.key, offset, *data_type)?;
+            row.insert(
+                name.clone(),
+                decode_component(&self.key[offset..end], *data_type)?.into_value(),
+            );
+            offset = end;
+        }
+        if offset != self.key.len() {
+            return Err(storage_corrupt(
+                "A stored row key contains trailing bytes after its primary key",
+            ));
+        }
+        self.decode_columns(&mut row, strict)?;
+        Ok(row)
+    }
+
+    fn key_component(&self, position: usize) -> Result<ValueRef<'a>> {
+        let mut start = 0;
+        for data_type in &self.layout.key_types[..position] {
+            start = component_end(self.key, start, *data_type)?;
+        }
+        let data_type = self.layout.key_types[position];
+        let end = component_end(self.key, start, data_type)?;
+        decode_component(&self.key[start..end], data_type)
+    }
+
+    fn stored_column(
+        &self,
+        position: usize,
+        column: &'a crate::ColumnDefinition,
+    ) -> Result<ValueRef<'a>> {
+        if position >= self.count {
+            return Ok(stored_default(column));
+        }
+        let start = if position == 0 {
+            0
         } else {
-            let at = offsets_start + index * width;
-            let mut bytes = [0; 4];
-            bytes[..width].copy_from_slice(&value[at..at + width]);
-            u32::from_le_bytes(bytes) as usize
+            self.end(position - 1)
         };
-        if end < start || end > data.len() {
+        let end = self.end(position);
+        if end < start || end > self.data.len() {
             return Err(storage_corrupt(
                 "A stored row record has invalid column offsets",
             ));
         }
-        let bytes = &data[start..end];
-        start = end;
-        let null = bitmap
-            .get(index / 8)
-            .is_some_and(|byte| byte & (1 << (index % 8)) != 0);
-        let decoded = if null {
-            if !bytes.is_empty() {
-                return Err(storage_corrupt("A stored NULL column has a value"));
-            }
-            Value::Null
-        } else {
-            decode_value(column.data_type, bytes, strict)?
-        };
-        row.insert(column.name.clone(), decoded);
+        let bytes = &self.data[start..end];
+        if self.is_null(position) {
+            return if bytes.is_empty() {
+                Ok(ValueRef::Null)
+            } else {
+                Err(storage_corrupt("A stored NULL column has a value"))
+            };
+        }
+        decode_value(column.data_type, bytes, false)
     }
 
-    if strict {
-        let largest_offset = if count >= 2 {
-            let at = offsets_start + (count - 2) * width;
-            let mut bytes = [0; 4];
-            bytes[..width].copy_from_slice(&value[at..at + width]);
-            u32::from_le_bytes(bytes) as usize
-        } else {
-            0
-        };
-        let bit = |index: usize| {
-            bitmap
-                .get(index / 8)
-                .is_some_and(|byte| byte & (1 << (index % 8)) != 0)
-        };
-        let has_nulls = (0..count).any(bit);
-        let unused_bits = (count..bitmap.len() * 8).any(bit);
+    /// Where the stored column at `position` ends within the data.
+    fn end(&self, position: usize) -> usize {
+        if position + 1 == self.count {
+            return self.data.len();
+        }
+        let at = self.offsets_start + position * self.width;
+        let mut bytes = [0; 4];
+        bytes[..self.width].copy_from_slice(&self.value[at..at + self.width]);
+        u32::from_le_bytes(bytes) as usize
+    }
+
+    fn is_null(&self, position: usize) -> bool {
+        self.bitmap
+            .get(position / 8)
+            .is_some_and(|byte| byte & (1 << (position % 8)) != 0)
+    }
+
+    fn decode_columns(&self, row: &mut Row, strict: bool) -> Result<()> {
+        let schema = self.schema;
+        let mut start = 0;
+        for (position, index) in self.layout.stored.iter().enumerate() {
+            let column = &schema.columns[*index];
+            if position >= self.count {
+                row.insert(column.name.clone(), stored_default(column).into_value());
+                continue;
+            }
+            let end = self.end(position);
+            if end < start || end > self.data.len() {
+                return Err(storage_corrupt(
+                    "A stored row record has invalid column offsets",
+                ));
+            }
+            let bytes = &self.data[start..end];
+            start = end;
+            let decoded = if self.is_null(position) {
+                if !bytes.is_empty() {
+                    return Err(storage_corrupt("A stored NULL column has a value"));
+                }
+                Value::Null
+            } else {
+                decode_value(column.data_type, bytes, strict)?.into_value()
+            };
+            row.insert(column.name.clone(), decoded);
+        }
+        if strict {
+            self.check_canonical(row)?;
+        }
+        Ok(())
+    }
+
+    fn check_canonical(&self, row: &Row) -> Result<()> {
+        let count = self.count;
+        let flags = self.value[0];
+        let largest_offset = if count >= 2 { self.end(count - 2) } else { 0 };
+        let has_nulls = (0..count).any(|position| self.is_null(position));
+        let unused_bits = (count..self.bitmap.len() * 8).any(|position| self.is_null(position));
         if offset_width(largest_offset).0 != flags & RECORD_OFFSET_WIDTH
             || (flags & RECORD_HAS_NULLS != 0) != has_nulls
             || unused_bits
@@ -367,7 +531,8 @@ fn decode_entry(schema: &TableDefinition, key: &[u8], value: &[u8], strict: bool
             return Err(storage_corrupt("A stored row record is not canonical"));
         }
         if count > 0 {
-            let column = stored[count - 1];
+            let schema = self.schema;
+            let column = &schema.columns[self.layout.stored[count - 1]];
             let mut last = Vec::new();
             let last_value = match row.get(&column.name) {
                 Some(value) if !value.is_null() => {
@@ -383,8 +548,8 @@ fn decode_entry(schema: &TableDefinition, key: &[u8], value: &[u8], strict: bool
                 ));
             }
         }
+        Ok(())
     }
-    Ok(row)
 }
 
 /// A table's non-key columns, in schema order: the columns a row record stores.
@@ -398,11 +563,14 @@ fn stored_columns(schema: &TableDefinition) -> Vec<&crate::ColumnDefinition> {
 
 /// The value a row holds for a column its record omits: the column's default, normalized as it
 /// would be if it had been stored.
-fn stored_default(column: &crate::ColumnDefinition) -> Value {
+fn stored_default(column: &crate::ColumnDefinition) -> ValueRef<'_> {
     match &column.default {
-        None => Value::Null,
-        Some(value) if column.data_type == ColumnType::Float => crate::storage::float_value(value),
-        Some(value) => value.clone(),
+        None => ValueRef::Null,
+        Some(value) if column.data_type == ColumnType::Float => value.as_f64().map_or_else(
+            || ValueRef::from_value(value, ColumnType::Float),
+            ValueRef::Float,
+        ),
+        Some(value) => ValueRef::from_value(value, column.data_type),
     }
 }
 
@@ -489,11 +657,11 @@ fn integer_length(value: i64) -> usize {
         .expect("eight bytes hold every integer")
 }
 
-fn decode_value(data_type: ColumnType, bytes: &[u8], strict: bool) -> Result<Value> {
+fn decode_value(data_type: ColumnType, bytes: &[u8], strict: bool) -> Result<ValueRef<'_>> {
     let value = match data_type {
         ColumnType::Boolean => match bytes {
-            [0] => Value::Bool(false),
-            [1] => Value::Bool(true),
+            [0] => ValueRef::Boolean(false),
+            [1] => ValueRef::Boolean(true),
             _ => return Err(storage_corrupt("A stored boolean is not canonical")),
         },
         ColumnType::Integer => {
@@ -513,23 +681,28 @@ fn decode_value(data_type: ColumnType, bytes: &[u8], strict: bool) -> Result<Val
             {
                 return Err(storage_corrupt("A stored integer is not canonical"));
             }
-            Value::from(value)
+            ValueRef::Integer(value)
         }
         ColumnType::Float => {
             let bytes = <[u8; 8]>::try_from(bytes)
                 .map_err(|_| storage_corrupt("A stored float is not eight bytes"))?;
-            serde_json::Number::from_f64(f64::from_le_bytes(bytes))
-                .map(Value::Number)
-                .ok_or_else(|| storage_corrupt("A stored float is not finite"))?
+            let value = f64::from_le_bytes(bytes);
+            if !value.is_finite() {
+                return Err(storage_corrupt("A stored float is not finite"));
+            }
+            ValueRef::Float(value)
         }
-        ColumnType::Text => Value::String(
-            std::str::from_utf8(bytes)
-                .map_err(|_| storage_corrupt("A stored text value is not valid UTF-8"))?
-                .to_owned(),
-        ),
-        ColumnType::Json if strict => decode_canonical_json(bytes, "JSON column")?,
-        ColumnType::Json => serde_json::from_slice(bytes)
-            .map_err(|error| storage_corrupt(format!("A stored JSON value is invalid: {error}")))?,
+        ColumnType::Text => {
+            ValueRef::Text(Cow::Borrowed(std::str::from_utf8(bytes).map_err(|_| {
+                storage_corrupt("A stored text value is not valid UTF-8")
+            })?))
+        }
+        ColumnType::Json if strict => {
+            ValueRef::Json(Cow::Owned(decode_canonical_json(bytes, "JSON column")?))
+        }
+        ColumnType::Json => ValueRef::Json(Cow::Owned(serde_json::from_slice(bytes).map_err(
+            |error| storage_corrupt(format!("A stored JSON value is invalid: {error}")),
+        )?)),
     };
     Ok(value)
 }
@@ -837,8 +1010,9 @@ fn component_end(key: &[u8], offset: usize, data_type: ColumnType) -> Result<usi
     }
 }
 
-/// Decodes one complete key component, rejecting any encoding the encoder would not produce.
-fn decode_component(bytes: &[u8], data_type: ColumnType) -> Result<Value> {
+/// Decodes one complete key component, rejecting any encoding the encoder would not produce. Text
+/// borrows the key's bytes unless it contains an escaped zero.
+fn decode_component(bytes: &[u8], data_type: ColumnType) -> Result<ValueRef<'_>> {
     let sortable = || {
         <[u8; 8]>::try_from(bytes)
             .map(u64::from_be_bytes)
@@ -846,8 +1020,8 @@ fn decode_component(bytes: &[u8], data_type: ColumnType) -> Result<Value> {
     };
     match data_type {
         ColumnType::Boolean => match bytes {
-            [0] => Ok(Value::Bool(false)),
-            [1] => Ok(Value::Bool(true)),
+            [0] => Ok(ValueRef::Boolean(false)),
+            [1] => Ok(ValueRef::Boolean(true)),
             _ => Err(storage_corrupt("A boolean key component is not canonical")),
         },
         ColumnType::Integer => {
@@ -855,7 +1029,7 @@ fn decode_component(bytes: &[u8], data_type: ColumnType) -> Result<Value> {
             if value.unsigned_abs() > MAX_SAFE_INTEGER {
                 return Err(storage_corrupt("An integer key component is out of range"));
             }
-            Ok(Value::from(value))
+            Ok(ValueRef::Integer(value))
         }
         ColumnType::Float => {
             if !valid_encoded_float_component(bytes) {
@@ -867,12 +1041,16 @@ fn decode_component(bytes: &[u8], data_type: ColumnType) -> Result<Value> {
             } else {
                 !sortable
             };
-            serde_json::Number::from_f64(f64::from_bits(bits))
-                .map(Value::Number)
-                .ok_or_else(|| storage_corrupt("A float key component is not finite"))
+            Ok(ValueRef::Float(f64::from_bits(bits)))
         }
         ColumnType::Text => {
             let payload = &bytes[..bytes.len() - 2];
+            let invalid = || storage_corrupt("A text key component is not valid UTF-8");
+            if !payload.contains(&0) {
+                return std::str::from_utf8(payload)
+                    .map(|text| ValueRef::Text(Cow::Borrowed(text)))
+                    .map_err(|_| invalid());
+            }
             let mut text = Vec::with_capacity(payload.len());
             let mut escaped = false;
             for byte in payload {
@@ -884,8 +1062,8 @@ fn decode_component(bytes: &[u8], data_type: ColumnType) -> Result<Value> {
                 }
             }
             String::from_utf8(text)
-                .map(Value::String)
-                .map_err(|_| storage_corrupt("A text key component is not valid UTF-8"))
+                .map(|text| ValueRef::Text(Cow::Owned(text)))
+                .map_err(|_| invalid())
         }
         ColumnType::Json => Err(storage_corrupt("A storage key cannot contain JSON")),
     }
@@ -1794,6 +1972,62 @@ mod tests {
             let key = encode_primary_key(&schema, &row).unwrap();
             assert_eq!(decode_row_strictly(&schema, &key, &record).unwrap(), row);
         }
+    }
+
+    #[test]
+    fn stored_records_read_each_column_as_the_whole_row_decodes_it() {
+        // Key columns come first in the key but not in the schema, and text keys escape zeros.
+        let schema = typed_schema(
+            vec!["name", "at"],
+            vec![
+                ("count", ColumnType::Integer),
+                ("at", ColumnType::Float),
+                ("label", ColumnType::Text),
+                ("name", ColumnType::Text),
+                ("flag", ColumnType::Boolean),
+            ],
+        );
+        let layout = RecordLayout::new(&schema).unwrap();
+        for stored in [
+            row(json!({"name": "", "at": 0.0, "count": 0, "label": "", "flag": false})),
+            row(json!({"name": "a\u{0}b", "at": -2.5, "count": -1, "label": "x", "flag": true})),
+            row(json!({"name": "\u{0}", "at": 1e300, "count": 1, "label": "é🦀", "flag": false})),
+        ] {
+            let key = encode_primary_key(&schema, &stored).unwrap();
+            let record = encode_row(&schema, &stored).unwrap();
+            let entry = StoredRecord::new(&schema, &layout, &key, &record).unwrap();
+            assert_eq!(entry.to_row().unwrap(), stored);
+            for (index, column) in schema.columns.iter().enumerate() {
+                assert_eq!(
+                    entry.column(index).unwrap().into_value(),
+                    stored[&column.name]
+                );
+            }
+            // Text borrows the entry's bytes unless its key form escapes a zero.
+            let name = schema
+                .columns
+                .iter()
+                .position(|column| column.name == "name");
+            let borrowed = matches!(
+                entry.column(name.unwrap()).unwrap(),
+                ValueRef::Text(Cow::Borrowed(_))
+            );
+            assert_eq!(borrowed, !stored["name"].as_str().unwrap().contains('\0'));
+        }
+        assert_eq!(
+            StoredRecord::new(&schema, &layout, &[], &[0x00])
+                .map(|_| ())
+                .unwrap_err()
+                .code,
+            "PAGED_STORAGE_CORRUPT"
+        );
+        assert_eq!(
+            StoredRecord::new(&schema, &layout, &[], &[0x08, 0])
+                .map(|_| ())
+                .unwrap_err()
+                .code,
+            "PAGED_STORAGE_VERSION_UNSUPPORTED"
+        );
     }
 
     #[test]

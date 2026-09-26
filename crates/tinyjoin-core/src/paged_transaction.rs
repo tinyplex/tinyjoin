@@ -8,6 +8,7 @@ use crate::{
     TableDefinition, VisitControl, VisitOutcome,
     paged_codec::encode_primary_key,
     paged_storage::{AppendWriteContext, PagedWriteUsage, UniquePrefixes},
+    row::RowRef,
     storage::estimated_row_bytes,
 };
 
@@ -415,7 +416,7 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
     fn visit_table(
         &self,
         table: &str,
-        visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
         self.ensure_base_revision()?;
         let Some(transaction) = self.transaction else {
@@ -428,10 +429,10 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
         let schema = self.storage.table_schema(table)?;
         let outcome = self.storage.visit_table(table, &mut |row| {
             self.charge_work(1)?;
-            let encoded_key = encode_primary_key(&schema, row)?;
-            if entries
-                .and_then(|entries| entries.get(&encoded_key))
-                .is_some_and(|entry| entry.base != entry.next)
+            if let Some(entries) = entries
+                && entries
+                    .get(row.encoded_key()?.as_ref())
+                    .is_some_and(|entry| entry.base != entry.next)
             {
                 return Ok(VisitControl::Continue);
             }
@@ -447,7 +448,7 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
                     continue;
                 }
                 if let Some(row) = &entry.next
-                    && visitor(row)? == VisitControl::Stop
+                    && visitor(&RowRef::map(row, &schema))? == VisitControl::Stop
                 {
                     return Ok(VisitOutcome::Stopped);
                 }
@@ -515,7 +516,7 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
         table: &str,
         columns: &[String],
         key: &Row,
-        visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<Option<VisitOutcome>> {
         self.ensure_base_revision()?;
         if self.transaction.is_some() {

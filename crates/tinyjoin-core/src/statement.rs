@@ -6,10 +6,11 @@ use serde_json::{Map, Number, Value};
 #[cfg(test)]
 use crate::StorageDriver;
 use crate::query::{
-    ParseMode, Token, bind_parameter, is_reserved_keyword, matches_predicate, parse_predicate_at,
+    Filter, ParseMode, Token, bind_parameter, is_reserved_keyword, parse_predicate_at,
     primary_key_lookup, tokenize, validate_named_columns, validate_parameter_expansion,
     validate_predicate_columns, validate_predicate_types, validate_sql_input,
 };
+use crate::row::RowRef;
 use crate::storage::{
     estimated_row_bytes, estimated_value_bytes, normalize_row, row_key, schema_with_added_column,
     validate_index_columns_for_schema, validate_index_definition_shape,
@@ -1004,7 +1005,7 @@ impl ConflictIndex {
                     &self.definition.columns,
                     &lookup,
                     &mut |row| {
-                        rows.push(row.clone());
+                        rows.push(row.to_row()?);
                         Ok(VisitControl::Continue)
                     },
                 )?
@@ -1043,8 +1044,9 @@ impl ConflictIndex {
                     "A data-modification statement cannot scan more than {MAX_DML_SCAN_ROWS} rows"
                 )));
             }
-            if let Some(index_key) = conflict_key(schema, &self.definition.columns, row)? {
-                let primary_key = primary_key_row(schema, row)?;
+            let row = row.to_row()?;
+            if let Some(index_key) = conflict_key(schema, &self.definition.columns, &row)? {
+                let primary_key = primary_key_row(schema, &row)?;
                 *work_bytes = checked_dml_add(
                     *work_bytes,
                     checked_dml_add(
@@ -1130,6 +1132,7 @@ fn plan_update(
     let mut scanned = 0usize;
     let mut work_bytes = 0usize;
     let mut result_bytes = 0usize;
+    let filter = Filter::new(predicate, &schema, table)?;
     let visit_outcome = visit_dml_candidates(storage, &schema, predicate, &mut |row| {
         scanned = scanned.saturating_add(1);
         if scanned > MAX_DML_SCAN_ROWS {
@@ -1137,7 +1140,7 @@ fn plan_update(
                 "A data-modification statement cannot scan more than {MAX_DML_SCAN_ROWS} rows"
             )));
         }
-        if !matches_predicate(row, predicate, table)? {
+        if !filter.matches(row)? {
             return Ok(VisitControl::Continue);
         }
         if updates.len() == MAX_DML_CHANGED_ROWS {
@@ -1146,16 +1149,17 @@ fn plan_update(
             )));
         }
 
-        // Check the retained candidate budget before cloning the visited row or assignment values.
+        // Check the retained candidate budget before copying assignment values into the row.
+        let row = row.to_row()?;
         let conservative_row_bytes = checked_dml_add(
-            checked_dml_mul(estimated_row_bytes(row)?, 3)?,
+            checked_dml_mul(estimated_row_bytes(&row)?, 3)?,
             checked_dml_add(assignment_bytes, 256)?,
         )?;
         ensure_dml_work_bytes(checked_dml_add(work_bytes, conservative_row_bytes)?)?;
 
-        let old_key = row_key(&schema, row)?;
-        let old_primary_key = primary_key_row(&schema, row)?;
-        let mut new_row = row.clone();
+        let old_key = row_key(&schema, &row)?;
+        let old_primary_key = primary_key_row(&schema, &row)?;
+        let mut new_row = row;
         for (column, value) in &resolved_assignments {
             new_row.insert(column.clone(), value.clone());
         }
@@ -1270,6 +1274,7 @@ fn plan_delete(
     let mut scanned = 0usize;
     let mut work_bytes = 0usize;
     let mut result_bytes = 0usize;
+    let filter = Filter::new(predicate, &schema, table)?;
     let visit_outcome = visit_dml_candidates(storage, &schema, predicate, &mut |row| {
         scanned = scanned.saturating_add(1);
         if scanned > MAX_DML_SCAN_ROWS {
@@ -1277,7 +1282,7 @@ fn plan_delete(
                 "A data-modification statement cannot scan more than {MAX_DML_SCAN_ROWS} rows"
             )));
         }
-        if !matches_predicate(row, predicate, table)? {
+        if !filter.matches(row)? {
             return Ok(VisitControl::Continue);
         }
         if changes.len() == MAX_DML_CHANGED_ROWS {
@@ -1285,6 +1290,7 @@ fn plan_delete(
                 "A data-modification statement cannot change more than {MAX_DML_CHANGED_ROWS} rows"
             )));
         }
+        let row = &row.to_row()?;
 
         let mut charge = 32usize;
         for column in &schema.primary_key {
@@ -1336,14 +1342,16 @@ fn visit_dml_candidates(
     storage: &dyn StorageReader,
     schema: &TableDefinition,
     predicate: Option<&Predicate>,
-    visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+    visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
 ) -> Result<VisitOutcome> {
     // A valid predicate can name a key too large to store; keep its scan behavior.
     if let Some(key) = primary_key_lookup(predicate, schema)
         && validate_primary_storage_key_bound(schema, &key).is_ok()
     {
         return match storage.lookup_primary_key(&schema.name, &key)? {
-            Some(row) if visitor(&row)? == VisitControl::Stop => Ok(VisitOutcome::Stopped),
+            Some(row) if visitor(&RowRef::map(&row, schema))? == VisitControl::Stop => {
+                Ok(VisitOutcome::Stopped)
+            }
             _ => Ok(VisitOutcome::Complete),
         };
     }
@@ -2188,7 +2196,7 @@ mod tests {
         fn visit_table(
             &self,
             _table: &str,
-            _visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+            _visitor: &mut dyn FnMut(&crate::row::RowRef<'_>) -> Result<VisitControl>,
         ) -> Result<VisitOutcome> {
             Ok(VisitOutcome::Stopped)
         }
@@ -2214,7 +2222,7 @@ mod tests {
             table: &str,
             columns: &[String],
             key: &Row,
-            visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+            visitor: &mut dyn FnMut(&crate::row::RowRef<'_>) -> Result<VisitControl>,
         ) -> Result<Option<VisitOutcome>> {
             self.inner.visit_index(table, columns, key, visitor)
         }

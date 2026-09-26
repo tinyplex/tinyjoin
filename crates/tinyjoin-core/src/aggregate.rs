@@ -5,10 +5,10 @@ use std::str::FromStr;
 use serde_json::{Map, Number, Value};
 
 use crate::query::{
-    ParseMode, Token, bind_parameter, is_distinct_keyword_at, is_reserved_keyword,
-    matches_predicate, pagination_value, parse_predicate_at, validate_predicate_columns,
-    validate_predicate_types,
+    Filter, ParseMode, Token, bind_parameter, is_distinct_keyword_at, is_reserved_keyword,
+    pagination_value, parse_predicate_at, validate_predicate_columns, validate_predicate_types,
 };
+use crate::row::{RowRef, ValueRef};
 use crate::storage::StorageReader;
 use crate::{
     ColumnDefinition, ColumnType, EngineError, NullOrder, OrderBy, OrderDirection, Predicate,
@@ -176,8 +176,14 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &AggregatePlan) -> Resu
     ensure_work_budget(working_bytes, MAX_AGGREGATE_WORK_BYTES)?;
     let mut groups = BTreeMap::<String, GroupState>::new();
     let mut scanned = 0_usize;
+    let filter = Filter::new(plan.predicate.as_ref(), &schema, &plan.table)?;
+    let group_columns = plan
+        .group_by
+        .iter()
+        .map(|column| SourceColumn::new(&schema, column, &plan.table))
+        .collect::<Result<Vec<_>>>()?;
     // Grouping never stops early, so narrowing only removes rows the predicate would reject
-    // anyway; the per-row `matches_predicate` below remains the authority on membership.
+    // anyway; the per-row filter below remains the authority on membership.
     crate::query::visit_predicate_candidates(
         storage,
         &plan.table,
@@ -191,7 +197,7 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &AggregatePlan) -> Resu
                     format!("An aggregate query cannot scan more than {MAX_SCAN_ROWS} rows"),
                 ));
             }
-            if matches_predicate(row, plan.predicate.as_ref(), &plan.table)? {
+            if filter.matches(row)? {
                 if let Some(state) = &mut global {
                     let before = state.estimated_bytes()?;
                     let after = state.estimated_bytes_after(row)?;
@@ -205,8 +211,8 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &AggregatePlan) -> Resu
                     working_bytes = next_total;
                     return Ok(VisitControl::Continue);
                 }
-                ensure_group_key_input_budget(&schema, &plan.group_by, row)?;
-                let key = group_key(&schema, &plan.group_by, row)?;
+                ensure_group_key_input_budget(&group_columns, row)?;
+                let key = group_key(&group_columns, row)?;
                 let group_count = groups.len();
                 match groups.entry(key) {
                     Entry::Vacant(entry) => {
@@ -428,6 +434,34 @@ fn validate_aggregate(
     }
 }
 
+/// A column an aggregate reads: its name, its position in the schema, and its type.
+struct SourceColumn {
+    name: String,
+    index: usize,
+    data_type: ColumnType,
+}
+
+impl SourceColumn {
+    fn new(schema: &TableDefinition, column: &str, table: &str) -> Result<Self> {
+        let index = schema
+            .columns
+            .iter()
+            .position(|definition| definition.name == column)
+            .ok_or_else(|| EngineError::column_not_found(column, table))?;
+        Ok(Self {
+            name: column.to_owned(),
+            index,
+            data_type: schema.columns[index].data_type,
+        })
+    }
+
+    /// The column's value in `row`, or `None` when it is `NULL`.
+    fn non_null<'r>(&self, row: &RowRef<'r>) -> Result<Option<ValueRef<'r>>> {
+        let value = row.get(self.index)?;
+        Ok((!value.is_null()).then_some(value))
+    }
+}
+
 struct GroupState {
     grouped_values: Row,
     aggregates: Vec<AggregateAccumulator>,
@@ -437,22 +471,20 @@ impl GroupState {
     fn new(
         plan: &AggregatePlan,
         schema: &TableDefinition,
-        representative: Option<&Row>,
+        representative: Option<&RowRef<'_>>,
     ) -> Result<Self> {
         let mut grouped_values = Map::new();
         let mut aggregates = Vec::new();
         for item in &plan.items {
             match &item.expression {
                 SelectExpression::Column(column) => {
-                    let value = representative
-                        .and_then(|row| row.get(column))
-                        .cloned()
-                        .ok_or_else(|| {
-                            EngineError::invalid_query(format!(
-                                "Grouped column `{column}` has no representative row"
-                            ))
-                        })?;
-                    grouped_values.insert(column.clone(), value);
+                    let Some(row) = representative else {
+                        return Err(EngineError::invalid_query(format!(
+                            "Grouped column `{column}` has no representative row"
+                        )));
+                    };
+                    let source = SourceColumn::new(schema, column, &plan.table)?;
+                    grouped_values.insert(column.clone(), row.get(source.index)?.into_value());
                 }
                 SelectExpression::Aggregate { function, argument } => {
                     aggregates.push(AggregateAccumulator::new(*function, argument, schema)?)
@@ -465,14 +497,14 @@ impl GroupState {
         })
     }
 
-    fn update(&mut self, row: &Row) -> Result<()> {
+    fn update(&mut self, row: &RowRef<'_>) -> Result<()> {
         for aggregate in &mut self.aggregates {
             aggregate.update(row)?;
         }
         Ok(())
     }
 
-    fn estimated_bytes_after(&self, row: &Row) -> Result<usize> {
+    fn estimated_bytes_after(&self, row: &RowRef<'_>) -> Result<usize> {
         let mut bytes = 0_usize;
         for (column, value) in &self.grouped_values {
             bytes = checked_add(bytes, 96)?;
@@ -501,28 +533,26 @@ impl GroupState {
 
 enum AggregateAccumulator {
     Count {
-        column: Option<String>,
+        column: Option<SourceColumn>,
         count: u64,
     },
     IntegerSum {
-        column: String,
+        column: SourceColumn,
         sum: i128,
         seen: bool,
     },
     FloatSum {
-        column: String,
+        column: SourceColumn,
         sum: f64,
         seen: bool,
     },
     Average {
-        column: String,
-        data_type: ColumnType,
+        column: SourceColumn,
         sum: f64,
         count: u64,
     },
     Extremum {
-        column: String,
-        data_type: ColumnType,
+        column: SourceColumn,
         value: Option<Value>,
         minimum: bool,
     },
@@ -536,7 +566,9 @@ impl AggregateAccumulator {
     ) -> Result<Self> {
         let column = match argument {
             AggregateArgument::Star => None,
-            AggregateArgument::Column(column) => Some(column.clone()),
+            AggregateArgument::Column(column) => {
+                Some(SourceColumn::new(schema, column, &schema.name)?)
+            }
         };
         if function == AggregateFunction::Count {
             return Ok(Self::Count { column, count: 0 });
@@ -544,10 +576,9 @@ impl AggregateAccumulator {
         let column = column.ok_or_else(|| {
             EngineError::unsupported_sql("Only COUNT accepts `*` as an aggregate argument")
         })?;
-        let definition = column_definition(schema, &column, &schema.name)?;
         match function {
             AggregateFunction::Count => unreachable!("COUNT returned above"),
-            AggregateFunction::Sum if definition.data_type == ColumnType::Integer => {
+            AggregateFunction::Sum if column.data_type == ColumnType::Integer => {
                 Ok(Self::IntegerSum {
                     column,
                     sum: 0,
@@ -561,25 +592,24 @@ impl AggregateAccumulator {
             }),
             AggregateFunction::Avg => Ok(Self::Average {
                 column,
-                data_type: definition.data_type,
                 sum: 0.0,
                 count: 0,
             }),
             AggregateFunction::Min | AggregateFunction::Max => Ok(Self::Extremum {
                 column,
-                data_type: definition.data_type,
                 value: None,
                 minimum: function == AggregateFunction::Min,
             }),
         }
     }
 
-    fn update(&mut self, row: &Row) -> Result<()> {
+    fn update(&mut self, row: &RowRef<'_>) -> Result<()> {
         match self {
             Self::Count { column, count } => {
-                let counts = column.as_ref().is_none_or(|column| {
-                    row.get(column).is_some_and(|value| value != &Value::Null)
-                });
+                let counts = match column {
+                    None => true,
+                    Some(column) => column.non_null(row)?.is_some(),
+                };
                 if counts {
                     *count = count.checked_add(1).ok_or_else(|| {
                         EngineError::new("NUMERIC_OVERFLOW", "COUNT result overflowed")
@@ -587,30 +617,25 @@ impl AggregateAccumulator {
                 }
             }
             Self::IntegerSum { column, sum, seen } => {
-                if let Some(value) = non_null_value(row, column) {
-                    *sum = sum.checked_add(integer_value(value)?).ok_or_else(|| {
+                if let Some(value) = column.non_null(row)? {
+                    *sum = sum.checked_add(integer_input(&value)?).ok_or_else(|| {
                         EngineError::new("NUMERIC_OVERFLOW", "SUM result overflowed")
                     })?;
                     *seen = true;
                 }
             }
             Self::FloatSum { column, sum, seen } => {
-                if let Some(value) = non_null_value(row, column) {
-                    *sum += value.as_f64().expect("typed float was validated");
+                if let Some(value) = column.non_null(row)? {
+                    *sum += float_input(&value)?;
                     *seen = true;
                 }
             }
-            Self::Average {
-                column,
-                data_type,
-                sum,
-                count,
-            } => {
-                if let Some(value) = non_null_value(row, column) {
-                    *sum += if *data_type == ColumnType::Integer {
-                        integer_value(value)? as f64
+            Self::Average { column, sum, count } => {
+                if let Some(value) = column.non_null(row)? {
+                    *sum += if column.data_type == ColumnType::Integer {
+                        integer_input(&value)? as f64
                     } else {
-                        value.as_f64().expect("typed float was validated")
+                        float_input(&value)?
                     };
                     *count = count.checked_add(1).ok_or_else(|| {
                         EngineError::new("NUMERIC_OVERFLOW", "AVG count overflowed")
@@ -619,22 +644,13 @@ impl AggregateAccumulator {
             }
             Self::Extremum {
                 column,
-                data_type,
                 value: selected,
                 minimum,
             } => {
-                if let Some(value) = non_null_value(row, column) {
-                    let replace = selected.as_ref().is_none_or(|selected| {
-                        let ordering = compare_typed(*data_type, value, selected);
-                        if *minimum {
-                            ordering == Ordering::Less
-                        } else {
-                            ordering == Ordering::Greater
-                        }
-                    });
-                    if replace {
-                        *selected = Some(value.clone());
-                    }
+                if let Some(value) = column.non_null(row)?
+                    && replaces_extremum(column.data_type, &value, selected.as_ref(), *minimum)
+                {
+                    *selected = Some(value.into_value());
                 }
             }
         }
@@ -684,15 +700,15 @@ impl AggregateAccumulator {
 
     fn estimated_bytes(&self) -> Result<usize> {
         let (column, selected) = match self {
-            Self::Count { column, .. } => (column.as_deref(), None),
+            Self::Count { column, .. } => (column.as_ref(), None),
             Self::IntegerSum { column, .. }
             | Self::FloatSum { column, .. }
-            | Self::Average { column, .. } => (Some(column.as_str()), None),
-            Self::Extremum { column, value, .. } => (Some(column.as_str()), value.as_ref()),
+            | Self::Average { column, .. } => (Some(column), None),
+            Self::Extremum { column, value, .. } => (Some(column), value.as_ref()),
         };
         let mut bytes = 96_usize;
         if let Some(column) = column {
-            bytes = checked_add(bytes, checked_mul(column.len(), 2)?)?;
+            bytes = checked_add(bytes, checked_mul(column.name.len(), 2)?)?;
         }
         if let Some(value) = selected {
             bytes = checked_add(bytes, checked_mul(owned_value_bytes(value)?, 2)?)?;
@@ -700,35 +716,29 @@ impl AggregateAccumulator {
         Ok(bytes)
     }
 
-    fn estimated_bytes_after(&self, row: &Row) -> Result<usize> {
+    fn estimated_bytes_after(&self, row: &RowRef<'_>) -> Result<usize> {
         let mut bytes = self.estimated_bytes()?;
         let Self::Extremum {
             column,
-            data_type,
             value: selected,
             minimum,
         } = self
         else {
             return Ok(bytes);
         };
-        let Some(incoming) = non_null_value(row, column) else {
+        let Some(incoming) = column.non_null(row)? else {
             return Ok(bytes);
         };
-        let replaces = selected.as_ref().is_none_or(|selected| {
-            let ordering = compare_typed(*data_type, incoming, selected);
-            if *minimum {
-                ordering == Ordering::Less
-            } else {
-                ordering == Ordering::Greater
-            }
-        });
-        if replaces {
+        if replaces_extremum(column.data_type, &incoming, selected.as_ref(), *minimum) {
             if let Some(selected) = selected {
                 bytes = bytes
                     .checked_sub(checked_mul(owned_value_bytes(selected)?, 2)?)
                     .ok_or_else(work_limit_error)?;
             }
-            bytes = checked_add(bytes, checked_mul(owned_value_bytes(incoming)?, 2)?)?;
+            bytes = checked_add(
+                bytes,
+                checked_mul(incoming.owned_bytes(owned_value_bytes)?, 2)?,
+            )?;
         }
         Ok(bytes)
     }
@@ -744,26 +754,74 @@ impl AggregateAccumulator {
     }
 }
 
-fn non_null_value<'a>(row: &'a Row, column: &str) -> Option<&'a Value> {
-    row.get(column).filter(|value| *value != &Value::Null)
+/// Whether a non-null input replaces the selected minimum or maximum.
+fn replaces_extremum(
+    data_type: ColumnType,
+    incoming: &ValueRef<'_>,
+    selected: Option<&Value>,
+    minimum: bool,
+) -> bool {
+    selected.is_none_or(|selected| {
+        // As `compare_typed` orders the equivalent JSON values.
+        let ordering = match (data_type, incoming) {
+            (_, ValueRef::Json(incoming)) => compare_typed(data_type, incoming, selected),
+            (ColumnType::Integer | ColumnType::Float, incoming) => {
+                let incoming = match incoming {
+                    ValueRef::Integer(value) => Some(*value as f64),
+                    ValueRef::Float(value) => Some(*value),
+                    _ => None,
+                };
+                incoming
+                    .partial_cmp(&selected.as_f64())
+                    .unwrap_or(Ordering::Equal)
+            }
+            (ColumnType::Text, ValueRef::Text(incoming)) => incoming
+                .as_ref()
+                .cmp(selected.as_str().expect("typed text was validated")),
+            _ => Ordering::Equal,
+        };
+        if minimum {
+            ordering == Ordering::Less
+        } else {
+            ordering == Ordering::Greater
+        }
+    })
 }
 
-fn ensure_group_key_input_budget(
-    schema: &TableDefinition,
-    columns: &[String],
-    row: &Row,
-) -> Result<()> {
+/// An integer aggregate input.
+fn integer_input(value: &ValueRef<'_>) -> Result<i128> {
+    match value {
+        ValueRef::Integer(value) => Ok(i128::from(*value)),
+        ValueRef::Json(value) => integer_value(value),
+        _ => Err(EngineError::type_mismatch("Expected a typed integer value")),
+    }
+}
+
+/// A float aggregate input.
+fn float_input(value: &ValueRef<'_>) -> Result<f64> {
+    match value {
+        ValueRef::Float(value) => Ok(*value),
+        ValueRef::Integer(value) => Ok(*value as f64),
+        ValueRef::Json(value) => value
+            .as_f64()
+            .ok_or_else(|| EngineError::type_mismatch("Expected a typed float value")),
+        _ => Err(EngineError::type_mismatch("Expected a typed float value")),
+    }
+}
+
+fn ensure_group_key_input_budget(columns: &[SourceColumn], row: &RowRef<'_>) -> Result<()> {
     let mut bytes = 32_usize;
     for column in columns {
-        let value = row
-            .get(column)
-            .ok_or_else(|| EngineError::column_not_found(column, &schema.name))?;
+        let value = row.get(column.index)?;
         bytes = checked_add(bytes, 16)?;
-        bytes = checked_add(bytes, checked_mul(column.len(), 2)?)?;
+        bytes = checked_add(bytes, checked_mul(column.name.len(), 2)?)?;
         // `group_key` JSON-escapes text into a tagged component and then encodes the component
         // vector. Control characters can therefore transiently expand to roughly thirteen times
         // their input length while both encodings coexist; fourteen is a conservative ceiling.
-        bytes = checked_add(bytes, checked_mul(owned_value_bytes(value)?, 14)?)?;
+        bytes = checked_add(
+            bytes,
+            checked_mul(value.owned_bytes(owned_value_bytes)?, 14)?,
+        )?;
     }
     ensure_work_budget(bytes, MAX_AGGREGATE_WORK_BYTES)
 }
@@ -917,16 +975,40 @@ fn integer_value(value: &Value) -> Result<i128> {
         .ok_or_else(|| EngineError::type_mismatch("Expected a typed integer value"))
 }
 
-fn group_key(schema: &TableDefinition, columns: &[String], row: &Row) -> Result<String> {
+fn group_key(columns: &[SourceColumn], row: &RowRef<'_>) -> Result<String> {
     let mut parts = Vec::with_capacity(columns.len());
     for column in columns {
-        let definition = column_definition(schema, column, &schema.name)?;
-        let value = row
-            .get(column)
-            .ok_or_else(|| EngineError::column_not_found(column, &schema.name))?;
-        parts.push(group_key_part(definition.data_type, value, column)?);
+        let value = row.get(column.index)?;
+        parts.push(match value {
+            ValueRef::Json(value) => group_key_part(column.data_type, &value, &column.name)?,
+            value => group_key_part_ref(column.data_type, &value, &column.name)?,
+        });
     }
     encode_group_key(&parts)
+}
+
+/// [`group_key_part`] for a typed value read from a row.
+fn group_key_part_ref(data_type: ColumnType, value: &ValueRef<'_>, column: &str) -> Result<String> {
+    Ok(match (data_type, value) {
+        (_, ValueRef::Null) => "null".to_owned(),
+        (ColumnType::Boolean, ValueRef::Boolean(value)) => format!("b:{value}"),
+        (ColumnType::Integer, ValueRef::Integer(value)) => format!("i:{value}"),
+        (ColumnType::Float, ValueRef::Float(value)) => {
+            let number = if *value == 0.0 { 0.0 } else { *value };
+            format!("f:{:016x}", number.to_bits())
+        }
+        (ColumnType::Text, ValueRef::Text(value)) => {
+            format!(
+                "s:{}",
+                serde_json::to_string(value.as_ref()).expect("strings encode")
+            )
+        }
+        _ => {
+            return Err(EngineError::type_mismatch(format!(
+                "Column `{column}` contains a value incompatible with its catalog type"
+            )));
+        }
+    })
 }
 
 /// Encodes one grouped value so that values SQL considers equal encode identically: `NULL`s group
@@ -1421,6 +1503,7 @@ fn normalize_identifier(value: String, quoted: bool) -> Result<String> {
 mod tests {
     use serde_json::{Value, json};
 
+    use crate::row::RowRef;
     use crate::{Engine, Row, RowChange, StorageDriver, StorageReader};
 
     fn row(value: Value) -> Row {
@@ -1531,12 +1614,13 @@ mod tests {
         .unwrap();
         let schema = sales().into_storage().table_schema("sales").unwrap();
         let representative = row(json!({"region": "r", "label": "small"}));
+        let representative = RowRef::map(&representative, &schema);
         let mut state = super::GroupState::new(&plan, &schema, Some(&representative)).unwrap();
         state.update(&representative).unwrap();
 
         let before = state.estimated_bytes().unwrap();
         let larger = row(json!({"region": "r", "label": "a much longer value"}));
-        state.update(&larger).unwrap();
+        state.update(&RowRef::map(&larger, &schema)).unwrap();
         let after = state.estimated_bytes().unwrap();
         assert!(after > before);
 
@@ -2088,7 +2172,7 @@ mod tests {
         fn visit_table(
             &self,
             table: &str,
-            visitor: &mut dyn FnMut(&Row) -> crate::Result<crate::VisitControl>,
+            visitor: &mut dyn FnMut(&crate::row::RowRef<'_>) -> crate::Result<crate::VisitControl>,
         ) -> crate::Result<crate::VisitOutcome> {
             self.table_scans.set(self.table_scans.get() + 1);
             self.inner.visit_table(table, &mut |row| {
@@ -2102,7 +2186,7 @@ mod tests {
             table: &str,
             columns: &[String],
             key: &Row,
-            visitor: &mut dyn FnMut(&Row) -> crate::Result<crate::VisitControl>,
+            visitor: &mut dyn FnMut(&crate::row::RowRef<'_>) -> crate::Result<crate::VisitControl>,
         ) -> crate::Result<Option<crate::VisitOutcome>> {
             let outcome = self.inner.visit_index(table, columns, key, &mut |row| {
                 self.rows_visited.set(self.rows_visited.get() + 1);

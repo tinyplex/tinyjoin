@@ -19,8 +19,9 @@ use crate::{
     },
     paged_storage::{
         PagedIndex, PagedTable, adjusted_count, batch_too_large, ensure_batch_bytes, limit_error,
-        storage_corrupt, stored_row, unique_violation,
+        storage_corrupt, unique_violation,
     },
+    row::RowRef,
     statement::{PlannedDml, Statement, WriteStatement},
     storage::{
         estimated_row_bytes, normalize_row, preflight_row_write_set, schema_with_added_column,
@@ -197,16 +198,8 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                         )));
                     }
                     let tree_id = self.allocate_tree_id()?;
-                    Rc::make_mut(&mut self.tables).insert(
-                        schema.name.clone(),
-                        PagedTable {
-                            schema: schema.clone(),
-                            tree_id,
-                            root_page_id: None,
-                            row_count: 0,
-                            hash: EMPTY_HASH,
-                        },
-                    );
+                    let table = PagedTable::new(schema.clone(), tree_id, None, 0, EMPTY_HASH)?;
+                    Rc::make_mut(&mut self.tables).insert(schema.name.clone(), table);
                 }
                 outcome
             }
@@ -303,7 +296,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 Btree::cursor_in_transaction(&mut transaction, table_root, table.tree_id)?;
             while let Some((primary_key, value)) = rows.next_in_transaction(&mut transaction)? {
                 self.charge_operations(1)?;
-                let row = stored_row(&table.schema, &primary_key, &value)?;
+                let row = table.record(&primary_key, &value)?.to_row()?;
                 let Some(index_key) =
                     encode_secondary_index_entry_key(&table.schema, definition, &row)?
                 else {
@@ -399,7 +392,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         Rc::make_mut(&mut self.tables)
             .get_mut(table_name)
             .expect("the altered table was resolved above")
-            .schema = schema;
+            .set_schema(schema)?;
         self.charge_operations(1)
     }
 
@@ -668,7 +661,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         };
         self.charge_operations(1)?;
         get_in_transaction(&mut self.transaction.borrow_mut(), root, table.tree_id, key)?
-            .map(|value| stored_row(&table.schema, key, &value))
+            .map(|value| table.record(key, &value)?.to_row())
             .transpose()
     }
 
@@ -898,7 +891,7 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
     fn visit_table(
         &self,
         table: &str,
-        visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
         let table = self
             .tables
@@ -915,7 +908,7 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
                 break;
             };
             self.charge_operations(1)?;
-            let row = stored_row(&table.schema, key, &value)?;
+            let row = RowRef::record(table.record(key, &value)?);
             if visitor(&row)? == VisitControl::Stop {
                 return Ok(VisitOutcome::Stopped);
             }
@@ -960,7 +953,7 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
         table: &str,
         columns: &[String],
         key: &Row,
-        visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<Option<VisitOutcome>> {
         let table_data = self
             .tables
@@ -1032,7 +1025,7 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
                 ))
             })?;
             self.charge_operations(1)?;
-            let row = stored_row(&table_data.schema, primary_key, &row_value)?;
+            let row = RowRef::record(table_data.record(primary_key, &row_value)?);
             if visitor(&row)? == VisitControl::Stop {
                 return Ok(Some(VisitOutcome::Stopped));
             }

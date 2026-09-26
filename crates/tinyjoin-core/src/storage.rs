@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde_json::Value;
 
+use crate::row::RowRef;
 use crate::{
     ColumnDefinition, ColumnType, EngineError, IndexDefinition, Result, Row, RowChange,
     TableDefinition,
@@ -54,10 +55,11 @@ pub(crate) trait StorageReader {
         Ok(())
     }
 
+    /// Visits every row of a table, in primary-key order for stored rows.
     fn visit_table(
         &self,
         table: &str,
-        visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome>;
     fn table_row_count(&self, table: &str) -> Result<usize>;
     /// Collecting helper for operators that require all table rows at once.
@@ -65,7 +67,7 @@ pub(crate) trait StorageReader {
     fn scan_table(&self, table: &str) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
         self.visit_table(table, &mut |row| {
-            rows.push(row.clone());
+            rows.push(row.to_row()?);
             Ok(VisitControl::Continue)
         })?;
         Ok(rows)
@@ -78,14 +80,14 @@ pub(crate) trait StorageReader {
         table: &str,
         columns: &[String],
         key: &Row,
-        visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<Option<VisitOutcome>>;
     /// Collecting helper for callers that require all matching index rows.
     #[cfg(test)]
     fn lookup_index(&self, table: &str, columns: &[String], key: &Row) -> Result<Option<Vec<Row>>> {
         let mut rows = Vec::new();
         let outcome = self.visit_index(table, columns, key, &mut |row| {
-            rows.push(row.clone());
+            rows.push(row.to_row()?);
             Ok(VisitControl::Continue)
         })?;
         Ok(outcome.map(|_| rows))
@@ -529,7 +531,7 @@ impl StorageReader for InMemoryStorage {
     fn visit_table(
         &self,
         table: &str,
-        visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
         #[cfg(test)]
         self.scan_count.set(self.scan_count.get() + 1);
@@ -540,7 +542,7 @@ impl StorageReader for InMemoryStorage {
         for row in table.rows.values() {
             #[cfg(test)]
             self.visited_row_count.set(self.visited_row_count.get() + 1);
-            if visitor(row)? == VisitControl::Stop {
+            if visitor(&RowRef::map(row, &table.schema))? == VisitControl::Stop {
                 return Ok(VisitOutcome::Stopped);
             }
         }
@@ -559,7 +561,7 @@ impl StorageReader for InMemoryStorage {
         self.collector_count.set(self.collector_count.get() + 1);
         let mut rows = Vec::new();
         self.visit_table(table, &mut |row| {
-            rows.push(row.clone());
+            rows.push(row.to_row()?);
             Ok(VisitControl::Continue)
         })?;
         Ok(rows)
@@ -597,7 +599,7 @@ impl StorageReader for InMemoryStorage {
         table: &str,
         columns: &[String],
         key: &Row,
-        visitor: &mut dyn FnMut(&Row) -> Result<VisitControl>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<Option<VisitOutcome>> {
         #[cfg(test)]
         self.lookup_count.set(self.lookup_count.get() + 1);
@@ -624,7 +626,7 @@ impl StorageReader for InMemoryStorage {
         {
             #[cfg(test)]
             self.visited_row_count.set(self.visited_row_count.get() + 1);
-            if visitor(row)? == VisitControl::Stop {
+            if visitor(&RowRef::map(row, &table_data.schema))? == VisitControl::Stop {
                 return Ok(Some(VisitOutcome::Stopped));
             }
         }
@@ -636,7 +638,7 @@ impl StorageReader for InMemoryStorage {
         self.collector_count.set(self.collector_count.get() + 1);
         let mut rows = Vec::new();
         let outcome = self.visit_index(table, columns, key, &mut |row| {
-            rows.push(row.clone());
+            rows.push(row.to_row()?);
             Ok(VisitControl::Continue)
         })?;
         Ok(outcome.map(|_| rows))
@@ -1702,7 +1704,7 @@ mod tests {
         let mut visited = Vec::new();
         let outcome = storage
             .visit_table("users", &mut |row| {
-                visited.push(row["id"].clone());
+                visited.push(row.to_row()?["id"].clone());
                 Ok(VisitControl::Stop)
             })
             .unwrap();
