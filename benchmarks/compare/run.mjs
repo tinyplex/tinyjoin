@@ -86,6 +86,21 @@ if (!ENGINES.slice(1).every((engine) => existsSync(resolve(here, 'node_modules',
   execFileSync('npm', ['ci', '--no-audit', '--no-fund'], {cwd: here, stdio: 'inherit'});
 }
 if (!existsSync(resolve(root, 'dist/index.js'))) throw new Error('Build TinyJoin first: npm run build');
+
+// Published results must measure the runtime the committed sources build, not a
+// leftover experimental or stale build. Uncompressed sizes do not depend on
+// zlib, so they must match site/data/sizes.json exactly.
+if (options.publish) {
+  const {measureSizes, readSizes} = await import(new URL('../../scripts/sizes.mjs', import.meta.url).href);
+  const [measured, committed] = await Promise.all([measureSizes(), readSizes()]);
+  const differing = Object.keys(measured).filter((group) => measured[group].raw !== committed[group]?.raw);
+  if (differing.length) {
+    throw new Error(
+      `--publish measures dist/, but its ${differing.join(', ')} sizes differ from site/data/sizes.json. ` +
+        'Run npm run build from the committed sources first.',
+    );
+  }
+}
 const version = async (engine) =>
   JSON.parse(await readFile(engine === 'tinyjoin' ? resolve(root, 'dist/package.json') : resolve(here, 'node_modules', PACKAGES[engine], 'package.json'), 'utf8')).version;
 const git = (...args) => execFileSync('git', args, {cwd: root, encoding: 'utf8'}).trim();
