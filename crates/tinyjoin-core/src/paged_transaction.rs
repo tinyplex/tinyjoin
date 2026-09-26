@@ -169,16 +169,14 @@ impl PagedTransaction {
         let mut previous = previous.into_iter();
         for change in changes {
             let held = previous.next().unwrap_or(PreviousRow::Unread);
-            let (table, input, next) = match change {
-                RowChange::Upsert { table, row } => {
-                    let next = Some(row.clone());
-                    (table, row, next)
-                }
-                RowChange::Delete { table, key } => (table, key, None),
+            let (table, input, is_delete) = match change {
+                RowChange::Upsert { table, row } => (table, row, false),
+                RowChange::Delete { table, key } => (table, key, true),
             };
             let schema = storage.table_schema(&table)?;
             let key = primary_key_row(&schema, &input)?;
             let encoded_key = encode_primary_key(&schema, &key)?;
+            let next = (!is_delete).then_some(input);
             let entries = patch.entries.entry(table.clone()).or_default();
             if !entries.contains_key(&encoded_key) {
                 let entry = match self
@@ -279,17 +277,12 @@ impl PagedTransaction {
                 entry.cost = if !entry.changed {
                     None
                 } else {
-                    let change = match &entry.next {
-                        Some(row) => RowChange::Upsert {
-                            table: table.clone(),
-                            row: row.clone(),
-                        },
-                        None => RowChange::Delete {
-                            table: table.clone(),
-                            key: entry.key.clone(),
-                        },
-                    };
-                    Some(storage.change_cost(table, &change, entry.base.as_ref())?)
+                    Some(storage.change_cost(
+                        table,
+                        entry.next.as_ref(),
+                        &entry.key,
+                        entry.base.as_ref(),
+                    )?)
                 };
                 if let Some(cost) = &entry.cost {
                     totals.usage = totals.usage.plus(cost.usage)?;

@@ -1519,65 +1519,102 @@ fn preflight_row_changes(
         let schema = schemas
             .get(table.as_str())
             .ok_or_else(|| EngineError::table_not_found(table))?;
-        let input_row_bytes = validate_row_value_limits(input)
-            .map_err(|error| EngineError::invalid_change(error.message))?;
-        let mut retained = estimated_row_bytes(input)?;
-        if is_delete {
-            validate_primary_key_values(schema, input)?;
-            validate_primary_storage_key_bound(schema, input)?;
-        }
-        let row_bytes = if !is_delete {
-            let mut row_bytes = 2;
-            for (index, column) in schema.columns.iter().enumerate() {
-                let value = column.default.as_ref().unwrap_or(&Value::Null);
-                let value = input.get(&column.name).unwrap_or(value);
-                if index != 0 {
-                    row_bytes = checked_row_write_add(row_bytes, 1)?;
-                }
-                let value_bytes = encoded_json_bytes(value, 1)
-                    .map_err(|error| EngineError::invalid_change(error.message))?;
-                row_bytes = checked_row_write_add(
-                    row_bytes,
-                    checked_row_write_add(
-                        encoded_json_string_bytes(&column.name)?,
-                        checked_row_write_add(value_bytes, 1)?,
-                    )?,
+        batch_bytes = preflight_row_change(table, schema, input, is_delete, indexes, batch_bytes)?;
+    }
+    Ok(batch_bytes)
+}
+
+/// [`preflight_row_write_set`] for one change to a table the caller resolved: an upsert of
+/// `input`, or a delete of the key `input`.
+pub(crate) fn preflight_row_write(
+    table: &str,
+    schema: &TableDefinition,
+    input: &Row,
+    is_delete: bool,
+    indexes: &[&IndexDefinition],
+    previous: RowWriteUsage,
+) -> Result<RowWriteUsage> {
+    let changes = previous
+        .changes
+        .checked_add(1)
+        .ok_or_else(row_write_overflow_error)?;
+    if changes > MAX_ROW_WRITE_CHANGES {
+        return Err(row_write_limit_error(format!(
+            "A row write-set cannot contain more than {MAX_ROW_WRITE_CHANGES} changes"
+        )));
+    }
+    validate_catalog_name_bound(table)
+        .map_err(|error| EngineError::invalid_change(error.message))?;
+    Ok(RowWriteUsage {
+        changes,
+        bytes: preflight_row_change(table, schema, input, is_delete, indexes, previous.bytes)?,
+    })
+}
+
+fn preflight_row_change(
+    table: &str,
+    schema: &TableDefinition,
+    input: &Row,
+    is_delete: bool,
+    indexes: &[&IndexDefinition],
+    batch_bytes: usize,
+) -> Result<usize> {
+    let input_row_bytes = validate_row_value_limits(input)
+        .map_err(|error| EngineError::invalid_change(error.message))?;
+    let mut retained = estimated_row_bytes(input)?;
+    if is_delete {
+        validate_primary_key_values(schema, input)?;
+        validate_primary_storage_key_bound(schema, input)?;
+    }
+    let row_bytes = if !is_delete {
+        let mut row_bytes = 2;
+        for (index, column) in schema.columns.iter().enumerate() {
+            let value = column.default.as_ref().unwrap_or(&Value::Null);
+            let value = input.get(&column.name).unwrap_or(value);
+            if index != 0 {
+                row_bytes = checked_row_write_add(row_bytes, 1)?;
+            }
+            let value_bytes = encoded_json_bytes(value, 1)
+                .map_err(|error| EngineError::invalid_change(error.message))?;
+            row_bytes = checked_row_write_add(
+                row_bytes,
+                checked_row_write_add(
+                    encoded_json_string_bytes(&column.name)?,
+                    checked_row_write_add(value_bytes, 1)?,
+                )?,
+            )?;
+            if !input.contains_key(&column.name) {
+                retained = checked_row_write_add(retained, 64)?;
+                retained =
+                    checked_row_write_add(retained, checked_row_write_mul(column.name.len(), 2)?)?;
+                retained = checked_row_write_add(
+                    retained,
+                    checked_row_write_mul(estimated_value_bytes(value)?, 2)?,
                 )?;
-                if !input.contains_key(&column.name) {
-                    retained = checked_row_write_add(retained, 64)?;
-                    retained = checked_row_write_add(
-                        retained,
-                        checked_row_write_mul(column.name.len(), 2)?,
-                    )?;
-                    retained = checked_row_write_add(
-                        retained,
-                        checked_row_write_mul(estimated_value_bytes(value)?, 2)?,
-                    )?;
-                }
             }
-            if row_bytes > MAX_LOGICAL_ROW_BYTES {
-                return Err(EngineError::invalid_change(format!(
-                    "A normalized row cannot exceed {MAX_LOGICAL_ROW_BYTES} encoded bytes"
-                )));
-            }
-            row_bytes
-        } else {
-            input_row_bytes
-        };
-        if !is_delete {
-            validate_prospective_storage_keys(schema, input, indexes)?;
         }
-        debug_assert!(row_bytes <= MAX_LOGICAL_ROW_BYTES);
-        batch_bytes = checked_row_write_add(
-            batch_bytes,
-            checked_row_write_add(table.len(), checked_row_write_add(retained, 64)?)?,
-        )?;
-        if batch_bytes > MAX_ROW_WRITE_BYTES {
-            return Err(EngineError::new(
-                "TRANSACTION_TOO_LARGE",
-                format!("A row write-set cannot retain more than {MAX_ROW_WRITE_BYTES} bytes"),
-            ));
+        if row_bytes > MAX_LOGICAL_ROW_BYTES {
+            return Err(EngineError::invalid_change(format!(
+                "A normalized row cannot exceed {MAX_LOGICAL_ROW_BYTES} encoded bytes"
+            )));
         }
+        row_bytes
+    } else {
+        input_row_bytes
+    };
+    if !is_delete {
+        validate_prospective_storage_keys(schema, input, indexes)?;
+    }
+    debug_assert!(row_bytes <= MAX_LOGICAL_ROW_BYTES);
+    let batch_bytes = checked_row_write_add(
+        batch_bytes,
+        checked_row_write_add(table.len(), checked_row_write_add(retained, 64)?)?,
+    )?;
+    if batch_bytes > MAX_ROW_WRITE_BYTES {
+        return Err(EngineError::new(
+            "TRANSACTION_TOO_LARGE",
+            format!("A row write-set cannot retain more than {MAX_ROW_WRITE_BYTES} bytes"),
+        ));
     }
     Ok(batch_bytes)
 }

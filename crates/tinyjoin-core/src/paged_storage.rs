@@ -8,6 +8,8 @@ use std::{
 use crate::paged_codec::{
     CatalogHeader, encode_catalog_header_record, encode_catalog_index_record,
 };
+#[cfg(test)]
+use crate::storage::preflight_row_write_set;
 use crate::{
     ApplyOutcome, Btree, ColumnType, EngineError, ExecuteResult, IndexDefinition, PageDevice,
     PageId, Pager, Result, Row, RowChange, StorageReader, TableDefinition, TreeId, VisitControl,
@@ -22,7 +24,7 @@ use crate::{
         secondary_index_primary_key_for_definition,
     },
     row::{HeldRow, RowRef},
-    storage::{KeyOrder, KeyRange, RowWriteUsage, normalize_row, preflight_row_write_set},
+    storage::{KeyOrder, KeyRange, RowWriteUsage, normalize_row, preflight_row_write},
 };
 /// A relational view over the crash-safe paged B-tree store.
 ///
@@ -402,10 +404,14 @@ impl<D: PageDevice> PagedStorage<D> {
         }
     }
 
+    /// What a change to a row of `table_name` costs a write set: an upsert of `next`, which
+    /// planning normalized, or where `next` is `None`, a delete of the key `key`. `base` is the
+    /// committed row the change replaces.
     pub(crate) fn change_cost(
         &self,
         table_name: &str,
-        change: &RowChange,
+        next: Option<&Row>,
+        key: &Row,
         base: Option<&Row>,
     ) -> Result<ChangeCost> {
         self.ensure_ready()?;
@@ -421,38 +427,33 @@ impl<D: PageDevice> PagedStorage<D> {
             .values()
             .filter(|index| index.definition.table == table_name)
             .collect::<Vec<_>>();
-        let mut schemas = BTreeMap::new();
-        schemas.insert(table_name, &*table.schema);
         let definitions = indexes
             .iter()
             .map(|index| &index.definition)
             .collect::<Vec<_>>();
-        let row_write = preflight_row_write_set(
-            std::slice::from_ref(change),
-            &schemas,
+        let (row, is_delete) = match next {
+            Some(row) => (row, false),
+            None => (key, true),
+        };
+        let row_write = preflight_row_write(
+            table_name,
+            &table.schema,
+            row,
+            is_delete,
             &definitions,
             RowWriteUsage::default(),
         )?;
-        let (input, is_delete) = match change {
-            RowChange::Upsert { row, .. } => (row, false),
-            RowChange::Delete { key, .. } => (key, true),
-        };
         let input_bytes = table_name
             .len()
-            .checked_add(estimated_row_bytes(input)?)
+            .checked_add(estimated_row_bytes(row)?)
             .and_then(|bytes| bytes.checked_add(64))
             .ok_or_else(batch_too_large)?;
-        let row = if is_delete {
-            input.clone()
-        } else {
-            normalize_row(&table.schema, input.clone())?
-        };
-        let key = encode_primary_key(&table.schema, &row)?;
+        let key = encode_primary_key(&table.schema, row)?;
         let base_bytes = base.map_or(Ok(0), estimated_row_bytes)?;
         let next_bytes = if is_delete {
             0
         } else {
-            estimated_row_bytes(&row)?
+            estimated_row_bytes(row)?
         };
         let mut prepared_bytes = key
             .len()
@@ -464,7 +465,7 @@ impl<D: PageDevice> PagedStorage<D> {
         if !is_delete {
             for index in indexes.iter().filter(|index| index.definition.unique) {
                 let Some(prefix) =
-                    encode_secondary_index_prefix(&table.schema, &index.definition, &row)?
+                    encode_secondary_index_prefix(&table.schema, &index.definition, row)?
                 else {
                     continue;
                 };
@@ -1706,7 +1707,10 @@ mod tests {
             let RowChange::Upsert { table, .. } = change else {
                 unreachable!()
             };
-            let cost = storage.change_cost(table, change, None).unwrap();
+            let RowChange::Upsert { row, .. } = change else {
+                unreachable!()
+            };
+            let cost = storage.change_cost(table, Some(row), row, None).unwrap();
             // One row and two maintained indexes, or one row and one index.
             assert_eq!(
                 cost.usage.operations,
@@ -1742,7 +1746,13 @@ mod tests {
             table: "items".to_owned(),
             row: row(json!({"id": 1, "value": "one"})),
         };
-        let addition = storage.change_cost("items", &change, None).unwrap().usage;
+        let RowChange::Upsert { row, .. } = &change else {
+            unreachable!()
+        };
+        let addition = storage
+            .change_cost("items", Some(row), row, None)
+            .unwrap()
+            .usage;
         // Seed each independent budget just below its limit, leaving the other two empty.
         // This checks that the totals enforce cumulative, inclusive bounds.
         for budget in 0..3 {
