@@ -408,7 +408,8 @@ impl<D: PageDevice> PagedStorage<D> {
             .values()
             .filter(|index| index.definition.table == table_name)
             .collect::<Vec<_>>();
-        let schemas = BTreeMap::from([(table_name, &*table.schema)]);
+        let mut schemas = BTreeMap::new();
+        schemas.insert(table_name, &*table.schema);
         let definitions = indexes
             .iter()
             .map(|index| &index.definition)
@@ -1266,7 +1267,8 @@ fn load_and_validate_catalog<D: PageDevice>(
         )));
     }
 
-    let mut tree_ids = BTreeSet::from([CATALOG_TREE_ID]);
+    let mut tree_ids = BTreeSet::new();
+    tree_ids.insert(CATALOG_TREE_ID);
     for record in table_records.values() {
         validate_catalog_tree_id(record.tree_id, header.next_tree_id, &mut tree_ids)?;
     }
@@ -1285,39 +1287,31 @@ fn load_and_validate_catalog<D: PageDevice>(
         validate_index_tree(pager, record, &table_records)?;
     }
 
-    let tables = table_records
-        .into_iter()
-        .map(|(name, record)| {
-            let row_count = usize::try_from(record.row_count)
-                .map_err(|_| storage_corrupt("A table row count cannot fit in memory"))?;
-            Ok((
-                name,
-                PagedTable::new(
-                    record.schema,
-                    record.tree_id,
-                    record.root_page_id,
-                    row_count,
-                    record.hash,
-                )?,
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    let indexes = index_records
-        .into_iter()
-        .map(|(name, record)| {
-            Ok((
-                name,
-                PagedIndex {
-                    definition: record.definition,
-                    tree_id: record.tree_id,
-                    root_page_id: record.root_page_id,
-                    entry_count: usize::try_from(record.entry_count).map_err(|_| {
-                        storage_corrupt("An index entry count cannot fit in memory")
-                    })?,
-                },
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
+    let mut tables = BTreeMap::new();
+    for (name, record) in table_records {
+        let row_count = usize::try_from(record.row_count)
+            .map_err(|_| storage_corrupt("A table row count cannot fit in memory"))?;
+        let table = PagedTable::new(
+            record.schema,
+            record.tree_id,
+            record.root_page_id,
+            row_count,
+            record.hash,
+        )?;
+        tables.insert(name, table);
+    }
+    let mut indexes = BTreeMap::new();
+    for (name, record) in index_records {
+        let entry_count = usize::try_from(record.entry_count)
+            .map_err(|_| storage_corrupt("An index entry count cannot fit in memory"))?;
+        let index = PagedIndex {
+            definition: record.definition,
+            tree_id: record.tree_id,
+            root_page_id: record.root_page_id,
+            entry_count,
+        };
+        indexes.insert(name, index);
+    }
     Ok((header.next_tree_id, tables, indexes))
 }
 

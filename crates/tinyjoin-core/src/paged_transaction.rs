@@ -10,7 +10,7 @@ use crate::{
     paged_script::{ChangedRow, ChangedRows},
     paged_storage::{ChangeCost, PagedWriteUsage},
     row::RowRef,
-    statement::PreviousRow,
+    statement::{PreviousRow, primary_key_row},
     storage::{KeyOrder, KeyRange, estimated_row_bytes},
 };
 
@@ -417,24 +417,6 @@ fn retained_bytes(table: &str, encoded_key: &[u8], entry: &OverlayEntry) -> Resu
         .and_then(|bytes| bytes.checked_add(next_bytes))
         .and_then(|bytes| bytes.checked_add(OVERLAY_ENTRY_BYTES))
         .ok_or_else(transaction_too_large)
-}
-
-fn primary_key_row(schema: &TableDefinition, row: &Row) -> Result<Row> {
-    schema
-        .primary_key
-        .iter()
-        .map(|column| {
-            row.get(column)
-                .cloned()
-                .map(|value| (column.clone(), value))
-                .ok_or_else(|| {
-                    EngineError::invalid_change(format!(
-                        "Row for `{}` is missing primary-key column `{column}`",
-                        schema.name
-                    ))
-                })
-        })
-        .collect()
 }
 
 fn transaction_too_large() -> EngineError {

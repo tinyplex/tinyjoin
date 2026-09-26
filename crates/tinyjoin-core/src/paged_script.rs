@@ -412,11 +412,10 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         input_changes: Vec<RowChange>,
         previous: Vec<PreviousRow>,
     ) -> Result<()> {
-        let schemas = self
-            .tables
-            .iter()
-            .map(|(name, table)| (name.as_str(), &*table.schema))
-            .collect();
+        let mut schemas = BTreeMap::new();
+        for (name, table) in self.tables.iter() {
+            schemas.insert(name.as_str(), &*table.schema);
+        }
         let definitions = self
             .indexes
             .values()
@@ -640,14 +639,14 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 if entries.is_empty() {
                     continue;
                 }
-                entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-                let batch = entries
+                let mut batch = entries
                     .iter()
                     .map(|(key, insert)| BatchChange {
                         key,
                         value: insert.then_some(&[][..]),
                     })
                     .collect::<Vec<_>>();
+                BatchChange::sort(&mut batch);
                 let inserted = entries.iter().filter(|(_, insert)| *insert).count();
                 let removed = entries.len() - inserted;
                 let applied =
@@ -806,14 +805,14 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 changes.push((key, Some(value)));
             }
         }
-        changes.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        let batch = changes
+        let mut batch = changes
             .iter()
             .map(|(key, value)| BatchChange {
                 key,
                 value: value.as_deref(),
             })
             .collect::<Vec<_>>();
+        BatchChange::sort(&mut batch);
         let applied = Btree::apply(
             &mut self.transaction.borrow_mut(),
             self.catalog_root,

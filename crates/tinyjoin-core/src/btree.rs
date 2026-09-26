@@ -90,6 +90,14 @@ pub(crate) struct BatchChange<'a> {
     pub(crate) value: Option<&'a [u8]>,
 }
 
+impl BatchChange<'_> {
+    /// Sorts a batch of changes to distinct keys into the order [`Btree::apply`] takes. Batches
+    /// share this sort, so its code is built once.
+    pub(crate) fn sort(batch: &mut [Self]) {
+        batch.sort_unstable_by(|left, right| left.key.cmp(right.key));
+    }
+}
+
 /// The outcome of one [`Btree::apply`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BtreeBatch {

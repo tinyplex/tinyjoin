@@ -717,11 +717,10 @@ fn secondary_index_key(
                 .get(column)
                 .is_some_and(|value| exact_primary_key_value(schema, column, value))
         }) {
-            let key = definition
-                .columns
-                .iter()
-                .map(|column| (column.clone(), equalities[column].clone()))
-                .collect();
+            let mut key = Row::new();
+            for column in &definition.columns {
+                key.insert(column.clone(), equalities[column].clone());
+            }
             return Ok(Some((definition.columns, key)));
         }
     }
@@ -1909,10 +1908,12 @@ pub(crate) fn parameter_index(index: &str) -> Result<usize> {
 const PREPARED_PARAMETER_KEY: &str = "\0tinyjoin:parameter";
 
 pub(crate) fn prepared_parameter_marker(index: usize) -> Value {
-    Value::Object(Map::from_iter([(
+    let mut marker = Map::new();
+    marker.insert(
         PREPARED_PARAMETER_KEY.to_owned(),
         Value::Number((index as u64).into()),
-    )]))
+    );
+    Value::Object(marker)
 }
 
 pub(crate) fn prepared_parameter_index(value: &Value) -> Option<usize> {
@@ -3068,11 +3069,11 @@ pub(crate) fn primary_key_lookup(
                 .is_some_and(|value| exact_primary_key_value(schema, column, value))
         })
         .then(|| {
-            schema
-                .primary_key
-                .iter()
-                .map(|column| (column.clone(), equalities[column].clone()))
-                .collect()
+            let mut key = Row::new();
+            for column in &schema.primary_key {
+                key.insert(column.clone(), equalities[column].clone());
+            }
+            key
         })
 }
 

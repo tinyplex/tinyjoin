@@ -1090,12 +1090,10 @@ impl ConflictIndex {
         work_bytes: &mut usize,
     ) -> Result<Vec<Row>> {
         if self.scanned.is_none() {
-            let lookup = self
-                .definition
-                .columns
-                .iter()
-                .map(|column| (column.clone(), row[column].clone()))
-                .collect::<Row>();
+            let mut lookup = Row::new();
+            for column in &self.definition.columns {
+                lookup.insert(column.clone(), row[column].clone());
+            }
             let mut rows = Vec::new();
             if storage
                 .visit_index(
@@ -1508,7 +1506,7 @@ fn column_default(schema: &TableDefinition, name: &str) -> Result<Value> {
         .ok_or_else(|| EngineError::column_not_found(name, &schema.name))
 }
 
-fn primary_key_row(schema: &TableDefinition, row: &Row) -> Result<Row> {
+pub(crate) fn primary_key_row(schema: &TableDefinition, row: &Row) -> Result<Row> {
     let mut key = Map::new();
     for column in &schema.primary_key {
         let value = row.get(column).ok_or_else(|| {
