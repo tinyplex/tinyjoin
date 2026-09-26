@@ -69,10 +69,12 @@ than about four times as long, and reading every row, `LIKE` scans, and
   it is no longer held to the limit on ordered matching rows. Inside a
   transaction that has changed the table, it still sorts.
 - Scans read only the columns a statement uses, straight from the stored row.
-- Writes apply each statement's rows to each B-tree in one pass, index builds
-  sort their entries first, and commits write each page once and flush twice
-  rather than three times, writing each run of consecutive pages with a
-  single storage call.
+- Writes apply each statement's rows to each B-tree in one pass, and index
+  builds sort their entries first. A commit writes each page once, a run of
+  consecutive pages with a single storage call, and makes them durable with one
+  flush rather than three. Its superblock records a fingerprint of the pages it
+  wrote, so reopening after an interrupted commit returns to the last complete
+  one.
 - Rows travel from the engine to the page as JSON text, which only the page
   parses, rather than as objects built one property at a time and then copied
   between threads. A point query takes about a quarter less time, and reading

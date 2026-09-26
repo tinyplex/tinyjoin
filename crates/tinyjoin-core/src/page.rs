@@ -75,6 +75,36 @@ impl TryFrom<u8> for PageType {
     }
 }
 
+/// The checksum a sealed page carries.
+pub(crate) fn page_checksum(bytes: &[u8; PAGE_SIZE]) -> u32 {
+    u32::from_le_bytes(
+        bytes[PAGE_CRC_OFFSET..PAGE_CRC_OFFSET + 4]
+            .try_into()
+            .expect("a checksum is four bytes"),
+    )
+}
+
+/// The fingerprint of the data pages a commit wrote, from each page's ID and checksum in ascending
+/// page order. A superblock records its commit's, so that recovery can tell whether every page the
+/// commit wrote became durable with it.
+pub(crate) struct CommitHash(crate::hash::Hasher);
+
+impl CommitHash {
+    pub(crate) fn new() -> Self {
+        Self(crate::hash::Hasher::new())
+    }
+
+    /// Adds the next page, which must follow every page added before it.
+    pub(crate) fn page(&mut self, id: PageId, checksum: u32) {
+        self.0.write_u64(id);
+        self.0.write_u64(checksum.into());
+    }
+
+    pub(crate) fn finish(self) -> u64 {
+        self.0.finish()
+    }
+}
+
 /// Writes a physical page's checksum, which covers the page with its own field read as zero.
 pub(crate) fn seal(bytes: &mut [u8; PAGE_SIZE]) {
     let checksum = crc32_update(u32::MAX, &bytes[..PAGE_CRC_OFFSET]);
@@ -347,6 +377,9 @@ pub(crate) struct Superblock {
     pub catalog_root_page_id: Option<PageId>,
     pub live_data_page_count: u32,
     pub max_page_count: PageId,
+    /// The [commit hash](CommitHash) of the data pages this generation's commit wrote: those
+    /// its allocation bitmap holds and its predecessor's does not.
+    pub commit_hash: u64,
 }
 
 impl Superblock {
@@ -365,6 +398,7 @@ impl Superblock {
             catalog_root_page_id: None,
             live_data_page_count: 0,
             max_page_count: MAX_PAGE_COUNT,
+            commit_hash: CommitHash::new().finish(),
         }
     }
 
@@ -386,6 +420,7 @@ impl Superblock {
         payload[68..70].copy_from_slice(&(BITMAP_CHUNK_COUNT as u16).to_le_bytes());
         payload[70] = self.slot as u8;
         payload[71] = self.bitmap_slot as u8;
+        payload[72..80].copy_from_slice(&self.commit_hash.to_le_bytes());
         Page::new(self.slot.page_id(), PageType::Superblock, payload)?.encode()
     }
 
@@ -432,7 +467,7 @@ impl Superblock {
                 "Superblock maximum page count does not match this build",
             ));
         }
-        if payload[72..].iter().any(|byte| *byte != 0) {
+        if payload[80..].iter().any(|byte| *byte != 0) {
             return Err(invalid_page("Superblock reserved bytes must be zero"));
         }
         if read_u16(payload, 68) as usize != BITMAP_CHUNK_COUNT {
@@ -462,6 +497,7 @@ impl Superblock {
             catalog_root_page_id,
             live_data_page_count: read_u32(payload, 64),
             max_page_count,
+            commit_hash: read_u64(payload, 72),
         };
         superblock.validate()?;
         Ok(superblock)
@@ -601,7 +637,13 @@ impl AllocationBitmap {
     }
 
     pub(crate) fn allocated_page_count(&self) -> u32 {
-        self.bits.iter().map(|byte| byte.count_ones()).sum()
+        // Eight bytes at a time: every commit counts the whole bitmap.
+        let (words, rest) = self.bits.as_chunks::<8>();
+        let words: u32 = words
+            .iter()
+            .map(|word| u64::from_le_bytes(*word).count_ones())
+            .sum();
+        words + rest.iter().map(|byte| byte.count_ones()).sum::<u32>()
     }
 
     pub(crate) fn encode_pages(&self) -> Result<Vec<[u8; PAGE_SIZE]>> {
@@ -820,10 +862,15 @@ pub(crate) struct PendingMetadata {
     pub allocation_bitmap: AllocationBitmap,
 }
 
+/// The newest recoverable metadata root, and the root it replaced when that is recoverable too.
+///
+/// A commit writes its root in the slot beside its predecessor's, and makes its pages and its root
+/// durable together, so an interrupted commit can leave a newest root naming pages that never
+/// became durable. The predecessor is what recovery falls back to then.
 pub(crate) fn recover_metadata(
     slot_a: RawMetadataSlot<'_>,
     slot_b: RawMetadataSlot<'_>,
-) -> Result<Option<RecoveredMetadata>> {
+) -> Result<Option<(RecoveredMetadata, Option<RecoveredMetadata>)>> {
     let metadata_present = slot_a.is_present() || slot_b.is_present();
     if !metadata_present {
         return Ok(None);
@@ -846,14 +893,21 @@ pub(crate) fn recover_metadata(
                         "Equal-generation metadata slots contain different logical roots",
                     ));
                 }
-                Ok(Some(candidate_a))
-            } else if candidate_a.superblock.generation > candidate_b.superblock.generation {
-                Ok(Some(candidate_a))
+                Ok(Some((candidate_a, None)))
             } else {
-                Ok(Some(candidate_b))
+                let (newest, older) =
+                    if candidate_a.superblock.generation > candidate_b.superblock.generation {
+                        (candidate_a, candidate_b)
+                    } else {
+                        (candidate_b, candidate_a)
+                    };
+                let previous = (older.superblock.generation.checked_add(1)
+                    == Some(newest.superblock.generation))
+                .then_some(older);
+                Ok(Some((newest, previous)))
             }
         }
-        (Ok(candidate), Err(_)) | (Err(_), Ok(candidate)) => Ok(Some(candidate)),
+        (Ok(candidate), Err(_)) | (Err(_), Ok(candidate)) => Ok(Some((candidate, None))),
         (Err(error_a), Err(error_b)) => Err(invalid_page(format!(
             "No valid metadata root remains; slot A: {}: {}; slot B: {}: {}",
             error_a.code, error_a.message, error_b.code, error_b.message
@@ -900,6 +954,8 @@ pub(crate) fn build_next_metadata(
         catalog_root_page_id,
         live_data_page_count,
         max_page_count: MAX_PAGE_COUNT,
+        // The pager records the commit's pages once it has written them.
+        commit_hash: CommitHash::new().finish(),
     };
     superblock.validate()?;
     superblock.validate_bitmap(&allocation_bitmap)?;
@@ -1040,6 +1096,7 @@ mod tests {
             catalog_root_page_id: Some(FIRST_DATA_PAGE_ID),
             live_data_page_count: if extra_page { 2 } else { 1 },
             max_page_count: MAX_PAGE_COUNT,
+            commit_hash: CommitHash::new().finish(),
         };
         superblock.validate_bitmap(&allocation_bitmap).unwrap();
         EncodedMetadata {
@@ -1162,7 +1219,7 @@ mod tests {
             (68, 2, "UNSUPPORTED_PAGE"),
             (70, 2, "INVALID_PAGE"),
             (71, 1, "INVALID_PAGE"),
-            (72, 1, "INVALID_PAGE"),
+            (80, 1, "INVALID_PAGE"),
         ] {
             let mut corrupted = page;
             mutate_payload(&mut corrupted, offset, value);
@@ -1345,10 +1402,17 @@ mod tests {
     fn metadata_recovery_selects_the_highest_complete_generation() {
         let older = encoded_metadata(SuperblockSlot::A, 8, 20, false);
         let newer = encoded_metadata(SuperblockSlot::B, 9, 21, false);
-        let recovered = recover_metadata(older.raw(), newer.raw()).unwrap().unwrap();
+        let (recovered, previous) = recover_metadata(older.raw(), newer.raw()).unwrap().unwrap();
         assert_eq!(recovered.superblock.slot, SuperblockSlot::B);
         assert_eq!(recovered.superblock.generation, 9);
         assert_eq!(recovered.superblock.database_revision, 21);
+        // The older root is the newer one's predecessor, which recovery can fall back to.
+        assert_eq!(previous.unwrap().superblock.generation, 8);
+        let distant = encoded_metadata(SuperblockSlot::B, 10, 22, false);
+        let (_, previous) = recover_metadata(older.raw(), distant.raw())
+            .unwrap()
+            .unwrap();
+        assert!(previous.is_none());
     }
 
     #[test]
@@ -1369,6 +1433,7 @@ mod tests {
                 recover_metadata(older.raw(), torn)
                     .unwrap()
                     .unwrap()
+                    .0
                     .superblock
                     .slot,
                 SuperblockSlot::A
@@ -1392,6 +1457,7 @@ mod tests {
                     )
                     .unwrap()
                     .unwrap()
+                    .0
                     .superblock
                     .slot,
                     SuperblockSlot::A
@@ -1419,6 +1485,7 @@ mod tests {
                 recover_metadata(older.raw(), corrupted)
                     .unwrap()
                     .unwrap()
+                    .0
                     .superblock
                     .slot,
                 SuperblockSlot::A
@@ -1456,7 +1523,7 @@ mod tests {
                 &stale_bitmap.bitmap_chunks[2],
             ],
         );
-        let recovered = recover_metadata(older.raw(), mixed).unwrap().unwrap();
+        let (recovered, _) = recover_metadata(older.raw(), mixed).unwrap().unwrap();
         assert_eq!(recovered.superblock.slot, SuperblockSlot::A);
         assert_eq!(recovered.superblock.generation, 8);
     }
@@ -1465,10 +1532,11 @@ mod tests {
     fn equal_generation_roots_must_be_logically_identical() {
         let slot_a = encoded_metadata(SuperblockSlot::A, 12, 30, false);
         let slot_b = encoded_metadata(SuperblockSlot::B, 12, 30, false);
-        let recovered = recover_metadata(slot_a.raw(), slot_b.raw())
+        let (recovered, previous) = recover_metadata(slot_a.raw(), slot_b.raw())
             .unwrap()
             .unwrap();
         assert_eq!(recovered.superblock.generation, 12);
+        assert!(previous.is_none());
 
         let different_root = encoded_metadata(SuperblockSlot::B, 12, 31, false);
         assert_eq!(
@@ -1564,7 +1632,8 @@ mod tests {
         let active_bytes = encoded_metadata(SuperblockSlot::A, 8, 20, false);
         let active = recover_metadata(active_bytes.raw(), RawMetadataSlot::empty())
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .0;
         let mut allocation_bitmap = active.allocation_bitmap.clone();
         allocation_bitmap
             .set_allocated(FIRST_DATA_PAGE_ID + 1, true)
@@ -1590,7 +1659,8 @@ mod tests {
         let active_bytes = encoded_metadata(SuperblockSlot::A, 8, 20, false);
         let active = recover_metadata(active_bytes.raw(), RawMetadataSlot::empty())
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .0;
         assert_eq!(
             build_next_metadata(
                 &active,
@@ -1606,7 +1676,8 @@ mod tests {
         let exhausted_bytes = encoded_metadata(SuperblockSlot::A, u64::MAX, 20, false);
         let exhausted = recover_metadata(exhausted_bytes.raw(), RawMetadataSlot::empty())
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .0;
         assert_eq!(
             build_next_metadata(
                 &exhausted,

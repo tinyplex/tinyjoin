@@ -336,6 +336,30 @@ impl<D: PageDevice> PageCache<D> {
         self.write_owner(Owner::Candidate(candidate))
     }
 
+    /// The checksum a candidate's page was last written with. A page is sealed when it is
+    /// written, so this follows [`Self::write_candidate_pages`]; a page evicted since then is read
+    /// back from the device.
+    pub(crate) fn candidate_page_checksum(
+        &mut self,
+        candidate: CandidateId,
+        id: PageId,
+    ) -> Result<u32> {
+        self.ensure_reserved_by(candidate, id)?;
+        if let Some(index) = self.lookup.get(&(Owner::Candidate(candidate), id)) {
+            let entry = &self.entries[*index];
+            if entry.dirty || entry.unsealed {
+                return Err(cache_error(storage_diagnostic!(
+                    "Candidate {candidate} must write page {id} before its checksum is read"
+                )));
+            }
+            return Ok(crate::page::page_checksum(&entry.bytes));
+        }
+        let mut bytes = [0; PAGE_SIZE];
+        self.device.read_page(id, &mut bytes)?;
+        crate::page::Page::verify(&bytes)?;
+        Ok(crate::page::page_checksum(&bytes))
+    }
+
     /// Flushes the device, making every page written through it durable.
     pub(crate) fn flush_device(&mut self) -> Result<()> {
         self.device.flush()?;

@@ -3593,6 +3593,18 @@ mod tests {
         value
     }
 
+    /// The pager's device, without the root its active root replaced. These tests alter the
+    /// active root's pages or metadata on purpose; recovery would otherwise take that for an
+    /// interrupted commit and reopen the predecessor instead.
+    fn into_device_without_predecessor(pager: Pager<MemoryPageDevice>) -> MemoryPageDevice {
+        let inactive = pager.active_metadata().superblock.slot.inactive();
+        let mut device = pager.into_device();
+        device
+            .write_page(inactive.page_id(), &[0; crate::PAGE_SIZE])
+            .unwrap();
+        device
+    }
+
     fn create_tree(pager: &mut Pager<MemoryPageDevice>) -> PageId {
         let mut transaction = pager.begin_write().unwrap();
         let root = Btree::create(&mut transaction, TREE).unwrap();
@@ -3760,7 +3772,7 @@ mod tests {
         free_pages: &[PageId],
     ) -> Pager<SparseDevice> {
         let active = pager.active_metadata().clone();
-        let mut memory = pager.into_device();
+        let mut memory = into_device_without_predecessor(pager);
         let mut bitmap = active.allocation_bitmap;
         for id in FIRST_DATA_PAGE_ID..MAX_PAGE_COUNT {
             bitmap.set_allocated(id, true).unwrap();
@@ -4881,7 +4893,7 @@ mod tests {
         );
         let descriptor = overflow_descriptor_from_root(&mut pager, root, b"overflow");
         let active = pager.active_metadata().clone();
-        let mut device = pager.into_device();
+        let mut device = into_device_without_predecessor(pager);
         let mut overflow = Page::decode(device.page(descriptor.first_page_id).unwrap()).unwrap();
         overflow.payload[OVERFLOW_HEADER_SIZE] ^= 1;
         device
@@ -4937,7 +4949,7 @@ mod tests {
         );
 
         let active = pager.active_metadata().clone();
-        let mut memory = pager.into_device();
+        let mut memory = into_device_without_predecessor(pager);
         let mut bitmap: AllocationBitmap = active.allocation_bitmap;
         for id in FIRST_DATA_PAGE_ID..MAX_PAGE_COUNT {
             bitmap.set_allocated(id, true).unwrap();
@@ -5233,7 +5245,7 @@ mod tests {
                 &vec![5; MAX_OVERFLOW_CHUNK_BYTES * 2 + 1],
             );
             let descriptor = overflow_descriptor_from_root(&mut pager, root, b"large");
-            (pager.into_device(), root, descriptor)
+            (into_device_without_predecessor(pager), root, descriptor)
         }
 
         let (mut device, root, descriptor) = committed_overflow();
@@ -5279,7 +5291,7 @@ mod tests {
         let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
         let root = create_tree(&mut pager);
         let generation = pager.generation();
-        let mut device = pager.into_device();
+        let mut device = into_device_without_predecessor(pager);
         let corrupt = Node::internal(
             TREE,
             generation,

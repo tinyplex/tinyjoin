@@ -16,6 +16,9 @@ enum Cut {
     Before,
     After,
     PartialDurable,
+    /// A failed flush that persists every metadata page but only some of the data pages written
+    /// since the last flush, as one flush per commit allows.
+    MetadataDurable,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -98,7 +101,7 @@ impl PageDevice for FaultDevice {
         assert_eq!(source.len(), PAGE_SIZE);
         let mut state = self.0.borrow_mut();
         let cut = Self::failure(&mut state, Io::Write(id));
-        if matches!(cut, Some(Cut::Before)) {
+        if matches!(cut, Some(Cut::Before | Cut::MetadataDurable)) {
             return Err(interrupted());
         }
         let id = id as usize;
@@ -129,6 +132,16 @@ impl PageDevice for FaultDevice {
         let mut state = self.0.borrow_mut();
         let cut = Self::failure(&mut state, Io::Flush);
         if matches!(cut, Some(Cut::Before)) {
+            return Err(interrupted());
+        }
+        if matches!(cut, Some(Cut::MetadataDurable)) {
+            let length = state.working.len();
+            state.durable.resize(length, [0; PAGE_SIZE]);
+            for id in 0..length {
+                if id < FIRST_DATA_PAGE_ID as usize || (id as u64 + state.salt).is_multiple_of(2) {
+                    state.durable[id] = state.working[id];
+                }
+            }
             return Err(interrupted());
         }
         if matches!(cut, Some(Cut::PartialDurable)) {
@@ -428,11 +441,20 @@ fn check_recovery(mode: Execution) {
             &format!("seed={seed}, mode={mode:?}, successful probe"),
         );
         let trace = probe.0.borrow().trace.clone();
-        assert!(trace.iter().filter(|io| matches!(io, Io::Flush)).count() >= 2);
+        assert!(trace.iter().any(|io| matches!(io, Io::Flush)));
         assert!(trace.iter().any(|io| matches!(io, Io::Write(id) if *id >= FIRST_DATA_PAGE_ID && (*id as usize) < baseline.len())), "the candidate must exercise reused data pages");
 
         for operation in 1..=trace.len() {
-            for cut in [Cut::Before, Cut::After, Cut::PartialDurable] {
+            for cut in [
+                Cut::Before,
+                Cut::After,
+                Cut::PartialDurable,
+                Cut::MetadataDurable,
+            ] {
+                if matches!(cut, Cut::MetadataDurable) && !matches!(trace[operation - 1], Io::Flush)
+                {
+                    continue;
+                }
                 cases += 1;
                 let context = format!(
                     "seed={seed}, mode={mode:?}, operation={operation}/{}, io={:?}, cut={cut:?}",

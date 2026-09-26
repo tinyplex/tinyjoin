@@ -4,6 +4,7 @@ use std::{
     rc::Rc,
 };
 
+use crate::page::{CommitHash, page_checksum};
 use crate::{
     AllocationBitmap, CandidateId, DEFAULT_PAGE_CACHE_BYTES, EngineError, FIRST_DATA_PAGE_ID,
     MAX_PAGE_COUNT, PAGE_SIZE, Page, PageCache, PageDevice, PageId, PageRef, RawMetadataSlot,
@@ -34,9 +35,9 @@ macro_rules! storage_diagnostic {
 ///
 /// `Pager` deliberately permits only one [`PagerWriteTransaction`] at a time. Data pages are
 /// written to locations which are unreachable from the active superblock, then published by
-/// writing the inactive allocation bitmap and superblock. A failure after the superblock write is
-/// attempted poisons the in-memory pager: callers must reopen the same device to discover whether
-/// the old or new root became durable.
+/// writing the inactive allocation bitmap and superblock and flushing them all together. A failure
+/// after the superblock write is attempted poisons the in-memory pager: callers must reopen the
+/// same device to discover whether the old or new root became durable.
 pub(crate) struct Pager<D: PageDevice> {
     device: SharedPageDevice<D>,
     cache: PageCache<SharedPageDevice<D>>,
@@ -398,13 +399,16 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
         self.finished = true;
     }
 
-    /// Publishes this candidate in the only crash-safe order:
+    /// Publishes this candidate with one flush:
     ///
-    /// 1. write the candidate data pages and the inactive bitmap chunks, and flush them together:
-    ///    only the new superblock refers to any of them, so they need not be durable in any order
-    ///    among themselves, only before it;
-    /// 2. write the inactive superblock and flush it;
+    /// 1. write the candidate data pages, the inactive bitmap chunks, and the inactive superblock,
+    ///    which records a [commit hash](CommitHash) of the data pages;
+    /// 2. flush them together;
     /// 3. install the candidate cache view and swap the in-memory active root.
+    ///
+    /// None of these writes touches a page the active root can reach, so an interruption leaves
+    /// that root intact. If it also leaves the new superblock durable without every page it names,
+    /// recovery finds that the commit hash no longer matches and reopens the active root instead.
     pub(crate) fn commit(
         mut self,
         database_revision: u64,
@@ -426,7 +430,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
             )));
         }
 
-        let pending = match build_next_metadata(
+        let mut pending = match build_next_metadata(
             &self.pager.active,
             database_revision,
             database_hash,
@@ -436,20 +440,36 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
             Ok(pending) => pending,
             Err(error) => return self.fail_before_superblock(error),
         };
-        // Serialize every metadata page before performing any publication I/O. This prevents a
-        // local validation error from appearing after candidate data has been flushed.
+        // Serialize every metadata page before performing any publication I/O, so that a local
+        // validation error cannot appear after candidate data has been written. Only the commit
+        // hash, which the pages' checksums decide, is added once they have been written.
         let bitmap_pages = match pending.allocation_bitmap.encode_pages() {
             Ok(pages) => pages,
             Err(error) => return self.fail_before_superblock(error),
         };
-        let superblock_page = match pending.superblock.encode_page() {
-            Ok(page) => page,
-            Err(error) => return self.fail_before_superblock(error),
-        };
+        if let Err(error) = pending.superblock.encode_page() {
+            return self.fail_before_superblock(error);
+        }
 
         if let Err(error) = self.pager.cache.write_candidate_pages(self.candidate) {
             return self.fail_before_superblock(error);
         }
+        let mut hash = CommitHash::new();
+        for id in &self.new_pages {
+            match self
+                .pager
+                .cache
+                .candidate_page_checksum(self.candidate, *id)
+            {
+                Ok(checksum) => hash.page(*id, checksum),
+                Err(error) => return self.fail_before_superblock(error),
+            }
+        }
+        pending.superblock.commit_hash = hash.finish();
+        let superblock_page = match pending.superblock.encode_page() {
+            Ok(page) => page,
+            Err(error) => return self.fail_before_superblock(error),
+        };
         // A slot's chunks are consecutive pages, so they are written in one call.
         if let Err(error) = self.pager.device.write_pages(
             pending.superblock.bitmap_slot.page_id(0),
@@ -457,13 +477,10 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
         ) {
             return self.fail_before_superblock(error);
         }
-        if let Err(error) = self.pager.cache.flush_device() {
-            return self.fail_before_superblock(error);
-        }
 
-        // From this point onward the inactive superblock may already name the new bitmap even if
-        // the device reports failure. Continuing to use the old in-memory view could overwrite
-        // pages needed by whichever generation actually became durable.
+        // From this point onward the inactive superblock may name the new bitmap even if the
+        // device reports failure. Continuing to use the old in-memory view could overwrite pages
+        // needed by whichever generation actually became durable.
         if let Err(error) = self
             .pager
             .device
@@ -471,7 +488,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
         {
             return self.fail_after_superblock("writing the new superblock", error);
         }
-        if let Err(error) = self.pager.device.flush() {
+        if let Err(error) = self.pager.cache.flush_device() {
             return self.fail_after_superblock("flushing the new superblock", error);
         }
 
@@ -694,9 +711,42 @@ fn recover_device_metadata<D: PageDevice>(
             &pages[SuperblockSlot::B.bitmap_slot().page_id(2) as usize],
         ],
     );
-    recover_metadata(slot_a, slot_b)?.ok_or_else(|| {
+    let (newest, previous) = recover_metadata(slot_a, slot_b)?.ok_or_else(|| {
         pager_error("A non-empty page device does not contain a recoverable metadata root")
-    })
+    })?;
+    match previous {
+        Some(previous) if !commit_is_durable(&mut direct, &newest, &previous)? => Ok(previous),
+        _ => Ok(newest),
+    }
+}
+
+/// Whether every data page the newest root's commit wrote became durable with it: the pages its
+/// bitmap holds and its predecessor's does not, which must all be present, valid, and match the
+/// commit hash the root recorded.
+fn commit_is_durable<D: PageDevice>(
+    device: &mut SharedPageDevice<D>,
+    newest: &RecoveredMetadata,
+    previous: &RecoveredMetadata,
+) -> Result<bool> {
+    let page_count = device.page_count();
+    let mut hash = CommitHash::new();
+    let mut bytes = [0; PAGE_SIZE];
+    for id in FIRST_DATA_PAGE_ID..MAX_PAGE_COUNT {
+        if !newest.allocation_bitmap.is_allocated(id)?
+            || previous.allocation_bitmap.is_allocated(id)?
+        {
+            continue;
+        }
+        if id >= page_count {
+            return Ok(false);
+        }
+        device.read_page(id, &mut bytes)?;
+        if verify_expected_page(id, &bytes).is_err() {
+            return Ok(false);
+        }
+        hash.page(id, page_checksum(&bytes));
+    }
+    Ok(hash.finish() == newest.superblock.commit_hash)
 }
 
 fn validate_physical_coverage<D: PageDevice>(
@@ -1232,9 +1282,9 @@ mod tests {
 
     #[test]
     fn every_pre_superblock_publication_cut_reopens_the_old_root() {
-        // commit operations: data write, three bitmap writes, one flush for both, superblock
-        // write, superblock flush.
-        for operation in 1..=5 {
+        // commit operations: data write, three bitmap writes, superblock write, and one flush
+        // for all of them.
+        for operation in 1..=4 {
             for timing in [FailureTiming::Before, FailureTiming::After] {
                 let (device, old_root) = committed_fault_device();
                 let mut pager = Pager::open_or_create(device.clone()).unwrap();
@@ -1261,10 +1311,10 @@ mod tests {
     #[test]
     fn ambiguous_superblock_cuts_poison_and_reopen_the_old_or_new_valid_root() {
         for (operation, timing, expected_value) in [
+            (5, FailureTiming::Before, 1),
+            (5, FailureTiming::After, 1),
             (6, FailureTiming::Before, 1),
-            (6, FailureTiming::After, 1),
-            (7, FailureTiming::Before, 1),
-            (7, FailureTiming::After, 2),
+            (6, FailureTiming::After, 2),
         ] {
             let (device, old_root) = committed_fault_device();
             let mut pager = Pager::open_or_create(device.clone()).unwrap();
@@ -1296,6 +1346,37 @@ mod tests {
                 reopened.read_page(expected_root).unwrap().payload,
                 vec![expected_value]
             );
+        }
+    }
+
+    #[test]
+    fn a_commit_whose_pages_did_not_all_become_durable_reopens_its_predecessor() {
+        // One flush makes a commit's pages and its superblock durable together, so an interrupted
+        // flush can leave the superblock without a page it names, as zeros or as a stale page.
+        for stale in [false, true] {
+            let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+            let mut transaction = pager.begin_write().unwrap();
+            let old_root = transaction.allocate_page().unwrap();
+            transaction.write_new_page(&leaf(old_root, 1)).unwrap();
+            transaction.commit(1, EMPTY_HASH, Some(old_root)).unwrap();
+            let generation = pager.generation();
+            let mut transaction = pager.begin_write().unwrap();
+            let new_root = transaction.allocate_page().unwrap();
+            transaction.write_new_page(&leaf(new_root, 2)).unwrap();
+            transaction.free_shared_page(old_root).unwrap();
+            transaction.commit(2, EMPTY_HASH, Some(new_root)).unwrap();
+
+            let mut device = pager.into_device();
+            let damaged = if stale {
+                leaf(new_root, 7).encode().unwrap()
+            } else {
+                [0; PAGE_SIZE]
+            };
+            device.write_page(new_root, &damaged).unwrap();
+            let mut reopened = Pager::open_or_create(device).unwrap();
+            assert_eq!(reopened.generation(), generation);
+            assert_eq!(reopened.catalog_root_page_id(), Some(old_root));
+            assert_eq!(reopened.read_page(old_root).unwrap().payload, vec![1]);
         }
     }
 
@@ -1339,38 +1420,57 @@ mod tests {
 
     #[test]
     fn recovery_rejects_an_allocated_page_past_physical_eof() {
-        let pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
-        let mut device = pager.into_device();
-        let missing = FIRST_DATA_PAGE_ID + 9;
-        let mut bitmap = AllocationBitmap::new(2, BitmapSlot::B).unwrap();
-        bitmap.set_allocated(missing, true).unwrap();
-        let superblock = Superblock {
-            slot: SuperblockSlot::B,
-            generation: 2,
-            database_revision: 1,
-            database_hash: EMPTY_HASH,
-            bitmap_slot: BitmapSlot::B,
-            bitmap_generation: 2,
-            catalog_root_page_id: Some(missing),
-            live_data_page_count: 1,
-            max_page_count: MAX_PAGE_COUNT,
-        };
-        for (chunk, page) in bitmap.encode_pages().unwrap().iter().enumerate() {
+        // A root naming a page the file does not hold. With its predecessor intact, that is an
+        // interrupted commit, which recovery rolls back; without one, recovery fails closed.
+        for predecessor in [true, false] {
+            let pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+            let mut device = pager.into_device();
+            let missing = FIRST_DATA_PAGE_ID + 9;
+            let mut bitmap = AllocationBitmap::new(2, BitmapSlot::B).unwrap();
+            bitmap.set_allocated(missing, true).unwrap();
+            let superblock = Superblock {
+                slot: SuperblockSlot::B,
+                generation: 2,
+                database_revision: 1,
+                database_hash: EMPTY_HASH,
+                bitmap_slot: BitmapSlot::B,
+                bitmap_generation: 2,
+                catalog_root_page_id: Some(missing),
+                live_data_page_count: 1,
+                max_page_count: MAX_PAGE_COUNT,
+                commit_hash: CommitHash::new().finish(),
+            };
+            for (chunk, page) in bitmap.encode_pages().unwrap().iter().enumerate() {
+                device
+                    .write_page(BitmapSlot::B.page_id(chunk), page)
+                    .unwrap();
+            }
             device
-                .write_page(BitmapSlot::B.page_id(chunk), page)
+                .write_page(
+                    SuperblockSlot::B.page_id(),
+                    &superblock.encode_page().unwrap(),
+                )
                 .unwrap();
+            if !predecessor {
+                device
+                    .write_page(SuperblockSlot::A.page_id(), &[0; PAGE_SIZE])
+                    .unwrap();
+            }
+            match Pager::open_or_create(device) {
+                Ok(pager) => {
+                    assert!(predecessor, "metadata past physical EOF must fail recovery");
+                    assert_eq!(pager.generation(), 1);
+                    assert_eq!(pager.catalog_root_page_id(), None);
+                }
+                Err(error) => {
+                    assert!(
+                        !predecessor,
+                        "an interrupted commit must roll back: {error}"
+                    );
+                    assert_eq!(error.code, "PAGER_ERROR");
+                }
+            }
         }
-        device
-            .write_page(
-                SuperblockSlot::B.page_id(),
-                &superblock.encode_page().unwrap(),
-            )
-            .unwrap();
-        let error = match Pager::open_or_create(device) {
-            Ok(_) => panic!("metadata past physical EOF must fail recovery"),
-            Err(error) => error,
-        };
-        assert_eq!(error.code, "PAGER_ERROR");
     }
 
     #[derive(Debug)]
@@ -1414,6 +1514,7 @@ mod tests {
             catalog_root_page_id: Some(FIRST_DATA_PAGE_ID),
             live_data_page_count: (MAX_PAGE_COUNT - FIRST_DATA_PAGE_ID) as u32,
             max_page_count: MAX_PAGE_COUNT,
+            commit_hash: CommitHash::new().finish(),
         };
         let mut pages = HashMap::new();
         pages.insert(

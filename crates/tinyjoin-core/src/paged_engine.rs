@@ -343,6 +343,7 @@ mod tests {
         durable: Vec<[u8; PAGE_SIZE]>,
         flushes: usize,
         fail_after_flush: Option<usize>,
+        fail_next_write: bool,
     }
 
     #[derive(Clone, Default)]
@@ -353,6 +354,11 @@ mod tests {
             let mut state = self.0.borrow_mut();
             state.flushes = 0;
             state.fail_after_flush = Some(flush);
+        }
+
+        /// Fails the next page write before it changes anything.
+        fn arm_next_write(&self) {
+            self.0.borrow_mut().fail_next_write = true;
         }
 
         fn crash(&self) {
@@ -381,6 +387,12 @@ mod tests {
             let mut state = self.0.borrow_mut();
             if source.len() != PAGE_SIZE {
                 return Err(EngineError::new("DURABLE_DEVICE", "invalid write"));
+            }
+            if std::mem::take(&mut state.fail_next_write) {
+                return Err(EngineError::new(
+                    "INJECTED_IO",
+                    "failure before a page write",
+                ));
             }
             if id == state.working.len() as PageId {
                 state.working.push([0; PAGE_SIZE]);
@@ -1323,7 +1335,7 @@ mod tests {
                 &[],
             )
             .unwrap();
-        control.arm_after_flush(1);
+        control.arm_next_write();
         assert_eq!(engine.commit_transaction().unwrap_err().code, "INJECTED_IO");
         assert!(engine.in_transaction());
         assert_eq!(engine.revision(), revision);
@@ -1362,7 +1374,7 @@ mod tests {
                 &[],
             )
             .unwrap();
-        control.arm_after_flush(2);
+        control.arm_after_flush(1);
         assert_eq!(
             engine.commit_transaction().unwrap_err().code,
             "RECOVERY_REQUIRED"
@@ -1477,7 +1489,7 @@ mod tests {
         let control = device.clone();
         let mut engine = page_native_fixture(device).unwrap();
         assert!(!engine.in_transaction());
-        control.arm_after_flush(2);
+        control.arm_after_flush(1);
         assert_eq!(
             engine
                 .execute_sql(
