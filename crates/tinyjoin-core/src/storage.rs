@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use serde_json::Value;
 
+use crate::paged_codec::StoredRecord;
 use crate::row::RowRef;
 use crate::{
     ColumnDefinition, ColumnType, EngineError, IndexDefinition, Result, Row, RowChange,
@@ -1128,6 +1129,22 @@ pub(crate) fn estimated_row_bytes(row: &Row) -> Result<usize> {
             bytes,
             checked_row_write_mul(estimated_value_bytes_at_depth(value, 1)?, 2)?,
         )?;
+    }
+    Ok(bytes)
+}
+
+/// [`estimated_row_bytes`] for the row a stored record decodes to, reading each column in place.
+/// The decoded row holds every column of its schema, and each value's estimate is the one its
+/// decoded JSON value has.
+pub(crate) fn estimated_record_bytes(record: &StoredRecord<'_>) -> Result<usize> {
+    let mut bytes = 32usize;
+    for (position, column) in record.schema().columns.iter().enumerate() {
+        let value = record
+            .column(position)?
+            .owned_bytes(|value| estimated_value_bytes_at_depth(value, 1))?;
+        bytes = checked_row_write_add(bytes, 64)?;
+        bytes = checked_row_write_add(bytes, checked_row_write_mul(column.name.len(), 2)?)?;
+        bytes = checked_row_write_add(bytes, checked_row_write_mul(value, 2)?)?;
     }
     Ok(bytes)
 }

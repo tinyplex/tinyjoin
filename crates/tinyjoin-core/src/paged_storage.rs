@@ -21,7 +21,7 @@ use crate::{
         leading_key_component, secondary_index_entry_matches_prefix, secondary_index_primary_key,
         secondary_index_primary_key_for_definition,
     },
-    row::RowRef,
+    row::{HeldRow, RowRef},
     storage::{KeyOrder, KeyRange, RowWriteUsage, normalize_row, preflight_row_write_set},
 };
 /// A relational view over the crash-safe paged B-tree store.
@@ -389,6 +389,19 @@ impl<D: PageDevice> PagedStorage<D> {
     /// measures what it adds to the write set's usage exactly as [`Self::validate_row_write_set`]
     /// does for each change. The catalog operations charged once per changed table are left to
     /// [`Self::write_set_usage`], and conflicts between claims to the caller.
+    /// A row planning held for a writer of `table_name`, as a map.
+    pub(crate) fn held_row(&self, table_name: &str, row: HeldRow) -> Result<Row> {
+        match row {
+            HeldRow::Map(row) => Ok(row),
+            HeldRow::Stored(entry) => self
+                .tables
+                .get(table_name)
+                .ok_or_else(|| EngineError::table_not_found(table_name))?
+                .record(entry.key(), entry.value())?
+                .to_row(),
+        }
+    }
+
     pub(crate) fn change_cost(
         &self,
         table_name: &str,

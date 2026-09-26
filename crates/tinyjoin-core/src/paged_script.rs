@@ -12,21 +12,22 @@ use crate::{
     paged_codec::{
         CATALOG_TREE_ID, CatalogHeader, CatalogIndexRecord, MAX_CATALOG_INDEXES,
         MAX_CATALOG_TABLES, MAX_TREE_ID, encode_catalog_header_record, encode_catalog_index_key,
-        encode_catalog_index_record, encode_catalog_table_key, encode_primary_key, encode_row,
-        encode_secondary_index_entry, encode_secondary_index_entry_key,
-        encode_secondary_index_prefix, leading_key_component, secondary_index_entry_matches_prefix,
-        secondary_index_primary_key, secondary_index_primary_key_for_definition,
+        encode_catalog_index_record, encode_catalog_table_key, encode_primary_key,
+        encode_record_index_entry, encode_row, encode_secondary_index_entry_key,
+        encode_secondary_index_prefix, index_column_positions, leading_key_component,
+        secondary_index_entry_matches_prefix, secondary_index_primary_key,
+        secondary_index_primary_key_for_definition,
     },
     paged_storage::{
         PagedIndex, PagedTable, adjusted_count, batch_too_large, dangling_index_entry,
         ensure_batch_bytes, limit_error, ranged_index_primary_key, storage_corrupt,
         unique_violation,
     },
-    row::RowRef,
+    row::{HeldRow, RowRef},
     statement::{PlannedDml, PreviousRow, Statement, WriteStatement},
     storage::{
-        KeyOrder, KeyRange, estimated_row_bytes, preflight_row_write_set, schema_with_added_column,
-        validate_schema,
+        KeyOrder, KeyRange, estimated_record_bytes, estimated_row_bytes, preflight_row_write_set,
+        schema_with_added_column, validate_schema,
     },
 };
 
@@ -48,12 +49,23 @@ pub(crate) struct ScriptPublication {
 /// A row a write changes: the row its key held, and the row it holds after, where `None` is no
 /// row.
 pub(crate) struct ChangedRow {
-    pub(crate) old: Option<Row>,
+    pub(crate) old: Option<HeldRow>,
     pub(crate) next: Option<Row>,
 }
 
 /// Changed rows by table and encoded primary key.
 pub(crate) type ChangedRows = BTreeMap<String, BTreeMap<Vec<u8>, ChangedRow>>;
+
+/// The estimated bytes of a row a writer holds, which [`estimated_row_bytes`] finds for it as a
+/// map, reading a stored entry in place.
+fn held_row_bytes(table: &PagedTable, row: &HeldRow) -> Result<usize> {
+    match row {
+        HeldRow::Map(row) => estimated_row_bytes(row),
+        HeldRow::Stored(entry) => {
+            estimated_record_bytes(&table.record(entry.key(), entry.value())?)
+        }
+    }
+}
 
 struct PagedScriptCandidate<'a, D: PageDevice> {
     transaction: RefCell<PagerWriteTransaction<'a, D>>,
@@ -320,6 +332,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             entry_count: 0,
         };
         if let Some(table_root) = table.root_page_id {
+            let positions = index_column_positions(&table.schema, definition)?;
             let mut transaction = self.transaction.borrow_mut();
             let mut rows =
                 Btree::cursor_in_transaction(&mut transaction, table_root, table.tree_id)?;
@@ -327,9 +340,8 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             let mut bytes = 0usize;
             while let Some((primary_key, value)) = rows.next_in_transaction(&mut transaction)? {
                 self.charge_operations(1)?;
-                let row = table.record(&primary_key, &value)?.to_row()?;
-                let Some(entry) = encode_secondary_index_entry(&table.schema, definition, &row)?
-                else {
+                let record = table.record(&primary_key, &value)?;
+                let Some(entry) = encode_record_index_entry(&positions, &record)? else {
                     continue;
                 };
                 bytes += entry.0.len() + 48;
@@ -484,9 +496,15 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                     self.charge_operations(1)?;
                     row
                 }
-                PreviousRow::Unread => self.lookup_encoded_primary_key(table_name, slot.key())?,
+                PreviousRow::Unread => self
+                    .lookup_record(table_name, slot.key())?
+                    .map(|value| Ok::<_, EngineError>(table.record(slot.key(), &value)?.to_entry()))
+                    .transpose()?
+                    .map(HeldRow::Stored),
             };
-            let old_bytes = old.as_ref().map_or(Ok(0), estimated_row_bytes)?;
+            let old_bytes = old
+                .as_ref()
+                .map_or(Ok(0), |old| held_row_bytes(table, old))?;
             let next_bytes = next.as_ref().map_or(Ok(0), estimated_row_bytes)?;
             retained_bytes = retained_bytes
                 .checked_add(slot.key().len())
@@ -617,16 +635,20 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 .filter(|index| index.definition.table == *table_name)
             {
                 // Entries end with their row's primary key, so no two changes share one.
+                let positions = index_column_positions(&table.schema, &index.definition)?;
                 let mut entries = Vec::new();
                 for change in table_changes.values() {
-                    let old_key = change
-                        .old
-                        .as_ref()
-                        .map(|row| {
-                            encode_secondary_index_entry_key(&table.schema, &index.definition, row)
-                        })
-                        .transpose()?
-                        .flatten();
+                    let old_key = match &change.old {
+                        None => None,
+                        Some(HeldRow::Map(row)) => {
+                            encode_secondary_index_entry_key(&table.schema, &index.definition, row)?
+                        }
+                        Some(HeldRow::Stored(entry)) => encode_record_index_entry(
+                            &positions,
+                            &table.record(entry.key(), entry.value())?,
+                        )?
+                        .map(|(key, _)| key),
+                    };
                     let next_key = change
                         .next
                         .as_ref()
@@ -676,7 +698,8 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         Ok(())
     }
 
-    fn lookup_encoded_primary_key(&self, table_name: &str, key: &[u8]) -> Result<Option<Row>> {
+    /// The record the encoded primary key `key` holds in `table_name`, if any.
+    fn lookup_record(&self, table_name: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let table = self
             .tables
             .get(table_name)
@@ -685,9 +708,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             return Ok(None);
         };
         self.charge_operations(1)?;
-        Btree::get_in_transaction(&mut self.transaction.borrow_mut(), root, table.tree_id, key)?
-            .map(|value| table.record(key, &value)?.to_row())
-            .transpose()
+        Btree::get_in_transaction(&mut self.transaction.borrow_mut(), root, table.tree_id, key)
     }
 
     fn index_primary_keys(&self, index: &PagedIndex, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
@@ -1074,7 +1095,9 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
             .get(table)
             .ok_or_else(|| EngineError::table_not_found(table))?;
         let key = encode_primary_key(&table_data.schema, key)?;
-        self.lookup_encoded_primary_key(table, &key)
+        self.lookup_record(table, &key)?
+            .map(|value| table_data.record(&key, &value)?.to_row())
+            .transpose()
     }
 
     fn index_definition(&self, name: &str) -> Option<crate::IndexDefinition> {

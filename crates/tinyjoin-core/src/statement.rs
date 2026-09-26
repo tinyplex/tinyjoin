@@ -12,7 +12,7 @@ use crate::query::{
     validate_predicate_columns, validate_predicate_types, validate_sql_input,
     visit_indexed_candidates,
 };
-use crate::row::RowRef;
+use crate::row::{HeldRow, RowRef};
 use crate::storage::{
     estimated_row_bytes, estimated_value_bytes, normalize_row, row_key, schema_with_added_column,
     validate_index_columns_for_schema, validate_index_definition_shape,
@@ -135,7 +135,7 @@ pub(crate) enum PreviousRow {
     /// Planning did not read the key, or did not keep what it read.
     Unread,
     /// The key held this row, or no row.
-    Read(Option<Row>),
+    Read(Option<HeldRow>),
 }
 
 /// The most estimated bytes of rows one statement's planning keeps for its writer. Past it, the
@@ -788,7 +788,7 @@ fn plan_insert(
                 // The updated row keeps the existing row's key, which held the existing row.
                 let held = kept
                     .fits(estimated_row_bytes(&existing)?)
-                    .then(|| existing.clone());
+                    .then(|| HeldRow::Map(existing.clone()));
                 let row = updated_conflict_row(
                     &schema,
                     updates.expect("DO NOTHING was handled above"),
@@ -1220,7 +1220,7 @@ fn plan_update(
         old_key: String,
         old_primary_key: Row,
         /// The row being updated, when it is kept for the writer.
-        old_row: Option<Row>,
+        old_row: Option<HeldRow>,
         new_key: String,
         new_row: Row,
     }
@@ -1249,7 +1249,8 @@ fn plan_update(
         }
 
         // Check the retained candidate budget before copying assignment values into the row.
-        let row = row.to_row()?;
+        let read = row;
+        let row = read.to_row()?;
         let old_row_bytes = estimated_row_bytes(&row)?;
         let conservative_row_bytes = checked_dml_add(
             checked_dml_mul(old_row_bytes, 3)?,
@@ -1259,7 +1260,7 @@ fn plan_update(
 
         let old_key = row_key(&schema, &row)?;
         let old_primary_key = primary_key_row(&schema, &row)?;
-        let old_row = kept.fits(old_row_bytes).then(|| row.clone());
+        let old_row = kept.fits(read.held_bytes()?).then(|| read.hold());
         let mut new_row = row;
         for (column, value) in &resolved_assignments {
             new_row.insert(column.clone(), value.clone());
@@ -1407,12 +1408,11 @@ fn plan_delete(
                 "A data-modification statement cannot change more than {MAX_DML_CHANGED_ROWS} rows"
             )));
         }
-        let owned = row.to_row()?;
-        let row = &owned;
-
+        // A delete needs only the row's key; the writer reads the rest from the row it keeps.
+        let key = row.primary_key()?;
         let mut charge = 32usize;
         for column in &schema.primary_key {
-            let value = row.get(column).ok_or_else(|| {
+            let value = key.get(column).ok_or_else(|| {
                 EngineError::invalid_change(format!(
                     "Row for `{}` is missing primary-key column `{column}`",
                     schema.name
@@ -1426,17 +1426,17 @@ fn plan_delete(
         ensure_dml_work_bytes(checked_dml_add(work_bytes, charge)?)?;
         work_bytes = retain_dml_change(work_bytes, table)?;
         if let Some(columns) = returning {
-            result_bytes = retain_returned_row(result_bytes, row, columns)?;
-            returned.push(project_returning_row(row, columns, table)?);
+            let row = row.to_row()?;
+            result_bytes = retain_returned_row(result_bytes, &row, columns)?;
+            returned.push(project_returning_row(&row, columns, table)?);
         }
-        let key = primary_key_row(&schema, row)?;
         work_bytes = checked_dml_add(work_bytes, charge)?;
         changes.push(RowChange::Delete {
             table: table.to_owned(),
             key,
         });
-        previous.push(if kept.fits(estimated_row_bytes(&owned)?) {
-            PreviousRow::Read(Some(owned))
+        previous.push(if kept.fits(row.held_bytes()?) {
+            PreviousRow::Read(Some(row.hold()))
         } else {
             PreviousRow::Unread
         });

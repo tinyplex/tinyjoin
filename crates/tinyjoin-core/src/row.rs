@@ -10,7 +10,8 @@ use std::borrow::Cow;
 
 use serde_json::Value;
 
-use crate::paged_codec::{StoredRecord, encode_primary_key};
+use crate::paged_codec::{StoredEntry, StoredRecord, encode_primary_key};
+use crate::storage::estimated_row_bytes;
 use crate::{ColumnType, EngineError, Result, Row, TableDefinition};
 
 /// One column's value as its row holds it, borrowed where the row allows.
@@ -83,6 +84,14 @@ pub(crate) trait Columns {
 /// A row as a visitor reads it.
 pub(crate) struct RowRef<'a>(Source<'a>);
 
+/// A row a writer keeps from reading it: a map, or the stored entry a record was read from, which
+/// the writer reads in place rather than decoding whole.
+#[derive(Clone, Debug)]
+pub(crate) enum HeldRow {
+    Map(Row),
+    Stored(StoredEntry),
+}
+
 enum Source<'a> {
     Map {
         row: &'a Row,
@@ -126,6 +135,37 @@ impl<'a> RowRef<'a> {
             Source::Map { row, .. } => Ok((*row).clone()),
             Source::Record(record) => record.to_row(),
         }
+    }
+
+    /// The row as a writer keeps it: a copy of a record's stored entry, or of a map.
+    pub(crate) fn hold(&self) -> HeldRow {
+        match &self.0 {
+            Source::Map { row, .. } => HeldRow::Map((*row).clone()),
+            Source::Record(record) => HeldRow::Stored(record.to_entry()),
+        }
+    }
+
+    /// What [`Self::hold`] keeps, in bytes: a record's entry, or a map's estimated bytes.
+    pub(crate) fn held_bytes(&self) -> Result<usize> {
+        match &self.0 {
+            Source::Map { row, .. } => estimated_row_bytes(row),
+            Source::Record(record) => Ok(record.entry_len()),
+        }
+    }
+
+    /// The row's primary-key columns and their values, as the key of a change to the row.
+    pub(crate) fn primary_key(&self) -> Result<Row> {
+        let schema = match &self.0 {
+            Source::Map { row, schema } => return crate::statement::primary_key_row(schema, row),
+            Source::Record(record) => record.schema(),
+        };
+        let mut key = Row::new();
+        for (position, column) in schema.columns.iter().enumerate() {
+            if schema.primary_key.contains(&column.name) {
+                key.insert(column.name.clone(), self.get(position)?.into_value());
+            }
+        }
+        Ok(key)
     }
 
     /// The row's primary key, encoded as its B-tree key.

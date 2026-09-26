@@ -177,6 +177,58 @@ pub(crate) fn encode_secondary_index_entry(
     Ok(Some((key, tuple)))
 }
 
+/// Where each of an index's columns is in its table's schema, to read them from stored records.
+pub(crate) fn index_column_positions(
+    schema: &TableDefinition,
+    definition: &IndexDefinition,
+) -> Result<Vec<usize>> {
+    let mut positions = Vec::with_capacity(definition.columns.len());
+    for column in &definition.columns {
+        let position = schema
+            .columns
+            .iter()
+            .position(|item| item.name == *column)
+            .ok_or_else(|| {
+                EngineError::invalid_change(format!(
+                    "Row for `{}` is missing key column `{column}`",
+                    schema.name
+                ))
+            })?;
+        positions.push(position);
+    }
+    Ok(positions)
+}
+
+/// Encodes a stored row's secondary-index entry, as [`encode_secondary_index_entry`] encodes the
+/// row the record decodes to, reading only the indexed columns, at `positions`. The entry ends with
+/// the record's key, which is the row's encoded primary key.
+pub(crate) fn encode_record_index_entry(
+    positions: &[usize],
+    record: &StoredRecord<'_>,
+) -> Result<Option<(Vec<u8>, usize)>> {
+    let schema = record.schema;
+    let mut key = Vec::with_capacity(16 * positions.len() + record.key.len());
+    for position in positions {
+        let value = record.column(*position)?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        let column = &schema.columns[*position];
+        encode_component_ref(
+            &mut key,
+            column.data_type,
+            &value,
+            &schema.name,
+            &column.name,
+        )?;
+        validate_key_size(&key)?;
+    }
+    let tuple = key.len();
+    key.extend_from_slice(record.key);
+    validate_key_size(&key)?;
+    Ok(Some((key, tuple)))
+}
+
 /// Encodes one value as a key component of `data_type`, to bound a range of keys. Components compare
 /// as their values do, so a key lies between two bounds exactly when its component does.
 pub(crate) fn encode_key_bound(data_type: ColumnType, value: &Value) -> Result<Vec<u8>> {
@@ -392,6 +444,26 @@ pub(crate) struct StoredRecord<'a> {
     data: &'a [u8],
 }
 
+/// A stored row's entry copied out of its page, its encoded primary key and its record, which a
+/// [`StoredRecord`] reads in place again.
+#[derive(Clone, Debug)]
+pub(crate) struct StoredEntry {
+    bytes: Box<[u8]>,
+    key_length: usize,
+}
+
+impl StoredEntry {
+    /// The encoded primary key.
+    pub(crate) fn key(&self) -> &[u8] {
+        &self.bytes[..self.key_length]
+    }
+
+    /// The row record.
+    pub(crate) fn value(&self) -> &[u8] {
+        &self.bytes[self.key_length..]
+    }
+}
+
 impl<'a> StoredRecord<'a> {
     /// Opens an entry of `schema`'s table, whose columns are placed as `layout` says.
     pub(crate) fn new(
@@ -442,6 +514,27 @@ impl<'a> StoredRecord<'a> {
     /// The entry's B-tree key, which is its encoded primary key.
     pub(crate) fn key(&self) -> &'a [u8] {
         self.key
+    }
+
+    /// The schema of the table the entry belongs to.
+    pub(crate) fn schema(&self) -> &'a TableDefinition {
+        self.schema
+    }
+
+    /// The length of the entry, its key and its record.
+    pub(crate) fn entry_len(&self) -> usize {
+        self.key.len() + self.value.len()
+    }
+
+    /// A copy of the entry, its key and record, to read in place again later.
+    pub(crate) fn to_entry(self) -> StoredEntry {
+        let mut bytes = Vec::with_capacity(self.key.len() + self.value.len());
+        bytes.extend_from_slice(self.key);
+        bytes.extend_from_slice(self.value);
+        StoredEntry {
+            bytes: bytes.into_boxed_slice(),
+            key_length: self.key.len(),
+        }
     }
 
     /// The value of the column at `index`, in schema order.
@@ -1010,8 +1103,7 @@ fn encode_component(
         ColumnType::Integer => {
             let value =
                 safe_integer(value).ok_or_else(|| key_type_mismatch(table, column, "integer"))?;
-            let sortable = (value as u64) ^ (1_u64 << 63);
-            key.extend_from_slice(&sortable.to_be_bytes());
+            push_integer_component(key, value);
         }
         ColumnType::Float => {
             let Value::Number(number) = value else {
@@ -1021,29 +1113,13 @@ fn encode_component(
                 .as_f64()
                 .filter(|value| value.is_finite())
                 .ok_or_else(|| key_type_mismatch(table, column, "finite float"))?;
-            // SQL comparison already operates in f64 space. Normalize signed zero before deriving
-            // lexicographically sortable IEEE-754 bytes, so a B-tree cannot admit two primary
-            // keys which SQL considers equal.
-            let normalized = if value == 0.0 { 0.0 } else { value };
-            let bits = normalized.to_bits();
-            let sortable = if bits & (1_u64 << 63) == 0 {
-                bits ^ (1_u64 << 63)
-            } else {
-                !bits
-            };
-            key.extend_from_slice(&sortable.to_be_bytes());
+            push_float_component(key, value);
         }
         ColumnType::Text => {
             let value = value
                 .as_str()
                 .ok_or_else(|| key_type_mismatch(table, column, "text"))?;
-            for byte in value.bytes() {
-                key.push(byte);
-                if byte == 0 {
-                    key.push(TEXT_ESCAPED_ZERO);
-                }
-            }
-            key.extend_from_slice(&[0, TEXT_TERMINATOR]);
+            push_text_component(key, value);
         }
         ColumnType::Json => {
             return Err(codec_argument(format!(
@@ -1052,6 +1128,60 @@ fn encode_component(
         }
     }
     Ok(())
+}
+
+/// Encodes a value read from a row as a key component, exactly as [`encode_component`] encodes the
+/// equivalent JSON value, without converting a typed value to JSON first.
+fn encode_component_ref(
+    key: &mut Vec<u8>,
+    data_type: ColumnType,
+    value: &ValueRef<'_>,
+    table: &str,
+    column: &str,
+) -> Result<()> {
+    match (data_type, value) {
+        (ColumnType::Boolean, ValueRef::Boolean(value)) => key.push(u8::from(*value)),
+        (ColumnType::Integer, ValueRef::Integer(value))
+            if value.unsigned_abs() <= MAX_SAFE_INTEGER =>
+        {
+            push_integer_component(key, *value);
+        }
+        (ColumnType::Float, ValueRef::Float(value)) if value.is_finite() => {
+            push_float_component(key, *value);
+        }
+        (ColumnType::Text, ValueRef::Text(value)) => push_text_component(key, value),
+        _ => return encode_component(key, data_type, &value.clone().into_value(), table, column),
+    }
+    Ok(())
+}
+
+fn push_integer_component(key: &mut Vec<u8>, value: i64) {
+    let sortable = (value as u64) ^ (1_u64 << 63);
+    key.extend_from_slice(&sortable.to_be_bytes());
+}
+
+fn push_float_component(key: &mut Vec<u8>, value: f64) {
+    // SQL comparison already operates in f64 space. Normalize signed zero before deriving
+    // lexicographically sortable IEEE-754 bytes, so a B-tree cannot admit two primary keys which
+    // SQL considers equal.
+    let normalized = if value == 0.0 { 0.0 } else { value };
+    let bits = normalized.to_bits();
+    let sortable = if bits & (1_u64 << 63) == 0 {
+        bits ^ (1_u64 << 63)
+    } else {
+        !bits
+    };
+    key.extend_from_slice(&sortable.to_be_bytes());
+}
+
+fn push_text_component(key: &mut Vec<u8>, value: &str) {
+    for byte in value.bytes() {
+        key.push(byte);
+        if byte == 0 {
+            key.push(TEXT_ESCAPED_ZERO);
+        }
+    }
+    key.extend_from_slice(&[0, TEXT_TERMINATOR]);
 }
 
 /// Returns where the key component starting at `offset` ends.
@@ -2116,6 +2246,79 @@ mod tests {
                 .code,
             "PAGED_STORAGE_VERSION_UNSUPPORTED"
         );
+    }
+
+    #[test]
+    fn stored_records_estimate_key_and_index_as_the_rows_they_decode_to() {
+        // Writers read the rows they hold in place: a record's estimate, key, and index entries
+        // must be exactly those of the row it decodes to.
+        let mut schema = typed_schema(
+            vec!["name", "at"],
+            vec![
+                ("count", ColumnType::Integer),
+                ("at", ColumnType::Float),
+                ("label", ColumnType::Text),
+                ("name", ColumnType::Text),
+                ("flag", ColumnType::Boolean),
+                ("doc", ColumnType::Json),
+                ("extra", ColumnType::Text),
+            ],
+        );
+        for column in &mut schema.columns {
+            column.nullable = !schema.primary_key.contains(&column.name);
+        }
+        // A trailing column holding its default is left out of the record.
+        schema.columns[6].default = Some(json!("fallback"));
+        let layout = RecordLayout::new(&schema).unwrap();
+        let indexes = [
+            vec!["label"],
+            vec!["count", "flag"],
+            vec!["flag", "label", "count"],
+            vec!["at", "extra"],
+            vec!["doc"],
+        ]
+        .map(|columns| IndexDefinition {
+            name: columns.join("_"),
+            table: "items".to_owned(),
+            columns: columns.into_iter().map(str::to_owned).collect(),
+            unique: false,
+        });
+        for stored in [
+            json!({"name": "", "at": 0.0, "count": 0, "label": "", "flag": false, "doc": null,
+                "extra": "fallback"}),
+            json!({"name": "a\u{0}b", "at": -2.5, "count": -9_007_199_254_740_991_i64,
+                "label": "x\u{0}", "flag": true, "doc": {"k": [1, "two"]}, "extra": "é🦀"}),
+            json!({"name": "\u{0}", "at": 1e300, "count": null, "label": null, "flag": null,
+                "doc": [true], "extra": null}),
+            json!({"name": "z", "at": 3.0, "count": 9_007_199_254_740_991_i64, "label": "é",
+                "flag": false, "doc": "text", "extra": "fallback"}),
+        ] {
+            let stored = row(stored);
+            let key = encode_primary_key(&schema, &stored).unwrap();
+            let value = encode_row(&schema, &stored).unwrap();
+            let record = StoredRecord::new(&schema, &layout, &key, &value).unwrap();
+            let decoded = record.to_row().unwrap();
+            assert_eq!(
+                crate::storage::estimated_record_bytes(&record).unwrap(),
+                crate::storage::estimated_row_bytes(&decoded).unwrap()
+            );
+            assert_eq!(
+                crate::row::RowRef::record(record).primary_key().unwrap(),
+                crate::statement::primary_key_row(&schema, &decoded).unwrap()
+            );
+            for definition in &indexes {
+                let positions = index_column_positions(&schema, definition).unwrap();
+                assert_eq!(
+                    encode_record_index_entry(&positions, &record).map_err(|error| error.code),
+                    encode_secondary_index_entry(&schema, definition, &decoded)
+                        .map_err(|error| error.code),
+                    "{}",
+                    definition.name
+                );
+            }
+            let entry = record.to_entry();
+            assert_eq!((entry.key(), entry.value()), (&key[..], &value[..]));
+        }
     }
 
     #[test]

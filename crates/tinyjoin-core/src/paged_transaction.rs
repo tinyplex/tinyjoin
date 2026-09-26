@@ -9,7 +9,7 @@ use crate::{
     paged_codec::encode_primary_key,
     paged_script::{ChangedRow, ChangedRows},
     paged_storage::{ChangeCost, PagedWriteUsage},
-    row::RowRef,
+    row::{HeldRow, RowRef},
     statement::{PreviousRow, primary_key_row},
     storage::{KeyOrder, KeyRange, estimated_row_bytes},
 };
@@ -100,7 +100,7 @@ impl PagedTransaction {
             for (key, entry) in entries {
                 if entry.changed {
                     let row = ChangedRow {
-                        old: entry.base.clone(),
+                        old: entry.base.clone().map(HeldRow::Map),
                         next: entry.next.clone(),
                     };
                     rows.insert(key.clone(), row);
@@ -189,7 +189,9 @@ impl PagedTransaction {
                     Some(entry) => entry.clone(),
                     None => {
                         let base = match held {
-                            PreviousRow::Read(row) => row,
+                            PreviousRow::Read(row) => {
+                                row.map(|row| storage.held_row(&table, row)).transpose()?
+                            }
                             PreviousRow::Unread => storage.lookup_primary_key(&table, &key)?,
                         };
                         OverlayEntry {
