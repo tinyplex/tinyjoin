@@ -36,8 +36,8 @@ In-memory databases, including every `tinyjoin/node` database, are unaffected.
 This release is also much faster. In the
 [comparative benchmarks](/guides/benchmarks/), most workloads in v0.3.0 took 10
 to 1,400 times as long as the faster of SQLite and PGlite. None now takes more
-than about four times as long. Reading every row and `LIKE` scans are quicker
-than in either, and `GROUP BY` is about as quick.
+than about four times as long, and reading every row, `LIKE` scans, and
+`GROUP BY` are quicker than in either.
 
 - Updates, upserts, and deletes inside a transaction no longer slow down as the
   transaction grows. Each statement is checked against running totals rather

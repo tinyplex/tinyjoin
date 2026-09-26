@@ -30,18 +30,20 @@ cancels out:
 
 | Workload | v0.3.0 | Now | Workload | v0.3.0 | Now |
 | --- | ---: | ---: | --- | ---: | ---: |
-| `cold-open` | 0.7× | 0.7× | `select-all` | 2.3× | 0.6× |
-| `reopen` | 3.5× | 1.2× | `group-by` | 22× | 1.05× |
-| `insert-autocommit` | 3.3× | 1.9× | `join` | 175× | 1.5× |
-| `insert-transaction` | 9.9× | 2.3× | `update-pk` | 1,077× | 2.4× |
-| `insert-indexed` | 15× | 2.1× | `update-scan` | 179× | 2.8× |
-| `insert-batch` | 33× | 2.9× | `upsert` | 1,362× | 2.3× |
-| `select-pk` | 4.2× | 1.5× | `delete-pk` | 1,105× | 2.5× |
-| `select-scan` | 105× | 2.0× | `delete-like` | 95× | 4.0× |
-| `select-like` | 39× | 0.96× | `delete-range` | 249× | 3.7× |
-| `select-indexed` | 1,406× | 2.4× | `create-index` | 142× | 1.4× |
+| `cold-open` | 0.7× | 0.8× | `select-all` | 2.3× | 0.6× |
+| `reopen` | 3.5× | 1.2× | `group-by` | 22× | 0.95× |
+| `insert-autocommit` | 3.3× | 2.1× | `join` | 175× | 1.4× |
+| `insert-transaction` | 9.9× | 2.5× | `update-pk` | 1,077× | 2.3× |
+| `insert-indexed` | 15× | 2.3× | `update-scan` | 179× | 2.2× |
+| `insert-batch` | 33× | 3.4× | `upsert` | 1,362× | 2.5× |
+| `select-pk` | 4.2× | 1.6× | `delete-pk` | 1,105× | 2.6× |
+| `select-scan` | 105× | 1.75× | `delete-like` | 95× | 3.7× |
+| `select-like` | 39× | 0.9× | `delete-range` | 249× | 3.7× |
+| `select-indexed` | 1,406× | 2.4× | `create-index` | 142× | 1.3× |
 
-The compressed download grew from 296 KiB to 323 KiB.
+The compressed download grew from 296 KiB to 325 KiB. Between two runs on the
+same build, the ratios moved by up to a tenth, so read them to one significant
+figure.
 
 Done:
 
@@ -70,7 +72,7 @@ Found along the way:
 
 Remaining, in order of expected value:
 
-1. Per-statement cost. A single statement takes 45–60 µs in the browser
+1. Per-statement cost. A single statement takes 45–65 µs in the browser
    against SQLite's 25–30 µs. Its engine share is 9–17 µs in V8: building the
    structured result, decoding parameters through `serde_wasm_bindgen`, and
    planning and staging each row as a map. The Worker's JavaScript layers add
