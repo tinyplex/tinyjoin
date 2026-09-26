@@ -1817,7 +1817,8 @@ mod tests {
                     .unwrap();
             }
         }
-        let join = "SELECT a.id AS id FROM a JOIN b ON a.join_key = b.join_key WHERE a.id < 0";
+        let join =
+            "SELECT a.id AS id FROM a JOIN b ON a.join_key = b.join_key WHERE a.id < 0 OR b.id < 0";
         // Each query examines 600,000 pairs plus its scanned rows. Separate
         // requests fit, but two joins in one script share the work budget.
         for _ in 0..2 {

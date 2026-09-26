@@ -1562,3 +1562,382 @@ fn generated_key_orders_agree_with_sorting() {
     }
     engine.rollback_transaction().unwrap();
 }
+
+/// Joins read each later relation by key lookup, index lookup, or hash table, and push `WHERE`
+/// terms that read one relation into its reads. Every combination must return exactly the rows a
+/// nested-loop model does, in left-major order with each relation's matches in key order, with
+/// `NULL` keys, mixed integer and float keys, `LEFT JOIN` null extension, and terms that no
+/// single relation can take, inside and outside a transaction.
+#[test]
+fn generated_joins_agree_with_a_nested_loop_model() {
+    type Bindings<'a> = [Option<&'a Row>];
+    let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+    engine
+        .exec_sql(
+            "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER, f FLOAT, t TEXT); \
+             CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER, u INTEGER); \
+             CREATE INDEX b_k ON b (k); \
+             CREATE TABLE c (id INTEGER PRIMARY KEY, u INTEGER, t TEXT)",
+        )
+        .unwrap();
+    let mut generator = Generator(0x701e);
+    let maybe = |generator: &mut Generator, value: Value| {
+        if generator.pick(6) == 0 {
+            Value::Null
+        } else {
+            value
+        }
+    };
+    let mut tables = vec![Vec::new(), Vec::new(), Vec::new()];
+    engine.begin_transaction().unwrap();
+    for id in 0..40 {
+        let k = generator.pick(9) as i64;
+        let f = match generator.pick(3) {
+            0 => json!(k as f64),
+            1 => json!(2.5),
+            _ => json!(-0.0),
+        };
+        let t = ["x", "xy", "q", "é"][generator.pick(4)];
+        let row = row(json!({
+            "id": id,
+            "k": maybe(&mut generator, json!(k)),
+            "f": maybe(&mut generator, f),
+            "t": maybe(&mut generator, json!(t)),
+        }));
+        tables[0].push(row);
+    }
+    for id in 0..60 {
+        let (k, u) = (generator.pick(9) as i64, generator.pick(6) as i64);
+        let row = row(json!({
+            "id": id - 10,
+            "k": maybe(&mut generator, json!(k)),
+            "u": maybe(&mut generator, json!(u)),
+        }));
+        tables[1].push(row);
+    }
+    for id in 0..30 {
+        let (u, t) = (generator.pick(6) as i64, ["q", "r"][generator.pick(2)]);
+        let row = row(json!({
+            "id": id,
+            "u": maybe(&mut generator, json!(u)),
+            "t": maybe(&mut generator, json!(t)),
+        }));
+        tables[2].push(row);
+    }
+    for (name, rows) in ["a", "b", "c"].iter().zip(&tables) {
+        for row in rows {
+            let columns = row.keys().cloned().collect::<Vec<_>>();
+            let placeholders = (1..=columns.len())
+                .map(|index| format!("${index}"))
+                .collect::<Vec<_>>();
+            let values = columns
+                .iter()
+                .map(|column| row[column].clone())
+                .collect::<Vec<_>>();
+            engine
+                .execute_sql(
+                    &format!(
+                        "INSERT INTO {name} ({}) VALUES ({})",
+                        columns.join(", "),
+                        placeholders.join(", ")
+                    ),
+                    &values,
+                )
+                .unwrap();
+        }
+    }
+    engine.commit_transaction().unwrap();
+
+    /// One joined relation: the table's index in `tables`, its alias, whether it is a LEFT JOIN,
+    /// and its ON equalities as (earlier alias index, earlier column, own column).
+    struct Stage {
+        table: usize,
+        left: bool,
+        on: Vec<(usize, &'static str, &'static str)>,
+    }
+    let shapes: Vec<(&str, Vec<Stage>)> = vec![
+        (
+            "a JOIN b ON a.k = b.k",
+            vec![Stage {
+                table: 1,
+                left: false,
+                on: vec![(0, "k", "k")],
+            }],
+        ),
+        (
+            "a LEFT JOIN b ON a.k = b.k",
+            vec![Stage {
+                table: 1,
+                left: true,
+                on: vec![(0, "k", "k")],
+            }],
+        ),
+        (
+            "a JOIN b ON b.id = a.k",
+            vec![Stage {
+                table: 1,
+                left: false,
+                on: vec![(0, "k", "id")],
+            }],
+        ),
+        (
+            "a JOIN b ON b.id = a.f",
+            vec![Stage {
+                table: 1,
+                left: false,
+                on: vec![(0, "f", "id")],
+            }],
+        ),
+        (
+            "a JOIN c ON a.k = c.u",
+            vec![Stage {
+                table: 2,
+                left: false,
+                on: vec![(0, "k", "u")],
+            }],
+        ),
+        (
+            "a LEFT JOIN c ON a.f = c.u",
+            vec![Stage {
+                table: 2,
+                left: true,
+                on: vec![(0, "f", "u")],
+            }],
+        ),
+        (
+            "a JOIN b ON a.k = b.k JOIN c ON b.u = c.u",
+            vec![
+                Stage {
+                    table: 1,
+                    left: false,
+                    on: vec![(0, "k", "k")],
+                },
+                Stage {
+                    table: 2,
+                    left: false,
+                    on: vec![(1, "u", "u")],
+                },
+            ],
+        ),
+        (
+            "a LEFT JOIN b ON a.k = b.k AND b.u = a.k JOIN c ON c.u = a.k",
+            vec![
+                Stage {
+                    table: 1,
+                    left: true,
+                    on: vec![(0, "k", "k"), (0, "k", "u")],
+                },
+                Stage {
+                    table: 2,
+                    left: false,
+                    on: vec![(0, "k", "u")],
+                },
+            ],
+        ),
+    ];
+    type Term = (&'static str, fn(&Bindings<'_>) -> Option<bool>);
+    fn value<'a>(bindings: &Bindings<'a>, source: usize, column: &str) -> Option<&'a Value> {
+        bindings
+            .get(source)
+            .copied()
+            .flatten()
+            .map(|row| &row[column])
+            .filter(|value| !value.is_null())
+    }
+    let terms: [Term; 8] = [
+        ("a.id < 20", |row| {
+            value(row, 0, "id").map(|id| id.as_i64().unwrap() < 20)
+        }),
+        ("a.t LIKE 'x%'", |row| {
+            value(row, 0, "t").map(|t| t.as_str().unwrap().starts_with('x'))
+        }),
+        ("a.k >= 3", |row| {
+            value(row, 0, "k").map(|k| k.as_i64().unwrap() >= 3)
+        }),
+        ("a.f = 2.5", |row| {
+            value(row, 0, "f").map(|f| f.as_f64().unwrap() == 2.5)
+        }),
+        ("b.u > 2", |row| {
+            value(row, 1, "u").map(|u| u.as_i64().unwrap() > 2)
+        }),
+        ("b.id IS NULL", |row| Some(value(row, 1, "id").is_none())),
+        ("(a.id < 5 OR b.u = 2)", |row| {
+            let left = value(row, 0, "id").map(|id| id.as_i64().unwrap() < 5);
+            let right = value(row, 1, "u").map(|u| u.as_i64().unwrap() == 2);
+            match (left, right) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            }
+        }),
+        ("c.t = 'q'", |row| value(row, 2, "t").map(|t| t == "q")),
+    ];
+
+    fn join<'a>(
+        tables: &'a [Vec<Row>],
+        stages: &[Stage],
+        stage: usize,
+        bindings: &mut Vec<Option<&'a Row>>,
+        output: &mut Vec<Vec<Option<&'a Row>>>,
+    ) {
+        if stage == stages.len() {
+            output.push(bindings.clone());
+            return;
+        }
+        let equal = |left: &Value, right: &Value| {
+            !left.is_null()
+                && !right.is_null()
+                && match (left.as_f64(), right.as_f64()) {
+                    (Some(left), Some(right)) => left == right,
+                    _ => left == right,
+                }
+        };
+        let current = &stages[stage];
+        let mut rows = tables[current.table].iter().collect::<Vec<_>>();
+        rows.sort_by_key(|row| row["id"].as_i64());
+        let mut matched = false;
+        for row in rows {
+            let matches = current.on.iter().all(|(source, column, own)| {
+                bindings[*source].is_some_and(|earlier| equal(&earlier[*column], &row[*own]))
+            });
+            if matches {
+                matched = true;
+                bindings.push(Some(row));
+                join(tables, stages, stage + 1, bindings, output);
+                bindings.pop();
+            }
+        }
+        if current.left && !matched {
+            bindings.push(None);
+            join(tables, stages, stage + 1, bindings, output);
+            bindings.pop();
+        }
+    }
+
+    for phase in 0..3 {
+        // Phase 1 reads inside a transaction with no staged changes, and phase 2 inside one that
+        // has changed every table, which reads them without indexes or key order.
+        if phase > 0 {
+            engine.begin_transaction().unwrap();
+        }
+        if phase == 2 {
+            for (table, staged) in [
+                json!({"id": 100, "k": 3, "f": 3.0, "t": "x"}),
+                json!({"id": 100, "k": 3, "u": 2}),
+                json!({"id": 100, "u": 3, "t": "q"}),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let staged = row(staged);
+                let columns = staged.keys().cloned().collect::<Vec<_>>();
+                let placeholders = (1..=columns.len())
+                    .map(|index| format!("${index}"))
+                    .collect::<Vec<_>>();
+                let values = columns
+                    .iter()
+                    .map(|column| staged[column].clone())
+                    .collect::<Vec<_>>();
+                engine
+                    .execute_sql(
+                        &format!(
+                            "INSERT INTO {} ({}) VALUES ({})",
+                            ["a", "b", "c"][table],
+                            columns.join(", "),
+                            placeholders.join(", ")
+                        ),
+                        &values,
+                    )
+                    .unwrap();
+                tables[table].push(staged);
+            }
+        }
+        for case in 0..150 {
+            let (from, stages) = &shapes[generator.pick(shapes.len())];
+            let aliases = std::iter::once(0)
+                .chain(stages.iter().map(|stage| stage.table))
+                .collect::<Vec<_>>();
+            let chosen = (0..generator.pick(3))
+                .map(|_| &terms[generator.pick(terms.len())])
+                .filter(|(sql, _)| {
+                    // A term may name only joined tables.
+                    ["b.", "c."].iter().enumerate().all(|(index, prefix)| {
+                        !sql.contains(prefix) || aliases.contains(&(index + 1))
+                    })
+                })
+                .collect::<Vec<_>>();
+            let columns = aliases
+                .iter()
+                .map(|table| {
+                    let name = ["a", "b", "c"][*table];
+                    format!("{name}.id AS {name}_id")
+                })
+                .collect::<Vec<_>>();
+            let ordered = generator.pick(2) == 0;
+            let mut sql = format!("SELECT {} FROM {from}", columns.join(", "));
+            if !chosen.is_empty() {
+                let condition = chosen.iter().map(|(sql, _)| *sql).collect::<Vec<_>>();
+                sql.push_str(&format!(" WHERE {}", condition.join(" AND ")));
+            }
+            if ordered {
+                sql.push_str(" ORDER BY a.id DESC");
+            }
+            let mut output = Vec::new();
+            for probe in {
+                let mut rows = tables[0].iter().collect::<Vec<_>>();
+                rows.sort_by_key(|row| row["id"].as_i64());
+                rows
+            } {
+                let mut bindings = vec![Some(probe)];
+                join(&tables, stages, 0, &mut bindings, &mut output);
+            }
+            let mut expected = output
+                .iter()
+                .filter(|bindings| {
+                    // Terms read each table by its index, whichever position it joined at.
+                    let mut by_table = [None; 3];
+                    for (alias, table) in aliases.iter().enumerate() {
+                        by_table[*table] = bindings[alias];
+                    }
+                    chosen
+                        .iter()
+                        .all(|(_, matches)| matches(&by_table) == Some(true))
+                })
+                .collect::<Vec<_>>();
+            if ordered {
+                // A stable sort keeps left-major order among rows of equal `a.id`.
+                expected
+                    .sort_by_key(|bindings| std::cmp::Reverse(bindings[0].unwrap()["id"].as_i64()));
+            }
+            let expected = expected
+                .into_iter()
+                .map(|bindings| {
+                    aliases
+                        .iter()
+                        .enumerate()
+                        .map(|(alias, table)| {
+                            let name = ["a", "b", "c"][*table];
+                            (
+                                format!("{name}_id"),
+                                bindings[alias].map_or(Value::Null, |row| row["id"].clone()),
+                            )
+                        })
+                        .collect::<Row>()
+                })
+                .collect::<Vec<_>>();
+            let actual = engine
+                .query_sql(&sql, &[])
+                .unwrap_or_else(|error| panic!("phase {phase}, case {case}: {sql}: {error}"))
+                .rows;
+            assert_eq!(actual, expected, "phase {phase}, case {case}: {sql}");
+        }
+        if phase > 0 {
+            engine.rollback_transaction().unwrap();
+        }
+        if phase == 2 {
+            for rows in &mut tables {
+                rows.pop();
+            }
+        }
+    }
+}

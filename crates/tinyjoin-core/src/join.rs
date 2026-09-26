@@ -9,8 +9,8 @@ use crate::query::{
     Filter, ParseMode, Token, bind_parameter, is_distinct_keyword_at, is_reserved_keyword,
     pagination_value, parse_predicate_at,
 };
-use crate::row::{Columns, ValueRef};
-use crate::storage::StorageReader;
+use crate::row::{Columns, RowRef, ValueRef};
+use crate::storage::{KeyOrder, StorageReader};
 use crate::{
     ColumnDefinition, ColumnType, ComparisonOperator, EngineError, NullOrder, OrderDirection,
     Predicate, QueryResult, Result, ResultField, Row, TableDefinition, VisitControl, VisitOutcome,
@@ -193,10 +193,18 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &JoinPlan) -> Result<Qu
         });
     }
 
-    let counts = relations
-        .iter()
-        .map(|relation| storage.table_row_count(&relation.source.table))
-        .collect::<Result<Vec<_>>>()?;
+    let access = plan_access(storage, plan, &relations, &conditions)?;
+    // Relations read whole, with no pushed terms to narrow them, preflight their sizes: the probe,
+    // and every hash-joined relation, which is also retained.
+    let mut counts = Vec::with_capacity(relations.len());
+    for (source, relation) in relations.iter().enumerate() {
+        let hashed = source == 0 || matches!(access.stages[source - 1], StageAccess::Hash);
+        counts.push(if hashed && access.pushed[source].is_none() {
+            storage.table_row_count(&relation.source.table)?
+        } else {
+            0
+        });
+    }
     let scan_rows = counts
         .iter()
         .fold(0_usize, |total, count| total.saturating_add(*count));
@@ -222,10 +230,16 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &JoinPlan) -> Result<Qu
         offsets: &offsets,
     };
 
+    let join = Join {
+        plan,
+        relations: &relations,
+        conditions: &conditions,
+        access: &access,
+    };
     let rows = if plan.order_by.is_empty() {
-        execute_unordered(storage, plan, &relations, &conditions, &filter)?
+        execute_unordered(storage, &join, &filter)?
     } else {
-        execute_ordered(storage, plan, &relations, &conditions, &filter)?
+        execute_ordered(storage, &join, &filter)?
     };
 
     Ok(QueryResult {
@@ -248,87 +262,77 @@ fn preflight_build_rows(counts: &[usize]) -> Result<()> {
 
 fn execute_unordered(
     storage: &dyn StorageReader,
-    plan: &JoinPlan,
-    relations: &[Relation],
-    conditions: &[Vec<ResolvedCondition>],
+    join: &Join<'_>,
     filter: &JoinFilter<'_>,
 ) -> Result<Vec<Row>> {
+    let Join {
+        plan, relations, ..
+    } = *join;
     let mut rows = Vec::new();
     let mut skipped = 0_usize;
     let mut result_bytes = 0_usize;
     let mut seen = HashSet::new();
-    visit_joined_rows(
-        storage,
-        plan,
-        relations,
-        conditions,
-        &mut |bindings, budget| {
-            if !filter.matches(bindings, relations)?
-                || !first_distinct_row(&mut seen, bindings, plan, relations, budget)?
-            {
-                return Ok(VisitControl::Continue);
-            }
-            if skipped < plan.offset {
-                skipped += 1;
-                return Ok(VisitControl::Continue);
-            }
-            if rows.len() == MAX_RESULT_ROWS {
-                return Err(result_rows_limit_error());
-            }
-            let projected_bytes = projected_row_bytes(bindings, plan, relations)?;
-            let next_result_bytes = checked_add(result_bytes, projected_bytes)?;
-            ensure_result_budget(next_result_bytes)?;
-            rows.push(project_joined_row(bindings, plan, relations)?);
-            result_bytes = next_result_bytes;
-            if plan.limit.is_some_and(|limit| rows.len() == limit) {
-                Ok(VisitControl::Stop)
-            } else {
-                Ok(VisitControl::Continue)
-            }
-        },
-    )?;
+    visit_joined_rows(storage, join, &mut |bindings, budget| {
+        if !filter.matches(bindings, relations)?
+            || !first_distinct_row(&mut seen, bindings, plan, relations, budget)?
+        {
+            return Ok(VisitControl::Continue);
+        }
+        if skipped < plan.offset {
+            skipped += 1;
+            return Ok(VisitControl::Continue);
+        }
+        if rows.len() == MAX_RESULT_ROWS {
+            return Err(result_rows_limit_error());
+        }
+        let projected_bytes = projected_row_bytes(bindings, plan, relations)?;
+        let next_result_bytes = checked_add(result_bytes, projected_bytes)?;
+        ensure_result_budget(next_result_bytes)?;
+        rows.push(project_joined_row(bindings, plan, relations)?);
+        result_bytes = next_result_bytes;
+        if plan.limit.is_some_and(|limit| rows.len() == limit) {
+            Ok(VisitControl::Stop)
+        } else {
+            Ok(VisitControl::Continue)
+        }
+    })?;
     Ok(rows)
 }
 
 fn execute_ordered(
     storage: &dyn StorageReader,
-    plan: &JoinPlan,
-    relations: &[Relation],
-    conditions: &[Vec<ResolvedCondition>],
+    join: &Join<'_>,
     filter: &JoinFilter<'_>,
 ) -> Result<Vec<Row>> {
+    let Join {
+        plan, relations, ..
+    } = *join;
     let mut joined_rows = Vec::new();
     let mut seen = HashSet::new();
-    visit_joined_rows(
-        storage,
-        plan,
-        relations,
-        conditions,
-        &mut |bindings, budget| {
-            // DISTINCT may keep the first of several equal rows because every ordering key is a
-            // projected value, which validation guarantees, so equal rows also sort equally.
-            if !filter.matches(bindings, relations)?
-                || !first_distinct_row(&mut seen, bindings, plan, relations, budget)?
-            {
-                return Ok(VisitControl::Continue);
-            }
-            if joined_rows.len() == MAX_RESULT_ROWS {
-                return Err(result_rows_limit_error());
-            }
-            let projected_bytes = projected_row_bytes(bindings, plan, relations)?;
-            budget.retain(ordered_row_bytes(
-                projected_bytes,
-                order_keys_bytes(bindings, plan, relations)?,
-            )?)?;
-            joined_rows.push(OrderedJoinedRow {
-                row: project_joined_row(bindings, plan, relations)?,
-                keys: order_keys(bindings, plan, relations)?,
-                projected_bytes,
-                ordinal: joined_rows.len(),
-            });
-            Ok(VisitControl::Continue)
-        },
-    )?;
+    visit_joined_rows(storage, join, &mut |bindings, budget| {
+        // DISTINCT may keep the first of several equal rows because every ordering key is a
+        // projected value, which validation guarantees, so equal rows also sort equally.
+        if !filter.matches(bindings, relations)?
+            || !first_distinct_row(&mut seen, bindings, plan, relations, budget)?
+        {
+            return Ok(VisitControl::Continue);
+        }
+        if joined_rows.len() == MAX_RESULT_ROWS {
+            return Err(result_rows_limit_error());
+        }
+        let projected_bytes = projected_row_bytes(bindings, plan, relations)?;
+        budget.retain(ordered_row_bytes(
+            projected_bytes,
+            order_keys_bytes(bindings, plan, relations)?,
+        )?)?;
+        joined_rows.push(OrderedJoinedRow {
+            row: project_joined_row(bindings, plan, relations)?,
+            keys: order_keys(bindings, plan, relations)?,
+            projected_bytes,
+            ordinal: joined_rows.len(),
+        });
+        Ok(VisitControl::Continue)
+    })?;
 
     joined_rows.sort_unstable_by(|first, second| compare_joined_rows(first, second, plan));
 
@@ -347,66 +351,393 @@ fn execute_ordered(
     Ok(rows)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn visit_joined_rows(
+/// Receives each joined combination of rows, one binding per relation in join order.
+type JoinedRowVisitor<'v> =
+    dyn for<'a> FnMut(&[Option<&'a Row>], &mut WorkBudget) -> Result<VisitControl> + 'v;
+
+/// A validated join and how it reads each relation.
+#[derive(Clone, Copy)]
+struct Join<'a> {
+    plan: &'a JoinPlan,
+    relations: &'a [Relation],
+    conditions: &'a [Vec<ResolvedCondition>],
+    access: &'a Access,
+}
+
+/// How a join reads its relations. The probe, and each relation joined without `LEFT`, first
+/// drops the rows that fail the `WHERE` terms that read only that relation, and uses those terms to
+/// narrow its reads as a single-table query would. Each later relation is then read by looking up
+/// the rows matching each combination of earlier rows, through its primary key or an index its
+/// `ON` equalities fix, or else from a hash table of its rows keyed by those equalities.
+///
+/// Every path finds a combination's matches in primary-key order, as scanning the relation and
+/// testing each row would, so output keeps left-major order. The complete `WHERE` clause is still
+/// evaluated on every joined row.
+struct Access {
+    /// The `WHERE` terms each relation's rows must meet, in that relation's own column names.
+    pushed: Vec<Option<Predicate>>,
+    stages: Vec<StageAccess>,
+}
+
+enum StageAccess {
+    /// Rows whose `columns` equal values of earlier relations: the complete primary key when
+    /// `index` is `None`, or else every column of the index on `index`.
+    Lookup {
+        index: Option<Vec<String>>,
+        columns: Vec<KeyColumn>,
+    },
+    Hash,
+}
+
+/// A column a lookup fixes, and the earlier relation's column whose value it takes.
+struct KeyColumn {
+    column: String,
+    data_type: ColumnType,
+    source: usize,
+    source_column: String,
+}
+
+fn plan_access(
     storage: &dyn StorageReader,
     plan: &JoinPlan,
     relations: &[Relation],
     conditions: &[Vec<ResolvedCondition>],
-    visitor: &mut impl for<'a> FnMut(&[Option<&'a Row>], &mut WorkBudget) -> Result<VisitControl>,
+) -> Result<Access> {
+    let mut terms = vec![Vec::new(); relations.len()];
+    let conjuncts = match &plan.predicate {
+        Some(Predicate::And { predicates }) => predicates.iter().collect(),
+        Some(predicate) => vec![predicate],
+        None => Vec::new(),
+    };
+    for conjunct in conjuncts {
+        // A relation a LEFT JOIN may null-extend must keep every row: its null extension is
+        // decided by the ON clause alone, and WHERE then sees it.
+        if let Some(source) = single_source(conjunct, relations)?
+            && (source == 0 || plan.joins[source - 1].kind == JoinKind::Inner)
+        {
+            terms[source].push(renamed_to_source(conjunct));
+        }
+    }
+    let pushed = terms
+        .into_iter()
+        .map(|mut terms| match terms.len() {
+            0 => None,
+            1 => terms.pop(),
+            _ => Some(Predicate::And { predicates: terms }),
+        })
+        .collect();
+
+    let mut stages = Vec::with_capacity(plan.joins.len());
+    for (stage, conditions) in conditions.iter().enumerate() {
+        let source = stage + 1;
+        let relation = &relations[source];
+        // The earlier column each of this relation's columns is equal to.
+        let fixed = |column: &str| {
+            conditions.iter().find_map(|condition| {
+                let (own, other) = if condition.right_source == source {
+                    (
+                        &condition.right_column,
+                        (condition.left_source, &condition.left_column),
+                    )
+                } else {
+                    (
+                        &condition.left_column,
+                        (condition.right_source, &condition.right_column),
+                    )
+                };
+                (own == column).then_some(other)
+            })
+        };
+        let key = |columns: &[String]| {
+            columns
+                .iter()
+                .map(|column| {
+                    let (source, source_column) = fixed(column)?;
+                    let data_type = relation
+                        .schema
+                        .columns
+                        .iter()
+                        .find(|definition| definition.name == *column)?
+                        .data_type;
+                    Some(KeyColumn {
+                        column: column.clone(),
+                        data_type,
+                        source,
+                        source_column: source_column.clone(),
+                    })
+                })
+                .collect::<Option<Vec<_>>>()
+        };
+        let mut access = key(&relation.schema.primary_key).map(|columns| StageAccess::Lookup {
+            index: None,
+            columns,
+        });
+        if access.is_none() && storage.visits_indexes(&relation.source.table) {
+            for definition in storage.indexes_for_table(&relation.source.table)? {
+                if let Some(columns) = key(&definition.columns) {
+                    access = Some(StageAccess::Lookup {
+                        index: Some(definition.columns),
+                        columns,
+                    });
+                    break;
+                }
+            }
+        }
+        stages.push(access.unwrap_or(StageAccess::Hash));
+    }
+    Ok(Access { pushed, stages })
+}
+
+/// The one relation every column a predicate reads belongs to, if there is one.
+fn single_source(predicate: &Predicate, relations: &[Relation]) -> Result<Option<usize>> {
+    fn visit(
+        predicate: &Predicate,
+        relations: &[Relation],
+        found: &mut Option<Option<usize>>,
+    ) -> Result<()> {
+        match predicate {
+            Predicate::Comparison { column, .. }
+            | Predicate::IsNull { column, .. }
+            | Predicate::In { column, .. }
+            | Predicate::Like { column, .. } => {
+                let (source, _, _) = resolve_column(&parse_column_ref_text(column), relations)?;
+                *found = match *found {
+                    None => Some(Some(source)),
+                    Some(Some(existing)) if existing == source => Some(Some(source)),
+                    Some(_) => Some(None),
+                };
+            }
+            Predicate::And { predicates } | Predicate::Or { predicates } => {
+                for predicate in predicates {
+                    visit(predicate, relations, found)?;
+                }
+            }
+            Predicate::Not { predicate } => visit(predicate, relations, found)?,
+        }
+        Ok(())
+    }
+    let mut found = None;
+    visit(predicate, relations, &mut found)?;
+    Ok(found.flatten())
+}
+
+/// A predicate reading one relation, with its columns named as that relation names them.
+fn renamed_to_source(predicate: &Predicate) -> Predicate {
+    let mut predicate = predicate.clone();
+    fn rename(predicate: &mut Predicate) {
+        match predicate {
+            Predicate::Comparison { column, .. }
+            | Predicate::IsNull { column, .. }
+            | Predicate::In { column, .. }
+            | Predicate::Like { column, .. } => *column = parse_column_ref_text(column).column,
+            Predicate::And { predicates } | Predicate::Or { predicates } => {
+                predicates.iter_mut().for_each(rename)
+            }
+            Predicate::Not { predicate } => rename(predicate),
+        }
+    }
+    rename(&mut predicate);
+    predicate
+}
+
+/// One part of a hash-join key: equal values encode equally, numbers by their `f64` value with
+/// zero's sign ignored, as join equality compares them.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum KeyPart {
+    Number(u64),
+    Text(String),
+    Boolean(bool),
+}
+
+impl KeyPart {
+    /// The part for a value, or `None` for `NULL`, which never matches.
+    fn new(value: &Value) -> Option<Self> {
+        match value {
+            Value::Number(number) => {
+                let number = number.as_f64()?;
+                Some(Self::Number(if number == 0.0 {
+                    0
+                } else {
+                    number.to_bits()
+                }))
+            }
+            Value::String(text) => Some(Self::Text(text.clone())),
+            Value::Bool(value) => Some(Self::Boolean(*value)),
+            _ => None,
+        }
+    }
+}
+
+/// A hash-joined relation's rows that can match, grouped by the values of its `ON` columns.
+struct HashTable {
+    rows: Vec<Row>,
+    buckets: std::collections::HashMap<Vec<KeyPart>, Vec<usize>>,
+}
+
+/// Which side of each of a stage's `ON` equalities belongs to its new relation: its own column,
+/// then the earlier relation and column it equals.
+fn stage_sides(conditions: &[ResolvedCondition], source: usize) -> Vec<(&str, usize, &str)> {
+    conditions
+        .iter()
+        .map(|condition| {
+            if condition.right_source == source {
+                (
+                    condition.right_column.as_str(),
+                    condition.left_source,
+                    condition.left_column.as_str(),
+                )
+            } else {
+                (
+                    condition.left_column.as_str(),
+                    condition.right_source,
+                    condition.right_column.as_str(),
+                )
+            }
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_hash_table(
+    storage: &dyn StorageReader,
+    join: &Join<'_>,
+    source: usize,
+    filter: &Filter<'_>,
+    scanned: &mut usize,
+    build_count: &mut usize,
+    budget: &mut WorkBudget,
+) -> Result<HashTable> {
+    let relation = &join.relations[source];
+    let sides = stage_sides(&join.conditions[source - 1], source);
+    let mut table = HashTable {
+        rows: Vec::new(),
+        buckets: std::collections::HashMap::new(),
+    };
+    let outcome = crate::query::visit_predicate_candidates(
+        storage,
+        &relation.source.table,
+        join.access.pushed[source].as_ref(),
+        &relation.schema,
+        KeyOrder::Ascending,
+        &mut |row| {
+            count_scanned_row(scanned)?;
+            if !filter.matches(row)? {
+                return Ok(VisitControl::Continue);
+            }
+            let row = row.to_row()?;
+            // A row with a NULL key matches nothing, so it need not be kept.
+            let Some(key) = sides
+                .iter()
+                .map(|(column, ..)| {
+                    row.get(*column)
+                        .ok_or_else(|| missing_join_column_error(column))
+                        .map(KeyPart::new)
+                })
+                .collect::<Result<Option<Vec<_>>>>()?
+            else {
+                return Ok(VisitControl::Continue);
+            };
+            *build_count = build_count.saturating_add(1);
+            if *build_count > MAX_JOIN_BUILD_ROWS {
+                return Err(build_rows_limit_error());
+            }
+            let key_bytes = key.iter().try_fold(64_usize, |bytes, part| {
+                checked_add(
+                    bytes,
+                    match part {
+                        KeyPart::Text(text) => checked_add(32, text.len())?,
+                        _ => 16,
+                    },
+                )
+            })?;
+            budget.retain(checked_add(owned_row_bytes(&row)?, key_bytes)?)?;
+            table.buckets.entry(key).or_default().push(table.rows.len());
+            table.rows.push(row);
+            Ok(VisitControl::Continue)
+        },
+    )?;
+    if outcome != VisitOutcome::Complete {
+        return Err(malformed_reader_error(
+            "A join build visitor stopped before completing",
+        ));
+    }
+    Ok(table)
+}
+
+fn visit_joined_rows(
+    storage: &dyn StorageReader,
+    join: &Join<'_>,
+    visitor: &mut JoinedRowVisitor<'_>,
 ) -> Result<()> {
+    let Join {
+        plan, relations, ..
+    } = *join;
+    let filters = relations
+        .iter()
+        .zip(&join.access.pushed)
+        .map(|(relation, pushed)| {
+            Filter::new(pushed.as_ref(), &relation.schema, &relation.source.table)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut budget = WorkBudget::default();
     let mut scanned = 0_usize;
     let mut build_count = 0_usize;
-    let mut build_tables = Vec::with_capacity(plan.joins.len());
-    for relation in &relations[1..] {
-        let mut rows = Vec::new();
-        let outcome = storage.visit_table(&relation.source.table, &mut |row| {
-            count_scanned_row(&mut scanned)?;
-            build_count = build_count.saturating_add(1);
-            if build_count > MAX_JOIN_BUILD_ROWS {
-                return Err(build_rows_limit_error());
-            }
-            let row = row.to_row()?;
-            budget.retain(owned_row_bytes(&row)?)?;
-            rows.push(row);
-            Ok(VisitControl::Continue)
-        })?;
-        if outcome != VisitOutcome::Complete {
-            return Err(malformed_reader_error(
-                "A join build visitor stopped before completing",
-            ));
-        }
-        build_tables.push(rows);
+    let mut tables = Vec::with_capacity(plan.joins.len());
+    for (stage, access) in join.access.stages.iter().enumerate() {
+        tables.push(match access {
+            StageAccess::Hash => Some(build_hash_table(
+                storage,
+                join,
+                stage + 1,
+                &filters[stage + 1],
+                &mut scanned,
+                &mut build_count,
+                &mut budget,
+            )?),
+            StageAccess::Lookup { .. } => None,
+        });
     }
 
+    let extend = Extend {
+        storage,
+        join,
+        tables: &tables,
+        filters: &filters,
+    };
     let mut pairs = 0_usize;
     let mut stop_requested = false;
-    let probe_outcome = storage.visit_table(&relations[0].source.table, &mut |probe| {
-        if stop_requested {
-            return Ok(VisitControl::Stop);
-        }
-        count_scanned_row(&mut scanned)?;
-        let probe = probe.to_row()?;
-        let mut bindings = [None; MAX_JOIN_SOURCES];
-        bindings[0] = Some(&probe);
-        if visit_extensions(
-            storage,
-            0,
-            plan,
-            &build_tables,
-            conditions,
-            &mut bindings[..relations.len()],
-            &mut pairs,
-            &mut budget,
-            visitor,
-        )? == VisitControl::Stop
-        {
-            stop_requested = true;
-            return Ok(VisitControl::Stop);
-        }
-        Ok(VisitControl::Continue)
-    })?;
+    let probe = &relations[0];
+    let probe_outcome = crate::query::visit_predicate_candidates(
+        storage,
+        &probe.source.table,
+        join.access.pushed[0].as_ref(),
+        &probe.schema,
+        KeyOrder::Ascending,
+        &mut |row| {
+            if stop_requested {
+                return Ok(VisitControl::Stop);
+            }
+            count_scanned_row(&mut scanned)?;
+            if !filters[0].matches(row)? {
+                return Ok(VisitControl::Continue);
+            }
+            let row = row.to_row()?;
+            let mut bindings = [None; MAX_JOIN_SOURCES];
+            bindings[0] = Some(&row);
+            if extend.visit(
+                0,
+                &bindings[..relations.len()],
+                &mut pairs,
+                &mut budget,
+                visitor,
+            )? == VisitControl::Stop
+            {
+                stop_requested = true;
+                return Ok(VisitControl::Stop);
+            }
+            Ok(VisitControl::Continue)
+        },
+    )?;
     match (probe_outcome, stop_requested) {
         (VisitOutcome::Complete, false) | (VisitOutcome::Stopped, true) => Ok(()),
         (VisitOutcome::Stopped, false) => Err(malformed_reader_error(
@@ -418,65 +749,162 @@ fn visit_joined_rows(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn visit_extensions<'a>(
-    storage: &dyn StorageReader,
-    stage: usize,
-    plan: &JoinPlan,
-    build_tables: &'a [Vec<Row>],
-    conditions: &[Vec<ResolvedCondition>],
-    bindings: &mut [Option<&'a Row>],
-    pairs: &mut usize,
-    budget: &mut WorkBudget,
-    visitor: &mut impl for<'b> FnMut(&[Option<&'b Row>], &mut WorkBudget) -> Result<VisitControl>,
-) -> Result<VisitControl> {
-    if stage == plan.joins.len() {
-        return visitor(bindings, budget);
-    }
-    let source = stage + 1;
-    let mut matched = false;
-    for build in &build_tables[stage] {
-        count_join_pair(pairs)?;
-        storage.charge_work(1)?;
-        bindings[source] = Some(build);
-        if conditions_match(&conditions[stage], bindings)? {
-            matched = true;
-            if visit_extensions(
-                storage,
-                stage + 1,
-                plan,
-                build_tables,
-                conditions,
-                bindings,
-                pairs,
-                budget,
-                visitor,
-            )? == VisitControl::Stop
+/// Extends combinations of joined rows one stage at a time.
+struct Extend<'a> {
+    storage: &'a dyn StorageReader,
+    join: &'a Join<'a>,
+    tables: &'a [Option<HashTable>],
+    filters: &'a [Filter<'a>],
+}
+
+impl Extend<'_> {
+    fn visit(
+        &self,
+        stage: usize,
+        bindings: &[Option<&Row>],
+        pairs: &mut usize,
+        budget: &mut WorkBudget,
+        visitor: &mut JoinedRowVisitor<'_>,
+    ) -> Result<VisitControl> {
+        let plan = self.join.plan;
+        if stage == plan.joins.len() {
+            return visitor(bindings, budget);
+        }
+        let source = stage + 1;
+        let relation = &self.join.relations[source];
+        let conditions = &self.join.conditions[stage];
+        // A hash-joined relation's candidates are its rows with equal key values. A looked-up
+        // relation's are the rows its lookup finds, which must also meet its pushed terms.
+        let table = self.tables[stage].as_ref();
+        let found = match &self.join.access.stages[stage] {
+            StageAccess::Lookup { index, columns } => match lookup_key(columns, bindings)? {
+                Some(key) => self.lookup(relation, index.as_deref(), &key)?,
+                None => Vec::new(),
+            },
+            StageAccess::Hash => Vec::new(),
+        };
+        let candidates: Vec<&Row> = match table {
+            Some(table) => stage_sides(conditions, source)
+                .into_iter()
+                .map(|(_, other, column)| {
+                    earlier_value(bindings, other, column).map(|value| value.and_then(KeyPart::new))
+                })
+                .collect::<Result<Option<Vec<_>>>>()?
+                .and_then(|key| table.buckets.get(&key))
+                .map_or_else(Vec::new, |bucket| {
+                    bucket.iter().map(|index| &table.rows[*index]).collect()
+                }),
+            None => found.iter().collect(),
+        };
+        let mut local = [None; MAX_JOIN_SOURCES];
+        local[..bindings.len()].copy_from_slice(bindings);
+        let mut matched = false;
+        for row in candidates {
+            count_join_pair(pairs)?;
+            self.storage.charge_work(1)?;
+            if table.is_none()
+                && !self.filters[source].matches(&RowRef::map(row, &relation.schema))?
             {
-                bindings[source] = None;
+                continue;
+            }
+            local[source] = Some(row);
+            if !conditions_match(conditions, &local[..bindings.len()])? {
+                continue;
+            }
+            matched = true;
+            if self.visit(stage + 1, &local[..bindings.len()], pairs, budget, visitor)?
+                == VisitControl::Stop
+            {
                 return Ok(VisitControl::Stop);
             }
         }
+        if plan.joins[stage].kind == JoinKind::Left && !matched {
+            local[source] = None;
+            if self.visit(stage + 1, &local[..bindings.len()], pairs, budget, visitor)?
+                == VisitControl::Stop
+            {
+                return Ok(VisitControl::Stop);
+            }
+        }
+        Ok(VisitControl::Continue)
     }
-    if plan.joins[stage].kind == JoinKind::Left && !matched {
-        bindings[source] = None;
-        if visit_extensions(
-            storage,
-            stage + 1,
-            plan,
-            build_tables,
-            conditions,
-            bindings,
-            pairs,
-            budget,
-            visitor,
-        )? == VisitControl::Stop
-        {
-            return Ok(VisitControl::Stop);
+
+    /// The rows of `relation` with the complete primary key or index tuple `key`, in primary-key
+    /// order.
+    fn lookup(&self, relation: &Relation, index: Option<&[String]>, key: &Row) -> Result<Vec<Row>> {
+        let table = &relation.source.table;
+        let Some(columns) = index else {
+            return Ok(self
+                .storage
+                .lookup_primary_key(table, key)?
+                .into_iter()
+                .collect());
+        };
+        let mut rows = Vec::new();
+        let outcome = self.storage.visit_index(table, columns, key, &mut |row| {
+            rows.push(row.to_row()?);
+            Ok(VisitControl::Continue)
+        })?;
+        match outcome {
+            Some(VisitOutcome::Complete) => Ok(rows),
+            _ => Err(malformed_reader_error(
+                "A join lookup could not read the index it planned to use",
+            )),
         }
     }
-    bindings[source] = None;
-    Ok(VisitControl::Continue)
+}
+
+/// An earlier relation's value for an `ON` equality, or `None` when that relation has no row, as in
+/// an unmatched `LEFT JOIN`.
+fn earlier_value<'a>(
+    bindings: &[Option<&'a Row>],
+    source: usize,
+    column: &str,
+) -> Result<Option<&'a Value>> {
+    bindings[source]
+        .map(|row| {
+            row.get(column)
+                .ok_or_else(|| missing_join_column_error(column))
+        })
+        .transpose()
+}
+
+/// The values a lookup fixes, converted to the looked-up columns' types, or `None` when one is
+/// `NULL` or cannot equal any value of its column, so that nothing matches.
+fn lookup_key(columns: &[KeyColumn], bindings: &[Option<&Row>]) -> Result<Option<Row>> {
+    let mut key = Row::new();
+    for column in columns {
+        let Some(value) = earlier_value(bindings, column.source, &column.source_column)? else {
+            return Ok(None);
+        };
+        let Some(value) = lookup_value(column.data_type, value) else {
+            return Ok(None);
+        };
+        key.insert(column.column.clone(), value);
+    }
+    Ok(Some(key))
+}
+
+/// A value as a lookup of a `data_type` column takes it, if some value of that type equals it.
+fn lookup_value(data_type: ColumnType, value: &Value) -> Option<Value> {
+    Some(match (data_type, value) {
+        (ColumnType::Integer, Value::Number(number)) => match number.as_i64() {
+            Some(value) => Value::from(value),
+            None => {
+                let number = number.as_f64()?;
+                const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+                if number.fract() != 0.0 || number.abs() > MAX_SAFE_INTEGER {
+                    return None;
+                }
+                Value::from(number as i64)
+            }
+        },
+        (ColumnType::Float, Value::Number(number)) => Value::from(number.as_f64()?),
+        (ColumnType::Text, Value::String(_)) | (ColumnType::Boolean, Value::Bool(_)) => {
+            value.clone()
+        }
+        _ => return None,
+    })
 }
 
 /// Reports whether a matching joined row is the first with its projected values, remembering it if
@@ -2510,8 +2938,10 @@ mod tests {
         for order in ["", " ORDER BY l.id LIMIT 1"] {
             let before = storage.visitor_counts();
             // Reject every output row so the result-row cap cannot mask the
-            // candidate-pair guard. ORDER BY must finish even with LIMIT 1.
-            let plan = super::parse_sql(&format!("{query} WHERE l.id < 0{order}"), &[]).unwrap();
+            // candidate-pair guard. ORDER BY must finish even with LIMIT 1. A
+            // term reading both tables cannot be pushed into either one's reads.
+            let plan = super::parse_sql(&format!("{query} WHERE l.id < 0 OR r.id < 0{order}"), &[])
+                .unwrap();
             let error = super::execute(&storage, &plan).unwrap_err();
             assert_eq!(error.code, "INVALID_QUERY");
             assert!(
@@ -2529,7 +2959,7 @@ mod tests {
         // pass. The shared one-million-pair budget must reject the whole join.
         let plan = super::parse_sql(
             "SELECT a.id AS id FROM a JOIN b ON a.join_key = b.join_key \
-             JOIN c ON b.join_key = c.join_key WHERE a.id < 0",
+             JOIN c ON b.join_key = c.join_key WHERE a.id < 0 OR c.id < 0",
             &[],
         )
         .unwrap();

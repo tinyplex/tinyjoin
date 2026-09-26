@@ -467,6 +467,10 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
         Ok(VisitOutcome::Complete)
     }
 
+    fn visits_indexes(&self, table: &str) -> bool {
+        self.reads_committed(table)
+    }
+
     fn visits_in_key_order(&self, table: &str) -> bool {
         self.reads_committed(table)
     }
@@ -771,7 +775,8 @@ mod tests {
     #[test]
     fn script_work_budget_counts_join_candidate_pairs_beyond_row_scans() {
         let storage = storage();
-        let work = Cell::new(crate::sql_script::MAX_SQL_SCRIPT_OPERATIONS - 7);
+        // Two probe rows and two key lookups fit, and the two candidate pairs do not.
+        let work = Cell::new(crate::sql_script::MAX_SQL_SCRIPT_OPERATIONS - 5);
         let view = PagedReadView::with_work_budget(&storage, None, &work);
         let plan =
             crate::join::parse_sql("SELECT a.id FROM items a JOIN items b ON a.id = b.id", &[])

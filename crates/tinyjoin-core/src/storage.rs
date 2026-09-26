@@ -105,6 +105,12 @@ pub(crate) trait StorageReader {
         table: &str,
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome>;
+    /// Whether [`Self::visit_index`] serves `table`'s indexes, as it cannot while a transaction has
+    /// staged changes to the table that its index entries do not yet reflect.
+    fn visits_indexes(&self, table: &str) -> bool {
+        let _ = table;
+        true
+    }
     /// Whether this reader visits `table`'s rows in primary-key order, from every visit, so that a
     /// query ordered by its primary key can stream them.
     fn visits_in_key_order(&self, table: &str) -> bool {

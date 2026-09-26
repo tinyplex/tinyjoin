@@ -406,24 +406,40 @@ names without dots for tables that will participate in joins.
 
 ### Join work budgets
 
-Join chains are evaluated as written, from left to right, by a bounded nested
-loop; TinyJoin does not reorder or optimize them. Each `ON` equality must
-connect its newly introduced source to one of the sources already in scope.
+Join chains are evaluated as written, from left to right; TinyJoin does not
+reorder them. Each `ON` equality must connect its newly introduced source to
+one of the sources already in scope. For each combination of earlier rows, a
+joined table's matching rows are found:
+
+- by direct lookup, when the `ON` equalities fix its complete primary key;
+- through a secondary index whose every column they fix, unless the table has
+  staged changes inside a callback transaction; or
+- in a hash table of the table's rows keyed by the `ON` columns, built once
+  per query.
+
+`WHERE` terms that read only the first table, or only a table joined without
+`LEFT`, also narrow how that table is read, as they would in a single-table
+query, and rows that fail them are dropped before joining. A term on a table
+joined with `LEFT` must see its null-extended rows, so it is never applied
+early. The complete `WHERE` clause is still checked on every joined row.
+
 Across the full chain, candidate-extension, retained-row, result-row, and byte
 budgets are global rather than resetting for each `JOIN`. Aggregates over joins
-are not supported. The engine counts actual candidate comparisons while
-executing; it does not reject a join merely because the full Cartesian product
-is large. Source row counts still enforce the scan and retained-build-row
-limits before execution.
+are not supported. A candidate is a row a lookup or hash table returns for one
+combination of earlier rows, so the budget counts only rows whose `ON` values
+match: a join is never rejected because the Cartesian product is large. Rows of
+hash-joined tables are retained and count toward the retained-build-row limit,
+and tables read whole, without narrowing terms, are checked against the scan
+and retained-build-row limits before execution.
 
 For example, three tables of 100 rows joined on unique matching identifiers
-need about 20,000 candidate comparisons and return 100 rows. Such a selective
-chain fits. Two tables of 1,001 rows whose join keys all match can exceed the
-1,000,000-comparison budget even when a later `WHERE` removes every result.
-Order and join shape therefore matter. An unordered `LIMIT` can stop early;
-an ordered join must first collect its matches. Standalone queries and exec()
-also charge scans and comparisons to their shared script-work budget, which
-can be reached before the comparison-only limit.
+examine 200 candidates and return 100 rows. Two tables of 1,001 rows whose join
+keys all match examine over 1,000,000 candidates, and exceed the budget even
+when a later `WHERE` term that reads both tables removes every result. An
+unordered `LIMIT` can stop early; an ordered join must first collect its
+matches. Standalone queries and exec() also charge scans and candidates to
+their shared script-work budget, which can be reached before the join's own
+limit.
 
 Many-to-many relationships can use a bridge table with a composite primary
 key, for example:
@@ -537,11 +553,11 @@ An ordered query can reach its materialization limit before applying a small
 columns, or descending by all of them. Such a query reads rows in key order and
 stops at its `LIMIT`, so the ordered-row limit does not apply to it, except
 when it descends through a secondary index or reads a table with staged
-changes inside a transaction. Join candidate-extension and retained-row bounds apply to the complete
-left-deep chain, not separately to each step and not just to returned rows. The
-candidate limit is enforced by a runtime counter, including comparisons that
-fail the join condition. The
-1,024-byte secondary-index key limit covers the complete encoded indexed tuple
+changes inside a transaction. Join candidate-extension and retained-row bounds
+apply to the complete left-deep chain, not separately to each step and not just
+to returned rows. The candidate limit is enforced by a runtime counter as
+candidates are found, including those that later fail another `ON` equality or
+the `WHERE` clause. The 1,024-byte secondary-index key limit covers the complete encoded indexed tuple
 and primary-key tuple together, not each component independently. A boolean
 component takes 1 byte, an integer or float 8, and text its UTF-8 bytes plus 2,
 and 1 more for each zero byte. An individual JSON value remains subject to the
