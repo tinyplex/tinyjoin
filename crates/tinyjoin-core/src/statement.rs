@@ -1357,7 +1357,14 @@ fn visit_dml_candidates(
             _ => Ok(VisitOutcome::Complete),
         };
     }
-    visit_indexed_candidates(storage, &schema.name, predicate, schema, visitor)
+    visit_indexed_candidates(
+        storage,
+        &schema.name,
+        predicate,
+        schema,
+        crate::storage::KeyOrder::Ascending,
+        visitor,
+    )
 }
 
 fn validate_projection(schema: &TableDefinition, returning: Option<&[String]>) -> Result<()> {

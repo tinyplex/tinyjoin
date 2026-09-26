@@ -25,7 +25,7 @@ use crate::{
     row::RowRef,
     statement::{PlannedDml, Statement, WriteStatement},
     storage::{
-        KeyRange, estimated_row_bytes, normalize_row, preflight_row_write_set,
+        KeyOrder, KeyRange, estimated_row_bytes, normalize_row, preflight_row_write_set,
         schema_with_added_column, validate_schema,
     },
 };
@@ -904,10 +904,15 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
         Ok(VisitOutcome::Complete)
     }
 
+    fn visits_in_key_order(&self, _table: &str) -> bool {
+        true
+    }
+
     fn visit_table_range(
         &self,
         table: &str,
         range: &KeyRange,
+        order: KeyOrder,
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
         let table = self
@@ -918,18 +923,26 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
             return Ok(VisitOutcome::Complete);
         };
         let key_type = table.leading_key_type();
-        let mut cursor = Btree::cursor_from_in_transaction(
-            &mut self.transaction.borrow_mut(),
-            root,
-            table.tree_id,
-            range.start(),
-        )?;
+        let mut cursor = match order {
+            KeyOrder::Ascending => Btree::cursor_from_in_transaction(
+                &mut self.transaction.borrow_mut(),
+                root,
+                table.tree_id,
+                range.start(),
+            )?,
+            KeyOrder::Descending => Btree::cursor_before_in_transaction(
+                &mut self.transaction.borrow_mut(),
+                root,
+                table.tree_id,
+                range.end().as_deref(),
+            )?,
+        };
         loop {
             let next = cursor.next_entry_in_transaction(&mut self.transaction.borrow_mut())?;
             let Some((key, value)) = next else {
                 break;
             };
-            if !range.admits(leading_key_component(key, key_type)?) {
+            if !range.contains(leading_key_component(key, key_type)?) {
                 break;
             }
             self.charge_operations(1)?;
@@ -1097,7 +1110,7 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
                 range.start(),
             )?;
             while let Some((entry, value)) = cursor.next_entry_in_transaction(&mut transaction)? {
-                if !range.admits(leading_key_component(entry, types[0])?) {
+                if !range.contains(leading_key_component(entry, types[0])?) {
                     break;
                 }
                 if primary_keys.len() == limit {

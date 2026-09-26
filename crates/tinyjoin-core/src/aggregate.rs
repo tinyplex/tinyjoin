@@ -189,6 +189,7 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &AggregatePlan) -> Resu
         &plan.table,
         plan.predicate.as_ref(),
         &schema,
+        crate::storage::KeyOrder::Ascending,
         &mut |row| {
             scanned = scanned.saturating_add(1);
             if scanned > MAX_SCAN_ROWS {

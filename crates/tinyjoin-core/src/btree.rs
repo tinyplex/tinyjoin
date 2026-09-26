@@ -258,7 +258,25 @@ impl Btree {
         tree_id: TreeId,
         lower_bound: &[u8],
     ) -> Result<BtreeCursor> {
-        open_cursor(pager, root_page_id, tree_id, lower_bound, false)
+        open_cursor(
+            pager,
+            root_page_id,
+            tree_id,
+            Some(lower_bound),
+            false,
+            false,
+        )
+    }
+
+    /// Opens a detached cursor which moves backward from the last key before `bound`, or from the
+    /// last key of all.
+    pub(crate) fn cursor_before<D: PageDevice>(
+        pager: &mut Pager<D>,
+        root_page_id: PageId,
+        tree_id: TreeId,
+        bound: Option<&[u8]>,
+    ) -> Result<BtreeCursor> {
+        open_cursor(pager, root_page_id, tree_id, bound, true, false)
     }
 
     /// Opens a committed cursor which fully validates every node it reads, as opening a database
@@ -268,7 +286,7 @@ impl Btree {
         root_page_id: PageId,
         tree_id: TreeId,
     ) -> Result<BtreeCursor> {
-        open_cursor(pager, root_page_id, tree_id, &[], true)
+        open_cursor(pager, root_page_id, tree_id, None, false, true)
     }
 
     /// Opens a detached cursor over a tree visible to an open pager transaction.
@@ -293,7 +311,24 @@ impl Btree {
         tree_id: TreeId,
         lower_bound: &[u8],
     ) -> Result<BtreeCursor> {
-        open_cursor(transaction, root_page_id, tree_id, lower_bound, false)
+        open_cursor(
+            transaction,
+            root_page_id,
+            tree_id,
+            Some(lower_bound),
+            false,
+            false,
+        )
+    }
+
+    /// [`Self::cursor_before`] for a tree visible to an open pager transaction.
+    pub(crate) fn cursor_before_in_transaction<D: PageDevice>(
+        transaction: &mut PagerWriteTransaction<'_, D>,
+        root_page_id: PageId,
+        tree_id: TreeId,
+        bound: Option<&[u8]>,
+    ) -> Result<BtreeCursor> {
+        open_cursor(transaction, root_page_id, tree_id, bound, true, false)
     }
 
     /// Validates and atomically removes every page reachable from `root_page_id`.
@@ -427,15 +462,20 @@ fn get_from(
     )))
 }
 
+/// Opens a cursor moving forward from the first key at or after `bound`, or backward from the last
+/// key before it. With no bound, it starts at the first or last key of all.
 fn open_cursor(
     reader: &mut impl BtreeReadView,
     root_page_id: PageId,
     tree_id: TreeId,
-    lower_bound: &[u8],
+    bound: Option<&[u8]>,
+    backward: bool,
     strict: bool,
 ) -> Result<BtreeCursor> {
     validate_tree_id(tree_id)?;
-    validate_key(lower_bound)?;
+    if let Some(bound) = bound {
+        validate_key(bound)?;
+    }
     let view = reader.cursor_view(tree_id)?;
     let mut cursor = BtreeCursor {
         tree_id,
@@ -446,9 +486,10 @@ fn open_cursor(
         leaf_index: 0,
         finished: false,
         visited_pages: HashSet::new(),
+        backward,
         strict,
     };
-    cursor.seek(reader, lower_bound)?;
+    cursor.seek(reader, bound)?;
     Ok(cursor)
 }
 
@@ -456,7 +497,7 @@ fn open_cursor(
 /// from an overflow chain.
 pub(crate) type CursorEntry<'a> = (&'a [u8], Cow<'a, [u8]>);
 
-/// Resumable forward cursor state which does not hold a pager borrow.
+/// Resumable cursor state which does not hold a pager borrow.
 ///
 /// The cursor keeps a view of its current leaf and of every internal node above it, so moving to
 /// the next leaf reads only that leaf, and entries are returned as slices of the leaf's page.
@@ -468,9 +509,13 @@ pub(crate) struct BtreeCursor {
     /// Internal nodes from the root down, each with the child index the cursor followed.
     path: Vec<(NodeView, usize)>,
     leaf: Option<NodeView>,
+    /// How many of the leaf's entries lie before the cursor: the next entry moving forward, or one
+    /// past it moving backward.
     leaf_index: usize,
     finished: bool,
     visited_pages: HashSet<PageId>,
+    /// Whether the cursor moves toward smaller keys.
+    backward: bool,
     strict: bool,
 }
 
@@ -518,13 +563,25 @@ impl BtreeCursor {
             return Ok(None);
         }
         self.ensure_view(reader)?;
-        while self.leaf_index >= self.leaf.as_ref().map_or(0, NodeView::len) {
+        loop {
+            let remaining = if self.backward {
+                self.leaf_index > 0
+            } else {
+                self.leaf_index < self.leaf.as_ref().map_or(0, NodeView::len)
+            };
+            if remaining {
+                break;
+            }
             if !self.advance_leaf(reader)? {
                 self.finished = true;
                 return Ok(None);
             }
         }
-        let index = self.leaf_index;
+        let index = if self.backward {
+            self.leaf_index - 1
+        } else {
+            self.leaf_index
+        };
         let tree_id = self.tree_id;
         let generation = self.view.generation();
         let leaf = self
@@ -546,7 +603,7 @@ impl BtreeCursor {
             ),
         };
         // An entry that fails to read is not passed over: reading on reports the same error.
-        self.leaf_index = index + 1;
+        self.leaf_index = if self.backward { index } else { index + 1 };
         Ok(Some((key, value)))
     }
 
@@ -575,7 +632,7 @@ impl BtreeCursor {
         Ok(node)
     }
 
-    fn seek(&mut self, reader: &mut impl BtreeReadView, lower_bound: &[u8]) -> Result<()> {
+    fn seek(&mut self, reader: &mut impl BtreeReadView, bound: Option<&[u8]>) -> Result<()> {
         self.ensure_view(reader)?;
         self.path.clear();
         self.visited_pages.clear();
@@ -584,12 +641,24 @@ impl BtreeCursor {
         let mut parent_generation = None;
         for _ in 0..MAX_TREE_DEPTH {
             let node = self.load(reader, page_id, expected_level, parent_generation)?;
+            // Either way, the entries before the cursor are those with keys below the bound.
             if node.leaf {
-                self.leaf_index = node.lower_bound(lower_bound)?;
+                self.leaf_index = match (bound, self.backward) {
+                    (Some(bound), _) => node.lower_bound(bound)?,
+                    (None, false) => 0,
+                    (None, true) => node.len(),
+                };
                 self.leaf = Some(node);
                 return Ok(());
             }
-            let child_index = node.child_index_for(lower_bound)?;
+            let child_index = match (bound, self.backward) {
+                (Some(bound), false) => node.child_index_for(bound)?,
+                (Some(bound), true) => {
+                    node.partition(|index| Ok(node.internal_key(index)? < bound))?
+                }
+                (None, false) => 0,
+                (None, true) => node.len(),
+            };
             page_id = node.child(child_index)?;
             expected_level = Some(node.level - 1);
             parent_generation = Some(node.generation);
@@ -603,23 +672,24 @@ impl BtreeCursor {
 
     fn advance_leaf(&mut self, reader: &mut impl BtreeReadView) -> Result<bool> {
         while let Some((node, child_index)) = self.path.pop() {
-            if child_index < node.len() {
-                let next_child = node.child(child_index + 1)?;
+            let sibling = if self.backward {
+                child_index.checked_sub(1)
+            } else {
+                (child_index < node.len()).then_some(child_index + 1)
+            };
+            if let Some(sibling) = sibling {
+                let next_child = node.child(sibling)?;
                 let expected_level = node.level - 1;
                 let parent_generation = node.generation;
-                self.path.push((node, child_index + 1));
-                return self.descend_leftmost(
-                    reader,
-                    next_child,
-                    expected_level,
-                    parent_generation,
-                );
+                self.path.push((node, sibling));
+                return self.descend_edge(reader, next_child, expected_level, parent_generation);
             }
         }
         Ok(false)
     }
 
-    fn descend_leftmost(
+    /// Descends to the first leaf under a node moving forward, or its last moving backward.
+    fn descend_edge(
         &mut self,
         reader: &mut impl BtreeReadView,
         mut page_id: PageId,
@@ -634,14 +704,15 @@ impl BtreeCursor {
                 Some(parent_generation),
             )?;
             if node.leaf {
-                self.leaf_index = 0;
+                self.leaf_index = if self.backward { node.len() } else { 0 };
                 self.leaf = Some(node);
                 return Ok(true);
             }
-            page_id = node.child(0)?;
+            let edge = if self.backward { node.len() } else { 0 };
+            page_id = node.child(edge)?;
             expected_level = node.level - 1;
             parent_generation = node.generation;
-            self.path.push((node, 0));
+            self.path.push((node, edge));
         }
         Err(invalid_btree(storage_diagnostic!(
             "Tree {} exceeds the maximum depth of {MAX_TREE_DEPTH}",
@@ -2816,6 +2887,83 @@ mod tests {
             pages.insert(id, bytes);
         }
         Pager::open_or_create(SparseDevice { pages }).unwrap()
+    }
+
+    #[test]
+    fn backward_cursors_visit_keys_in_reverse_from_any_bound() {
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let mut root = create_tree(&mut pager);
+        // Even numbers, so that odd bounds fall between keys.
+        let numbers = (0..120u32).map(|number| number * 2).collect::<Vec<_>>();
+        let mut transaction = pager.begin_write().unwrap();
+        for number in &numbers {
+            root = Btree::upsert(&mut transaction, root, TREE, &key(*number), &value(*number))
+                .unwrap()
+                .root_page_id;
+        }
+        transaction.commit(2, EMPTY_HASH, Some(root)).unwrap();
+        assert!(
+            page_count_of(&mut pager, root) > 20,
+            "the tree must have several levels"
+        );
+
+        let keys = |cursor: &mut BtreeCursor, pager: &mut Pager<MemoryPageDevice>| {
+            let mut keys = Vec::new();
+            while let Some((key, value)) = cursor.next(pager).unwrap() {
+                assert_eq!(value[..4], key[..4]);
+                keys.push(key);
+            }
+            keys
+        };
+        let forward = keys(
+            &mut Btree::cursor(&mut pager, root, TREE).unwrap(),
+            &mut pager,
+        );
+        assert_eq!(
+            forward,
+            numbers
+                .iter()
+                .map(|number| key(*number))
+                .collect::<Vec<_>>()
+        );
+        for bound in [
+            None,
+            Some(Vec::new()),
+            Some(vec![0]),
+            Some(key(0)),
+            Some(key(1)),
+            Some(key(2)),
+            Some(key(119)),
+            Some(key(120)),
+            Some(key(238)),
+            Some(key(239)),
+            Some(key(1_000)),
+        ] {
+            let expected = forward
+                .iter()
+                .filter(|key| bound.as_ref().is_none_or(|bound| *key < bound))
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut cursor =
+                Btree::cursor_before(&mut pager, root, TREE, bound.as_deref()).unwrap();
+            assert_eq!(
+                keys(&mut cursor, &mut pager),
+                expected,
+                "{:?}",
+                bound.map(|bound| bound.len())
+            );
+        }
+
+        let mut transaction = pager.begin_write().unwrap();
+        let mut cursor =
+            Btree::cursor_before_in_transaction(&mut transaction, root, TREE, None).unwrap();
+        let mut backward = Vec::new();
+        while let Some((key, _)) = cursor.next_in_transaction(&mut transaction).unwrap() {
+            backward.push(key);
+        }
+        backward.reverse();
+        assert_eq!(backward, forward);
     }
 
     #[test]

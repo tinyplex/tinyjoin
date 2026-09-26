@@ -1446,3 +1446,119 @@ fn generated_ranges_agree_with_full_scans() {
 fn generator_value(id: i64, bound: i64) -> i64 {
     (id * 7919 + id * id * 31) % bound
 }
+
+/// Queries ordered by a prefix of the primary key stream rows in key order, forward or backward,
+/// and stop at their limit, while any other order is sorted. Both must return exactly the rows a
+/// model sorts, with every combination of range, index and filter, inside and outside a
+/// transaction.
+#[test]
+fn generated_key_orders_agree_with_sorting() {
+    type Pair = (i64, String, Option<i64>);
+    let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+    engine
+        .exec_sql(
+            "CREATE TABLE pairs (a INTEGER NOT NULL, b TEXT NOT NULL, v INTEGER, \
+             PRIMARY KEY (a, b)); CREATE INDEX pairs_v ON pairs (v)",
+        )
+        .unwrap();
+    let texts = ["", "a", "ab", "b", "é", "🦀", "a\u{0}"];
+    let mut model = Vec::<Pair>::new();
+    let mut generator = Generator(0x0bde);
+    engine.begin_transaction().unwrap();
+    for a in -6..30 {
+        for b in texts {
+            if generator.pick(3) == 0 {
+                continue;
+            }
+            let v = (generator.pick(5) != 0).then(|| generator.pick(40) as i64);
+            engine
+                .execute_sql(
+                    "INSERT INTO pairs VALUES ($1, $2, $3)",
+                    &[json!(a), json!(b), json!(v)],
+                )
+                .unwrap();
+            model.push((a, b.to_owned(), v));
+        }
+    }
+    engine.commit_transaction().unwrap();
+
+    type Term = (&'static str, fn(&Pair) -> bool);
+    let terms: [Term; 12] = [
+        ("a > 20", |row| row.0 > 20),
+        ("a <= -2", |row| row.0 <= -2),
+        ("a BETWEEN 3 AND 5", |row| (3..=5).contains(&row.0)),
+        ("a = 7", |row| row.0 == 7),
+        ("a >= 2.5", |row| row.0 >= 3),
+        ("b >= 'b'", |row| row.1.as_str() >= "b"),
+        ("b < 'ab'", |row| row.1.as_str() < "ab"),
+        ("b LIKE 'a%'", |row| row.1.starts_with('a')),
+        ("v = 3", |row| row.2 == Some(3)),
+        ("v > 30", |row| row.2.is_some_and(|v| v > 30)),
+        ("v IS NULL", |row| row.2.is_none()),
+        ("a <> 4", |row| row.0 != 4),
+    ];
+    type Order = (&'static str, fn(&Pair, &Pair) -> std::cmp::Ordering);
+    let orders: [Order; 7] = [
+        ("a", |x, y| x.0.cmp(&y.0).then(x.1.cmp(&y.1))),
+        ("a DESC", |x, y| y.0.cmp(&x.0).then(x.1.cmp(&y.1))),
+        ("a, b", |x, y| (x.0, &x.1).cmp(&(y.0, &y.1))),
+        ("a DESC, b DESC", |x, y| (y.0, &y.1).cmp(&(x.0, &x.1))),
+        ("a ASC, b DESC", |x, y| x.0.cmp(&y.0).then(y.1.cmp(&x.1))),
+        ("a DESC, b", |x, y| y.0.cmp(&x.0).then(x.1.cmp(&y.1))),
+        ("b DESC, a", |x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0))),
+    ];
+    for staged in [false, true, false] {
+        let in_transaction = staged || engine.in_transaction();
+        if staged {
+            engine.begin_transaction().unwrap();
+            engine
+                .execute_sql("INSERT INTO pairs VALUES (100, 'z', 1)", &[])
+                .unwrap();
+            model.push((100, "z".to_owned(), Some(1)));
+        }
+        for case in 0..300 {
+            let chosen = (0..generator.pick(3))
+                .map(|_| &terms[generator.pick(terms.len())])
+                .collect::<Vec<_>>();
+            let (order_sql, compare) = orders[generator.pick(orders.len())];
+            let limit = [None, Some(0), Some(1), Some(5), Some(40)][generator.pick(5)];
+            let offset = [0, 0, 1, 7][generator.pick(4)];
+            let mut sql = String::from("SELECT a, b FROM pairs");
+            if !chosen.is_empty() {
+                let condition = chosen.iter().map(|(sql, _)| *sql).collect::<Vec<_>>();
+                sql.push_str(&format!(" WHERE {}", condition.join(" AND ")));
+            }
+            sql.push_str(&format!(" ORDER BY {order_sql}"));
+            if let Some(limit) = limit {
+                sql.push_str(&format!(" LIMIT {limit}"));
+            }
+            if offset > 0 {
+                sql.push_str(&format!(" OFFSET {offset}"));
+            }
+            let mut expected = model
+                .iter()
+                .filter(|row| chosen.iter().all(|(_, matches)| matches(row)))
+                .collect::<Vec<_>>();
+            // Rows equal on every ordering column keep ascending key order, as a stable sort of
+            // rows read in key order leaves them.
+            expected.sort_by(|x, y| compare(x, y));
+            let expected = expected
+                .into_iter()
+                .skip(offset)
+                .take(limit.unwrap_or(usize::MAX))
+                .map(|row| self::row(json!({"a": row.0, "b": row.1})))
+                .collect::<Vec<_>>();
+            let actual = engine.query_sql(&sql, &[]).unwrap().rows;
+            assert_eq!(
+                actual, expected,
+                "case {case}, transaction {in_transaction}: {sql}"
+            );
+        }
+        if staged {
+            engine.rollback_transaction().unwrap();
+            model.pop();
+            engine.begin_transaction().unwrap();
+        }
+    }
+    engine.rollback_transaction().unwrap();
+}

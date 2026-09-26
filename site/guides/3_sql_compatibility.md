@@ -533,7 +533,11 @@ rather than growing without bound.
 | Query, DML result, join, aggregate, or mutation working set | 16 MiB per operation-specific bound |
 
 An ordered query can reach its materialization limit before applying a small
-`LIMIT`. Join candidate-extension and retained-row bounds apply to the complete
+`LIMIT`, unless it is ordered by the primary key: ascending by its leading
+columns, or descending by all of them. Such a query reads rows in key order and
+stops at its `LIMIT`, so the ordered-row limit does not apply to it, except
+when it descends through a secondary index or reads a table with staged
+changes inside a transaction. Join candidate-extension and retained-row bounds apply to the complete
 left-deep chain, not separately to each step and not just to returned rows. The
 candidate limit is enforced by a runtime counter, including comparisons that
 fail the join condition. The

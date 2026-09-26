@@ -21,7 +21,7 @@ use crate::{
         secondary_index_primary_key_for_definition,
     },
     row::RowRef,
-    storage::{KeyRange, RowWriteUsage, normalize_row, preflight_row_write_set},
+    storage::{KeyOrder, KeyRange, RowWriteUsage, normalize_row, preflight_row_write_set},
 };
 /// A relational view over the crash-safe paged B-tree store.
 ///
@@ -707,10 +707,15 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
         Ok(VisitOutcome::Complete)
     }
 
+    fn visits_in_key_order(&self, _table: &str) -> bool {
+        true
+    }
+
     fn visit_table_range(
         &self,
         table: &str,
         range: &KeyRange,
+        order: KeyOrder,
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
         self.ensure_ready()?;
@@ -722,18 +727,26 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
             return Ok(VisitOutcome::Complete);
         };
         let key_type = table.leading_key_type();
-        let mut cursor = Btree::cursor_from(
-            &mut self.pager.borrow_mut(),
-            root,
-            table.tree_id,
-            range.start(),
-        )?;
+        let mut cursor = match order {
+            KeyOrder::Ascending => Btree::cursor_from(
+                &mut self.pager.borrow_mut(),
+                root,
+                table.tree_id,
+                range.start(),
+            )?,
+            KeyOrder::Descending => Btree::cursor_before(
+                &mut self.pager.borrow_mut(),
+                root,
+                table.tree_id,
+                range.end().as_deref(),
+            )?,
+        };
         loop {
             let next = cursor.next_entry(&mut self.pager.borrow_mut())?;
             let Some((key, value)) = next else {
                 break;
             };
-            if !range.admits(leading_key_component(key, key_type)?) {
+            if !range.contains(leading_key_component(key, key_type)?) {
                 break;
             }
             if visitor(&RowRef::record(table.record(key, &value)?))? == VisitControl::Stop {
@@ -913,7 +926,7 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
             let mut cursor =
                 Btree::cursor_from(&mut pager, index_root, index.tree_id, range.start())?;
             while let Some((entry, value)) = cursor.next_entry(&mut pager)? {
-                if !range.admits(leading_key_component(entry, types[0])?) {
+                if !range.contains(leading_key_component(entry, types[0])?) {
                     break;
                 }
                 if primary_keys.len() == limit {

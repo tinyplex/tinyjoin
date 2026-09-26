@@ -42,16 +42,38 @@ pub(crate) struct KeyRange {
 }
 
 impl KeyRange {
-    /// Where a visit in key order starts.
+    /// Where a visit in ascending key order starts.
     pub(crate) fn start(&self) -> &[u8] {
         self.lower.as_deref().unwrap_or_default()
     }
 
-    /// Whether a key whose leading component is `component` lies at or below the upper bound. A
-    /// visit in key order stops at the first key that does not.
-    pub(crate) fn admits(&self, component: &[u8]) -> bool {
-        self.upper.as_deref().is_none_or(|upper| component <= upper)
+    /// Where a visit in descending key order starts, just past every key whose leading component
+    /// is at or below the upper bound: that bound with its last byte incremented. No component is
+    /// a proper prefix of another, or of an upper bound, so this admits exactly those keys.
+    pub(crate) fn end(&self) -> Option<Vec<u8>> {
+        let mut end = self.upper.clone()?;
+        while let Some(last) = end.pop() {
+            if last < u8::MAX {
+                end.push(last + 1);
+                return Some(end);
+            }
+        }
+        None
     }
+
+    /// Whether a key whose leading component is `component` lies within the range. A visit in key
+    /// order stops at the first key that does not.
+    pub(crate) fn contains(&self, component: &[u8]) -> bool {
+        self.lower.as_deref().is_none_or(|lower| component >= lower)
+            && self.upper.as_deref().is_none_or(|upper| component <= upper)
+    }
+}
+
+/// The order in which a visit returns rows, by primary key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KeyOrder {
+    Ascending,
+    Descending,
 }
 
 /// Read-only relational storage used by query planning and execution.
@@ -83,15 +105,23 @@ pub(crate) trait StorageReader {
         table: &str,
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome>;
-    /// Visits the rows whose leading primary-key column lies within `range`, which may include rows
-    /// outside it. Readers without ordered keys visit every row.
+    /// Whether this reader visits `table`'s rows in primary-key order, from every visit, so that a
+    /// query ordered by its primary key can stream them.
+    fn visits_in_key_order(&self, table: &str) -> bool {
+        let _ = table;
+        false
+    }
+    /// Visits the rows whose leading primary-key column lies within `range`, in `order` if the
+    /// reader [visits in key order](Self::visits_in_key_order). Readers without ordered keys visit
+    /// every row, as [`Self::visit_table`] does.
     fn visit_table_range(
         &self,
         table: &str,
         range: &KeyRange,
+        order: KeyOrder,
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
-        let _ = range;
+        let _ = (range, order);
         self.visit_table(table, visitor)
     }
     fn table_row_count(&self, table: &str) -> Result<usize>;

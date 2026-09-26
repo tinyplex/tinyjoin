@@ -9,7 +9,7 @@ use crate::{
     paged_codec::encode_primary_key,
     paged_storage::{AppendWriteContext, PagedWriteUsage, UniquePrefixes},
     row::RowRef,
-    storage::{KeyRange, estimated_row_bytes},
+    storage::{KeyOrder, KeyRange, estimated_row_bytes},
 };
 
 const MAX_TRANSACTION_KEYS: usize = 100_000;
@@ -467,10 +467,15 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
         Ok(VisitOutcome::Complete)
     }
 
+    fn visits_in_key_order(&self, table: &str) -> bool {
+        self.reads_committed(table)
+    }
+
     fn visit_table_range(
         &self,
         table: &str,
         range: &KeyRange,
+        order: KeyOrder,
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
         self.ensure_base_revision()?;
@@ -479,10 +484,11 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
             // so a transaction which changed the table visits every row.
             return self.visit_table(table, visitor);
         }
-        self.storage.visit_table_range(table, range, &mut |row| {
-            self.charge_work(1)?;
-            visitor(row)
-        })
+        self.storage
+            .visit_table_range(table, range, order, &mut |row| {
+                self.charge_work(1)?;
+                visitor(row)
+            })
     }
 
     fn table_row_count(&self, table: &str) -> Result<usize> {

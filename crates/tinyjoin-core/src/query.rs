@@ -7,7 +7,8 @@ use serde_json::{Map, Number, Value};
 use crate::paged_codec::{encode_key_bound, encode_text_prefix_bounds};
 use crate::row::{Columns, RowRef, ValueRef};
 use crate::storage::{
-    KeyRange, StorageReader, estimated_row_bytes, estimated_value_bytes, validate_json_value,
+    KeyOrder, KeyRange, StorageReader, estimated_row_bytes, estimated_value_bytes,
+    validate_json_value,
 };
 use crate::{
     ColumnDefinition, ColumnType, ComparisonOperator, EngineError, NullOrder, OrderBy,
@@ -90,10 +91,23 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &SelectPlan) -> Result<
         });
     }
 
-    let rows = if plan.order_by.is_empty() {
-        execute_unordered(storage, plan, &schema)?
-    } else {
-        execute_ordered(storage, plan, &schema)?
+    let rows = match row_order(plan, &schema) {
+        RowOrder::Any => execute_unordered(storage, plan, &schema, KeyOrder::Ascending)?,
+        // Rows ordered by a prefix of the primary key arrive in that order, so they stream and
+        // stop at the limit, unless a descending query would read them through an index.
+        RowOrder::Key(order)
+            if storage.visits_in_key_order(&plan.table)
+                && (order == KeyOrder::Ascending
+                    || !secondary_index_applies(
+                        storage,
+                        &plan.table,
+                        plan.predicate.as_ref(),
+                        &schema,
+                    )?) =>
+        {
+            execute_unordered(storage, plan, &schema, order)?
+        }
+        RowOrder::Key(_) | RowOrder::Sorted => execute_ordered(storage, plan, &schema)?,
     };
 
     Ok(QueryResult {
@@ -218,10 +232,51 @@ pub(crate) fn validate_named_columns(schema: &TableDefinition, columns: &[String
     Ok(())
 }
 
+/// The order a query's rows must come in.
+enum RowOrder {
+    /// There is no `ORDER BY`.
+    Any,
+    /// `ORDER BY` names a prefix of the primary key's columns in ascending order, or all of them in
+    /// descending order. Key columns are never `NULL`, so null placement cannot matter. Rows equal
+    /// on a prefix then come in ascending key order, as a stable sort of rows read in key order
+    /// would leave them.
+    Key(KeyOrder),
+    /// Rows must be collected and sorted.
+    Sorted,
+}
+
+fn row_order(plan: &SelectPlan, schema: &TableDefinition) -> RowOrder {
+    let Some(first) = plan.order_by.first() else {
+        return RowOrder::Any;
+    };
+    let complete = match first.direction {
+        OrderDirection::Asc => plan.order_by.len() <= schema.primary_key.len(),
+        OrderDirection::Desc => plan.order_by.len() == schema.primary_key.len(),
+    };
+    if complete
+        && plan
+            .order_by
+            .iter()
+            .zip(&schema.primary_key)
+            .all(|(order, column)| order.column == *column && order.direction == first.direction)
+    {
+        RowOrder::Key(match first.direction {
+            OrderDirection::Asc => KeyOrder::Ascending,
+            OrderDirection::Desc => KeyOrder::Descending,
+        })
+    } else {
+        RowOrder::Sorted
+    }
+}
+
+/// Reads the rows a query returns in the order candidates arrive, stopping at `LIMIT`. Without
+/// `ORDER BY` any order will do, and with it [`row_order`] has confirmed that `order` is the one
+/// asked for.
 fn execute_unordered(
     storage: &dyn StorageReader,
     plan: &SelectPlan,
     schema: &crate::TableDefinition,
+    order: KeyOrder,
 ) -> Result<Vec<Row>> {
     let mut scanned = 0_usize;
     let mut skipped_matches = 0_usize;
@@ -229,7 +284,7 @@ fn execute_unordered(
     let mut rows = Vec::new();
     let filter = Filter::new(plan.predicate.as_ref(), schema, &plan.table)?;
     let projection = Projection::new(plan.columns.as_deref(), schema, &plan.table)?;
-    visit_candidate_rows(storage, plan, schema, &mut |row| {
+    visit_candidate_rows(storage, plan, schema, order, &mut |row| {
         count_scanned_row(&mut scanned)?;
         if !filter.matches(row)? {
             return Ok(VisitControl::Continue);
@@ -274,7 +329,7 @@ fn execute_ordered(
     let mut ordered_bytes = 0_usize;
     let mut rows = Vec::new();
     let filter = Filter::new(plan.predicate.as_ref(), schema, &plan.table)?;
-    visit_candidate_rows(storage, plan, schema, &mut |row| {
+    visit_candidate_rows(storage, plan, schema, KeyOrder::Ascending, &mut |row| {
         count_scanned_row(&mut scanned)?;
         if filter.matches(row)? {
             if rows.len() == MAX_ORDERED_ROWS {
@@ -336,6 +391,7 @@ fn visit_candidate_rows(
     storage: &dyn StorageReader,
     plan: &SelectPlan,
     schema: &crate::TableDefinition,
+    order: KeyOrder,
     visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
 ) -> Result<VisitOutcome> {
     visit_predicate_candidates(
@@ -343,6 +399,7 @@ fn visit_candidate_rows(
         &plan.table,
         plan.predicate.as_ref(),
         schema,
+        order,
         visitor,
     )
 }
@@ -356,6 +413,7 @@ pub(crate) fn visit_predicate_candidates(
     table: &str,
     predicate: Option<&Predicate>,
     schema: &crate::TableDefinition,
+    order: KeyOrder,
     visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
 ) -> Result<VisitOutcome> {
     if let Some(key) = primary_key_lookup(predicate, schema) {
@@ -366,66 +424,126 @@ pub(crate) fn visit_predicate_candidates(
             _ => Ok(VisitOutcome::Complete),
         };
     }
-    visit_indexed_candidates(storage, table, predicate, schema, visitor)
+    visit_indexed_candidates(storage, table, predicate, schema, order, visitor)
 }
 
-/// [`visit_predicate_candidates`] once no complete primary key applies. It reads, in order of
-/// preference: an index whose every column the predicate fixes, a range of an index's leading
-/// column, a range of the leading primary-key column, and otherwise the whole table.
-///
-/// Rows come in primary-key order from every path but the equality index, which returns rows with
-/// equal indexed values, and so in primary-key order too.
+/// [`visit_predicate_candidates`] once no complete primary key applies. In ascending order it reads,
+/// by preference: an index whose every column the predicate fixes, a range of an index's leading
+/// column, a range of the leading primary-key column, and otherwise the whole table. Every one of
+/// these returns rows in primary-key order, the equality index because its rows' indexed values
+/// are equal. In descending order it reads only by primary key.
 pub(crate) fn visit_indexed_candidates(
     storage: &dyn StorageReader,
     table: &str,
     predicate: Option<&Predicate>,
     schema: &crate::TableDefinition,
+    order: KeyOrder,
     visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
 ) -> Result<VisitOutcome> {
-    if let Some((columns, key)) = secondary_index_key(storage, table, predicate, schema)?
-        && let Some(outcome) = storage.visit_index(table, &columns, &key, visitor)?
+    if order == KeyOrder::Ascending
+        && let Some(outcome) = visit_secondary_index(storage, table, predicate, schema, visitor)?
     {
         return Ok(outcome);
     }
+    let range = match predicate {
+        Some(predicate) => column_range(
+            predicate,
+            column_definition(schema, &schema.primary_key[0], table)?,
+        )?,
+        None => ColumnRange::Unbounded,
+    };
+    match (range, order) {
+        (ColumnRange::Unbounded, KeyOrder::Ascending) => storage.visit_table(table, visitor),
+        (ColumnRange::Unbounded, KeyOrder::Descending) => {
+            storage.visit_table_range(table, &KeyRange::default(), order, visitor)
+        }
+        (ColumnRange::Empty, _) => Ok(VisitOutcome::Complete),
+        (ColumnRange::Bounded(range), _) => {
+            storage.visit_table_range(table, &range, order, visitor)
+        }
+    }
+}
+
+/// Whether a predicate's candidates would be read through a secondary index, which returns them
+/// only in ascending primary-key order.
+pub(crate) fn secondary_index_applies(
+    storage: &dyn StorageReader,
+    table: &str,
+    predicate: Option<&Predicate>,
+    schema: &crate::TableDefinition,
+) -> Result<bool> {
+    if secondary_index_key(storage, table, predicate, schema)?.is_some() {
+        return Ok(true);
+    }
     let Some(predicate) = predicate else {
-        return storage.visit_table(table, visitor);
+        return Ok(false);
+    };
+    for definition in ranged_indexes(storage, table, schema)? {
+        let column = column_definition(schema, &definition.columns[0], table)?;
+        if !matches!(column_range(predicate, column)?, ColumnRange::Unbounded) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Reads candidates through an index whose every column the predicate fixes, or through a range
+/// of an index's leading column. `None` means no index serves the predicate.
+fn visit_secondary_index(
+    storage: &dyn StorageReader,
+    table: &str,
+    predicate: Option<&Predicate>,
+    schema: &crate::TableDefinition,
+    visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+) -> Result<Option<VisitOutcome>> {
+    if let Some((columns, key)) = secondary_index_key(storage, table, predicate, schema)?
+        && let Some(outcome) = storage.visit_index(table, &columns, &key, visitor)?
+    {
+        return Ok(Some(outcome));
+    }
+    let Some(predicate) = predicate else {
+        return Ok(None);
     };
     // Each row an index range finds costs a lookup, so a range is worth reading only while it
     // covers a small part of the table. Beyond that, reading in key order is cheaper.
     let limit = storage.table_row_count(table)? / 4;
-    for definition in storage.indexes_for_table(table)? {
-        // A row is indexed only when every indexed column is non-null, so a range of the leading
-        // column finds every row in it only if no other indexed column can be null.
-        let complete = definition.columns[1..].iter().all(|name| {
-            schema
-                .columns
-                .iter()
-                .any(|column| column.name == *name && !column.nullable)
-        });
-        if !complete {
-            continue;
-        }
+    for definition in ranged_indexes(storage, table, schema)? {
         match column_range(
             predicate,
             column_definition(schema, &definition.columns[0], table)?,
         )? {
             ColumnRange::Unbounded => {}
-            ColumnRange::Empty => return Ok(VisitOutcome::Complete),
+            ColumnRange::Empty => return Ok(Some(VisitOutcome::Complete)),
             ColumnRange::Bounded(range) => {
                 if let Some(outcome) =
                     storage.visit_index_range(table, &definition.columns, &range, limit, visitor)?
                 {
-                    return Ok(outcome);
+                    return Ok(Some(outcome));
                 }
             }
         }
     }
-    let key = column_definition(schema, &schema.primary_key[0], table)?;
-    match column_range(predicate, key)? {
-        ColumnRange::Unbounded => storage.visit_table(table, visitor),
-        ColumnRange::Empty => Ok(VisitOutcome::Complete),
-        ColumnRange::Bounded(range) => storage.visit_table_range(table, &range, visitor),
-    }
+    Ok(None)
+}
+
+/// The indexes whose leading column can be read as a range. A row is indexed only when every
+/// indexed column is non-null, so a range of the leading column finds every row in it only if no
+/// other indexed column can be null.
+fn ranged_indexes(
+    storage: &dyn StorageReader,
+    table: &str,
+    schema: &crate::TableDefinition,
+) -> Result<Vec<crate::IndexDefinition>> {
+    let mut indexes = storage.indexes_for_table(table)?;
+    indexes.retain(|definition| {
+        definition.columns[1..].iter().all(|name| {
+            schema
+                .columns
+                .iter()
+                .any(|column| column.name == *name && !column.nullable)
+        })
+    });
+    Ok(indexes)
 }
 
 /// The key range of one column that a predicate's AND-ed terms allow.
