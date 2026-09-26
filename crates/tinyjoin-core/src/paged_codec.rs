@@ -626,10 +626,15 @@ impl<'a> StoredRecord<'a> {
         if position + 1 == self.count {
             return self.data.len();
         }
+        // Read byte by byte: copying a slice of the offset's width would call memcpy.
         let at = self.offsets_start + position * self.width;
-        let mut bytes = [0; 4];
-        bytes[..self.width].copy_from_slice(&self.value[at..at + self.width]);
-        u32::from_le_bytes(bytes) as usize
+        let value = self.value;
+        match self.width {
+            1 => usize::from(value[at]),
+            2 => usize::from(u16::from_le_bytes([value[at], value[at + 1]])),
+            _ => u32::from_le_bytes([value[at], value[at + 1], value[at + 2], value[at + 3]])
+                as usize,
+        }
     }
 
     fn is_null(&self, position: usize) -> bool {
@@ -821,13 +826,16 @@ fn decode_value(data_type: ColumnType, bytes: &[u8], strict: bool) -> Result<Val
             if bytes.len() > 7 {
                 return Err(storage_corrupt("A stored integer is too long"));
             }
-            let mut raw = [0; 8];
-            raw[..bytes.len()].copy_from_slice(bytes);
+            // Gathered byte by byte: copying a slice of the value's length would call memcpy.
+            let mut raw = 0_u64;
+            for (index, byte) in bytes.iter().enumerate() {
+                raw |= u64::from(*byte) << (8 * index);
+            }
             let shift = 64 - 8 * bytes.len() as u32;
             let value = if bytes.is_empty() {
                 0
             } else {
-                (i64::from_le_bytes(raw) << shift) >> shift
+                ((raw as i64) << shift) >> shift
             };
             if value.unsigned_abs() > MAX_SAFE_INTEGER
                 || strict && integer_length(value) != bytes.len()
@@ -2246,6 +2254,42 @@ mod tests {
                 .code,
             "PAGED_STORAGE_VERSION_UNSUPPORTED"
         );
+    }
+
+    #[test]
+    fn stored_records_read_offsets_and_integers_of_every_width() {
+        let schema = typed_schema(
+            vec!["id"],
+            vec![
+                ("id", ColumnType::Integer),
+                ("first", ColumnType::Text),
+                ("second", ColumnType::Integer),
+                ("third", ColumnType::Text),
+            ],
+        );
+        let layout = RecordLayout::new(&schema).unwrap();
+        // The offset width grows with the largest offset, from one byte to two and then four.
+        for (length, width) in [(3, 1), (300, 2), (70_000, 4)] {
+            for second in [0_i64, -1, 255, -70_000, 1 << 40, -9_007_199_254_740_991] {
+                let stored = row(json!({
+                    "id": 1,
+                    "first": "f".repeat(length),
+                    "second": second,
+                    "third": "t"
+                }));
+                let key = encode_primary_key(&schema, &stored).unwrap();
+                let value = encode_row(&schema, &stored).unwrap();
+                assert_eq!(1 << (value[0] & RECORD_OFFSET_WIDTH), width);
+                let record = StoredRecord::new(&schema, &layout, &key, &value).unwrap();
+                for (index, column) in schema.columns.iter().enumerate() {
+                    assert_eq!(
+                        record.column(index).unwrap().into_value(),
+                        stored[&column.name]
+                    );
+                }
+                assert_eq!(decode_row_strictly(&schema, &key, &value).unwrap(), stored);
+            }
+        }
     }
 
     #[test]
