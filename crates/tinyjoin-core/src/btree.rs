@@ -2,7 +2,7 @@ use std::{borrow::Cow, collections::HashSet};
 
 use crate::{
     CandidateId, EngineError, FIRST_DATA_PAGE_ID, MAX_PAGE_COUNT, MAX_PAGE_PAYLOAD_SIZE, Page,
-    PageDevice, PageId, PageType, Pager, PagerWriteTransaction, Result,
+    PageDevice, PageId, PageRef, PageType, Pager, PagerWriteTransaction, Result,
     checksum::crc32,
     hash::{EMPTY_HASH, Hasher, combine},
 };
@@ -495,6 +495,7 @@ impl CursorView {
 
 trait BtreeReadView {
     fn read_btree_page(&mut self, id: PageId) -> Result<Page>;
+    fn read_btree_page_in_place(&mut self, id: PageId) -> Result<PageRef<'_>>;
     fn cursor_view(&self, tree_id: TreeId) -> Result<CursorView>;
     fn requires_view_generation(&self, _id: PageId) -> bool {
         false
@@ -504,6 +505,10 @@ trait BtreeReadView {
 impl<D: PageDevice> BtreeReadView for Pager<D> {
     fn read_btree_page(&mut self, id: PageId) -> Result<Page> {
         self.read_page(id)
+    }
+
+    fn read_btree_page_in_place(&mut self, id: PageId) -> Result<PageRef<'_>> {
+        self.read_page_in_place(id)
     }
 
     fn cursor_view(&self, _tree_id: TreeId) -> Result<CursorView> {
@@ -516,6 +521,10 @@ impl<D: PageDevice> BtreeReadView for Pager<D> {
 impl<D: PageDevice> BtreeReadView for PagerWriteTransaction<'_, D> {
     fn read_btree_page(&mut self, id: PageId) -> Result<Page> {
         self.read_page(id)
+    }
+
+    fn read_btree_page_in_place(&mut self, id: PageId) -> Result<PageRef<'_>> {
+        self.read_page_in_place(id)
     }
 
     fn cursor_view(&self, tree_id: TreeId) -> Result<CursorView> {
@@ -531,7 +540,8 @@ impl<D: PageDevice> BtreeReadView for PagerWriteTransaction<'_, D> {
     }
 }
 
-/// Descends from `root_page_id` to the one leaf that can hold `key`, reading each node in place.
+/// Descends from `root_page_id` to the one leaf that can hold `key`, reading each node in place in
+/// the page cache.
 ///
 /// Each step down must reach exactly the next lower level and a page's level is fixed, so a cycle
 /// is rejected without tracking visited pages.
@@ -549,12 +559,12 @@ fn get_from(
     let mut parent_generation = None;
 
     for _ in 0..MAX_TREE_DEPTH {
-        let node = NodeView::open(
-            reader.read_btree_page(page_id)?,
+        let require_view_generation = reader.requires_view_generation(page_id);
+        let node = NodeView::open_in_place(
+            reader.read_btree_page_in_place(page_id)?,
             tree_id,
             generation,
-            reader.requires_view_generation(page_id),
-            false,
+            require_view_generation,
         )?;
         validate_expected_level(page_id, node.level, expected_level)?;
         validate_child_generation(page_id, node.generation, parent_generation)?;
@@ -562,17 +572,19 @@ fn get_from(
             let Some(index) = node.find(key)? else {
                 return Ok(None);
             };
-            return match node.leaf_cell(index)?.1 {
-                CellValue::Inline(value) => Ok(Some(value.to_vec())),
-                CellValue::Overflow(descriptor) => read_overflow_chain(
-                    |page_id| reader.read_btree_page(page_id),
-                    tree_id,
-                    generation,
-                    node.generation,
-                    &descriptor,
-                )
-                .map(|(value, _)| Some(value)),
+            let descriptor = match node.leaf_cell(index)?.1 {
+                CellValue::Inline(value) => return Ok(Some(value.to_vec())),
+                CellValue::Overflow(descriptor) => descriptor,
             };
+            let leaf_generation = node.generation;
+            return read_overflow_chain(
+                |page_id| reader.read_btree_page(page_id),
+                tree_id,
+                generation,
+                leaf_generation,
+                &descriptor,
+            )
+            .map(|(value, _)| Some(value));
         }
         page_id = node.child(node.child_index_for(key)?)?;
         expected_level = Some(node.level - 1);
@@ -628,8 +640,8 @@ pub(crate) struct BtreeCursor {
     root_page_id: PageId,
     view: CursorView,
     /// Internal nodes from the root down, each with the child index the cursor followed.
-    path: Vec<(NodeView, usize)>,
-    leaf: Option<NodeView>,
+    path: Vec<(NodeView<'static>, usize)>,
+    leaf: Option<NodeView<'static>>,
     /// How many of the leaf's entries lie before the cursor: the next entry moving forward, or one
     /// past it moving backward.
     leaf_index: usize,
@@ -734,7 +746,7 @@ impl BtreeCursor {
         page_id: PageId,
         expected_level: Option<u8>,
         parent_generation: Option<u64>,
-    ) -> Result<NodeView> {
+    ) -> Result<NodeView<'static>> {
         if !self.visited_pages.insert(page_id) {
             return Err(invalid_btree(storage_diagnostic!(
                 "Tree {} contains a cycle through page {page_id}",
@@ -867,9 +879,10 @@ enum CellValue<'a> {
 /// Pages are verified as they enter the page cache, and nodes are fully validated when written
 /// and when a database is opened, so a view checks the node header and the bounds of each cell
 /// it reads. Writers, and open-time validation through [`Btree::validating_cursor`], still decode
-/// with every check in [`Node::decode`].
+/// with every check in [`Node::decode`]. A view owns a copy of its page's payload, which a cursor
+/// keeps between steps, or borrows it from the page cache for one lookup.
 #[derive(Debug)]
-struct NodeView {
+struct NodeView<'a> {
     page_id: PageId,
     level: u8,
     generation: u64,
@@ -877,10 +890,10 @@ struct NodeView {
     leftmost_child: PageId,
     item_count: usize,
     free_end: usize,
-    bytes: Vec<u8>,
+    bytes: Cow<'a, [u8]>,
 }
 
-impl NodeView {
+impl NodeView<'static> {
     fn open(
         page: Page,
         expected_tree_id: TreeId,
@@ -896,73 +909,104 @@ impl NodeView {
                 require_view_generation,
             )?;
         }
-        let bytes = page.payload;
+        NodeView::from_payload(
+            page.id,
+            page.page_type,
+            Cow::Owned(page.payload),
+            expected_tree_id,
+            view_generation,
+            require_view_generation,
+        )
+    }
+}
+
+impl<'a> NodeView<'a> {
+    /// A view of a page read in place.
+    fn open_in_place(
+        page: PageRef<'a>,
+        expected_tree_id: TreeId,
+        view_generation: u64,
+        require_view_generation: bool,
+    ) -> Result<Self> {
+        NodeView::from_payload(
+            page.id,
+            page.page_type,
+            Cow::Borrowed(page.payload),
+            expected_tree_id,
+            view_generation,
+            require_view_generation,
+        )
+    }
+
+    fn from_payload(
+        page_id: PageId,
+        page_type: PageType,
+        payload: Cow<'a, [u8]>,
+        expected_tree_id: TreeId,
+        view_generation: u64,
+        require_view_generation: bool,
+    ) -> Result<Self> {
+        let bytes = &*payload;
         if bytes.len() != MAX_PAGE_PAYLOAD_SIZE || &bytes[..4] != NODE_MAGIC {
             return Err(invalid_btree(storage_diagnostic!(
-                "Page {} is not a B-tree node",
-                page.id
+                "Page {page_id} is not a B-tree node"
             )));
         }
-        let version = read_u16(&bytes, 4);
+        let version = read_u16(bytes, 4);
         if version != NODE_FORMAT_VERSION || bytes[7] != NODE_FLAGS {
             return Err(unsupported_btree(format!(
-                "B-tree page {} format version {version} or flags are not supported",
-                page.id
+                "B-tree page {page_id} format version {version} or flags are not supported"
             )));
         }
-        let tree_id = read_u64(&bytes, 8);
+        let tree_id = read_u64(bytes, 8);
         if tree_id != expected_tree_id {
             return Err(invalid_btree(storage_diagnostic!(
-                "B-tree page {} belongs to tree {tree_id}, not tree {expected_tree_id}",
-                page.id
+                "B-tree page {page_id} belongs to tree {tree_id}, not tree {expected_tree_id}"
             )));
         }
-        let generation = read_u64(&bytes, 16);
+        let generation = read_u64(bytes, 16);
         if generation == 0
             || generation > view_generation
             || require_view_generation && generation != view_generation
         {
             return Err(invalid_btree(storage_diagnostic!(
-                "B-tree page {} generation {generation} does not fit view generation {view_generation}",
-                page.id
+                "B-tree page {page_id} generation {generation} does not fit view generation {view_generation}"
             )));
         }
         let level = bytes[6];
-        let leaf = match page.page_type {
+        let leaf = match page_type {
             PageType::BtreeLeaf if level == 0 => true,
             PageType::BtreeInternal if level > 0 => false,
             other => {
                 return Err(invalid_btree(storage_diagnostic!(
-                    "Page {} of type {other:?} at level {level} is not a valid B-tree node",
-                    page.id
+                    "Page {page_id} of type {other:?} at level {level} is not a valid B-tree node"
                 )));
             }
         };
-        let item_count = read_u16(&bytes, 24) as usize;
-        let free_start = read_u16(&bytes, 26) as usize;
-        let free_end = read_u16(&bytes, 28) as usize;
+        let item_count = read_u16(bytes, 24) as usize;
+        let free_start = read_u16(bytes, 26) as usize;
+        let free_end = read_u16(bytes, 28) as usize;
         if free_start != NODE_HEADER_SIZE + item_count * SLOT_SIZE
             || free_start > free_end
             || free_end > MAX_PAGE_PAYLOAD_SIZE
         {
             return Err(invalid_btree(storage_diagnostic!(
-                "B-tree page {} has invalid free-space bounds {free_start}..{free_end}",
-                page.id
+                "B-tree page {page_id} has invalid free-space bounds {free_start}..{free_end}"
             )));
         }
-        let leftmost_child = read_u64(&bytes, 32);
+        let leftmost_child = read_u64(bytes, 32);
         if !leaf {
-            validate_child_page(page.id, leftmost_child)?;
+            validate_child_page(page_id, leftmost_child)?;
         }
         Ok(Self {
-            page_id: page.id,
+            page_id,
             level,
             generation,
             leaf,
             leftmost_child,
             item_count,
             free_end,
-            bytes,
+            bytes: payload,
         })
     }
 
@@ -978,8 +1022,9 @@ impl NodeView {
                 self.page_id
             )));
         }
-        let offset = read_u16(&self.bytes, NODE_HEADER_SIZE + index * SLOT_SIZE) as usize;
-        if offset < self.free_end || offset >= self.bytes.len() {
+        let bytes = &*self.bytes;
+        let offset = read_u16(bytes, NODE_HEADER_SIZE + index * SLOT_SIZE) as usize;
+        if offset < self.free_end || offset >= bytes.len() {
             return Err(invalid_btree(storage_diagnostic!(
                 "B-tree page {} cell {index} lies outside its cell area",
                 self.page_id
@@ -989,7 +1034,7 @@ impl NodeView {
     }
 
     fn leaf_cell(&self, index: usize) -> Result<(&[u8], CellValue<'_>)> {
-        let bytes = &self.bytes;
+        let bytes = &*self.bytes;
         let offset = self.cell_offset(index)?;
         let header_end = checked_end(offset, LEAF_CELL_HEADER_SIZE, bytes.len())?;
         let key_length = read_u16(bytes, offset) as usize;
@@ -1023,7 +1068,7 @@ impl NodeView {
     }
 
     fn internal_key(&self, index: usize) -> Result<&[u8]> {
-        let bytes = &self.bytes;
+        let bytes = &*self.bytes;
         let offset = self.cell_offset(index)?;
         let header_end = checked_end(offset, INTERNAL_CELL_HEADER_SIZE, bytes.len())?;
         let key_length = read_u16(bytes, offset) as usize;
@@ -1035,9 +1080,10 @@ impl NodeView {
         let child = if index == 0 {
             self.leftmost_child
         } else {
+            let bytes = &*self.bytes;
             let offset = self.cell_offset(index - 1)?;
-            checked_end(offset, INTERNAL_CELL_HEADER_SIZE, self.bytes.len())?;
-            read_u64(&self.bytes, offset + 4)
+            checked_end(offset, INTERNAL_CELL_HEADER_SIZE, bytes.len())?;
+            read_u64(bytes, offset + 4)
         };
         validate_child_page(self.page_id, child)?;
         Ok(child)
@@ -1532,6 +1578,21 @@ impl Node {
         view_generation: u64,
         require_view_generation: bool,
     ) -> Result<Self> {
+        Self::decode_in_place(
+            page.as_page_ref(),
+            expected_tree_id,
+            view_generation,
+            require_view_generation,
+        )
+    }
+
+    /// Decodes a node, as [`Self::decode`] does, from a page read in place.
+    fn decode_in_place(
+        page: PageRef<'_>,
+        expected_tree_id: TreeId,
+        view_generation: u64,
+        require_view_generation: bool,
+    ) -> Result<Self> {
         if page.payload.len() != MAX_PAGE_PAYLOAD_SIZE {
             return Err(invalid_btree(storage_diagnostic!(
                 "B-tree page {} payload is {} bytes, not {MAX_PAGE_PAYLOAD_SIZE}",
@@ -1775,8 +1836,8 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
             )));
         }
         let owned = self.transaction.owns_page(page_id);
-        let node = Node::decode(
-            self.transaction.read_page(page_id)?,
+        let node = Node::decode_in_place(
+            self.transaction.read_page_in_place(page_id)?,
             tree_id,
             self.generation,
             owned,
@@ -2647,8 +2708,8 @@ fn reclaim_tree<D: PageDevice>(
         }
 
         let owned = transaction.owns_page(current.page_id);
-        let node = Node::decode(
-            transaction.read_page(current.page_id)?,
+        let node = Node::decode_in_place(
+            transaction.read_page_in_place(current.page_id)?,
             tree_id,
             view_generation,
             owned,

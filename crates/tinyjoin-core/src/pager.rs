@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     AllocationBitmap, CandidateId, DEFAULT_PAGE_CACHE_BYTES, EngineError, FIRST_DATA_PAGE_ID,
-    MAX_PAGE_COUNT, PAGE_SIZE, Page, PageCache, PageDevice, PageId, RawMetadataSlot,
+    MAX_PAGE_COUNT, PAGE_SIZE, Page, PageCache, PageDevice, PageId, PageRef, RawMetadataSlot,
     RecoveredMetadata, Result, SUPERBLOCK_PAGE_COUNT, Superblock, SuperblockSlot,
     build_next_metadata, recover_metadata,
 };
@@ -132,6 +132,11 @@ impl<D: PageDevice> Pager<D> {
     }
 
     pub(crate) fn read_page(&mut self, id: PageId) -> Result<Page> {
+        self.read_page_in_place(id).map(PageRef::to_page)
+    }
+
+    /// Reads a data page as [`Self::read_page`] does, borrowing its payload from the page cache.
+    pub(crate) fn read_page_in_place(&mut self, id: PageId) -> Result<PageRef<'_>> {
         self.ensure_usable()?;
         ensure_data_page(id)?;
         if !self.active.allocation_bitmap.is_allocated(id)? {
@@ -322,6 +327,11 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
     }
 
     pub(crate) fn read_page(&mut self, id: PageId) -> Result<Page> {
+        self.read_page_in_place(id).map(PageRef::to_page)
+    }
+
+    /// Reads a data page as [`Self::read_page`] does, borrowing its payload from the page cache.
+    pub(crate) fn read_page_in_place(&mut self, id: PageId) -> Result<PageRef<'_>> {
         self.ensure_open()?;
         ensure_data_page(id)?;
         if !self.next_bitmap.is_allocated(id)? {
@@ -724,8 +734,8 @@ fn verify_expected_page(id: PageId, bytes: &[u8; PAGE_SIZE]) -> Result<()> {
 }
 
 /// Decodes a cached data page, which was verified when it was loaded or encoded by this engine.
-fn decode_verified_page(id: PageId, bytes: &[u8; PAGE_SIZE]) -> Result<Page> {
-    let page = Page::decode_verified(bytes)?;
+fn decode_verified_page(id: PageId, bytes: &[u8; PAGE_SIZE]) -> Result<PageRef<'_>> {
+    let page = PageRef::decode_verified(bytes)?;
     debug_assert_eq!(
         page.id, id,
         "cached pages keep the envelope they were verified with"

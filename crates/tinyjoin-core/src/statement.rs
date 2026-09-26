@@ -662,22 +662,28 @@ fn plan_insert(
     let schema = storage.table_schema(table)?;
     let default_values =
         columns.is_none() && value_rows.len() == 1 && value_rows.first().is_some_and(Vec::is_empty);
+    let all_columns;
     let columns = match columns {
-        Some(columns) => columns.to_vec(),
-        None => schema
-            .columns
-            .iter()
-            .map(|column| column.name.clone())
-            .collect(),
+        Some(columns) => columns,
+        None => {
+            all_columns = schema
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect::<Vec<_>>();
+            &all_columns
+        }
     };
-    validate_named_columns(&schema, &columns)?;
+    validate_named_columns(&schema, columns)?;
     validate_projection(&schema, returning)?;
     let mut conflicts = on_conflict
         .map(|clause| ConflictPlan::new(storage, &schema, clause))
         .transpose()?;
 
-    // Canonical primary keys of every row this statement writes, whether inserted or updated.
-    let mut written = HashSet::with_capacity(value_rows.len());
+    // Canonical primary keys of every row this statement writes, whether inserted or updated. A
+    // lone row with no conflict clause cannot meet another, so its key is not needed.
+    let tracks_keys = conflicts.is_some() || value_rows.len() > 1;
+    let mut written = HashSet::with_capacity(if tracks_keys { value_rows.len() } else { 0 });
     let mut changes = Vec::with_capacity(value_rows.len());
     let mut returned = Vec::with_capacity(returning.map_or(0, |_| value_rows.len()));
     let mut work_bytes = 0usize;
@@ -691,7 +697,7 @@ fn plan_insert(
             )));
         }
         let prospective_bytes =
-            prospective_insert_row_bytes(&schema, &columns, values, default_values)?;
+            prospective_insert_row_bytes(&schema, columns, values, default_values)?;
         let prospective_charge = checked_dml_add(
             checked_dml_mul(prospective_bytes, 2)?,
             checked_dml_add(table.len(), DML_CHANGE_RETAINED_BYTES + 160)?,
@@ -711,7 +717,11 @@ fn plan_insert(
         let key_charge = checked_dml_add(checked_dml_mul(storage_key.len(), 2)?, 64)?;
         work_bytes = checked_dml_add(work_bytes, key_charge)?;
         ensure_dml_work_bytes(work_bytes)?;
-        let key = primary_conflict_key(&schema, &row)?;
+        let key = if tracks_keys {
+            primary_conflict_key(&schema, &row)?
+        } else {
+            String::new()
+        };
 
         let conflict = match &mut conflicts {
             Some(conflicts) => {
@@ -751,7 +761,9 @@ fn plan_insert(
         if let Some(conflicts) = &mut conflicts {
             conflicts.record(&schema, &row, &mut work_bytes)?;
         }
-        written.insert(key);
+        if tracks_keys {
+            written.insert(key);
+        }
         if let Some(columns) = returning {
             result_bytes = retain_returned_row(result_bytes, &row, columns)?;
             returned.push(project_returning_row(&row, columns, table)?);

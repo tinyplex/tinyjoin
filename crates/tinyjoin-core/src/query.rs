@@ -220,9 +220,14 @@ impl<'a> Projection<'a> {
 }
 
 pub(crate) fn validate_named_columns(schema: &TableDefinition, columns: &[String]) -> Result<()> {
-    let mut names = HashSet::with_capacity(columns.len());
-    for column in columns {
-        if !names.insert(column) {
+    // A few names are cheaper to compare with each other than to hash.
+    let mut names = (columns.len() > 16).then(|| HashSet::with_capacity(columns.len()));
+    for (index, column) in columns.iter().enumerate() {
+        let repeated = match &mut names {
+            Some(names) => !names.insert(column),
+            None => columns[..index].contains(column),
+        };
+        if repeated {
             return Err(EngineError::invalid_query(format!(
                 "Column `{column}` is named more than once"
             )));
@@ -1976,16 +1981,82 @@ pub(crate) fn bind_predicate_parameters(
 }
 
 pub(crate) fn bind_prepared_value(value: &mut Value, params: &[Value]) -> Result<()> {
+    if prepared_parameter_index(value).is_some() {
+        *value = bound_value(value, params)?;
+    }
+    Ok(())
+}
+
+/// A copy of `value`, or of the parameter it is a placeholder for.
+pub(crate) fn bound_value(value: &Value, params: &[Value]) -> Result<Value> {
     let Some(index) = prepared_parameter_index(value) else {
-        return Ok(());
+        return Ok(value.clone());
     };
-    *value = params.get(index - 1).cloned().ok_or_else(|| {
+    params.get(index - 1).cloned().ok_or_else(|| {
         EngineError::new(
             "INTERNAL_ERROR",
             "Prepared statement parameter metadata is inconsistent",
         )
-    })?;
-    Ok(())
+    })
+}
+
+/// A copy of `predicate` with its parameters bound, copying no placeholder.
+pub(crate) fn bound_predicate(predicate: &Predicate, params: &[Value]) -> Result<Predicate> {
+    let bound_all = |predicates: &[Predicate]| {
+        let mut bound = Vec::with_capacity(predicates.len());
+        for predicate in predicates {
+            bound.push(bound_predicate(predicate, params)?);
+        }
+        Ok::<_, EngineError>(bound)
+    };
+    Ok(match predicate {
+        Predicate::Comparison {
+            column,
+            operator,
+            value,
+        } => Predicate::Comparison {
+            column: column.clone(),
+            operator: *operator,
+            value: bound_value(value, params)?,
+        },
+        Predicate::IsNull { column, negated } => Predicate::IsNull {
+            column: column.clone(),
+            negated: *negated,
+        },
+        Predicate::In { column, values } => Predicate::In {
+            column: column.clone(),
+            values: {
+                let mut bound = Vec::with_capacity(values.len());
+                for value in values {
+                    bound.push(bound_value(value, params)?);
+                }
+                bound
+            },
+        },
+        Predicate::Like {
+            column,
+            pattern,
+            escape,
+            case_insensitive,
+        } => Predicate::Like {
+            column: column.clone(),
+            pattern: bound_value(pattern, params)?,
+            escape: escape
+                .as_ref()
+                .map(|escape| bound_value(escape, params))
+                .transpose()?,
+            case_insensitive: *case_insensitive,
+        },
+        Predicate::And { predicates } => Predicate::And {
+            predicates: bound_all(predicates)?,
+        },
+        Predicate::Or { predicates } => Predicate::Or {
+            predicates: bound_all(predicates)?,
+        },
+        Predicate::Not { predicate } => Predicate::Not {
+            predicate: Box::new(bound_predicate(predicate, params)?),
+        },
+    })
 }
 
 pub(crate) fn bind_nonnegative_integer_parameter(index: usize, params: &[Value]) -> Result<usize> {

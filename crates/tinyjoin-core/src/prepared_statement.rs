@@ -4,9 +4,9 @@ use std::mem::size_of;
 use serde_json::Value;
 
 use crate::query::{
-    MAX_SQL_PARAMETERS, ParseMode, Token, bind_predicate_parameters, bind_prepared_value,
-    parameter_index, prepared_parameter_marker, tokenize, validate_bound_parameter_bytes,
-    validate_sql_input, validate_sql_parameters,
+    MAX_SQL_PARAMETERS, ParseMode, Token, bound_predicate, bound_value, parameter_index,
+    prepared_parameter_marker, tokenize, validate_bound_parameter_bytes, validate_sql_input,
+    validate_sql_parameters,
 };
 use crate::statement::{
     ConflictAction, ConflictValue, OnConflict, SqlValue, Statement, WriteStatement,
@@ -231,44 +231,68 @@ impl ParameterLayout {
     }
 }
 
+/// A copy of a write statement with its parameters bound. Values are copied as they are bound, so
+/// the placeholders they replace are never copied.
 fn bind_write_statement(statement: &WriteStatement, params: &[Value]) -> Result<WriteStatement> {
-    let mut statement = statement.clone();
-    match &mut statement {
+    Ok(match statement {
         WriteStatement::Insert {
+            table,
+            columns,
             values,
             on_conflict,
-            ..
-        } => {
-            for row in values {
-                for value in row {
-                    bind_sql_value(value, params)?;
-                }
-            }
-            if let Some(OnConflict {
-                action: ConflictAction::Update(assignments),
-                ..
-            }) = on_conflict
-            {
-                for (_, value) in assignments {
-                    if let ConflictValue::Value(value) = value {
-                        bind_sql_value(value, params)?;
+            returning,
+        } => WriteStatement::Insert {
+            table: table.clone(),
+            columns: columns.clone(),
+            values: {
+                let mut rows = Vec::with_capacity(values.len());
+                for row in values {
+                    let mut bound = Vec::with_capacity(row.len());
+                    for value in row {
+                        bound.push(bound_sql_value(value, params)?);
                     }
+                    rows.push(bound);
                 }
-            }
-        }
+                rows
+            },
+            on_conflict: on_conflict
+                .as_ref()
+                .map(|clause| bound_on_conflict(clause, params))
+                .transpose()?,
+            returning: returning.clone(),
+        },
         WriteStatement::Update {
+            table,
             assignments,
             predicate,
-            ..
-        } => {
-            for (_, value) in assignments {
-                bind_sql_value(value, params)?;
-            }
-            bind_predicate_parameters(predicate.as_mut(), params)?;
-        }
-        WriteStatement::Delete { predicate, .. } => {
-            bind_predicate_parameters(predicate.as_mut(), params)?;
-        }
+            returning,
+        } => WriteStatement::Update {
+            table: table.clone(),
+            assignments: {
+                let mut bound = Vec::with_capacity(assignments.len());
+                for (column, value) in assignments {
+                    bound.push((column.clone(), bound_sql_value(value, params)?));
+                }
+                bound
+            },
+            predicate: predicate
+                .as_ref()
+                .map(|predicate| bound_predicate(predicate, params))
+                .transpose()?,
+            returning: returning.clone(),
+        },
+        WriteStatement::Delete {
+            table,
+            predicate,
+            returning,
+        } => WriteStatement::Delete {
+            table: table.clone(),
+            predicate: predicate
+                .as_ref()
+                .map(|predicate| bound_predicate(predicate, params))
+                .transpose()?,
+            returning: returning.clone(),
+        },
         WriteStatement::CreateTable { .. }
         | WriteStatement::CreateIndex { .. }
         | WriteStatement::DropTable { .. }
@@ -279,15 +303,36 @@ fn bind_write_statement(statement: &WriteStatement, params: &[Value]) -> Result<
                 "A prepared statement registry retained unsupported DDL",
             ));
         }
-    }
-    Ok(statement)
+    })
 }
 
-fn bind_sql_value(value: &mut SqlValue, params: &[Value]) -> Result<()> {
-    match value {
-        SqlValue::Value(value) => bind_prepared_value(value, params),
-        SqlValue::Default => Ok(()),
-    }
+fn bound_on_conflict(clause: &OnConflict, params: &[Value]) -> Result<OnConflict> {
+    Ok(OnConflict {
+        target: clause.target.clone(),
+        action: match &clause.action {
+            ConflictAction::Nothing => ConflictAction::Nothing,
+            ConflictAction::Update(assignments) => {
+                let mut bound = Vec::with_capacity(assignments.len());
+                for (column, value) in assignments {
+                    let value = match value {
+                        ConflictValue::Value(value) => {
+                            ConflictValue::Value(bound_sql_value(value, params)?)
+                        }
+                        ConflictValue::Excluded(source) => ConflictValue::Excluded(source.clone()),
+                    };
+                    bound.push((column.clone(), value));
+                }
+                ConflictAction::Update(bound)
+            }
+        },
+    })
+}
+
+fn bound_sql_value(value: &SqlValue, params: &[Value]) -> Result<SqlValue> {
+    Ok(match value {
+        SqlValue::Value(value) => SqlValue::Value(bound_value(value, params)?),
+        SqlValue::Default => SqlValue::Default,
+    })
 }
 
 fn retained_bytes(sql_bytes: usize, tokens: usize, parameter_count: usize) -> Result<usize> {

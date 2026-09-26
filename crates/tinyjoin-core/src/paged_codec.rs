@@ -951,7 +951,8 @@ fn encode_columns(
     if columns.is_empty() {
         return Err(codec_argument("A key tuple must name at least one column"));
     }
-    let mut key = Vec::new();
+    // Room for a typical tuple, so that encoding it allocates once.
+    let mut key = Vec::with_capacity(16 * columns.len());
     for column in columns {
         let value = row.get(column).ok_or_else(|| {
             EngineError::invalid_change(format!(

@@ -204,6 +204,29 @@ impl Page {
     ///
     /// Only the bounds needed to slice the payload safely are checked again.
     pub(crate) fn decode_verified(bytes: &[u8]) -> Result<Self> {
+        PageRef::decode_verified(bytes).map(PageRef::to_page)
+    }
+
+    pub(crate) fn as_page_ref(&self) -> PageRef<'_> {
+        PageRef {
+            id: self.id,
+            page_type: self.page_type,
+            payload: &self.payload,
+        }
+    }
+}
+
+/// A page read in place: its envelope, and its payload borrowed from the bytes holding it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PageRef<'a> {
+    pub(crate) id: PageId,
+    pub(crate) page_type: PageType,
+    pub(crate) payload: &'a [u8],
+}
+
+impl<'a> PageRef<'a> {
+    /// Reads a page as [`Page::decode_verified`] does, without copying its payload.
+    pub(crate) fn decode_verified(bytes: &'a [u8]) -> Result<Self> {
         if bytes.len() != PAGE_SIZE {
             return Err(invalid_page(storage_diagnostic!(
                 "A physical page must be exactly {PAGE_SIZE} bytes, not {}",
@@ -219,8 +242,16 @@ impl Page {
         Ok(Self {
             id: read_u64(bytes, 12),
             page_type: PageType::try_from(bytes[20])?,
-            payload: bytes[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + payload_length].to_vec(),
+            payload: &bytes[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + payload_length],
         })
+    }
+
+    pub(crate) fn to_page(self) -> Page {
+        Page {
+            id: self.id,
+            page_type: self.page_type,
+            payload: self.payload.to_vec(),
+        }
     }
 }
 
