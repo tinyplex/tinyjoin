@@ -6,7 +6,11 @@ import {
   type PreparedStatement,
   type Transaction,
 } from '../../src/client/client.ts';
-import {PROTOCOL_VERSION, type WorkerRequest} from '../../src/protocol.ts';
+import {
+  PROTOCOL_VERSION,
+  type RowMode,
+  type WorkerRequest,
+} from '../../src/protocol.ts';
 import {FakeWorker} from '../helpers/fake-worker.ts';
 
 const ID_FIELD = [{name: 'id', dataTypeID: 20}];
@@ -45,17 +49,22 @@ function writableWorker(): FakeWorker {
         }
         const isSelect = command === 'SELECT';
         const returnsId = isSelect || /RETURNING\s+id/i.test(message.params.sql);
-        respondOk(worker, message, {
-          command,
-          fields: returnsId ? ID_FIELD : [],
-          revision,
-          rowCount: isSelect || writes ? 1 : 0,
-          rows: returnsId
-            ? [{id: message.params.params[0] ?? 1}]
-            : [],
-          tables: writes ? ['posts'] : [],
-          keys: {},
-        });
+        respondOk(
+          worker,
+          message,
+          sqlResult(
+            {
+              command,
+              fields: returnsId ? ID_FIELD : [],
+              revision,
+              rowCount: isSelect || writes ? 1 : 0,
+              rows: returnsId ? [{id: message.params.params[0] ?? 1}] : [],
+              tables: writes ? ['posts'] : [],
+              keys: {},
+            },
+            message.params.rowMode,
+          ),
+        );
       } else if (message.method === 'prepareSql') {
         const statementId = nextStatementId++;
         preparedSql.set(statementId, message.params.sql);
@@ -69,15 +78,22 @@ function writableWorker(): FakeWorker {
           revision += 1;
         }
         const isSelect = command === 'SELECT';
-        respondOk(worker, message, {
-          command,
-          fields: isSelect ? ID_FIELD : [],
-          revision,
-          rowCount: 1,
-          rows: isSelect ? [{id: message.params.params[0] ?? 1}] : [],
-          tables: writes ? ['posts'] : [],
-          keys: {},
-        });
+        respondOk(
+          worker,
+          message,
+          sqlResult(
+            {
+              command,
+              fields: isSelect ? ID_FIELD : [],
+              revision,
+              rowCount: 1,
+              rows: isSelect ? [{id: message.params.params[0] ?? 1}] : [],
+              tables: writes ? ['posts'] : [],
+              keys: {},
+            },
+            message.params.rowMode,
+          ),
+        );
       } else if (message.method === 'closePrepared') {
         preparedSql.delete(message.params.statementId);
         respondOk(worker, message, undefined);
@@ -85,35 +101,39 @@ function writableWorker(): FakeWorker {
         if (message.params.transactionId === undefined) {
           revision += 1;
         }
-        respondOk(worker, message, [
-          {
-            command: 'CREATE',
-            fields: [],
-            revision,
-            rowCount: 0,
-            rows: [],
-            tables: ['posts'],
-            keys: {},
-          },
-          {
-            command: 'INSERT',
-            fields: [],
-            revision,
-            rowCount: 1,
-            rows: [],
-            tables: ['posts'],
-            keys: {},
-          },
-          {
-            command: 'SELECT',
-            fields: ID_FIELD,
-            revision,
-            rowCount: 1,
-            rows: [{id: 1}],
-            tables: [],
-            keys: {},
-          },
-        ]);
+        respondOk(
+          worker,
+          message,
+          [
+            {
+              command: 'CREATE',
+              fields: [],
+              revision,
+              rowCount: 0,
+              rows: [],
+              tables: ['posts'],
+              keys: {},
+            },
+            {
+              command: 'INSERT',
+              fields: [],
+              revision,
+              rowCount: 1,
+              rows: [],
+              tables: ['posts'],
+              keys: {},
+            },
+            {
+              command: 'SELECT',
+              fields: ID_FIELD,
+              revision,
+              rowCount: 1,
+              rows: [{id: 1}],
+              tables: [],
+              keys: {},
+            },
+          ].map((result) => sqlResult(result, message.params.rowMode)),
+        );
       } else if (message.method === 'beginTransaction') {
         respondOk(worker, message, {
           transactionId: `tx-${nextTransactionId++}`,
@@ -129,6 +149,32 @@ function writableWorker(): FakeWorker {
     });
   };
   return worker;
+}
+
+// A result as a Worker sends it, with its fields and rows as JSON text, and
+// each row as an array when the request asked for them.
+function sqlResult(
+  {fields, rows, ...header}: {
+    command: string;
+    fields: {name: string; dataTypeID: number}[];
+    revision: number;
+    rowCount: number;
+    rows: Record<string, unknown>[];
+    tables: string[];
+    keys: object;
+  },
+  rowMode?: RowMode,
+) {
+  return {
+    ...header,
+    data: JSON.stringify({
+      fields,
+      rows:
+        rowMode === 'array'
+          ? rows.map((row) => fields.map(({name}) => row[name] ?? null))
+          : rows,
+    }),
+  };
 }
 
 function respondOk(
@@ -349,6 +395,11 @@ describe('Client', () => {
       tables: [],
       keys: {},
     });
+    // The Worker writes array rows, so the request asks for them.
+    expect(
+      (worker.posted[2] as Extract<WorkerRequest, {method: 'executeSql'}>)
+        .params,
+    ).toEqual({sql: 'SELECT id FROM posts', params: [], rowMode: 'array'});
     await client.close();
   });
 
@@ -500,15 +551,19 @@ describe('Client', () => {
     const firstClose = statement.close();
     expect(statement.closed).toBe(true);
     expect(statementClose).toBeUndefined();
-    respondOk(worker, execution!, {
-      command: 'SELECT',
-      fields: ID_FIELD,
-      revision: 0,
-      rowCount: 1,
-      rows: [{id: 4}],
-      tables: [],
-      keys: {},
-    });
+    respondOk(
+      worker,
+      execution!,
+      sqlResult({
+        command: 'SELECT',
+        fields: ID_FIELD,
+        revision: 0,
+        rowCount: 1,
+        rows: [{id: 4}],
+        tables: [],
+        keys: {},
+      }),
+    );
     await pending;
     await vi.waitFor(() => expect(statementClose).toBeDefined());
     respondOk(worker, statementClose!, undefined);
@@ -557,15 +612,19 @@ describe('Client', () => {
     await new Promise<void>((resolve) => queueMicrotask(resolve));
     expect(begin).toBeUndefined();
 
-    respondOk(worker, execution!, {
-      command: 'SELECT',
-      fields: ID_FIELD,
-      revision: 0,
-      rowCount: 1,
-      rows: [{id: 1}],
-      tables: [],
-      keys: {},
-    });
+    respondOk(
+      worker,
+      execution!,
+      sqlResult({
+        command: 'SELECT',
+        fields: ID_FIELD,
+        revision: 0,
+        rowCount: 1,
+        rows: [{id: 1}],
+        tables: [],
+        keys: {},
+      }),
+    );
     await executionPromise;
     await vi.waitFor(() => expect(statementClose).toBeDefined());
     expect(begin).toBeUndefined();
@@ -806,35 +865,6 @@ describe('Client', () => {
       } as never),
     ).rejects.toThrow('support only rowMode');
     expect(worker.posted).toHaveLength(requestCount);
-    await client.close();
-  });
-
-  it('rejects array row mode when field metadata is unavailable', async () => {
-    const worker = writableWorker();
-    worker.onPost = (message) => {
-      queueMicrotask(() => {
-        if (message.method === 'init') {
-          respondOk(worker, message, {revision: 0});
-        } else if (message.method === 'executeSql') {
-          respondOk(worker, message, {
-            command: 'SELECT',
-            fields: [],
-            revision: 0,
-            rowCount: 1,
-            rows: [{id: 1}],
-            tables: [],
-            keys: {},
-          });
-        } else if (message.method === 'close') {
-          respondOk(worker, message, undefined);
-        }
-      });
-    };
-    const client = await create({worker});
-
-    await expect(
-      client.query('SELECT * FROM missing_metadata', [], {rowMode: 'array'}),
-    ).rejects.toMatchObject({code: 'ROW_METADATA_UNAVAILABLE'});
     await client.close();
   });
 

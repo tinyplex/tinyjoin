@@ -65,12 +65,11 @@ function mockEngine() {
       }
       return {
         command,
-        fields: [],
         revision,
         rowCount: 1,
-        rows: [],
         tables: [table],
         keys: {},
+        data: sqlData([], []),
       };
     }),
     prepareSql: vi.fn(() => 1),
@@ -83,12 +82,11 @@ function mockEngine() {
       }
       return {
         command: 'UPDATE',
-        fields: [],
         revision,
         rowCount: params.length,
-        rows: [],
         tables: [table],
         keys: {},
+        data: sqlData([], []),
       };
     }),
     closePrepared: vi.fn(),
@@ -102,21 +100,19 @@ function mockEngine() {
       return [
         {
           command: 'CREATE',
-          fields: [],
           revision,
           rowCount: 0,
-          rows: [],
           tables: [table],
           keys: {},
+          data: sqlData([], []),
         },
         {
           command: 'SELECT',
-          fields: [{name: 'id', dataTypeID: 20}],
           revision,
           rowCount: 1,
-          rows: [{id: 1}],
           tables: [],
           keys: {},
+          data: sqlData([{name: 'id', dataTypeID: 20}], [{id: 1}]),
         },
       ];
     }),
@@ -144,6 +140,10 @@ function mockEngine() {
   return engine;
 }
 
+function sqlData(fields: unknown[], rows: unknown[]): string {
+  return JSON.stringify({fields, rows});
+}
+
 async function waitForPosted(scope: FakeScope, count: number): Promise<void> {
   await vi.waitFor(() =>
     expect(scope.posted.length).toBeGreaterThanOrEqual(count),
@@ -155,19 +155,23 @@ describe('startWorker', () => {
     const scope = new FakeScope();
     const result = {
       command: 'SELECT',
-      fields: [{name: 'id', dataTypeID: 20}],
       revision: 0,
       rowCount: 1,
-      rows: [{id: 1}],
       tables: [],
       keys: {},
+      data: sqlData([{name: 'id', dataTypeID: 20}], [{id: 1}]),
     };
     const callStructured = vi.fn((_version: number, operation: number) => {
-      const payload =
-        operation === WASM_OPERATION.revision
-          ? 0
-          : operation === WASM_OPERATION.executeSql ? result : undefined;
-      return [2, 0, 0, payload];
+      if (operation === WASM_OPERATION.executeSql) {
+        const {data, ...header} = result;
+        return `${JSON.stringify([3, 0, 0, header])}\n${data}`;
+      }
+      return JSON.stringify([
+        3,
+        0,
+        0,
+        operation === WASM_OPERATION.revision ? 0 : null,
+      ]);
     });
     const engine = adaptStructuredWasmEngine({callStructured});
     const controller = startWorker({
@@ -336,6 +340,19 @@ describe('startWorker', () => {
     expect(engine.executeSql).toHaveBeenCalledWith(
       'INSERT INTO posts (id) VALUES ($1)',
       [1],
+      undefined,
+    );
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 3,
+      method: 'executeSql',
+      params: {sql: 'SELECT id FROM posts', params: [], rowMode: 'array'},
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 3);
+    expect(engine.executeSql).toHaveBeenLastCalledWith(
+      'SELECT id FROM posts',
+      [],
+      'array',
     );
     expect(scope.posted).toContainEqual({
       v: PROTOCOL_VERSION,
@@ -343,12 +360,11 @@ describe('startWorker', () => {
       ok: true,
       result: {
         command: 'INSERT',
-        fields: [],
         revision: 1,
         rowCount: 1,
-        rows: [],
         tables: ['posts'],
         keys: {},
+        data: sqlData([], []),
       },
     });
   });
@@ -420,12 +436,11 @@ describe('startWorker', () => {
       ok: true,
       result: {
         command: 'INSERT',
-        fields: [],
         revision: 1,
         rowCount: 1,
-        rows: [],
         tables: ['posts'],
         keys: {},
+        data: sqlData([], []),
       },
     });
     expect(scope.posted).toContainEqual({
@@ -468,12 +483,11 @@ describe('startWorker', () => {
         ok: true,
         result: {
           command: 'UPDATE',
-          fields: [],
           revision: 1,
           rowCount: 1,
-          rows: [],
           tables: ['posts'],
           keys: {},
+          data: sqlData([], []),
         },
       },
     ]);
@@ -527,7 +541,11 @@ describe('startWorker', () => {
     expect(engine.prepareSql).toHaveBeenCalledWith(
       'UPDATE posts SET title = $1',
     );
-    expect(engine.executePrepared).toHaveBeenCalledWith(1, ['outside']);
+    expect(engine.executePrepared).toHaveBeenCalledWith(
+      1,
+      ['outside'],
+      undefined,
+    );
     expect(scope.posted).toContainEqual({
       v: PROTOCOL_VERSION,
       event: 'tablesChanged',
@@ -631,6 +649,7 @@ describe('startWorker', () => {
 
     expect(engine.execSql).toHaveBeenCalledWith(
       'CREATE TABLE posts; SELECT id FROM posts',
+      undefined,
     );
     expect(scope.posted).toContainEqual({
       v: PROTOCOL_VERSION,
@@ -639,21 +658,19 @@ describe('startWorker', () => {
       result: [
         {
           command: 'CREATE',
-          fields: [],
           revision: 1,
           rowCount: 0,
-          rows: [],
           tables: ['posts'],
           keys: {},
+          data: sqlData([], []),
         },
         {
           command: 'SELECT',
-          fields: [{name: 'id', dataTypeID: 20}],
           revision: 1,
           rowCount: 1,
-          rows: [{id: 1}],
           tables: [],
           keys: {},
+          data: sqlData([{name: 'id', dataTypeID: 20}], [{id: 1}]),
         },
       ],
     });

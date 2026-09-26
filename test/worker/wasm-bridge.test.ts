@@ -15,7 +15,7 @@ import {
   type RawStructuredWasmEngineConstructor,
 } from '../../src/worker/wasm-bridge.ts';
 
-const VERSION = 2;
+const VERSION = 3;
 const SUCCESS = 0;
 const FAILURE = 1;
 const SAFE = 0;
@@ -27,21 +27,30 @@ type RawCall = {
   payload: unknown;
 };
 
-function success(payload: unknown = undefined, disposition = SAFE): unknown[] {
-  return [VERSION, SUCCESS, disposition, payload];
+// A response is the JSON text of its envelope, and then a line for each
+// statement result's fields and rows.
+function envelope(
+  version: number,
+  status: number,
+  disposition: number,
+  payload: unknown,
+  ...lines: string[]
+): string {
+  return [JSON.stringify([version, status, disposition, payload]), ...lines].join(
+    '\n',
+  );
 }
 
-function failure(
-  code: string,
-  message: string,
-  retryable?: boolean,
-): unknown[] {
-  return [
-    VERSION,
-    FAILURE,
-    SAFE,
-    {code, message, ...(retryable === undefined ? {} : {retryable})},
-  ];
+function success(payload: unknown = null, disposition = SAFE): string {
+  return envelope(VERSION, SUCCESS, disposition, payload);
+}
+
+function failure(code: string, message: string, retryable?: boolean): string {
+  return envelope(VERSION, FAILURE, SAFE, {
+    code,
+    message,
+    ...(retryable === undefined ? {} : {retryable}),
+  });
 }
 
 function outcome(revision = 1, tables: string[] = ['items']) {
@@ -51,13 +60,26 @@ function outcome(revision = 1, tables: string[] = ['items']) {
 function sqlResult(rows: Row[] = []): SqlResult {
   return {
     command: 'SELECT',
-    fields: rows.length > 0 ? [{name: 'id', dataTypeID: 20}] : [],
     revision: 1,
     rowCount: rows.length,
-    rows,
     tables: [],
     keys: {},
+    data: JSON.stringify({
+      fields: rows.length > 0 ? [{name: 'id', dataTypeID: 20}] : [],
+      rows,
+    }),
   };
+}
+
+function sqlResponse(results: SqlResult[], list = false, disposition = SAFE) {
+  const headers = results.map(({data: _data, ...header}) => header);
+  return envelope(
+    VERSION,
+    SUCCESS,
+    disposition,
+    list ? headers : headers[0],
+    ...results.map((result) => result.data),
+  );
 }
 
 class FakeRawEngine implements RawStructuredWasmEngine {
@@ -108,7 +130,7 @@ describe('WASM engine bridge', () => {
   it('normalizes the direct constructor error payload', () => {
     const ThrowingRaw = class {
       constructor(_device: PageDevice) {
-        throw Object.assign(Object.create(null), {
+        throw JSON.stringify({
           code: 'STORAGE_LOCKED',
           message: 'locked',
           retryable: true,
@@ -126,12 +148,17 @@ describe('WASM engine bridge', () => {
       }),
     );
 
-    const malformed = {
-      code: 'STORAGE_LOCKED',
-      message: 'locked',
-      details: 'not part of the constructor ABI',
-    };
-    expect(normalizeWasmConstructorError(malformed)).toBe(malformed);
+    for (const malformed of [
+      JSON.stringify({
+        code: 'STORAGE_LOCKED',
+        message: 'locked',
+        details: 'not part of the constructor ABI',
+      }),
+      'not JSON',
+      {code: 'STORAGE_LOCKED', message: 'an object, not its text'},
+    ]) {
+      expect(normalizeWasmConstructorError(malformed)).toBe(malformed);
+    }
   });
   it('passes the exact structured payload shapes through every operation', () => {
     const raw = new FakeRawEngine();
@@ -144,7 +171,17 @@ describe('WASM engine bridge', () => {
     expect(engine.executeSql('SELECT $1, $2', params)).toEqual(
       sqlResult([{id: 1}]),
     );
-    expect(engine.execSql('SELECT 1; SELECT 2')).toEqual([]);
+    expect(engine.executeSql('SELECT $1', [5], 'array')).toEqual(
+      sqlResult([{id: 1}]),
+    );
+    expect(engine.execSql('SELECT 1; SELECT 2')).toEqual([
+      sqlResult([{id: 1}]),
+      sqlResult(),
+    ]);
+    expect(engine.execSql('SELECT 3', 'object')).toEqual([
+      sqlResult([{id: 1}]),
+      sqlResult(),
+    ]);
     engine.beginTransaction();
     expect(engine.commitTransaction()).toEqual(outcome());
     engine.rollbackTransaction();
@@ -165,8 +202,18 @@ describe('WASM engine bridge', () => {
       },
       {
         bridgeVersion: VERSION,
+        operation: WASM_OPERATION.executeSql,
+        payload: {sql: 'SELECT $1', params: [5], arrayRows: true},
+      },
+      {
+        bridgeVersion: VERSION,
         operation: WASM_OPERATION.execSql,
-        payload: 'SELECT 1; SELECT 2',
+        payload: {sql: 'SELECT 1; SELECT 2'},
+      },
+      {
+        bridgeVersion: VERSION,
+        operation: WASM_OPERATION.execSql,
+        payload: {sql: 'SELECT 3'},
       },
       {
         bridgeVersion: VERSION,
@@ -217,13 +264,19 @@ describe('WASM engine bridge', () => {
     expect(raw.freeCalls).toBe(1);
   });
 
-  it('returns validated result graphs without rebuilding them', () => {
+  it('passes the rows of each result on as the JSON text WASM wrote', () => {
     const raw = new FakeRawEngine();
-    const result = sqlResult([{id: 1}]);
-    raw.response = success(result);
+    const data = '{"fields":[{"name":"id","dataTypeID":20}],"rows":[{"id":1}]}';
+    raw.response = envelope(
+      VERSION,
+      SUCCESS,
+      SAFE,
+      {command: 'SELECT', revision: 1, rowCount: 1, tables: [], keys: {}},
+      data,
+    );
     const engine = adaptStructuredWasmEngine(raw);
 
-    expect(engine.executeSql('SELECT id FROM items', [])).toBe(result);
+    expect(engine.executeSql('SELECT id FROM items', []).data).toBe(data);
   });
 
   it('preflights structured requests before entering WASM', () => {
@@ -241,15 +294,27 @@ describe('WASM engine bridge', () => {
     expect(raw.calls).toHaveLength(0);
   });
 
-  it('fully validates structured results while preserving SAFE failures', () => {
+  it('validates result headers while preserving SAFE failures', () => {
     const raw = new FakeRawEngine();
     const engine = adaptStructuredWasmEngine(raw);
-    raw.response = success({
-      ...sqlResult(),
-      rows: [{created: new Date()}],
-      rowCount: 1,
-    });
-
+    const {data, ...header} = sqlResult();
+    for (const response of [
+      envelope(VERSION, SUCCESS, SAFE, {...header, rowCount: -1}, data),
+      envelope(VERSION, SUCCESS, SAFE, header),
+      envelope(VERSION, SUCCESS, SAFE, {...header, extra: true}, data),
+      envelope(VERSION, SUCCESS, SAFE, [header], data, data),
+      `${success()}\n${data}`,
+    ]) {
+      raw.response = response;
+      expect(() => engine.executeSql('UPDATE items SET id = id', [])).toThrow(
+        WasmStructuredDecodeError,
+      );
+    }
+    raw.response = envelope(VERSION, SUCCESS, SAFE, [header, header], data);
+    expect(() => engine.execSql('SELECT 1; SELECT 2')).toThrow(
+      WasmStructuredDecodeError,
+    );
+    raw.response = `${failure('CONSTRAINT', 'no')}\n${data}`;
     expect(() => engine.executeSql('UPDATE items SET id = id', [])).toThrow(
       WasmStructuredDecodeError,
     );
@@ -258,8 +323,10 @@ describe('WASM engine bridge', () => {
 
   it('poisons durable and unknown malformed mutation results', () => {
     for (const response of [
-      success(undefined, DURABLE),
-      [99, SUCCESS, SAFE, undefined],
+      success(null, DURABLE),
+      envelope(99, SUCCESS, SAFE, null),
+      'not JSON',
+      [VERSION, SUCCESS, SAFE, null],
       new Error('structured call trapped'),
     ]) {
       const raw = new FakeRawEngine();
@@ -284,7 +351,7 @@ describe('WASM engine bridge', () => {
 
   it('keeps malformed nonmutating control results nonfatal', () => {
     const raw = new FakeRawEngine();
-    raw.response = [99, SUCCESS, SAFE, undefined];
+    raw.response = envelope(99, SUCCESS, SAFE, null);
     const engine = adaptStructuredWasmEngine(raw);
 
     expect(() => engine.revision()).toThrow(WasmStructuredDecodeError);
@@ -378,9 +445,9 @@ function responseForOperation(operation: number): unknown {
       return success(outcome(), DURABLE);
     case WASM_OPERATION.executeSql:
     case WASM_OPERATION.executePrepared:
-      return success(sqlResult([{id: 1}]));
+      return sqlResponse([sqlResult([{id: 1}])]);
     case WASM_OPERATION.execSql:
-      return success([]);
+      return sqlResponse([sqlResult([{id: 1}]), sqlResult()], true);
     case WASM_OPERATION.inTransaction:
       return success(false);
     case WASM_OPERATION.revision:
@@ -460,7 +527,7 @@ class CallbackRawEngine implements RawStructuredWasmEngine {
       } else {
         this.device.flush();
       }
-      return success(sqlResult());
+      return sqlResponse([sqlResult()]);
     }
     return success(1);
   }

@@ -16,7 +16,7 @@ import {
   ownKeys,
 } from './common.js';
 
-export const PROTOCOL_VERSION = 8 as const;
+export const PROTOCOL_VERSION = 9 as const;
 
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue =
@@ -68,14 +68,25 @@ export interface ApplyOutcome {
   keys: ChangedKeys;
 }
 
-export interface SqlResult<RowType extends object = Row> {
+/**
+ * A statement's result as the Worker sends it. Its fields and rows travel as
+ * JSON text that only the page parses, `{"fields": [...], "rows": [...]}`,
+ * with each row's values in field order: an object keyed by field name, or an
+ * array when the request asked for `rowMode: 'array'`.
+ */
+export interface SqlResult {
   command: string;
-  fields: ResultField[];
   revision: number;
   rowCount: number;
-  rows: RowType[];
   tables: string[];
   keys: ChangedKeys;
+  data: string;
+}
+
+/** The fields and rows a {@link SqlResult} carries as JSON text. */
+export interface SqlData {
+  fields: ResultField[];
+  rows: (Row | JsonValue[])[];
 }
 
 export interface SerializedError {
@@ -91,7 +102,12 @@ export interface RpcMethods {
     response: {revision: number};
   };
   executeSql: {
-    request: {sql: string; params: JsonValue[]; transactionId?: string};
+    request: {
+      sql: string;
+      params: JsonValue[];
+      transactionId?: string;
+      rowMode?: RowMode;
+    };
     response: SqlResult;
   };
   prepareSql: {
@@ -103,6 +119,7 @@ export interface RpcMethods {
       statementId: number;
       params: JsonValue[];
       transactionId?: string;
+      rowMode?: RowMode;
     };
     response: SqlResult;
   };
@@ -111,7 +128,7 @@ export interface RpcMethods {
     response: undefined;
   };
   execSql: {
-    request: {sql: string; transactionId?: string};
+    request: {sql: string; transactionId?: string; rowMode?: RowMode};
     response: SqlResult[];
   };
   beginTransaction: {
@@ -167,12 +184,11 @@ const MAX_ARRAY_ITEMS = 1_000_000;
 const MAX_TRANSACTION_ID_LENGTH = 128;
 const SQL_RESULT_KEYS = [
   'command',
-  'fields',
   'revision',
   'rowCount',
-  'rows',
   'tables',
   'keys',
+  'data',
 ] as const;
 
 export const isWorkerResponse = (value: unknown): value is WorkerResponse =>
@@ -205,19 +221,21 @@ export const isWorkerRequest = (value: unknown): value is WorkerRequest => {
       );
     case 'executeSql':
       return (
-        hasParams(params, ['sql', 'params', 'transactionId']) &&
+        hasParams(params, ['sql', 'params', 'transactionId', 'rowMode']) &&
         isString(params.sql) &&
         isJsonValues(params.params) &&
-        isOptionalTransactionId(params.transactionId)
+        isOptionalTransactionId(params.transactionId) &&
+        isOptionalRowMode(params.rowMode)
       );
     case 'prepareSql':
       return hasExactParams(params, ['sql']) && isString(params.sql);
     case 'executePrepared':
       return (
-        hasParams(params, ['statementId', 'params', 'transactionId']) &&
+        hasParams(params, ['statementId', 'params', 'transactionId', 'rowMode']) &&
         isPreparedStatementId(params.statementId) &&
         isJsonValues(params.params) &&
-        isOptionalTransactionId(params.transactionId)
+        isOptionalTransactionId(params.transactionId) &&
+        isOptionalRowMode(params.rowMode)
       );
     case 'closePrepared':
       return (
@@ -226,9 +244,10 @@ export const isWorkerRequest = (value: unknown): value is WorkerRequest => {
       );
     case 'execSql':
       return (
-        hasParams(params, ['sql', 'transactionId']) &&
+        hasParams(params, ['sql', 'transactionId', 'rowMode']) &&
         isString(params.sql) &&
-        isOptionalTransactionId(params.transactionId)
+        isOptionalTransactionId(params.transactionId) &&
+        isOptionalRowMode(params.rowMode)
       );
     case 'commitTransaction':
     case 'rollbackTransaction':
@@ -250,9 +269,9 @@ export const isRpcResult = <Method extends RpcMethod>(
 ): value is RpcMethods[Method]['response'] => isResult(method, value, true);
 
 /**
- * Checks only the fixed result envelope produced by TinyJoin's bundled Worker.
- * The Worker has already validated the complete WASM result before posting it;
- * avoiding another walk here keeps large row sets off the UI thread's hot path.
+ * Checks only the fixed result envelope produced by TinyJoin's bundled Worker,
+ * which writes every result's rows itself. Leaving the rows' JSON text unread
+ * here keeps large row sets off the UI thread's hot path until they are used.
  */
 export const isRpcResultHeader = <Method extends RpcMethod>(
   method: Method,
@@ -349,6 +368,9 @@ const hasExactKeys = (
 const isOptionalTransactionId = (value: unknown): boolean =>
   isUndefined(value) || isTransactionId(value);
 
+const isOptionalRowMode = (value: unknown): boolean =>
+  isUndefined(value) || value === 'array' || value === 'object';
+
 const isTransactionId = (value: unknown): value is string =>
   isString(value) && value.length > 0 && value.length <= MAX_TRANSACTION_ID_LENGTH;
 
@@ -416,8 +438,8 @@ const isResultField = (value: unknown): value is ResultField =>
   isString(value.name) &&
   isCountWithin(value.dataTypeID, 0, MAX_U32);
 
-// A validation context walks every field and row. The header-only pass checks
-// the envelope and leaves the two large arrays to whoever produced them.
+// A validation context also parses the rows' JSON text and walks every field
+// and row. The header-only pass leaves the text to whoever produced it.
 const isSqlResult = (
   value: unknown,
   validation?: JsonValidation,
@@ -426,16 +448,34 @@ const isSqlResult = (
   isRecord(value) &&
   hasExactKeys(value, SQL_RESULT_KEYS) &&
   isString(value.command) &&
-  (validation
-    ? isDenseArray(value.fields, isResultField, validation.step)
-    : arrayIsArray(value.fields)) &&
   isCount(value.revision) &&
   isCount(value.rowCount) &&
-  (validation
-    ? isDenseArray(value.rows, (row) => isRow(row, validation))
-    : arrayIsArray(value.rows)) &&
   isStrings(value.tables, validation?.step) &&
-  isChangedKeys(value.keys, validation);
+  isChangedKeys(value.keys, validation) &&
+  isString(value.data) &&
+  (!validation || isSqlData(parseSqlData(value.data), validation));
+
+/** Parses a result's rows, or returns undefined if they are not JSON. */
+export const parseSqlData = (text: string): unknown => {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+};
+
+const isSqlData = (
+  value: unknown,
+  validation: JsonValidation,
+): value is SqlData =>
+  isRecord(value) &&
+  hasExactKeys(value, ['fields', 'rows']) &&
+  isDenseArray(value.fields, isResultField, validation.step) &&
+  isDenseArray(value.rows, (row) =>
+    arrayIsArray(row)
+      ? validation.step() && isDenseArray(row, validation.isJson)
+      : isRow(row, validation),
+  );
 
 type JsonValidation = ReturnType<typeof createJsonValidation>;
 

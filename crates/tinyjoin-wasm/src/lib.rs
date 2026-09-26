@@ -40,7 +40,7 @@ impl WasmEngine {
                 if fatal_storage_error(&error) {
                     self.poison_and_close();
                 }
-                structured::error(&error)
+                Ok(structured::error(&error))
             }
         }
     }
@@ -81,16 +81,22 @@ impl WasmEngine {
                     .engine_mut()?
                     .execute_sql(&request.sql, &request.params)?;
                 let committed = !was_in_transaction && result.revision != previous_revision;
-                self.encode_committed(structured::execute_result(&result, committed), committed)
+                self.encode_committed(
+                    structured::execute_result(&result, committed, request.array_rows),
+                    committed,
+                )
             }
             structured::OP_EXEC_SQL => {
-                let sql: String = structured::decode(payload)?;
+                let request: structured::ExecSqlRequest = structured::decode(payload)?;
                 let was_in_transaction = self.engine()?.in_transaction();
                 let previous_revision = self.engine()?.revision();
-                let results = self.engine_mut()?.exec_sql(&sql)?;
+                let results = self.engine_mut()?.exec_sql(&request.sql)?;
                 let committed =
                     !was_in_transaction && self.engine()?.revision() != previous_revision;
-                self.encode_committed(structured::execute_results(&results, committed), committed)
+                self.encode_committed(
+                    structured::execute_results(&results, committed, request.array_rows),
+                    committed,
+                )
             }
             structured::OP_PREPARE_SQL => {
                 let sql: String = structured::decode(payload)?;
@@ -105,7 +111,10 @@ impl WasmEngine {
                     .engine_mut()?
                     .execute_prepared(request.statement_id, &request.params)?;
                 let committed = !was_in_transaction && result.revision != previous_revision;
-                self.encode_committed(structured::execute_result(&result, committed), committed)
+                self.encode_committed(
+                    structured::execute_result(&result, committed, request.array_rows),
+                    committed,
+                )
             }
             structured::OP_CLOSE_PREPARED => {
                 let id: u32 = structured::decode(payload)?;

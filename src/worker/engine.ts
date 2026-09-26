@@ -1,6 +1,7 @@
 import type {
   ApplyOutcome,
   JsonValue,
+  RowMode,
   SqlResult,
   StorageOptions,
 } from '../protocol.js';
@@ -8,11 +9,15 @@ import {createMemoryPageDevice, type PageDevice} from './page-device.js';
 import {createStructuredWasmEngine} from './wasm-bridge.js';
 
 export interface WorkerEngine {
-  executeSql(sql: string, params: JsonValue[]): SqlResult;
+  executeSql(sql: string, params: JsonValue[], rowMode?: RowMode): SqlResult;
   prepareSql(sql: string): number;
-  executePrepared(statementId: number, params: JsonValue[]): SqlResult;
+  executePrepared(
+    statementId: number,
+    params: JsonValue[],
+    rowMode?: RowMode,
+  ): SqlResult;
   closePrepared(statementId: number): void;
-  execSql(sql: string): SqlResult[];
+  execSql(sql: string, rowMode?: RowMode): SqlResult[];
   beginTransaction(): void;
   commitTransaction(): ApplyOutcome;
   rollbackTransaction(): void;

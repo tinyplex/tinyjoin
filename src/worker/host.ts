@@ -178,6 +178,7 @@ export const startWorker = (
         const result = engine.executeSql(
           request.params.sql,
           request.params.params,
+          request.params.rowMode,
         );
         emitUnlessInTransaction(result);
         return result;
@@ -192,6 +193,7 @@ export const startWorker = (
         const result = engine.executePrepared(
           request.params.statementId,
           request.params.params,
+          request.params.rowMode,
         );
         emitUnlessInTransaction(result);
         return result;
@@ -204,7 +206,10 @@ export const startWorker = (
 
       case 'execSql': {
         assertTransactionId(request.params.transactionId);
-        const results = engine.execSql(request.params.sql);
+        const results = engine.execSql(
+          request.params.sql,
+          request.params.rowMode,
+        );
         emitUnlessInTransaction({
           revision: mathMax(...results.map((result) => result.revision), 0),
           tables: [...new Set(results.flatMap((result) => result.tables))],

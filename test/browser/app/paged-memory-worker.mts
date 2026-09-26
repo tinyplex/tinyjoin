@@ -169,6 +169,6 @@ async function run(): Promise<{
     committedRevision,
     pageCount,
     reopenedRevision,
-    rows: result.rows,
+    rows: (JSON.parse(result.data) as {rows: unknown[]}).rows,
   };
 }

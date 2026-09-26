@@ -33,6 +33,19 @@ the OPFS name does not copy existing data.
 
 In-memory databases, including every `tinyjoin/node` database, are unaffected.
 
+**Object rows now list their columns in field order.** A row's keys follow the
+result's `fields`, as in PostgreSQL, so `SELECT title, id` returns rows whose
+first key is `title`. Earlier releases sorted the keys alphabetically. Code
+that reads a row by column name is unaffected; only code that depends on key
+order, such as `Object.keys(row)` or `JSON.stringify(row)`, sees a difference.
+
+**The Worker protocol version moves from 8 to 9.** Client and Worker ship
+together and are upgraded together by a normal install, so this affects only a
+deployment that pins or caches a Worker file independently of the client
+bundle. A mismatched pair fails cleanly with `PROTOCOL_MISMATCH`, and tabs
+running different releases fail with `DATABASE_VERSION_MISMATCH`, rather than
+misreading each other's results.
+
 This release is also much faster. In the
 [comparative benchmarks](/guides/benchmarks/), most workloads in v0.3.0 took 10
 to 1,400 times as long as the faster of SQLite and PGlite. None now takes more
@@ -58,7 +71,14 @@ than about four times as long, and reading every row, `LIKE` scans, and
 - Scans read only the columns a statement uses, straight from the stored row.
 - Writes apply each statement's rows to each B-tree in one pass, index builds
   sort their entries first, and commits write each page once and flush twice
-  rather than three times.
+  rather than three times, writing each run of consecutive pages with a
+  single storage call.
+- Rows travel from the engine to the page as JSON text, which only the page
+  parses, rather than as objects built one property at a time and then copied
+  between threads. A point query takes about a quarter less time, and reading
+  10,000 rows well under half.
+- On the tab that owns a database, statements reach the engine as calls rather
+  than as messages checked again at every layer.
 
 The compressed download is now {{sizes.total.gzip}}, up from 295 KiB in v0.3.0.
 

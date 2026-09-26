@@ -113,7 +113,7 @@ describe('WorkerRpc', () => {
       result: [
         {
           ...sqlResult(0, [{id: 1}]),
-          fields: [{name: 'id', dataTypeID: -1}],
+          data: sqlData([{name: 'id', dataTypeID: -1}], [{id: 1}]),
         },
       ],
     });
@@ -127,14 +127,8 @@ describe('WorkerRpc', () => {
     const rpc = createWorkerRpc(worker, 'header');
     const request = rpc.request('executeSql', {sql: 'SELECT id FROM posts', params: []});
     const [message] = worker.posted as WorkerRequest[];
-    const row = {};
-    Object.defineProperty(row, 'id', {
-      enumerable: true,
-      get() {
-        throw new Error('The client revisited a trusted result cell');
-      },
-    });
-    const result = sqlResult(1, [row as {id: number}]);
+    // The rows' text is left for the client to parse once they are used.
+    const result = {...sqlResult(1), data: 'not JSON'};
 
     worker.respond({
       v: PROTOCOL_VERSION,
@@ -166,12 +160,20 @@ describe('WorkerRpc', () => {
     expect(isRpcResult('close', undefined)).toBe(true);
 
     expect(isRpcResult('init', {revision: -1})).toBe(false);
+    for (const data of [
+      'not JSON',
+      sqlData([], [1]),
+      sqlData([{name: 'id'}], []),
+      JSON.stringify({fields: [], rows: [], extra: true}),
+    ]) {
+      expect(isRpcResult('executeSql', {...sqlResult(1), data})).toBe(false);
+    }
     expect(
       isRpcResult('executeSql', {
         ...sqlResult(1),
-        rows: [{created: new Date()}],
+        data: sqlData([{name: 'id', dataTypeID: 20}], [[1], {id: 2}]),
       }),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       isRpcResult('executeSql', {
         ...sqlResult(1),
@@ -194,16 +196,13 @@ describe('WorkerRpc', () => {
     expect(isRpcResult('close', null)).toBe(false);
 
     expect(
-      isRpcResultHeader('executeSql', {
-        ...sqlResult(1),
-        rows: [{created: new Date()}],
-      }),
+      isRpcResultHeader('executeSql', {...sqlResult(1), data: 'not JSON'}),
     ).toBe(true);
+    expect(isRpcResultHeader('executeSql', {...sqlResult(1), data: 5})).toBe(
+      false,
+    );
     expect(
-      isRpcResultHeader('executeSql', {
-        ...sqlResult(1),
-        rows: 'not-an-array',
-      }),
+      isRpcResultHeader('executeSql', {...sqlResult(1), rows: []}),
     ).toBe(false);
   });
 
@@ -299,7 +298,6 @@ describe('WorkerRpc', () => {
         params: {statementId: 1, params: [value]},
       }),
     ).toBe(true);
-    expect(isRpcResult('executeSql', jsonResult(value))).toBe(true);
     expect(
       isSerializedError({code: 'CUSTOM_ERROR', message: 'details', details: value}),
     ).toBe(true);
@@ -318,25 +316,17 @@ describe('WorkerRpc', () => {
     for (const [depth, valid] of [[63, true], [64, false]] as const) {
       const values = [shared, nested(depth)];
       expect(isWorkerRequest(queryRequest(values))).toBe(valid);
-      expect(
-        isRpcResult('executeSql', {
-          ...sqlResult(0),
-          rows: [{shallow: shared}, {deep: values[1]}],
-        }),
-      ).toBe(valid);
       expect(isRpcResult('execSql', values.map(jsonResult))).toBe(valid);
     }
 
     const cyclic: JsonValue[] = [];
     cyclic.push(cyclic);
     expect(isWorkerRequest(queryRequest([shared, cyclic]))).toBe(false);
-    expect(isRpcResult('executeSql', jsonResult(cyclic))).toBe(false);
     expect(
       isSerializedError({code: 'CUSTOM_ERROR', message: 'cycle', details: cyclic}),
     ).toBe(false);
     const sparse = new Array<JsonValue>(1);
     expect(isWorkerRequest(queryRequest([sparse]))).toBe(false);
-    expect(isRpcResult('executeSql', jsonResult(sparse))).toBe(false);
   });
 
   it('shares one JSON work budget across parameters, rows, and script results', () => {
@@ -348,7 +338,7 @@ describe('WorkerRpc', () => {
     expect(
       isRpcResult('executeSql', {
         ...sqlResult(0),
-        rows: [{payload: first}, {payload: second}],
+        data: sqlData([], [{payload: first}, {payload: second}]),
       }),
     ).toBe(false);
     expect(
@@ -368,7 +358,7 @@ describe('WorkerRpc', () => {
   it('also bounds repeated non-JSON result metadata within a script response', () => {
     const result = {
       ...sqlResult(0),
-      fields: new Array(600_000).fill({name: 'id', dataTypeID: 20}),
+      data: sqlData(new Array(600_000).fill({name: 'id', dataTypeID: 20}), []),
     };
     expect(isRpcResult('executeSql', result)).toBe(true);
     expect(isRpcResult('execSql', [result, result])).toBe(false);
@@ -399,15 +389,18 @@ describe('WorkerRpc', () => {
   });
 });
 
+function sqlData(fields: unknown[], rows: unknown[]): string {
+  return JSON.stringify({fields, rows});
+}
+
 function sqlResult(revision: number, rows: Array<{id: number}> = []) {
   return {
     command: 'SELECT',
-    fields: rows.length > 0 ? [{name: 'id', dataTypeID: 20}] : [],
     revision,
     rowCount: rows.length,
-    rows,
     tables: [],
     keys: {},
+    data: sqlData(rows.length > 0 ? [{name: 'id', dataTypeID: 20}] : [], rows),
   };
 }
 
@@ -423,8 +416,7 @@ function queryRequest(params: JsonValue[]): WorkerRequest {
 function jsonResult(value: JsonValue) {
   return {
     ...sqlResult(0),
-    fields: [{name: 'payload', dataTypeID: 114}],
     rowCount: 1,
-    rows: [{payload: value}],
+    data: sqlData([{name: 'payload', dataTypeID: 114}], [{payload: value}]),
   };
 }

@@ -14,9 +14,10 @@ import {
   type CodedError,
 } from '../common.js';
 import {
-  isRpcResult,
+  isRpcResultHeader,
   type ApplyOutcome,
   type JsonValue,
+  type RowMode,
   type SqlResult,
 } from '../protocol.js';
 import type {WorkerEngine} from './engine.js';
@@ -46,7 +47,7 @@ export const WASM_OPERATION = {
   close: 11,
 } as const;
 
-const BRIDGE_VERSION = 2;
+const BRIDGE_VERSION = 3;
 const SUCCESS = 0;
 const FAILURE = 1;
 const SAFE_RESPONSE = 0;
@@ -95,11 +96,16 @@ export const createStructuredWasmEngine = (
   return adaptStructuredWasmEngine(raw);
 };
 
-/** Normalizes the direct error payload thrown while opening the raw engine. */
-export const normalizeWasmConstructorError = (error: unknown): unknown =>
-  isBridgeErrorPayload(error)
-    ? new WasmBridgeError(error.code, error.message, error.retryable)
+/**
+ * Normalizes the error the raw engine throws while opening: the JSON text of a
+ * bridge error payload.
+ */
+export const normalizeWasmConstructorError = (error: unknown): unknown => {
+  const payload = isString(error) ? parseJson(error) : undefined;
+  return isBridgeErrorPayload(payload)
+    ? new WasmBridgeError(payload.code, payload.message, payload.retryable)
     : error;
+};
 
 /**
  * Adapts a raw engine to WorkerEngine, passing structured values straight into
@@ -210,12 +216,16 @@ export const adaptStructuredWasmEngine = (
   // Every operation asserts that the engine is still callable, measures its
   // request, and then invokes.
   return objFreeze({
-    executeSql: (sql: string, params: JsonValue[]): SqlResult => {
+    executeSql: (
+      sql: string,
+      params: JsonValue[],
+      rowMode?: RowMode,
+    ): SqlResult => {
       assertCallable();
       preflightExecuteSql(sql, params);
       return invoke(
         WASM_OPERATION.executeSql,
-        {sql, params},
+        {sql, params, ...arrayRows(rowMode)},
         true,
         decodeSqlResult,
       );
@@ -232,12 +242,16 @@ export const adaptStructuredWasmEngine = (
       );
     },
 
-    executePrepared: (statementId: number, params: JsonValue[]): SqlResult => {
+    executePrepared: (
+      statementId: number,
+      params: JsonValue[],
+      rowMode?: RowMode,
+    ): SqlResult => {
       assertCallable();
       preflightExecutePrepared(statementId, params);
       return invoke(
         WASM_OPERATION.executePrepared,
-        {statementId, params},
+        {statementId, params, ...arrayRows(rowMode)},
         true,
         decodeSqlResult,
       );
@@ -249,10 +263,15 @@ export const adaptStructuredWasmEngine = (
       invoke(WASM_OPERATION.closePrepared, statementId, false, decodeUnit);
     },
 
-    execSql: (sql: string): SqlResult[] => {
+    execSql: (sql: string, rowMode?: RowMode): SqlResult[] => {
       assertCallable();
       preflightExecSql(sql);
-      return invoke(WASM_OPERATION.execSql, sql, true, decodeSqlResults);
+      return invoke(
+        WASM_OPERATION.execSql,
+        {sql, ...arrayRows(rowMode)},
+        true,
+        decodeSqlResults,
+      );
     },
 
     beginTransaction: (): void => {
@@ -343,27 +362,43 @@ const assertNotInPageDeviceCallback = (): void => {
   }
 };
 
+// WASM writes a statement's rows only as requested, as objects by default.
+const arrayRows = (rowMode: RowMode | undefined): {arrayRows?: true} =>
+  rowMode === 'array' ? {arrayRows: true} : {};
+
 /**
- * Reads one `[version, status, disposition, payload]` envelope. The disposition
- * says whether a failure the bridge could not read might still have been
- * published, which is what decides between an error and a poisoned engine.
+ * Reads one response, whose first line is the JSON text of its `[version,
+ * status, disposition, payload]` envelope. The disposition says whether a
+ * failure the bridge could not read might still have been published, which is
+ * what decides between an error and a poisoned engine. Statement results
+ * follow the envelope with a line each, holding their fields and rows, which
+ * `read` attaches to their headers unread.
  */
 const decoder =
-  <Result>(label: string, isValid: (payload: unknown) => payload is Result) =>
+  <Result>(
+    label: string,
+    read: (payload: unknown, rest: string | undefined) => Result | typeof INVALID,
+  ) =>
   (value: unknown): Result => {
-    if (!isDenseEnvelope(value)) {
+    if (!isString(value)) {
+      throw invalidStructured('response');
+    }
+    const end = value.indexOf('\n');
+    const envelope = parseJson(end < 0 ? value : value.slice(0, end));
+    const rest = end < 0 ? undefined : value.slice(end + 1);
+    if (!isDenseEnvelope(envelope)) {
       throw invalidStructured('response envelope');
     }
-    if (value[0] !== BRIDGE_VERSION) {
+    if (envelope[0] !== BRIDGE_VERSION) {
       throw new WasmStructuredDecodeError(
         'WASM returned an unsupported structured bridge version',
       );
     }
-    const status = value[1];
+    const status = envelope[1];
     if (status !== SUCCESS && status !== FAILURE) {
       throw invalidStructured('response status');
     }
-    const dispositionTag = value[2];
+    const dispositionTag = envelope[2];
     if (
       dispositionTag !== SAFE_RESPONSE &&
       dispositionTag !== DURABLE_RESPONSE
@@ -372,7 +407,7 @@ const decoder =
     }
     const disposition: StructuredResponseDisposition =
       dispositionTag === DURABLE_RESPONSE ? 'durable' : 'safe';
-    const payload = value[3];
+    const payload = envelope[3];
     if (status === FAILURE) {
       if (disposition !== 'safe') {
         throw new WasmStructuredDecodeError(
@@ -380,7 +415,7 @@ const decoder =
           disposition,
         );
       }
-      if (!isBridgeErrorPayload(payload)) {
+      if (!isBridgeErrorPayload(payload) || !isUndefined(rest)) {
         throw invalidStructured('error', disposition);
       }
       throw new WasmBridgeError(
@@ -389,11 +424,29 @@ const decoder =
         payload.retryable,
       );
     }
-    if (!isValid(payload)) {
+    const result = read(payload, rest);
+    if (result === INVALID) {
       throw invalidStructured(label, disposition);
     }
-    return payload;
+    return result;
   };
+
+const INVALID = Symbol('invalid');
+
+/** Reads a payload that stands alone, which `isValid` checks. */
+const single =
+  <Result>(isValid: (payload: unknown) => payload is Result) =>
+  (payload: unknown, rest: string | undefined): Result | typeof INVALID =>
+    isUndefined(rest) && isValid(payload) ? payload : INVALID;
+
+// A result's header is checked, and its rows' JSON text passed on unread:
+// both come from TinyJoin's own engine, which tests check in full.
+const withData = (header: unknown, data: string | undefined): unknown => {
+  if (isRecord(header) && isString(data)) {
+    header.data = data;
+  }
+  return header;
+};
 
 const invalidStructured = (
   what: string,
@@ -404,25 +457,44 @@ const invalidStructured = (
     disposition,
   );
 
-const decodeUnit = decoder('unit result', isUndefined);
-const decodeBoolean = decoder('boolean result', isBoolean);
-const decodeRevision = decoder('revision', isCount);
+const decodeUnit = decoder(
+  'unit result',
+  single((payload): payload is null => payload === null),
+);
+const decodeBoolean = decoder('boolean result', single(isBoolean));
+const decodeRevision = decoder('revision', single(isCount));
 const decodePreparedStatementId = decoder(
   'prepared statement ID',
-  (payload): payload is number => isCountWithin(payload, 1, MAX_U32),
+  single((payload): payload is number => isCountWithin(payload, 1, MAX_U32)),
 );
 const decodeApplyOutcome = decoder(
   'apply outcome',
-  (payload): payload is ApplyOutcome => isRpcResult('commitTransaction', payload),
+  single((payload): payload is ApplyOutcome =>
+    isRpcResultHeader('commitTransaction', payload),
+  ),
 );
-const decodeSqlResult = decoder(
-  'SQL result',
-  (payload): payload is SqlResult => isRpcResult('executeSql', payload),
-);
-const decodeSqlResults = decoder(
-  'SQL results',
-  (payload): payload is SqlResult[] => isRpcResult('execSql', payload),
-);
+const decodeSqlResult = decoder('SQL result', (payload, rest) => {
+  const result = withData(payload, rest);
+  return isRpcResultHeader('executeSql', result) ? result : INVALID;
+});
+const decodeSqlResults = decoder('SQL results', (payload, rest) => {
+  const lines = rest?.split('\n') ?? [];
+  if (!arrayIsArray(payload) || payload.length !== lines.length) {
+    return INVALID;
+  }
+  const results = payload.map((header, index) =>
+    withData(header, lines[index]),
+  );
+  return isRpcResultHeader('execSql', results) ? results : INVALID;
+});
+
+const parseJson = (text: string): unknown => {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+};
 
 const isDenseEnvelope = (value: unknown): value is unknown[] =>
   arrayIsArray(value) &&

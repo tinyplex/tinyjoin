@@ -12,12 +12,14 @@ version.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+itoa = "1"
 js-sys = "0.3"
 serde = {version = "1", features = ["derive"]}
 serde_json = {version = "1", default-features = false, features = ["alloc"]}
 serde-wasm-bindgen = "0.6"
 tinyjoin-core = {path = "../tinyjoin-core", features = ["compact-storage-diagnostics"]}
 wasm-bindgen = "0.2"
+zmij = "1"
 
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = [

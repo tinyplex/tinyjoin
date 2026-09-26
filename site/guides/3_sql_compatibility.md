@@ -50,8 +50,9 @@ optional JSON-compatible `$1` parameters. exec(sql, options?) executes one or
 more statements without parameters as one implicit transaction and returns one
 result per statement. Both use `{rows, fields, affectedRows?, command?,
 rowCount?}` results; TinyJoin adds `revision` and `tables`. `fields` contains
-ordered `{name, dataTypeID}` entries, including for empty typed results.
-`rowMode: "array"` returns values in that field order. The `sql` tagged template
+ordered `{name, dataTypeID}` entries, including for empty typed results. Each
+object row lists its keys in that field order, and `rowMode: "array"` returns
+its values in that order. The `sql` tagged template
 is a parameterizing form of query(). `rowMode` is the only query option
 implemented today; parser, serializer, notice, parameter-type, and blob
 options are rejected. The tag accepts parameter values only and does not

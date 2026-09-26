@@ -6,7 +6,14 @@ import {compileFunction} from 'node:vm';
 import {describe, expect, it} from 'vitest';
 import {transformSync} from 'esbuild';
 
-import type {JsonValue} from '../../src/protocol.js';
+import {
+  isRpcResult,
+  type JsonValue,
+  type Row,
+  type RowMode,
+  type SqlData,
+  type SqlResult,
+} from '../../src/protocol.js';
 import type {PageDevice} from '../../src/worker/page-device.js';
 import {
   WASM_OPERATION,
@@ -15,7 +22,7 @@ import {
   type RawStructuredWasmEngineConstructor,
 } from '../../src/worker/wasm-bridge.js';
 
-const BRIDGE_VERSION = 2;
+const BRIDGE_VERSION = 3;
 const artifactDirectory =
   process.env.TINYJOIN_PAGED_WASM_DIR ?? resolve('dist/wasm');
 const artifactModule = `${artifactDirectory}/tinyjoin_wasm.js`;
@@ -435,8 +442,8 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
       payload JSONB
     )`;
     const created = engine.execSql(schemaSql);
-    expectRequest(recording, WASM_OPERATION.execSql).toBe(schemaSql);
-    expect(created).toBe(
+    expectRequest(recording, WASM_OPERATION.execSql).toEqual({sql: schemaSql});
+    expect(created.map(withoutRows)).toEqual(
       responsePayload(lastCall(recording, WASM_OPERATION.execSql)),
     );
     expect(created[0]?.command).toBe('CREATE TABLE');
@@ -462,7 +469,7 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
     expect((insertCall.payload as {params: JsonValue[]}).params).toBe(
       insertParams,
     );
-    expect(inserted).toBe(responsePayload(insertCall));
+    expect(withoutRows(inserted)).toEqual(responsePayload(insertCall));
     expectDisposition(recording, WASM_OPERATION.executeSql, 'durable');
 
     const selected = engine.executeSql(
@@ -476,17 +483,31 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
       {name: 'payload', dataTypeID: 114},
     ]);
     const selectedRow = selected.rows[0]!;
+    // Keys come in field order, and a `__proto__` key stays an own property
+    // without changing any prototype.
+    expect(Object.keys(selectedRow)).toEqual(['id', 'title', 'payload']);
     const selectedPayload = selectedRow.payload as Record<string, JsonValue>;
-    expect(Object.getPrototypeOf(selectedRow)).toBeNull();
-    expect(Object.getPrototypeOf(selectedPayload)).toBeNull();
+    expect(Object.getPrototypeOf(selectedPayload)).toBe(Object.prototype);
     expect(Object.hasOwn(selectedPayload, '__proto__')).toBe(true);
     expect(selectedPayload.__proto__).toBe('data');
     expect(Object.is(selectedPayload.signedZero, -0)).toBe(false);
     const nested = selectedPayload.nested as JsonValue[];
     const nestedRecord = nested[3] as Record<string, JsonValue>;
-    expect(Object.getPrototypeOf(nestedRecord)).toBeNull();
+    expect(Object.getPrototypeOf(nestedRecord)).toBe(Object.prototype);
     expect(Object.hasOwn(nestedRecord, '__proto__')).toBe(true);
     expect(nestedRecord.__proto__).toBe('nested-data');
+    expect(
+      engine.executeSql(
+        'SELECT payload, title, id FROM items WHERE id = $1',
+        [1],
+        'array',
+      ).rows,
+    ).toEqual([[selectedPayload, 'typed-default', 1]]);
+    expectRequest(recording, WASM_OPERATION.executeSql).toEqual({
+      sql: 'SELECT payload, title, id FROM items WHERE id = $1',
+      params: [1],
+      arrayRows: true,
+    });
 
     engine.beginTransaction();
     expectDisposition(recording, WASM_OPERATION.begin, 'safe');
@@ -525,7 +546,7 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
     expect((preparedCall.payload as {params: JsonValue[]}).params).toBe(
       preparedParams,
     );
-    expect(prepared).toBe(responsePayload(preparedCall));
+    expect(withoutRows(prepared)).toEqual(responsePayload(preparedCall));
     expect(prepared.rows).toEqual([{title: 'committed', payload: null}]);
     expectDisposition(recording, WASM_OPERATION.executePrepared, 'safe');
     engine.closePrepared(statementId);
@@ -542,8 +563,8 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
       'SELECT id FROM items LIMIT 0; SELECT COUNT(*) AS total FROM items LIMIT 0';
     const scripted = engine.execSql(script);
     const execCall = lastCall(recording, WASM_OPERATION.execSql);
-    expect(execCall.payload).toBe(script);
-    expect(scripted).toBe(responsePayload(execCall));
+    expect(execCall.payload).toEqual({sql: script});
+    expect(scripted.map(withoutRows)).toEqual(responsePayload(execCall));
     expect(scripted).toHaveLength(2);
     expectDisposition(recording, WASM_OPERATION.execSql, 'safe');
 
@@ -617,13 +638,25 @@ async function loadStructuredModule(): Promise<StructuredModule> {
   return wasm;
 }
 
+type DecodedResult = Omit<SqlResult, 'data'> & SqlData & {rows: Row[]};
+
+// Every result the real engine writes gets the full check that a custom
+// Worker's results get on the page, and then its rows are parsed as the page
+// parses them.
+function decode(result: SqlResult): DecodedResult {
+  expect(isRpcResult('executeSql', result)).toBe(true);
+  const {data, ...header} = result;
+  return {...header, ...(JSON.parse(data) as SqlData)} as DecodedResult;
+}
+
+function withoutRows({fields: _fields, rows: _rows, ...header}: DecodedResult) {
+  return header;
+}
+
 function createRecordingEngine(
   wasm: StructuredModule,
   device: PageDevice,
-): {
-  engine: ReturnType<typeof createStructuredWasmEngine>;
-  recording: RecordingStructuredEngine;
-} {
+) {
   let recording: RecordingStructuredEngine | undefined;
   class RecordingConstructor extends RecordingStructuredEngine {
     constructor(guardedDevice: PageDevice) {
@@ -631,10 +664,22 @@ function createRecordingEngine(
       recording = this;
     }
   }
-  const engine = createStructuredWasmEngine(RecordingConstructor, device);
+  const bridged = createStructuredWasmEngine(RecordingConstructor, device);
   if (!recording) {
     throw new Error('The structured WASM recording engine was not created');
   }
+  const engine = {
+    ...bridged,
+    executeSql: (sql: string, params: JsonValue[], rowMode?: RowMode) =>
+      decode(bridged.executeSql(sql, params, rowMode)),
+    executePrepared: (
+      statementId: number,
+      params: JsonValue[],
+      rowMode?: RowMode,
+    ) => decode(bridged.executePrepared(statementId, params, rowMode)),
+    execSql: (sql: string, rowMode?: RowMode) =>
+      bridged.execSql(sql, rowMode).map(decode),
+  };
   return {engine, recording};
 }
 
@@ -660,9 +705,14 @@ function expectRequest(
   return expect(lastCall(engine, operation).payload);
 }
 
+// A response is JSON text, whose first line holds its envelope.
+function responseEnvelope(call: StructuredCall): unknown[] {
+  expect(typeof call.response).toBe('string');
+  return JSON.parse((call.response as string).split('\n')[0]!) as unknown[];
+}
+
 function responsePayload(call: StructuredCall): unknown {
-  expect(Array.isArray(call.response)).toBe(true);
-  return (call.response as unknown[])[3];
+  return responseEnvelope(call)[3];
 }
 
 function expectDisposition(
@@ -671,16 +721,22 @@ function expectDisposition(
   expected: 'safe' | 'durable',
 ): void {
   const expectedTag = expected === 'durable' ? 1 : 0;
-  const response = lastCall(engine, operation).response as unknown[];
-  expect(response.slice(0, 3)).toEqual([BRIDGE_VERSION, 0, expectedTag]);
+  expect(responseEnvelope(lastCall(engine, operation)).slice(0, 3)).toEqual([
+    BRIDGE_VERSION,
+    0,
+    expectedTag,
+  ]);
 }
 
 function expectFailureDisposition(
   engine: RecordingStructuredEngine,
   operation: number,
 ): void {
-  const response = lastCall(engine, operation).response as unknown[];
-  expect(response.slice(0, 3)).toEqual([BRIDGE_VERSION, 1, 0]);
+  expect(responseEnvelope(lastCall(engine, operation)).slice(0, 3)).toEqual([
+    BRIDGE_VERSION,
+    1,
+    0,
+  ]);
 }
 
 function captureError(operation: () => unknown): unknown {

@@ -1,28 +1,11 @@
-use std::{cell::RefCell, collections::BTreeMap, mem::size_of};
+use std::collections::BTreeMap;
 
-use js_sys::{Array, Object};
 use serde::Deserialize;
 use serde_json::{Map, Number, Value};
-use tinyjoin_core::{ApplyOutcome, EngineError, ExecuteResult, Result, ResultField, Row};
-use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
+use tinyjoin_core::{ApplyOutcome, EngineError, ExecuteResult, Result, Row};
+use wasm_bindgen::JsValue;
 
-// Responses are built from records and arrays the bridge has just created, whose properties are
-// all plain data, so setting one cannot throw. These bindings therefore leave out wasm-bindgen's
-// exception wrapper, and take numbers and strings as themselves, so that setting one crosses into
-// JS once rather than first creating the value there.
-#[wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_namespace = Reflect, js_name = set)]
-    fn reflect_set(target: &Object, key: &JsValue, value: &JsValue) -> bool;
-    #[wasm_bindgen(js_namespace = Reflect, js_name = set)]
-    fn reflect_set_number(target: &Object, key: &JsValue, value: f64) -> bool;
-    #[wasm_bindgen(js_namespace = Reflect, js_name = set)]
-    fn reflect_set_str(target: &Object, key: &JsValue, value: &str) -> bool;
-    #[wasm_bindgen(js_namespace = Reflect, js_name = set)]
-    fn reflect_set_index_number(target: &Array, index: u32, value: f64) -> bool;
-}
-
-pub(crate) const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 3;
 
 pub(crate) const OP_EXECUTE_SQL: u32 = 1;
 pub(crate) const OP_EXEC_SQL: u32 = 2;
@@ -42,20 +25,16 @@ const SAFE_RESPONSE: u32 = 0;
 const DURABLE_RESPONSE: u32 = 1;
 
 const MAX_BYTES: usize = 16 * 1024 * 1024;
-const MAX_NODES: usize = 1_000_000;
-const MAX_ITEMS: usize = 1_000_000;
 const MAX_DEPTH: usize = 64;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
-const STRING_OVERHEAD: usize = size_of::<String>();
-const JS_ARRAY_OVERHEAD: usize = 12;
-const JS_VALUE_BYTES: usize = 4;
-const JS_OBJECT_OVERHEAD: usize = 64;
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ExecuteSqlRequest {
     pub(crate) sql: String,
     pub(crate) params: Vec<Value>,
+    #[serde(default)]
+    pub(crate) array_rows: bool,
 }
 
 #[derive(Deserialize)]
@@ -63,6 +42,16 @@ pub(crate) struct ExecuteSqlRequest {
 pub(crate) struct ExecutePreparedRequest {
     pub(crate) statement_id: u32,
     pub(crate) params: Vec<Value>,
+    #[serde(default)]
+    pub(crate) array_rows: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ExecSqlRequest {
+    pub(crate) sql: String,
+    #[serde(default)]
+    pub(crate) array_rows: bool,
 }
 
 pub(crate) fn decode<T: for<'de> Deserialize<'de>>(payload: JsValue) -> Result<T> {
@@ -78,571 +67,379 @@ pub(crate) fn unit_payload(payload: &JsValue) -> Result<()> {
 }
 
 pub(crate) fn unit(committed: bool) -> Result<JsValue> {
-    success(committed, JsValue::UNDEFINED)
+    let mut json = Json::success(committed);
+    json.raw("null]");
+    json.finish()
 }
 
 pub(crate) fn boolean(value: bool) -> Result<JsValue> {
-    let mut measure = Measure::default();
-    measure.raw(1)?;
-    success(false, JsValue::from_bool(value))
+    let mut json = Json::success(false);
+    json.raw(if value { "true]" } else { "false]" });
+    json.finish()
 }
 
 pub(crate) fn unsigned(value: u64) -> Result<JsValue> {
-    safe_number(value)?;
-    let mut measure = Measure::default();
-    measure.raw(8)?;
-    success(false, JsValue::from_f64(value as f64))
+    let mut json = Json::success(false);
+    json.unsigned(value)?;
+    json.raw("]");
+    json.finish()
 }
 
 pub(crate) fn prepared_statement_id(value: u32) -> Result<JsValue> {
-    let mut measure = Measure::default();
-    measure.raw(4)?;
-    success(false, JsValue::from_f64(f64::from(value)))
+    unsigned(value.into())
 }
 
 pub(crate) fn apply_outcome(outcome: &ApplyOutcome, committed: bool) -> Result<JsValue> {
-    let mut measure = Measure::default();
-    measure.apply_outcome(outcome)?;
-    success(committed, build_apply_outcome(outcome)?)
+    let mut json = Json::success(committed);
+    json.raw("{\"revision\":");
+    json.unsigned(outcome.revision)?;
+    json.raw(",\"tables\":");
+    json.strings(&outcome.tables);
+    json.raw(",\"keys\":");
+    json.changed_keys(&outcome.keys)?;
+    json.raw("}]");
+    json.finish()
 }
 
-pub(crate) fn execute_result(result: &ExecuteResult, committed: bool) -> Result<JsValue> {
-    let mut measure = Measure::default();
-    measure.execute_result(result)?;
-    success(committed, build_execute_result(result)?)
+pub(crate) fn execute_result(
+    result: &ExecuteResult,
+    committed: bool,
+    array_rows: bool,
+) -> Result<JsValue> {
+    let mut json = Json::success(committed);
+    json.results(std::slice::from_ref(result), array_rows, false)?;
+    json.finish()
 }
 
-pub(crate) fn execute_results(results: &[ExecuteResult], committed: bool) -> Result<JsValue> {
-    let mut measure = Measure::default();
-    measure.array(results.len())?;
-    for result in results {
-        measure.operation()?;
-        measure.execute_result(result)?;
-    }
-    let values = array(results.len())?;
-    for (index, result) in results.iter().enumerate() {
-        values.set(index as u32, build_execute_result(result)?);
-    }
-    success(committed, values.into())
+/// Writes every result of a script: an array of their headers as the payload, and then each
+/// result's fields and rows on a line of its own.
+pub(crate) fn execute_results(
+    results: &[ExecuteResult],
+    committed: bool,
+    array_rows: bool,
+) -> Result<JsValue> {
+    let mut json = Json::success(committed);
+    json.results(results, array_rows, true)?;
+    json.finish()
 }
 
-pub(crate) fn error(error: &EngineError) -> std::result::Result<JsValue, JsValue> {
-    let payload = serialized_error(error)?;
-    envelope(FAILURE, SAFE_RESPONSE, payload).map_err(|_| terminal_error())
+pub(crate) fn error(error: &EngineError) -> JsValue {
+    JsValue::from_str(&error_text(error))
 }
 
-/// Private generated-constructor ABI: `new WasmEngine(device)` throws this
-/// null-prototype `{code, message, retryable?}` object directly. It is not a
-/// response envelope because no engine/call boundary exists yet. The worker's
-/// structured constructor normalizer validates this exact serialized-error
-/// shape before exposing it as a public error.
+/// Private generated-constructor ABI: `new WasmEngine(device)` throws the JSON text of a
+/// `{code, message, retryable?}` object directly. It is not a response envelope because no
+/// engine/call boundary exists yet. The worker's constructor normalizer validates this exact
+/// serialized-error shape before exposing it as a public error.
 pub(crate) fn constructor_error(error: EngineError) -> JsValue {
-    serialized_error(&error).unwrap_or_else(|error| error)
+    let mut json = Json::default();
+    json.error(&error);
+    JsValue::from_str(&json.0)
 }
 
-fn serialized_error(error: &EngineError) -> std::result::Result<JsValue, JsValue> {
-    match error_payload(error) {
-        Ok(payload) => Ok(payload),
-        Err(_) => error_payload(
-            &EngineError::new(
-                "BRIDGE_SERIALIZATION_ERROR",
-                "TinyJoin could not encode a structured bridge error",
-            )
-            .with_retryable(false),
+/// A failure's response. A message too long to send is replaced by one that says so.
+fn error_text(error: &EngineError) -> String {
+    let mut json = Json::envelope(FAILURE, SAFE_RESPONSE);
+    json.error(error);
+    json.raw("]");
+    if json.0.len() <= MAX_BYTES {
+        return json.0;
+    }
+    error_text(
+        &EngineError::new(
+            "BRIDGE_SERIALIZATION_ERROR",
+            "TinyJoin could not encode a structured bridge error",
         )
-        .map_err(|_| terminal_error()),
-    }
-}
-
-fn error_payload(error: &EngineError) -> Result<JsValue> {
-    let mut measure = Measure::default();
-    let keys = if error.retryable.is_some() {
-        &["code", "message", "retryable"][..]
-    } else {
-        &["code", "message"][..]
-    };
-    measure.result_object(keys)?;
-    measure.string(&error.code)?;
-    measure.string(&error.message)?;
-    measure.raw(1)?;
-    let payload = record();
-    set(&payload, "code", &JsValue::from_str(&error.code))?;
-    set(&payload, "message", &JsValue::from_str(&error.message))?;
-    if let Some(retryable) = error.retryable {
-        set(&payload, "retryable", &JsValue::from_bool(retryable))?;
-    }
-    Ok(payload.into())
-}
-
-fn terminal_error() -> JsValue {
-    JsValue::from_str("TinyJoin could not encode a structured bridge error")
-}
-
-fn success(committed: bool, payload: JsValue) -> Result<JsValue> {
-    envelope(
-        SUCCESS,
-        if committed {
-            DURABLE_RESPONSE
-        } else {
-            SAFE_RESPONSE
-        },
-        payload,
+        .with_retryable(false),
     )
 }
 
-fn envelope(status: u32, disposition: u32, payload: JsValue) -> Result<JsValue> {
-    let response = Array::new_with_length(4);
-    for (index, value) in [VERSION, status, disposition].into_iter().enumerate() {
-        reflect_set_index_number(&response, index as u32, f64::from(value));
-    }
-    response.set(3, payload);
-    Ok(response.into())
-}
-
-fn build_apply_outcome(outcome: &ApplyOutcome) -> Result<JsValue> {
-    safe_number(outcome.revision)?;
-    let value = record();
-    set_fixed(
-        &value,
-        "revision",
-        &JsValue::from_f64(outcome.revision as f64),
-    )?;
-    set_fixed(&value, "tables", &build_strings(&outcome.tables)?.into())?;
-    set_fixed(&value, "keys", &build_changed_keys(&outcome.keys)?)?;
-    Ok(value.into())
-}
-
-fn build_execute_result(result: &ExecuteResult) -> Result<JsValue> {
-    safe_number(result.revision)?;
-    let row_count = u64::try_from(result.row_count).map_err(|_| serialization())?;
-    safe_number(row_count)?;
-    let value = record();
-    set_fixed_with(&value, "command", |target, key| {
-        reflect_set_str(target, key, &result.command)
-    })?;
-    set_fixed_number(&value, "revision", result.revision as f64)?;
-    set_fixed_number(&value, "rowCount", row_count as f64)?;
-    let mut columns = ColumnNames::default();
-    set_fixed(
-        &value,
-        "fields",
-        &build_fields(&result.fields, &mut columns)?.into(),
-    )?;
-    set_fixed(&value, "rows", &build_rows(&result.rows, columns)?.into())?;
-    set_fixed(&value, "tables", &build_strings(&result.tables)?.into())?;
-    set_fixed(&value, "keys", &build_changed_keys(&result.keys)?)?;
-    Ok(value.into())
-}
-
-/// Builds the result's fields, keeping their names for the rows' keys.
-fn build_fields(fields: &[ResultField], columns: &mut ColumnNames) -> Result<Array> {
-    let values = array(fields.len())?;
-    for (index, field) in fields.iter().enumerate() {
-        let value = record();
-        let name = JsValue::from_str(&field.name);
-        set_fixed(&value, "name", &name)?;
-        columns.fields.push((field.name.clone(), name));
-        set_fixed_number(&value, "dataTypeID", f64::from(field.data_type_id))?;
-        values.set(index as u32, value.into());
-    }
-    Ok(values)
-}
-
-/// Builds the per-table changed-key map. A table appears only when its complete key set is known,
-/// so an absent table means "changed, but re-read it" rather than "unchanged".
-fn build_changed_keys(keys: &BTreeMap<String, Vec<Row>>) -> Result<JsValue> {
-    let value = record();
-    for (table, rows) in keys {
-        set(
-            &value,
-            table,
-            &build_rows(rows, ColumnNames::default())?.into(),
-        )?;
-    }
-    Ok(value.into())
-}
-
-fn build_rows(rows: &[Row], mut columns: ColumnNames) -> Result<Array> {
-    let values = array(rows.len())?;
-    for (index, row) in rows.iter().enumerate() {
-        let value = record();
-        for (position, (key, child)) in row.iter().enumerate() {
-            set_cell(&value, columns.get(position, key), child)?;
-        }
-        values.set(index as u32, value.into());
-    }
-    Ok(values)
-}
-
-/// Sets a row's cell, passing a number or string straight into the property.
-fn set_cell(row: &Object, key: &JsValue, value: &Value) -> Result<()> {
-    let set = match value {
-        Value::Number(number) => reflect_set_number(row, key, number_f64(number)?),
-        Value::String(text) => reflect_set_str(row, key, text),
-        value => reflect_set(row, key, &build_value(value, 1)?),
-    };
-    if set { Ok(()) } else { Err(serialization()) }
-}
-
-/// The column names of a result's rows, as JS strings. Every row of a result names the same
-/// columns in the same order, so each name crosses into JS once per result, not once per cell,
-/// and a name the result's fields already carried is not converted again.
+/// A response, written as JSON text. Its first line is the envelope, `[version, status,
+/// disposition, payload]`. A statement's payload is its header, and its fields and rows follow on
+/// a line of their own, which the worker passes to the page without reading. JSON text holds no
+/// raw line breaks, so the lines separate unambiguously.
 #[derive(Default)]
-struct ColumnNames {
-    fields: Vec<(String, JsValue)>,
-    positions: Vec<(String, JsValue)>,
-}
+struct Json(String);
 
-impl ColumnNames {
-    /// The name of the column at `position` in a row, which fills positions in order.
-    fn get(&mut self, position: usize, key: &str) -> &JsValue {
-        if self
-            .positions
-            .get(position)
-            .is_none_or(|(name, _)| name != key)
-        {
-            let value = match self.fields.iter().find(|(name, _)| name == key) {
-                Some((_, value)) => value.clone(),
-                None => JsValue::from_str(key),
-            };
-            let name = (key.to_owned(), value);
-            match self.positions.get_mut(position) {
-                Some(slot) => *slot = name,
-                None => self.positions.push(name),
-            }
+impl Json {
+    fn envelope(status: u32, disposition: u32) -> Self {
+        let mut json = Self::default();
+        json.raw("[");
+        for value in [VERSION, status, disposition] {
+            json.raw(itoa::Buffer::new().format(value));
+            json.raw(",");
         }
-        &self.positions[position].1
-    }
-}
-
-fn build_row(row: &Row, depth: usize) -> Result<Object> {
-    if depth > MAX_DEPTH {
-        return Err(serialization());
-    }
-    let value = record();
-    for (key, child) in row {
-        set(&value, key, &build_value(child, depth + 1)?)?;
-    }
-    Ok(value)
-}
-
-fn build_value(value: &Value, depth: usize) -> Result<JsValue> {
-    if depth > MAX_DEPTH {
-        return Err(serialization());
-    }
-    match value {
-        Value::Null => Ok(JsValue::NULL),
-        Value::Bool(value) => Ok(JsValue::from_bool(*value)),
-        Value::Number(number) => number_value(number),
-        Value::String(value) => Ok(JsValue::from_str(value)),
-        Value::Array(values) => {
-            let output = array(values.len())?;
-            for (index, value) in values.iter().enumerate() {
-                output.set(index as u32, build_value(value, depth + 1)?);
-            }
-            Ok(output.into())
-        }
-        Value::Object(values) => Ok(build_row(values, depth)?.into()),
-    }
-}
-
-fn number_value(number: &Number) -> Result<JsValue> {
-    Ok(JsValue::from_f64(number_f64(number)?))
-}
-
-/// A JSON number as the JS number a response carries: an integer within JavaScript's safe range,
-/// or a finite float.
-fn number_f64(number: &Number) -> Result<f64> {
-    checked_number(number)?;
-    if let Some(value) = number.as_i64() {
-        Ok(value as f64)
-    } else if let Some(value) = number.as_u64() {
-        Ok(value as f64)
-    } else {
-        number.as_f64().ok_or_else(serialization)
-    }
-}
-
-fn build_strings(values: &[String]) -> Result<Array> {
-    let output = array(values.len())?;
-    for (index, value) in values.iter().enumerate() {
-        output.set(index as u32, JsValue::from_str(value));
-    }
-    Ok(output)
-}
-
-fn array(length: usize) -> Result<Array> {
-    let length = u32::try_from(length).map_err(|_| limit())?;
-    Ok(Array::new_with_length(length))
-}
-
-fn record() -> Object {
-    Object::create(JsValue::NULL.unchecked_ref::<Object>())
-}
-
-fn set(target: &Object, key: &str, value: &JsValue) -> Result<()> {
-    set_value(target, &JsValue::from_str(key), value)
-}
-
-thread_local! {
-    /// JS strings for the keys every response uses, made once.
-    static FIXED_KEYS: RefCell<Vec<(&'static str, JsValue)>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Sets one of the keys every response uses, converting it to a JS string only once.
-fn set_fixed(target: &Object, key: &'static str, value: &JsValue) -> Result<()> {
-    set_fixed_with(target, key, |target, key| reflect_set(target, key, value))
-}
-
-fn set_fixed_number(target: &Object, key: &'static str, value: f64) -> Result<()> {
-    set_fixed_with(target, key, |target, key| {
-        reflect_set_number(target, key, value)
-    })
-}
-
-/// Sets one of the keys every response uses with `set`, which reports whether the property was
-/// set.
-fn set_fixed_with(
-    target: &Object,
-    key: &'static str,
-    set: impl FnOnce(&Object, &JsValue) -> bool,
-) -> Result<()> {
-    let set = FIXED_KEYS.with(|keys| {
-        let mut keys = keys.borrow_mut();
-        let index = match keys.iter().position(|(name, _)| *name == key) {
-            Some(index) => index,
-            None => {
-                keys.push((key, JsValue::from_str(key)));
-                keys.len() - 1
-            }
-        };
-        set(target, &keys[index].1)
-    });
-    if set { Ok(()) } else { Err(serialization()) }
-}
-
-fn set_value(target: &Object, key: &JsValue, value: &JsValue) -> Result<()> {
-    if reflect_set(target, key, value) {
-        Ok(())
-    } else {
-        Err(serialization())
-    }
-}
-
-struct Measure {
-    bytes: usize,
-    retained: usize,
-    nodes: usize,
-    operations: usize,
-}
-
-impl Default for Measure {
-    fn default() -> Self {
-        Self {
-            // Charge the version/status/disposition prefix before measuring
-            // the structured response payload's canonical logical size.
-            bytes: 3,
-            retained: 0,
-            nodes: 0,
-            operations: 0,
-        }
-    }
-}
-
-impl Measure {
-    fn raw(&mut self, bytes: usize) -> Result<()> {
-        self.bytes = self.bytes.checked_add(bytes).ok_or_else(limit)?;
-        if self.bytes > MAX_BYTES {
-            return Err(limit());
-        }
-        Ok(())
+        json
     }
 
-    fn retain(&mut self, bytes: usize) -> Result<()> {
-        self.retained = self.retained.checked_add(bytes).ok_or_else(limit)?;
-        if self.retained > MAX_BYTES {
-            return Err(limit());
-        }
-        Ok(())
-    }
-
-    fn operation(&mut self) -> Result<()> {
-        self.operations = self.operations.checked_add(1).ok_or_else(limit)?;
-        if self.operations > MAX_ITEMS {
-            return Err(limit());
-        }
-        Ok(())
-    }
-
-    fn node(&mut self, depth: usize) -> Result<()> {
-        if depth > MAX_DEPTH {
-            return Err(serialization());
-        }
-        self.nodes = self.nodes.checked_add(1).ok_or_else(limit)?;
-        if self.nodes > MAX_NODES {
-            return Err(limit());
-        }
-        Ok(())
-    }
-
-    fn string(&mut self, value: &str) -> Result<()> {
-        self.raw(4usize.checked_add(value.len()).ok_or_else(limit)?)?;
-        self.retain(STRING_OVERHEAD.checked_add(value.len()).ok_or_else(limit)?)
-    }
-
-    fn array(&mut self, length: usize) -> Result<()> {
-        if length > MAX_ITEMS {
-            return Err(limit());
-        }
-        self.raw(4)?;
-        self.retain(
-            JS_ARRAY_OVERHEAD
-                .checked_add(JS_VALUE_BYTES.checked_mul(length).ok_or_else(limit)?)
-                .ok_or_else(limit)?,
+    fn success(committed: bool) -> Self {
+        Self::envelope(
+            SUCCESS,
+            if committed {
+                DURABLE_RESPONSE
+            } else {
+                SAFE_RESPONSE
+            },
         )
     }
 
-    fn result_object(&mut self, keys: &[&str]) -> Result<()> {
-        self.retain(JS_OBJECT_OVERHEAD)?;
-        for key in keys {
-            self.operation()?;
-            self.retain(STRING_OVERHEAD.checked_add(key.len()).ok_or_else(limit)?)?;
-        }
-        Ok(())
+    fn finish(self) -> Result<JsValue> {
+        self.bounded()?;
+        Ok(JsValue::from_str(&self.0))
     }
 
-    fn strings(&mut self, values: &[String]) -> Result<()> {
-        self.array(values.len())?;
-        for value in values {
-            self.operation()?;
-            self.string(value)?;
-        }
-        Ok(())
-    }
-
-    fn fields(&mut self, fields: &[ResultField]) -> Result<()> {
-        self.array(fields.len())?;
-        for field in fields {
-            self.operation()?;
-            self.result_object(&["name", "dataTypeID"])?;
-            self.string(&field.name)?;
-            self.raw(4)?;
-        }
-        Ok(())
-    }
-
-    fn changed_keys(&mut self, keys: &BTreeMap<String, Vec<Row>>) -> Result<()> {
-        self.retain(JS_OBJECT_OVERHEAD)?;
-        for (table, rows) in keys {
-            self.operation()?;
-            self.string(table)?;
-            self.rows(rows)?;
-        }
-        Ok(())
-    }
-
-    fn rows(&mut self, rows: &[Row]) -> Result<()> {
-        self.array(rows.len())?;
-        for row in rows {
-            self.operation()?;
-            self.row(row, 0)?;
-        }
-        Ok(())
-    }
-
-    fn row(&mut self, row: &Map<String, Value>, depth: usize) -> Result<()> {
-        self.node(depth)?;
-        self.retain(JS_OBJECT_OVERHEAD)?;
-        self.raw(4)?;
-        if row.len() > MAX_ITEMS {
+    fn bounded(&self) -> Result<()> {
+        if self.0.len() > MAX_BYTES {
             return Err(limit());
         }
-        for (key, value) in row {
-            self.operation()?;
-            self.string(key)?;
-            self.value(value, depth + 1)?;
+        Ok(())
+    }
+
+    fn raw(&mut self, text: &str) {
+        self.0.push_str(text);
+    }
+
+    fn unsigned(&mut self, value: u64) -> Result<()> {
+        if value > MAX_SAFE_INTEGER {
+            return Err(serialization());
+        }
+        self.raw(itoa::Buffer::new().format(value));
+        Ok(())
+    }
+
+    /// Writes a JSON number as the JS number a response carries: an integer within JavaScript's
+    /// safe range, or a finite float.
+    fn number(&mut self, number: &Number) -> Result<()> {
+        if let Some(value) = number.as_i64() {
+            if value.unsigned_abs() > MAX_SAFE_INTEGER {
+                return Err(serialization());
+            }
+            self.raw(itoa::Buffer::new().format(value));
+        } else if let Some(value) = number.as_u64() {
+            self.unsigned(value)?;
+        } else {
+            let value = number
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or_else(serialization)?;
+            self.raw(zmij::Buffer::new().format_finite(value));
         }
         Ok(())
+    }
+
+    fn string(&mut self, value: &str) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        self.0.push('"');
+        let mut start = 0;
+        for (index, byte) in value.bytes().enumerate() {
+            let escaped = match byte {
+                b'"' => "\\\"",
+                b'\\' => "\\\\",
+                b'\n' => "\\n",
+                b'\r' => "\\r",
+                b'\t' => "\\t",
+                0..0x20 => "",
+                _ => continue,
+            };
+            self.0.push_str(&value[start..index]);
+            if escaped.is_empty() {
+                self.0.push_str("\\u00");
+                self.0.push(char::from(HEX[usize::from(byte >> 4)]));
+                self.0.push(char::from(HEX[usize::from(byte & 0xf)]));
+            } else {
+                self.0.push_str(escaped);
+            }
+            start = index + 1;
+        }
+        self.0.push_str(&value[start..]);
+        self.0.push('"');
     }
 
     fn value(&mut self, value: &Value, depth: usize) -> Result<()> {
-        self.node(depth)?;
-        self.raw(1)?;
+        if depth > MAX_DEPTH {
+            return Err(serialization());
+        }
         match value {
-            Value::Null | Value::Bool(_) => Ok(()),
-            Value::Number(number) => {
-                checked_number(number)?;
-                self.raw(8)
-            }
-            Value::String(value) => self.string(value),
+            Value::Null => self.raw("null"),
+            Value::Bool(true) => self.raw("true"),
+            Value::Bool(false) => self.raw("false"),
+            Value::Number(number) => self.number(number)?,
+            Value::String(text) => self.string(text),
             Value::Array(values) => {
-                self.array(values.len())?;
-                for value in values {
-                    self.operation()?;
+                self.raw("[");
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        self.raw(",");
+                    }
                     self.value(value, depth + 1)?;
                 }
-                Ok(())
+                self.raw("]");
             }
-            Value::Object(values) => {
-                self.retain(JS_OBJECT_OVERHEAD)?;
-                self.raw(4)?;
-                if values.len() > MAX_ITEMS {
-                    return Err(limit());
-                }
-                for (key, value) in values {
-                    self.operation()?;
-                    self.string(key)?;
-                    self.value(value, depth + 1)?;
-                }
-                Ok(())
-            }
+            Value::Object(values) => self.object(values, depth)?,
         }
-    }
-
-    fn apply_outcome(&mut self, outcome: &ApplyOutcome) -> Result<()> {
-        safe_number(outcome.revision)?;
-        self.result_object(&["revision", "tables", "keys"])?;
-        self.raw(8)?;
-        self.strings(&outcome.tables)?;
-        self.changed_keys(&outcome.keys)
-    }
-
-    fn execute_result(&mut self, result: &ExecuteResult) -> Result<()> {
-        safe_number(result.revision)?;
-        let row_count = u64::try_from(result.row_count).map_err(|_| serialization())?;
-        safe_number(row_count)?;
-        self.result_object(&[
-            "command", "revision", "rowCount", "fields", "rows", "tables", "keys",
-        ])?;
-        self.string(&result.command)?;
-        self.raw(16)?;
-        self.fields(&result.fields)?;
-        self.rows(&result.rows)?;
-        self.strings(&result.tables)?;
-        self.changed_keys(&result.keys)
-    }
-}
-
-fn checked_number(number: &Number) -> Result<()> {
-    if let Some(value) = number.as_i64() {
-        if value.unsigned_abs() <= MAX_SAFE_INTEGER {
-            return Ok(());
-        }
-    } else if let Some(value) = number.as_u64() {
-        if value <= MAX_SAFE_INTEGER {
-            return Ok(());
-        }
-    } else if number.as_f64().is_some_and(f64::is_finite) {
-        return Ok(());
-    }
-    Err(serialization())
-}
-
-fn safe_number(value: u64) -> Result<()> {
-    if value <= MAX_SAFE_INTEGER {
         Ok(())
-    } else {
-        Err(serialization())
+    }
+
+    fn object(&mut self, values: &Map<String, Value>, depth: usize) -> Result<()> {
+        self.raw("{");
+        for (index, (key, value)) in values.iter().enumerate() {
+            if index > 0 {
+                self.raw(",");
+            }
+            self.string(key);
+            self.raw(":");
+            self.value(value, depth + 1)?;
+        }
+        self.raw("}");
+        Ok(())
+    }
+
+    fn strings(&mut self, values: &[String]) {
+        self.raw("[");
+        for (index, value) in values.iter().enumerate() {
+            if index > 0 {
+                self.raw(",");
+            }
+            self.string(value);
+        }
+        self.raw("]");
+    }
+
+    /// Writes the per-table changed-key map. A table appears only when its complete key set is
+    /// known, so an absent table means "changed, but re-read it" rather than "unchanged".
+    fn changed_keys(&mut self, keys: &BTreeMap<String, Vec<Row>>) -> Result<()> {
+        self.raw("{");
+        for (index, (table, rows)) in keys.iter().enumerate() {
+            if index > 0 {
+                self.raw(",");
+            }
+            self.string(table);
+            self.raw(":[");
+            for (index, row) in rows.iter().enumerate() {
+                if index > 0 {
+                    self.raw(",");
+                }
+                self.object(row, 0)?;
+            }
+            self.raw("]");
+        }
+        self.raw("}");
+        Ok(())
+    }
+
+    fn error(&mut self, error: &EngineError) {
+        self.raw("{\"code\":");
+        self.string(&error.code);
+        self.raw(",\"message\":");
+        self.string(&error.message);
+        if let Some(retryable) = error.retryable {
+            self.raw(if retryable {
+                ",\"retryable\":true"
+            } else {
+                ",\"retryable\":false"
+            });
+        }
+        self.raw("}");
+    }
+
+    /// Writes each result's header as the payload, or with `list` an array of them, closes the
+    /// envelope, and then writes each result's fields and rows on a line of its own.
+    fn results(&mut self, results: &[ExecuteResult], array_rows: bool, list: bool) -> Result<()> {
+        if list {
+            self.raw("[");
+        }
+        for (index, result) in results.iter().enumerate() {
+            if index > 0 {
+                self.raw(",");
+            }
+            self.raw("{\"command\":");
+            self.string(&result.command);
+            self.raw(",\"revision\":");
+            self.unsigned(result.revision)?;
+            self.raw(",\"rowCount\":");
+            self.unsigned(u64::try_from(result.row_count).map_err(|_| serialization())?)?;
+            self.raw(",\"tables\":");
+            self.strings(&result.tables);
+            self.raw(",\"keys\":");
+            self.changed_keys(&result.keys)?;
+            self.raw("}");
+        }
+        self.raw(if list { "]]" } else { "]" });
+        for result in results {
+            self.raw("\n");
+            self.rows(result, array_rows)?;
+        }
+        Ok(())
+    }
+
+    /// Writes a result's fields, and its rows with their values in field order: as arrays, or as
+    /// objects whose keys follow the fields.
+    fn rows(&mut self, result: &ExecuteResult, array_rows: bool) -> Result<()> {
+        let fields = &result.fields;
+        // A row's values come in key order. Each field's position in that order is where its
+        // value sits, and the key there must be the field's name.
+        let positions: Vec<usize> = fields
+            .iter()
+            .map(|field| {
+                fields
+                    .iter()
+                    .filter(|other| other.name < field.name)
+                    .count()
+            })
+            .collect();
+        let mut names = vec![""; fields.len()];
+        for (field, position) in fields.iter().zip(&positions) {
+            names[*position] = &field.name;
+        }
+        let mut keys = Vec::new();
+        self.raw("{\"fields\":[");
+        for (index, field) in fields.iter().enumerate() {
+            if index > 0 {
+                self.raw(",");
+            }
+            self.raw("{\"name\":");
+            let start = self.0.len();
+            self.string(&field.name);
+            if !array_rows {
+                let mut key = self.0[start..].to_owned();
+                key.push(':');
+                keys.push(key);
+            }
+            self.raw(",\"dataTypeID\":");
+            self.unsigned(field.data_type_id.into())?;
+            self.raw("}");
+        }
+        self.raw("],\"rows\":[");
+        let mut values = Vec::with_capacity(fields.len());
+        for (index, row) in result.rows.iter().enumerate() {
+            if index > 0 {
+                self.raw(",");
+            }
+            values.clear();
+            for ((key, value), name) in row.iter().zip(&names) {
+                if key != name {
+                    return Err(serialization());
+                }
+                values.push(value);
+            }
+            if row.len() != fields.len() || values.len() != fields.len() {
+                return Err(serialization());
+            }
+            self.raw(if array_rows { "[" } else { "{" });
+            for (index, position) in positions.iter().enumerate() {
+                if index > 0 {
+                    self.raw(",");
+                }
+                if !array_rows {
+                    self.raw(&keys[index]);
+                }
+                self.value(values[*position], 1)?;
+            }
+            self.raw(if array_rows { "]" } else { "}" });
+            self.bounded()?;
+        }
+        self.raw("]}");
+        Ok(())
     }
 }
 
@@ -668,10 +465,41 @@ fn serialization() -> EngineError {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tinyjoin_core::ResultField;
+
+    fn result(fields: &[(&str, u32)], rows: Vec<Value>) -> ExecuteResult {
+        ExecuteResult {
+            command: "SELECT".into(),
+            revision: 7,
+            row_count: rows.len(),
+            fields: fields
+                .iter()
+                .map(|(name, data_type_id)| ResultField {
+                    name: (*name).into(),
+                    data_type_id: *data_type_id,
+                })
+                .collect(),
+            rows: rows
+                .into_iter()
+                .map(|row| row.as_object().unwrap().clone())
+                .collect(),
+            tables: vec!["items".into()],
+            keys: BTreeMap::from([(
+                "items".into(),
+                vec![json!({"id": 1}).as_object().unwrap().clone()],
+            )]),
+        }
+    }
+
+    fn written(results: &[ExecuteResult], array_rows: bool, list: bool) -> Result<String> {
+        let mut json = Json::success(true);
+        json.results(results, array_rows, list)?;
+        Ok(json.0)
+    }
 
     #[test]
     fn operation_numbers_are_dense_and_stable() {
-        assert_eq!(VERSION, 2);
+        assert_eq!(VERSION, 3);
         assert_eq!(
             [
                 OP_EXECUTE_SQL,
@@ -691,83 +519,115 @@ mod tests {
     }
 
     #[test]
-    fn output_measure_preserves_safe_numbers_depth_and_resource_bounds() {
-        let valid = ExecuteResult {
-            command: "SELECT".into(),
-            revision: MAX_SAFE_INTEGER,
-            row_count: 1,
-            fields: vec![ResultField {
-                name: "value".into(),
-                data_type_id: 25,
-            }],
-            rows: vec![Map::from_iter([("value".into(), json!([true, null, 1.5]))])],
-            tables: vec![],
-            keys: BTreeMap::new(),
-        };
-        let mut measure = Measure::default();
-        measure.execute_result(&valid).unwrap();
+    fn results_put_headers_in_the_envelope_and_rows_on_their_own_lines() {
+        let rows = result(
+            &[("title", 25), ("id", 20)],
+            vec![
+                json!({"id": 1, "title": "one"}),
+                json!({"id": 2, "title": null}),
+            ],
+        );
+        let header = r#"{"command":"SELECT","revision":7,"rowCount":2,"tables":["items"],"keys":{"items":[{"id":1}]}}"#;
+        let fields =
+            r#"{"fields":[{"name":"title","dataTypeID":25},{"name":"id","dataTypeID":20}]"#;
+        assert_eq!(
+            written(std::slice::from_ref(&rows), false, false).unwrap(),
+            format!(
+                "[3,0,1,{header}]\n{fields},\"rows\":[{{\"title\":\"one\",\"id\":1}},{{\"title\":null,\"id\":2}}]}}"
+            )
+        );
+        assert_eq!(
+            written(std::slice::from_ref(&rows), true, false).unwrap(),
+            format!("[3,0,1,{header}]\n{fields},\"rows\":[[\"one\",1],[null,2]]}}")
+        );
 
-        let invalid = ExecuteResult {
-            command: "SELECT".into(),
-            revision: MAX_SAFE_INTEGER + 1,
-            row_count: 0,
+        let empty = ExecuteResult {
+            command: "UPDATE".into(),
+            revision: 8,
+            row_count: 3,
             fields: vec![],
             rows: vec![],
             tables: vec![],
             keys: BTreeMap::new(),
         };
         assert_eq!(
-            Measure::default()
-                .execute_result(&invalid)
-                .unwrap_err()
-                .code,
-            "BRIDGE_SERIALIZATION_ERROR"
-        );
-
-        let oversized = ExecuteResult {
-            command: "SELECT".into(),
-            revision: 1,
-            row_count: 1,
-            fields: vec![],
-            rows: vec![Map::from_iter([(
-                "value".into(),
-                Value::String("x".repeat(MAX_BYTES)),
-            )])],
-            tables: vec![],
-            keys: BTreeMap::new(),
-        };
-        assert_eq!(
-            Measure::default()
-                .execute_result(&oversized)
-                .unwrap_err()
-                .code,
-            "RESOURCE_LIMIT"
+            written(&[empty.clone(), empty], false, true).unwrap(),
+            [
+                r#"[3,0,1,[{"command":"UPDATE","revision":8,"rowCount":3,"tables":[],"keys":{}},{"command":"UPDATE","revision":8,"rowCount":3,"tables":[],"keys":{}}]]"#,
+                r#"{"fields":[],"rows":[]}"#,
+                r#"{"fields":[],"rows":[]}"#,
+            ]
+            .join("\n")
         );
     }
 
     #[test]
-    fn output_measure_keeps_the_canonical_logical_byte_cap() {
-        let result = ExecuteResult {
-            command: "SELECT".into(),
-            revision: 7,
-            row_count: 1,
-            fields: vec![ResultField {
-                name: "payload".into(),
-                data_type_id: 25,
-            }],
-            rows: vec![Map::from_iter([(
-                "payload".into(),
-                json!({"nested": [true, null, 1.5, "value"]}),
-            )])],
-            tables: vec!["items".into()],
-            keys: BTreeMap::new(),
-        };
-        let mut measure = Measure::default();
-        measure.execute_result(&result).unwrap();
+    fn values_are_written_as_the_json_a_page_parses_back() {
+        let text = "quote \" backslash \\ line\nreturn\r tab\t bell\u{7} é 😀";
+        let value = json!([text, 1.5, -0.0, 1e21, -9_007_199_254_740_991_i64, {"nested": [true, false, null]}]);
+        let mut json = Json::default();
+        json.value(&value, 0).unwrap();
+        assert!(!json.0.contains('\n'));
+        assert_eq!(serde_json::from_str::<Value>(&json.0).unwrap(), value);
+        assert!(json.0.contains(r#"\u0007"#));
+        assert!(json.0.contains("-0.0"));
+    }
 
-        // Version/status/disposition plus the canonical lengths, scalar widths,
-        // collections, keys, and JSON tags for this result.
-        assert_eq!(measure.bytes, 121);
+    #[test]
+    fn unsafe_numbers_deep_values_and_mismatched_rows_are_refused() {
+        let mut json = Json::default();
+        assert_eq!(
+            json.unsigned(MAX_SAFE_INTEGER + 1).unwrap_err().code,
+            "BRIDGE_SERIALIZATION_ERROR"
+        );
+        let unsafe_integer = json!(-9_007_199_254_740_992_i64);
+        assert_eq!(
+            json.value(&unsafe_integer, 0).unwrap_err().code,
+            "BRIDGE_SERIALIZATION_ERROR"
+        );
+        let mut deep = json!(null);
+        for _ in 0..MAX_DEPTH {
+            deep = json!([deep]);
+        }
+        assert!(json.value(&deep, 0).is_ok());
+        assert_eq!(
+            json.value(&json!([deep]), 0).unwrap_err().code,
+            "BRIDGE_SERIALIZATION_ERROR"
+        );
+
+        for row in [
+            json!({"id": 1}),
+            json!({"id": 1, "title": "x", "extra": 2}),
+            json!({"id": 1, "name": "x"}),
+        ] {
+            let mismatched = result(&[("id", 20), ("title", 25)], vec![row]);
+            assert_eq!(
+                written(&[mismatched], false, false).unwrap_err().code,
+                "BRIDGE_SERIALIZATION_ERROR"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_results_and_errors_are_bounded() {
+        let oversized = result(
+            &[("value", 25)],
+            vec![json!({"value": "x".repeat(MAX_BYTES)})],
+        );
+        assert_eq!(
+            written(&[oversized], false, false).unwrap_err().code,
+            "RESOURCE_LIMIT"
+        );
+
+        let error = EngineError::new("CONSTRAINT", "a \"quoted\" failure").with_retryable(true);
+        assert_eq!(
+            error_text(&error),
+            r#"[3,1,0,{"code":"CONSTRAINT","message":"a \"quoted\" failure","retryable":true}]"#
+        );
+        assert_eq!(
+            error_text(&EngineError::new("HUGE", "x".repeat(MAX_BYTES))),
+            r#"[3,1,0,{"code":"BRIDGE_SERIALIZATION_ERROR","message":"TinyJoin could not encode a structured bridge error","retryable":false}]"#
+        );
     }
 
     #[test]
@@ -779,6 +639,10 @@ mod tests {
         .unwrap();
         assert_eq!(request.statement_id, 7);
         assert_eq!(request.params, [json!(1), json!("two")]);
+        assert!(!request.array_rows);
+        let request: ExecSqlRequest =
+            serde_json::from_value(json!({"sql": "SELECT 1", "arrayRows": true})).unwrap();
+        assert!(request.array_rows);
         assert!(
             serde_json::from_value::<ExecutePreparedRequest>(json!({
                 "statementId": 7,

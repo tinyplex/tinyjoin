@@ -1,4 +1,5 @@
 import {
+  arrayIsArray,
   finishChangedKeys,
   isFunction,
   isRecord,
@@ -12,9 +13,11 @@ import {
 } from '../common.js';
 import {createDefaultWorker, createUrlWorker} from '../default-worker.js';
 import {
+  parseSqlData,
   type ApplyOutcome,
   type JsonValue,
   type QueryOptions,
+  type ResultField,
   type Results,
   type Row,
   type SqlResult,
@@ -248,9 +251,13 @@ const createClient = (options: ClientOptions): Client => {
     options?: QueryOptions,
   ): Promise<Results<RowType>> => {
     await beginDirect();
-    const result = await rpc.request('executePrepared', {statementId, params});
+    const result = await rpc.request('executePrepared', {
+      statementId,
+      params,
+      ...rowModeParam(options),
+    });
     noteRevision(result.revision);
-    return toResults<RowType>(result, options);
+    return toResults<RowType>(result);
   };
 
   const trackPreparedClose = (close: Promise<void>): void => {
@@ -389,9 +396,13 @@ const createClient = (options: ClientOptions): Client => {
     ): Promise<Results<RowType>> => {
       await beginDirect();
       assertQueryOptions(options);
-      const result = await rpc.request('executeSql', {sql, params});
+      const result = await rpc.request('executeSql', {
+        sql,
+        params,
+        ...rowModeParam(options),
+      });
       noteRevision(result.revision);
-      return toResults<RowType>(result, options);
+      return toResults<RowType>(result);
     },
 
     sql: <RowType = Row>(
@@ -433,11 +444,14 @@ const createClient = (options: ClientOptions): Client => {
     exec: async (sql: string, options?: QueryOptions): Promise<Results[]> => {
       await beginDirect();
       assertQueryOptions(options);
-      const results = await rpc.request('execSql', {sql});
+      const results = await rpc.request('execSql', {
+        sql,
+        ...rowModeParam(options),
+      });
       for (const result of results) {
         noteRevision(result.revision);
       }
-      return results.map((result) => toResults(result, options));
+      return results.map((result) => toResults(result));
     },
 
     /**
@@ -591,10 +605,15 @@ const createTransactionSession = (
       assertQueryOptions(options);
       return track(
         rpc
-          .request('executeSql', {sql, params, transactionId})
+          .request('executeSql', {
+            sql,
+            params,
+            transactionId,
+            ...rowModeParam(options),
+          })
           .then((result) => {
             noteRevision(result.revision);
-            return toResults<RowType>(result, options);
+            return toResults<RowType>(result);
           }),
       );
     },
@@ -609,12 +628,14 @@ const createTransactionSession = (
       assertOpen();
       assertQueryOptions(options);
       return track(
-        rpc.request('execSql', {sql, transactionId}).then((results) => {
-          for (const result of results) {
-            noteRevision(result.revision);
-          }
-          return results.map((result) => toResults(result, options));
-        }),
+        rpc
+          .request('execSql', {sql, transactionId, ...rowModeParam(options)})
+          .then((results) => {
+            for (const result of results) {
+              noteRevision(result.revision);
+            }
+            return results.map((result) => toResults(result));
+          }),
       );
     },
 
@@ -642,10 +663,11 @@ const createTransactionSession = (
               statementId: state.statementId,
               params,
               transactionId,
+              ...rowModeParam(options),
             })
             .then((result) => {
               noteRevision(result.revision);
-              return toResults<RowType>(result, options);
+              return toResults<RowType>(result);
             }),
         ),
       );
@@ -842,37 +864,38 @@ const parameterize = (
   return sql;
 };
 
-const toResults = <RowType>(
-  result: SqlResult,
-  options?: QueryOptions,
-): Results<RowType> => ({
-  rows: (options?.rowMode === 'array'
-    ? rowsAsArrays(result.rows, result.fields)
-    : result.rows) as RowType[],
-  fields: result.fields,
-  affectedRows: AFFECTED_ROW_COMMANDS.test(result.command)
-    ? result.rowCount
-    : 0,
-  command: result.command,
-  ...(ROW_COUNT_COMMANDS.test(result.command)
-    ? {rowCount: result.rowCount}
-    : {}),
-  revision: result.revision,
-  tables: result.tables,
-  keys: result.keys,
-});
+// A query asks the Worker for array rows, which it then writes itself.
+const rowModeParam = (
+  options: QueryOptions | undefined,
+): {rowMode?: 'array'} => (options?.rowMode === 'array' ? {rowMode: 'array'} : {});
 
-const rowsAsArrays = (
-  rows: Row[],
-  fields: SqlResult['fields'],
-): JsonValue[][] => {
-  if (rows.length > 0 && fields.length === 0) {
+// A result's rows arrive as JSON text, parsed here only once they are used.
+const toResults = <RowType>(result: SqlResult): Results<RowType> => {
+  const data = parseSqlData(result.data);
+  if (
+    !isRecord(data) ||
+    !arrayIsArray(data.fields) ||
+    !arrayIsArray(data.rows)
+  ) {
     throw clientError(
-      'ROW_METADATA_UNAVAILABLE',
-      'TinyJoin cannot return array rows without field metadata',
+      'PROTOCOL_MISMATCH',
+      'The TinyJoin worker returned an invalid result for the requested operation',
     );
   }
-  return rows.map((row) => fields.map((field) => row[field.name] ?? null));
+  return {
+    rows: data.rows as RowType[],
+    fields: data.fields as ResultField[],
+    affectedRows: AFFECTED_ROW_COMMANDS.test(result.command)
+      ? result.rowCount
+      : 0,
+    command: result.command,
+    ...(ROW_COUNT_COMMANDS.test(result.command)
+      ? {rowCount: result.rowCount}
+      : {}),
+    revision: result.revision,
+    tables: result.tables,
+    keys: result.keys,
+  };
 };
 
 const assertQueryOptions = (options: QueryOptions | undefined): void => {

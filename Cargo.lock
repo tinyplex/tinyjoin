@@ -180,12 +180,14 @@ dependencies = [
 name = "tinyjoin-wasm"
 version = "0.1.0"
 dependencies = [
+ "itoa",
  "js-sys",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
  "tinyjoin-core",
  "wasm-bindgen",
+ "zmij",
 ]
 
 [[package]]
