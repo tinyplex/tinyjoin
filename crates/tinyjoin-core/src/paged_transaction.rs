@@ -1,5 +1,6 @@
 use std::{
     cell::Cell,
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
 };
 
@@ -521,14 +522,15 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
             self.charge_work(1)?;
             if let Some(staged) = &mut staged {
                 let key = row.encoded_key()?;
-                while staged
-                    .next_if(|(staged, _)| staged.as_slice() < key.as_ref())
-                    .is_some()
-                {}
-                if staged.peek().is_some_and(|(staged, entry)| {
-                    staged.as_slice() == key.as_ref() && entry.changed
-                }) {
-                    return Ok(VisitControl::Continue);
+                // One comparison per row: most committed rows lie before the next staged key.
+                while let Some((staged_key, entry)) = staged.peek() {
+                    match staged_key.as_slice().cmp(key.as_ref()) {
+                        Ordering::Less => {
+                            staged.next();
+                        }
+                        Ordering::Equal if entry.changed => return Ok(VisitControl::Continue),
+                        _ => break,
+                    }
                 }
             }
             visitor(row)
