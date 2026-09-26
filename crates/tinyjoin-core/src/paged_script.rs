@@ -7,6 +7,7 @@ use std::{
 use crate::{
     Btree, EngineError, ExecuteResult, PageDevice, PageId, Pager, PagerWriteTransaction,
     QueryResult, Result, Row, RowChange, StorageReader, TreeId, VisitControl, VisitOutcome,
+    btree::BatchChange,
     hash::{EMPTY_HASH, combine, identify},
     paged_codec::{
         CATALOG_TREE_ID, CatalogHeader, CatalogIndexRecord, CatalogTableRecord,
@@ -552,54 +553,52 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 .get_mut(table_name)
                 .expect("every changed table was resolved above");
             let mut transaction = self.transaction.borrow_mut();
-            for (key, change) in table_changes {
-                match &change.next {
-                    Some(row) => {
-                        let root = match table.root_page_id {
-                            Some(root) => root,
-                            None => Btree::create(&mut transaction, table.tree_id)?,
-                        };
-                        let upserted = Btree::upsert(
-                            &mut transaction,
-                            root,
-                            table.tree_id,
-                            key,
-                            &encode_row(&table.schema, row)?,
-                        )?;
-                        table.root_page_id = Some(upserted.root_page_id);
-                        table.hash = upserted.hash;
-                    }
-                    None => {
-                        if let Some(root) = table.root_page_id {
-                            let deleted =
-                                Btree::delete(&mut transaction, root, table.tree_id, key)?;
-                            table.root_page_id = deleted.root_page_id;
-                            if let Some(hash) = deleted.hash {
-                                table.hash = hash;
-                            }
-                        }
-                    }
-                }
+            // The changes are keyed by encoded primary key, so they are already in tree order.
+            let values = table_changes
+                .values()
+                .map(|change| {
+                    change
+                        .next
+                        .as_ref()
+                        .map(|row| encode_row(&table.schema, row))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let batch = table_changes
+                .keys()
+                .zip(&values)
+                .map(|(key, value)| BatchChange {
+                    key,
+                    value: value.as_deref(),
+                })
+                .collect::<Vec<_>>();
+            let inserted = table_changes
+                .values()
+                .filter(|change| change.old.is_none() && change.next.is_some())
+                .count();
+            let removed = table_changes
+                .values()
+                .filter(|change| change.old.is_some() && change.next.is_none())
+                .count();
+            let applied =
+                Btree::apply(&mut transaction, table.root_page_id, table.tree_id, &batch)?;
+            if (applied.inserted, applied.removed) != (inserted, removed) {
+                return Err(storage_corrupt(format!(
+                    "Table `{table_name}` does not hold the rows its changes replace"
+                )));
             }
-            table.row_count = adjusted_count(
-                table.row_count,
-                table_changes
-                    .values()
-                    .filter(|change| change.old.is_none() && change.next.is_some())
-                    .count(),
-                table_changes
-                    .values()
-                    .filter(|change| change.old.is_some() && change.next.is_none())
-                    .count(),
-                "table row",
-            )?;
+            table.root_page_id = applied.root_page_id;
+            if let Some(hash) = applied.hash {
+                table.hash = hash;
+            }
+            table.row_count = adjusted_count(table.row_count, inserted, removed, "table row")?;
 
             for index in Rc::make_mut(&mut self.indexes)
                 .values_mut()
                 .filter(|index| index.definition.table == *table_name)
             {
-                let mut inserted = 0usize;
-                let mut deleted = 0usize;
+                // Entries end with their row's primary key, so no two changes share one.
+                let mut entries = Vec::new();
                 for change in table_changes.values() {
                     let old_key = change
                         .old
@@ -620,33 +619,39 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                     if old_key == next_key {
                         continue;
                     }
-                    if let Some(key) = old_key
-                        && let Some(root) = index.root_page_id
-                    {
-                        let removal = Btree::delete(&mut transaction, root, index.tree_id, &key)?;
-                        if !removal.removed {
-                            return Err(storage_corrupt(format!(
-                                "Index `{}` is missing an entry for a candidate row",
-                                index.definition.name
-                            )));
-                        }
-                        index.root_page_id = removal.root_page_id;
-                        deleted += 1;
-                    }
-                    if let Some(key) = next_key {
-                        let root = match index.root_page_id {
-                            Some(root) => root,
-                            None => Btree::create(&mut transaction, index.tree_id)?,
-                        };
-                        index.root_page_id = Some(
-                            Btree::upsert(&mut transaction, root, index.tree_id, &key, &[])?
-                                .root_page_id,
-                        );
-                        inserted += 1;
-                    }
+                    entries.extend(old_key.map(|key| (key, false)));
+                    entries.extend(next_key.map(|key| (key, true)));
                 }
+                if entries.is_empty() {
+                    continue;
+                }
+                entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+                let batch = entries
+                    .iter()
+                    .map(|(key, insert)| BatchChange {
+                        key,
+                        value: insert.then_some(&[][..]),
+                    })
+                    .collect::<Vec<_>>();
+                let inserted = entries.iter().filter(|(_, insert)| *insert).count();
+                let removed = entries.len() - inserted;
+                let applied =
+                    Btree::apply(&mut transaction, index.root_page_id, index.tree_id, &batch)?;
+                if applied.removed != removed {
+                    return Err(storage_corrupt(format!(
+                        "Index `{}` is missing an entry for a candidate row",
+                        index.definition.name
+                    )));
+                }
+                if applied.inserted != inserted {
+                    return Err(storage_corrupt(format!(
+                        "Index `{}` already holds an entry for a candidate row",
+                        index.definition.name
+                    )));
+                }
+                index.root_page_id = applied.root_page_id;
                 index.entry_count =
-                    adjusted_count(index.entry_count, inserted, deleted, "index entry")?;
+                    adjusted_count(index.entry_count, inserted, removed, "index entry")?;
             }
         }
         Ok(())

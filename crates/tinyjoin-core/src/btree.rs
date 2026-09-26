@@ -81,6 +81,27 @@ pub(crate) struct BtreeDelete {
     pub(crate) removed: bool,
 }
 
+/// One change in a [`Btree::apply`] batch: `value` upserts `key`, and `None` deletes it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BatchChange<'a> {
+    pub(crate) key: &'a [u8],
+    pub(crate) value: Option<&'a [u8]>,
+}
+
+/// The outcome of one [`Btree::apply`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BtreeBatch {
+    /// The candidate root, or `None` once the tree holds no entry.
+    pub(crate) root_page_id: Option<PageId>,
+    /// The fingerprint of every entry in the tree, or `None` when the batch changed nothing. A
+    /// caller which records tree fingerprints must leave the one it already holds in place then.
+    pub(crate) hash: Option<u64>,
+    /// How many upserts added a key the tree did not hold.
+    pub(crate) inserted: usize,
+    /// How many deletes removed a key the tree held.
+    pub(crate) removed: usize,
+}
+
 impl Btree {
     /// Creates an empty leaf and returns its candidate root page ID.
     ///
@@ -230,6 +251,98 @@ impl Btree {
                 root_page_id: deleted.page_id,
                 hash: deleted.hash,
                 removed: deleted.removed,
+            })
+        })();
+        if result.is_err() {
+            transaction.mark_failed();
+        }
+        result
+    }
+
+    /// Applies a batch of changes, sorted by strictly increasing key, in one pass over the tree.
+    ///
+    /// Each page the batch reaches is read and written once, however many of its changes land on
+    /// it, and a page that overflows is divided into as many pages as it needs at once. A page that
+    /// takes only appends past its last key is filled before the next is started, so tables
+    /// loaded in key order keep full pages; otherwise its entries are spread evenly. As in
+    /// [`Self::delete`], emptied pages are pruned and pages are not rebalanced. A missing root
+    /// starts an empty tree. On error, the pager transaction is marked failed and must be aborted.
+    pub(crate) fn apply<D: PageDevice>(
+        transaction: &mut PagerWriteTransaction<'_, D>,
+        root_page_id: Option<PageId>,
+        tree_id: TreeId,
+        changes: &[BatchChange<'_>],
+    ) -> Result<BtreeBatch> {
+        validate_tree_id(tree_id)?;
+        if changes.is_empty() {
+            return Ok(BtreeBatch {
+                root_page_id,
+                hash: None,
+                inserted: 0,
+                removed: 0,
+            });
+        }
+        for (index, change) in changes.iter().enumerate() {
+            validate_key(change.key)?;
+            if let Some(value) = change.value {
+                validate_value(value)?;
+            }
+            if index > 0 && changes[index - 1].key >= change.key {
+                return Err(EngineError::new(
+                    "INVALID_PAGED_ARGUMENT",
+                    "A B-tree batch must be sorted by strictly increasing key",
+                ));
+            }
+        }
+        let result = (|| {
+            let mut batch = BatchWriter {
+                transaction: &mut *transaction,
+                tree_id,
+                generation: 0,
+                visited: HashSet::new(),
+                inserted: 0,
+                removed: 0,
+            };
+            batch.generation = batch.transaction.generation()?;
+            let (pieces, level) = match root_page_id {
+                Some(root) => match batch.apply(root, changes, 0, None, None)? {
+                    None => {
+                        return Ok(BtreeBatch {
+                            root_page_id,
+                            hash: None,
+                            inserted: 0,
+                            removed: 0,
+                        });
+                    }
+                    Some(applied) => applied,
+                },
+                None => {
+                    let mut entries = Vec::new();
+                    for change in changes {
+                        if let Some(value) = change.value {
+                            entries.push(batch.leaf_entry(change.key, value)?);
+                        }
+                    }
+                    batch.inserted = entries.len();
+                    if entries.is_empty() {
+                        return Ok(BtreeBatch {
+                            root_page_id: None,
+                            hash: None,
+                            inserted: 0,
+                            removed: 0,
+                        });
+                    }
+                    (batch.write_leaves(None, entries, true)?, 0)
+                }
+            };
+            let (root_page_id, hash) = batch.root(pieces, level)?;
+            let (inserted, removed) = (batch.inserted, batch.removed);
+            transaction.mark_btree_mutated(tree_id)?;
+            Ok(BtreeBatch {
+                root_page_id,
+                hash: Some(hash),
+                inserted,
+                removed,
             })
         })();
         if result.is_err() {
@@ -1598,6 +1711,408 @@ struct InsertedPage {
     split: Option<PageSplit>,
 }
 
+/// One page a batch wrote in place of a node it changed.
+struct Piece {
+    /// The first key beneath the page, when its parent must record a new one: for every page a
+    /// division created, and for a page whose first key changed. `None` leaves the parent's
+    /// separator, or the absence of one, as it was.
+    first_key: Option<Vec<u8>>,
+    page_id: PageId,
+    hash: u64,
+}
+
+/// A child of an internal node, as a batch rebuilds the node: its separator, `None` for the
+/// leftmost, its page, and its fingerprint.
+struct Child {
+    separator: Option<Vec<u8>>,
+    page_id: PageId,
+    hash: u64,
+}
+
+/// The state of one [`Btree::apply`].
+struct BatchWriter<'t, 'p, D: PageDevice> {
+    transaction: &'t mut PagerWriteTransaction<'p, D>,
+    tree_id: TreeId,
+    generation: u64,
+    visited: HashSet<PageId>,
+    inserted: usize,
+    removed: usize,
+}
+
+impl<D: PageDevice> BatchWriter<'_, '_, D> {
+    /// Applies the changes that fall beneath one node. Returns `None` when they leave it as it
+    /// was, and otherwise the pages that replace it, which are none once it is empty.
+    fn apply(
+        &mut self,
+        page_id: PageId,
+        changes: &[BatchChange<'_>],
+        depth: usize,
+        expected_level: Option<u8>,
+        parent_generation: Option<u64>,
+    ) -> Result<Option<(Vec<Piece>, u8)>> {
+        let tree_id = self.tree_id;
+        if depth >= MAX_TREE_DEPTH {
+            return Err(invalid_btree(storage_diagnostic!(
+                "Tree {tree_id} exceeds the maximum depth of {MAX_TREE_DEPTH}"
+            )));
+        }
+        if !self.visited.insert(page_id) {
+            return Err(invalid_btree(storage_diagnostic!(
+                "Tree {tree_id} contains a cycle through page {page_id}"
+            )));
+        }
+        let owned = self.transaction.owns_page(page_id);
+        let node = Node::decode(
+            self.transaction.read_page(page_id)?,
+            tree_id,
+            self.generation,
+            owned,
+        )?;
+        validate_expected_level(page_id, node.level, expected_level)?;
+        validate_child_generation(page_id, node.generation, parent_generation)?;
+        let (level, node_generation) = (node.level, node.generation);
+        let pieces = match node.kind {
+            NodeKind::Leaf(entries) => {
+                self.apply_leaf(page_id, owned, node_generation, entries, changes)?
+            }
+            NodeKind::Internal(internal) => self.apply_internal(
+                page_id,
+                owned,
+                level,
+                node_generation,
+                internal,
+                changes,
+                depth,
+            )?,
+        };
+        Ok(pieces.map(|pieces| (pieces, level)))
+    }
+
+    fn apply_leaf(
+        &mut self,
+        page_id: PageId,
+        owned: bool,
+        leaf_generation: u64,
+        entries: Vec<LeafEntry>,
+        changes: &[BatchChange<'_>],
+    ) -> Result<Option<Vec<Piece>>> {
+        let first_key = entries.first().map(|entry| entry.key.clone());
+        let appends = entries
+            .last()
+            .is_none_or(|last| changes[0].key > last.key.as_slice())
+            && changes.iter().all(|change| change.value.is_some());
+        let mut merged = Vec::with_capacity(entries.len() + changes.len());
+        let mut changed = false;
+        let mut entries = entries.into_iter().peekable();
+        for change in changes {
+            while let Some(entry) = entries.next_if(|entry| entry.key.as_slice() < change.key) {
+                merged.push(entry);
+            }
+            if let Some(entry) = entries.next_if(|entry| entry.key.as_slice() == change.key) {
+                release_leaf_value(
+                    self.transaction,
+                    self.tree_id,
+                    self.generation,
+                    leaf_generation,
+                    &entry.value,
+                )?;
+                changed = true;
+                match change.value {
+                    Some(value) => merged.push(self.leaf_entry(change.key, value)?),
+                    None => self.removed += 1,
+                }
+            } else if let Some(value) = change.value {
+                changed = true;
+                self.inserted += 1;
+                merged.push(self.leaf_entry(change.key, value)?);
+            }
+        }
+        merged.extend(entries);
+        if !changed {
+            return Ok(None);
+        }
+        if merged.is_empty() {
+            release_node_page(self.transaction, page_id, owned)?;
+            return Ok(Some(Vec::new()));
+        }
+        let first_changed = first_key.as_deref() != Some(merged[0].key.as_slice());
+        let mut pieces = self.write_leaves(Some((page_id, owned)), merged, appends)?;
+        if !first_changed {
+            pieces[0].first_key = None;
+        }
+        Ok(Some(pieces))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_internal(
+        &mut self,
+        page_id: PageId,
+        owned: bool,
+        level: u8,
+        node_generation: u64,
+        internal: InternalNode,
+        changes: &[BatchChange<'_>],
+        depth: usize,
+    ) -> Result<Option<Vec<Piece>>> {
+        let mut original = Vec::with_capacity(internal.entries.len() + 1);
+        original.push(Child {
+            separator: None,
+            page_id: internal.leftmost_child,
+            hash: internal.leftmost_child_hash,
+        });
+        original.extend(internal.entries.into_iter().map(|entry| Child {
+            separator: Some(entry.key),
+            page_id: entry.right_child,
+            hash: entry.child_hash,
+        }));
+        // A child takes the changes below the next child's separator.
+        let mut ends = Vec::with_capacity(original.len());
+        let mut start = 0;
+        for next in original.iter().skip(1) {
+            let separator = next.separator.as_deref().unwrap_or_default();
+            start += changes[start..].partition_point(|change| change.key < separator);
+            ends.push(start);
+        }
+        ends.push(changes.len());
+
+        let mut children = Vec::with_capacity(original.len() + 1);
+        let mut changed = false;
+        let mut start = 0;
+        for (child, end) in original.into_iter().zip(ends) {
+            let taken = &changes[start..end];
+            start = end;
+            if taken.is_empty() {
+                children.push(child);
+                continue;
+            }
+            let Some((pieces, _)) = self.apply(
+                child.page_id,
+                taken,
+                depth + 1,
+                Some(level - 1),
+                Some(node_generation),
+            )?
+            else {
+                children.push(child);
+                continue;
+            };
+            changed = true;
+            for (index, piece) in pieces.into_iter().enumerate() {
+                let separator = match piece.first_key {
+                    Some(key) => Some(key),
+                    None if index == 0 => child.separator.clone(),
+                    None => return Err(invalid_btree("A divided B-tree page has no first key")),
+                };
+                children.push(Child {
+                    separator,
+                    page_id: piece.page_id,
+                    hash: piece.hash,
+                });
+            }
+        }
+        if !changed {
+            return Ok(None);
+        }
+        if children.is_empty() {
+            release_node_page(self.transaction, page_id, owned)?;
+            return Ok(Some(Vec::new()));
+        }
+        // The first child is the leftmost. A separator it carries, from a removed child before it
+        // or a first key that changed, is the node's new first key.
+        let first_key = children[0].separator.take();
+        let mut pieces = self.write_internals(Some((page_id, owned)), level, children)?;
+        pieces[0].first_key = first_key;
+        Ok(Some(pieces))
+    }
+
+    /// A leaf entry for an upserted value, stored in overflow pages when it is large.
+    fn leaf_entry(&mut self, key: &[u8], value: &[u8]) -> Result<LeafEntry> {
+        Ok(LeafEntry {
+            key: key.to_vec(),
+            value: store_leaf_value(self.transaction, self.tree_id, self.generation, key, value)?,
+        })
+    }
+
+    /// Writes leaf entries into as many pages as they need, the first in place of `replacing`.
+    /// Every piece reports its first key.
+    fn write_leaves(
+        &mut self,
+        replacing: Option<(PageId, bool)>,
+        entries: Vec<LeafEntry>,
+        fill: bool,
+    ) -> Result<Vec<Piece>> {
+        let sizes = entries
+            .iter()
+            .map(|entry| {
+                SLOT_SIZE + LEAF_CELL_HEADER_SIZE + entry.key.len() + entry.value.encoded_len()
+            })
+            .collect::<Vec<_>>();
+        let mut entries = entries.into_iter();
+        let mut pieces = Vec::new();
+        for (index, count) in divide(&sizes, fill)?.into_iter().enumerate() {
+            let entries = entries.by_ref().take(count).collect::<Vec<_>>();
+            let first_key = entries[0].key.clone();
+            let page_id = self.page_for(index, replacing)?;
+            let hash = write_node(
+                self.transaction,
+                page_id,
+                &Node::leaf(self.tree_id, self.generation, entries),
+            )?;
+            pieces.push(Piece {
+                first_key: Some(first_key),
+                page_id,
+                hash,
+            });
+        }
+        self.release_replaced(replacing)?;
+        Ok(pieces)
+    }
+
+    /// Writes the children of an internal node at `level` into as many pages as they need, the
+    /// first in place of `replacing`. The first child of every page after the first becomes its
+    /// leftmost, and that page reports the child's separator as its first key.
+    fn write_internals(
+        &mut self,
+        replacing: Option<(PageId, bool)>,
+        level: u8,
+        children: Vec<Child>,
+    ) -> Result<Vec<Piece>> {
+        let sizes = children
+            .iter()
+            .map(|child| {
+                child
+                    .separator
+                    .as_ref()
+                    .map_or(0, |key| SLOT_SIZE + INTERNAL_CELL_HEADER_SIZE + key.len())
+            })
+            .collect::<Vec<_>>();
+        let mut children = children.into_iter();
+        let mut pieces = Vec::new();
+        for (index, count) in divide(&sizes, false)?.into_iter().enumerate() {
+            let leftmost = children
+                .next()
+                .expect("every division holds at least one child");
+            let entries = children
+                .by_ref()
+                .take(count - 1)
+                .map(|child| {
+                    Ok(InternalEntry {
+                        key: child
+                            .separator
+                            .ok_or_else(|| invalid_btree("A B-tree child has no separator"))?,
+                        right_child: child.page_id,
+                        child_hash: child.hash,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let page_id = self.page_for(index, replacing)?;
+            let hash = write_node(
+                self.transaction,
+                page_id,
+                &Node::internal(
+                    self.tree_id,
+                    self.generation,
+                    level,
+                    leftmost.page_id,
+                    leftmost.hash,
+                    entries,
+                ),
+            )?;
+            pieces.push(Piece {
+                first_key: leftmost.separator,
+                page_id,
+                hash,
+            });
+        }
+        self.release_replaced(replacing)?;
+        Ok(pieces)
+    }
+
+    /// The page for the `index`th piece of a node: the node's own page for the first when the
+    /// transaction owns it, and otherwise a new one.
+    fn page_for(&mut self, index: usize, replacing: Option<(PageId, bool)>) -> Result<PageId> {
+        match replacing {
+            Some((page_id, true)) if index == 0 => Ok(page_id),
+            _ => self.transaction.allocate_page(),
+        }
+    }
+
+    /// Frees a committed page its new pieces replaced.
+    fn release_replaced(&mut self, replacing: Option<(PageId, bool)>) -> Result<()> {
+        match replacing {
+            Some((page_id, false)) => self.transaction.free_shared_page(page_id),
+            _ => Ok(()),
+        }
+    }
+
+    /// Builds new levels above the pieces a batch left at `level` until one root holds them.
+    fn root(&mut self, mut pieces: Vec<Piece>, mut level: u8) -> Result<(Option<PageId>, u64)> {
+        loop {
+            if pieces.len() <= 1 {
+                return Ok(pieces.first().map_or((None, EMPTY_HASH), |piece| {
+                    (Some(piece.page_id), piece.hash)
+                }));
+            }
+            level = level
+                .checked_add(1)
+                .filter(|level| (*level as usize) < MAX_TREE_DEPTH)
+                .ok_or_else(|| {
+                    limit_error(format!(
+                        "The B-tree exceeds the maximum depth of {MAX_TREE_DEPTH}"
+                    ))
+                })?;
+            let children = pieces
+                .into_iter()
+                .enumerate()
+                .map(|(index, piece)| Child {
+                    separator: if index == 0 { None } else { piece.first_key },
+                    page_id: piece.page_id,
+                    hash: piece.hash,
+                })
+                .collect();
+            pieces = self.write_internals(None, level, children)?;
+        }
+    }
+}
+
+/// Divides cells, given their sizes including slots, into pages, returning how many cells each
+/// page takes. Cells that fit one page stay together. Otherwise `fill` packs each page before
+/// starting the next, and without it cells are spread evenly over the fewest pages that hold them.
+fn divide(sizes: &[usize], fill: bool) -> Result<Vec<usize>> {
+    const CAPACITY: usize = MAX_PAGE_PAYLOAD_SIZE - NODE_HEADER_SIZE;
+    if sizes.iter().any(|size| *size > CAPACITY) {
+        return Err(limit_error("A single B-tree cell cannot fit in a page"));
+    }
+    let total = sizes.iter().sum::<usize>();
+    if total <= CAPACITY {
+        return Ok(vec![sizes.len()]);
+    }
+    let mut pages = total.div_ceil(CAPACITY);
+    loop {
+        let target = if fill {
+            CAPACITY
+        } else {
+            total.div_ceil(pages)
+        };
+        let mut counts = Vec::with_capacity(pages);
+        let (mut count, mut size) = (0, 0);
+        for cell in sizes {
+            if count > 0 && size + cell > target {
+                counts.push(count);
+                (count, size) = (0, 0);
+            }
+            count += 1;
+            size += cell;
+        }
+        counts.push(count);
+        // Every page but the last stays at or under the target; the last takes the rest.
+        if size <= CAPACITY {
+            return Ok(counts);
+        }
+        pages += 1;
+    }
+}
+
 struct PageSplit {
     separator: Vec<u8>,
     right_page_id: PageId,
@@ -2670,7 +3185,7 @@ fn unsupported_overflow(message: impl Into<String>) -> EngineError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     use super::*;
     use crate::{AllocationBitmap, MemoryPageDevice, PageDevice};
@@ -2887,6 +3402,160 @@ mod tests {
             pages.insert(id, bytes);
         }
         Pager::open_or_create(SparseDevice { pages }).unwrap()
+    }
+
+    /// Every entry of a committed tree, in key order.
+    fn all_entries(
+        pager: &mut Pager<MemoryPageDevice>,
+        root: Option<PageId>,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let Some(root) = root else {
+            return Vec::new();
+        };
+        let mut cursor = Btree::validating_cursor(pager, root, TREE).unwrap();
+        let mut entries = Vec::new();
+        while let Some(entry) = cursor.next(pager).unwrap() {
+            entries.push(entry);
+        }
+        entries
+    }
+
+    #[test]
+    fn batches_agree_with_single_changes_and_leak_no_pages() {
+        struct Random(u64);
+        impl Random {
+            fn below(&mut self, bound: usize) -> usize {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                (self.0 % bound as u64) as usize
+            }
+        }
+        let mut random = Random(0x0ba7c4);
+        for case in 0..60 {
+            // Key sizes decide how many entries share a page, and some values overflow.
+            let key_bytes = [4, 24, 300, 900][case % 4];
+            let key = |number: usize| {
+                let mut key = vec![b'k'; key_bytes];
+                key[..4].copy_from_slice(&(number as u32).to_be_bytes());
+                key
+            };
+            let value = |random: &mut Random| match random.below(10) {
+                0 => vec![b'o'; 3_000 + random.below(9_000)],
+                1 => Vec::new(),
+                _ => vec![random.below(256) as u8; random.below(200)],
+            };
+            let mut batched = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+            let mut single = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+            let (mut batched_root, mut single_root) = (None, None);
+            let (mut batched_hash, mut single_hash) = (EMPTY_HASH, EMPTY_HASH);
+            let mut model = BTreeMap::new();
+            for round in 0..4 {
+                let count = [1, 7, 60, 400][random.below(4)];
+                let mut numbers = (0..count)
+                    .map(|_| random.below(if round == 0 { 400 } else { 600 }))
+                    .collect::<Vec<_>>();
+                numbers.sort_unstable();
+                numbers.dedup();
+                let changes = numbers
+                    .iter()
+                    .map(|number| {
+                        (
+                            key(*number),
+                            (random.below(4) != 0).then(|| value(&mut random)),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let batch = changes
+                    .iter()
+                    .map(|(key, value)| BatchChange {
+                        key,
+                        value: value.as_deref(),
+                    })
+                    .collect::<Vec<_>>();
+
+                let revision = round as u64 + 2;
+                let mut transaction = batched.begin_write().unwrap();
+                let applied = Btree::apply(&mut transaction, batched_root, TREE, &batch).unwrap();
+                batched_root = applied.root_page_id;
+                batched_hash = applied.hash.unwrap_or(batched_hash);
+                transaction
+                    .commit(revision, EMPTY_HASH, batched_root)
+                    .unwrap();
+
+                let mut transaction = single.begin_write().unwrap();
+                let (mut inserted, mut removed) = (0, 0);
+                for (key, value) in &changes {
+                    match value {
+                        Some(value) => {
+                            let root = match single_root {
+                                Some(root) => root,
+                                None => Btree::create(&mut transaction, TREE).unwrap(),
+                            };
+                            let upserted =
+                                Btree::upsert(&mut transaction, root, TREE, key, value).unwrap();
+                            single_root = Some(upserted.root_page_id);
+                            single_hash = upserted.hash;
+                            if model.insert(key.clone(), value.clone()).is_none() {
+                                inserted += 1;
+                            }
+                        }
+                        None => {
+                            if let Some(root) = single_root {
+                                let deleted =
+                                    Btree::delete(&mut transaction, root, TREE, key).unwrap();
+                                single_root = deleted.root_page_id;
+                                single_hash = deleted.hash.unwrap_or(single_hash);
+                            }
+                            if model.remove(key).is_some() {
+                                removed += 1;
+                            }
+                        }
+                    }
+                }
+                transaction
+                    .commit(revision, EMPTY_HASH, single_root)
+                    .unwrap();
+
+                let context = format!("case {case}, round {round}, {} changes", changes.len());
+                assert_eq!(applied.inserted, inserted, "{context}");
+                assert_eq!(applied.removed, removed, "{context}");
+                let expected = model
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    all_entries(&mut batched, batched_root),
+                    expected,
+                    "{context}"
+                );
+                assert_eq!(all_entries(&mut single, single_root), expected, "{context}");
+                assert_eq!(batched_hash, single_hash, "{context}");
+                if let Some(root) = batched_root {
+                    assert_eq!(
+                        verified_subtree_hash(&mut batched, root),
+                        batched_hash,
+                        "{context}"
+                    );
+                }
+            }
+            // Reclaiming the tree must free every page the batches left allocated.
+            if let Some(root) = batched_root {
+                let mut transaction = batched.begin_write().unwrap();
+                Btree::reclaim(&mut transaction, root, TREE).unwrap();
+                transaction.commit(10, EMPTY_HASH, None).unwrap();
+            }
+            assert_eq!(
+                batched.active_metadata().superblock.live_data_page_count,
+                0,
+                "case {case}"
+            );
+            let reopened = Pager::open_or_create(batched.into_device()).unwrap();
+            assert_eq!(
+                reopened.active_metadata().superblock.live_data_page_count,
+                0
+            );
+        }
     }
 
     #[test]
