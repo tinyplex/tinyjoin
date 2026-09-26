@@ -798,26 +798,43 @@ pub(crate) fn decode_catalog_header_record(key: &[u8], value: &[u8]) -> Result<C
     Ok(header)
 }
 
+#[cfg(test)]
 pub(crate) fn encode_catalog_table_record(
     record: &CatalogTableRecord,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
-    validate_catalog_name(&record.schema.name)?;
     validate_schema_shape(&record.schema)?;
-    validate_catalog_item(
-        record.tree_id,
-        record.root_page_id,
-        record.row_count,
-        "table",
-    )?;
-    let key = encode_catalog_key(CATALOG_TABLE_KEY, &record.schema.name)?;
-    let value = encode_catalog_item_value(
+    encode_catalog_table_record_with_schema(
+        &record.schema.name,
         record.tree_id,
         record.root_page_id,
         record.row_count,
         record.hash,
-        &record.schema,
-        "table schema",
-    )?;
+        &encode_catalog_schema(&record.schema)?,
+    )
+}
+
+/// Encodes a table's schema as its catalog record holds it.
+pub(crate) fn encode_catalog_schema(schema: &TableDefinition) -> Result<Vec<u8>> {
+    let model = serde_json::to_value(schema).map_err(|error| {
+        codec_argument(format!("Could not encode catalog table schema: {error}"))
+    })?;
+    encode_canonical_json(&model)
+}
+
+/// Encodes a table's catalog record around a schema that [`encode_catalog_schema`] encoded and the
+/// catalog already validated.
+pub(crate) fn encode_catalog_table_record_with_schema(
+    name: &str,
+    tree_id: TreeId,
+    root_page_id: Option<PageId>,
+    row_count: u64,
+    hash: u64,
+    schema: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    validate_catalog_name(name)?;
+    validate_catalog_item(tree_id, root_page_id, row_count, "table")?;
+    let key = encode_catalog_key(CATALOG_TABLE_KEY, name)?;
+    let value = encode_catalog_item_body(tree_id, root_page_id, row_count, hash, schema)?;
     Ok((key, value))
 }
 
@@ -1439,6 +1456,16 @@ fn encode_catalog_item_value<T: Serialize>(
         codec_argument(format!("Could not encode catalog {description}: {error}"))
     })?;
     let body = encode_canonical_json(&model)?;
+    encode_catalog_item_body(tree_id, root_page_id, count, hash, &body)
+}
+
+fn encode_catalog_item_body(
+    tree_id: TreeId,
+    root_page_id: Option<PageId>,
+    count: u64,
+    hash: u64,
+    body: &[u8],
+) -> Result<Vec<u8>> {
     let total = CATALOG_ITEM_HEADER_BYTES
         .checked_add(body.len())
         .ok_or_else(|| value_too_large("Catalog value length overflowed"))?;
@@ -1454,7 +1481,7 @@ fn encode_catalog_item_value<T: Serialize>(
     value.extend_from_slice(&count.to_le_bytes());
     value.extend_from_slice(&hash.to_le_bytes());
     value.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    value.extend_from_slice(&body);
+    value.extend_from_slice(body);
     Ok(value)
 }
 

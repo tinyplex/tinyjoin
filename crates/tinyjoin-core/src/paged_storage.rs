@@ -15,7 +15,8 @@ use crate::{
     paged_codec::{
         CATALOG_TREE_ID, CatalogIndexRecord, CatalogKey, CatalogTableRecord, FIRST_USER_TREE_ID,
         RecordLayout, StoredRecord, decode_catalog_header_record, decode_catalog_index_record,
-        decode_catalog_key, decode_catalog_table_record, encode_primary_key,
+        decode_catalog_key, decode_catalog_table_record, encode_catalog_schema,
+        encode_catalog_table_record_with_schema, encode_primary_key,
         encode_secondary_index_entry_key, encode_secondary_index_prefix, index_entry_primary_key,
         leading_key_component, secondary_index_entry_matches_prefix, secondary_index_primary_key,
         secondary_index_primary_key_for_definition,
@@ -42,11 +43,12 @@ pub(crate) struct PagedStorage<D: PageDevice> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PagedTable {
-    /// The table's columns. [`Self::set_schema`] changes them, keeping `layout` in step. Both are
-    /// shared, since the catalog is copied whenever a statement changes it, and readers hold the
-    /// schema while they run.
+    /// The table's columns. [`Self::set_schema`] changes them, keeping `layout` and `catalog` in
+    /// step. All three are shared, since the catalog is copied whenever a statement changes it,
+    /// and readers hold the schema while they run.
     pub(crate) schema: Rc<TableDefinition>,
     layout: Rc<RecordLayout>,
+    catalog: Rc<CatalogSchema>,
     pub(crate) tree_id: TreeId,
     pub(crate) root_page_id: Option<PageId>,
     pub(crate) row_count: usize,
@@ -64,6 +66,7 @@ impl PagedTable {
     ) -> Result<Self> {
         Ok(Self {
             layout: Rc::new(RecordLayout::new(&schema)?),
+            catalog: Rc::new(CatalogSchema::new(&schema)?),
             schema: Rc::new(schema),
             tree_id,
             root_page_id,
@@ -74,8 +77,27 @@ impl PagedTable {
 
     pub(crate) fn set_schema(&mut self, schema: TableDefinition) -> Result<()> {
         self.layout = Rc::new(RecordLayout::new(&schema)?);
+        self.catalog = Rc::new(CatalogSchema::new(&schema)?);
         self.schema = Rc::new(schema);
         Ok(())
+    }
+
+    /// The fingerprint of the table's columns and primary key, which the database fingerprint
+    /// binds to the table's rows.
+    pub(crate) fn columns_fingerprint(&self) -> u64 {
+        self.catalog.columns_fingerprint
+    }
+
+    /// The table's catalog record, around the schema it encoded when the schema was set.
+    pub(crate) fn catalog_record(&self) -> Result<(Vec<u8>, Vec<u8>)> {
+        encode_catalog_table_record_with_schema(
+            &self.schema.name,
+            self.tree_id,
+            self.root_page_id,
+            self.row_count as u64,
+            self.hash,
+            &self.catalog.encoded,
+        )
     }
 
     /// One of this table's stored entries, read in place.
@@ -101,6 +123,32 @@ impl PagedTable {
                     .ok_or_else(|| EngineError::column_not_found(name, &self.schema.name))
             })
             .collect()
+    }
+}
+
+/// What a table's catalog record and fingerprint need from its schema, which only a schema change
+/// changes, so that a commit need not encode the schema again.
+#[derive(Debug)]
+struct CatalogSchema {
+    /// The schema as its catalog record holds it.
+    encoded: Vec<u8>,
+    /// A fingerprint of the table's column definitions: their names, types, nullability,
+    /// defaults, and order, and which of them form the primary key.
+    columns_fingerprint: u64,
+}
+
+impl CatalogSchema {
+    fn new(schema: &TableDefinition) -> Result<Self> {
+        let columns = serde_json::json!({
+            "columns": schema.columns,
+            "primaryKey": schema.primary_key,
+        });
+        let mut hasher = crate::hash::Hasher::new();
+        hasher.write_bytes(&crate::paged_codec::encode_canonical_json(&columns)?);
+        Ok(Self {
+            encoded: encode_catalog_schema(schema)?,
+            columns_fingerprint: hasher.finish(),
+        })
     }
 }
 

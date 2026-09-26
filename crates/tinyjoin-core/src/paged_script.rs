@@ -10,13 +10,12 @@ use crate::{
     btree::BatchChange,
     hash::{EMPTY_HASH, combine, identify},
     paged_codec::{
-        CATALOG_TREE_ID, CatalogHeader, CatalogIndexRecord, CatalogTableRecord,
-        MAX_CATALOG_INDEXES, MAX_CATALOG_TABLES, MAX_TREE_ID, encode_catalog_header_record,
-        encode_catalog_index_key, encode_catalog_index_record, encode_catalog_table_key,
-        encode_catalog_table_record, encode_primary_key, encode_row, encode_secondary_index_entry,
-        encode_secondary_index_entry_key, encode_secondary_index_prefix, leading_key_component,
-        secondary_index_entry_matches_prefix, secondary_index_primary_key,
-        secondary_index_primary_key_for_definition,
+        CATALOG_TREE_ID, CatalogHeader, CatalogIndexRecord, MAX_CATALOG_INDEXES,
+        MAX_CATALOG_TABLES, MAX_TREE_ID, encode_catalog_header_record, encode_catalog_index_key,
+        encode_catalog_index_record, encode_catalog_table_key, encode_primary_key, encode_row,
+        encode_secondary_index_entry, encode_secondary_index_entry_key,
+        encode_secondary_index_prefix, leading_key_component, secondary_index_entry_matches_prefix,
+        secondary_index_primary_key, secondary_index_primary_key_for_definition,
     },
     paged_storage::{
         PagedIndex, PagedTable, adjusted_count, batch_too_large, dangling_index_entry,
@@ -776,13 +775,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 .get(name)
                 .is_none_or(|base| !same_table_record(base, table))
             {
-                let (key, value) = encode_catalog_table_record(&CatalogTableRecord {
-                    schema: crate::TableDefinition::clone(&table.schema),
-                    tree_id: table.tree_id,
-                    root_page_id: table.root_page_id,
-                    row_count: table.row_count as u64,
-                    hash: table.hash,
-                })?;
+                let (key, value) = table.catalog_record()?;
                 changes.push((key, Some(value)));
             }
             // Binding each table's fingerprint to its name keeps two tables from cancelling each
@@ -794,7 +787,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 database_hash,
                 identify(
                     table.schema.name.as_bytes(),
-                    combine(table.hash, columns_fingerprint(&table.schema)?),
+                    combine(table.hash, table.columns_fingerprint()),
                 ),
             );
         }
@@ -1262,16 +1255,4 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
     fn revision(&self) -> u64 {
         self.base_revision
     }
-}
-
-/// A fingerprint of a table's column definitions: their names, types, nullability, defaults, and
-/// order, and which of them form the primary key.
-fn columns_fingerprint(schema: &crate::TableDefinition) -> Result<u64> {
-    let columns = serde_json::json!({
-        "columns": schema.columns,
-        "primaryKey": schema.primary_key,
-    });
-    let mut hasher = crate::hash::Hasher::new();
-    hasher.write_bytes(&crate::paged_codec::encode_canonical_json(&columns)?);
-    Ok(hasher.finish())
 }
