@@ -270,7 +270,14 @@ impl<D: PageDevice> PagedEngine<D> {
                 "Page-native explicit transactions currently support only INSERT, UPDATE, and DELETE",
             ));
         }
-        let (PlannedDml { outcome, changes }, keys) = {
+        let (
+            PlannedDml {
+                outcome,
+                changes,
+                previous,
+            },
+            keys,
+        ) = {
             let view = self.read_view_with_work(work);
             let planned = crate::statement::plan_dml(&view, statement)?;
             let keys = crate::statement::changed_keys(&view, &planned.changes)?;
@@ -282,7 +289,7 @@ impl<D: PageDevice> PagedEngine<D> {
             self.transaction
                 .as_mut()
                 .expect("the transaction branch was selected above")
-                .stage(&self.storage, changes)?;
+                .stage(&self.storage, changes, previous)?;
         }
         Ok(ExecuteResult {
             command: outcome.command.to_owned(),

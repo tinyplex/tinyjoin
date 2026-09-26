@@ -52,7 +52,7 @@ fn stage_with_full_validation(
     if changes.is_empty() {
         return Ok(());
     }
-    let patch = transaction.patch(storage, changes)?;
+    let patch = transaction.patch(storage, changes, Vec::new())?;
     let mut entries = transaction.entries.clone();
     for (table, patched) in &patch.entries {
         entries.entry(table.clone()).or_default().extend(
@@ -89,7 +89,7 @@ fn compare_stage(
 ) -> Option<String> {
     let before = staged.changes();
     let touched = staged.touched_tables();
-    let actual = staged.stage(storage, changes.clone());
+    let actual = staged.stage(storage, changes.clone(), Vec::new());
     let expected = stage_with_full_validation(storage, reference, changes);
     assert_eq!(
         actual.as_ref().err().map(|error| &error.code),

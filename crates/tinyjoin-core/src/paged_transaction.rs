@@ -10,6 +10,7 @@ use crate::{
     paged_script::{ChangedRow, ChangedRows},
     paged_storage::{ChangeCost, PagedWriteUsage},
     row::RowRef,
+    statement::PreviousRow,
     storage::{KeyOrder, KeyRange, estimated_row_bytes},
 };
 
@@ -120,16 +121,18 @@ impl PagedTransaction {
     }
 
     /// Validates and installs one statement's row delta without exposing a partial statement.
+    /// `previous` reports, change by change, the rows planning read; those it lacks are looked up.
     pub(crate) fn stage<D: PageDevice>(
         &mut self,
         storage: &PagedStorage<D>,
         changes: Vec<RowChange>,
+        previous: Vec<PreviousRow>,
     ) -> Result<()> {
         self.ensure_base_revision(storage)?;
         if changes.is_empty() {
             return Ok(());
         }
-        let mut patch = self.patch(storage, changes)?;
+        let mut patch = self.patch(storage, changes, previous)?;
         let (totals, released, claimed) = self.validate_patch(storage, &mut patch)?;
 
         // No fallible validation remains: a failed statement changes neither the staged rows nor
@@ -148,17 +151,21 @@ impl PagedTransaction {
     }
 
     /// The overlay entries a statement's changes produce, each starting from the entry it
-    /// replaces or from the committed row.
+    /// replaces or from the committed row. Planning read through this overlay, so a row it read
+    /// for a key the overlay does not hold is the committed row.
     fn patch<D: PageDevice>(
         &self,
         storage: &PagedStorage<D>,
         changes: Vec<RowChange>,
+        previous: Vec<PreviousRow>,
     ) -> Result<OverlayPatch> {
         // Detect collisions in the statement's original sequence before the overlay's canonical
         // key map can collapse them.
         storage.validate_sql_row_change_sequence(&changes)?;
         let mut patch = OverlayPatch::default();
+        let mut previous = previous.into_iter();
         for change in changes {
+            let held = previous.next().unwrap_or(PreviousRow::Unread);
             let (table, input, next) = match change {
                 RowChange::Upsert { table, row } => {
                     let next = Some(row.clone());
@@ -178,7 +185,10 @@ impl PagedTransaction {
                 {
                     Some(entry) => entry.clone(),
                     None => {
-                        let base = storage.lookup_primary_key(&table, &key)?;
+                        let base = match held {
+                            PreviousRow::Read(row) => row,
+                            PreviousRow::Unread => storage.lookup_primary_key(&table, &key)?,
+                        };
                         OverlayEntry {
                             key,
                             next: base.clone(),
@@ -728,6 +738,7 @@ mod tests {
                             table: "items".to_owned(),
                             row: row(json!({"id": id, "name": format!("item-{id}")})),
                         }],
+                        Vec::new(),
                     )
                     .unwrap();
             }
@@ -775,6 +786,7 @@ mod tests {
                         row: row(json!({"id": 3, "name": "three"})),
                     },
                 ],
+                Vec::new(),
             )
             .unwrap();
         transaction
@@ -784,6 +796,7 @@ mod tests {
                     table: "items".to_owned(),
                     key: row(json!({"id": 3})),
                 }],
+                Vec::new(),
             )
             .unwrap();
 
@@ -816,7 +829,10 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            transaction.stage(&storage, changes).unwrap_err().code,
+            transaction
+                .stage(&storage, changes, Vec::new())
+                .unwrap_err()
+                .code,
             "TRANSACTION_TOO_LARGE"
         );
         assert!(!transaction.is_dirty());

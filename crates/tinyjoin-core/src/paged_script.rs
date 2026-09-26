@@ -24,10 +24,10 @@ use crate::{
         unique_violation,
     },
     row::RowRef,
-    statement::{PlannedDml, Statement, WriteStatement},
+    statement::{PlannedDml, PreviousRow, Statement, WriteStatement},
     storage::{
-        KeyOrder, KeyRange, estimated_row_bytes, normalize_row, preflight_row_write_set,
-        schema_with_added_column, validate_schema,
+        KeyOrder, KeyRange, estimated_row_bytes, preflight_row_write_set, schema_with_added_column,
+        validate_schema,
     },
 };
 
@@ -265,10 +265,14 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             WriteStatement::Insert { .. }
             | WriteStatement::Update { .. }
             | WriteStatement::Delete { .. } => {
-                let PlannedDml { outcome, changes } = crate::statement::plan_dml(self, statement)?;
+                let PlannedDml {
+                    outcome,
+                    changes,
+                    previous,
+                } = crate::statement::plan_dml(self, statement)?;
                 if outcome.mutated {
                     keys = crate::statement::changed_keys(self, &changes)?;
-                    self.apply_changes(&changes)?;
+                    self.apply_changes(changes, previous)?;
                 }
                 outcome
             }
@@ -402,7 +406,13 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         self.charge_operations(1)
     }
 
-    fn apply_changes(&mut self, input_changes: &[RowChange]) -> Result<()> {
+    /// Applies a statement's planned changes. Planning normalized every row they write, and read
+    /// the row each key held wherever it could, which `previous` reports.
+    fn apply_changes(
+        &mut self,
+        input_changes: Vec<RowChange>,
+        previous: Vec<PreviousRow>,
+    ) -> Result<()> {
         let schemas = self
             .tables
             .iter()
@@ -413,8 +423,8 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             .values()
             .map(|index| &index.definition)
             .collect::<Vec<_>>();
-        preflight_row_write_set(input_changes, &schemas, &definitions, Default::default())?;
-        for change in input_changes {
+        preflight_row_write_set(&input_changes, &schemas, &definitions, Default::default())?;
+        for change in &input_changes {
             let table = match change {
                 RowChange::Upsert { table, .. } | RowChange::Delete { table, .. } => table,
             };
@@ -429,20 +439,18 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         let mut duplicate_upserts = BTreeMap::<String, BTreeSet<Vec<u8>>>::new();
         let mut retained_bytes = 0usize;
         let mut changes = ChangedRows::new();
+        let mut previous = previous.into_iter();
         for change in input_changes {
-            let (table_name, input, is_delete) = match change {
+            let held = previous.next().unwrap_or(PreviousRow::Unread);
+            let (table_name, row, is_delete) = match change {
                 RowChange::Upsert { table, row } => (table, row, false),
                 RowChange::Delete { table, key } => (table, key, true),
             };
+            let table_name = &table_name;
             let table = self
                 .tables
                 .get(table_name)
                 .ok_or_else(|| EngineError::table_not_found(table_name))?;
-            let row = if is_delete {
-                input.clone()
-            } else {
-                normalize_row(&table.schema, input.clone())?
-            };
             let key = encode_primary_key(&table.schema, &row)?;
             if !is_delete
                 && !duplicate_upserts
@@ -467,7 +475,14 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 existing.next = next;
                 continue;
             }
-            let old = self.lookup_encoded_primary_key(table_name, &key)?;
+            let old = match held {
+                PreviousRow::Read(row) => {
+                    // Charged as the lookup it replaces.
+                    self.charge_operations(1)?;
+                    row
+                }
+                PreviousRow::Unread => self.lookup_encoded_primary_key(table_name, &key)?,
+            };
             let old_bytes = old.as_ref().map_or(Ok(0), estimated_row_bytes)?;
             let next_bytes = next.as_ref().map_or(Ok(0), estimated_row_bytes)?;
             retained_bytes = retained_bytes

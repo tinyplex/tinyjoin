@@ -124,6 +124,41 @@ pub(crate) struct WriteOutcome {
 pub(crate) struct PlannedDml {
     pub outcome: WriteOutcome,
     pub changes: Vec<RowChange>,
+    /// For each change, what its key held before the statement, where planning read it. Writers
+    /// use it in place of looking the row up again.
+    pub previous: Vec<PreviousRow>,
+}
+
+/// What a planned change's key held before its statement.
+#[derive(Debug)]
+pub(crate) enum PreviousRow {
+    /// Planning did not read the key, or did not keep what it read.
+    Unread,
+    /// The key held this row, or no row.
+    Read(Option<Row>),
+}
+
+/// The most estimated bytes of rows one statement's planning keeps for its writer. Past it, the
+/// writer looks rows up again, so planning never holds more than this beyond its own budget.
+const MAX_KEPT_ROW_BYTES: usize = 8 * 1024 * 1024;
+
+/// The rows planning keeps for its writer so far.
+#[derive(Default)]
+struct KeptRows {
+    bytes: usize,
+}
+
+impl KeptRows {
+    /// Whether a row of `bytes` can be kept, counting it if so.
+    fn fits(&mut self, bytes: usize) -> bool {
+        match self.bytes.checked_add(bytes) {
+            Some(total) if total <= MAX_KEPT_ROW_BYTES => {
+                self.bytes = total;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 pub(crate) fn parse(sql: &str, params: &[Value]) -> Result<Statement> {
@@ -191,7 +226,9 @@ pub(crate) fn execute<S: StorageDriver>(
         WriteStatement::Insert { .. }
         | WriteStatement::Update { .. }
         | WriteStatement::Delete { .. } => {
-            let PlannedDml { outcome, changes } = plan_dml(storage, statement)?;
+            let PlannedDml {
+                outcome, changes, ..
+            } = plan_dml(storage, statement)?;
             let keys = changed_keys(storage, &changes)?;
             storage.apply_row_changes_unrevisioned(changes)?;
             Ok((outcome, keys))
@@ -685,6 +722,8 @@ fn plan_insert(
     let tracks_keys = conflicts.is_some() || value_rows.len() > 1;
     let mut written = HashSet::with_capacity(if tracks_keys { value_rows.len() } else { 0 });
     let mut changes = Vec::with_capacity(value_rows.len());
+    let mut previous = Vec::with_capacity(value_rows.len());
+    let mut kept = KeptRows::default();
     let mut returned = Vec::with_capacity(returning.map_or(0, |_| value_rows.len()));
     let mut work_bytes = 0usize;
     let mut result_bytes = 0usize;
@@ -730,14 +769,14 @@ fn plan_insert(
             None => Conflict::None,
         };
         let updates = conflicts.as_ref().and_then(ConflictPlan::updates);
-        let (row, key) = match conflict {
+        let (row, key, held) = match conflict {
             Conflict::None => {
                 if written.contains(&key) || storage.lookup_primary_key(table, &row)?.is_some() {
                     return Err(EngineError::constraint_violation(format!(
                         "INSERT into `{table}` would duplicate a primary key"
                     )));
                 }
-                (row, key)
+                (row, key, PreviousRow::Read(None))
             }
             Conflict::Written | Conflict::Existing(_) if updates.is_none() => continue,
             Conflict::Written => {
@@ -746,6 +785,10 @@ fn plan_insert(
                 )));
             }
             Conflict::Existing(existing) => {
+                // The updated row keeps the existing row's key, which held the existing row.
+                let held = kept
+                    .fits(estimated_row_bytes(&existing)?)
+                    .then(|| existing.clone());
                 let row = updated_conflict_row(
                     &schema,
                     updates.expect("DO NOTHING was handled above"),
@@ -753,7 +796,11 @@ fn plan_insert(
                     &row,
                 )?;
                 let key = primary_conflict_key(&schema, &row)?;
-                (row, key)
+                (
+                    row,
+                    key,
+                    held.map_or(PreviousRow::Unread, |held| PreviousRow::Read(Some(held))),
+                )
             }
         };
         work_bytes = retain_dml_row(work_bytes, &row)?;
@@ -772,6 +819,7 @@ fn plan_insert(
             table: table.to_owned(),
             row,
         });
+        previous.push(held);
     }
 
     let row_count = changes.len();
@@ -787,6 +835,7 @@ fn plan_insert(
             mutated: row_count > 0,
         },
         changes,
+        previous,
     })
 }
 
@@ -1172,11 +1221,14 @@ fn plan_update(
     struct PlannedUpdate {
         old_key: String,
         old_primary_key: Row,
+        /// The row being updated, when it is kept for the writer.
+        old_row: Option<Row>,
         new_key: String,
         new_row: Row,
     }
 
     let mut updates = Vec::new();
+    let mut kept = KeptRows::default();
     let mut returned = Vec::new();
     let mut scanned = 0usize;
     let mut work_bytes = 0usize;
@@ -1200,14 +1252,16 @@ fn plan_update(
 
         // Check the retained candidate budget before copying assignment values into the row.
         let row = row.to_row()?;
+        let old_row_bytes = estimated_row_bytes(&row)?;
         let conservative_row_bytes = checked_dml_add(
-            checked_dml_mul(estimated_row_bytes(&row)?, 3)?,
+            checked_dml_mul(old_row_bytes, 3)?,
             checked_dml_add(assignment_bytes, 256)?,
         )?;
         ensure_dml_work_bytes(checked_dml_add(work_bytes, conservative_row_bytes)?)?;
 
         let old_key = row_key(&schema, &row)?;
         let old_primary_key = primary_key_row(&schema, &row)?;
+        let old_row = kept.fits(old_row_bytes).then(|| row.clone());
         let mut new_row = row;
         for (column, value) in &resolved_assignments {
             new_row.insert(column.clone(), value.clone());
@@ -1233,6 +1287,7 @@ fn plan_update(
         updates.push(PlannedUpdate {
             old_key,
             old_primary_key,
+            old_row,
             new_key,
             new_row,
         });
@@ -1270,15 +1325,26 @@ fn plan_update(
         }
     }
 
-    let changes = if row_count > 0 {
+    // A row keeping its key replaces the row planning read there. A row moving to a new key is
+    // deleted from its old one, and what its new key holds is left for the writer to read.
+    let (changes, previous) = if row_count > 0 {
         let mut deletes = Vec::with_capacity(row_count);
+        let mut deleted = Vec::with_capacity(row_count);
         let mut upserts = Vec::with_capacity(row_count);
+        let mut replaced = Vec::with_capacity(row_count);
         for update in updates {
+            let old_row = update
+                .old_row
+                .map_or(PreviousRow::Unread, |row| PreviousRow::Read(Some(row)));
             if update.old_key != update.new_key {
                 deletes.push(RowChange::Delete {
                     table: table.to_owned(),
                     key: update.old_primary_key,
                 });
+                deleted.push(old_row);
+                replaced.push(PreviousRow::Unread);
+            } else {
+                replaced.push(old_row);
             }
             upserts.push(RowChange::Upsert {
                 table: table.to_owned(),
@@ -1286,9 +1352,10 @@ fn plan_update(
             });
         }
         deletes.extend(upserts);
-        deletes
+        deleted.extend(replaced);
+        (deletes, deleted)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     Ok(PlannedDml {
         outcome: WriteOutcome {
@@ -1302,6 +1369,7 @@ fn plan_update(
             mutated: row_count > 0,
         },
         changes,
+        previous,
     })
 }
 
@@ -1319,6 +1387,8 @@ fn plan_delete(
     validate_projection(&schema, returning)?;
 
     let mut changes = Vec::new();
+    let mut previous = Vec::new();
+    let mut kept = KeptRows::default();
     let mut returned = Vec::new();
     let mut scanned = 0usize;
     let mut work_bytes = 0usize;
@@ -1339,7 +1409,8 @@ fn plan_delete(
                 "A data-modification statement cannot change more than {MAX_DML_CHANGED_ROWS} rows"
             )));
         }
-        let row = &row.to_row()?;
+        let owned = row.to_row()?;
+        let row = &owned;
 
         let mut charge = 32usize;
         for column in &schema.primary_key {
@@ -1366,6 +1437,11 @@ fn plan_delete(
             table: table.to_owned(),
             key,
         });
+        previous.push(if kept.fits(estimated_row_bytes(&owned)?) {
+            PreviousRow::Read(Some(owned))
+        } else {
+            PreviousRow::Unread
+        });
         Ok(VisitControl::Continue)
     })?;
     require_complete_dml_scan(visit_outcome, table)?;
@@ -1382,6 +1458,7 @@ fn plan_delete(
             mutated: row_count > 0,
         },
         changes,
+        previous,
     })
 }
 
