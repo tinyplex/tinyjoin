@@ -6,16 +6,17 @@ dedicated Worker, store their data in the origin private file system (OPFS),
 and are driven from the page by the same workloads in the same Chromium.
 
 These numbers are published to track progress, not to win an argument.
-TinyJoin's engine is young. It is already small and quick to open, but most
-reads and writes are currently much slower than in either alternative, and
-closing that gap is ongoing work. The suite is designed to be rerun after
-every optimization.
+TinyJoin's engine is young. It is the smallest download and the quickest to
+open, it reads every row and runs `LIKE` scans more quickly than either
+alternative, and it groups about as quickly, but most other reads and writes
+still take one and a half to four times as long as the faster of them. Closing
+that gap is ongoing work, and the suite is designed to be rerun after every
+optimization.
 
 {{benchmarks.environment}}
 
-Every chart has a linear axis from zero, so bar lengths compare directly. Where
-TinyJoin is a thousand times slower, the other engines' bars are slivers, and
-their values are printed beside them. In each group, the best value is bold.
+Every chart has a linear axis from zero, so bar lengths compare directly, and
+every bar is labeled with its value. In each group, the best value is bold.
 
 ## Measured results
 
@@ -53,34 +54,34 @@ again, opens an existing database, and counts its rows.
 
 ## What the results show
 
-In the v0.3.0 results above, TinyJoin is the smallest download and the quickest
-to create a new database: PGlite initializes a new PostgreSQL cluster on first
-open. Nearly everything after that is slower in TinyJoin, and the gaps point
-directly at the work ahead.
+In the results above, TinyJoin is the smallest download and the quickest to
+create a new database: PGlite initializes a new PostgreSQL cluster on first
+open. It reads all 10,000 rows in order faster than either engine, runs `LIKE`
+scans slightly faster, and groups about as fast as the faster of them. The rest
+is slower, but no longer by orders of magnitude: in v0.3.0, most workloads took
+10 to 1,400 times as long as the fastest engine, and none now takes more than
+about four times as long. The remaining gaps point at the work ahead.
 
-- **Updates, deletes, and upserts inside a transaction** are the largest gap,
-  at three orders of magnitude. Once a transaction contains anything but
-  appended rows, TinyJoin validates the complete write set after every
-  statement, so the cost of each statement grows with the transaction.
-  Append-only inserts already validate incrementally.
-- **Range predicates do not use secondary indexes.** Only equality does, so the
-  indexed range aggregates take as long as the unindexed ones, while SQLite
-  and PGlite answer them from the index.
-- **Scans are slow.** Every unindexed query, `LIKE` predicate, `GROUP BY`, and
-  bulk `DELETE` reads all 10,000 rows, and TinyJoin reads rows far more slowly
-  than either engine. Creating an index over those rows is also slow.
-- **Joins run as nested loops** without index lookups, repeating that scan
-  cost for every row of the outer table.
-- **Multi-row inserts are no faster than single-row inserts.** In SQLite and
-  PGlite, batching rows into fewer statements is the quickest way to load
-  data; in TinyJoin, it currently saves nothing.
-- **Reopening validates the stored trees**, so a populated database takes
-  longer to reopen in TinyJoin than in SQLite.
-
-The closest results are the ones dominated by messages between the page and
-the Worker: point reads by primary key, reading every row, and committing
-single-row writes one at a time. There, TinyJoin is within a small factor of
-both engines, and reads single rows faster than PGlite.
+- **Single statements** cost about 45 to 60 microseconds each, which is 1.5 to
+  2.5 times SQLite's cost for a point read, or an update, upsert, or delete by
+  primary key. Part of every round trip is the message between the page and the
+  Worker, which every engine pays. TinyJoin adds its own Worker layers, which
+  coordinate tabs and check each request and result, and its engine still
+  builds and validates each written row as a map of column names to values.
+- **Scans** run at about half SQLite's speed. TinyJoin reads each column in
+  place from the stored row, but spends more per row walking the B-tree and
+  evaluating the predicate. A range `UPDATE` inside a transaction also merges
+  each scan with the transaction's staged rows.
+- **Inserts** take two to three times as long as SQLite's, for the same reason
+  as single statements: each row is normalized, measured, and staged as a map.
+- **Bulk deletes** take about four times as long as PGlite's, which, like
+  PostgreSQL, only marks deleted rows and leaves reclaiming their space to a
+  later vacuum. TinyJoin removes each row and its index entries at once, and
+  rewrites every page they occupied.
+- **Committing each insert alone** is dominated by storage flushes, two per
+  commit, and takes twice as long as PGlite's commits.
+- **Reopening validates every row and index entry**, so a populated database
+  reopens a little more slowly than in SQLite.
 
 ## Features are not equivalent
 
@@ -98,7 +99,7 @@ boundaries in full.
 | Expressions, casts, scalar functions | No | Yes | Yes |
 | `HAVING`, window functions | No | Yes | Yes |
 | Views, triggers | No | Yes | Yes |
-| Joins | Up to eight sources, evaluated as written, without index lookups | Query planner, with indexes | Query planner, with indexes |
+| Joins | Up to eight sources, evaluated as written, through key lookups, indexes, or hash tables | Query planner, with indexes | Query planner, with indexes |
 | `INSERT ... SELECT`, `UPDATE ... FROM` | No | Yes | Yes |
 | Upserts | `ON CONFLICT`, assigning values from `EXCLUDED` | Yes | Yes |
 | Types | Boolean, safe integer, float, text, JSON | Dynamic: integer, real, text, blob | The PostgreSQL type system |
@@ -181,10 +182,8 @@ counts, and replace the forms TinyJoin cannot run: arithmetic in `UPDATE ...
 SET` becomes a literal assignment, and the `INSERT ... SELECT` tests are
 omitted.
 
-The join places 5,000 orders across 100 customers. With 10,000 orders, the
-query would exceed TinyJoin's 1,000,000-comparison
-[join budget](/guides/sql-compatibility/#join-work-budgets) and fail, because
-TinyJoin's nested loop does not use the index on `customer_id`.
+The join places 5,000 orders across 100 customers, and each query reads one
+customer's orders through the index on `customer_id`.
 
 A sample that runs longer than 60 seconds is abandoned and reported as such,
 and that engine skips the workload's remaining samples.

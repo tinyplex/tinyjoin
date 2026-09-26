@@ -55,6 +55,7 @@
     "linejoin",
     "llms",
     "lparen",
+    "memcpy",
     "microbatches",
     "monomorphizing",
     "MVCC",

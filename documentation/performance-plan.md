@@ -19,6 +19,73 @@ Wall times in the native and Node figures were noisy, because the machine was
 under heavy load. Instruction counts, profile shares and A/B ratios are the
 reliable figures.
 
+## Progress
+
+As of 26 September 2026, the `perf/faster-engine` branch carries this plan
+through most of its steps, one commit per step, each gated on the Rust,
+TypeScript, browser and size checks. The published browser results in
+`site/data/benchmarks.json` were remeasured on its final commit. The ratios
+below are to the faster of SQLite and PGlite in the same run, so machine load
+cancels out:
+
+| Workload | v0.3.0 | Now | Workload | v0.3.0 | Now |
+| --- | ---: | ---: | --- | ---: | ---: |
+| `cold-open` | 0.7× | 0.7× | `select-all` | 2.3× | 0.6× |
+| `reopen` | 3.5× | 1.2× | `group-by` | 22× | 1.05× |
+| `insert-autocommit` | 3.3× | 1.9× | `join` | 175× | 1.5× |
+| `insert-transaction` | 9.9× | 2.3× | `update-pk` | 1,077× | 2.4× |
+| `insert-indexed` | 15× | 2.1× | `update-scan` | 179× | 2.8× |
+| `insert-batch` | 33× | 2.9× | `upsert` | 1,362× | 2.3× |
+| `select-pk` | 4.2× | 1.5× | `delete-pk` | 1,105× | 2.5× |
+| `select-scan` | 105× | 2.0× | `delete-like` | 95× | 4.0× |
+| `select-like` | 39× | 0.96× | `delete-range` | 249× | 3.7× |
+| `select-indexed` | 1,406× | 2.4× | `create-index` | 142× | 1.4× |
+
+The compressed download grew from 296 KiB to 323 KiB.
+
+Done:
+
+- Phase 0, the native benchmark.
+- R1 to R7. D3 and D4 were adopted as recommended, and the SQL guide
+  documents both.
+- R8's typed `GROUP BY` keys and once-compiled `LIKE` patterns.
+- Page format 3: S1, S2, S4, and S3 for reads and for the rows a write
+  replaces, which stay stored entries rather than maps. D1, D6 and D8 were
+  decided as recommended.
+- T1 and T2.
+- C1, C2, C3, C5, and C4 except writing only changed bitmap chunks.
+- O1 follows from R1.
+
+Found along the way:
+
+- Copying a slice of a length known only at run time compiles to `memcpy`,
+  which WebAssembly runs as a `memory.copy` call into the runtime. Reading a
+  record's offsets and integers that way cost scans about a quarter of their
+  time.
+- Collecting into a `BTreeMap`, and sorting with a closure, compiles a
+  separate copy of the sort for every call site. Replacing nine such sites
+  shrank the engine by 13 KiB compressed.
+- Allocating a page past the end of the file wrote a zero placeholder for it,
+  so commits that grew the file wrote every new page twice.
+
+Remaining, in order of expected value:
+
+1. Per-statement cost. A single statement takes 45–60 µs in the browser
+   against SQLite's 25–30 µs. Its engine share is 9–17 µs in V8: building the
+   structured result, decoding parameters through `serde_wasm_bindgen`, and
+   planning and staging each row as a map. The Worker's JavaScript layers add
+   another 15 µs or so, including a deep check of every WASM result (R9, D5)
+   and a second measurement of each request by the database broker.
+2. The rest of S3, for writes: inserts, updates and staging still normalize,
+   measure and copy every written row as a map, several times over. Inserts
+   are 2–3× SQLite's time largely because of it.
+3. [D7](#decisions-needed), with the measurements under
+   [build settings](#build-settings).
+4. T3, indexes inside transactions, and the scan merge with staged rows.
+5. Writing only changed bitmap chunks. This needs per-chunk slots in the
+   superblock, a format change, and would save two page writes per commit.
+6. O2 and O4. Reopening is already within 1.2× of SQLite.
+
 ## Where the time goes
 
 The engine, not the Worker, dominates. A scan of 10,000 rows costs about
@@ -475,6 +542,25 @@ The fixes above take most of the sensitive loops off the hot path: CRC,
 serde, string-keyed maps and allocator calls. So re-measure after R1–R4 and
 C1, and decide [D7](#decisions-needed) with data.
 
+Remeasured on 26 September 2026, raising the optimization level of
+`tinyjoin-core` alone, with the other crates left at `z`. Times are
+engine-only V8 runs of the benchmark workloads in Node, the best of three, in
+milliseconds:
+
+| `tinyjoin-core` | `wasm-opt` | Engine gzip | `insert-transaction` | `insert-batch` | `select-scan` | `group-by` | `update-pk` | `delete-range` | `create-index` |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `z` (shipped) | `-Oz` | 301 KiB | 116 | 76 | 85 | 16.9 | 17.2 | 12.6 | 11.7 |
+| `s` | `-Oz` | 326 KiB | 114 | 75 | 80 | 17.0 | 17.6 | 12.9 | 11.4 |
+| `2` | `-Oz` | 371 KiB | 102 | 63 | 83 | 15.6 | 14.5 | 9.6 | 9.2 |
+| `2` | `-O2` | 374 KiB | 93 | 61 | 83 | 15.7 | 15.2 | 9.5 | 9.2 |
+| `3` | `-Oz` | 379 KiB | 96 | 58 | 81 | 15.7 | 14.0 | 9.5 | 9.2 |
+| `3` | `-O3` | 380 KiB | 92 | 59 | 81 | 15.7 | 13.7 | 9.7 | 9.2 |
+
+Levels 2 and 3 cut writes by 15–25% but barely move scans, which the fixes
+above already made cheap, for 70–80 KiB more compressed, about a quarter of
+the engine. Every build stays under the 1 MiB gate: level 3 is 963 KiB
+uncompressed. `s` costs 24 KiB for a few percent.
+
 ## Decisions needed
 
 | | Decision | Recommendation |
@@ -485,7 +571,7 @@ C1, and decide [D7](#decisions-needed) with data.
 | D4 | Streaming in primary-key order relaxes the 100,000 ordered-row limit for those queries. | Accept, and document it |
 | D5 | Array transport needs a protocol version bump, which makes mixed-version tabs a `DATABASE_VERSION_MISMATCH`. Object keys would follow column order instead of today's alphabetical order. | Accept for the next minor release |
 | D6 | Page format 3 cannot read existing databases. Refuse them or migrate them on open? | **Decided:** refuse with `UNSUPPORTED_PAGE`, with no migration, as announced in the v0.4.0 release notes |
-| D7 | Optimization level, trading size for speed. | Decide after page format 3 and C1 |
+| D7 | Optimization level, trading size for speed. | Keep `z` for now: level 2 or 3 buys 15–25% on writes for about 75 KiB, a quarter of the engine, while the larger per-statement costs lie outside the optimizer's reach. Revisit after the rest of S3 |
 | D8 | Omit trailing columns that equal their defaults, so `ADD COLUMN` stops rewriting every row? | **Decided:** yes |
 
 ## Order of work

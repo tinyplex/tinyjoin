@@ -12,8 +12,8 @@ export const TABLE =
   'CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, ' +
   'b INTEGER NOT NULL, c TEXT NOT NULL, g INTEGER NOT NULL)';
 
-// 100 customers by 10,000 orders would exceed TinyJoin's 1,000,000-comparison
-// join budget, since its nested loop does not use the index on customer_id.
+// Kept at 5,000 orders across 100 customers, the size of the first published
+// results, so that later results stay comparable with them.
 const ORDERS = 5_000;
 
 const COLUMNS = 5;

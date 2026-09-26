@@ -33,6 +33,35 @@ the OPFS name does not copy existing data.
 
 In-memory databases, including every `tinyjoin/node` database, are unaffected.
 
+This release is also much faster. In the
+[comparative benchmarks](/guides/benchmarks/), most workloads in v0.3.0 took 10
+to 1,400 times as long as the faster of SQLite and PGlite. None now takes more
+than about four times as long. Reading every row and `LIKE` scans are quicker
+than in either, and `GROUP BY` is about as quick.
+
+- Updates, upserts, and deletes inside a transaction no longer slow down as the
+  transaction grows. Each statement is checked against running totals rather
+  than the whole write set, so a thousand of them take about 60 ms rather than
+  more than half a minute.
+- Comparisons, `BETWEEN`, and `LIKE` patterns that start with literal
+  characters read a range of an index or of the primary key, rather than every
+  row. See [constraints and indexes](/guides/sql-compatibility/#constraints-and-indexes)
+  for when a range is used.
+- Joins find each table's matching rows by key lookup, through an index, or in
+  a hash table, rather than comparing every pair of rows. The join budget now
+  counts the rows each lookup actually returns, so a join is never rejected
+  because the Cartesian product of its tables is large.
+- A query ordered by the leading primary-key columns reads rows in key order
+  and stops at its `LIMIT`, rather than collecting and sorting every match, so
+  it is no longer held to the limit on ordered matching rows. Inside a
+  transaction that has changed the table, it still sorts.
+- Scans read only the columns a statement uses, straight from the stored row.
+- Writes apply each statement's rows to each B-tree in one pass, index builds
+  sort their entries first, and commits write each page once and flush twice
+  rather than three times.
+
+The compressed download grows by 28 KiB, to 323 KiB.
+
 ## v0.3.0
 
 This release closes some of the most commonly encountered gaps in the
