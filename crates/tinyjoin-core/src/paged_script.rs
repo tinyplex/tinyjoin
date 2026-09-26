@@ -660,7 +660,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             return Ok(None);
         };
         self.charge_operations(1)?;
-        get_in_transaction(&mut self.transaction.borrow_mut(), root, table.tree_id, key)?
+        Btree::get_in_transaction(&mut self.transaction.borrow_mut(), root, table.tree_id, key)?
             .map(|value| table.record(key, &value)?.to_row())
             .transpose()
     }
@@ -858,19 +858,6 @@ pub(crate) fn retain_result(result_bytes: &mut usize, result: &ExecuteResult) ->
     ensure_batch_bytes(*result_bytes)
 }
 
-fn get_in_transaction<D: PageDevice>(
-    transaction: &mut PagerWriteTransaction<'_, D>,
-    root: PageId,
-    tree_id: TreeId,
-    key: &[u8],
-) -> Result<Option<Vec<u8>>> {
-    let mut cursor = Btree::cursor_from_in_transaction(transaction, root, tree_id, key)?;
-    match cursor.next_in_transaction(transaction)? {
-        Some((found, value)) if found.as_slice() == key => Ok(Some(value)),
-        _ => Ok(None),
-    }
-}
-
 fn execute_query_result(result: QueryResult) -> Result<ExecuteResult> {
     Ok(ExecuteResult {
         command: "SELECT".to_owned(),
@@ -1012,7 +999,7 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
                     index.definition.name
                 )));
             }
-            let row_value = get_in_transaction(
+            let row_value = Btree::get_in_transaction(
                 &mut self.transaction.borrow_mut(),
                 table_root,
                 table_data.tree_id,

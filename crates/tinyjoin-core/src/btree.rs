@@ -108,50 +108,23 @@ impl Btree {
     }
 
     /// Looks up one exact key in a committed root.
-    ///
-    /// Each step down must reach exactly the next lower level and a page's level is fixed, so a
-    /// cycle is rejected without tracking visited pages.
     pub(crate) fn get<D: PageDevice>(
         pager: &mut Pager<D>,
         root_page_id: PageId,
         tree_id: TreeId,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
-        validate_tree_id(tree_id)?;
-        validate_key(key)?;
-        let generation = pager.generation();
-        let mut page_id = root_page_id;
-        let mut expected_level = None;
-        let mut parent_generation = None;
+        get_from(pager, root_page_id, tree_id, key)
+    }
 
-        for _ in 0..MAX_TREE_DEPTH {
-            let node =
-                NodeView::open(pager.read_page(page_id)?, tree_id, generation, false, false)?;
-            validate_expected_level(page_id, node.level, expected_level)?;
-            validate_child_generation(page_id, node.generation, parent_generation)?;
-            if node.leaf {
-                let Some(index) = node.find(key)? else {
-                    return Ok(None);
-                };
-                return match node.leaf_cell(index)?.1 {
-                    CellValue::Inline(value) => Ok(Some(value.to_vec())),
-                    CellValue::Overflow(descriptor) => read_overflow_chain(
-                        |page_id| pager.read_page(page_id),
-                        tree_id,
-                        generation,
-                        node.generation,
-                        &descriptor,
-                    )
-                    .map(|(value, _)| Some(value)),
-                };
-            }
-            page_id = node.child(node.child_index_for(key)?)?;
-            expected_level = Some(node.level - 1);
-            parent_generation = Some(node.generation);
-        }
-        Err(invalid_btree(storage_diagnostic!(
-            "Tree {tree_id} exceeds the maximum depth of {MAX_TREE_DEPTH}"
-        )))
+    /// Looks up one exact key in a tree visible to an open pager transaction.
+    pub(crate) fn get_in_transaction<D: PageDevice>(
+        transaction: &mut PagerWriteTransaction<'_, D>,
+        root_page_id: PageId,
+        tree_id: TreeId,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        get_from(transaction, root_page_id, tree_id, key)
     }
 
     /// Inserts or replaces an inline value and returns the candidate root and its fingerprint.
@@ -400,6 +373,58 @@ impl<D: PageDevice> BtreeReadView for PagerWriteTransaction<'_, D> {
     fn requires_view_generation(&self, id: PageId) -> bool {
         self.owns_page(id)
     }
+}
+
+/// Descends from `root_page_id` to the one leaf that can hold `key`, reading each node in place.
+///
+/// Each step down must reach exactly the next lower level and a page's level is fixed, so a cycle
+/// is rejected without tracking visited pages.
+fn get_from(
+    reader: &mut impl BtreeReadView,
+    root_page_id: PageId,
+    tree_id: TreeId,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    validate_tree_id(tree_id)?;
+    validate_key(key)?;
+    let generation = reader.cursor_view(tree_id)?.generation();
+    let mut page_id = root_page_id;
+    let mut expected_level = None;
+    let mut parent_generation = None;
+
+    for _ in 0..MAX_TREE_DEPTH {
+        let node = NodeView::open(
+            reader.read_btree_page(page_id)?,
+            tree_id,
+            generation,
+            reader.requires_view_generation(page_id),
+            false,
+        )?;
+        validate_expected_level(page_id, node.level, expected_level)?;
+        validate_child_generation(page_id, node.generation, parent_generation)?;
+        if node.leaf {
+            let Some(index) = node.find(key)? else {
+                return Ok(None);
+            };
+            return match node.leaf_cell(index)?.1 {
+                CellValue::Inline(value) => Ok(Some(value.to_vec())),
+                CellValue::Overflow(descriptor) => read_overflow_chain(
+                    |page_id| reader.read_btree_page(page_id),
+                    tree_id,
+                    generation,
+                    node.generation,
+                    &descriptor,
+                )
+                .map(|(value, _)| Some(value)),
+            };
+        }
+        page_id = node.child(node.child_index_for(key)?)?;
+        expected_level = Some(node.level - 1);
+        parent_generation = Some(node.generation);
+    }
+    Err(invalid_btree(storage_diagnostic!(
+        "Tree {tree_id} exceeds the maximum depth of {MAX_TREE_DEPTH}"
+    )))
 }
 
 fn open_cursor(
