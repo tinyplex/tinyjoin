@@ -10,7 +10,7 @@ use crate::{
     Row, RowChange, StorageReader, TableDefinition, TreeId, VisitControl, VisitOutcome,
     paged_codec::{EMPTY_RECORD, IndexEntryLayout, RecordLayout, encode_primary_key, encode_row},
     paged_script::{ChangedRow, TableChanges, held_row_bytes},
-    paged_storage::{ChangeCost, ChangeRow, PagedTable, PagedWriteUsage},
+    paged_storage::{ChangeCost, ChangeRow, PagedTable, PagedWriteUsage, batch_too_large},
     row::{HeldRow, RowRef},
     statement::PreviousRow,
     storage::{KeyOrder, KeyRange, estimated_record_bytes, estimated_row_bytes},
@@ -77,11 +77,41 @@ enum PatchRow {
     Delete(Row),
 }
 
+/// A table's entries in a patch, in key order.
+type PatchEntries = Vec<(Vec<u8>, OverlayEntry)>;
+
+/// A statement's overlay entries: each table it changes, with its entries in key order. A
+/// statement changes a table or two, and most change a row or two, so vectors hold them without
+/// the nodes a map would allocate.
 #[derive(Default)]
 struct OverlayPatch {
-    entries: BTreeMap<String, BTreeMap<Vec<u8>, OverlayEntry>>,
+    entries: Vec<(String, PatchEntries)>,
     /// Whether any entry replaces one the transaction staged before.
     replaces: bool,
+}
+
+impl OverlayPatch {
+    fn entry(&self, table: &str, key: &[u8]) -> Option<&OverlayEntry> {
+        let (_, entries) = self.entries.iter().find(|(name, _)| name == table)?;
+        let index = entries
+            .binary_search_by(|(entry, _)| entry.as_slice().cmp(key))
+            .ok()?;
+        Some(&entries[index].1)
+    }
+}
+
+/// What a validated patch changes in the transaction's totals.
+struct TotalsChange {
+    overlay_keys: usize,
+    overlay_bytes: usize,
+    usage: PagedWriteUsage,
+    /// How many changed rows each of the patch's tables gains, or loses, in patch order, as a
+    /// two's-complement change to its count.
+    changed_rows: Vec<usize>,
+    /// The unique-index claims the patch gives up.
+    released: BTreeSet<(TreeId, Box<[u8]>)>,
+    /// The claims it makes, each with the primary key that makes it.
+    claimed: BTreeMap<(TreeId, Box<[u8]>), Vec<u8>>,
 }
 
 impl PagedTransaction {
@@ -170,27 +200,38 @@ impl PagedTransaction {
             return Ok(());
         }
         let patch = self.patch(storage, changes, previous)?;
-        let (totals, released, claimed) = self.validate_patch(storage, &patch)?;
+        let change = self.validate_patch(storage, &patch)?;
 
         // No fallible validation remains: a failed statement changes neither the staged rows nor
         // the totals.
-        for (table, entries) in patch.entries {
+        for ((table, entries), changed_rows) in patch.entries.into_iter().zip(change.changed_rows) {
+            let count = changed_count(&self.totals.changed_tables, &table, changed_rows);
+            match self.totals.changed_tables.get_mut(&table) {
+                Some(counted) => *counted = count,
+                None if count > 0 => {
+                    self.totals.changed_tables.insert(table.clone(), count);
+                }
+                None => {}
+            }
             if !self.touched_tables.contains(&table) {
                 self.touched_tables.insert(table.clone());
             }
             match self.entries.get_mut(&table) {
                 Some(staged) => staged.extend(entries),
                 None => {
-                    self.entries.insert(table, entries);
+                    let mut staged = BTreeMap::new();
+                    staged.extend(entries);
+                    self.entries.insert(table, staged);
                 }
             }
         }
-        let mut claims = std::mem::take(&mut self.totals.claims);
-        for claim in released {
-            claims.remove(&claim);
+        for claim in change.released {
+            self.totals.claims.remove(&claim);
         }
-        claims.extend(claimed);
-        self.totals = Totals { claims, ..totals };
+        self.totals.claims.extend(change.claimed);
+        self.totals.overlay_keys = change.overlay_keys;
+        self.totals.overlay_bytes = change.overlay_bytes;
+        self.totals.usage = change.usage;
         Ok(())
     }
 
@@ -205,6 +246,7 @@ impl PagedTransaction {
     ) -> Result<OverlayPatch> {
         let mut patched = BTreeMap::<String, BTreeMap<Vec<u8>, PatchChange>>::new();
         let mut replaces = false;
+        let count = changes.len();
         let mut previous = previous.into_iter();
         for change in changes {
             let held = previous.next().unwrap_or(PreviousRow::Unread);
@@ -226,6 +268,16 @@ impl PagedTransaction {
                 }
                 (None, _, PatchRow::Record(_)) => unreachable!("a record comes with its key"),
             };
+            // A statement's only change needs nothing merged with it.
+            if count == 1 {
+                let (change, replaces) =
+                    self.first_change(storage, &table, &key, held, row, is_delete)?;
+                let entry = overlay_entry(storage, storage.table(&table)?, &table, &key, change)?;
+                return Ok(OverlayPatch {
+                    entries: vec![(table, vec![(key, entry)])],
+                    replaces,
+                });
+            }
             if !patched.contains_key(&table) {
                 patched.insert(table.clone(), BTreeMap::new());
             }
@@ -244,23 +296,10 @@ impl PagedTransaction {
                     slot.row = row;
                 }
                 Entry::Vacant(slot) => {
-                    let staged = self
-                        .entries
-                        .get(&table)
-                        .and_then(|entries| entries.get(slot.key()));
-                    replaces |= staged.is_some();
-                    let base = match (staged, held) {
-                        (Some(entry), _) => entry.row.old.clone(),
-                        (None, PreviousRow::Read(row)) => row,
-                        (None, PreviousRow::Unread) => storage
-                            .committed_entry(&table, slot.key())?
-                            .map(HeldRow::Stored),
-                    };
-                    slot.insert(PatchChange {
-                        base,
-                        row,
-                        upserted: !is_delete,
-                    });
+                    let (change, replaced) =
+                        self.first_change(storage, &table, slot.key(), held, row, is_delete)?;
+                    replaces |= replaced;
+                    slot.insert(change);
                 }
             }
         }
@@ -270,14 +309,42 @@ impl PagedTransaction {
         };
         for (table, changes) in patched {
             let paged = storage.table(&table)?;
-            let mut entries = BTreeMap::new();
+            let mut entries = Vec::with_capacity(changes.len());
             for (key, change) in changes {
                 let entry = overlay_entry(storage, paged, &table, &key, change)?;
-                entries.insert(key, entry);
+                entries.push((key, entry));
             }
-            patch.entries.insert(table, entries);
+            patch.entries.push((table, entries));
         }
         Ok(patch)
+    }
+
+    /// A statement's first change to `key`, starting from the committed row of the entry it
+    /// replaces, or else the row planning read, or else the row the key holds; and whether it
+    /// replaces an entry the transaction staged before.
+    fn first_change<D: PageDevice>(
+        &self,
+        storage: &PagedStorage<D>,
+        table: &str,
+        key: &[u8],
+        held: PreviousRow,
+        row: PatchRow,
+        is_delete: bool,
+    ) -> Result<(PatchChange, bool)> {
+        let staged = self.entries.get(table).and_then(|entries| entries.get(key));
+        let base = match (staged, held) {
+            (Some(entry), _) => entry.row.old.clone(),
+            (None, PreviousRow::Read(row)) => row,
+            (None, PreviousRow::Unread) => {
+                storage.committed_entry(table, key)?.map(HeldRow::Stored)
+            }
+        };
+        let change = PatchChange {
+            base,
+            row,
+            upserted: !is_delete,
+        };
+        Ok((change, staged.is_some()))
     }
 
     /// Measures a patch's entries and returns the totals with them in place of the entries they
@@ -287,68 +354,46 @@ impl PagedTransaction {
     /// A claimed value must not be held by another staged row, nor by a committed row unless the
     /// transaction changes that row, since a changed row holds only the values of its new row. A
     /// row the patch changes back to its committed state holds its committed values again.
-    #[allow(clippy::type_complexity)]
     fn validate_patch<D: PageDevice>(
         &self,
         storage: &PagedStorage<D>,
         patch: &OverlayPatch,
-    ) -> Result<(
-        Totals,
-        BTreeSet<(TreeId, Box<[u8]>)>,
-        BTreeMap<(TreeId, Box<[u8]>), Vec<u8>>,
-    )> {
-        let mut totals = Totals {
-            overlay_keys: self.totals.overlay_keys,
-            overlay_bytes: self.totals.overlay_bytes,
-            usage: self.totals.usage,
-            changed_tables: self.totals.changed_tables.clone(),
-            claims: BTreeMap::new(),
-        };
+    ) -> Result<TotalsChange> {
+        let mut overlay_keys = self.totals.overlay_keys;
+        let mut overlay_bytes = self.totals.overlay_bytes;
+        let mut usage = self.totals.usage;
+        let mut changed_rows = vec![0_usize; patch.entries.len()];
         // Take each replaced entry's share out first, so that no total passes its limit only on
         // the way to a smaller final value. A patch of new keys, such as an insert's, has none.
         let mut released = BTreeSet::new();
-        let replaced = if patch.replaces {
-            patch.entries.iter()
-        } else {
-            Default::default()
-        };
-        for (table, entries) in replaced {
-            for key in entries.keys() {
-                let Some(previous) = self.entries.get(table).and_then(|entries| entries.get(key))
-                else {
-                    continue;
-                };
-                totals.overlay_keys -= 1;
-                totals.overlay_bytes -= previous.retained;
-                if let Some(cost) = &previous.cost {
-                    totals.usage = totals.usage.minus(cost.usage);
-                    *totals
-                        .changed_tables
-                        .get_mut(table)
-                        .expect("a changed row's table is counted") -= 1;
-                    released.extend(
-                        cost.claims
-                            .iter()
-                            .map(|claim| (claim.tree_id, claim.prefix.clone())),
-                    );
+        if patch.replaces {
+            for ((table, entries), changed) in patch.entries.iter().zip(&mut changed_rows) {
+                for (key, _) in entries {
+                    let Some(previous) =
+                        self.entries.get(table).and_then(|entries| entries.get(key))
+                    else {
+                        continue;
+                    };
+                    overlay_keys -= 1;
+                    overlay_bytes -= previous.retained;
+                    if let Some(cost) = &previous.cost {
+                        usage = usage.minus(cost.usage);
+                        *changed = changed.wrapping_sub(1);
+                        released.extend(
+                            cost.claims
+                                .iter()
+                                .map(|claim| (claim.tree_id, claim.prefix.clone())),
+                        );
+                    }
                 }
             }
         }
-        for (table, entries) in &patch.entries {
-            for entry in entries.values() {
-                retain_entry(
-                    &mut totals.overlay_keys,
-                    &mut totals.overlay_bytes,
-                    entry.retained,
-                )?;
+        for ((_, entries), changed) in patch.entries.iter().zip(&mut changed_rows) {
+            for (_, entry) in entries {
+                retain_entry(&mut overlay_keys, &mut overlay_bytes, entry.retained)?;
                 if let Some(cost) = &entry.cost {
-                    totals.usage = totals.usage.plus(cost.usage)?;
-                    match totals.changed_tables.get_mut(table) {
-                        Some(count) => *count += 1,
-                        None => {
-                            totals.changed_tables.insert(table.clone(), 1);
-                        }
-                    }
+                    usage = usage.plus(cost.usage)?;
+                    *changed = changed.wrapping_add(1);
                 }
             }
         }
@@ -366,9 +411,7 @@ impl PagedTransaction {
         // Whether the transaction changes a row, once the patch is in place.
         let changes_row = |table: &str, key: &[u8]| {
             patch
-                .entries
-                .get(table)
-                .and_then(|entries| entries.get(key))
+                .entry(table, key)
                 .or_else(|| self.entries.get(table).and_then(|entries| entries.get(key)))
                 .is_some_and(|entry| entry.cost.is_some())
         };
@@ -407,15 +450,38 @@ impl PagedTransaction {
                 }
             }
         }
-        storage.write_set_usage(
-            totals.usage,
-            totals
-                .changed_tables
+        // Each table with changed rows once the patch is in place is charged its catalog
+        // operations: those the transaction changed, and those the patch changes.
+        let mut operations = 0_usize;
+        for (table, count) in &self.totals.changed_tables {
+            let changed = patch
+                .entries
                 .iter()
-                .filter(|(_, count)| **count > 0)
-                .map(|(table, _)| table.as_str()),
-        )?;
-        Ok((totals, released, claimed))
+                .zip(&changed_rows)
+                .find(|((name, _), _)| name == table)
+                .map_or(0, |(_, changed)| *changed);
+            if count.wrapping_add(changed) > 0 {
+                operations = operations
+                    .checked_add(storage.catalog_operations(table))
+                    .ok_or_else(batch_too_large)?;
+            }
+        }
+        for ((table, _), changed) in patch.entries.iter().zip(&changed_rows) {
+            if !self.totals.changed_tables.contains_key(table.as_str()) && *changed as isize > 0 {
+                operations = operations
+                    .checked_add(storage.catalog_operations(table))
+                    .ok_or_else(batch_too_large)?;
+            }
+        }
+        usage.with_operations(operations)?;
+        Ok(TotalsChange {
+            overlay_keys,
+            overlay_bytes,
+            usage,
+            changed_rows,
+            released,
+            claimed,
+        })
     }
 
     fn ensure_base_revision<D: PageDevice>(&self, storage: &PagedStorage<D>) -> Result<()> {
@@ -515,6 +581,14 @@ fn changes_from_entries<'a, D: PageDevice>(
             }
         })
         .collect()
+}
+
+/// A table's count of changed rows once `changed`, a two's-complement change, is applied to it.
+fn changed_count(counts: &BTreeMap<String, usize>, table: &str, changed: usize) -> usize {
+    let count = counts.get(table).copied().unwrap_or(0);
+    count
+        .checked_add_signed(changed as isize)
+        .expect("a changed row's table is counted")
 }
 
 /// Adds an entry retaining `bytes` to the overlay's totals, failing once either passes its limit.

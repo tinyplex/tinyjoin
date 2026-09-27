@@ -216,6 +216,14 @@ impl PagedWriteUsage {
         Ok(usage)
     }
 
+    /// This usage with `operations` more operations, failing as [`Self::plus`] does.
+    pub(crate) fn with_operations(self, operations: usize) -> Result<Self> {
+        self.plus(Self {
+            operations,
+            ..Self::default()
+        })
+    }
+
     /// This usage without `other`'s, which it includes.
     pub(crate) fn minus(self, other: Self) -> Self {
         Self {
@@ -625,6 +633,7 @@ impl<D: PageDevice> PagedStorage<D> {
 
     /// A write set's complete usage: the sum of its changes' costs, and the catalog operations
     /// charged once for each changed table. Fails once any budget passes its limit.
+    #[cfg(test)]
     pub(crate) fn write_set_usage<'t>(
         &self,
         changes: PagedWriteUsage,
@@ -632,19 +641,21 @@ impl<D: PageDevice> PagedStorage<D> {
     ) -> Result<PagedWriteUsage> {
         let mut operations = 0usize;
         for table in changed_tables {
-            let index_count = self
-                .indexes
-                .values()
-                .filter(|index| index.definition.table == table)
-                .count();
             operations = operations
-                .checked_add(1 + index_count)
+                .checked_add(self.catalog_operations(table))
                 .ok_or_else(batch_too_large)?;
         }
-        changes.plus(PagedWriteUsage {
-            operations,
-            ..PagedWriteUsage::default()
-        })
+        changes.with_operations(operations)
+    }
+
+    /// The operations a write set is charged once for each table it changes: the table's own
+    /// catalog entry, and one for each of its indexes.
+    pub(crate) fn catalog_operations(&self, table: &str) -> usize {
+        1 + self
+            .indexes
+            .values()
+            .filter(|index| index.definition.table == table)
+            .count()
     }
 
     /// Validates a whole write set at once: the reference for the totals a transaction keeps as
