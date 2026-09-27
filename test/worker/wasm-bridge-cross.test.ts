@@ -23,8 +23,9 @@ import {
   type RawStructuredWasmEngine,
   type RawStructuredWasmEngineConstructor,
 } from '../../src/worker/wasm-bridge.js';
+import {decodeRequest} from '../helpers/wasm-request.js';
 
-const BRIDGE_VERSION = 3;
+const BRIDGE_VERSION = 4;
 const artifactDirectory =
   process.env.TINYJOIN_PAGED_WASM_DIR ?? resolve('dist/wasm');
 const artifactModule = `${artifactDirectory}/tinyjoin_wasm.js`;
@@ -51,12 +52,14 @@ class RecordingStructuredEngine implements RawStructuredWasmEngine {
   callStructured(
     bridgeVersion: number,
     operation: number,
-    payload: unknown,
+    request: Uint8Array,
   ): unknown {
+    // The request's bytes are reused for the next, so they are read at once.
+    const payload = decodeRequest(operation, request);
     const response = this.raw.callStructured(
       bridgeVersion,
       operation,
-      payload,
+      request,
     );
     this.calls.push({bridgeVersion, operation, payload, response});
     return response;
@@ -481,7 +484,7 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
       insertParams,
     );
     const insertCall = lastCall(recording, WASM_OPERATION.executeSql);
-    expect((insertCall.payload as {params: JsonValue[]}).params).toBe(
+    expect((insertCall.payload as {params: JsonValue[]}).params).toEqual(
       insertParams,
     );
     expect(withoutRows(inserted)).toEqual(responsePayload(insertCall));
@@ -558,7 +561,7 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
       recording,
       WASM_OPERATION.executePrepared,
     );
-    expect((preparedCall.payload as {params: JsonValue[]}).params).toBe(
+    expect((preparedCall.payload as {params: JsonValue[]}).params).toEqual(
       preparedParams,
     );
     expect(withoutRows(prepared)).toEqual(responsePayload(preparedCall));

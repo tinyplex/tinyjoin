@@ -14,8 +14,9 @@ import {
   type RawStructuredWasmEngine,
   type RawStructuredWasmEngineConstructor,
 } from '../../src/worker/wasm-bridge.ts';
+import {decodeRequest} from '../helpers/wasm-request.ts';
 
-const VERSION = 3;
+const VERSION = 4;
 const SUCCESS = 0;
 const FAILURE = 1;
 const SAFE = 0;
@@ -92,9 +93,10 @@ class FakeRawEngine implements RawStructuredWasmEngine {
   callStructured(
     bridgeVersion: number,
     operation: number,
-    payload: unknown,
+    request: Uint8Array,
   ): unknown {
-    const call = {bridgeVersion, operation, payload};
+    // The request's bytes are reused for the next, so they are read at once.
+    const call = {bridgeVersion, operation, payload: decodeRequest(operation, request)};
     this.calls.push(call);
     if (operation === WASM_OPERATION.close) {
       this.closeCalls += 1;
@@ -510,7 +512,7 @@ class CallbackRawEngine implements RawStructuredWasmEngine {
   callStructured(
     bridgeVersion: number,
     operation: number,
-    _payload: unknown,
+    _request: Uint8Array,
   ): unknown {
     expect(bridgeVersion).toBe(VERSION);
     if (operation === WASM_OPERATION.close) {

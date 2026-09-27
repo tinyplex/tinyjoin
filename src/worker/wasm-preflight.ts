@@ -51,59 +51,90 @@ export class WasmBridgeError extends Error {
   }
 }
 
+// The bytes of the request being written. One buffer serves every request,
+// since each is written, and then copied into WASM, before the next begins.
+const INITIAL_BUFFER_BYTES = 1024;
+let buffer = new Uint8Array(INITIAL_BUFFER_BYTES);
+let view = new DataView(buffer.buffer);
+const textEncoder = new TextEncoder();
+
+/** The request of an operation that takes no arguments. */
+export const EMPTY_REQUEST = new Uint8Array(0);
+
 /**
- * Measures one request the way WASM will read it, without building anything.
+ * Writes one request as WASM reads it, checking and bounding it on the way.
  *
- * The sink tracks two quantities at once: the bytes the encoded request would
- * occupy, and the memory the Rust side would retain to hold it. Both are
- * bounded, so a request that cannot be served is rejected before it reaches
- * WASM rather than after it has allocated. Each request makes one, so it is a
- * single object rather than a set of closures.
+ * A number is little-endian, a string is its UTF-8 length as a u32 and then
+ * its bytes, a list is its length as a u32 and then its items, and a JSON
+ * value is a tag byte and then its content: a number's eight bytes as a float,
+ * or a string, or a list of values, or a list of keys each followed by its
+ * value. The writer tracks two quantities at once: the bytes of the request,
+ * and the memory the Rust side would retain to hold it. Both are bounded, so
+ * a request that cannot be served is rejected before it reaches WASM rather
+ * than after it has allocated.
  */
-class PreflightSink {
-  #bytes = 0;
+class RequestWriter {
+  #length = 0;
   #retained = 0;
   #nodes = 0;
   #operations = 0;
 
-  add(count: number): void {
-    const next = this.#bytes + count;
+  /** Makes room for `count` more bytes, and returns where they start. */
+  reserve(count: number): number {
+    const at = this.#length;
+    const next = at + count;
     if (!isCount(next) || next > MAX_BYTES) {
       throw resourceLimit();
     }
-    this.#bytes = next;
+    if (next > buffer.length) {
+      const grown = new Uint8Array(Math.max(next, buffer.length * 2));
+      grown.set(buffer.subarray(0, at));
+      buffer = grown;
+      view = new DataView(buffer.buffer);
+    }
+    this.#length = next;
+    return at;
   }
 
+  // Each writes only after reserving: reserving can replace the buffer and its
+  // view, which an expression naming them first would still hold.
   u8(value: number): void {
     assertUint(value, 0xff);
-    this.add(1);
+    const at = this.reserve(1);
+    buffer[at] = value;
   }
 
   u32(value: number): void {
     assertUint(value, MAX_U32);
-    this.add(4);
+    const at = this.reserve(4);
+    view.setUint32(at, value, true);
   }
 
-  /** A JavaScript-safe integer, which WASM reads as eight bytes. */
-  i64(): void {
-    this.add(8);
-  }
-
-  f64(value: number): void {
-    if (!isFiniteNumber(value)) {
-      throw invalidBridgeValue('A JSON number must be finite');
-    }
-    this.add(8);
+  /** A finite number, as the eight bytes of a float. */
+  number(value: number): void {
+    const at = this.reserve(8);
+    view.setFloat64(at, value, true);
   }
 
   string(value: string): void {
     if (!isString(value)) {
       throw invalidBridgeValue('A bridge string must be a string');
     }
-    const length = utf8Length(value);
-    this.retain(length + STRING_OVERHEAD);
-    this.u32(length);
-    this.add(length);
+    const lengthAt = this.reserve(4);
+    const start = this.#length;
+    // UTF-8 takes at most three bytes for each UTF-16 unit, and TextEncoder
+    // replaces a lone surrogate with U+FFFD, which takes three too. Only a
+    // string that might not fit is measured exactly first.
+    const room =
+      start + value.length * 3 > MAX_BYTES ? utf8Length(value) : value.length * 3;
+    this.reserve(room);
+    const {written} = textEncoder.encodeInto(
+      value,
+      buffer.subarray(start, start + room),
+    );
+    this.#length = start + written;
+    view.setUint32(lengthAt, written, true);
+    this.retain(written + STRING_OVERHEAD);
   }
 
   retain(count: number): void {
@@ -131,47 +162,78 @@ class PreflightSink {
   operation(): void {
     this.#operations = checkedIncrement(this.#operations, MAX_OPERATIONS);
   }
+
+  /**
+   * The request written, which stays valid only until the next is begun. A
+   * buffer grown for an unusually large request is let go afterwards.
+   */
+  bytes(): Uint8Array {
+    const written = buffer.subarray(0, this.#length);
+    if (buffer.length > MAX_KEPT_BUFFER_BYTES) {
+      buffer = new Uint8Array(INITIAL_BUFFER_BYTES);
+      view = new DataView(buffer.buffer);
+    }
+    return written;
+  }
 }
 
-/** Validates and bounds a request once before passing it unchanged to WASM. */
-export const preflightExecuteSql = (
+const MAX_KEPT_BUFFER_BYTES = 1024 * 1024;
+
+/** Writes a SQL statement and its parameters. */
+export const encodeExecuteSql = (
   sql: string,
   params: readonly JsonValue[],
-): void => {
-  const sink = new PreflightSink();
-  sink.string(sql);
-  writeJsonValues(sink, params, 0, 'SQL parameters');
+  arrayRows: boolean,
+): Uint8Array => {
+  const request = new RequestWriter();
+  request.u8(arrayRows ? 1 : 0);
+  request.string(sql);
+  writeJsonValues(request, params, 0, 'SQL parameters');
+  return request.bytes();
 };
 
-export const preflightPrepareSql = (sql: string): void =>
-  new PreflightSink().string(sql);
+export const encodePrepareSql = (sql: string): Uint8Array => {
+  const request = new RequestWriter();
+  request.string(sql);
+  return request.bytes();
+};
 
-export const preflightExecutePrepared = (
+export const encodeExecutePrepared = (
   statementId: number,
   params: readonly JsonValue[],
-): void => {
-  const sink = new PreflightSink();
-  sink.u32(preparedStatementId(statementId));
-  writeJsonValues(sink, params, 0, 'SQL parameters');
+  arrayRows: boolean,
+): Uint8Array => {
+  const request = new RequestWriter();
+  request.u8(arrayRows ? 1 : 0);
+  request.u32(preparedStatementId(statementId));
+  writeJsonValues(request, params, 0, 'SQL parameters');
+  return request.bytes();
 };
 
-export const preflightClosePrepared = (statementId: number): void =>
-  new PreflightSink().u32(preparedStatementId(statementId));
+export const encodeClosePrepared = (statementId: number): Uint8Array => {
+  const request = new RequestWriter();
+  request.u32(preparedStatementId(statementId));
+  return request.bytes();
+};
 
-export const preflightExecSql = (sql: string): void =>
-  new PreflightSink().string(sql);
+export const encodeExecSql = (sql: string, arrayRows: boolean): Uint8Array => {
+  const request = new RequestWriter();
+  request.u8(arrayRows ? 1 : 0);
+  request.string(sql);
+  return request.bytes();
+};
 
 const writeJsonValues = (
-  sink: PreflightSink,
+  request: RequestWriter,
   input: unknown,
   depth: number,
   label: string,
 ): void => {
   const length = denseArrayLength(input, label);
-  sink.vector(length, RUST_VALUE_BYTES);
-  writeCount(sink, length);
+  request.vector(length, RUST_VALUE_BYTES);
+  writeCount(request, length);
   for (let index = 0; index < length; index += 1) {
-    writeJsonValue(sink, indexedDataValue(input, index, label), depth);
+    writeJsonValue(request, indexedDataValue(input, index, label), depth);
   }
   if (denseArrayLength(input, label) !== length) {
     throw invalidBridgeValue('A bridge array changed while it was inspected');
@@ -179,68 +241,52 @@ const writeJsonValues = (
 };
 
 const writeJsonValue = (
-  sink: PreflightSink,
+  request: RequestWriter,
   value: unknown,
   depth: number,
 ): void => {
-  sink.operation();
-  sink.node(depth);
+  request.operation();
+  request.node(depth);
   if (value === null) {
-    sink.u8(JSON_NULL);
+    request.u8(JSON_NULL);
   } else if (value === false) {
-    sink.u8(JSON_FALSE);
+    request.u8(JSON_FALSE);
   } else if (value === true) {
-    sink.u8(JSON_TRUE);
+    request.u8(JSON_TRUE);
   } else if (isNumber(value)) {
     if (!isFiniteNumber(value)) {
       throw invalidBridgeValue('A JSON number must be finite');
     }
-    if (isSafeInteger(value)) {
-      sink.u8(JSON_I64);
-      sink.i64();
-    } else {
-      sink.u8(JSON_F64);
-      sink.f64(value);
-    }
+    request.u8(isSafeInteger(value) ? JSON_I64 : JSON_F64);
+    request.number(value);
   } else if (isString(value)) {
-    sink.u8(JSON_STRING);
-    sink.string(value);
+    request.u8(JSON_STRING);
+    request.string(value);
   } else if (isArray(value)) {
-    sink.u8(JSON_ARRAY);
-    const length = denseArrayLength(value, 'JSON array');
-    sink.vector(length, RUST_VALUE_BYTES);
-    writeCount(sink, length);
-    for (let index = 0; index < length; index += 1) {
-      writeJsonValue(
-        sink,
-        indexedDataValue(value, index, 'JSON array'),
-        depth + 1,
-      );
-    }
+    request.u8(JSON_ARRAY);
+    writeJsonValues(request, value, depth + 1, 'JSON array');
   } else if (isRecord(value)) {
-    sink.u8(JSON_OBJECT);
-    const count = enumerableDataCount(value);
-    writeCount(sink, count);
-    let visited = 0;
+    request.u8(JSON_OBJECT);
+    // The count is written once the entries are.
+    const countAt = request.reserve(4);
+    let count = 0;
     forEachEnumerableDataEntry(value, (key, child) => {
-      visited += 1;
-      sink.string(key);
-      sink.retain(RUST_VALUE_BYTES + RUST_MAP_ENTRY_OVERHEAD);
-      writeJsonValue(sink, child, depth + 1);
+      count += 1;
+      request.string(key);
+      request.retain(RUST_VALUE_BYTES + RUST_MAP_ENTRY_OVERHEAD);
+      writeJsonValue(request, child, depth + 1);
     });
-    if (visited !== count) {
-      throw invalidBridgeValue('A bridge object changed while it was inspected');
-    }
+    view.setUint32(countAt, count, true);
   } else {
     throw invalidBridgeValue('A value is not JSON-compatible');
   }
 };
 
-const writeCount = (sink: PreflightSink, count: number): void => {
+const writeCount = (request: RequestWriter, count: number): void => {
   if (!isCountWithin(count, 0, MAX_OPERATIONS)) {
     throw resourceLimit();
   }
-  sink.u32(count);
+  request.u32(count);
 };
 
 const MISSING = Symbol('missing');
@@ -277,17 +323,6 @@ const ownDataField = (value: object, name: string | number): unknown => {
     throw invalidBridgeValue('Bridge accessors are not supported');
   }
   return descriptor.value;
-};
-
-const enumerableDataCount = (value: object): number => {
-  let count = 0;
-  forEachEnumerableDataEntry(value, () => {
-    count += 1;
-    if (count > MAX_OPERATIONS) {
-      throw resourceLimit();
-    }
-  });
-  return count;
 };
 
 const forEachEnumerableDataEntry = (

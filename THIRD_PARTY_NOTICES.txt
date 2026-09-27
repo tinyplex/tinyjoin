@@ -23,7 +23,7 @@ library release as a whole, so it too is a conservative target superset.
 These notices are for attribution and reference. They do not alter the
 applicable upstream terms and are not legal advice.
 
-Packages (26)
+Packages (25)
 -------------
 
 bumpalo 3.20.3
@@ -96,11 +96,6 @@ serde 1.0.229
   Source: https://crates.io/crates/serde/1.0.229
   Upstream files: [6] LICENSE-APACHE; [7] LICENSE-MIT
 
-serde-wasm-bindgen 0.6.5
-  Declared license: MIT
-  Source: https://crates.io/crates/serde-wasm-bindgen/0.6.5
-  Upstream files: [12] LICENSE
-
 serde_core 1.0.229
   Declared license: MIT OR Apache-2.0
   Source: https://crates.io/crates/serde_core/1.0.229
@@ -119,7 +114,7 @@ serde_json 1.0.151
 slab 0.4.12
   Declared license: MIT
   Source: https://crates.io/crates/slab/0.4.12
-  Upstream files: [13] LICENSE
+  Upstream files: [12] LICENSE
 
 syn 3.0.6
   Declared license: MIT OR Apache-2.0
@@ -129,7 +124,7 @@ syn 3.0.6
 unicode-ident 1.0.26
   Declared license: (MIT OR Apache-2.0) AND Unicode-3.0
   Source: https://crates.io/crates/unicode-ident/1.0.26
-  Upstream files: [6] LICENSE-APACHE; [7] LICENSE-MIT; [14] LICENSE-UNICODE
+  Upstream files: [6] LICENSE-APACHE; [7] LICENSE-MIT; [13] LICENSE-UNICODE
 
 wasm-bindgen 0.2.128
   Declared license: MIT OR Apache-2.0
@@ -1176,35 +1171,7 @@ Used by:
    END OF TERMS AND CONDITIONS
 -------------------------------------------------------------------------------
 
-[12] SHA-256 62f78cf0242220d7dd98074cd2ca3dda4015788c07c0c45d99151bdbd21738a1
-Used by:
-  - serde-wasm-bindgen 0.6.5 / LICENSE
-
--------------------------------------------------------------------------------
-MIT License
-
-Copyright (c) 2019 Cloudflare, Inc.
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
--------------------------------------------------------------------------------
-
-[13] SHA-256 8ce0830173fdac609dfb4ea603fdc002c2f4af0dc9b1a005653f5da9cf534b18
+[12] SHA-256 8ce0830173fdac609dfb4ea603fdc002c2f4af0dc9b1a005653f5da9cf534b18
 Used by:
   - slab 0.4.12 / LICENSE
 
@@ -1236,7 +1203,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 -------------------------------------------------------------------------------
 
-[14] SHA-256 f7db81051789b729fea528a63ec4c938fdcb93d9d61d97dc8cc2e9df6d47f2a1
+[13] SHA-256 f7db81051789b729fea528a63ec4c938fdcb93d9d61d97dc8cc2e9df6d47f2a1
 Used by:
   - unicode-ident 1.0.26 / LICENSE-UNICODE
 

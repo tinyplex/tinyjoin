@@ -1,33 +1,97 @@
 import {describe, expect, it} from 'vitest';
 
 import type {JsonValue} from '../../src/protocol.ts';
+import {WASM_OPERATION} from '../../src/worker/wasm-bridge.ts';
 import {
-  preflightClosePrepared,
-  preflightExecSql,
-  preflightExecutePrepared,
-  preflightExecuteSql,
-  preflightPrepareSql,
+  encodeClosePrepared,
+  encodeExecSql,
+  encodeExecutePrepared,
+  encodeExecuteSql,
+  encodePrepareSql,
 } from '../../src/worker/wasm-preflight.ts';
+import {decodeRequest} from '../helpers/wasm-request.ts';
 
-describe('WASM request preflight', () => {
-  it('accepts every SQL-first structured request shape', () => {
-    expect(() =>
-      preflightExecuteSql('SELECT $1, $2', [
-        -0,
-        {nested: [true, null, 1.5, '\ud800']},
-      ]),
-    ).not.toThrow();
-    expect(() => preflightPrepareSql('SELECT $1')).not.toThrow();
-    expect(() => preflightExecutePrepared(7, [1, 'two'])).not.toThrow();
-    expect(() => preflightClosePrepared(7)).not.toThrow();
-    expect(() =>
-      preflightExecSql('CREATE TABLE items; SELECT * FROM items'),
-    ).not.toThrow();
+describe('WASM request writing', () => {
+  it('writes every SQL-first request as WASM reads it', () => {
+    const params = [
+      -0,
+      1.5,
+      9_007_199_254_740_993,
+      {nested: [true, null, 'é😀'], ['__proto__']: 'data'},
+    ] satisfies JsonValue[];
+    expect(
+      decodeRequest(
+        WASM_OPERATION.executeSql,
+        encodeExecuteSql('SELECT $1, $2', params, false),
+      ),
+    ).toEqual({sql: 'SELECT $1, $2', params});
+    expect(
+      decodeRequest(WASM_OPERATION.prepareSql, encodePrepareSql('SELECT $1')),
+    ).toBe('SELECT $1');
+    expect(
+      decodeRequest(
+        WASM_OPERATION.executePrepared,
+        encodeExecutePrepared(7, [1, 'two'], true),
+      ),
+    ).toEqual({statementId: 7, params: [1, 'two'], arrayRows: true});
+    expect(
+      decodeRequest(WASM_OPERATION.closePrepared, encodeClosePrepared(7)),
+    ).toBe(7);
+    expect(
+      decodeRequest(
+        WASM_OPERATION.execSql,
+        encodeExecSql('CREATE TABLE items; SELECT * FROM items', false),
+      ),
+    ).toEqual({sql: 'CREATE TABLE items; SELECT * FROM items'});
+  });
+
+  it('writes a lone surrogate as TextEncoder does, as U+FFFD', () => {
+    expect(
+      decodeRequest(
+        WASM_OPERATION.executeSql,
+        encodeExecuteSql('SELECT $1', ['a\ud800b'], false),
+      ),
+    ).toEqual({sql: 'SELECT $1', params: ['a�b']});
+  });
+
+  it('writes each request afresh into the reused buffer, growing it as needed', () => {
+    const large = 'x'.repeat(100_000);
+    const first = decodeRequest(
+      WASM_OPERATION.executeSql,
+      encodeExecuteSql('SELECT $1', [large], false),
+    );
+    expect(first).toEqual({sql: 'SELECT $1', params: [large]});
+    expect(
+      decodeRequest(
+        WASM_OPERATION.executeSql,
+        encodeExecuteSql('SELECT 1', [], true),
+      ),
+    ).toEqual({sql: 'SELECT 1', params: [], arrayRows: true});
+  });
+
+  it('keeps every value when the buffer grows in the middle of one', () => {
+    // Enough values to cross several capacities, at every alignment of tags,
+    // numbers, and strings, and then to be let go as unusually large.
+    const params: JsonValue[] = Array.from({length: 200_000}, (_, index) =>
+      index % 3 === 0 ? index : index % 3 === 1 ? index + 0.5 : `v${index}`,
+    );
+    expect(
+      decodeRequest(
+        WASM_OPERATION.executePrepared,
+        encodeExecutePrepared(3, params, false),
+      ),
+    ).toEqual({statementId: 3, params});
+    expect(
+      decodeRequest(
+        WASM_OPERATION.executePrepared,
+        encodeExecutePrepared(4, [{a: [1, 'b']}], false),
+      ),
+    ).toEqual({statementId: 4, params: [{a: [1, 'b']}]});
   });
 
   it('rejects sparse arrays, accessors, revoked proxies, and oversized work', () => {
     const sparse = new Array<JsonValue>(1);
-    expect(() => preflightExecuteSql('SELECT $1', sparse)).toThrow(
+    expect(() => encodeExecuteSql('SELECT $1', sparse, false)).toThrow(
       expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}),
     );
 
@@ -40,40 +104,40 @@ describe('WASM request preflight', () => {
       },
     });
     expect(() =>
-      preflightExecuteSql('SELECT $1', [accessor as JsonValue]),
+      encodeExecuteSql('SELECT $1', [accessor as JsonValue], false),
     ).toThrow(expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}));
     expect(getterCalls).toBe(0);
 
     const revoked = Proxy.revocable([], {});
     revoked.revoke();
-    expect(() => preflightExecuteSql('SELECT 1', revoked.proxy)).toThrow(
+    expect(() => encodeExecuteSql('SELECT 1', revoked.proxy, false)).toThrow(
       expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}),
     );
 
-    expect(() => preflightExecuteSql('SELECT 1', new Array(1_000_001))).toThrow(
-      expect.objectContaining({code: 'RESOURCE_LIMIT'}),
-    );
-    expect(() => preflightExecuteSql('x'.repeat(16 * 1024 * 1024), [])).toThrow(
-      expect.objectContaining({code: 'RESOURCE_LIMIT'}),
-    );
+    expect(() =>
+      encodeExecuteSql('SELECT 1', new Array(1_000_001), false),
+    ).toThrow(expect.objectContaining({code: 'RESOURCE_LIMIT'}));
+    expect(() =>
+      encodeExecuteSql('x'.repeat(16 * 1024 * 1024), [], false),
+    ).toThrow(expect.objectContaining({code: 'RESOURCE_LIMIT'}));
 
     for (const invalidId of [0, -1, 1.5, 0x1_0000_0000]) {
-      expect(() => preflightExecutePrepared(invalidId, [])).toThrow(
+      expect(() => encodeExecutePrepared(invalidId, [], false)).toThrow(
         expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}),
       );
-      expect(() => preflightClosePrepared(invalidId)).toThrow(
+      expect(() => encodeClosePrepared(invalidId)).toThrow(
         expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}),
       );
     }
   });
 
-  it('checks the retained Rust-model estimate without allocating a copy', () => {
+  it('checks the retained Rust-model estimate', () => {
     // wasm32 Vec<Value> is 12 bytes and each serde_json::Value slot is 24.
     expect(() =>
-      preflightExecuteSql('SELECT', new Array<JsonValue>(699_049).fill(null)),
+      encodeExecuteSql('SELECT', new Array<JsonValue>(699_049).fill(null), false),
     ).not.toThrow();
     expect(() =>
-      preflightExecuteSql('SELECT', new Array<JsonValue>(699_050).fill(null)),
+      encodeExecuteSql('SELECT', new Array<JsonValue>(699_050).fill(null), false),
     ).toThrow(expect.objectContaining({code: 'RESOURCE_LIMIT'}));
   }, 15_000);
 
@@ -86,15 +150,17 @@ describe('WASM request preflight', () => {
       return value;
     };
 
-    expect(() => preflightExecuteSql('SELECT $1', [nested(64)])).not.toThrow();
-    expect(() => preflightExecuteSql('SELECT $1', [nested(65)])).toThrow(
+    expect(() =>
+      encodeExecuteSql('SELECT $1', [nested(64)], false),
+    ).not.toThrow();
+    expect(() => encodeExecuteSql('SELECT $1', [nested(65)], false)).toThrow(
       expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}),
     );
   });
 
   it('rejects non-finite JSON numbers', () => {
     for (const value of [Number.NaN, Number.POSITIVE_INFINITY]) {
-      expect(() => preflightExecuteSql('SELECT $1', [value])).toThrow(
+      expect(() => encodeExecuteSql('SELECT $1', [value], false)).toThrow(
         expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}),
       );
     }

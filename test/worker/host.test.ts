@@ -164,10 +164,10 @@ describe('startWorker', () => {
     const callStructured = vi.fn((_version: number, operation: number) => {
       if (operation === WASM_OPERATION.executeSql) {
         const {data, ...header} = result;
-        return `${JSON.stringify([3, 0, 0, header])}\n${data}`;
+        return `${JSON.stringify([4, 0, 0, header])}\n${data}`;
       }
       return JSON.stringify([
-        3,
+        4,
         0,
         0,
         operation === WASM_OPERATION.revision ? 0 : null,

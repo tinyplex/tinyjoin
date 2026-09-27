@@ -8,7 +8,7 @@ declare module '*tinyjoin_wasm.js' {
     callStructured(
       bridgeVersion: number,
       operation: number,
-      payload: unknown,
+      request: Uint8Array,
     ): unknown;
     free(): void;
   }

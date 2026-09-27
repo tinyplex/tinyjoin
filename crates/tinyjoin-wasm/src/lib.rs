@@ -26,13 +26,13 @@ impl WasmEngine {
         })
     }
 
-    /// Executes one versioned structured-clone request.
+    /// Executes one versioned request, written as [`structured::Request`] reads it.
     #[wasm_bindgen(js_name = callStructured)]
     pub fn call_structured(
         &mut self,
         bridge_version: u32,
         operation: u32,
-        payload: JsValue,
+        payload: &[u8],
     ) -> std::result::Result<JsValue, JsValue> {
         match self.call_structured_inner(bridge_version, operation, payload) {
             Ok(response) => Ok(response),
@@ -51,7 +51,7 @@ impl WasmEngine {
         &mut self,
         bridge_version: u32,
         operation: u32,
-        payload: JsValue,
+        payload: &[u8],
     ) -> tinyjoin_core::Result<JsValue> {
         if bridge_version != structured::VERSION {
             return Err(EngineError::new(
@@ -59,8 +59,9 @@ impl WasmEngine {
                 "Invalid structured bridge request",
             ));
         }
+        let mut request = structured::Request::new(payload);
         if operation == structured::OP_CLOSE {
-            structured::unit_payload(&payload)?;
+            request.finish()?;
             let result = match self.engine.take() {
                 Some(engine) => engine
                     .into_device()
@@ -74,76 +75,82 @@ impl WasmEngine {
         self.ensure_available()?;
         match operation {
             structured::OP_EXECUTE_SQL => {
-                let request: structured::ExecuteSqlRequest = structured::decode(payload)?;
+                let array_rows = request.flag()?;
+                let sql = request.string()?;
+                let params = request.values()?;
+                request.finish()?;
                 let was_in_transaction = self.engine()?.in_transaction();
                 let previous_revision = self.engine()?.revision();
-                let result = self
-                    .engine_mut()?
-                    .execute_sql(&request.sql, &request.params)?;
+                let result = self.engine_mut()?.execute_sql(sql, &params)?;
                 let committed = !was_in_transaction && result.revision != previous_revision;
                 self.encode_committed(
-                    structured::execute_result(&result, committed, request.array_rows),
+                    structured::execute_result(&result, committed, array_rows),
                     committed,
                 )
             }
             structured::OP_EXEC_SQL => {
-                let request: structured::ExecSqlRequest = structured::decode(payload)?;
+                let array_rows = request.flag()?;
+                let sql = request.string()?;
+                request.finish()?;
                 let was_in_transaction = self.engine()?.in_transaction();
                 let previous_revision = self.engine()?.revision();
-                let results = self.engine_mut()?.exec_sql(&request.sql)?;
+                let results = self.engine_mut()?.exec_sql(sql)?;
                 let committed =
                     !was_in_transaction && self.engine()?.revision() != previous_revision;
                 self.encode_committed(
-                    structured::execute_results(&results, committed, request.array_rows),
+                    structured::execute_results(&results, committed, array_rows),
                     committed,
                 )
             }
             structured::OP_PREPARE_SQL => {
-                let sql: String = structured::decode(payload)?;
-                let id = self.engine_mut()?.prepare_sql(&sql)?;
+                let sql = request.string()?;
+                request.finish()?;
+                let id = self.engine_mut()?.prepare_sql(sql)?;
                 structured::prepared_statement_id(id)
             }
             structured::OP_EXECUTE_PREPARED => {
-                let request: structured::ExecutePreparedRequest = structured::decode(payload)?;
+                let array_rows = request.flag()?;
+                let statement_id = request.u32()?;
+                let params = request.values()?;
+                request.finish()?;
                 let was_in_transaction = self.engine()?.in_transaction();
                 let previous_revision = self.engine()?.revision();
-                let result = self
-                    .engine_mut()?
-                    .execute_prepared(request.statement_id, &request.params)?;
+                let result = self.engine_mut()?.execute_prepared(statement_id, &params)?;
                 let committed = !was_in_transaction && result.revision != previous_revision;
                 self.encode_committed(
-                    structured::execute_result(&result, committed, request.array_rows),
+                    structured::execute_result(&result, committed, array_rows),
                     committed,
                 )
             }
             structured::OP_CLOSE_PREPARED => {
-                let id: u32 = structured::decode(payload)?;
+                let id = request.u32()?;
+                request.finish()?;
                 self.engine_mut()?.close_prepared(id)?;
                 structured::unit(false)
             }
             structured::OP_BEGIN => {
-                structured::unit_payload(&payload)?;
+                request.finish()?;
                 self.engine_mut()?.begin_transaction()?;
                 structured::unit(false)
             }
             structured::OP_COMMIT => {
-                structured::unit_payload(&payload)?;
+                request.finish()?;
                 let previous_revision = self.engine()?.revision();
                 let outcome = self.engine_mut()?.commit_transaction()?;
                 let committed = outcome.revision != previous_revision;
                 self.encode_committed(structured::apply_outcome(&outcome, committed), committed)
             }
             structured::OP_ROLLBACK => {
-                structured::unit_payload(&payload)?;
+                request.finish()?;
                 self.engine_mut()?.rollback_transaction()?;
                 structured::unit(false)
             }
             structured::OP_IN_TRANSACTION => {
-                structured::unit_payload(&payload)?;
+                request.finish()?;
                 structured::boolean(self.engine()?.in_transaction())
             }
             structured::OP_REVISION => {
-                structured::unit_payload(&payload)?;
+                request.finish()?;
                 let revision = self.engine()?.revision();
                 self.engine()?.ensure_readiness()?;
                 structured::unsigned(revision)

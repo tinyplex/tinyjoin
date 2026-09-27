@@ -120,11 +120,12 @@ Remaining, in order of expected value:
    writes a row's new record from its old one, copying the columns it does
    not assign, made 1,000 updates by key 1.27 times as fast natively and 1.14
    times in WASM, but grew the engine by 2 KiB compressed, for about 3% in
-   the browser, so it was set aside. The rest is the
-   Worker's JavaScript, a few microseconds more than SQLite's: the layers each
-   request passes through, copying requests and results between threads as
-   object graphs, and parameters crossing into WASM through
-   `serde_wasm_bindgen`.
+   the browser, so it was set aside. The rest is the Worker's JavaScript, a
+   few microseconds more than SQLite's: the layers each request passes
+   through, and copying requests and results between threads as object
+   graphs. Parameters now cross into WASM as bytes the Worker writes while it
+   checks them, rather than through `serde_wasm_bindgen`, which cost about
+   0.7 µs a statement.
 2. Bulk deletes take about twice as long as PGlite's. PGlite, like PostgreSQL,
    marks deleted rows and reclaims them later; TinyJoin removes each row and
    its index entries at once. Deleting a contiguous key or index range could

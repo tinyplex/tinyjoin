@@ -23,12 +23,13 @@ import {
 import type {WorkerEngine} from './engine.js';
 import type {PageDevice} from './page-device.js';
 import {
+  EMPTY_REQUEST,
   WasmBridgeError,
-  preflightClosePrepared,
-  preflightExecSql,
-  preflightExecutePrepared,
-  preflightExecuteSql,
-  preflightPrepareSql,
+  encodeClosePrepared,
+  encodeExecSql,
+  encodeExecutePrepared,
+  encodeExecuteSql,
+  encodePrepareSql,
 } from './wasm-preflight.js';
 
 export {WasmBridgeError} from './wasm-preflight.js';
@@ -47,7 +48,7 @@ export const WASM_OPERATION = {
   close: 11,
 } as const;
 
-const BRIDGE_VERSION = 3;
+const BRIDGE_VERSION = 4;
 const SUCCESS = 0;
 const FAILURE = 1;
 const SAFE_RESPONSE = 0;
@@ -72,7 +73,7 @@ export interface RawStructuredWasmEngine {
   callStructured(
     bridgeVersion: number,
     operation: number,
-    payload: unknown,
+    request: Uint8Array,
   ): unknown;
   free?(): void;
 }
@@ -108,8 +109,7 @@ export const normalizeWasmConstructorError = (error: unknown): unknown => {
 };
 
 /**
- * Adapts a raw engine to WorkerEngine, passing structured values straight into
- * WASM.
+ * Adapts a raw engine to WorkerEngine, writing each request as WASM reads it.
  *
  * The engine is a frozen object over closure state rather than a class: only
  * the eleven operations are observable from outside, and the state machine that
@@ -122,8 +122,8 @@ export const adaptStructuredWasmEngine = (
   let state: 'open' | 'poisoned' | 'closed' = 'open';
   let rawReleased = false;
 
-  const call = (operation: number, payload: unknown): unknown =>
-    raw.callStructured(BRIDGE_VERSION, operation, payload);
+  const call = (operation: number, request: Uint8Array): unknown =>
+    raw.callStructured(BRIDGE_VERSION, operation, request);
 
   const releaseRaw = (): void => {
     if (rawReleased) {
@@ -143,7 +143,7 @@ export const adaptStructuredWasmEngine = (
     }
     state = 'poisoned';
     try {
-      call(WASM_OPERATION.close, undefined);
+      call(WASM_OPERATION.close, EMPTY_REQUEST);
     } catch {
       // The first uncertain/fatal result remains decisive.
     }
@@ -175,18 +175,18 @@ export const adaptStructuredWasmEngine = (
   };
 
   // Callers assert first, so that a closed engine is reported before a request
-  // is measured. `mayPublish` marks the operations whose failure could have
+  // is written. `mayPublish` marks the operations whose failure could have
   // already changed durable state, and which therefore poison the engine when
   // their outcome cannot be read back.
   const invoke = <Result>(
     operation: number,
-    payload: unknown,
+    request: Uint8Array,
     mayPublish: boolean,
     decode: (value: unknown) => Result,
   ): Result => {
     let response: unknown;
     try {
-      response = call(operation, payload);
+      response = call(operation, request);
     } catch (error) {
       throw mayPublish ? poisonUnknown(error) : error;
     }
@@ -213,7 +213,7 @@ export const adaptStructuredWasmEngine = (
     }
   };
 
-  // Every operation asserts that the engine is still callable, measures its
+  // Every operation asserts that the engine is still callable, writes its
   // request, and then invokes.
   return objFreeze({
     executeSql: (
@@ -222,10 +222,9 @@ export const adaptStructuredWasmEngine = (
       rowMode?: RowMode,
     ): SqlResult => {
       assertCallable();
-      preflightExecuteSql(sql, params);
       return invoke(
         WASM_OPERATION.executeSql,
-        {sql, params, ...arrayRows(rowMode)},
+        encodeExecuteSql(sql, params, rowMode === 'array'),
         true,
         decodeSqlResult,
       );
@@ -233,10 +232,9 @@ export const adaptStructuredWasmEngine = (
 
     prepareSql: (sql: string): number => {
       assertCallable();
-      preflightPrepareSql(sql);
       return invoke(
         WASM_OPERATION.prepareSql,
-        sql,
+        encodePrepareSql(sql),
         false,
         decodePreparedStatementId,
       );
@@ -248,10 +246,9 @@ export const adaptStructuredWasmEngine = (
       rowMode?: RowMode,
     ): SqlResult => {
       assertCallable();
-      preflightExecutePrepared(statementId, params);
       return invoke(
         WASM_OPERATION.executePrepared,
-        {statementId, params, ...arrayRows(rowMode)},
+        encodeExecutePrepared(statementId, params, rowMode === 'array'),
         true,
         decodeSqlResult,
       );
@@ -259,16 +256,19 @@ export const adaptStructuredWasmEngine = (
 
     closePrepared: (statementId: number): void => {
       assertCallable();
-      preflightClosePrepared(statementId);
-      invoke(WASM_OPERATION.closePrepared, statementId, false, decodeUnit);
+      invoke(
+        WASM_OPERATION.closePrepared,
+        encodeClosePrepared(statementId),
+        false,
+        decodeUnit,
+      );
     },
 
     execSql: (sql: string, rowMode?: RowMode): SqlResult[] => {
       assertCallable();
-      preflightExecSql(sql);
       return invoke(
         WASM_OPERATION.execSql,
-        {sql, ...arrayRows(rowMode)},
+        encodeExecSql(sql, rowMode === 'array'),
         true,
         decodeSqlResults,
       );
@@ -276,24 +276,29 @@ export const adaptStructuredWasmEngine = (
 
     beginTransaction: (): void => {
       assertCallable();
-      invoke(WASM_OPERATION.begin, undefined, false, decodeUnit);
+      invoke(WASM_OPERATION.begin, EMPTY_REQUEST, false, decodeUnit);
     },
 
     commitTransaction: (): ApplyOutcome => {
       assertCallable();
-      return invoke(WASM_OPERATION.commit, undefined, true, decodeApplyOutcome);
+      return invoke(
+        WASM_OPERATION.commit,
+        EMPTY_REQUEST,
+        true,
+        decodeApplyOutcome,
+      );
     },
 
     rollbackTransaction: (): void => {
       assertCallable();
-      invoke(WASM_OPERATION.rollback, undefined, false, decodeUnit);
+      invoke(WASM_OPERATION.rollback, EMPTY_REQUEST, false, decodeUnit);
     },
 
     inTransaction: (): boolean => {
       assertCallable();
       return invoke(
         WASM_OPERATION.inTransaction,
-        undefined,
+        EMPTY_REQUEST,
         false,
         decodeBoolean,
       );
@@ -301,7 +306,12 @@ export const adaptStructuredWasmEngine = (
 
     revision: (): number => {
       assertCallable();
-      return invoke(WASM_OPERATION.revision, undefined, false, decodeRevision);
+      return invoke(
+        WASM_OPERATION.revision,
+        EMPTY_REQUEST,
+        false,
+        decodeRevision,
+      );
     },
 
     close: (): void => {
@@ -313,7 +323,7 @@ export const adaptStructuredWasmEngine = (
       state = 'closed';
       try {
         if (wasOpen) {
-          decodeUnit(call(WASM_OPERATION.close, undefined));
+          decodeUnit(call(WASM_OPERATION.close, EMPTY_REQUEST));
         }
       } finally {
         releaseRaw();
@@ -361,10 +371,6 @@ const assertNotInPageDeviceCallback = (): void => {
     );
   }
 };
-
-// WASM writes a statement's rows only as requested, as objects by default.
-const arrayRows = (rowMode: RowMode | undefined): {arrayRows?: true} =>
-  rowMode === 'array' ? {arrayRows: true} : {};
 
 /**
  * Reads one response, whose first line is the JSON text of its `[version,

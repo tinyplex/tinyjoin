@@ -1,11 +1,10 @@
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
 use serde_json::{Map, Number, Value};
 use tinyjoin_core::{ApplyOutcome, EngineError, ExecuteResult, Result, Row};
 use wasm_bindgen::JsValue;
 
-pub(crate) const VERSION: u32 = 3;
+pub(crate) const VERSION: u32 = 4;
 
 pub(crate) const OP_EXECUTE_SQL: u32 = 1;
 pub(crate) const OP_EXEC_SQL: u32 = 2;
@@ -28,41 +27,123 @@ const MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DEPTH: usize = 64;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ExecuteSqlRequest {
-    pub(crate) sql: String,
-    pub(crate) params: Vec<Value>,
-    #[serde(default)]
-    pub(crate) array_rows: bool,
+const TAG_NULL: u8 = 0;
+const TAG_FALSE: u8 = 1;
+const TAG_TRUE: u8 = 2;
+const TAG_INTEGER: u8 = 3;
+const TAG_FLOAT: u8 = 5;
+const TAG_STRING: u8 = 6;
+const TAG_ARRAY: u8 = 7;
+const TAG_OBJECT: u8 = 8;
+
+/// A request, read from the bytes the Worker wrote for it. A number is little-endian, a string is
+/// its UTF-8 length as a u32 and then its bytes, a list is its length as a u32 and then its items,
+/// and a JSON value is a tag byte and then its content: nothing for null and the booleans, the
+/// eight bytes of a float for a number, which is an integer where its tag says so, and a string,
+/// or a list of values, or a list of keys each followed by its value.
+pub(crate) struct Request<'a> {
+    bytes: &'a [u8],
+    at: usize,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ExecutePreparedRequest {
-    pub(crate) statement_id: u32,
-    pub(crate) params: Vec<Value>,
-    #[serde(default)]
-    pub(crate) array_rows: bool,
-}
+impl<'a> Request<'a> {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, at: 0 }
+    }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ExecSqlRequest {
-    pub(crate) sql: String,
-    #[serde(default)]
-    pub(crate) array_rows: bool,
-}
+    fn take(&mut self, count: usize) -> Result<&'a [u8]> {
+        let end = self
+            .at
+            .checked_add(count)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or_else(invalid)?;
+        let bytes = &self.bytes[self.at..end];
+        self.at = end;
+        Ok(bytes)
+    }
 
-pub(crate) fn decode<T: for<'de> Deserialize<'de>>(payload: JsValue) -> Result<T> {
-    serde_wasm_bindgen::from_value(payload).map_err(|_| invalid())
-}
+    pub(crate) fn flag(&mut self) -> Result<bool> {
+        match self.take(1)? {
+            [0] => Ok(false),
+            [1] => Ok(true),
+            _ => Err(invalid()),
+        }
+    }
 
-pub(crate) fn unit_payload(payload: &JsValue) -> Result<()> {
-    if payload.is_undefined() {
-        Ok(())
-    } else {
-        Err(invalid())
+    pub(crate) fn u32(&mut self) -> Result<u32> {
+        let bytes = self.take(4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn f64(&mut self) -> Result<f64> {
+        let bytes = self.take(8)?;
+        let mut raw = [0; 8];
+        raw.copy_from_slice(bytes);
+        Ok(f64::from_le_bytes(raw))
+    }
+
+    pub(crate) fn string(&mut self) -> Result<&'a str> {
+        let length = self.u32()? as usize;
+        std::str::from_utf8(self.take(length)?).map_err(|_| invalid())
+    }
+
+    /// A list of JSON values, such as a statement's parameters.
+    pub(crate) fn values(&mut self) -> Result<Vec<Value>> {
+        self.list(0)
+    }
+
+    fn list(&mut self, depth: usize) -> Result<Vec<Value>> {
+        let count = self.u32()? as usize;
+        // Every value takes at least its tag, so a count past the bytes left is malformed, and
+        // never reserves more than the request holds.
+        if count > self.bytes.len() - self.at {
+            return Err(invalid());
+        }
+        let mut values = Vec::with_capacity(count);
+        for _ in 0..count {
+            values.push(self.value(depth)?);
+        }
+        Ok(values)
+    }
+
+    fn value(&mut self, depth: usize) -> Result<Value> {
+        if depth > MAX_DEPTH {
+            return Err(invalid());
+        }
+        Ok(match self.take(1)?[0] {
+            TAG_NULL => Value::Null,
+            TAG_FALSE => Value::Bool(false),
+            TAG_TRUE => Value::Bool(true),
+            TAG_INTEGER => {
+                let value = self.f64()?;
+                if value.fract() != 0.0 || value.abs() > MAX_SAFE_INTEGER as f64 {
+                    return Err(invalid());
+                }
+                Value::from(value as i64)
+            }
+            TAG_FLOAT => Value::Number(Number::from_f64(self.f64()?).ok_or_else(invalid)?),
+            TAG_STRING => Value::String(self.string()?.to_owned()),
+            TAG_ARRAY => Value::Array(self.list(depth + 1)?),
+            TAG_OBJECT => {
+                let count = self.u32()?;
+                let mut object = Map::new();
+                for _ in 0..count {
+                    let key = self.string()?.to_owned();
+                    object.insert(key, self.value(depth + 1)?);
+                }
+                Value::Object(object)
+            }
+            _ => return Err(invalid()),
+        })
+    }
+
+    /// Checks that nothing follows what was read.
+    pub(crate) fn finish(self) -> Result<()> {
+        if self.at == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(invalid())
+        }
     }
 }
 
@@ -499,7 +580,7 @@ mod tests {
 
     #[test]
     fn operation_numbers_are_dense_and_stable() {
-        assert_eq!(VERSION, 3);
+        assert_eq!(VERSION, 4);
         assert_eq!(
             [
                 OP_EXECUTE_SQL,
@@ -533,12 +614,12 @@ mod tests {
         assert_eq!(
             written(std::slice::from_ref(&rows), false, false).unwrap(),
             format!(
-                "[3,0,1,{header}]\n{fields},\"rows\":[{{\"title\":\"one\",\"id\":1}},{{\"title\":null,\"id\":2}}]}}"
+                "[4,0,1,{header}]\n{fields},\"rows\":[{{\"title\":\"one\",\"id\":1}},{{\"title\":null,\"id\":2}}]}}"
             )
         );
         assert_eq!(
             written(std::slice::from_ref(&rows), true, false).unwrap(),
-            format!("[3,0,1,{header}]\n{fields},\"rows\":[[\"one\",1],[null,2]]}}")
+            format!("[4,0,1,{header}]\n{fields},\"rows\":[[\"one\",1],[null,2]]}}")
         );
 
         let empty = ExecuteResult {
@@ -553,7 +634,7 @@ mod tests {
         assert_eq!(
             written(&[empty.clone(), empty], false, true).unwrap(),
             [
-                r#"[3,0,1,[{"command":"UPDATE","revision":8,"rowCount":3,"tables":[],"keys":{}},{"command":"UPDATE","revision":8,"rowCount":3,"tables":[],"keys":{}}]]"#,
+                r#"[4,0,1,[{"command":"UPDATE","revision":8,"rowCount":3,"tables":[],"keys":{}},{"command":"UPDATE","revision":8,"rowCount":3,"tables":[],"keys":{}}]]"#,
                 r#"{"fields":[],"rows":[]}"#,
                 r#"{"fields":[],"rows":[]}"#,
             ]
@@ -622,34 +703,59 @@ mod tests {
         let error = EngineError::new("CONSTRAINT", "a \"quoted\" failure").with_retryable(true);
         assert_eq!(
             error_text(&error),
-            r#"[3,1,0,{"code":"CONSTRAINT","message":"a \"quoted\" failure","retryable":true}]"#
+            r#"[4,1,0,{"code":"CONSTRAINT","message":"a \"quoted\" failure","retryable":true}]"#
         );
         assert_eq!(
             error_text(&EngineError::new("HUGE", "x".repeat(MAX_BYTES))),
-            r#"[3,1,0,{"code":"BRIDGE_SERIALIZATION_ERROR","message":"TinyJoin could not encode a structured bridge error","retryable":false}]"#
+            r#"[4,1,0,{"code":"BRIDGE_SERIALIZATION_ERROR","message":"TinyJoin could not encode a structured bridge error","retryable":false}]"#
         );
     }
 
     #[test]
-    fn operation_payload_structs_keep_exact_camel_case_shapes() {
-        let request: ExecutePreparedRequest = serde_json::from_value(json!({
-            "statementId": 7,
-            "params": [1, "two"],
-        }))
-        .unwrap();
-        assert_eq!(request.statement_id, 7);
-        assert_eq!(request.params, [json!(1), json!("two")]);
-        assert!(!request.array_rows);
-        let request: ExecSqlRequest =
-            serde_json::from_value(json!({"sql": "SELECT 1", "arrayRows": true})).unwrap();
-        assert!(request.array_rows);
-        assert!(
-            serde_json::from_value::<ExecutePreparedRequest>(json!({
-                "statementId": 7,
-                "params": [],
-                "extra": true,
-            }))
-            .is_err()
+    fn requests_read_exactly_the_values_written() {
+        let mut bytes = vec![1, 7, 0, 0, 0, 3, 0, 0, 0];
+        bytes.push(TAG_INTEGER);
+        bytes.extend_from_slice(&(-0.0_f64).to_le_bytes());
+        bytes.push(TAG_FLOAT);
+        bytes.extend_from_slice(&0.9856906946328695_f64.to_le_bytes());
+        bytes.push(TAG_OBJECT);
+        bytes.extend_from_slice(&2_u32.to_le_bytes());
+        for (key, value) in [("b", TAG_TRUE), ("a", TAG_NULL)] {
+            bytes.extend_from_slice(&1_u32.to_le_bytes());
+            bytes.extend_from_slice(key.as_bytes());
+            bytes.push(value);
+        }
+        let mut request = Request::new(&bytes);
+        assert!(request.flag().unwrap());
+        assert_eq!(request.u32().unwrap(), 7);
+        let values = request.values().unwrap();
+        request.finish().unwrap();
+        assert_eq!(
+            values,
+            [
+                json!(0),
+                json!(0.9856906946328695),
+                json!({"a": null, "b": true})
+            ]
         );
+        assert!(values[0].is_u64());
+
+        // Truncated, trailing, unsafe, and unknown content is refused.
+        for malformed in [
+            &bytes[..bytes.len() - 1],
+            &[bytes.as_slice(), &[0]].concat()[..],
+            &[0, 1, 0, 0, 0, TAG_INTEGER, 0, 0, 0, 0, 0, 0, 0x40, 0x43][..],
+            &[0, 1, 0, 0, 0, TAG_INTEGER, 0, 0, 0, 0, 0, 0, 0xf8, 0x3f][..],
+            &[0, 1, 0, 0, 0, 4][..],
+            &[0, 255, 255, 255, 255][..],
+            &[2][..],
+        ] {
+            let mut request = Request::new(malformed);
+            let read = request
+                .flag()
+                .and_then(|_| request.values())
+                .and_then(|_| request.finish());
+            assert_eq!(read.unwrap_err().code, "INVALID_BRIDGE_VALUE");
+        }
     }
 }
