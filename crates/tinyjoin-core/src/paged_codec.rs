@@ -38,6 +38,9 @@ const RECORD_HAS_NULLS: u8 = 0b0000_0100;
 /// any of these bits, or an unknown one, is rejected until a sync protocol defines them.
 const RECORD_RESERVED: u8 = 0b1111_1000;
 const RECORD_HEADER_BYTES: usize = 2;
+/// The record of a row whose every stored column holds its default, which reads the columns of
+/// any primary key as a whole row would.
+pub(crate) const EMPTY_RECORD: &[u8] = &[0, 0];
 
 const RECORD_VERSION: u8 = 1;
 const RECORD_FLAGS: u8 = 0;
@@ -272,8 +275,32 @@ pub(crate) fn encode_record_index_entry(
     positions: &[usize],
     record: &StoredRecord<'_>,
 ) -> Result<Option<(Vec<u8>, usize)>> {
+    let Some(mut key) = encode_record_index_tuple(positions, record, record.key.len())? else {
+        return Ok(None);
+    };
+    let tuple = key.len();
+    key.extend_from_slice(record.key);
+    validate_key_size(&key)?;
+    Ok(Some((key, tuple)))
+}
+
+/// Encodes a stored row's indexed tuple, as [`encode_secondary_index_prefix`] encodes the row the
+/// record decodes to, reading only the indexed columns, at `positions`.
+pub(crate) fn encode_record_index_prefix(
+    positions: &[usize],
+    record: &StoredRecord<'_>,
+) -> Result<Option<Vec<u8>>> {
+    encode_record_index_tuple(positions, record, 0)
+}
+
+/// The indexed tuple of a stored row, with room for `spare` more bytes.
+fn encode_record_index_tuple(
+    positions: &[usize],
+    record: &StoredRecord<'_>,
+    spare: usize,
+) -> Result<Option<Vec<u8>>> {
     let schema = record.schema;
-    let mut key = Vec::with_capacity(16 * positions.len() + record.key.len());
+    let mut key = Vec::with_capacity(16 * positions.len() + spare);
     for position in positions {
         let value = record.column(*position)?;
         if value.is_null() {
@@ -289,10 +316,7 @@ pub(crate) fn encode_record_index_entry(
         )?;
         validate_key_size(&key)?;
     }
-    let tuple = key.len();
-    key.extend_from_slice(record.key);
-    validate_key_size(&key)?;
-    Ok(Some((key, tuple)))
+    Ok(Some(key))
 }
 
 /// Encodes one value as a key component of `data_type`, to bound a range of keys. Components compare
@@ -519,6 +543,17 @@ pub(crate) struct StoredEntry {
 }
 
 impl StoredEntry {
+    /// An entry of the encoded primary key `key` and the record `value`.
+    pub(crate) fn new(key: &[u8], value: &[u8]) -> Self {
+        let mut bytes = Vec::with_capacity(key.len() + value.len());
+        bytes.extend_from_slice(key);
+        bytes.extend_from_slice(value);
+        Self {
+            bytes: bytes.into_boxed_slice(),
+            key_length: key.len(),
+        }
+    }
+
     /// The encoded primary key.
     pub(crate) fn key(&self) -> &[u8] {
         &self.bytes[..self.key_length]
@@ -594,13 +629,7 @@ impl<'a> StoredRecord<'a> {
 
     /// A copy of the entry, its key and record, to read in place again later.
     pub(crate) fn to_entry(self) -> StoredEntry {
-        let mut bytes = Vec::with_capacity(self.key.len() + self.value.len());
-        bytes.extend_from_slice(self.key);
-        bytes.extend_from_slice(self.value);
-        StoredEntry {
-            bytes: bytes.into_boxed_slice(),
-            key_length: self.key.len(),
-        }
+        StoredEntry::new(self.key, self.value)
     }
 
     /// The value of the column at `index`, in schema order.

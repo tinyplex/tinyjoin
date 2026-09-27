@@ -14,7 +14,7 @@ use crate::{
         CATALOG_TREE_ID, CatalogHeader, CatalogIndexRecord, IndexEntry, IndexEntryLayout,
         MAX_CATALOG_INDEXES, MAX_CATALOG_TABLES, MAX_TREE_ID, encode_catalog_header_record,
         encode_catalog_index_key, encode_catalog_index_record, encode_catalog_table_key,
-        encode_primary_key, encode_record_index_entry, encode_row,
+        encode_primary_key, encode_record_index_entry, encode_record_index_prefix, encode_row,
         encode_secondary_index_entry_key, encode_secondary_index_prefix, index_column_positions,
         leading_key_component, secondary_index_entry_matches_prefix, secondary_index_primary_key,
         secondary_index_primary_key_for_definition,
@@ -47,19 +47,23 @@ pub(crate) struct ScriptPublication {
     pub(crate) results: Vec<ExecuteResult>,
 }
 
-/// A row a write changes: the row its key held, and the row it holds after, where `None` is no
-/// row.
+/// A row a write changes: the row its key held, and the record of the row it holds after, where
+/// `None` is no row.
+#[derive(Clone)]
 pub(crate) struct ChangedRow {
     pub(crate) old: Option<HeldRow>,
-    pub(crate) next: Option<Row>,
+    pub(crate) next: Option<Vec<u8>>,
 }
 
 /// Changed rows by table and encoded primary key.
-pub(crate) type ChangedRows = BTreeMap<String, BTreeMap<Vec<u8>, ChangedRow>>;
+type ChangedRows = BTreeMap<String, BTreeMap<Vec<u8>, ChangedRow>>;
+
+/// The rows a write changes in one table, each with its encoded primary key, in key order.
+pub(crate) type TableChanges<'a> = (&'a str, Vec<(&'a [u8], &'a ChangedRow)>);
 
 /// The estimated bytes of a row a writer holds, which [`estimated_row_bytes`] finds for it as a
 /// map, reading a stored entry in place.
-fn held_row_bytes(table: &PagedTable, row: &HeldRow) -> Result<usize> {
+pub(crate) fn held_row_bytes(table: &PagedTable, row: &HeldRow) -> Result<usize> {
     match row {
         HeldRow::Map(row) => estimated_row_bytes(row),
         HeldRow::Stored(entry) => {
@@ -117,7 +121,7 @@ pub(crate) fn execute_changed_rows<D: PageDevice>(
     next_tree_id: TreeId,
     tables: Rc<BTreeMap<String, PagedTable>>,
     indexes: Rc<BTreeMap<String, PagedIndex>>,
-    changes: &ChangedRows,
+    changes: &[TableChanges<'_>],
 ) -> Result<ScriptPublication> {
     let mut candidate = begin_candidate(pager, base_revision, next_tree_id, tables, indexes)?;
     let execution = (|| {
@@ -481,20 +485,30 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                     "SQL statement would write canonical primary key in `{table_name}` more than once"
                 )));
             }
-            let next = (!is_delete).then_some(row);
+            // The row is retained as its record, charged as the map it was planned as.
+            let next_bytes = if is_delete {
+                0
+            } else {
+                estimated_row_bytes(&row)?
+            };
+            let next = (!is_delete)
+                .then(|| encode_row(&table.schema, &row))
+                .transpose()?;
             let table_changes = changes.entry(table_name.clone()).or_default();
             let slot = match table_changes.entry(key) {
                 Entry::Occupied(mut existing) => {
-                    let existing = existing.get_mut();
-                    let previous_bytes =
-                        existing.next.as_ref().map_or(Ok(0), estimated_row_bytes)?;
-                    let next_bytes = next.as_ref().map_or(Ok(0), estimated_row_bytes)?;
+                    let previous_bytes = match &existing.get().next {
+                        Some(record) => {
+                            estimated_record_bytes(&table.record(existing.key(), record)?)?
+                        }
+                        None => 0,
+                    };
                     retained_bytes = retained_bytes
                         .checked_sub(previous_bytes)
                         .and_then(|bytes| bytes.checked_add(next_bytes))
                         .ok_or_else(batch_too_large)?;
                     ensure_batch_bytes(retained_bytes)?;
-                    existing.next = next;
+                    existing.get_mut().next = next;
                     continue;
                 }
                 Entry::Vacant(slot) => slot,
@@ -514,7 +528,6 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             let old_bytes = old
                 .as_ref()
                 .map_or(Ok(0), |old| held_row_bytes(table, old))?;
-            let next_bytes = next.as_ref().map_or(Ok(0), estimated_row_bytes)?;
             retained_bytes = retained_bytes
                 .checked_add(slot.key().len())
                 .and_then(|bytes| bytes.checked_add(old_bytes))
@@ -525,6 +538,13 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             slot.insert(ChangedRow { old, next });
         }
         self.validate_changed_unique_indexes(&changes, retained_bytes)?;
+        let changes = changes
+            .iter()
+            .map(|(table, rows)| {
+                let rows = rows.iter().map(|(key, row)| (key.as_slice(), row));
+                (table.as_str(), rows.collect())
+            })
+            .collect::<Vec<_>>();
         self.apply_row_changes(&changes)
     }
 
@@ -540,13 +560,16 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 .values()
                 .filter(|index| index.definition.table == *table_name && index.definition.unique)
             {
+                let positions = index_column_positions(&table.schema, &index.definition)?;
                 let mut changed_prefixes = BTreeMap::<Vec<u8>, &[u8]>::new();
                 for (primary_key, change) in table_changes {
-                    let Some(row) = &change.next else {
+                    let Some(record) = &change.next else {
                         continue;
                     };
-                    let Some(prefix) =
-                        encode_secondary_index_prefix(&table.schema, &index.definition, row)?
+                    let Some(prefix) = encode_record_index_prefix(
+                        &positions,
+                        &table.record(primary_key, record)?,
+                    )?
                     else {
                         continue;
                     };
@@ -571,13 +594,9 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                         let existing_moves = match table_changes.get(&existing_primary_key) {
                             Some(existing) => match &existing.next {
                                 None => true,
-                                Some(row) => {
-                                    encode_secondary_index_prefix(
-                                        &table.schema,
-                                        &index.definition,
-                                        row,
-                                    )?
-                                    .as_deref()
+                                Some(record) => {
+                                    let record = table.record(&existing_primary_key, record)?;
+                                    encode_record_index_prefix(&positions, &record)?.as_deref()
                                         != Some(prefix.as_slice())
                                 }
                             },
@@ -593,38 +612,28 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         Ok(())
     }
 
-    fn apply_row_changes(&mut self, changes: &ChangedRows) -> Result<()> {
+    /// Writes each table's changed rows, and its indexes' entries for them. Each table's changes
+    /// are in key order, which is the table's tree order.
+    fn apply_row_changes(&mut self, changes: &[TableChanges<'_>]) -> Result<()> {
         for (table_name, table_changes) in changes {
             let table = Rc::make_mut(&mut self.tables)
-                .get_mut(table_name)
+                .get_mut(*table_name)
                 .ok_or_else(|| EngineError::table_not_found(table_name))?;
             let mut transaction = self.transaction.borrow_mut();
-            // The changes are keyed by encoded primary key, so they are already in tree order.
-            let values = table_changes
-                .values()
-                .map(|change| {
-                    change
-                        .next
-                        .as_ref()
-                        .map(|row| encode_row(&table.schema, row))
-                        .transpose()
-                })
-                .collect::<Result<Vec<_>>>()?;
             let batch = table_changes
-                .keys()
-                .zip(&values)
-                .map(|(key, value)| BatchChange {
+                .iter()
+                .map(|(key, change)| BatchChange {
                     key,
-                    value: value.as_deref(),
+                    value: change.next.as_deref(),
                 })
                 .collect::<Vec<_>>();
             let inserted = table_changes
-                .values()
-                .filter(|change| change.old.is_none() && change.next.is_some())
+                .iter()
+                .filter(|(_, change)| change.old.is_none() && change.next.is_some())
                 .count();
             let removed = table_changes
-                .values()
-                .filter(|change| change.old.is_some() && change.next.is_none())
+                .iter()
+                .filter(|(_, change)| change.old.is_some() && change.next.is_none())
                 .count();
             let applied =
                 Btree::apply(&mut transaction, table.root_page_id, table.tree_id, &batch)?;
@@ -646,7 +655,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 // Entries end with their row's primary key, so no two changes share one.
                 let positions = index_column_positions(&table.schema, &index.definition)?;
                 let mut entries = Vec::new();
-                for change in table_changes.values() {
+                for (key, change) in table_changes {
                     let old_key = match &change.old {
                         None => None,
                         Some(HeldRow::Map(row)) => {
@@ -658,14 +667,13 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                         )?
                         .map(|(key, _)| key),
                     };
-                    let next_key = change
-                        .next
-                        .as_ref()
-                        .map(|row| {
-                            encode_secondary_index_entry_key(&table.schema, &index.definition, row)
-                        })
-                        .transpose()?
-                        .flatten();
+                    let next_key = match &change.next {
+                        Some(record) => {
+                            encode_record_index_entry(&positions, &table.record(key, record)?)?
+                                .map(|(key, _)| key)
+                        }
+                        None => None,
+                    };
                     if old_key == next_key {
                         continue;
                     }

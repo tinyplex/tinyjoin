@@ -41,6 +41,27 @@ fn delete(id: i64) -> RowChange {
     }
 }
 
+/// What an entry retains, found from the maps its rows decode to, independently of the estimates
+/// staging makes as it encodes them.
+fn decoded_retained_bytes(
+    storage: &PagedStorage<MemoryPageDevice>,
+    table: &str,
+    key: &[u8],
+    entry: &OverlayEntry,
+) -> usize {
+    let paged = storage.table(table).unwrap();
+    let decoded = |value: &[u8]| {
+        estimated_row_bytes(&paged.record(key, value).unwrap().to_row().unwrap()).unwrap()
+    };
+    let base_bytes = match &entry.row.old {
+        None => 0,
+        Some(HeldRow::Map(row)) => estimated_row_bytes(row).unwrap(),
+        Some(HeldRow::Stored(stored)) => decoded(stored.value()),
+    };
+    let next_bytes = entry.row.next.as_deref().map_or(0, decoded);
+    retained_bytes(table, key, base_bytes, next_bytes).unwrap()
+}
+
 /// Stages a statement by validating the whole write set it leaves, as the reference for the
 /// totals [`PagedTransaction::stage`] keeps.
 fn stage_with_full_validation(
@@ -64,12 +85,21 @@ fn stage_with_full_validation(
     let (mut keys, mut bytes) = (0, 0);
     for (table, entries) in &entries {
         for (key, entry) in entries {
-            retain_entry(&mut keys, &mut bytes, retained_bytes(table, key, entry)?)?;
+            retain_entry(
+                &mut keys,
+                &mut bytes,
+                decoded_retained_bytes(storage, table, key, entry),
+            )?;
         }
     }
-    storage.validate_row_write_set(&changes_from_entries(entries.iter().flat_map(
-        |(table, entries)| entries.values().map(move |entry| (table.as_str(), entry)),
-    )))?;
+    storage.validate_row_write_set(&changes_from_entries(
+        storage,
+        entries.iter().flat_map(|(table, entries)| {
+            entries
+                .iter()
+                .map(move |(key, entry)| (table.as_str(), key.as_slice(), entry))
+        }),
+    ))?;
     for (table, patched) in patch.entries {
         transaction.touched_tables.insert(table.clone());
         transaction
@@ -87,7 +117,7 @@ fn compare_stage(
     reference: &mut PagedTransaction,
     changes: Vec<RowChange>,
 ) -> Option<String> {
-    let before = staged.changes();
+    let before = staged.changes(storage);
     let touched = staged.touched_tables();
     let actual = staged.stage(storage, changes.clone(), Vec::new());
     let expected = stage_with_full_validation(storage, reference, changes);
@@ -95,7 +125,7 @@ fn compare_stage(
         actual.as_ref().err().map(|error| &error.code),
         expected.as_ref().err().map(|error| &error.code)
     );
-    assert_eq!(staged.changes(), reference.changes());
+    assert_eq!(staged.changes(storage), reference.changes(storage));
     assert_eq!(staged.touched_tables(), reference.touched_tables());
     for table in ["items", "other"] {
         assert_eq!(
@@ -108,14 +138,16 @@ fn compare_stage(
         );
     }
     if actual.is_err() {
-        assert_eq!(staged.changes(), before);
+        assert_eq!(staged.changes(storage), before);
         assert_eq!(staged.touched_tables(), touched);
     }
     // The whole-write-set validator is an independent oracle for every total the transaction keeps
     // statement by statement: the three retention estimates, row, index and catalog operations,
     // unique claims, and the overlay's own retention.
     let totals = &staged.totals;
-    let full = storage.validate_row_write_set(&staged.changes()).unwrap();
+    let full = storage
+        .validate_row_write_set(&staged.changes(storage))
+        .unwrap();
     let usage = storage
         .write_set_usage(
             totals.usage,
@@ -135,7 +167,7 @@ fn compare_stage(
     for (table, entries) in &staged.entries {
         for (key, entry) in entries {
             keys += 1;
-            bytes += retained_bytes(table, key, entry).unwrap();
+            bytes += decoded_retained_bytes(storage, table, key, entry);
         }
     }
     assert_eq!(totals.overlay_keys, keys);

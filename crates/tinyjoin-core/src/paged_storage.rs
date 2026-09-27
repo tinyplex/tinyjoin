@@ -5,6 +5,8 @@ use std::{
 };
 
 #[cfg(test)]
+use crate::RowChange;
+#[cfg(test)]
 use crate::paged_codec::{
     CatalogHeader, encode_catalog_header_record, encode_catalog_index_record,
 };
@@ -12,18 +14,18 @@ use crate::paged_codec::{
 use crate::storage::preflight_row_write_set;
 use crate::{
     ApplyOutcome, Btree, ColumnType, EngineError, ExecuteResult, IndexDefinition, PageDevice,
-    PageId, Pager, Result, Row, RowChange, StorageReader, TableDefinition, TreeId, VisitControl,
-    VisitOutcome,
+    PageId, Pager, Result, Row, StorageReader, TableDefinition, TreeId, VisitControl, VisitOutcome,
     paged_codec::{
         CATALOG_TREE_ID, CatalogIndexRecord, CatalogKey, CatalogTableRecord, FIRST_USER_TREE_ID,
-        IndexEntry, IndexEntryLayout, RecordLayout, StoredRecord, decode_catalog_header_record,
-        decode_catalog_index_record, decode_catalog_key, decode_catalog_table_record,
-        encode_catalog_schema, encode_catalog_table_record_with_schema, encode_primary_key,
-        encode_secondary_index_entry_key, encode_secondary_index_prefix, index_entry_primary_key,
-        leading_key_component, secondary_index_entry_matches_prefix, secondary_index_primary_key,
-        secondary_index_primary_key_for_definition,
+        IndexEntry, IndexEntryLayout, RecordLayout, StoredEntry, StoredRecord,
+        decode_catalog_header_record, decode_catalog_index_record, decode_catalog_key,
+        decode_catalog_table_record, encode_catalog_schema,
+        encode_catalog_table_record_with_schema, encode_primary_key, encode_record_index_prefix,
+        encode_secondary_index_entry_key, encode_secondary_index_prefix, index_column_positions,
+        index_entry_primary_key, leading_key_component, secondary_index_entry_matches_prefix,
+        secondary_index_primary_key, secondary_index_primary_key_for_definition,
     },
-    row::{HeldRow, RowRef},
+    row::{HeldRow, RowRef, ValueRef},
     storage::{KeyOrder, KeyRange, RowWriteUsage, normalize_row, preflight_row_write},
 };
 /// A callback for each key and value of a B-tree entry, which says whether to go on.
@@ -391,6 +393,7 @@ impl<D: PageDevice> PagedStorage<D> {
     /// SQL planning still uses JSON-shaped logical keys for its in-memory compatibility path, but
     /// typed page keys intentionally canonicalize aliases such as FLOAT `0`, `0.0`, and `-0.0`.
     /// A delete followed by an upsert remains valid for a primary-key spelling change.
+    #[cfg(test)]
     pub(crate) fn validate_sql_row_change_sequence(
         &self,
         input_changes: &[RowChange],
@@ -416,32 +419,42 @@ impl<D: PageDevice> PagedStorage<D> {
         Ok(())
     }
 
-    /// Validates one change of a transaction's write set, whose committed row is `base`, and
-    /// measures what it adds to the write set's usage exactly as [`Self::validate_row_write_set`]
-    /// does for each change. The catalog operations charged once per changed table are left to
-    /// [`Self::write_set_usage`], and conflicts between claims to the caller.
-    /// A row planning held for a writer of `table_name`, as a map.
-    pub(crate) fn held_row(&self, table_name: &str, row: HeldRow) -> Result<Row> {
-        match row {
-            HeldRow::Map(row) => Ok(row),
-            HeldRow::Stored(entry) => self
-                .tables
-                .get(table_name)
-                .ok_or_else(|| EngineError::table_not_found(table_name))?
-                .record(entry.key(), entry.value())?
-                .to_row(),
-        }
+    /// The table `name`, as the committed catalog describes it.
+    pub(crate) fn table(&self, name: &str) -> Result<&PagedTable> {
+        self.tables
+            .get(name)
+            .ok_or_else(|| EngineError::table_not_found(name))
     }
 
-    /// What a change to a row of `table_name` costs a write set: an upsert of `next`, which
-    /// planning normalized, or where `next` is `None`, a delete of the key `key`. `base` is the
-    /// committed row the change replaces.
+    /// The committed row the encoded primary key `key` holds in `table_name`, as its stored entry.
+    pub(crate) fn committed_entry(
+        &self,
+        table_name: &str,
+        key: &[u8],
+    ) -> Result<Option<StoredEntry>> {
+        self.ensure_ready()?;
+        let table = self.table(table_name)?;
+        let Some(root) = table.root_page_id else {
+            return Ok(None);
+        };
+        Btree::get(&mut self.pager.borrow_mut(), root, table.tree_id, key)?
+            .map(|value| Ok(table.record(key, &value)?.to_entry()))
+            .transpose()
+    }
+
+    /// Validates one change of a transaction's write set, and measures what it adds to the write
+    /// set's usage exactly as [`Self::validate_row_write_set`] does for each change: an upsert of
+    /// `row`, which planning normalized, or where `is_delete`, a delete of the key `row`. `key` is
+    /// the row's encoded primary key, and `base` the committed row the change replaces. The catalog
+    /// operations charged once per changed table are left to [`Self::write_set_usage`], and
+    /// conflicts between claims to the caller.
     pub(crate) fn change_cost(
         &self,
         table_name: &str,
-        next: Option<&Row>,
-        key: &Row,
-        base: Option<&Row>,
+        row: &Row,
+        is_delete: bool,
+        key: &[u8],
+        base: Option<&HeldRow>,
     ) -> Result<ChangeCost> {
         self.ensure_ready()?;
         #[cfg(test)]
@@ -460,10 +473,6 @@ impl<D: PageDevice> PagedStorage<D> {
             .iter()
             .map(|index| &index.definition)
             .collect::<Vec<_>>();
-        let (row, is_delete) = match next {
-            Some(row) => (row, false),
-            None => (key, true),
-        };
         let row_write = preflight_row_write(
             table_name,
             &table.schema,
@@ -472,18 +481,20 @@ impl<D: PageDevice> PagedStorage<D> {
             &definitions,
             RowWriteUsage::default(),
         )?;
+        let row_bytes = estimated_row_bytes(row)?;
         let input_bytes = table_name
             .len()
-            .checked_add(estimated_row_bytes(row)?)
+            .checked_add(row_bytes)
             .and_then(|bytes| bytes.checked_add(64))
             .ok_or_else(batch_too_large)?;
-        let key = encode_primary_key(&table.schema, row)?;
-        let base_bytes = base.map_or(Ok(0), estimated_row_bytes)?;
-        let next_bytes = if is_delete {
-            0
-        } else {
-            estimated_row_bytes(row)?
+        let base_bytes = match base {
+            None => 0,
+            Some(HeldRow::Map(base)) => estimated_row_bytes(base)?,
+            Some(HeldRow::Stored(base)) => {
+                estimated_record_batch_bytes(&table.record(base.key(), base.value())?)?
+            }
         };
+        let next_bytes = if is_delete { 0 } else { row_bytes };
         let mut prepared_bytes = key
             .len()
             .checked_add(base_bytes)
@@ -533,23 +544,25 @@ impl<D: PageDevice> PagedStorage<D> {
     pub(crate) fn unique_values(
         &self,
         table_name: &str,
-        row: &Row,
+        row: &HeldRow,
     ) -> Result<Vec<(TreeId, Vec<u8>)>> {
-        let table = self
-            .tables
-            .get(table_name)
-            .ok_or_else(|| EngineError::table_not_found(table_name))?;
+        let table = self.table(table_name)?;
         let mut values = Vec::new();
         for index in self
             .indexes
             .values()
             .filter(|index| index.definition.table == table_name && index.definition.unique)
         {
-            if let Some(prefix) =
-                encode_secondary_index_prefix(&table.schema, &index.definition, row)?
-            {
-                values.push((index.tree_id, prefix));
-            }
+            let prefix = match row {
+                HeldRow::Map(row) => {
+                    encode_secondary_index_prefix(&table.schema, &index.definition, row)?
+                }
+                HeldRow::Stored(entry) => encode_record_index_prefix(
+                    &index_column_positions(&table.schema, &index.definition)?,
+                    &table.record(entry.key(), entry.value())?,
+                )?,
+            };
+            values.extend(prefix.map(|prefix| (index.tree_id, prefix)));
         }
         Ok(values)
     }
@@ -736,6 +749,7 @@ impl<D: PageDevice> PagedStorage<D> {
     ) -> Result<ApplyOutcome> {
         self.ensure_ready()?;
         let changes = transaction.changed_rows();
+        let keys = transaction.changed_keys(self)?;
         let publication = {
             let mut pager = self.pager.borrow_mut();
             crate::paged_script::execute_changed_rows(
@@ -751,7 +765,7 @@ impl<D: PageDevice> PagedStorage<D> {
         Ok(ApplyOutcome {
             revision,
             tables: transaction.touched_tables().into_iter().collect(),
-            keys: transaction.changed_keys(),
+            keys,
         })
     }
 
@@ -902,6 +916,32 @@ pub(crate) fn adjusted_count(
 
 fn estimated_row_bytes(row: &Row) -> Result<usize> {
     estimated_object_bytes(row, 0)
+}
+
+/// [`estimated_row_bytes`] for the row a stored record decodes to, reading its columns in place.
+fn estimated_record_batch_bytes(record: &StoredRecord<'_>) -> Result<usize> {
+    let mut bytes = 64usize;
+    for (position, column) in record.schema().columns.iter().enumerate() {
+        let value_bytes = match record.column(position)? {
+            ValueRef::Null | ValueRef::Boolean(_) => 8,
+            ValueRef::Integer(_) | ValueRef::Float(_) => 32,
+            ValueRef::Text(text) => text
+                .len()
+                .checked_mul(6)
+                .and_then(|bytes| bytes.checked_add(32))
+                .ok_or_else(batch_too_large)?,
+            ValueRef::Json(value) => estimated_json_bytes(&value, 1)?,
+        };
+        bytes = column
+            .name
+            .len()
+            .checked_mul(6)
+            .and_then(|key_bytes| bytes.checked_add(key_bytes))
+            .and_then(|bytes| bytes.checked_add(value_bytes))
+            .and_then(|bytes| bytes.checked_add(64))
+            .ok_or_else(batch_too_large)?;
+    }
+    Ok(bytes)
 }
 
 fn estimated_json_bytes(value: &serde_json::Value, depth: usize) -> Result<usize> {
@@ -1809,7 +1849,8 @@ mod tests {
             let RowChange::Upsert { row, .. } = change else {
                 unreachable!()
             };
-            let cost = storage.change_cost(table, Some(row), row, None).unwrap();
+            let key = encode_primary_key(&storage.table(table).unwrap().schema, row).unwrap();
+            let cost = storage.change_cost(table, row, false, &key, None).unwrap();
             // One row and two maintained indexes, or one row and one index.
             assert_eq!(
                 cost.usage.operations,
@@ -1848,8 +1889,9 @@ mod tests {
         let RowChange::Upsert { row, .. } = &change else {
             unreachable!()
         };
+        let key = encode_primary_key(&storage.table("items").unwrap().schema, row).unwrap();
         let addition = storage
-            .change_cost("items", Some(row), row, None)
+            .change_cost("items", row, false, &key, None)
             .unwrap()
             .usage;
         // Seed each independent budget just below its limit, leaving the other two empty.

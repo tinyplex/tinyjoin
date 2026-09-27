@@ -2285,7 +2285,7 @@ than about four times as long, and reading every row, `LIKE` scans, and
 - On the tab that owns a database, statements reach the engine as calls rather
   than as messages checked again at every layer.
 
-The compressed download is now 328 KiB, up from 295 KiB in v0.3.0.
+The compressed download is now 330 KiB, up from 295 KiB in v0.3.0.
 
 ## v0.3.0
 

@@ -1,17 +1,17 @@
 use std::{
     cell::Cell,
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
 };
 
 use crate::{
-    EngineError, IndexDefinition, PageDevice, PagedStorage, Result, Row, RowChange, StorageReader,
-    TableDefinition, TreeId, VisitControl, VisitOutcome,
-    paged_codec::{IndexEntryLayout, encode_primary_key},
-    paged_script::{ChangedRow, ChangedRows},
-    paged_storage::{ChangeCost, PagedWriteUsage},
+    EngineError, IndexDefinition, MAX_CHANGED_KEYS_PER_TABLE, PageDevice, PagedStorage, Result,
+    Row, RowChange, StorageReader, TableDefinition, TreeId, VisitControl, VisitOutcome,
+    paged_codec::{EMPTY_RECORD, IndexEntryLayout, encode_primary_key, encode_row},
+    paged_script::{ChangedRow, TableChanges, held_row_bytes},
+    paged_storage::{ChangeCost, PagedTable, PagedWriteUsage},
     row::{HeldRow, RowRef},
-    statement::{PreviousRow, primary_key_row},
+    statement::PreviousRow,
     storage::{KeyOrder, KeyRange, estimated_row_bytes},
 };
 
@@ -44,18 +44,28 @@ struct Totals {
     claims: BTreeMap<(TreeId, Box<[u8]>), Vec<u8>>,
 }
 
+/// One staged key: the committed row it held and the row the transaction stages for it, kept as
+/// the stored entry and the record a commit writes, so that neither is copied or encoded again.
 #[derive(Clone)]
 struct OverlayEntry {
-    key: Row,
-    base: Option<Row>,
-    next: Option<Row>,
-    /// Whether `next` differs from `base`, the committed row, as staging found once, so that
+    row: ChangedRow,
+    /// Whether the staged row differs from the committed one, as staging found once, so that
     /// reading the overlay compares no rows.
     changed: bool,
     /// What the entry retains in the overlay.
     retained: usize,
     /// What the entry costs the write set, while its row differs from the committed one.
     cost: Option<ChangeCost>,
+}
+
+/// The last of a statement's changes to one key, with the committed row the key holds.
+struct PatchChange {
+    base: Option<HeldRow>,
+    /// The row planning normalized, or for a delete, the key.
+    row: Row,
+    is_delete: bool,
+    /// Whether the statement upserts the key, which it may do only once.
+    upserted: bool,
 }
 
 #[derive(Default)]
@@ -86,42 +96,54 @@ impl PagedTransaction {
     }
 
     #[cfg(test)]
-    pub(crate) fn changes(&self) -> Vec<RowChange> {
-        changes_from_entries(self.entries.iter().flat_map(|(table, entries)| {
-            entries.values().map(move |entry| (table.as_str(), entry))
-        }))
+    pub(crate) fn changes<D: PageDevice>(&self, storage: &PagedStorage<D>) -> Vec<RowChange> {
+        changes_from_entries(
+            storage,
+            self.entries.iter().flat_map(|(table, entries)| {
+                entries
+                    .iter()
+                    .map(move |(key, entry)| (table.as_str(), key.as_slice(), entry))
+            }),
+        )
     }
 
     /// The rows this transaction changes, by table and encoded primary key, each with the committed
     /// row it replaces. A row changed back to its committed state is left out.
-    pub(crate) fn changed_rows(&self) -> ChangedRows {
-        let mut changed = ChangedRows::new();
+    pub(crate) fn changed_rows(&self) -> Vec<TableChanges<'_>> {
+        let mut changed = Vec::new();
         for (table, entries) in &self.entries {
-            let mut rows = BTreeMap::new();
-            for (key, entry) in entries {
-                if entry.changed {
-                    let row = ChangedRow {
-                        old: entry.base.clone().map(HeldRow::Map),
-                        next: entry.next.clone(),
-                    };
-                    rows.insert(key.clone(), row);
-                }
-            }
+            let rows = entries
+                .iter()
+                .filter(|(_, entry)| entry.changed)
+                .map(|(key, entry)| (key.as_slice(), &entry.row))
+                .collect::<Vec<_>>();
             if !rows.is_empty() {
-                changed.insert(table.clone(), rows);
+                changed.push((table.as_str(), rows));
             }
         }
         changed
     }
 
     /// The primary keys of the rows [`Self::changed_rows`] reports, as a commit reports them.
-    pub(crate) fn changed_keys(&self) -> BTreeMap<String, Vec<Row>> {
-        crate::statement::collect_changed_keys(self.entries.iter().flat_map(|(table, entries)| {
-            entries
-                .values()
-                .filter(|entry| entry.changed)
-                .map(move |entry| (table.as_str(), &entry.key))
-        }))
+    pub(crate) fn changed_keys<D: PageDevice>(
+        &self,
+        storage: &PagedStorage<D>,
+    ) -> Result<BTreeMap<String, Vec<Row>>> {
+        let mut keys = Vec::new();
+        for (table, entries) in &self.entries {
+            let paged = storage.table(table)?;
+            // One key more than a table can report shows that it reports none, so no more are read.
+            for (key, _) in entries
+                .iter()
+                .filter(|(_, entry)| entry.changed)
+                .take(MAX_CHANGED_KEYS_PER_TABLE + 1)
+            {
+                keys.push((table.as_str(), key_row(paged, key)?));
+            }
+        }
+        Ok(crate::statement::collect_changed_keys(
+            keys.iter().map(|(table, key)| (*table, key)),
+        ))
     }
 
     /// Validates and installs one statement's row delta without exposing a partial statement.
@@ -136,14 +158,21 @@ impl PagedTransaction {
         if changes.is_empty() {
             return Ok(());
         }
-        let mut patch = self.patch(storage, changes, previous)?;
-        let (totals, released, claimed) = self.validate_patch(storage, &mut patch)?;
+        let patch = self.patch(storage, changes, previous)?;
+        let (totals, released, claimed) = self.validate_patch(storage, &patch)?;
 
         // No fallible validation remains: a failed statement changes neither the staged rows nor
         // the totals.
         for (table, entries) in patch.entries {
-            self.touched_tables.insert(table.clone());
-            self.entries.entry(table).or_default().extend(entries);
+            if !self.touched_tables.contains(&table) {
+                self.touched_tables.insert(table.clone());
+            }
+            match self.entries.get_mut(&table) {
+                Some(staged) => staged.extend(entries),
+                None => {
+                    self.entries.insert(table, entries);
+                }
+            }
         }
         let mut claims = std::mem::take(&mut self.totals.claims);
         for claim in released {
@@ -154,66 +183,77 @@ impl PagedTransaction {
         Ok(())
     }
 
-    /// The overlay entries a statement's changes produce, each starting from the entry it
-    /// replaces or from the committed row. Planning read through this overlay, so a row it read
-    /// for a key the overlay does not hold is the committed row.
+    /// The overlay entries a statement's changes produce, each starting from the committed row the
+    /// entry it replaces started from, or from the committed row itself. Planning read through
+    /// this overlay, so a row it read for a key the overlay does not hold is the committed row.
     fn patch<D: PageDevice>(
         &self,
         storage: &PagedStorage<D>,
         changes: Vec<RowChange>,
         previous: Vec<PreviousRow>,
     ) -> Result<OverlayPatch> {
-        // Detect collisions in the statement's original sequence before the overlay's canonical
-        // key map can collapse them.
-        storage.validate_sql_row_change_sequence(&changes)?;
-        let mut patch = OverlayPatch::default();
+        let mut patched = BTreeMap::<String, BTreeMap<Vec<u8>, PatchChange>>::new();
         let mut previous = previous.into_iter();
         for change in changes {
             let held = previous.next().unwrap_or(PreviousRow::Unread);
-            let (table, input, is_delete) = match change {
+            let (table, row, is_delete) = match change {
                 RowChange::Upsert { table, row } => (table, row, false),
                 RowChange::Delete { table, key } => (table, key, true),
             };
-            let schema = storage.table_schema(&table)?;
-            let key = primary_key_row(&schema, &input)?;
-            let encoded_key = encode_primary_key(&schema, &key)?;
-            let next = (!is_delete).then_some(input);
-            let entries = patch.entries.entry(table.clone()).or_default();
-            if !entries.contains_key(&encoded_key) {
-                let entry = match self
-                    .entries
-                    .get(&table)
-                    .and_then(|entries| entries.get(&encoded_key))
-                {
-                    Some(entry) => entry.clone(),
-                    None => {
-                        let base = match held {
-                            PreviousRow::Read(row) => {
-                                row.map(|row| storage.held_row(&table, row)).transpose()?
-                            }
-                            PreviousRow::Unread => storage.lookup_primary_key(&table, &key)?,
-                        };
-                        OverlayEntry {
-                            key,
-                            next: base.clone(),
-                            base,
-                            changed: false,
-                            retained: 0,
-                            cost: None,
-                        }
+            // A stored row planning held is the row the change's key holds, so its entry's key is
+            // the change's encoded key.
+            let key = match &held {
+                PreviousRow::Read(Some(HeldRow::Stored(entry))) => entry.key().to_vec(),
+                _ => encode_primary_key(&storage.table(&table)?.schema, &row)?,
+            };
+            if !patched.contains_key(&table) {
+                patched.insert(table.clone(), BTreeMap::new());
+            }
+            let entries = patched.get_mut(&table).expect("the table was added above");
+            match entries.entry(key) {
+                Entry::Occupied(mut slot) => {
+                    let slot = slot.get_mut();
+                    // Keys are canonical, so this also catches spellings SQL considers equal, such
+                    // as FLOAT `0` and `-0.0`. A delete and an upsert of one key stay valid.
+                    if !is_delete && slot.upserted {
+                        return Err(EngineError::constraint_violation(format!(
+                            "SQL statement would write canonical primary key in `{table}` more than once"
+                        )));
                     }
-                };
-                entries.insert(encoded_key.clone(), entry);
+                    slot.upserted |= !is_delete;
+                    slot.row = row;
+                    slot.is_delete = is_delete;
+                }
+                Entry::Vacant(slot) => {
+                    let staged = self
+                        .entries
+                        .get(&table)
+                        .and_then(|entries| entries.get(slot.key()));
+                    let base = match (staged, held) {
+                        (Some(entry), _) => entry.row.old.clone(),
+                        (None, PreviousRow::Read(row)) => row,
+                        (None, PreviousRow::Unread) => storage
+                            .committed_entry(&table, slot.key())?
+                            .map(HeldRow::Stored),
+                    };
+                    slot.insert(PatchChange {
+                        base,
+                        row,
+                        is_delete,
+                        upserted: !is_delete,
+                    });
+                }
             }
-            entries
-                .get_mut(&encoded_key)
-                .expect("the statement patch entry was installed above")
-                .next = next;
         }
-        for entries in patch.entries.values_mut() {
-            for entry in entries.values_mut() {
-                entry.changed = entry.base != entry.next;
+        let mut patch = OverlayPatch::default();
+        for (table, changes) in patched {
+            let paged = storage.table(&table)?;
+            let mut entries = BTreeMap::new();
+            for (key, change) in changes {
+                let entry = overlay_entry(storage, paged, &table, &key, change)?;
+                entries.insert(key, entry);
             }
+            patch.entries.insert(table, entries);
         }
         Ok(patch)
     }
@@ -229,7 +269,7 @@ impl PagedTransaction {
     fn validate_patch<D: PageDevice>(
         &self,
         storage: &PagedStorage<D>,
-        patch: &mut OverlayPatch,
+        patch: &OverlayPatch,
     ) -> Result<(
         Totals,
         BTreeSet<(TreeId, Box<[u8]>)>,
@@ -267,27 +307,21 @@ impl PagedTransaction {
                 }
             }
         }
-        for (table, entries) in &mut patch.entries {
-            for (key, entry) in entries.iter_mut() {
-                entry.retained = retained_bytes(table, key, entry)?;
+        for (table, entries) in &patch.entries {
+            for entry in entries.values() {
                 retain_entry(
                     &mut totals.overlay_keys,
                     &mut totals.overlay_bytes,
                     entry.retained,
                 )?;
-                entry.cost = if !entry.changed {
-                    None
-                } else {
-                    Some(storage.change_cost(
-                        table,
-                        entry.next.as_ref(),
-                        &entry.key,
-                        entry.base.as_ref(),
-                    )?)
-                };
                 if let Some(cost) = &entry.cost {
                     totals.usage = totals.usage.plus(cost.usage)?;
-                    *totals.changed_tables.entry(table.clone()).or_default() += 1;
+                    match totals.changed_tables.get_mut(table) {
+                        Some(count) => *count += 1,
+                        None => {
+                            totals.changed_tables.insert(table.clone(), 1);
+                        }
+                    }
                 }
             }
         }
@@ -335,7 +369,7 @@ impl PagedTransaction {
                 if entry.cost.is_some() {
                     continue;
                 }
-                let Some(base) = &entry.base else {
+                let Some(base) = &entry.row.old else {
                     continue;
                 };
                 for (tree_id, prefix) in storage.unique_values(table, base)? {
@@ -370,25 +404,83 @@ impl PagedTransaction {
     }
 }
 
+/// The overlay entry a statement's last change to a key leaves: its row encoded as the record a
+/// commit writes, whether that differs from the committed row, and what the entry retains and
+/// costs.
+fn overlay_entry<D: PageDevice>(
+    storage: &PagedStorage<D>,
+    table: &PagedTable,
+    table_name: &str,
+    key: &[u8],
+    change: PatchChange,
+) -> Result<OverlayEntry> {
+    let PatchChange {
+        base,
+        row,
+        is_delete,
+        ..
+    } = change;
+    let schema = &table.schema;
+    let next = if is_delete {
+        None
+    } else {
+        Some(encode_row(schema, &row)?)
+    };
+    // Records are canonical, so equal rows have equal records.
+    let changed = match (&base, &next) {
+        (None, None) => false,
+        (Some(HeldRow::Stored(base)), Some(next)) => base.value() != next.as_slice(),
+        (Some(HeldRow::Map(base)), Some(next)) => encode_row(schema, base)? != *next,
+        _ => true,
+    };
+    let base_bytes = base
+        .as_ref()
+        .map_or(Ok(0), |base| held_row_bytes(table, base))?;
+    let next_bytes = if is_delete {
+        0
+    } else {
+        estimated_row_bytes(&row)?
+    };
+    let retained = retained_bytes(table_name, key, base_bytes, next_bytes)?;
+    let cost = changed
+        .then(|| storage.change_cost(table_name, &row, is_delete, key, base.as_ref()))
+        .transpose()?;
+    Ok(OverlayEntry {
+        row: ChangedRow { old: base, next },
+        changed,
+        retained,
+        cost,
+    })
+}
+
+/// The primary-key columns of the encoded key `key` of `table`, as a map.
+fn key_row(table: &PagedTable, key: &[u8]) -> Result<Row> {
+    RowRef::record(table.record(key, EMPTY_RECORD)?).primary_key()
+}
+
 #[cfg(test)]
 #[path = "paged_transaction_validation_tests.rs"]
 mod validation_tests;
 
 #[cfg(test)]
-fn changes_from_entries<'a>(
-    entries: impl Iterator<Item = (&'a str, &'a OverlayEntry)>,
+fn changes_from_entries<'a, D: PageDevice>(
+    storage: &PagedStorage<D>,
+    entries: impl Iterator<Item = (&'a str, &'a [u8], &'a OverlayEntry)>,
 ) -> Vec<RowChange> {
     entries
-        .filter(|(_, entry)| entry.changed)
-        .map(|(table, entry)| match &entry.next {
-            Some(row) => RowChange::Upsert {
-                table: table.to_owned(),
-                row: row.clone(),
-            },
-            None => RowChange::Delete {
-                table: table.to_owned(),
-                key: entry.key.clone(),
-            },
+        .filter(|(_, _, entry)| entry.changed)
+        .map(|(table, key, entry)| {
+            let paged = storage.table(table).unwrap();
+            match &entry.row.next {
+                Some(record) => RowChange::Upsert {
+                    table: table.to_owned(),
+                    row: paged.record(key, record).unwrap().to_row().unwrap(),
+                },
+                None => RowChange::Delete {
+                    table: table.to_owned(),
+                    key: key_row(paged, key).unwrap(),
+                },
+            }
         })
         .collect()
 }
@@ -409,15 +501,17 @@ fn retain_entry(keys: &mut usize, retained: &mut usize, bytes: usize) -> Result<
     Ok(())
 }
 
-/// What an overlay entry retains: its table name and keys, its rows, and a fixed overhead.
-fn retained_bytes(table: &str, encoded_key: &[u8], entry: &OverlayEntry) -> Result<usize> {
-    let key_bytes = estimated_row_bytes(&entry.key)?;
-    let base_bytes = entry.base.as_ref().map_or(Ok(0), estimated_row_bytes)?;
-    let next_bytes = entry.next.as_ref().map_or(Ok(0), estimated_row_bytes)?;
+/// What an overlay entry retains: its table name and encoded key, the estimated bytes of its
+/// committed and staged rows as maps, and a fixed overhead.
+fn retained_bytes(
+    table: &str,
+    encoded_key: &[u8],
+    base_bytes: usize,
+    next_bytes: usize,
+) -> Result<usize> {
     table
         .len()
         .checked_add(encoded_key.len())
-        .and_then(|bytes| bytes.checked_add(key_bytes))
         .and_then(|bytes| bytes.checked_add(base_bytes))
         .and_then(|bytes| bytes.checked_add(next_bytes))
         .and_then(|bytes| bytes.checked_add(OVERLAY_ENTRY_BYTES))
@@ -514,7 +608,7 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
             });
         };
         let entries = transaction.table_entries(table);
-        let schema = self.storage.table_schema(table)?;
+        let paged = self.storage.table(table)?;
         // Committed rows and staged entries are both in key order, so the staged entry for each
         // committed row, if any, is found by walking the two together.
         let mut staged = entries.map(|entries| entries.iter().peekable());
@@ -539,13 +633,13 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
             return Ok(outcome);
         }
         if let Some(entries) = entries {
-            for entry in entries.values() {
+            for (key, entry) in entries {
                 self.charge_work(1)?;
                 if !entry.changed {
                     continue;
                 }
-                if let Some(row) = &entry.next
-                    && visitor(&RowRef::map(row, &schema))? == VisitControl::Stop
+                if let Some(record) = &entry.row.next
+                    && visitor(&RowRef::record(paged.record(key, record)?))? == VisitControl::Stop
                 {
                     return Ok(VisitOutcome::Stopped);
                 }
@@ -590,7 +684,7 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
             .and_then(|transaction| transaction.table_entries(table))
         {
             for entry in entries.values() {
-                match (entry.base.is_some(), entry.next.is_some()) {
+                match (entry.row.old.is_some(), entry.row.next.is_some()) {
                     (false, true) => {
                         count = count.checked_add(1).ok_or_else(transaction_too_large)?;
                     }
@@ -613,13 +707,16 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
         self.ensure_base_revision()?;
         self.charge_work(1)?;
         if let Some(transaction) = self.transaction {
-            let schema = self.storage.table_schema(table)?;
-            let encoded_key = encode_primary_key(&schema, key)?;
+            let paged = self.storage.table(table)?;
+            let encoded_key = encode_primary_key(&paged.schema, key)?;
             if let Some(entry) = transaction
                 .table_entries(table)
                 .and_then(|entries| entries.get(&encoded_key))
             {
-                return Ok(entry.next.clone());
+                return match &entry.row.next {
+                    Some(record) => Ok(Some(paged.record(&encoded_key, record)?.to_row()?)),
+                    None => Ok(None),
+                };
             }
         }
         self.storage.lookup_primary_key(table, key)
@@ -634,14 +731,17 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
         self.ensure_base_revision()?;
         self.charge_work(1)?;
         if let Some(transaction) = self.transaction {
-            let schema = self.storage.table_schema(table)?;
-            let encoded_key = encode_primary_key(&schema, key)?;
+            let paged = self.storage.table(table)?;
+            let encoded_key = encode_primary_key(&paged.schema, key)?;
             if let Some(entry) = transaction
                 .table_entries(table)
                 .and_then(|entries| entries.get(&encoded_key))
             {
-                return match &entry.next {
-                    Some(row) if visitor(&RowRef::map(row, &schema))? == VisitControl::Stop => {
+                return match &entry.row.next {
+                    Some(record)
+                        if visitor(&RowRef::record(paged.record(&encoded_key, record)?))?
+                            == VisitControl::Stop =>
+                    {
                         Ok(VisitOutcome::Stopped)
                     }
                     _ => Ok(VisitOutcome::Complete),
@@ -790,7 +890,7 @@ mod tests {
             let totals = &transaction.totals;
             assert_eq!(totals.overlay_keys, 128);
             let complete = storage
-                .validate_row_write_set(&transaction.changes())
+                .validate_row_write_set(&transaction.changes(&storage))
                 .unwrap();
             assert_eq!(
                 storage
@@ -858,7 +958,7 @@ mod tests {
             "changed"
         );
         assert!(transaction.is_dirty());
-        assert_eq!(transaction.changes().len(), 2);
+        assert_eq!(transaction.changes(&storage).len(), 2);
     }
 
     #[test]
@@ -883,20 +983,15 @@ mod tests {
         assert!(transaction.entries.is_empty());
     }
 
-    fn entry() -> OverlayEntry {
-        OverlayEntry {
-            key: row(json!({"id": 1})),
-            base: None,
-            next: Some(row(json!({"id": 1, "name": "one"}))),
-            changed: true,
-            retained: 0,
-            cost: None,
-        }
+    /// What an entry inserting one small row retains.
+    fn entry_bytes() -> usize {
+        let next_bytes = estimated_row_bytes(&row(json!({"id": 1, "name": "one"}))).unwrap();
+        retained_bytes("items", b"[1]", 0, next_bytes).unwrap()
     }
 
     #[test]
     fn transaction_key_bound_is_checked_before_retaining_an_extra_entry() {
-        let bytes = retained_bytes("items", b"[1]", &entry()).unwrap();
+        let bytes = entry_bytes();
         let mut key_count = MAX_TRANSACTION_KEYS;
         let mut retained = 0;
         assert_eq!(
@@ -909,7 +1004,7 @@ mod tests {
 
     #[test]
     fn overlay_byte_limit_accepts_the_boundary_and_rejects_one_more_byte() {
-        let entry_bytes = retained_bytes("items", b"[1]", &entry()).unwrap();
+        let entry_bytes = entry_bytes();
         let mut keys = 0;
         for extra in [0, 1] {
             let mut bytes = MAX_TRANSACTION_BYTES - entry_bytes + extra;

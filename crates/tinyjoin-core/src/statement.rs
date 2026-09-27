@@ -809,17 +809,20 @@ fn plan_insert(
                 }
                 (row, key, PreviousRow::Read(None))
             }
-            Conflict::Written | Conflict::Existing(_) if updates.is_none() => continue,
+            Conflict::Written | Conflict::Existing(..) if updates.is_none() => continue,
             Conflict::Written => {
                 return Err(EngineError::constraint_violation(format!(
                     "INSERT ... ON CONFLICT DO UPDATE cannot affect a row in `{table}` a second time"
                 )));
             }
-            Conflict::Existing(existing) => {
+            Conflict::Existing(existing, stored) => {
                 // The updated row keeps the existing row's key, which held the existing row.
-                let held = kept
-                    .fits(estimated_row_bytes(&existing)?)
-                    .then(|| HeldRow::Map(existing.clone()));
+                let held = match stored {
+                    Some((held, bytes)) => kept.fits(bytes).then_some(held),
+                    None => kept
+                        .fits(estimated_row_bytes(&existing)?)
+                        .then(|| HeldRow::Map(existing.clone())),
+                };
                 let row = updated_conflict_row(
                     &schema,
                     updates.expect("DO NOTHING was handled above"),
@@ -906,7 +909,9 @@ enum Conflict {
     None,
     /// The proposed row conflicts with a row this statement already inserted or updated.
     Written,
-    Existing(Row),
+    /// The proposed row conflicts with an existing row. A row found by its primary key also comes
+    /// as a writer keeps it, with the bytes that keeps.
+    Existing(Row, Option<(HeldRow, usize)>),
 }
 
 /// One arbiter unique index, with the keys this statement has written into it.
@@ -1040,10 +1045,15 @@ impl ConflictPlan {
             }
             index_keys.push(index_key);
         }
-        if self.primary
-            && let Some(existing) = storage.lookup_primary_key(&schema.name, row)?
-        {
-            return Ok(Conflict::Existing(existing));
+        if self.primary {
+            let mut existing = None;
+            storage.visit_primary_key(&schema.name, row, &mut |found| {
+                existing = Some((found.to_row()?, (found.hold()?, found.held_bytes()?)));
+                Ok(VisitControl::Stop)
+            })?;
+            if let Some((existing, held)) = existing {
+                return Ok(Conflict::Existing(existing, Some(held)));
+            }
         }
         for (index, index_key) in self.indexes.iter_mut().zip(index_keys) {
             let Some(index_key) = index_key else {
@@ -1052,7 +1062,7 @@ impl ConflictPlan {
             for existing in index.existing(storage, schema, row, &index_key, work_bytes)? {
                 // A row this statement already rewrote was checked above through its new values.
                 if !written.contains(&primary_conflict_key(schema, &existing)?) {
-                    return Ok(Conflict::Existing(existing));
+                    return Ok(Conflict::Existing(existing, None));
                 }
             }
         }
