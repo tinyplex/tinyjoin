@@ -1,5 +1,8 @@
 import {describe, expect, it} from 'vitest';
-import {requestBytes} from '../../src/worker/request-size.js';
+import {
+  checkedRequestBytes,
+  requestBytes,
+} from '../../src/worker/request-size.js';
 
 describe('retained request accounting', () => {
   it('bounds actual graph size without expanding repeated aliases', () => {
@@ -57,5 +60,71 @@ describe('retained request accounting', () => {
     expect(requestBytes(null, 8)).toBe(8);
     expect(requestBytes(null, 7)).toBe(8);
     expect(requestBytes(undefined, 0)).toBe(1);
+  });
+});
+
+describe('checked request accounting', () => {
+  // Plain JSON-like graphs as structured clone delivers them: shared children
+  // stay shared, and arrays may carry named properties.
+  const random = (seed: number) => () => {
+    seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648;
+    return seed / 2_147_483_648;
+  };
+  const graph = (next: () => number): unknown => {
+    const pool: object[] = [];
+    const value = (depth: number): unknown => {
+      const pick = next();
+      if (depth > 4 || pick < 0.3) {
+        return [null, true, 1.5, -7, 'text', '🦀'.repeat(3), ''][
+          Math.floor(next() * 7)
+        ];
+      }
+      if (pool.length && pick < 0.4) {
+        return pool[Math.floor(next() * pool.length)];
+      }
+      const container: Record<string, unknown> | unknown[] =
+        pick < 0.7
+          ? Array.from({length: Math.floor(next() * 4)}, () => value(depth + 1))
+          : Object.fromEntries(
+              Array.from({length: Math.floor(next() * 4)}, (_, index) => [
+                `key${index}`,
+                value(depth + 1),
+              ]),
+            );
+      if (Array.isArray(container) && next() < 0.2) {
+        (container as unknown[] & {extra?: unknown}).extra = value(depth + 1);
+      }
+      pool.push(container);
+      return container;
+    };
+    return structuredClone({
+      v: 9,
+      id: 1,
+      method: 'executeSql',
+      params: {sql: 'SELECT 1', params: [value(0), value(0)]},
+    });
+  };
+
+  it('charges exactly what the general walk charges', () => {
+    const next = random(42);
+    for (let run = 0; run < 500; run++) {
+      const value = graph(next);
+      for (const limit of [64, 512, 4_096, 1_000_000]) {
+        expect(checkedRequestBytes(value, limit)).toBe(
+          requestBytes(value, limit),
+        );
+      }
+    }
+  });
+
+  it('falls back to the general walk for sparse arrays and other values', () => {
+    const sparse = structuredClone({params: [1, , 3]});
+    expect(checkedRequestBytes(sparse, 1_024)).toBe(
+      requestBytes(sparse, 1_024),
+    );
+    expect(checkedRequestBytes(new Array(100_000_000), 1_024)).toBe(1_025);
+    expect(checkedRequestBytes(1n, 1_024)).toBe(requestBytes(1n, 1_024));
+    expect(checkedRequestBytes(null, 7)).toBe(8);
+    expect(() => checkedRequestBytes(null, -1)).toThrow(RangeError);
   });
 });

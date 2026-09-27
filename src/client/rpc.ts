@@ -1,4 +1,4 @@
-import {isUndefined, objFreeze} from '../common.js';
+import {isRecord, isUndefined, objFreeze, objHasOwn} from '../common.js';
 import {
   PROTOCOL_VERSION,
   isRpcResult,
@@ -70,7 +70,12 @@ export const createWorkerRpc = (
   };
 
   const onMessage = (event: MessageEvent<unknown>): void => {
-    if (isWorkerEvent(event.data)) {
+    // A response carries an id and an event does not, so a response skips the
+    // event check.
+    if (
+      !(isRecord(event.data) && objHasOwn(event.data, 'id')) &&
+      isWorkerEvent(event.data)
+    ) {
       for (const listener of eventListeners) {
         listener(event.data);
       }

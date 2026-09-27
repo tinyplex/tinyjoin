@@ -15,7 +15,7 @@ import {
   MAX_QUEUED_BYTES,
   type RoutedRequest,
 } from './coordination-protocol.js';
-import {requestBytes} from './request-size.js';
+import {checkedRequestBytes} from './request-size.js';
 
 type Connection = {
   channel: BroadcastChannel;
@@ -294,11 +294,12 @@ export const createDatabaseBroker = (
     /**
      * Queues a request. The local client's coordinator passes the size it
      * measured, and holds its statement text itself, so that request is not
-     * measured twice.
+     * measured twice. Another tab's request arrives checked, as plain data
+     * from a structured clone.
      */
     receive: (
       message: RoutedRequest,
-      bytes = requestBytes(message, MAX_QUEUED_BYTES),
+      bytes = checkedRequestBytes(message, MAX_QUEUED_BYTES),
     ): void => {
       if (closed) return;
       let connection = connections.get(message.client);

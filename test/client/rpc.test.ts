@@ -329,6 +329,31 @@ describe('WorkerRpc', () => {
     expect(isWorkerRequest(queryRequest([sparse]))).toBe(false);
   });
 
+  it('checks scalar parameters as strictly as nested ones', () => {
+    const cases: [unknown[], boolean][] = [
+      [[null, true, false, 0, -0, 1.5, -2, 'text', ''], true],
+      [[1, NaN], false],
+      [[Infinity], false],
+      [[1, undefined], false],
+      [new Array(2), false],
+      [[1, 'x', {nested: [1, 'y']}], true],
+      [[{nested: 1}, NaN], false],
+      [[1, {nested: NaN}], false],
+      [[1, () => 1], false],
+      [[1, Symbol('s')], false],
+    ];
+    for (const [params, valid] of cases) {
+      expect(isWorkerRequest(queryRequest(params as JsonValue[]))).toBe(valid);
+      expect(
+        isWorkerRequest({
+          ...queryRequest([]),
+          method: 'executePrepared',
+          params: {statementId: 1, params},
+        }),
+      ).toBe(valid);
+    }
+  });
+
   it('shares one JSON work budget across parameters, rows, and script results', () => {
     const first = new Array<JsonValue>(600_000).fill(null);
     const second = new Array<JsonValue>(600_000).fill(null);

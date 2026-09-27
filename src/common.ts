@@ -49,10 +49,16 @@ export const isPlainRecord = (
     return false;
   }
   const prototype = Object.getPrototypeOf(value);
-  return (
-    (prototype === Object.prototype || prototype === null) &&
-    ownKeys(value).every(isString)
-  );
+  if (prototype !== Object.prototype && prototype !== null) {
+    return false;
+  }
+  const keys = ownKeys(value);
+  for (let index = 0; index < keys.length; index++) {
+    if (!isString(keys[index])) {
+      return false;
+    }
+  }
+  return true;
 };
 
 export const isInteger = (value: unknown): value is number =>

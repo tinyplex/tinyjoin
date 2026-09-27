@@ -355,15 +355,34 @@ const hasExactParams = (
 const hasOnlyKeys = (
   value: Record<string, unknown>,
   allowedKeys: readonly string[],
-): boolean =>
-  ownKeys(value).every((key) => isString(key) && allowedKeys.includes(key));
+): boolean => areKeysWithin(ownKeys(value), allowedKeys);
 
+// Keys are distinct, so as many keys as expected, each expected, are exactly
+// those expected.
 const hasExactKeys = (
   value: Record<string, unknown>,
   expectedKeys: readonly string[],
-): boolean =>
-  ownKeys(value).length === expectedKeys.length &&
-  hasOnlyKeys(value, expectedKeys);
+): boolean => {
+  const keys = ownKeys(value);
+  return (
+    keys.length === expectedKeys.length && areKeysWithin(keys, expectedKeys)
+  );
+};
+
+// Every message is checked this way, so the keys are read once and walked
+// without a callback.
+const areKeysWithin = (
+  keys: readonly (string | symbol)[],
+  allowedKeys: readonly string[],
+): boolean => {
+  for (let index = 0; index < keys.length; index++) {
+    const key = keys[index];
+    if (!isString(key) || !allowedKeys.includes(key)) {
+      return false;
+    }
+  }
+  return true;
+};
 
 const isOptionalTransactionId = (value: unknown): boolean =>
   isUndefined(value) || isTransactionId(value);
@@ -404,8 +423,27 @@ const isDenseArray = <Item>(
 const isStrings = (value: unknown, step?: () => boolean): value is string[] =>
   isDenseArray(value, isString, step);
 
-const isJsonValues = (value: unknown): value is JsonValue[] =>
-  isDenseArray(value, createJsonValidation().isJson);
+// Nearly every parameter is a scalar, which needs no validation context. Any
+// container sends the whole array through the full check.
+const isJsonValues = (value: unknown): value is JsonValue[] => {
+  if (!arrayIsArray(value) || value.length > MAX_ARRAY_ITEMS) {
+    return false;
+  }
+  for (let index = 0; index < value.length; index++) {
+    if (!objHasOwn(value, index)) {
+      return false;
+    }
+    const item: unknown = value[index];
+    if (isNumber(item)) {
+      if (!isFiniteNumber(item)) {
+        return false;
+      }
+    } else if (!(item === null || isBoolean(item) || isString(item))) {
+      return isDenseArray(value, createJsonValidation().isJson);
+    }
+  }
+  return true;
+};
 
 const isApplyOutcome = (value: unknown): value is ApplyOutcome =>
   isRecord(value) &&
