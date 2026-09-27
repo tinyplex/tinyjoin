@@ -9,7 +9,6 @@ import {
   isString,
   isUndefined,
   MAX_U32,
-  objFreeze,
   objHasOwn,
   ownKeys,
 } from '../common.js';
@@ -28,7 +27,6 @@ const MAX_BYTES = 16 * 1024 * 1024;
 const MAX_NODES = 1_000_000;
 const MAX_OPERATIONS = 1_000_000;
 const MAX_DEPTH = 64;
-const MAX_SAFE_INTEGER = BigInt(Number.MAX_SAFE_INTEGER);
 
 // Deterministic estimates aligned with the wasm32 retained model. They bound
 // work and allocation independently of a particular JavaScript engine's RSS.
@@ -59,131 +57,126 @@ export class WasmBridgeError extends Error {
  * The sink tracks two quantities at once: the bytes the encoded request would
  * occupy, and the memory the Rust side would retain to hold it. Both are
  * bounded, so a request that cannot be served is rejected before it reaches
- * WASM rather than after it has allocated.
+ * WASM rather than after it has allocated. Each request makes one, so it is a
+ * single object rather than a set of closures.
  */
-type PreflightSink = ReturnType<typeof createPreflightSink>;
+class PreflightSink {
+  #bytes = 0;
+  #retained = 0;
+  #nodes = 0;
+  #operations = 0;
 
-const createPreflightSink = () => {
-  let bytes = 0;
-  let retained = 0;
-  let nodes = 0;
-  let operations = 0;
-
-  const add = (count: number): void => {
-    const next = bytes + count;
+  add(count: number): void {
+    const next = this.#bytes + count;
     if (!isCount(next) || next > MAX_BYTES) {
       throw resourceLimit();
     }
-    bytes = next;
-  };
+    this.#bytes = next;
+  }
 
-  const u8 = (value: number): void => {
+  u8(value: number): void {
     assertUint(value, 0xff);
-    add(1);
-  };
+    this.add(1);
+  }
 
-  const u32 = (value: number): void => {
+  u32(value: number): void {
     assertUint(value, MAX_U32);
-    add(4);
-  };
+    this.add(4);
+  }
 
-  const retain = (count: number): void => {
+  /** A JavaScript-safe integer, which WASM reads as eight bytes. */
+  i64(): void {
+    this.add(8);
+  }
+
+  f64(value: number): void {
+    if (!isFiniteNumber(value)) {
+      throw invalidBridgeValue('A JSON number must be finite');
+    }
+    this.add(8);
+  }
+
+  string(value: string): void {
+    if (!isString(value)) {
+      throw invalidBridgeValue('A bridge string must be a string');
+    }
+    const length = utf8Length(value);
+    this.retain(length + STRING_OVERHEAD);
+    this.u32(length);
+    this.add(length);
+  }
+
+  retain(count: number): void {
     if (!isCount(count)) {
       throw resourceLimit();
     }
-    const next = retained + count;
+    const next = this.#retained + count;
     if (!isCount(next) || next > MAX_BYTES) {
       throw resourceLimit();
     }
-    retained = next;
-  };
+    this.#retained = next;
+  }
 
-  return objFreeze({
-    u8,
-    u32,
+  vector(length: number, elementBytes: number): void {
+    this.retain(length * elementBytes + VECTOR_OVERHEAD);
+  }
 
-    i64: (value: bigint): void => {
-      if (value < -MAX_SAFE_INTEGER || value > MAX_SAFE_INTEGER) {
-        throw invalidBridgeValue('A JSON integer is not JavaScript-safe');
-      }
-      add(8);
-    },
+  node(depth: number): void {
+    if (depth > MAX_DEPTH) {
+      throw invalidBridgeValue('A bridge value is too deeply nested');
+    }
+    this.#nodes = checkedIncrement(this.#nodes, MAX_NODES);
+  }
 
-    f64: (value: number): void => {
-      if (!isFiniteNumber(value)) {
-        throw invalidBridgeValue('A JSON number must be finite');
-      }
-      add(8);
-    },
-
-    string: (value: string): void => {
-      if (!isString(value)) {
-        throw invalidBridgeValue('A bridge string must be a string');
-      }
-      const length = utf8Length(value);
-      retain(length + STRING_OVERHEAD);
-      u32(length);
-      add(length);
-    },
-
-    retain,
-
-    vector: (length: number, elementBytes: number): void =>
-      retain(length * elementBytes + VECTOR_OVERHEAD),
-
-    node: (depth: number): void => {
-      if (depth > MAX_DEPTH) {
-        throw invalidBridgeValue('A bridge value is too deeply nested');
-      }
-      nodes = checkedIncrement(nodes, MAX_NODES);
-    },
-
-    operation: (): void => {
-      operations = checkedIncrement(operations, MAX_OPERATIONS);
-    },
-  });
-};
-
-const preflight = (write: (sink: PreflightSink) => void): void =>
-  write(createPreflightSink());
+  operation(): void {
+    this.#operations = checkedIncrement(this.#operations, MAX_OPERATIONS);
+  }
+}
 
 /** Validates and bounds a request once before passing it unchanged to WASM. */
 export const preflightExecuteSql = (
   sql: string,
   params: readonly JsonValue[],
-): void =>
-  preflight((sink) => {
-    sink.string(sql);
-    writeJsonValues(sink, params, 0, 'SQL parameters');
-  });
+): void => {
+  const sink = new PreflightSink();
+  sink.string(sql);
+  writeJsonValues(sink, params, 0, 'SQL parameters');
+};
 
 export const preflightPrepareSql = (sql: string): void =>
-  preflight((sink) => sink.string(sql));
+  new PreflightSink().string(sql);
 
 export const preflightExecutePrepared = (
   statementId: number,
   params: readonly JsonValue[],
-): void =>
-  preflight((sink) => {
-    sink.u32(preparedStatementId(statementId));
-    writeJsonValues(sink, params, 0, 'SQL parameters');
-  });
+): void => {
+  const sink = new PreflightSink();
+  sink.u32(preparedStatementId(statementId));
+  writeJsonValues(sink, params, 0, 'SQL parameters');
+};
 
 export const preflightClosePrepared = (statementId: number): void =>
-  preflight((sink) => sink.u32(preparedStatementId(statementId)));
+  new PreflightSink().u32(preparedStatementId(statementId));
 
 export const preflightExecSql = (sql: string): void =>
-  preflight((sink) => sink.string(sql));
+  new PreflightSink().string(sql);
 
 const writeJsonValues = (
   sink: PreflightSink,
   input: unknown,
   depth: number,
   label: string,
-): void =>
-  writeArray(sink, input, label, RUST_VALUE_BYTES, (target, value) =>
-    writeJsonValue(target, value, depth),
-  );
+): void => {
+  const length = denseArrayLength(input, label);
+  sink.vector(length, RUST_VALUE_BYTES);
+  writeCount(sink, length);
+  for (let index = 0; index < length; index += 1) {
+    writeJsonValue(sink, indexedDataValue(input, index, label), depth);
+  }
+  if (denseArrayLength(input, label) !== length) {
+    throw invalidBridgeValue('A bridge array changed while it was inspected');
+  }
+};
 
 const writeJsonValue = (
   sink: PreflightSink,
@@ -204,8 +197,7 @@ const writeJsonValue = (
     }
     if (isSafeInteger(value)) {
       sink.u8(JSON_I64);
-      // BigInt(-0) is 0n, preserving the prior bridge's canonical spelling.
-      sink.i64(BigInt(value));
+      sink.i64();
     } else {
       sink.u8(JSON_F64);
       sink.f64(value);
@@ -244,24 +236,6 @@ const writeJsonValue = (
   }
 };
 
-const writeArray = (
-  sink: PreflightSink,
-  input: unknown,
-  label: string,
-  retainedElementBytes: number,
-  write: (sink: PreflightSink, value: unknown) => void,
-): void => {
-  const length = denseArrayLength(input, label);
-  sink.vector(length, retainedElementBytes);
-  writeCount(sink, length);
-  for (let index = 0; index < length; index += 1) {
-    write(sink, indexedDataValue(input, index, label));
-  }
-  if (denseArrayLength(input, label) !== length) {
-    throw invalidBridgeValue('A bridge array changed while it was inspected');
-  }
-};
-
 const writeCount = (sink: PreflightSink, count: number): void => {
   if (!isCountWithin(count, 0, MAX_OPERATIONS)) {
     throw resourceLimit();
@@ -285,7 +259,7 @@ const isArray = (value: unknown): value is unknown[] => {
 
 const ownDataDescriptor = (
   value: object,
-  name: string,
+  name: string | number,
 ): PropertyDescriptor | undefined => {
   try {
     return getOwnPropertyDescriptor(value, name);
@@ -294,7 +268,7 @@ const ownDataDescriptor = (
   }
 };
 
-const ownDataField = (value: object, name: string): unknown => {
+const ownDataField = (value: object, name: string | number): unknown => {
   const descriptor = ownDataDescriptor(value, name);
   if (isUndefined(descriptor)) {
     return MISSING;
@@ -359,7 +333,7 @@ const indexedDataValue = (
   index: number,
   label: string,
 ): unknown => {
-  const item = ownDataField(value as object, String(index));
+  const item = ownDataField(value as object, index);
   if (item === MISSING || isUndefined(item)) {
     throw invalidBridgeValue(`${label} cannot be sparse`);
   }
