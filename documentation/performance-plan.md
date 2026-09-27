@@ -85,6 +85,14 @@ Done:
   entries without reading the table.
 - The owning tab reaches its engine through direct calls rather than messages,
   and serves a statement at once when nothing is queued ahead of it.
+- A statement's single change becomes its overlay entry directly, a
+  statement's entries are kept in vectors rather than maps, and its effect on
+  each table's changed-row count is applied once validated, rather than
+  checked against a copy of every count. An insert allocates 33 blocks rather
+  than 37, and 2.4 KB rather than 6.5 KB.
+- Protocol messages are checked with `Object.keys`, a result is read into
+  Results as its response arrives, and a ready client sends a direct statement
+  at once, rather than after turns of the microtask queue.
 
 Found along the way:
 
@@ -108,15 +116,37 @@ Found along the way:
   so a timed phase paid for compiling the code it reached: `DELETE ... LIKE`
   took 14 ms cold and 7 ms warm. Workers running the same module share
   compiled code, so a short-lived second Worker now warms the engine up.
+- Formatting an `f64` with Rust's `Display`, even in one error message, links
+  the Grisu and Dragon4 algorithms, about 10 KB compressed, and serde's derived
+  deserializers link them too, through their error messages. Reading the
+  catalog's models by hand, and writing that one number with zmij, took the
+  engine from 316 KiB to 307.
+- `Reflect.ownKeys` serves no cached key list in V8, and took 0.15 µs for a
+  six-key object where `Object.keys` takes 0.01. Four checks of every
+  statement's request and result used it: about 1 µs a statement.
+- A recycling allocator in front of dlmalloc made point statements 5-7%
+  faster while staging allocated kilobyte B-tree nodes for each row, but once
+  it no longer did, the layer cost bulk reads and deletes 4-6% for 1-3% on
+  point statements, and was removed. Removing the allocations served better
+  than making them cheaper.
+- Messages between the page and the Worker cost about the same whether a
+  result crosses as an object or as JSON text the page parses, so the
+  protocol keeps objects.
 
 Remaining, in order of expected value:
 
 1. Per-statement cost of writes. Measured warm in Chromium, a prepared point
    read costs 26 µs against SQLite's 24, but an insert in a transaction costs
    about 28 µs against 16, and an update about 34 against 17, before their
-   commits. The engine's share of a write is 6–10 µs, spent in many small
-   allocations and lookups as a statement is bound, planned, staged, and
-   reported. An `UPDATE` still plans each row as a map: a prototype that
+   commits. A round trip between the page and a Worker costs about 12 µs by
+   itself, and the engine's share of a write is now 4–7 µs in Node's V8 and
+   about half that in Chromium, spent in many small allocations and lookups
+   as a statement is bound, planned, staged, and reported. Staging and the
+   protocol's checks took 5-10% off each point statement in the browser on
+   28 September; what remains is spread thinly: the response header's JSON,
+   written in WASM and parsed in the Worker, the parameters' defensive
+   encoding, binding a statement by cloning its template, and the changed
+   keys each write reports as maps. An `UPDATE` still plans each row as a map: a prototype that
    writes a row's new record from its old one, copying the columns it does
    not assign, made 1,000 updates by key 1.27 times as fast natively and 1.14
    times in WASM, but grew the engine by 2 KiB compressed, for about 3% in

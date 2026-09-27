@@ -96,6 +96,10 @@ scans, `GROUP BY`, and joins are quicker than in either.
   than as messages checked again at every layer.
 - A plain `INSERT` plans each row straight into the record its commit writes,
   rather than into a map that staging encodes again.
+- Staging a single-row statement no longer copies the transaction's
+  bookkeeping, and each statement's request and result are checked, and its
+  result read, with less work on both sides of the Worker. Point inserts,
+  updates, and deletes in a transaction take 5 to 10% less time.
 - Once per page, create() also starts a short-lived second Worker that runs
   the engine's common statements on a scratch in-memory database for about a
   tenth of a second, and then exits. Chromium compiles WebAssembly one function
