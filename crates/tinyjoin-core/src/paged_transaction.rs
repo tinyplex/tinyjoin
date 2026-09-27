@@ -71,6 +71,8 @@ struct PatchChange {
 #[derive(Default)]
 struct OverlayPatch {
     entries: BTreeMap<String, BTreeMap<Vec<u8>, OverlayEntry>>,
+    /// Whether any entry replaces one the transaction staged before.
+    replaces: bool,
 }
 
 impl PagedTransaction {
@@ -193,6 +195,7 @@ impl PagedTransaction {
         previous: Vec<PreviousRow>,
     ) -> Result<OverlayPatch> {
         let mut patched = BTreeMap::<String, BTreeMap<Vec<u8>, PatchChange>>::new();
+        let mut replaces = false;
         let mut previous = previous.into_iter();
         for change in changes {
             let held = previous.next().unwrap_or(PreviousRow::Unread);
@@ -229,6 +232,7 @@ impl PagedTransaction {
                         .entries
                         .get(&table)
                         .and_then(|entries| entries.get(slot.key()));
+                    replaces |= staged.is_some();
                     let base = match (staged, held) {
                         (Some(entry), _) => entry.row.old.clone(),
                         (None, PreviousRow::Read(row)) => row,
@@ -245,7 +249,10 @@ impl PagedTransaction {
                 }
             }
         }
-        let mut patch = OverlayPatch::default();
+        let mut patch = OverlayPatch {
+            replaces,
+            ..OverlayPatch::default()
+        };
         for (table, changes) in patched {
             let paged = storage.table(&table)?;
             let mut entries = BTreeMap::new();
@@ -283,9 +290,14 @@ impl PagedTransaction {
             claims: BTreeMap::new(),
         };
         // Take each replaced entry's share out first, so that no total passes its limit only on
-        // the way to a smaller final value.
+        // the way to a smaller final value. A patch of new keys, such as an insert's, has none.
         let mut released = BTreeSet::new();
-        for (table, entries) in &patch.entries {
+        let replaced = if patch.replaces {
+            patch.entries.iter()
+        } else {
+            Default::default()
+        };
+        for (table, entries) in replaced {
             for key in entries.keys() {
                 let Some(previous) = self.entries.get(table).and_then(|entries| entries.get(key))
                 else {
@@ -436,14 +448,11 @@ fn overlay_entry<D: PageDevice>(
     let base_bytes = base
         .as_ref()
         .map_or(Ok(0), |base| held_row_bytes(table, base))?;
-    let next_bytes = if is_delete {
-        0
-    } else {
-        estimated_row_bytes(&row)?
-    };
+    let row_bytes = estimated_row_bytes(&row)?;
+    let next_bytes = if is_delete { 0 } else { row_bytes };
     let retained = retained_bytes(table_name, key, base_bytes, next_bytes)?;
     let cost = changed
-        .then(|| storage.change_cost(table_name, &row, is_delete, key, base.as_ref()))
+        .then(|| storage.change_cost(table_name, (&row, row_bytes), is_delete, key, base.as_ref()))
         .transpose()?;
     Ok(OverlayEntry {
         row: ChangedRow { old: base, next },

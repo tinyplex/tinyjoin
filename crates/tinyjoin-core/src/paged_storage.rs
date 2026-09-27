@@ -444,14 +444,15 @@ impl<D: PageDevice> PagedStorage<D> {
 
     /// Validates one change of a transaction's write set, and measures what it adds to the write
     /// set's usage exactly as [`Self::validate_row_write_set`] does for each change: an upsert of
-    /// `row`, which planning normalized, or where `is_delete`, a delete of the key `row`. `key` is
-    /// the row's encoded primary key, and `base` the committed row the change replaces. The catalog
-    /// operations charged once per changed table are left to [`Self::write_set_usage`], and
-    /// conflicts between claims to the caller.
+    /// `row`, which planning normalized, or where `is_delete`, a delete of the key `row`, with the
+    /// row's [`crate::storage::estimated_row_bytes`]. `key` is the row's encoded primary key, and
+    /// `base` the committed row the change replaces. The catalog operations charged once per
+    /// changed table are left to [`Self::write_set_usage`], and conflicts between claims to the
+    /// caller.
     pub(crate) fn change_cost(
         &self,
         table_name: &str,
-        row: &Row,
+        row: (&Row, usize),
         is_delete: bool,
         key: &[u8],
         base: Option<&HeldRow>,
@@ -481,6 +482,7 @@ impl<D: PageDevice> PagedStorage<D> {
             &definitions,
             RowWriteUsage::default(),
         )?;
+        let row = row.0;
         let row_bytes = estimated_row_bytes(row)?;
         let input_bytes = table_name
             .len()
@@ -1850,6 +1852,7 @@ mod tests {
                 unreachable!()
             };
             let key = encode_primary_key(&storage.table(table).unwrap().schema, row).unwrap();
+            let row = (row, crate::storage::estimated_row_bytes(row).unwrap());
             let cost = storage.change_cost(table, row, false, &key, None).unwrap();
             // One row and two maintained indexes, or one row and one index.
             assert_eq!(
@@ -1890,6 +1893,7 @@ mod tests {
             unreachable!()
         };
         let key = encode_primary_key(&storage.table("items").unwrap().schema, row).unwrap();
+        let row = (row, crate::storage::estimated_row_bytes(row).unwrap());
         let addition = storage
             .change_cost("items", row, false, &key, None)
             .unwrap()

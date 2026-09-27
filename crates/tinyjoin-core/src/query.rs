@@ -7,8 +7,8 @@ use serde_json::{Map, Number, Value};
 use crate::paged_codec::{IndexEntryLayout, encode_key_bound, encode_text_prefix_bounds};
 use crate::row::{Columns, RowRef, ValueRef};
 use crate::storage::{
-    KeyOrder, KeyRange, StorageReader, estimated_row_bytes, estimated_value_bytes,
-    validate_json_value,
+    KeyOrder, KeyRange, StorageReader, estimated_checked_value_bytes, estimated_row_bytes,
+    estimated_value_bytes, validate_json_value,
 };
 use crate::{
     ColumnDefinition, ColumnType, ComparisonOperator, EngineError, NullOrder, OrderBy,
@@ -911,7 +911,8 @@ pub(crate) fn validate_bound_parameter_bytes(
         if *count == 0 {
             continue;
         }
-        let retained = estimated_value_bytes(value)
+        // Every parameter's encoded size was checked as it arrived.
+        let retained = estimated_checked_value_bytes(value)
             .map_err(|error| EngineError::bind_error(error.message))?
             .checked_add(std::mem::size_of::<Value>())
             .ok_or_else(binding_limit_exceeded)?;

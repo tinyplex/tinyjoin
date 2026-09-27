@@ -1017,23 +1017,19 @@ pub(crate) fn normalize_row(schema: &TableDefinition, mut row: Row) -> Result<Ro
 
     let mut changed = false;
     for column in &schema.columns {
-        if !row.contains_key(&column.name) {
-            let value = column.default.clone().unwrap_or(Value::Null);
+        // One search finds a column the row names, as nearly every row names them all.
+        let named = match row.get_mut(&column.name) {
+            Some(value) => {
+                changed |= normalize_value(column, value, &schema.name)?;
+                true
+            }
+            None => false,
+        };
+        if !named {
+            let mut value = column.default.clone().unwrap_or(Value::Null);
+            normalize_value(column, &mut value, &schema.name)?;
             row.insert(column.name.clone(), value);
             changed = true;
-        }
-        let value = row
-            .get_mut(&column.name)
-            .expect("the catalog column was populated above");
-        validate_value(column, value, &schema.name)?;
-        // A FLOAT is one binary64 number, however its JSON was spelled, so `1` and `1.0` store
-        // and compare as the same value.
-        if column.data_type == ColumnType::Float && !value.is_null() {
-            let float = float_value(value);
-            if float != *value {
-                *value = float;
-                changed = true;
-            }
         }
     }
     // Only a default or a respelled FLOAT changes the row's size from the one checked above.
@@ -1042,6 +1038,21 @@ pub(crate) fn normalize_row(schema: &TableDefinition, mut row: Row) -> Result<Ro
             .map_err(|error| EngineError::invalid_change(error.message))?;
     }
     Ok(row)
+}
+
+/// Checks a value `column` can hold and respells a FLOAT, returning whether it did.
+fn normalize_value(column: &ColumnDefinition, value: &mut Value, table: &str) -> Result<bool> {
+    validate_value(column, value, table)?;
+    // A FLOAT is one binary64 number, however its JSON was spelled, so `1` and `1.0` store and
+    // compare as the same value.
+    if column.data_type == ColumnType::Float && !value.is_null() {
+        let float = float_value(value);
+        if float != *value {
+            *value = float;
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// A number as the binary64 value a FLOAT column holds. Numbers JavaScript can represent convert
@@ -1186,6 +1197,12 @@ pub(crate) fn estimated_record_bytes(record: &StoredRecord<'_>) -> Result<usize>
 
 pub(crate) fn estimated_value_bytes(value: &Value) -> Result<usize> {
     validate_json_value(value)?;
+    estimated_value_bytes_at_depth(value, 0)
+}
+
+/// [`estimated_value_bytes`] for a value whose encoded size was already checked, such as a bound
+/// parameter.
+pub(crate) fn estimated_checked_value_bytes(value: &Value) -> Result<usize> {
     estimated_value_bytes_at_depth(value, 0)
 }
 
@@ -1551,17 +1568,26 @@ fn preflight_row_changes(
         let schema = schemas
             .get(table.as_str())
             .ok_or_else(|| EngineError::table_not_found(table))?;
-        batch_bytes = preflight_row_change(table, schema, input, is_delete, indexes, batch_bytes)?;
+        let input_bytes = estimated_row_bytes(input)?;
+        batch_bytes = preflight_row_change(
+            table,
+            schema,
+            (input, input_bytes),
+            is_delete,
+            indexes,
+            batch_bytes,
+        )?;
     }
     Ok(batch_bytes)
 }
 
 /// [`preflight_row_write_set`] for one change to a table the caller resolved: an upsert of
-/// `input`, or a delete of the key `input`.
+/// `input`, which planning normalized, or a delete of the key `input`. `input_bytes` is the input's
+/// [`estimated_row_bytes`].
 pub(crate) fn preflight_row_write(
     table: &str,
     schema: &TableDefinition,
-    input: &Row,
+    (input, input_bytes): (&Row, usize),
     is_delete: bool,
     indexes: &[&IndexDefinition],
     previous: RowWriteUsage,
@@ -1579,68 +1605,44 @@ pub(crate) fn preflight_row_write(
         .map_err(|error| EngineError::invalid_change(error.message))?;
     Ok(RowWriteUsage {
         changes,
-        bytes: preflight_row_change(table, schema, input, is_delete, indexes, previous.bytes)?,
+        bytes: preflight_row_change(
+            table,
+            schema,
+            (input, input_bytes),
+            is_delete,
+            indexes,
+            previous.bytes,
+        )?,
     })
 }
 
 fn preflight_row_change(
     table: &str,
     schema: &TableDefinition,
-    input: &Row,
+    (input, input_bytes): (&Row, usize),
     is_delete: bool,
     indexes: &[&IndexDefinition],
     batch_bytes: usize,
 ) -> Result<usize> {
-    let input_row_bytes = validate_row_value_limits(input)
-        .map_err(|error| EngineError::invalid_change(error.message))?;
-    let mut retained = estimated_row_bytes(input)?;
     if is_delete {
+        validate_row_value_limits(input)
+            .map_err(|error| EngineError::invalid_change(error.message))?;
         validate_primary_key_values(schema, input)?;
         validate_primary_storage_key_bound(schema, input)?;
-    }
-    let row_bytes = if !is_delete {
-        let mut row_bytes = 2;
-        for (index, column) in schema.columns.iter().enumerate() {
-            let value = column.default.as_ref().unwrap_or(&Value::Null);
-            let value = input.get(&column.name).unwrap_or(value);
-            if index != 0 {
-                row_bytes = checked_row_write_add(row_bytes, 1)?;
-            }
-            let value_bytes = encoded_json_bytes(value, 1)
-                .map_err(|error| EngineError::invalid_change(error.message))?;
-            row_bytes = checked_row_write_add(
-                row_bytes,
-                checked_row_write_add(
-                    encoded_json_string_bytes(&column.name)?,
-                    checked_row_write_add(value_bytes, 1)?,
-                )?,
-            )?;
-            if !input.contains_key(&column.name) {
-                retained = checked_row_write_add(retained, 64)?;
-                retained =
-                    checked_row_write_add(retained, checked_row_write_mul(column.name.len(), 2)?)?;
-                retained = checked_row_write_add(
-                    retained,
-                    checked_row_write_mul(estimated_value_bytes(value)?, 2)?,
-                )?;
-            }
-        }
-        if row_bytes > MAX_LOGICAL_ROW_BYTES {
-            return Err(EngineError::invalid_change(format!(
-                "A normalized row cannot exceed {MAX_LOGICAL_ROW_BYTES} encoded bytes"
-            )));
-        }
-        row_bytes
     } else {
-        input_row_bytes
-    };
-    if !is_delete {
+        // Normalizing the row gave it every column and checked its values and its encoded size
+        // against their limits, so only the keys it would add to indexes remain to check.
+        debug_assert!(
+            schema
+                .columns
+                .iter()
+                .all(|column| input.contains_key(&column.name))
+        );
         validate_prospective_storage_keys(schema, input, indexes)?;
     }
-    debug_assert!(row_bytes <= MAX_LOGICAL_ROW_BYTES);
     let batch_bytes = checked_row_write_add(
         batch_bytes,
-        checked_row_write_add(table.len(), checked_row_write_add(retained, 64)?)?,
+        checked_row_write_add(table.len(), checked_row_write_add(input_bytes, 64)?)?,
     )?;
     if batch_bytes > MAX_ROW_WRITE_BYTES {
         return Err(EngineError::new(

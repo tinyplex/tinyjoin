@@ -15,8 +15,8 @@ use crate::query::{
 };
 use crate::row::{HeldRow, RowRef};
 use crate::storage::{
-    estimated_row_bytes, estimated_value_bytes, normalize_row, schema_with_added_column,
-    validate_index_columns_for_schema, validate_index_definition_shape,
+    estimated_checked_value_bytes, estimated_row_bytes, estimated_value_bytes, normalize_row,
+    schema_with_added_column, validate_index_columns_for_schema, validate_index_definition_shape,
     validate_primary_storage_key_bound, validate_value,
 };
 use crate::{
@@ -728,7 +728,8 @@ fn plan_insert(
             &all_columns
         }
     };
-    validate_named_columns(&schema, columns)?;
+    // Each schema column's place among the named ones, found once for all of the rows.
+    let positions = named_column_positions(&schema, columns)?;
     validate_projection(&schema, returning)?;
     let mut conflicts = on_conflict
         .map(|clause| ConflictPlan::new(storage, &schema, clause))
@@ -759,7 +760,7 @@ fn plan_insert(
             )));
         }
         let prospective_bytes =
-            prospective_insert_row_bytes(&schema, columns, values, default_values)?;
+            prospective_insert_row_bytes(&schema, &positions, values, default_values)?;
         let prospective_charge = checked_dml_add(
             checked_dml_mul(prospective_bytes, 2)?,
             checked_dml_add(table.len(), DML_CHANGE_RETAINED_BYTES + 160)?,
@@ -1555,21 +1556,42 @@ pub(crate) fn primary_key_row(schema: &TableDefinition, row: &Row) -> Result<Row
     Ok(key)
 }
 
-fn prospective_insert_row_bytes(
+/// Where each of `schema`'s columns is among the named `columns`, which this validates as
+/// [`validate_named_columns`] does.
+fn named_column_positions(
     schema: &TableDefinition,
     columns: &[String],
+) -> Result<Vec<Option<usize>>> {
+    let mut positions = vec![None; schema.columns.len()];
+    for (index, column) in columns.iter().enumerate() {
+        let position = schema
+            .columns
+            .iter()
+            .position(|definition| definition.name == *column)
+            .ok_or_else(|| EngineError::column_not_found(column, &schema.name))?;
+        // A repeated name is found here, since every earlier name was a column.
+        if positions[position].replace(index).is_some() {
+            return Err(EngineError::invalid_query(format!(
+                "Column `{column}` is named more than once"
+            )));
+        }
+    }
+    Ok(positions)
+}
+
+/// The estimated bytes of the row an INSERT's `values` make, with each column's value at its
+/// place in `positions`. Values are bound parameters or literals within the SQL text limit, which
+/// the size checks on either already cover.
+fn prospective_insert_row_bytes(
+    schema: &TableDefinition,
+    positions: &[Option<usize>],
     values: &[SqlValue],
     default_values: bool,
 ) -> Result<usize> {
     let mut bytes = 32usize;
-    for definition in &schema.columns {
+    for (definition, position) in schema.columns.iter().zip(positions) {
         let explicit = (!default_values)
-            .then(|| {
-                columns
-                    .iter()
-                    .position(|column| column == &definition.name)
-                    .and_then(|index| values.get(index))
-            })
+            .then(|| position.and_then(|index| values.get(index)))
             .flatten();
         let value = match explicit {
             Some(SqlValue::Value(value)) => value,
@@ -1577,7 +1599,10 @@ fn prospective_insert_row_bytes(
         };
         bytes = checked_dml_add(bytes, 64)?;
         bytes = checked_dml_add(bytes, checked_dml_mul(definition.name.len(), 2)?)?;
-        bytes = checked_dml_add(bytes, checked_dml_mul(estimated_value_bytes(value)?, 2)?)?;
+        bytes = checked_dml_add(
+            bytes,
+            checked_dml_mul(estimated_checked_value_bytes(value)?, 2)?,
+        )?;
     }
     Ok(bytes)
 }
