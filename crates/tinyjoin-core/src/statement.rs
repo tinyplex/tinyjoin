@@ -1459,9 +1459,13 @@ fn plan_delete(
                     schema.name
                 ))
             })?;
+            // The key was read from a stored row, within the limits on stored values.
             charge = checked_dml_add(charge, 64)?;
             charge = checked_dml_add(charge, checked_dml_mul(column.len(), 2)?)?;
-            charge = checked_dml_add(charge, checked_dml_mul(estimated_value_bytes(value)?, 2)?)?;
+            charge = checked_dml_add(
+                charge,
+                checked_dml_mul(estimated_checked_value_bytes(value)?, 2)?,
+            )?;
         }
         charge = checked_dml_add(charge, 96)?;
         ensure_dml_work_bytes(checked_dml_add(work_bytes, charge)?)?;

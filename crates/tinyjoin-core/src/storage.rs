@@ -1183,7 +1183,9 @@ pub(crate) fn estimated_record_bytes(record: &StoredRecord<'_>) -> Result<usize>
     let mut bytes = 32usize;
     for (position, column) in record.schema().columns.iter().enumerate() {
         let value = match column.data_type {
-            ColumnType::Text | ColumnType::Json => record
+            // A string takes 24 bytes more than its length, as a NULL takes 16.
+            ColumnType::Text => record.text_len(position)?.map_or(16, |length| 24 + length),
+            ColumnType::Json => record
                 .column(position)?
                 .owned_bytes(|value| estimated_value_bytes_at_depth(value, 1))?,
             ColumnType::Boolean | ColumnType::Integer | ColumnType::Float => 16,
@@ -1625,10 +1627,11 @@ fn preflight_row_change(
     batch_bytes: usize,
 ) -> Result<usize> {
     if is_delete {
-        validate_row_value_limits(input)
-            .map_err(|error| EngineError::invalid_change(error.message))?;
-        validate_primary_key_values(schema, input)?;
-        validate_primary_storage_key_bound(schema, input)?;
+        // Planning read the key from a stored row, so it holds valid values within their limits.
+        debug_assert!(
+            input.len() == schema.primary_key.len()
+                && validate_primary_key_values(schema, input).is_ok()
+        );
     } else {
         // Normalizing the row gave it every column and checked its values and its encoded size
         // against their limits, so only the keys it would add to indexes remain to check.

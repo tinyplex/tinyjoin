@@ -464,7 +464,7 @@ fn overlay_entry<D: PageDevice>(
 
 /// The primary-key columns of the encoded key `key` of `table`, as a map.
 fn key_row(table: &PagedTable, key: &[u8]) -> Result<Row> {
-    RowRef::record(table.record(key, EMPTY_RECORD)?).primary_key()
+    table.record(key, EMPTY_RECORD)?.key_row()
 }
 
 #[cfg(test)]

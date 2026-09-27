@@ -924,15 +924,17 @@ fn estimated_row_bytes(row: &Row) -> Result<usize> {
 fn estimated_record_batch_bytes(record: &StoredRecord<'_>) -> Result<usize> {
     let mut bytes = 64usize;
     for (position, column) in record.schema().columns.iter().enumerate() {
-        let value_bytes = match record.column(position)? {
-            ValueRef::Null | ValueRef::Boolean(_) => 8,
-            ValueRef::Integer(_) | ValueRef::Float(_) => 32,
-            ValueRef::Text(text) => text
-                .len()
-                .checked_mul(6)
-                .and_then(|bytes| bytes.checked_add(32))
-                .ok_or_else(batch_too_large)?,
-            ValueRef::Json(value) => estimated_json_bytes(&value, 1)?,
+        let value_bytes = if column.data_type == ColumnType::Text {
+            record
+                .text_len(position)?
+                .map_or(Ok(8), estimated_string_bytes)?
+        } else {
+            match record.column(position)? {
+                ValueRef::Null | ValueRef::Boolean(_) => 8,
+                ValueRef::Integer(_) | ValueRef::Float(_) => 32,
+                ValueRef::Text(text) => estimated_string_bytes(text.len())?,
+                ValueRef::Json(value) => estimated_json_bytes(&value, 1)?,
+            }
         };
         bytes = column
             .name
@@ -955,11 +957,7 @@ fn estimated_json_bytes(value: &serde_json::Value, depth: usize) -> Result<usize
     match value {
         serde_json::Value::Null | serde_json::Value::Bool(_) => Ok(8),
         serde_json::Value::Number(_) => Ok(32),
-        serde_json::Value::String(value) => value
-            .len()
-            .checked_mul(6)
-            .and_then(|bytes| bytes.checked_add(32))
-            .ok_or_else(batch_too_large),
+        serde_json::Value::String(value) => estimated_string_bytes(value.len()),
         serde_json::Value::Array(values) => values.iter().try_fold(64usize, |bytes, value| {
             bytes
                 .checked_add(estimated_json_bytes(value, depth + 1)?)
@@ -968,6 +966,14 @@ fn estimated_json_bytes(value: &serde_json::Value, depth: usize) -> Result<usize
         }),
         serde_json::Value::Object(values) => estimated_object_bytes(values, depth),
     }
+}
+
+/// A string of `length` bytes, escaped as JSON at worst.
+fn estimated_string_bytes(length: usize) -> Result<usize> {
+    length
+        .checked_mul(6)
+        .and_then(|bytes| bytes.checked_add(32))
+        .ok_or_else(batch_too_large)
 }
 
 fn estimated_object_bytes(values: &Row, depth: usize) -> Result<usize> {

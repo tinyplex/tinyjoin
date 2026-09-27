@@ -168,18 +168,11 @@ impl<'a> RowRef<'a> {
 
     /// The row's primary-key columns and their values, as the key of a change to the row.
     pub(crate) fn primary_key(&self) -> Result<Row> {
-        let schema = match &self.0 {
-            Source::Map { row, schema } => return crate::statement::primary_key_row(schema, row),
-            Source::Record(record) => record.schema(),
-            Source::Index(_) => return Err(partial_row()),
-        };
-        let mut key = Row::new();
-        for (position, column) in schema.columns.iter().enumerate() {
-            if schema.primary_key.contains(&column.name) {
-                key.insert(column.name.clone(), self.get(position)?.into_value());
-            }
+        match &self.0 {
+            Source::Map { row, schema } => crate::statement::primary_key_row(schema, row),
+            Source::Record(record) => record.key_row(),
+            Source::Index(_) => Err(partial_row()),
         }
-        Ok(key)
     }
 
     /// The row's primary key, encoded as its B-tree key.

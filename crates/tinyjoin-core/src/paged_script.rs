@@ -439,15 +439,24 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             .map(|index| &index.definition)
             .collect::<Vec<_>>();
         preflight_row_write_set(&input_changes, &schemas, &definitions, Default::default())?;
+        // A statement changes one table, whose index count is found once.
+        let mut indexed: Option<(&str, usize)> = None;
         for change in &input_changes {
             let table = match change {
                 RowChange::Upsert { table, .. } | RowChange::Delete { table, .. } => table,
             };
-            let index_count = self
-                .indexes
-                .values()
-                .filter(|index| index.definition.table == *table)
-                .count();
+            let index_count = match indexed {
+                Some((name, count)) if name == table => count,
+                _ => {
+                    let count = self
+                        .indexes
+                        .values()
+                        .filter(|index| index.definition.table == *table)
+                        .count();
+                    indexed = Some((table, count));
+                    count
+                }
+            };
             self.charge_operations(index_count.saturating_mul(2).saturating_add(1))?;
         }
 
@@ -466,6 +475,9 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 .tables
                 .get(table_name)
                 .ok_or_else(|| EngineError::table_not_found(table_name))?;
+            if !changes.contains_key(table_name) {
+                changes.insert(table_name.clone(), BTreeMap::new());
+            }
             // A stored row planning held is the row the change's key holds, so its entry's key is
             // the change's encoded key.
             let key = match &held {
@@ -475,10 +487,13 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 }
                 _ => encode_primary_key(&table.schema, &row)?,
             };
+            if !is_delete && !duplicate_upserts.contains_key(table_name) {
+                duplicate_upserts.insert(table_name.clone(), BTreeSet::new());
+            }
             if !is_delete
                 && !duplicate_upserts
-                    .entry(table_name.clone())
-                    .or_default()
+                    .get_mut(table_name)
+                    .expect("the table was added above")
                     .insert(key.clone())
             {
                 return Err(EngineError::constraint_violation(format!(
@@ -494,7 +509,9 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             let next = (!is_delete)
                 .then(|| encode_row(&table.schema, &row))
                 .transpose()?;
-            let table_changes = changes.entry(table_name.clone()).or_default();
+            let table_changes = changes
+                .get_mut(table_name)
+                .expect("the table was added above");
             let slot = match table_changes.entry(key) {
                 Entry::Occupied(mut existing) => {
                     let previous_bytes = match &existing.get().next {

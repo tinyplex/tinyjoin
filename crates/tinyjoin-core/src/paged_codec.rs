@@ -657,6 +657,13 @@ impl<'a> StoredRecord<'a> {
     }
 
     fn decode(&self, strict: bool) -> Result<Row> {
+        let mut row = self.key_row()?;
+        self.decode_columns(&mut row, strict)?;
+        Ok(row)
+    }
+
+    /// The primary-key columns, decoded from the key alone.
+    pub(crate) fn key_row(&self) -> Result<Row> {
         let mut row = Row::new();
         let mut offset = 0;
         for (name, data_type) in self.schema.primary_key.iter().zip(&self.layout.key_types) {
@@ -672,7 +679,6 @@ impl<'a> StoredRecord<'a> {
                 "A stored row key contains trailing bytes after its primary key",
             ));
         }
-        self.decode_columns(&mut row, strict)?;
         Ok(row)
     }
 
@@ -686,6 +692,21 @@ impl<'a> StoredRecord<'a> {
         decode_component(&self.key[start..end], data_type)
     }
 
+    /// The length in bytes of the TEXT column at `index`, or `None` for NULL, as [`Self::column`]
+    /// reads it. A stored value's bounds are read without checking its UTF-8, which only sizing a
+    /// row may skip.
+    pub(crate) fn text_len(&self, index: usize) -> Result<Option<usize>> {
+        if let Some(ColumnSlot::Stored(position)) = self.layout.slots.get(index)
+            && *position < self.count
+        {
+            return Ok(self.stored_bytes(*position)?.map(<[u8]>::len));
+        }
+        Ok(match self.column(index)? {
+            ValueRef::Text(text) => Some(text.len()),
+            _ => None,
+        })
+    }
+
     fn stored_column(
         &self,
         position: usize,
@@ -694,6 +715,15 @@ impl<'a> StoredRecord<'a> {
         if position >= self.count {
             return Ok(stored_default(column));
         }
+        match self.stored_bytes(position)? {
+            None => Ok(ValueRef::Null),
+            Some(bytes) => decode_value(column.data_type, bytes, false),
+        }
+    }
+
+    /// The encoded value of the stored column at `position`, below the record's count, or `None`
+    /// for NULL.
+    fn stored_bytes(&self, position: usize) -> Result<Option<&'a [u8]>> {
         let start = if position == 0 {
             0
         } else {
@@ -708,12 +738,12 @@ impl<'a> StoredRecord<'a> {
         let bytes = &self.data[start..end];
         if self.is_null(position) {
             return if bytes.is_empty() {
-                Ok(ValueRef::Null)
+                Ok(None)
             } else {
                 Err(storage_corrupt("A stored NULL column has a value"))
             };
         }
-        decode_value(column.data_type, bytes, false)
+        Ok(Some(bytes))
     }
 
     /// Where the stored column at `position` ends within the data.
