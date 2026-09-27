@@ -24,40 +24,45 @@ reliable figures.
 As of 27 September 2026, the `perf/faster-engine` branch carries this plan
 through most of its steps, one commit per step, each gated on the Rust,
 TypeScript, browser and size checks. The ratios below are to the faster of
-SQLite and PGlite in the same run, so machine load largely cancels out. Both
+SQLite and PGlite in the same run, so machine load largely cancels out. The
 later columns are runs published in `site/data/benchmarks.json`: 26 September
-with five samples, and 27 September, on commit `64ce856`, with nine. Three
-earlier runs on 27 September were discarded because background load inflated
-every engine's times; the published one was made with macOS media analysis
-paused, and its SQLite times match the quiet 26 September run's.
+with five samples, and two on 27 September with nine, on commits `64ce856` and
+`23fe19c`. Three earlier runs on 27 September were discarded because background
+load inflated every engine's times; the published ones were made with macOS
+media analysis paused, and their SQLite times match the quiet 26 September
+run's. The last column adds planning inserted rows straight into records and
+the warm-up Worker.
 
-| Workload | v0.3.0 | 26 Sep | 27 Sep |
-| --- | ---: | ---: | ---: |
-| `cold-open` | 0.7× | 0.8× | 0.71× |
-| `reopen` | 3.5× | 1.2× | 1.2× |
-| `insert-autocommit` | 3.3× | 2.1× | 1.1× |
-| `insert-transaction` | 9.9× | 2.5× | 1.7× |
-| `insert-indexed` | 15× | 2.3× | 1.8× |
-| `insert-batch` | 33× | 3.4× | 2.0× |
-| `select-pk` | 4.2× | 1.6× | 1.2× |
-| `select-scan` | 105× | 1.75× | 1.7× |
-| `select-like` | 39× | 0.9× | 0.95× |
-| `select-indexed` | 1,406× | 2.4× | 1.6× |
-| `select-all` | 2.3× | 0.6× | 0.28× |
-| `group-by` | 22× | 0.95× | 1.0× |
-| `join` | 175× | 1.4× | 1.1× |
-| `update-pk` | 1,077× | 2.3× | 1.8× |
-| `update-scan` | 179× | 2.2× | 2.1× |
-| `upsert` | 1,362× | 2.5× | 1.8× |
-| `delete-pk` | 1,105× | 2.6× | 1.8× |
-| `delete-like` | 95× | 3.7× | 2.7× |
-| `delete-range` | 249× | 3.7× | 2.5× |
-| `create-index` | 142× | 1.3× | 1.1× |
+| Workload | v0.3.0 | 26 Sep | `64ce856` | `23fe19c` |
+| --- | ---: | ---: | ---: | ---: |
+| `cold-open` | 0.7× | 0.8× | 0.71× | 0.59× |
+| `reopen` | 3.5× | 1.2× | 1.2× | 1.1× |
+| `insert-autocommit` | 3.3× | 2.1× | 1.1× | 1.1× |
+| `insert-transaction` | 9.9× | 2.5× | 1.7× | 1.7× |
+| `insert-indexed` | 15× | 2.3× | 1.8× | 1.6× |
+| `insert-batch` | 33× | 3.4× | 2.0× | 1.6× |
+| `select-pk` | 4.2× | 1.6× | 1.2× | 1.1× |
+| `select-scan` | 105× | 1.75× | 1.7× | 1.6× |
+| `select-like` | 39× | 0.9× | 0.95× | 0.94× |
+| `select-indexed` | 1,406× | 2.4× | 1.6× | 1.2× |
+| `select-all` | 2.3× | 0.6× | 0.28× | 0.23× |
+| `group-by` | 22× | 0.95× | 1.0× | 0.86× |
+| `join` | 175× | 1.4× | 1.1× | 0.88× |
+| `update-pk` | 1,077× | 2.3× | 1.8× | 1.8× |
+| `update-scan` | 179× | 2.2× | 2.1× | 2.1× |
+| `upsert` | 1,362× | 2.5× | 1.8× | 1.8× |
+| `delete-pk` | 1,105× | 2.6× | 1.8× | 1.8× |
+| `delete-like` | 95× | 3.7× | 2.7× | 1.9× |
+| `delete-range` | 249× | 3.7× | 2.5× | 2.3× |
+| `create-index` | 142× | 1.3× | 1.1× | 1.0× |
 
-The compressed download grew from 296 KiB to 331 KiB. Between two runs on the
+The compressed download grew from 296 KiB to 334 KiB. Between two runs on the
 same build, the ratios moved by up to a tenth, and by more under load, so read
-them to one significant figure. `update-scan` did not change natively between
-the two columns, and `group-by` only by noise: both scan the table.
+them to one significant figure. In the last column, TinyJoin's own times fell by
+up to a third, most on the workloads whose code the warm-up Worker compiles
+ahead of them: indexed ranges, bulk inserts, joins, grouping, and deletes.
+SQLite was also about 7% faster in that run, so single-statement writes barely
+moved against it.
 
 Done:
 
@@ -97,27 +102,37 @@ Found along the way:
 - The write-set budgets use two different row-size estimators, which share a
   name in different modules. The transaction's running totals are tested for
   exact equality with a whole-write-set oracle, which catches any mix-up.
+- Chromium compiles WebAssembly lazily: loading the engine takes about a
+  millisecond, and each function is compiled when first called, then
+  optimized once hot. Every benchmark sample starts in a new browser profile,
+  so a timed phase paid for compiling the code it reached: `DELETE ... LIKE`
+  took 14 ms cold and 7 ms warm. Workers running the same module share
+  compiled code, so a short-lived second Worker now warms the engine up.
 
 Remaining, in order of expected value:
 
-1. Per-statement cost in JavaScript. A statement in a transaction takes about
-   36 µs in the browser against SQLite's 20 µs. The engine's share is 7–9 µs.
-   Checking and measuring each request and response is now cheap, with a
-   walk that reads checked data directly, key checks that allocate nothing,
-   and a single-object WASM preflight. What remains is copying each request
-   and response between threads as object graphs, about a tenth of the
-   Worker's time and a seventh of the page's, the layers each request passes
-   through inside the Worker, and parameters crossing into WASM through
+1. Per-statement cost of writes. Measured warm in Chromium, a prepared point
+   read costs 26 µs against SQLite's 24, but an insert in a transaction costs
+   about 28 µs against 16, and an update about 34 against 17, before their
+   commits. The engine's share of a write is 6–10 µs, spent in many small
+   allocations and lookups as a statement is bound, planned, staged, and
+   reported; an `UPDATE` still plans each row as a map. The rest is the
+   Worker's JavaScript, a few microseconds more than SQLite's: the layers each
+   request passes through, copying requests and results between threads as
+   object graphs, and parameters crossing into WASM through
    `serde_wasm_bindgen`.
-2. Bulk deletes. PGlite, like PostgreSQL, marks deleted rows and reclaims them
-   later; TinyJoin removes each row and its index entries at once. Deleting a
-   contiguous key or index range could drop whole subtrees, using their
-   fingerprints and counts, rather than visiting every entry.
-3. Scans take 1.7–1.8 times as long as SQLite's, spent mostly in the cursor
-   and predicate evaluation. Inside a transaction, a range `UPDATE` also
-   merges each scan with the staged rows (T3).
-4. [D7](#decisions-needed), with the measurements under
-   [build settings](#build-settings).
+2. Bulk deletes take about twice as long as PGlite's. PGlite, like PostgreSQL,
+   marks deleted rows and reclaims them later; TinyJoin removes each row and
+   its index entries at once. Deleting a contiguous key or index range could
+   drop whole subtrees, using their fingerprints and counts, rather than
+   visiting every entry. An indexed range that turns out too large to read
+   through the index also collects a quarter of the table's keys before
+   giving up.
+3. Scans take 1.6 times as long as SQLite's, spent mostly in the cursor and
+   predicate evaluation. Inside a transaction, a range `UPDATE` also merges
+   each scan with the staged rows (T3), and takes 2.1 times as long.
+4. [D7](#decisions-needed), remeasured under
+   [build settings](#build-settings): keep `z`.
 5. Writing only changed bitmap chunks. This needs per-chunk slots in the
    superblock, a format change, and would save two page writes per commit.
 6. O2 and O4. Reopening is already within 1.2× of SQLite.
@@ -597,6 +612,20 @@ above already made cheap, for 70–80 KiB more compressed, about a quarter of
 the engine. Every build stays under the 1 MiB gate: level 3 is 963 KiB
 uncompressed. `s` costs 24 KiB for a few percent.
 
+Remeasured on 27 September 2026, on commit `ee2de97`, in the same way:
+
+| `tinyjoin-core` | Engine gzip | `insert-transaction` | `insert-batch` | `select-scan` | `group-by` | `update-pk` | `delete-range` | `create-index` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `z` (shipped) | 308 KiB | 78 | 51 | 70 | 16.5 | 12.1 | 8.8 | 11.5 |
+| `s` | +24 KiB | 76 | 51 | 69 | 16.3 | 11.4 | 8.8 | 10.6 |
+| `1` | larger | 80 | 53 | 70 | 18.7 | 12.1 | 9.2 | 10.7 |
+| `2` | +69 KiB | 65 | 41 | 62 | 15.0 | 9.8 | 7.4 | 9.0 |
+| `3` | +69 KiB | 65 | 41 | 62 | 14.9 | 10.0 | 7.7 | 9.1 |
+
+Level 2 still buys 10–25% on the engine alone, for about a fifth of the whole
+download, and the engine is only part of each statement's time in the browser.
+`s` buys 2–7% for 24 KiB. Keep `z`.
+
 ## Decisions needed
 
 | | Decision | Recommendation |
@@ -607,7 +636,7 @@ uncompressed. `s` costs 24 KiB for a few percent.
 | D4 | Streaming in primary-key order relaxes the 100,000 ordered-row limit for those queries. | Accept, and document it |
 | D5 | Array transport needs a protocol version bump, which makes mixed-version tabs a `DATABASE_VERSION_MISMATCH`. Object keys would follow column order instead of today's alphabetical order. | **Decided:** accepted for v0.4.0, as protocol version 9, with object rows' keys in field order, as its release notes announce |
 | D6 | Page format 3 cannot read existing databases. Refuse them or migrate them on open? | **Decided:** refuse with `UNSUPPORTED_PAGE`, with no migration, as announced in the v0.4.0 release notes |
-| D7 | Optimization level, trading size for speed. | Keep `z` for now: level 2 or 3 buys 15–25% on writes for about 75 KiB, a quarter of the engine, while the larger per-statement costs lie outside the optimizer's reach. Revisit after the rest of S3 |
+| D7 | Optimization level, trading size for speed. | Keep `z`: remeasured on 27 September, level 2 buys 10–25% on the engine alone for 69 KiB, about a fifth of the download, while the larger per-statement costs lie outside the optimizer's reach |
 | D8 | Omit trailing columns that equal their defaults, so `ADD COLUMN` stops rewriting every row? | **Decided:** yes |
 
 ## Order of work

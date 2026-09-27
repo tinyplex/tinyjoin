@@ -49,8 +49,8 @@ misreading each other's results.
 This release is also much faster. In the
 [comparative benchmarks](/guides/benchmarks/), most workloads in v0.3.0 took 10
 to 1,400 times as long as the faster of SQLite and PGlite. None now takes more
-than about three times as long, reading every row and `LIKE` scans are quicker
-than in either, and `GROUP BY` is about as quick as in PGlite.
+than about two and a quarter times as long, and reading every row, `LIKE`
+scans, `GROUP BY`, and joins are quicker than in either.
 
 - Updates, upserts, and deletes inside a transaction no longer slow down as the
   transaction grows. Each statement is checked against running totals rather
@@ -87,6 +87,8 @@ than in either, and `GROUP BY` is about as quick as in PGlite.
   10,000 rows well under half.
 - On the tab that owns a database, statements reach the engine as calls rather
   than as messages checked again at every layer.
+- A plain `INSERT` plans each row straight into the record its commit writes,
+  rather than into a map that staging encodes again.
 - Once per page, create() also starts a short-lived second Worker that runs
   the engine's common statements on a scratch in-memory database for about a
   tenth of a second, and then exits. Chromium compiles WebAssembly one function
