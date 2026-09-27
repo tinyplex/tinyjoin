@@ -26,7 +26,10 @@ use crate::{
         secondary_index_primary_key, secondary_index_primary_key_for_definition,
     },
     row::{HeldRow, RowRef, ValueRef},
-    storage::{KeyOrder, KeyRange, RowWriteUsage, normalize_row, preflight_row_write},
+    storage::{
+        KeyOrder, KeyRange, RowWriteUsage, normalize_row, preflight_record_write,
+        preflight_row_write,
+    },
 };
 /// A callback for each key and value of a B-tree entry, which says whether to go on.
 pub(crate) type EntryVisitor<'a> = dyn FnMut(&[u8], &[u8]) -> Result<VisitControl> + 'a;
@@ -110,6 +113,11 @@ impl PagedTable {
     /// One of this table's stored entries, read in place.
     pub(crate) fn record<'a>(&'a self, key: &'a [u8], value: &'a [u8]) -> Result<StoredRecord<'a>> {
         StoredRecord::new(&self.schema, &self.layout, key, value)
+    }
+
+    /// Where the table's columns live in its stored entries.
+    pub(crate) fn layout(&self) -> &Rc<RecordLayout> {
+        &self.layout
     }
 
     /// The type of the leading primary-key column, which orders this table's keys.
@@ -226,6 +234,14 @@ pub(crate) struct UniqueClaim {
     pub(crate) tree_id: TreeId,
     pub(crate) prefix: Box<[u8]>,
     pub(crate) owners: Vec<Vec<u8>>,
+}
+
+/// A changed row as a write set measures it, with its [`crate::storage::estimated_row_bytes`]: a
+/// map planning normalized, or for a delete its key, or the record an upsert was planned into.
+#[derive(Clone, Copy)]
+pub(crate) enum ChangeRow<'a> {
+    Map(&'a Row, usize),
+    Record(&'a [u8], usize),
 }
 
 /// What one change adds to a write set: its usage, and the unique-index values it claims.
@@ -404,6 +420,7 @@ impl<D: PageDevice> PagedStorage<D> {
             let (table_name, input, is_upsert) = match change {
                 RowChange::Upsert { table, row } => (table, row, true),
                 RowChange::Delete { table, key } => (table, key, false),
+                RowChange::Put { .. } => unreachable!("the reference validates rows as maps"),
             };
             let table = self
                 .tables
@@ -452,7 +469,7 @@ impl<D: PageDevice> PagedStorage<D> {
     pub(crate) fn change_cost(
         &self,
         table_name: &str,
-        row: (&Row, usize),
+        row: ChangeRow<'_>,
         is_delete: bool,
         key: &[u8],
         base: Option<&HeldRow>,
@@ -474,16 +491,33 @@ impl<D: PageDevice> PagedStorage<D> {
             .iter()
             .map(|index| &index.definition)
             .collect::<Vec<_>>();
-        let row_write = preflight_row_write(
-            table_name,
-            &table.schema,
-            row,
-            is_delete,
-            &definitions,
-            RowWriteUsage::default(),
-        )?;
-        let row = row.0;
-        let row_bytes = estimated_row_bytes(row)?;
+        let record = match row {
+            ChangeRow::Record(value, _) => Some(table.record(key, value)?),
+            ChangeRow::Map(..) => None,
+        };
+        let row_write = match (row, &record) {
+            (ChangeRow::Map(row, bytes), _) => preflight_row_write(
+                table_name,
+                &table.schema,
+                (row, bytes),
+                is_delete,
+                &definitions,
+                RowWriteUsage::default(),
+            )?,
+            (ChangeRow::Record(_, bytes), Some(record)) => preflight_record_write(
+                table_name,
+                record,
+                bytes,
+                &definitions,
+                RowWriteUsage::default(),
+            )?,
+            (ChangeRow::Record(..), None) => unreachable!("a record change opened its record"),
+        };
+        let row_bytes = match (row, &record) {
+            (ChangeRow::Map(row, _), _) => estimated_row_bytes(row)?,
+            (_, Some(record)) => estimated_record_batch_bytes(record)?,
+            (ChangeRow::Record(..), None) => unreachable!("a record change opened its record"),
+        };
         let input_bytes = table_name
             .len()
             .checked_add(row_bytes)
@@ -506,9 +540,19 @@ impl<D: PageDevice> PagedStorage<D> {
         let mut claims = Vec::new();
         if !is_delete {
             for index in indexes.iter().filter(|index| index.definition.unique) {
-                let Some(prefix) =
-                    encode_secondary_index_prefix(&table.schema, &index.definition, row)?
-                else {
+                let prefix = match (row, &record) {
+                    (ChangeRow::Map(row, _), _) => {
+                        encode_secondary_index_prefix(&table.schema, &index.definition, row)?
+                    }
+                    (_, Some(record)) => encode_record_index_prefix(
+                        &index_column_positions(&table.schema, &index.definition)?,
+                        record,
+                    )?,
+                    (ChangeRow::Record(..), None) => {
+                        unreachable!("a record change opened its record")
+                    }
+                };
+                let Some(prefix) = prefix else {
                     continue;
                 };
                 prepared_bytes = prepared_bytes
@@ -621,6 +665,7 @@ impl<D: PageDevice> PagedStorage<D> {
             let (table_name, input, is_delete) = match change {
                 RowChange::Upsert { table, row } => (table, row, false),
                 RowChange::Delete { table, key } => (table, key, true),
+                RowChange::Put { .. } => unreachable!("the reference validates rows as maps"),
             };
             let table = self
                 .tables
@@ -789,16 +834,20 @@ fn preflight_batch(
     tables: &BTreeMap<String, PagedTable>,
     indexes: &BTreeMap<String, PagedIndex>,
 ) -> Result<PagedWriteUsage> {
-    let schemas = tables
-        .iter()
-        .map(|(name, table)| (name.as_str(), &*table.schema))
-        .collect();
     let definitions = indexes
         .values()
         .map(|index| &index.definition)
         .collect::<Vec<_>>();
     let mut usage = PagedWriteUsage::default();
-    usage.row_write = preflight_row_write_set(changes, &schemas, &definitions, usage.row_write)?;
+    usage.row_write = preflight_row_write_set(
+        changes,
+        &|name| {
+            let table = tables.get(name)?;
+            Some((&*table.schema, Some(&**table.layout())))
+        },
+        &definitions,
+        usage.row_write,
+    )?;
     let mut bytes = usage.input_bytes;
     let mut operations = usage.operations;
     let mut changed_tables = BTreeSet::new();
@@ -813,6 +862,7 @@ fn preflight_batch(
             RowChange::Upsert { table, row } | RowChange::Delete { table, key: row } => {
                 (table, row)
             }
+            RowChange::Put { .. } => unreachable!("the reference validates rows as maps"),
         };
         if !tables.contains_key(table) {
             return Err(EngineError::table_not_found(table));
@@ -1859,7 +1909,9 @@ mod tests {
             };
             let key = encode_primary_key(&storage.table(table).unwrap().schema, row).unwrap();
             let row = (row, crate::storage::estimated_row_bytes(row).unwrap());
-            let cost = storage.change_cost(table, row, false, &key, None).unwrap();
+            let cost = storage
+                .change_cost(table, ChangeRow::Map(row.0, row.1), false, &key, None)
+                .unwrap();
             // One row and two maintained indexes, or one row and one index.
             assert_eq!(
                 cost.usage.operations,
@@ -1901,7 +1953,7 @@ mod tests {
         let key = encode_primary_key(&storage.table("items").unwrap().schema, row).unwrap();
         let row = (row, crate::storage::estimated_row_bytes(row).unwrap());
         let addition = storage
-            .change_cost("items", row, false, &key, None)
+            .change_cost("items", ChangeRow::Map(row.0, row.1), false, &key, None)
             .unwrap()
             .usage;
         // Seed each independent budget just below its limit, leaving the other two empty.

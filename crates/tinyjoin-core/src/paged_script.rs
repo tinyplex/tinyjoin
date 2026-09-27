@@ -12,11 +12,12 @@ use crate::{
     hash::{EMPTY_HASH, combine, identify},
     paged_codec::{
         CATALOG_TREE_ID, CatalogHeader, CatalogIndexRecord, IndexEntry, IndexEntryLayout,
-        MAX_CATALOG_INDEXES, MAX_CATALOG_TABLES, MAX_TREE_ID, encode_catalog_header_record,
-        encode_catalog_index_key, encode_catalog_index_record, encode_catalog_table_key,
-        encode_primary_key, encode_record_index_entry, encode_record_index_prefix, encode_row,
-        encode_secondary_index_entry_key, encode_secondary_index_prefix, index_column_positions,
-        leading_key_component, secondary_index_entry_matches_prefix, secondary_index_primary_key,
+        MAX_CATALOG_INDEXES, MAX_CATALOG_TABLES, MAX_TREE_ID, RecordLayout,
+        encode_catalog_header_record, encode_catalog_index_key, encode_catalog_index_record,
+        encode_catalog_table_key, encode_primary_key, encode_record_index_entry,
+        encode_record_index_prefix, encode_row, encode_secondary_index_entry_key,
+        encode_secondary_index_prefix, index_column_positions, leading_key_component,
+        secondary_index_entry_matches_prefix, secondary_index_primary_key,
         secondary_index_primary_key_for_definition,
     },
     paged_storage::{
@@ -57,6 +58,13 @@ pub(crate) struct ChangedRow {
 
 /// Changed rows by table and encoded primary key.
 type ChangedRows = BTreeMap<String, BTreeMap<Vec<u8>, ChangedRow>>;
+
+/// A planned change's row: a map, or a key a delete names, or the encoded key and record of a
+/// row planned straight into its stored entry.
+enum PlannedRow {
+    Map(Row),
+    Record(Vec<u8>, Vec<u8>),
+}
 
 /// The rows a write changes in one table, each with its encoded primary key, in key order.
 pub(crate) type TableChanges<'a> = (&'a str, Vec<(&'a [u8], &'a ChangedRow)>);
@@ -429,21 +437,27 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         input_changes: Vec<RowChange>,
         previous: Vec<PreviousRow>,
     ) -> Result<()> {
-        let mut schemas = BTreeMap::new();
-        for (name, table) in self.tables.iter() {
-            schemas.insert(name.as_str(), &*table.schema);
-        }
         let definitions = self
             .indexes
             .values()
             .map(|index| &index.definition)
             .collect::<Vec<_>>();
-        preflight_row_write_set(&input_changes, &schemas, &definitions, Default::default())?;
+        preflight_row_write_set(
+            &input_changes,
+            &|name| {
+                let table = self.tables.get(name)?;
+                Some((&*table.schema, Some(&**table.layout())))
+            },
+            &definitions,
+            Default::default(),
+        )?;
         // A statement changes one table, whose index count is found once.
         let mut indexed: Option<(&str, usize)> = None;
         for change in &input_changes {
             let table = match change {
-                RowChange::Upsert { table, .. } | RowChange::Delete { table, .. } => table,
+                RowChange::Upsert { table, .. }
+                | RowChange::Delete { table, .. }
+                | RowChange::Put { table, .. } => table,
             };
             let index_count = match indexed {
                 Some((name, count)) if name == table => count,
@@ -467,8 +481,11 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         for change in input_changes {
             let held = previous.next().unwrap_or(PreviousRow::Unread);
             let (table_name, row, is_delete) = match change {
-                RowChange::Upsert { table, row } => (table, row, false),
-                RowChange::Delete { table, key } => (table, key, true),
+                RowChange::Upsert { table, row } => (table, PlannedRow::Map(row), false),
+                RowChange::Delete { table, key } => (table, PlannedRow::Map(key), true),
+                RowChange::Put { table, key, record } => {
+                    (table, PlannedRow::Record(key, record), false)
+                }
             };
             let table_name = &table_name;
             let table = self
@@ -480,12 +497,13 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             }
             // A stored row planning held is the row the change's key holds, so its entry's key is
             // the change's encoded key.
-            let key = match &held {
-                PreviousRow::Read(Some(HeldRow::Stored(entry))) => {
-                    debug_assert_eq!(entry.key(), encode_primary_key(&table.schema, &row)?);
+            let key = match (&row, &held) {
+                (PlannedRow::Record(key, _), _) => key.clone(),
+                (PlannedRow::Map(row), PreviousRow::Read(Some(HeldRow::Stored(entry)))) => {
+                    debug_assert_eq!(entry.key(), encode_primary_key(&table.schema, row)?);
                     entry.key().to_vec()
                 }
-                _ => encode_primary_key(&table.schema, &row)?,
+                (PlannedRow::Map(row), _) => encode_primary_key(&table.schema, row)?,
             };
             if !is_delete && !duplicate_upserts.contains_key(table_name) {
                 duplicate_upserts.insert(table_name.clone(), BTreeSet::new());
@@ -501,14 +519,17 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 )));
             }
             // The row is retained as its record, charged as the map it was planned as.
-            let next_bytes = if is_delete {
-                0
-            } else {
-                estimated_row_bytes(&row)?
+            let (next, next_bytes) = match row {
+                _ if is_delete => (None, 0),
+                PlannedRow::Map(row) => (
+                    Some(encode_row(&table.schema, &row)?),
+                    estimated_row_bytes(&row)?,
+                ),
+                PlannedRow::Record(_, record) => {
+                    let bytes = estimated_record_bytes(&table.record(&key, &record)?)?;
+                    (Some(record), bytes)
+                }
             };
-            let next = (!is_delete)
-                .then(|| encode_row(&table.schema, &row))
-                .transpose()?;
             let table_changes = changes
                 .get_mut(table_name)
                 .expect("the table was added above");
@@ -1184,6 +1205,16 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
             }
             _ => Ok(VisitOutcome::Complete),
         }
+    }
+
+    fn record_layout(&self, table: &str) -> Option<Rc<RecordLayout>> {
+        self.tables
+            .get(table)
+            .map(|table| Rc::clone(table.layout()))
+    }
+
+    fn holds_encoded_key(&self, table: &str, key: &[u8]) -> Result<bool> {
+        Ok(self.lookup_record(table, key)?.is_some())
     }
 
     fn index_definition(&self, name: &str) -> Option<crate::IndexDefinition> {

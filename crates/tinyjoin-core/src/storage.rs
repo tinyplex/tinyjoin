@@ -1,14 +1,14 @@
 #[cfg(test)]
 use std::cell::Cell;
+use std::collections::HashSet;
 #[cfg(test)]
-use std::collections::BTreeSet;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use serde_json::Value;
 
-use crate::paged_codec::{IndexEntryLayout, StoredRecord};
-use crate::row::RowRef;
+use crate::paged_codec::{IndexEntryLayout, RecordLayout, StoredRecord};
+use crate::row::{RowRef, ValueRef};
 use crate::{
     ColumnDefinition, ColumnType, EngineError, IndexDefinition, Result, Row, RowChange,
     TableDefinition,
@@ -159,6 +159,16 @@ pub(crate) trait StorageReader {
             }
             _ => Ok(VisitOutcome::Complete),
         }
+    }
+    /// Where `table`'s columns live in its stored records, from a reader whose rows are stored
+    /// records, which lets a writer plan rows straight into records. Other readers plan maps.
+    fn record_layout(&self, _table: &str) -> Option<Rc<RecordLayout>> {
+        None
+    }
+    /// Whether a row of `table` holds the encoded primary key `key`, from a reader with record
+    /// layouts, charged as a primary-key visit.
+    fn holds_encoded_key(&self, _table: &str, _key: &[u8]) -> Result<bool> {
+        Err(unplanned_record())
     }
     fn index_definition(&self, name: &str) -> Option<IndexDefinition>;
     fn indexes_for_table(&self, table: &str) -> Result<Vec<IndexDefinition>>;
@@ -417,6 +427,7 @@ impl StorageDriver for InMemoryStorage {
                     let key = row_key(schema, &key)?;
                     (table, key, None)
                 }
+                RowChange::Put { .. } => return Err(unplanned_record()),
             };
 
             let next_bytes = next.as_ref().map_or(Ok(0), estimated_row_bytes)?;
@@ -1176,6 +1187,29 @@ pub(crate) fn estimated_row_bytes(row: &Row) -> Result<usize> {
     Ok(bytes)
 }
 
+/// The most JSON text a row of `schema` can take, apart from its values: braces, commas, and each
+/// column's name and colon.
+pub(crate) fn row_json_overhead(schema: &TableDefinition) -> Result<usize> {
+    let mut bytes = 2usize.saturating_add(schema.columns.len().saturating_sub(1));
+    for column in &schema.columns {
+        bytes = checked_row_write_add(bytes, encoded_json_string_bytes(&column.name)?)?;
+        bytes = checked_row_write_add(bytes, 1)?;
+    }
+    Ok(bytes)
+}
+
+/// An upper bound on a scalar's JSON text, or `None` for an array or object, which only its
+/// encoding measures. A number takes at most 25 bytes however it is spelled, and a string at most
+/// six per byte, when every byte is escaped, and its quotes.
+pub(crate) fn json_scalar_bound(value: &Value) -> Option<usize> {
+    match value {
+        Value::Null | Value::Bool(_) => Some(5),
+        Value::Number(_) => Some(25),
+        Value::String(text) => Some(text.len().saturating_mul(6).saturating_add(2)),
+        Value::Array(_) | Value::Object(_) => None,
+    }
+}
+
 /// [`estimated_row_bytes`] for the row a stored record decodes to, reading columns in place. The
 /// decoded row holds every column of its schema. A boolean, number, or NULL is estimated at 16
 /// bytes whatever its value, so only text and JSON values are read.
@@ -1449,7 +1483,7 @@ fn key_component_bytes(
     }
 }
 
-fn ensure_storage_key_bytes(bytes: usize) -> Result<()> {
+pub(crate) fn ensure_storage_key_bytes(bytes: usize) -> Result<()> {
     if bytes > MAX_STORAGE_KEY_BYTES {
         Err(EngineError::invalid_change(format!(
             "An encoded primary or index key cannot exceed {MAX_STORAGE_KEY_BYTES} bytes"
@@ -1533,9 +1567,12 @@ impl RowWriteUsage {
     }
 }
 
-pub(crate) fn preflight_row_write_set(
+/// A table's schema and, where its rows are stored as records, their layout.
+pub(crate) type TableShape<'a> = (&'a TableDefinition, Option<&'a RecordLayout>);
+
+pub(crate) fn preflight_row_write_set<'a>(
     changes: &[RowChange],
-    schemas: &BTreeMap<&str, &TableDefinition>,
+    tables: &dyn Fn(&str) -> Option<TableShape<'a>>,
     indexes: &[&IndexDefinition],
     previous: RowWriteUsage,
 ) -> Result<RowWriteUsage> {
@@ -1550,26 +1587,35 @@ pub(crate) fn preflight_row_write_set(
     }
     Ok(RowWriteUsage {
         changes: change_count,
-        bytes: preflight_row_changes(changes, schemas, indexes, previous.bytes)?,
+        bytes: preflight_row_changes(changes, tables, indexes, previous.bytes)?,
     })
 }
 
-fn preflight_row_changes(
+fn preflight_row_changes<'a>(
     changes: &[RowChange],
-    schemas: &BTreeMap<&str, &TableDefinition>,
+    tables: &dyn Fn(&str) -> Option<TableShape<'a>>,
     indexes: &[&IndexDefinition],
     mut batch_bytes: usize,
 ) -> Result<usize> {
     for change in changes {
-        let (table, input, is_delete) = match change {
-            RowChange::Upsert { table, row } => (table, row, false),
-            RowChange::Delete { table, key } => (table, key, true),
-        };
+        let (RowChange::Upsert { table, .. }
+        | RowChange::Delete { table, .. }
+        | RowChange::Put { table, .. }) = change;
         validate_catalog_name_bound(table)
             .map_err(|error| EngineError::invalid_change(error.message))?;
-        let schema = schemas
-            .get(table.as_str())
-            .ok_or_else(|| EngineError::table_not_found(table))?;
+        let (schema, layout) = tables(table).ok_or_else(|| EngineError::table_not_found(table))?;
+        let (input, is_delete) = match change {
+            RowChange::Upsert { row, .. } => (row, false),
+            RowChange::Delete { key, .. } => (key, true),
+            RowChange::Put { key, record, .. } => {
+                let layout = layout.ok_or_else(unplanned_record)?;
+                let record = StoredRecord::new(schema, layout, key, record)?;
+                let record_bytes = estimated_record_bytes(&record)?;
+                batch_bytes =
+                    preflight_record_change(table, &record, record_bytes, indexes, batch_bytes)?;
+                continue;
+            }
+        };
         let input_bytes = estimated_row_bytes(input)?;
         batch_bytes = preflight_row_change(
             table,
@@ -1618,6 +1664,117 @@ pub(crate) fn preflight_row_write(
     })
 }
 
+/// [`preflight_row_write`] for an upsert planned as its stored record, whose estimated bytes as
+/// a map are `record_bytes`. Planning checked its values and size as it would a map's.
+pub(crate) fn preflight_record_write(
+    table: &str,
+    record: &StoredRecord<'_>,
+    record_bytes: usize,
+    indexes: &[&IndexDefinition],
+    previous: RowWriteUsage,
+) -> Result<RowWriteUsage> {
+    let changes = previous
+        .changes
+        .checked_add(1)
+        .ok_or_else(row_write_overflow_error)?;
+    if changes > MAX_ROW_WRITE_CHANGES {
+        return Err(row_write_limit_error(format!(
+            "A row write-set cannot contain more than {MAX_ROW_WRITE_CHANGES} changes"
+        )));
+    }
+    validate_catalog_name_bound(table)
+        .map_err(|error| EngineError::invalid_change(error.message))?;
+    Ok(RowWriteUsage {
+        changes,
+        bytes: preflight_record_change(table, record, record_bytes, indexes, previous.bytes)?,
+    })
+}
+
+/// [`preflight_row_change`] for an upsert planned as its stored record.
+fn preflight_record_change(
+    table: &str,
+    record: &StoredRecord<'_>,
+    record_bytes: usize,
+    indexes: &[&IndexDefinition],
+    batch_bytes: usize,
+) -> Result<usize> {
+    validate_record_storage_keys(record, indexes)?;
+    let batch_bytes = checked_row_write_add(
+        batch_bytes,
+        checked_row_write_add(table.len(), checked_row_write_add(record_bytes, 64)?)?,
+    )?;
+    if batch_bytes > MAX_ROW_WRITE_BYTES {
+        return Err(EngineError::new(
+            "TRANSACTION_TOO_LARGE",
+            format!("A row write-set cannot retain more than {MAX_ROW_WRITE_BYTES} bytes"),
+        ));
+    }
+    Ok(batch_bytes)
+}
+
+/// [`validate_prospective_storage_keys`] for a stored record, whose encoded key is its primary-key
+/// tuple.
+fn validate_record_storage_keys(
+    record: &StoredRecord<'_>,
+    indexes: &[&IndexDefinition],
+) -> Result<()> {
+    let primary_bytes = record.key().len();
+    ensure_storage_key_bytes(primary_bytes)?;
+    validate_index_storage_keys(record.schema(), primary_bytes, indexes, &|position| {
+        record.column(position)
+    })
+}
+
+/// Checks the key each of `indexes` would hold for a row of `schema` whose primary-key tuple
+/// takes `primary_bytes`, reading the row's columns by schema position with `column`. A tuple
+/// with a null in it is not indexed.
+fn validate_index_storage_keys<'a>(
+    schema: &TableDefinition,
+    primary_bytes: usize,
+    indexes: &[&IndexDefinition],
+    column: &dyn Fn(usize) -> Result<ValueRef<'a>>,
+) -> Result<()> {
+    'indexes: for definition in indexes
+        .iter()
+        .copied()
+        .filter(|definition| definition.table == schema.name)
+    {
+        let mut bytes = 0usize;
+        for name in &definition.columns {
+            let position = schema
+                .columns
+                .iter()
+                .position(|column| column.name == *name)
+                .ok_or_else(|| EngineError::column_not_found(name, &schema.name))?;
+            let value = column(position)?;
+            if value.is_null() {
+                continue 'indexes;
+            }
+            let data_type = schema.columns[position].data_type;
+            let component = match (data_type, &value) {
+                (ColumnType::Boolean, _) => 1,
+                (ColumnType::Integer | ColumnType::Float, _) => 8,
+                (ColumnType::Text, ValueRef::Text(text)) => {
+                    text.len() + text.bytes().filter(|byte| *byte == 0).count() + 2
+                }
+                _ => key_component_bytes(schema, name, data_type, &value.clone().into_value())?,
+            };
+            bytes = checked_row_write_add(bytes, component)?;
+            ensure_storage_key_bytes(bytes)?;
+        }
+        ensure_storage_key_bytes(checked_row_write_add(bytes, primary_bytes)?)?;
+    }
+    Ok(())
+}
+
+/// The error for a row planned as a record reaching a writer that plans maps.
+pub(crate) fn unplanned_record() -> EngineError {
+    EngineError::new(
+        "INTERNAL_ERROR",
+        "A row planned as a stored record reached a writer without record layouts",
+    )
+}
+
 fn preflight_row_change(
     table: &str,
     schema: &TableDefinition,
@@ -1661,54 +1818,16 @@ fn validate_prospective_storage_keys(
     input: &Row,
     indexes: &[&IndexDefinition],
 ) -> Result<()> {
-    let value_for = |name: &str| {
-        input.get(name).or_else(|| {
-            schema
-                .columns
-                .iter()
-                .find(|column| column.name == name)
-                .and_then(|column| column.default.as_ref())
-        })
-    };
-    let tuple_bytes = |columns: &[String], omit_nulls: bool| -> Result<Option<usize>> {
-        let mut bytes = 0usize;
-        for name in columns {
-            let value = value_for(name).unwrap_or(&Value::Null);
-            if value == &Value::Null {
-                if omit_nulls {
-                    return Ok(None);
-                }
-                return Err(EngineError::invalid_change(format!(
-                    "Primary-key column `{name}` in `{}` cannot be null",
-                    schema.name
-                )));
-            }
-            let data_type = schema
-                .columns
-                .iter()
-                .find(|column| column.name == *name)
-                .ok_or_else(|| EngineError::column_not_found(name, &schema.name))?
-                .data_type;
-            bytes =
-                checked_row_write_add(bytes, key_component_bytes(schema, name, data_type, value)?)?;
-            ensure_storage_key_bytes(bytes)?;
-        }
-        Ok(Some(bytes))
-    };
-
-    let primary_bytes =
-        tuple_bytes(&schema.primary_key, false)?.expect("primary key tuple does not omit nulls");
-    for definition in indexes
-        .iter()
-        .copied()
-        .filter(|definition| definition.table == schema.name)
-    {
-        let Some(index_bytes) = tuple_bytes(&definition.columns, true)? else {
-            continue;
-        };
-        ensure_storage_key_bytes(checked_row_write_add(index_bytes, primary_bytes)?)?;
-    }
-    Ok(())
+    let primary_bytes = storage_tuple_bytes(schema, &schema.primary_key, input, false)?
+        .expect("a primary-key tuple omits no nulls");
+    validate_index_storage_keys(schema, primary_bytes, indexes, &|position| {
+        let column = &schema.columns[position];
+        let value = input
+            .get(&column.name)
+            .or(column.default.as_ref())
+            .unwrap_or(&Value::Null);
+        Ok(ValueRef::from_value(value, column.data_type))
+    })
 }
 
 #[cfg(test)]
@@ -1762,17 +1881,17 @@ mod tests {
     #[test]
     fn row_write_preflight_preserves_cumulative_count_and_byte_boundaries() {
         let schema = users_storage().table_schema("users").unwrap();
-        let schemas = BTreeMap::from([("users", &*schema)]);
+        let tables = |name: &str| (name == "users").then_some((&*schema, None));
         let changes = vec![RowChange::Upsert {
             table: "users".to_owned(),
             row: row(json!({"id": 1, "email": "one"})),
         }];
         let addition =
-            preflight_row_write_set(&changes, &schemas, &[], RowWriteUsage::default()).unwrap();
+            preflight_row_write_set(&changes, &tables, &[], RowWriteUsage::default()).unwrap();
         for extra in [0, 1] {
             let count = preflight_row_write_set(
                 &changes,
-                &schemas,
+                &tables,
                 &[],
                 RowWriteUsage {
                     changes: MAX_ROW_WRITE_CHANGES - 1 + extra,
@@ -1781,7 +1900,7 @@ mod tests {
             );
             let bytes = preflight_row_write_set(
                 &changes,
-                &schemas,
+                &tables,
                 &[],
                 RowWriteUsage {
                     changes: 0,

@@ -138,6 +138,28 @@ pub(crate) fn encode_primary_key(schema: &TableDefinition, row: &Row) -> Result<
     Ok(key)
 }
 
+/// Encodes the primary key of a row given as its columns' values in schema order, as
+/// [`encode_primary_key`] encodes it from a map of them, leaving its size to the caller to check.
+/// Each value is one its column holds, so none is null.
+pub(crate) fn encode_primary_key_values(
+    schema: &TableDefinition,
+    layout: &RecordLayout,
+    values: &[&Value],
+) -> Result<Vec<u8>> {
+    let mut key = Vec::with_capacity(16 * layout.keys.len());
+    for position in &layout.keys {
+        let column = &schema.columns[*position];
+        encode_component(
+            &mut key,
+            column.data_type,
+            values[*position],
+            &schema.name,
+            &column.name,
+        )?;
+    }
+    Ok(key)
+}
+
 /// Encodes an index tuple, which prefixes every entry for that tuple.
 ///
 /// `None` follows PostgreSQL's default index semantics for a tuple containing SQL NULL: it is not
@@ -382,16 +404,44 @@ pub(crate) fn secondary_index_primary_key<'a>(entry: &'a [u8], prefix: &[u8]) ->
 /// entry's B-tree key.
 pub(crate) fn encode_row(schema: &TableDefinition, row: &Row) -> Result<Vec<u8>> {
     let stored = stored_columns(schema);
-    let mut data = Vec::new();
-    let mut ends = Vec::with_capacity(stored.len());
-    let mut nulls = Vec::with_capacity(stored.len());
+    let mut values = Vec::with_capacity(stored.len());
     for column in &stored {
-        let value = row.get(&column.name).ok_or_else(|| {
+        values.push(row.get(&column.name).ok_or_else(|| {
             codec_argument(format!(
                 "Row for `{}` is missing column `{}`",
                 schema.name, column.name
             ))
-        })?;
+        })?);
+    }
+    encode_stored_values(schema, &stored, &values)
+}
+
+/// Encodes a row given as its columns' values in schema order, which planning checked and
+/// normalized as it would a map of them, as [`encode_row`] encodes that map.
+pub(crate) fn encode_row_values(
+    schema: &TableDefinition,
+    layout: &RecordLayout,
+    values: &[&Value],
+) -> Result<Vec<u8>> {
+    let mut stored = Vec::with_capacity(layout.stored.len());
+    let mut stored_values = Vec::with_capacity(layout.stored.len());
+    for position in &layout.stored {
+        stored.push(&schema.columns[*position]);
+        stored_values.push(values[*position]);
+    }
+    encode_stored_values(schema, &stored, &stored_values)
+}
+
+/// Encodes a record from its stored columns and their values, in record order.
+fn encode_stored_values(
+    schema: &TableDefinition,
+    stored: &[&crate::ColumnDefinition],
+    values: &[&Value],
+) -> Result<Vec<u8>> {
+    let mut data = Vec::new();
+    let mut ends = Vec::with_capacity(stored.len());
+    let mut nulls = Vec::with_capacity(stored.len());
+    for (column, value) in stored.iter().zip(values) {
         nulls.push(value.is_null());
         if !value.is_null() {
             encode_value(column, value, &mut data, &schema.name)?;
@@ -469,6 +519,8 @@ pub(crate) struct RecordLayout {
     slots: Vec<ColumnSlot>,
     /// The type of each primary-key component, in key order.
     key_types: Vec<ColumnType>,
+    /// The schema position of each primary-key component, in key order.
+    keys: Vec<usize>,
     /// The schema position of each stored column, in record order.
     stored: Vec<usize>,
 }
@@ -492,6 +544,7 @@ impl RecordLayout {
             .map(|name| schema_column_type(schema, name).map_err(as_storage_corruption))
             .collect::<Result<Vec<_>>>()?;
         let mut slots = Vec::with_capacity(schema.columns.len());
+        let mut keys = vec![0; key_types.len()];
         let mut stored = Vec::with_capacity(schema.columns.len().saturating_sub(key_types.len()));
         for (index, column) in schema.columns.iter().enumerate() {
             match schema
@@ -499,7 +552,10 @@ impl RecordLayout {
                 .iter()
                 .position(|name| *name == column.name)
             {
-                Some(position) => slots.push(ColumnSlot::Key(position)),
+                Some(position) => {
+                    slots.push(ColumnSlot::Key(position));
+                    keys[position] = index;
+                }
                 None => {
                     slots.push(ColumnSlot::Stored(stored.len()));
                     stored.push(index);
@@ -509,6 +565,7 @@ impl RecordLayout {
         Ok(Self {
             slots,
             key_types,
+            keys,
             stored,
         })
     }

@@ -2297,7 +2297,7 @@ than in either, and `GROUP BY` is about as quick as in PGlite.
 - On the tab that owns a database, statements reach the engine as calls rather
   than as messages checked again at every layer.
 
-The compressed download is now 331 KiB, up from 295 KiB in v0.3.0.
+The compressed download is now 333 KiB, up from 295 KiB in v0.3.0.
 
 ## v0.3.0
 

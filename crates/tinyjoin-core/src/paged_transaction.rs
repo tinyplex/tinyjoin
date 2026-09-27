@@ -2,17 +2,18 @@ use std::{
     cell::Cell,
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
+    rc::Rc,
 };
 
 use crate::{
     EngineError, IndexDefinition, MAX_CHANGED_KEYS_PER_TABLE, PageDevice, PagedStorage, Result,
     Row, RowChange, StorageReader, TableDefinition, TreeId, VisitControl, VisitOutcome,
-    paged_codec::{EMPTY_RECORD, IndexEntryLayout, encode_primary_key, encode_row},
+    paged_codec::{EMPTY_RECORD, IndexEntryLayout, RecordLayout, encode_primary_key, encode_row},
     paged_script::{ChangedRow, TableChanges, held_row_bytes},
-    paged_storage::{ChangeCost, PagedTable, PagedWriteUsage},
+    paged_storage::{ChangeCost, ChangeRow, PagedTable, PagedWriteUsage},
     row::{HeldRow, RowRef},
     statement::PreviousRow,
-    storage::{KeyOrder, KeyRange, estimated_row_bytes},
+    storage::{KeyOrder, KeyRange, estimated_record_bytes, estimated_row_bytes},
 };
 
 const MAX_TRANSACTION_KEYS: usize = 100_000;
@@ -61,11 +62,19 @@ struct OverlayEntry {
 /// The last of a statement's changes to one key, with the committed row the key holds.
 struct PatchChange {
     base: Option<HeldRow>,
-    /// The row planning normalized, or for a delete, the key.
-    row: Row,
-    is_delete: bool,
+    row: PatchRow,
     /// Whether the statement upserts the key, which it may do only once.
     upserted: bool,
+}
+
+/// A statement's change to one key, as planning made it.
+enum PatchRow {
+    /// A row planning normalized as a map.
+    Map(Row),
+    /// A row planning encoded as its record.
+    Record(Vec<u8>),
+    /// A delete, of the key as a map.
+    Delete(Row),
 }
 
 #[derive(Default)]
@@ -199,15 +208,23 @@ impl PagedTransaction {
         let mut previous = previous.into_iter();
         for change in changes {
             let held = previous.next().unwrap_or(PreviousRow::Unread);
-            let (table, row, is_delete) = match change {
-                RowChange::Upsert { table, row } => (table, row, false),
-                RowChange::Delete { table, key } => (table, key, true),
+            let (table, row, encoded) = match change {
+                RowChange::Upsert { table, row } => (table, PatchRow::Map(row), None),
+                RowChange::Delete { table, key } => (table, PatchRow::Delete(key), None),
+                RowChange::Put { table, key, record } => {
+                    (table, PatchRow::Record(record), Some(key))
+                }
             };
+            let is_delete = matches!(row, PatchRow::Delete(_));
             // A stored row planning held is the row the change's key holds, so its entry's key is
             // the change's encoded key.
-            let key = match &held {
-                PreviousRow::Read(Some(HeldRow::Stored(entry))) => entry.key().to_vec(),
-                _ => encode_primary_key(&storage.table(&table)?.schema, &row)?,
+            let key = match (encoded, &held, &row) {
+                (Some(key), ..) => key,
+                (None, PreviousRow::Read(Some(HeldRow::Stored(entry))), _) => entry.key().to_vec(),
+                (None, _, PatchRow::Map(row) | PatchRow::Delete(row)) => {
+                    encode_primary_key(&storage.table(&table)?.schema, row)?
+                }
+                (None, _, PatchRow::Record(_)) => unreachable!("a record comes with its key"),
             };
             if !patched.contains_key(&table) {
                 patched.insert(table.clone(), BTreeMap::new());
@@ -225,7 +242,6 @@ impl PagedTransaction {
                     }
                     slot.upserted |= !is_delete;
                     slot.row = row;
-                    slot.is_delete = is_delete;
                 }
                 Entry::Vacant(slot) => {
                     let staged = self
@@ -243,7 +259,6 @@ impl PagedTransaction {
                     slot.insert(PatchChange {
                         base,
                         row,
-                        is_delete,
                         upserted: !is_delete,
                     });
                 }
@@ -426,17 +441,14 @@ fn overlay_entry<D: PageDevice>(
     key: &[u8],
     change: PatchChange,
 ) -> Result<OverlayEntry> {
-    let PatchChange {
-        base,
-        row,
-        is_delete,
-        ..
-    } = change;
+    let PatchChange { base, row, .. } = change;
     let schema = &table.schema;
-    let next = if is_delete {
-        None
-    } else {
-        Some(encode_row(schema, &row)?)
+    let is_delete = matches!(row, PatchRow::Delete(_));
+    // A planned map is encoded here; a planned record already was, and is measured in place.
+    let (next, map) = match row {
+        PatchRow::Map(row) => (Some(encode_row(schema, &row)?), Some(row)),
+        PatchRow::Delete(key) => (None, Some(key)),
+        PatchRow::Record(record) => (Some(record), None),
     };
     // Records are canonical, so equal rows have equal records.
     let changed = match (&base, &next) {
@@ -448,11 +460,22 @@ fn overlay_entry<D: PageDevice>(
     let base_bytes = base
         .as_ref()
         .map_or(Ok(0), |base| held_row_bytes(table, base))?;
-    let row_bytes = estimated_row_bytes(&row)?;
+    let row_bytes = match (&map, &next) {
+        (Some(row), _) => estimated_row_bytes(row)?,
+        (None, Some(record)) => estimated_record_bytes(&table.record(key, record)?)?,
+        (None, None) => unreachable!("a change without a map is a record"),
+    };
     let next_bytes = if is_delete { 0 } else { row_bytes };
     let retained = retained_bytes(table_name, key, base_bytes, next_bytes)?;
     let cost = changed
-        .then(|| storage.change_cost(table_name, (&row, row_bytes), is_delete, key, base.as_ref()))
+        .then(|| {
+            let row = match (&map, &next) {
+                (Some(row), _) => ChangeRow::Map(row, row_bytes),
+                (None, Some(record)) => ChangeRow::Record(record, row_bytes),
+                (None, None) => unreachable!("a change without a map is a record"),
+            };
+            storage.change_cost(table_name, row, is_delete, key, base.as_ref())
+        })
         .transpose()?;
     Ok(OverlayEntry {
         row: ChangedRow { old: base, next },
@@ -758,6 +781,26 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
             }
         }
         self.storage.visit_primary_key(table, key, visitor)
+    }
+
+    fn record_layout(&self, table: &str) -> Option<Rc<RecordLayout>> {
+        self.storage
+            .table(table)
+            .ok()
+            .map(|table| Rc::clone(table.layout()))
+    }
+
+    fn holds_encoded_key(&self, table: &str, key: &[u8]) -> Result<bool> {
+        self.ensure_base_revision()?;
+        self.charge_work(1)?;
+        if let Some(entry) = self
+            .transaction
+            .and_then(|transaction| transaction.table_entries(table))
+            .and_then(|entries| entries.get(key))
+        {
+            return Ok(entry.row.next.is_some());
+        }
+        Ok(self.storage.committed_entry(table, key)?.is_some())
     }
 
     fn index_definition(&self, name: &str) -> Option<IndexDefinition> {

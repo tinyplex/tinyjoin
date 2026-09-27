@@ -90,8 +90,21 @@ fn default_nullable() -> bool {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum RowChange {
-    Upsert { table: String, row: Row },
-    Delete { table: String, key: Row },
+    Upsert {
+        table: String,
+        row: Row,
+    },
+    Delete {
+        table: String,
+        key: Row,
+    },
+    /// An upsert planned straight into the stored entry it writes: its encoded primary key and
+    /// its record. Only a reader with record layouts plans rows this way.
+    Put {
+        table: String,
+        key: Vec<u8>,
+        record: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

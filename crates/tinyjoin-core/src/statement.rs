@@ -6,7 +6,9 @@ use serde_json::{Map, Number, Value};
 
 #[cfg(test)]
 use crate::StorageDriver;
-use crate::paged_codec::encode_primary_key;
+use crate::paged_codec::{
+    RecordLayout, StoredRecord, encode_primary_key, encode_primary_key_values, encode_row_values,
+};
 use crate::query::{
     Filter, ParseMode, Token, bind_parameter, is_reserved_keyword, parse_predicate_at,
     primary_key_lookup, tokenize, validate_named_columns, validate_parameter_expansion,
@@ -15,8 +17,10 @@ use crate::query::{
 };
 use crate::row::{HeldRow, RowRef};
 use crate::storage::{
-    estimated_checked_value_bytes, estimated_row_bytes, estimated_value_bytes, normalize_row,
-    schema_with_added_column, validate_index_columns_for_schema, validate_index_definition_shape,
+    MAX_LOGICAL_ROW_BYTES, ensure_storage_key_bytes, estimated_checked_value_bytes,
+    estimated_record_bytes, estimated_row_bytes, estimated_value_bytes, json_scalar_bound,
+    normalize_row, row_json_overhead, schema_with_added_column, unplanned_record,
+    validate_index_columns_for_schema, validate_index_definition_shape,
     validate_primary_storage_key_bound, validate_value,
 };
 use crate::{
@@ -269,16 +273,17 @@ pub(crate) fn changed_keys(
     storage: &dyn StorageReader,
     changes: &[RowChange],
 ) -> Result<BTreeMap<String, Vec<Row>>> {
-    fn change_row(change: &RowChange) -> (&String, &Row) {
+    fn change_table(change: &RowChange) -> &String {
         match change {
-            RowChange::Upsert { table, row } => (table, row),
-            RowChange::Delete { table, key } => (table, key),
+            RowChange::Upsert { table, .. }
+            | RowChange::Delete { table, .. }
+            | RowChange::Put { table, .. } => table,
         }
     }
     // One change reports one key, which needs neither the bound nor ordering.
     if let [change] = changes {
-        let (table, row) = change_row(change);
-        let key = changed_key(&*storage.table_schema(table)?, row);
+        let table = change_table(change);
+        let key = changed_key(storage, &*storage.table_schema(table)?, change)?;
         let mut keys = BTreeMap::new();
         keys.insert(table.clone(), vec![key]);
         return Ok(keys);
@@ -286,7 +291,7 @@ pub(crate) fn changed_keys(
     let mut schemas: BTreeMap<String, Rc<TableDefinition>> = BTreeMap::new();
     let mut collector = KeyCollector::default();
     for change in changes {
-        let (table, row) = change_row(change);
+        let table = change_table(change);
         let Some(keys) = collector.room(table) else {
             continue;
         };
@@ -296,22 +301,34 @@ pub(crate) fn changed_keys(
                 .entry(table.clone())
                 .or_insert(storage.table_schema(table)?),
         };
-        insert_changed_key(keys, changed_key(schema, row));
+        insert_changed_key(keys, changed_key(storage, schema, change)?);
     }
     Ok(collector.finish())
 }
 
-/// A changed row's primary-key columns. A planned change always carries its table's key columns;
-/// a row that somehow does not is reported without them rather than failing an otherwise valid
+/// A changed row's primary-key columns: projected from the row a change carries, or decoded from
+/// the key of a row planned as its record. A planned map always carries its table's key columns;
+/// one that somehow does not is reported without them rather than failing an otherwise valid
 /// write.
-fn changed_key(schema: &TableDefinition, row: &Row) -> Row {
+fn changed_key(
+    storage: &dyn StorageReader,
+    schema: &TableDefinition,
+    change: &RowChange,
+) -> Result<Row> {
+    let row = match change {
+        RowChange::Upsert { row, .. } | RowChange::Delete { key: row, .. } => row,
+        RowChange::Put { table, key, record } => {
+            let layout = storage.record_layout(table).ok_or_else(unplanned_record)?;
+            return StoredRecord::new(schema, &layout, key, record)?.key_row();
+        }
+    };
     let mut key = Row::new();
     for column in &schema.primary_key {
         if let Some(value) = row.get(column) {
             key.insert(column.clone(), value.clone());
         }
     }
-    key
+    Ok(key)
 }
 
 /// Collects primary keys already projected from their rows, as [`changed_keys`] reports them.
@@ -751,6 +768,16 @@ fn plan_insert(
     let mut returned = Vec::with_capacity(returning.map_or(0, |_| value_rows.len()));
     let mut work_bytes = 0usize;
     let mut result_bytes = 0usize;
+    // A reader that stores records lets a plain INSERT plan each row straight into the entry it
+    // writes, without a map.
+    let records = if conflicts.is_none() && returning.is_none() {
+        storage
+            .record_layout(table)
+            .map(|layout| RecordPlan::new(&schema, layout))
+            .transpose()?
+    } else {
+        None
+    };
     for values in value_rows {
         if !default_values && values.len() != columns.len() {
             return Err(EngineError::invalid_query(format!(
@@ -766,6 +793,40 @@ fn plan_insert(
             checked_dml_add(table.len(), DML_CHANGE_RETAINED_BYTES + 160)?,
         )?;
         ensure_dml_work_bytes(checked_dml_add(work_bytes, prospective_charge)?)?;
+        if let Some(plan) = &records
+            && let Some(values) = plan.values(&schema, &positions, values, default_values)
+        {
+            // Checked as normalizing a map of them would check them, in schema order; a FLOAT is
+            // respelled by encoding it.
+            for (column, value) in schema.columns.iter().zip(&values) {
+                validate_value(column, value, table)?;
+            }
+            // Only its size can fail a key of valid values, however it is measured.
+            let key = encode_primary_key_values(&schema, &plan.layout, &values)?;
+            ensure_storage_key_bytes(key.len())?;
+            let key_charge = checked_dml_add(checked_dml_mul(key.len(), 2)?, 64)?;
+            work_bytes = checked_dml_add(work_bytes, key_charge)?;
+            ensure_dml_work_bytes(work_bytes)?;
+            if (tracks_keys && !written_keys.insert(key.clone()))
+                || storage.holds_encoded_key(table, &key)?
+            {
+                return Err(duplicate_primary_key("INSERT into", table));
+            }
+            let record = encode_row_values(&schema, &plan.layout, &values)?;
+            // Charged as the map it replaces, which the record's estimate is.
+            let record_bytes =
+                estimated_record_bytes(&StoredRecord::new(&schema, &plan.layout, &key, &record)?)?;
+            work_bytes = checked_dml_add(work_bytes, checked_dml_add(record_bytes, 96)?)?;
+            ensure_dml_work_bytes(work_bytes)?;
+            work_bytes = retain_dml_change(work_bytes, table)?;
+            changes.push(RowChange::Put {
+                table: table.to_owned(),
+                key,
+                record,
+            });
+            previous.push(PreviousRow::Read(None));
+            continue;
+        }
         let mut row = Map::new();
         if !default_values {
             for (column, value) in columns.iter().zip(values) {
@@ -804,9 +865,7 @@ fn plan_insert(
                     || storage.visit_primary_key(table, &row, &mut |_| Ok(VisitControl::Stop))?
                         == VisitOutcome::Stopped
                 {
-                    return Err(EngineError::constraint_violation(format!(
-                        "INSERT into `{table}` would duplicate a primary key"
-                    )));
+                    return Err(duplicate_primary_key("INSERT into", table));
                 }
                 (row, key, PreviousRow::Read(None))
             }
@@ -1350,18 +1409,14 @@ fn plan_update(
     let mut destinations = HashSet::with_capacity(row_count);
     for update in &updates {
         if !destinations.insert(update.new_key.as_slice()) {
-            return Err(EngineError::constraint_violation(format!(
-                "UPDATE of `{table}` would duplicate a primary key"
-            )));
+            return Err(duplicate_primary_key("UPDATE of", table));
         }
         if update.new_key != update.old_key
             && !old_keys.contains(update.new_key.as_slice())
             && storage.visit_primary_key(table, &update.new_row, &mut |_| Ok(VisitControl::Stop))?
                 == VisitOutcome::Stopped
         {
-            return Err(EngineError::constraint_violation(format!(
-                "UPDATE of `{table}` would duplicate a primary key"
-            )));
+            return Err(duplicate_primary_key("UPDATE of", table));
         }
     }
 
@@ -1560,6 +1615,48 @@ pub(crate) fn primary_key_row(schema: &TableDefinition, row: &Row) -> Result<Row
     Ok(key)
 }
 
+/// What planning an INSERT's rows straight into records needs, found once per statement.
+struct RecordPlan {
+    layout: Rc<RecordLayout>,
+    /// The JSON text a row takes apart from its values.
+    json_overhead: usize,
+}
+
+impl RecordPlan {
+    fn new(schema: &TableDefinition, layout: Rc<RecordLayout>) -> Result<Self> {
+        Ok(Self {
+            layout,
+            json_overhead: row_json_overhead(schema)?,
+        })
+    }
+
+    /// A row's values in schema order, each named value or its column's default, when every one
+    /// is a scalar and the row's JSON text cannot pass the row limit, so that no check on a map
+    /// of them could fail for its size. Any other row is planned as a map.
+    fn values<'a>(
+        &self,
+        schema: &'a TableDefinition,
+        positions: &[Option<usize>],
+        values: &'a [SqlValue],
+        default_values: bool,
+    ) -> Option<Vec<&'a Value>> {
+        let mut row = Vec::with_capacity(schema.columns.len());
+        let mut bound = self.json_overhead;
+        for (column, position) in schema.columns.iter().zip(positions) {
+            let explicit = (!default_values)
+                .then(|| position.and_then(|index| values.get(index)))
+                .flatten();
+            let value = match explicit {
+                Some(SqlValue::Value(value)) => value,
+                Some(SqlValue::Default) | None => column.default.as_ref().unwrap_or(&Value::Null),
+            };
+            bound = bound.saturating_add(json_scalar_bound(value)?);
+            row.push(value);
+        }
+        (bound <= MAX_LOGICAL_ROW_BYTES).then_some(row)
+    }
+}
+
 /// Where each of `schema`'s columns is among the named `columns`, which this validates as
 /// [`validate_named_columns`] does.
 fn named_column_positions(
@@ -1680,6 +1777,14 @@ fn ensure_dml_work_bytes(bytes: usize) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// The failure of a statement, `INSERT into` or `UPDATE of`, that would leave two rows of `table`
+/// with one primary key.
+fn duplicate_primary_key(statement: &str, table: &str) -> EngineError {
+    EngineError::constraint_violation(format!(
+        "{statement} `{table}` would duplicate a primary key"
+    ))
 }
 
 fn dml_overflow_error() -> EngineError {
