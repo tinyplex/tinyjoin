@@ -44,10 +44,15 @@ export const createLocalRpc = (): LocalRpc => {
   const envelope = (method: RpcMethod, params: unknown): WorkerRequest =>
     ({v: PROTOCOL_VERSION, id: nextId++, method, params}) as WorkerRequest;
   return objFreeze<LocalRpc>({
-    request: (method, params) =>
-      (disposed
-        ? Promise.reject(workerTerminated())
-        : host.request(envelope(method, params))) as never,
+    request: (method, params, read) => {
+      if (disposed) {
+        return Promise.reject(workerTerminated());
+      }
+      const served = host.request(envelope(method, params));
+      return (
+        read ? served.then(read as (value: unknown) => unknown) : served
+      ) as never;
+    },
     requestNow: (method, params) =>
       disposed ? undefined : host.requestNow(envelope(method, params)),
     onEvent: (listener) => {

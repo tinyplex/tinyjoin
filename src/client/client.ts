@@ -245,20 +245,39 @@ const createClient = (options: ClientOptions): Client => {
     assertNoActiveTransaction();
   };
 
-  const executePrepared = async <RowType>(
-    statementId: number,
-    params: JsonValue[],
-    options?: QueryOptions,
-  ): Promise<Results<RowType>> => {
-    await beginDirect();
-    const result = await rpc.request('executePrepared', {
-      statementId,
-      params,
-      ...rowModeParam(options),
-    });
+  // Sends a direct statement once beginDirect would let it: at once, when the
+  // database is already ready, rather than after turns of the microtask queue.
+  // A failed check, there or in `send`, rejects rather than throws.
+  const direct = <Result>(send: () => Promise<Result>): Promise<Result> => {
+    if (!ready) {
+      return beginDirect().then(send);
+    }
+    try {
+      assertNoActiveTransaction();
+      return send();
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  };
+
+  // Reads a statement's result as its response arrives.
+  const readResults = <RowType>(result: SqlResult): Results<RowType> => {
     noteRevision(result.revision);
     return toResults<RowType>(result);
   };
+
+  const executePrepared = <RowType>(
+    statementId: number,
+    params: JsonValue[],
+    options?: QueryOptions,
+  ): Promise<Results<RowType>> =>
+    direct(() =>
+      rpc.request(
+        'executePrepared',
+        {statementId, params, ...rowModeParam(options)},
+        readResults<RowType>,
+      ),
+    );
 
   const trackPreparedClose = (close: Promise<void>): void => {
     const previous = preparedCloseTail;
@@ -305,6 +324,7 @@ const createClient = (options: ClientOptions): Client => {
       transactionId,
       preparedOwner,
       noteRevision,
+      readResults,
     );
     let shouldRollback = true;
     try {
@@ -389,21 +409,19 @@ const createClient = (options: ClientOptions): Client => {
       return closed;
     },
 
-    query: async <RowType = Row>(
+    query: <RowType = Row>(
       sql: string,
       params: JsonValue[] = [],
       options?: QueryOptions,
-    ): Promise<Results<RowType>> => {
-      await beginDirect();
-      assertQueryOptions(options);
-      const result = await rpc.request('executeSql', {
-        sql,
-        params,
-        ...rowModeParam(options),
-      });
-      noteRevision(result.revision);
-      return toResults<RowType>(result);
-    },
+    ): Promise<Results<RowType>> =>
+      direct(() => {
+        assertQueryOptions(options);
+        return rpc.request(
+          'executeSql',
+          {sql, params, ...rowModeParam(options)},
+          readResults<RowType>,
+        );
+      }),
 
     sql: <RowType = Row>(
       strings: TemplateStringsArray,
@@ -565,6 +583,7 @@ const createTransactionSession = (
   transactionId: string,
   preparedOwner: object,
   noteRevision: (revision: number) => void,
+  readResults: <RowType>(result: SqlResult) => Results<RowType>,
 ): TransactionSession => {
   const pending = new Set<Promise<unknown>>();
   let open = true;
@@ -588,10 +607,20 @@ const createTransactionSession = (
     );
   };
 
-  const track = <Result>(promise: Promise<Result>): Promise<Result> => {
+  // Tracks a statement until it settles, and a prepared statement's execution
+  // with it, in one reaction rather than one for each.
+  const track = <Result>(
+    promise: Promise<Result>,
+    statement?: PreparedStatementState,
+  ): Promise<Result> => {
     assertOpen();
     pending.add(promise);
-    forget(promise);
+    statement?.inFlight.add(promise);
+    const settled = (): void => {
+      pending.delete(promise);
+      statement?.inFlight.delete(promise);
+    };
+    void promise.then(settled, settled);
     return promise;
   };
 
@@ -604,17 +633,11 @@ const createTransactionSession = (
       assertOpen();
       assertQueryOptions(options);
       return track(
-        rpc
-          .request('executeSql', {
-            sql,
-            params,
-            transactionId,
-            ...rowModeParam(options),
-          })
-          .then((result) => {
-            noteRevision(result.revision);
-            return toResults<RowType>(result);
-          }),
+        rpc.request(
+          'executeSql',
+          {sql, params, transactionId, ...rowModeParam(options)},
+          readResults<RowType>,
+        ),
       );
     },
 
@@ -628,14 +651,16 @@ const createTransactionSession = (
       assertOpen();
       assertQueryOptions(options);
       return track(
-        rpc
-          .request('execSql', {sql, transactionId, ...rowModeParam(options)})
-          .then((results) => {
+        rpc.request(
+          'execSql',
+          {sql, transactionId, ...rowModeParam(options)},
+          (results) => {
             for (const result of results) {
               noteRevision(result.revision);
             }
             return results.map((result) => toResults(result));
-          }),
+          },
+        ),
       );
     },
 
@@ -655,21 +680,18 @@ const createTransactionSession = (
       state.assertClientOpen();
       assertPreparedStatementOpen(state);
       assertQueryOptions(options);
-      return trackPreparedExecution(
-        state,
-        track(
-          rpc
-            .request('executePrepared', {
-              statementId: state.statementId,
-              params,
-              transactionId,
-              ...rowModeParam(options),
-            })
-            .then((result) => {
-              noteRevision(result.revision);
-              return toResults<RowType>(result);
-            }),
+      return track(
+        rpc.request(
+          'executePrepared',
+          {
+            statementId: state.statementId,
+            params,
+            transactionId,
+            ...rowModeParam(options),
+          },
+          readResults<RowType>,
         ),
+        state,
       );
     },
 

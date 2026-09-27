@@ -16,16 +16,24 @@ import {ClientError, clientError} from './error.js';
 export type ResultValidation = 'full' | 'header';
 
 export interface WorkerRpc {
-  request<Method extends RpcMethod>(
+  /**
+   * Sends a request, and settles with its result, as `read` returns it when
+   * given. Reading the result as the response arrives, rather than in a
+   * promise chained onto this one, saves the caller a turn of the microtask
+   * queue between one statement and the next.
+   */
+  request<Method extends RpcMethod, Result = RpcMethods[Method]['response']>(
     method: Method,
     params: RpcMethods[Method]['request'],
-  ): Promise<RpcMethods[Method]['response']>;
+    read?: (response: RpcMethods[Method]['response']) => Result,
+  ): Promise<Result>;
   onEvent(listener: (event: WorkerEvent) => void): void;
   dispose(error?: ClientError): void;
 }
 
 type PendingRequest = {
   method: RpcMethod;
+  read: ((response: never) => unknown) | undefined;
   resolve(value: unknown): void;
   reject(error: unknown): void;
 };
@@ -111,7 +119,18 @@ export const createWorkerRpc = (
       return;
     }
     pending.delete(event.data.id);
-    request.resolve(event.data.result);
+    if (isUndefined(request.read)) {
+      request.resolve(event.data.result);
+      return;
+    }
+    let result: unknown;
+    try {
+      result = request.read(event.data.result as never);
+    } catch (error) {
+      request.reject(error);
+      return;
+    }
+    request.resolve(result);
   };
 
   const onMessageError = (): void =>
@@ -135,17 +154,21 @@ export const createWorkerRpc = (
   worker.addEventListener('error', onError);
 
   return objFreeze({
-    request: <Method extends RpcMethod>(
+    request: <
+      Method extends RpcMethod,
+      Result = RpcMethods[Method]['response'],
+    >(
       method: Method,
       params: RpcMethods[Method]['request'],
-    ): Promise<RpcMethods[Method]['response']> => {
+      read?: (response: RpcMethods[Method]['response']) => Result,
+    ): Promise<Result> => {
       if (disposed) {
         return Promise.reject(workerTerminated());
       }
       const id = nextId++;
       const message = {v: PROTOCOL_VERSION, id, method, params} as WorkerRequest;
       return new Promise((resolve, reject) => {
-        pending.set(id, {method, resolve, reject});
+        pending.set(id, {method, read, resolve, reject});
         try {
           worker.postMessage(message);
         } catch (error) {
@@ -159,7 +182,7 @@ export const createWorkerRpc = (
                 ),
           );
         }
-      }) as Promise<RpcMethods[Method]['response']>;
+      }) as Promise<Result>;
     },
 
     onEvent: (listener: (event: WorkerEvent) => void): void => {
