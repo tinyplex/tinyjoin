@@ -869,9 +869,13 @@ const rowModeParam = (
   options: QueryOptions | undefined,
 ): {rowMode?: 'array'} => (options?.rowMode === 'array' ? {rowMode: 'array'} : {});
 
+// The rows of a statement that returns none, such as an INSERT's.
+const NO_ROWS = '{"fields":[],"rows":[]}';
+
 // A result's rows arrive as JSON text, parsed here only once they are used.
 const toResults = <RowType>(result: SqlResult): Results<RowType> => {
-  const data = parseSqlData(result.data);
+  const data =
+    result.data === NO_ROWS ? {fields: [], rows: []} : parseSqlData(result.data);
   if (
     !isRecord(data) ||
     !arrayIsArray(data.fields) ||
