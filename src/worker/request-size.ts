@@ -82,7 +82,9 @@ export const requestBytes = (value: unknown, limit: number): number => {
  * data from a structured clone or a literal, whose containers are plain objects
  * and dense arrays. It charges exactly what {@link requestBytes} charges, but
  * reads properties directly, since the check that accepted them already read
- * every one, and falls back to {@link requestBytes} for anything else.
+ * every one, and falls back to {@link requestBytes} for anything else. Such a
+ * container's own properties are exactly its enumerable ones, which
+ * Object.keys lists far faster than a for-in loop visits them.
  */
 export const checkedRequestBytes = (value: unknown, limit: number): number => {
   if (
@@ -120,34 +122,29 @@ export const checkedRequestBytes = (value: unknown, limit: number): number => {
     } else if (!seen.includes(next)) {
       seen.push(next);
       add(32);
+      const keys = Object.keys(next);
+      let named = 0;
       if (Array.isArray(next)) {
         const length = next.length;
         add(length * 8);
-        // A dense array's indices come first, in order, then any named
-        // properties.
-        let index = 0;
-        for (const key in next) {
-          if (bytes > limit || unchecked) return;
-          if (index < length) {
-            if (key !== String(index)) {
-              unchecked = true;
-              return;
-            }
-            visit(next[index++]);
-          } else if (Object.hasOwn(next, key)) {
-            add(24 + key.length * 2);
-            visit((next as unknown as Record<string, unknown>)[key]);
-          }
+        // An array's indices come first, in ascending order, and then its named
+        // properties. So a dense one's first `length` keys are its indices
+        // exactly when the last of them is.
+        if (length > 0 && keys[length - 1] !== String(length - 1)) {
+          unchecked = true;
+          return;
         }
-        if (index < length) unchecked = true;
-      } else {
-        for (const key in next) {
+        for (let index = 0; index < length; index++) {
           if (bytes > limit || unchecked) return;
-          if (Object.hasOwn(next, key)) {
-            add(24 + key.length * 2);
-            visit((next as Record<string, unknown>)[key]);
-          }
+          visit(next[index]);
         }
+        named = length;
+      }
+      for (; named < keys.length; named++) {
+        if (bytes > limit || unchecked) return;
+        const key = keys[named]!;
+        add(24 + key.length * 2);
+        visit((next as Record<string, unknown>)[key]);
       }
     }
   };

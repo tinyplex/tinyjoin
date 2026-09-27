@@ -7,13 +7,13 @@ import {
   isNumber,
   isObject,
   isPlainRecord,
+  objKeys,
   isRecord,
   isString,
   isUndefined,
   MAX_U32,
   objHasOwn,
   objValues,
-  ownKeys,
 } from './common.js';
 
 export const PROTOCOL_VERSION = 9 as const;
@@ -352,10 +352,13 @@ const hasExactParams = (
 ): value is Record<string, unknown> =>
   isRecord(value) && hasExactKeys(value, expectedKeys);
 
+// Every message arrives as a structured clone or parsed JSON, whose own keys
+// are exactly its enumerable string keys, so Object.keys reads them all, and
+// far faster than Reflect.ownKeys would.
 const hasOnlyKeys = (
   value: Record<string, unknown>,
   allowedKeys: readonly string[],
-): boolean => areKeysWithin(ownKeys(value), allowedKeys);
+): boolean => areKeysWithin(objKeys(value), allowedKeys);
 
 // Keys are distinct, so as many keys as expected, each expected, are exactly
 // those expected.
@@ -363,21 +366,21 @@ const hasExactKeys = (
   value: Record<string, unknown>,
   expectedKeys: readonly string[],
 ): boolean => {
-  const keys = ownKeys(value);
+  const keys = objKeys(value);
   return (
     keys.length === expectedKeys.length && areKeysWithin(keys, expectedKeys)
   );
 };
 
 // Every message is checked this way, so the keys are read once and walked
-// without a callback.
+// without a callback. They usually come in the order they are listed.
 const areKeysWithin = (
-  keys: readonly (string | symbol)[],
+  keys: readonly string[],
   allowedKeys: readonly string[],
 ): boolean => {
   for (let index = 0; index < keys.length; index++) {
-    const key = keys[index];
-    if (!isString(key) || !allowedKeys.includes(key)) {
+    const key = keys[index]!;
+    if (key !== allowedKeys[index] && !allowedKeys.includes(key)) {
       return false;
     }
   }

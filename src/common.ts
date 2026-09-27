@@ -15,6 +15,7 @@ import type {Row} from './protocol.js';
 export const arrayIsArray = Array.isArray;
 export const objFreeze = Object.freeze;
 export const objHasOwn = Object.hasOwn;
+export const objKeys = Object.keys;
 export const objValues = Object.values;
 export const ownKeys = Reflect.ownKeys;
 export const mathMax = Math.max;
@@ -41,7 +42,13 @@ export const isObject = (value: unknown): value is object =>
 export const isRecord = (value: unknown): value is Record<string, unknown> =>
   isObject(value) && !arrayIsArray(value);
 
-/** A plain object safe to walk as JSON, with only string keys. */
+/**
+ * A plain object safe to walk as JSON: one JSON.parse or a structured clone
+ * could have made, whose prototype is Object.prototype or null. Neither can
+ * give an object symbol keys, and JSON never sees them, so they are not
+ * looked for: Reflect.ownKeys, which would find them, costs far more than the
+ * rest of a message's checks.
+ */
 export const isPlainRecord = (
   value: unknown,
 ): value is Record<string, unknown> => {
@@ -49,16 +56,7 @@ export const isPlainRecord = (
     return false;
   }
   const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) {
-    return false;
-  }
-  const keys = ownKeys(value);
-  for (let index = 0; index < keys.length; index++) {
-    if (!isString(keys[index])) {
-      return false;
-    }
-  }
-  return true;
+  return prototype === Object.prototype || prototype === null;
 };
 
 export const isInteger = (value: unknown): value is number =>
