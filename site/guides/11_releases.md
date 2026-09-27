@@ -46,6 +46,13 @@ bundle. A mismatched pair fails cleanly with `PROTOCOL_MISMATCH`, and tabs
 running different releases fail with `DATABASE_VERSION_MISMATCH`, rather than
 misreading each other's results.
 
+**Numbers keep every bit.** Numbers in JSON values and SQL text are now read
+with correct rounding. Earlier releases read about one in ten numbers that
+need all 17 significant digits, such as many results of `Math.random()`, as a
+neighboring value. In v0.3.0 and earlier, a row holding one could then not be
+read at all: reading it failed with `PAGED_STORAGE_CORRUPT`, because the row
+no longer matched its stored text.
+
 This release is also much faster. In the
 [comparative benchmarks](/guides/benchmarks/), most workloads in v0.3.0 took 10
 to 1,400 times as long as the faster of SQLite and PGlite. None now takes more

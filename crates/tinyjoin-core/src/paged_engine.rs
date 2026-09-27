@@ -1416,6 +1416,67 @@ mod tests {
         );
     }
 
+    /// Numbers that need all 17 significant digits, such as about a tenth of `Math.random()`'s
+    /// results, and extreme exponents. Parsing JSON or SQL text without full precision rounds
+    /// many of them to a neighbouring float.
+    const PRECISE_FLOATS: [f64; 6] = [
+        0.9856906946328695,
+        124.58223982731829,
+        1.0715660391465826e-75,
+        20.900000000000002,
+        2.2250738585072014e-308,
+        1.7976931348623157e308,
+    ];
+
+    #[test]
+    fn json_and_sql_numbers_keep_every_bit_and_reopen() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .exec_sql("CREATE TABLE numbers (id INTEGER PRIMARY KEY, doc JSON, f FLOAT)")
+            .unwrap();
+        for (id, value) in PRECISE_FLOATS.into_iter().enumerate() {
+            engine
+                .execute_sql(
+                    "INSERT INTO numbers VALUES ($1, $2, $3)",
+                    &[
+                        json!(id),
+                        json!({"x": value, "list": [value]}),
+                        json!(value),
+                    ],
+                )
+                .unwrap();
+            // The same number written as SQL text.
+            engine
+                .execute_sql(
+                    &format!("INSERT INTO numbers VALUES ({}, NULL, {value:e})", id + 100),
+                    &[],
+                )
+                .unwrap();
+        }
+        let check = |engine: &PagedEngine<MemoryPageDevice>| {
+            for (id, value) in PRECISE_FLOATS.into_iter().enumerate() {
+                let rows = engine
+                    .query_sql(
+                        "SELECT doc, f FROM numbers WHERE id = $1 OR id = $2 ORDER BY id",
+                        &[json!(id), json!(id + 100)],
+                    )
+                    .unwrap()
+                    .rows;
+                assert_eq!(rows[0]["doc"], json!({"x": value, "list": [value]}));
+                for row in &rows {
+                    assert_eq!(row["f"].as_f64().map(f64::to_bits), Some(value.to_bits()));
+                }
+                // A literal compares as the value it spells.
+                let literal = format!("SELECT id FROM numbers WHERE f = {value:e} ORDER BY id");
+                assert_eq!(engine.query_sql(&literal, &[]).unwrap().rows.len(), 2);
+            }
+        };
+        check(&engine);
+        // Reopening checks that every stored JSON value is canonical.
+        let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        check(&reopened);
+    }
+
     #[test]
     fn transaction_overlay_uses_canonical_typed_float_primary_keys() {
         let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();

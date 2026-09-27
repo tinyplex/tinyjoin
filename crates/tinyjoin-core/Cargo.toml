@@ -13,4 +13,4 @@ compact-storage-diagnostics = []
 
 [dependencies]
 serde = {version = "1", features = ["derive"]}
-serde_json = {version = "1", default-features = false, features = ["alloc"]}
+serde_json = {version = "1", default-features = false, features = ["alloc", "float_roundtrip"]}
