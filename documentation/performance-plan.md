@@ -21,29 +21,42 @@ reliable figures.
 
 ## Progress
 
-As of 26 September 2026, the `perf/faster-engine` branch carries this plan
+As of 27 September 2026, the `perf/faster-engine` branch carries this plan
 through most of its steps, one commit per step, each gated on the Rust,
-TypeScript, browser and size checks. The published browser results in
-`site/data/benchmarks.json` were remeasured on its final commit. The ratios
-below are to the faster of SQLite and PGlite in the same run, so machine load
-cancels out:
+TypeScript, browser and size checks. The ratios below are to the faster of
+SQLite and PGlite in the same run, so machine load largely cancels out. The
+26 September column is the run published in `site/data/benchmarks.json`. The
+27 September column is the range of two full runs on the branch's latest
+commit, which were not published: the machine was heavily loaded, and every
+engine's absolute times were about 1.6 times those of the published run.
 
-| Workload | v0.3.0 | Now | Workload | v0.3.0 | Now |
-| --- | ---: | ---: | --- | ---: | ---: |
-| `cold-open` | 0.7× | 0.8× | `select-all` | 2.3× | 0.6× |
-| `reopen` | 3.5× | 1.2× | `group-by` | 22× | 0.95× |
-| `insert-autocommit` | 3.3× | 2.1× | `join` | 175× | 1.4× |
-| `insert-transaction` | 9.9× | 2.5× | `update-pk` | 1,077× | 2.3× |
-| `insert-indexed` | 15× | 2.3× | `update-scan` | 179× | 2.2× |
-| `insert-batch` | 33× | 3.4× | `upsert` | 1,362× | 2.5× |
-| `select-pk` | 4.2× | 1.6× | `delete-pk` | 1,105× | 2.6× |
-| `select-scan` | 105× | 1.75× | `delete-like` | 95× | 3.7× |
-| `select-like` | 39× | 0.9× | `delete-range` | 249× | 3.7× |
-| `select-indexed` | 1,406× | 2.4× | `create-index` | 142× | 1.3× |
+| Workload | v0.3.0 | 26 Sep | 27 Sep |
+| --- | ---: | ---: | ---: |
+| `cold-open` | 0.7× | 0.8× | 0.7–0.8× |
+| `reopen` | 3.5× | 1.2× | 1.2× |
+| `insert-autocommit` | 3.3× | 2.1× | 1.1–1.2× |
+| `insert-transaction` | 9.9× | 2.5× | 1.8–1.9× |
+| `insert-indexed` | 15× | 2.3× | 1.8× |
+| `insert-batch` | 33× | 3.4× | 2.2–2.4× |
+| `select-pk` | 4.2× | 1.6× | 1.2× |
+| `select-scan` | 105× | 1.75× | 1.7–1.8× |
+| `select-like` | 39× | 0.9× | 0.9–1.0× |
+| `select-indexed` | 1,406× | 2.4× | 1.7× |
+| `select-all` | 2.3× | 0.6× | 0.3× |
+| `group-by` | 22× | 0.95× | 0.9–1.0× |
+| `join` | 175× | 1.4× | 1.1–1.3× |
+| `update-pk` | 1,077× | 2.3× | 1.9–2.0× |
+| `update-scan` | 179× | 2.2× | 2.5× |
+| `upsert` | 1,362× | 2.5× | 1.8–2.4× |
+| `delete-pk` | 1,105× | 2.6× | 2.1–2.2× |
+| `delete-like` | 95× | 3.7× | 3.0–3.3× |
+| `delete-range` | 249× | 3.7× | 2.9–3.7× |
+| `create-index` | 142× | 1.3× | 1.1× |
 
-The compressed download grew from 296 KiB to 325 KiB. Between two runs on the
-same build, the ratios moved by up to a tenth, so read them to one significant
-figure.
+The compressed download grew from 296 KiB to 331 KiB. Between two runs on the
+same build, the ratios moved by up to a tenth, and by more under load, so read
+them to one significant figure. `update-scan` did not change natively between
+the two columns; its apparent regression is load.
 
 Done:
 
@@ -51,12 +64,21 @@ Done:
 - R1 to R7. D3 and D4 were adopted as recommended, and the SQL guide
   documents both.
 - R8's typed `GROUP BY` keys and once-compiled `LIKE` patterns.
-- Page format 3: S1, S2, S4, and S3 for reads and for the rows a write
-  replaces, which stay stored entries rather than maps. D1, D6 and D8 were
-  decided as recommended.
+- R9, and D5 as recommended: rows travel as JSON text that only the page
+  parses, and the Worker checks each result's header only.
+- Page format 3: S1 to S4. Rows a transaction stages are kept as the
+  records its commit writes, and each written row is checked and measured
+  once. D1, D6 and D8 were decided as recommended.
 - T1 and T2.
-- C1, C2, C3, C5, and C4 except writing only changed bitmap chunks.
+- C1 to C5, except writing only changed bitmap chunks. A commit writes each
+  run of consecutive pages with one storage call and flushes once; its
+  superblock carries a hash of the pages it wrote, and recovery returns to the
+  previous root when they did not all reach storage.
 - O1 follows from R1.
+- An aggregate whose columns an index holds is answered from the index's
+  entries without reading the table.
+- The owning tab reaches its engine through direct calls rather than messages,
+  and serves a statement at once when nothing is queued ahead of it.
 
 Found along the way:
 
@@ -69,21 +91,30 @@ Found along the way:
   shrank the engine by 13 KiB compressed.
 - Allocating a page past the end of the file wrote a zero placeholder for it,
   so commits that grew the file wrote every new page twice.
+- Each OPFS write call costs about 17 µs whatever its size, so a commit's
+  page writes are worth batching even when the pages are few.
+- The write-set budgets use two different row-size estimators, which share a
+  name in different modules. The transaction's running totals are tested for
+  exact equality with a whole-write-set oracle, which catches any mix-up.
 
 Remaining, in order of expected value:
 
-1. Per-statement cost. A single statement takes 45–65 µs in the browser
-   against SQLite's 25–30 µs. Its engine share is 9–17 µs in V8: building the
-   structured result, decoding parameters through `serde_wasm_bindgen`, and
-   planning and staging each row as a map. The Worker's JavaScript layers add
-   another 15 µs or so, including a deep check of every WASM result (R9, D5)
-   and a second measurement of each request by the database broker.
-2. The rest of S3, for writes: inserts, updates and staging still normalize,
-   measure and copy every written row as a map, several times over. Inserts
-   are 2–3× SQLite's time largely because of it.
-3. [D7](#decisions-needed), with the measurements under
+1. Per-statement cost in JavaScript. A statement in a transaction takes about
+   38 µs in the browser against SQLite's 20 µs. The engine's share is 7–9 µs.
+   The Worker spends about as much again: sizing each request with a generic
+   walk that looks up every property's descriptor, checking each request and
+   result's shape, walking parameters for the WASM preflight before
+   `serde_wasm_bindgen` walks them again, and posting the response as an
+   object graph. The page checks each response's shape again.
+2. Bulk deletes. PGlite, like PostgreSQL, marks deleted rows and reclaims them
+   later; TinyJoin removes each row and its index entries at once. Deleting a
+   contiguous key or index range could drop whole subtrees, using their
+   fingerprints and counts, rather than visiting every entry.
+3. Scans take 1.7–1.8 times as long as SQLite's, spent mostly in the cursor
+   and predicate evaluation. Inside a transaction, a range `UPDATE` also
+   merges each scan with the staged rows (T3).
+4. [D7](#decisions-needed), with the measurements under
    [build settings](#build-settings).
-4. T3, indexes inside transactions, and the scan merge with staged rows.
 5. Writing only changed bitmap chunks. This needs per-chunk slots in the
    superblock, a format change, and would save two page writes per commit.
 6. O2 and O4. Reopening is already within 1.2× of SQLite.
@@ -571,7 +602,7 @@ uncompressed. `s` costs 24 KiB for a few percent.
 | D2 | Should open keep checking every row and index entry, or accept fingerprints, lazy validation, or checking only trees changed since the last validated generation? | Keep it complete, but make it sequential (O2), and revisit if large databases still open slowly |
 | D3 | Join budgets count candidate comparisons, which index and hash joins mostly avoid. The documented limits and the guides' wording must change. | Count work actually done, and update the SQL compatibility and benchmarks guides |
 | D4 | Streaming in primary-key order relaxes the 100,000 ordered-row limit for those queries. | Accept, and document it |
-| D5 | Array transport needs a protocol version bump, which makes mixed-version tabs a `DATABASE_VERSION_MISMATCH`. Object keys would follow column order instead of today's alphabetical order. | Accept for the next minor release |
+| D5 | Array transport needs a protocol version bump, which makes mixed-version tabs a `DATABASE_VERSION_MISMATCH`. Object keys would follow column order instead of today's alphabetical order. | **Decided:** accepted for v0.4.0, as protocol version 9, with object rows' keys in field order, as its release notes announce |
 | D6 | Page format 3 cannot read existing databases. Refuse them or migrate them on open? | **Decided:** refuse with `UNSUPPORTED_PAGE`, with no migration, as announced in the v0.4.0 release notes |
 | D7 | Optimization level, trading size for speed. | Keep `z` for now: level 2 or 3 buys 15–25% on writes for about 75 KiB, a quarter of the engine, while the larger per-statement costs lie outside the optimizer's reach. Revisit after the rest of S3 |
 | D8 | Omit trailing columns that equal their defaults, so `ADD COLUMN` stops rewriting every row? | **Decided:** yes |

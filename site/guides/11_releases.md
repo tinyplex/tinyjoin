@@ -69,7 +69,12 @@ than about four times as long, and reading every row, `LIKE` scans, and
   and stops at its `LIMIT`, rather than collecting and sorting every match, so
   it is no longer held to the limit on ordered matching rows. Inside a
   transaction that has changed the table, it still sorts.
-- Scans read only the columns a statement uses, straight from the stored row.
+- Scans read only the columns a statement uses, straight from the stored row,
+  and so does a statement that finds its row by primary key.
+- Each row a statement writes is planned, checked, and measured once. A
+  transaction keeps the rows it stages as the encoded records its commit
+  writes, rather than as maps it copies and encodes again at commit, and reads
+  them in place, as it does stored rows.
 - Writes apply each statement's rows to each B-tree in one pass, and index
   builds sort their entries first. A commit writes each page once, a run of
   consecutive pages with a single storage call, and makes them durable with one
