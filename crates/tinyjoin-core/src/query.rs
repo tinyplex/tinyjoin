@@ -1,6 +1,5 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
-use std::str::FromStr;
 
 use serde_json::{Map, Number, Value};
 
@@ -1415,7 +1414,7 @@ impl<'a> SqlParser<'a> {
         };
         match token {
             Token::String(value) => Ok(Value::String(value)),
-            Token::Number(value) => Number::from_str(&value).map(Value::Number).map_err(|_| {
+            Token::Number(value) => number_literal(&value).map(Value::Number).ok_or_else(|| {
                 EngineError::invalid_query(format!("Invalid number literal `{value}`"))
             }),
             Token::Placeholder(index) => bind_parameter(&index, self.params),
@@ -1757,7 +1756,7 @@ impl PredicateParser<'_> {
         };
         match token {
             Token::String(value) => Ok(Value::String(value)),
-            Token::Number(value) => Number::from_str(&value).map(Value::Number).map_err(|_| {
+            Token::Number(value) => number_literal(&value).map(Value::Number).ok_or_else(|| {
                 EngineError::invalid_query(format!("Invalid number literal `{value}`"))
             }),
             Token::Placeholder(index) => bind_parameter(&index, self.params),
@@ -1856,6 +1855,17 @@ fn token_matches(token: Option<&Token>, matcher: TokenMatcher) -> bool {
             | (Some(Token::RParen), TokenMatcher::RParen)
             | (Some(Token::Semicolon), TokenMatcher::Semicolon)
     )
+}
+
+/// The JSON number a SQL number literal spells, if it spells one. It is read by the parser that
+/// reads JSON text from a byte slice, as a JSON value, rather than by `Number::from_str`, whose
+/// string reader would link a second copy of that parser. A lexer's number token holds no
+/// whitespace, so the two accept exactly the same literals.
+pub(crate) fn number_literal(text: &str) -> Option<Number> {
+    match serde_json::from_slice(text.as_bytes()) {
+        Ok(Value::Number(number)) => Some(number),
+        _ => None,
+    }
 }
 
 pub(crate) fn tokenize(sql: &str) -> Result<Vec<Token>> {

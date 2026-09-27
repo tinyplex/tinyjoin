@@ -2,13 +2,12 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
-use std::str::FromStr;
 
 use serde_json::{Map, Number, Value};
 
 use crate::query::{
     Filter, ParseMode, Token, bind_parameter, is_distinct_keyword_at, is_reserved_keyword,
-    pagination_value, parse_predicate_at, sort_rows_by, validate_predicate_columns,
+    number_literal, pagination_value, parse_predicate_at, sort_rows_by, validate_predicate_columns,
     validate_predicate_types,
 };
 use crate::row::{RowRef, ValueRef};
@@ -1554,7 +1553,7 @@ impl<'a> Parser<'a> {
             return Err(EngineError::parse_error("Expected a SQL value"));
         };
         match token {
-            Token::Number(value) => Number::from_str(&value).map(Value::Number).map_err(|_| {
+            Token::Number(value) => number_literal(&value).map(Value::Number).ok_or_else(|| {
                 EngineError::invalid_query(format!("Invalid number literal `{value}`"))
             }),
             Token::Placeholder(index) => bind_parameter(&index, self.params),

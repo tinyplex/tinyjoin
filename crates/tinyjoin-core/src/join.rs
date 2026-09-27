@@ -1,13 +1,12 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
-use std::str::FromStr;
 
-use serde_json::{Map, Number, Value};
+use serde_json::{Map, Value};
 
 use crate::aggregate::{encode_group_key, group_key_part};
 use crate::query::{
     Filter, ParseMode, Token, bind_parameter, is_distinct_keyword_at, is_reserved_keyword,
-    pagination_value, parse_predicate_at,
+    number_literal, pagination_value, parse_predicate_at,
 };
 use crate::row::{Columns, RowRef, ValueRef};
 use crate::storage::{KeyOrder, StorageReader};
@@ -1852,7 +1851,7 @@ impl<'a> Parser<'a> {
             return Err(EngineError::parse_error("Expected LIMIT or OFFSET value"));
         };
         let value = match token {
-            Token::Number(value) => Number::from_str(&value).map(Value::Number).map_err(|_| {
+            Token::Number(value) => number_literal(&value).map(Value::Number).ok_or_else(|| {
                 EngineError::invalid_query(format!("Invalid number literal `{value}`"))
             })?,
             Token::Placeholder(index) => bind_parameter(&index, self.params)?,

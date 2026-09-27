@@ -1,8 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
-use std::str::FromStr;
 
-use serde_json::{Map, Number, Value};
+use serde_json::{Map, Value};
 
 #[cfg(test)]
 use crate::StorageDriver;
@@ -10,10 +9,10 @@ use crate::paged_codec::{
     RecordLayout, StoredRecord, encode_primary_key, encode_primary_key_values, encode_row_values,
 };
 use crate::query::{
-    Filter, ParseMode, Token, bind_parameter, is_reserved_keyword, parse_predicate_at,
-    primary_key_lookup, tokenize, validate_named_columns, validate_parameter_expansion,
-    validate_predicate_columns, validate_predicate_types, validate_sql_input,
-    visit_indexed_candidates,
+    Filter, ParseMode, Token, bind_parameter, is_reserved_keyword, number_literal,
+    parse_predicate_at, primary_key_lookup, tokenize, validate_named_columns,
+    validate_parameter_expansion, validate_predicate_columns, validate_predicate_types,
+    validate_sql_input, visit_indexed_candidates,
 };
 use crate::row::{HeldRow, RowRef};
 use crate::storage::{
@@ -2346,10 +2345,10 @@ impl<'a> MutationParser<'a> {
         };
         match token {
             Token::String(value) => Ok(SqlValue::Value(Value::String(value))),
-            Token::Number(value) => Number::from_str(&value)
+            Token::Number(value) => number_literal(&value)
                 .map(Value::Number)
                 .map(SqlValue::Value)
-                .map_err(|_| EngineError::invalid_query(format!("Invalid number `{value}`"))),
+                .ok_or_else(|| EngineError::invalid_query(format!("Invalid number `{value}`"))),
             Token::Placeholder(index) => bind_parameter(&index, self.params).map(SqlValue::Value),
             Token::Identifier {
                 value,
