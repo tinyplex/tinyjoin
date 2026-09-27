@@ -244,7 +244,9 @@ struct Json(String);
 
 impl Json {
     fn envelope(status: u32, disposition: u32) -> Self {
-        let mut json = Self::default();
+        // Room for a statement's header and a few rows, so that most responses are written without
+        // growing the text.
+        let mut json = Self(String::with_capacity(512));
         json.raw("[");
         for value in [VERSION, status, disposition] {
             json.raw(itoa::Buffer::new().format(value));
@@ -472,7 +474,9 @@ impl Json {
         for (field, position) in fields.iter().zip(&positions) {
             names[*position] = &field.name;
         }
-        let mut keys = Vec::new();
+        // Each field's escaped name and colon, as an object row writes it, one after another.
+        let mut keys = String::with_capacity(if array_rows { 0 } else { fields.len() * 16 });
+        let mut key_ends = Vec::with_capacity(if array_rows { 0 } else { fields.len() });
         self.raw("{\"fields\":[");
         for (index, field) in fields.iter().enumerate() {
             if index > 0 {
@@ -482,9 +486,9 @@ impl Json {
             let start = self.0.len();
             self.string(&field.name);
             if !array_rows {
-                let mut key = self.0[start..].to_owned();
-                key.push(':');
-                keys.push(key);
+                keys.push_str(&self.0[start..]);
+                keys.push(':');
+                key_ends.push(keys.len());
             }
             self.raw(",\"dataTypeID\":");
             self.unsigned(field.data_type_id.into())?;
@@ -512,7 +516,8 @@ impl Json {
                     self.raw(",");
                 }
                 if !array_rows {
-                    self.raw(&keys[index]);
+                    let start = if index > 0 { key_ends[index - 1] } else { 0 };
+                    self.raw(&keys[start..key_ends[index]]);
                 }
                 self.value(values[*position], 1)?;
             }
