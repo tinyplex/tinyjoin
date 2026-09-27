@@ -26,30 +26,30 @@ through most of its steps, one commit per step, each gated on the Rust,
 TypeScript, browser and size checks. The ratios below are to the faster of
 SQLite and PGlite in the same run, so machine load largely cancels out. The
 26 September column is the run published in `site/data/benchmarks.json`. The
-27 September column is the range of two full runs on the branch's latest
+27 September column is the range of three full runs on the branch's latest
 commit, which were not published: the machine was heavily loaded, and every
 engine's absolute times were about 1.6 times those of the published run.
 
 | Workload | v0.3.0 | 26 Sep | 27 Sep |
 | --- | ---: | ---: | ---: |
-| `cold-open` | 0.7× | 0.8× | 0.7–0.8× |
-| `reopen` | 3.5× | 1.2× | 1.2× |
-| `insert-autocommit` | 3.3× | 2.1× | 1.1–1.2× |
+| `cold-open` | 0.7× | 0.8× | 0.66–0.76× |
+| `reopen` | 3.5× | 1.2× | 1.1–1.3× |
+| `insert-autocommit` | 3.3× | 2.1× | 0.97–1.2× |
 | `insert-transaction` | 9.9× | 2.5× | 1.8–1.9× |
-| `insert-indexed` | 15× | 2.3× | 1.8× |
-| `insert-batch` | 33× | 3.4× | 2.2–2.4× |
-| `select-pk` | 4.2× | 1.6× | 1.2× |
+| `insert-indexed` | 15× | 2.3× | 1.8–1.9× |
+| `insert-batch` | 33× | 3.4× | 2.0–2.4× |
+| `select-pk` | 4.2× | 1.6× | 1.1–1.2× |
 | `select-scan` | 105× | 1.75× | 1.7–1.8× |
-| `select-like` | 39× | 0.9× | 0.9–1.0× |
-| `select-indexed` | 1,406× | 2.4× | 1.7× |
-| `select-all` | 2.3× | 0.6× | 0.3× |
-| `group-by` | 22× | 0.95× | 0.9–1.0× |
+| `select-like` | 39× | 0.9× | 0.93–0.98× |
+| `select-indexed` | 1,406× | 2.4× | 1.5–1.7× |
+| `select-all` | 2.3× | 0.6× | 0.27–0.29× |
+| `group-by` | 22× | 0.95× | 0.81–0.96× |
 | `join` | 175× | 1.4× | 1.1–1.3× |
-| `update-pk` | 1,077× | 2.3× | 1.9–2.0× |
-| `update-scan` | 179× | 2.2× | 2.5× |
+| `update-pk` | 1,077× | 2.3× | 1.5–2.0× |
+| `update-scan` | 179× | 2.2× | 2.5–2.7× |
 | `upsert` | 1,362× | 2.5× | 1.8–2.4× |
-| `delete-pk` | 1,105× | 2.6× | 2.1–2.2× |
-| `delete-like` | 95× | 3.7× | 3.0–3.3× |
+| `delete-pk` | 1,105× | 2.6× | 2.1–2.4× |
+| `delete-like` | 95× | 3.7× | 2.5–3.3× |
 | `delete-range` | 249× | 3.7× | 2.9–3.7× |
 | `create-index` | 142× | 1.3× | 1.1× |
 
