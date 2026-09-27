@@ -116,7 +116,11 @@ Remaining, in order of expected value:
    about 28 µs against 16, and an update about 34 against 17, before their
    commits. The engine's share of a write is 6–10 µs, spent in many small
    allocations and lookups as a statement is bound, planned, staged, and
-   reported; an `UPDATE` still plans each row as a map. The rest is the
+   reported. An `UPDATE` still plans each row as a map: a prototype that
+   writes a row's new record from its old one, copying the columns it does
+   not assign, made 1,000 updates by key 1.27 times as fast natively and 1.14
+   times in WASM, but grew the engine by 2 KiB compressed, for about 3% in
+   the browser, so it was set aside. The rest is the
    Worker's JavaScript, a few microseconds more than SQLite's: the layers each
    request passes through, copying requests and results between threads as
    object graphs, and parameters crossing into WASM through
@@ -125,9 +129,7 @@ Remaining, in order of expected value:
    marks deleted rows and reclaims them later; TinyJoin removes each row and
    its index entries at once. Deleting a contiguous key or index range could
    drop whole subtrees, using their fingerprints and counts, rather than
-   visiting every entry. An indexed range that turns out too large to read
-   through the index also collects a quarter of the table's keys before
-   giving up.
+   visiting every entry.
 3. Scans take 1.6 times as long as SQLite's, spent mostly in the cursor and
    predicate evaluation. Inside a transaction, a range `UPDATE` also merges
    each scan with the staged rows (T3), and takes 2.1 times as long.
