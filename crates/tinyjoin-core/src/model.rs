@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Map, Value};
 
 pub type Row = Map<String, Value>;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum ColumnType {
     Boolean,
@@ -55,18 +55,17 @@ impl ResultField {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ColumnDefinition {
     pub(crate) name: String,
     pub(crate) data_type: ColumnType,
-    #[serde(default = "default_nullable")]
     pub(crate) nullable: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) default: Option<Value>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TableDefinition {
     pub(crate) name: String,
@@ -74,18 +73,91 @@ pub(crate) struct TableDefinition {
     pub(crate) columns: Vec<ColumnDefinition>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct IndexDefinition {
     pub(crate) name: String,
     pub(crate) table: String,
     pub(crate) columns: Vec<String>,
-    #[serde(default)]
     pub(crate) unique: bool,
 }
 
-fn default_nullable() -> bool {
-    true
+/// A catalog model read back from the JSON its [`Serialize`] implementation writes. Reading it by
+/// hand, rather than through serde's derived deserializers, keeps their error formatting, and the
+/// floating-point formatting it pulls in, out of the engine. A catalog item is only accepted when
+/// the model read back serializes to exactly the JSON it was read from, so a field this ignores
+/// cannot pass unnoticed.
+pub(crate) trait CatalogModel: Serialize + Sized {
+    fn from_catalog_json(value: &Value) -> Option<Self>;
+}
+
+impl CatalogModel for TableDefinition {
+    fn from_catalog_json(value: &Value) -> Option<Self> {
+        let object = value.as_object()?;
+        let mut columns = Vec::new();
+        for column in object.get("columns")?.as_array()? {
+            columns.push(ColumnDefinition::from_catalog_json(column)?);
+        }
+        Some(Self {
+            name: catalog_string(object.get("name")?)?,
+            primary_key: catalog_strings(object.get("primaryKey")?)?,
+            columns,
+        })
+    }
+}
+
+impl CatalogModel for IndexDefinition {
+    fn from_catalog_json(value: &Value) -> Option<Self> {
+        let object = value.as_object()?;
+        Some(Self {
+            name: catalog_string(object.get("name")?)?,
+            table: catalog_string(object.get("table")?)?,
+            columns: catalog_strings(object.get("columns")?)?,
+            unique: match object.get("unique") {
+                None => false,
+                Some(unique) => unique.as_bool()?,
+            },
+        })
+    }
+}
+
+impl ColumnDefinition {
+    fn from_catalog_json(value: &Value) -> Option<Self> {
+        let object = value.as_object()?;
+        let data_type = match object.get("dataType")?.as_str()? {
+            "boolean" => ColumnType::Boolean,
+            "integer" => ColumnType::Integer,
+            "float" => ColumnType::Float,
+            "text" => ColumnType::Text,
+            "json" => ColumnType::Json,
+            _ => return None,
+        };
+        Some(Self {
+            name: catalog_string(object.get("name")?)?,
+            data_type,
+            nullable: match object.get("nullable") {
+                None => true,
+                Some(nullable) => nullable.as_bool()?,
+            },
+            // A JSON null is no default, as an optional field reads it.
+            default: object
+                .get("default")
+                .filter(|value| !value.is_null())
+                .cloned(),
+        })
+    }
+}
+
+fn catalog_string(value: &Value) -> Option<String> {
+    value.as_str().map(str::to_owned)
+}
+
+fn catalog_strings(value: &Value) -> Option<Vec<String>> {
+    let mut strings = Vec::new();
+    for value in value.as_array()? {
+        strings.push(catalog_string(value)?);
+    }
+    Some(strings)
 }
 
 #[derive(Clone, Debug, PartialEq)]

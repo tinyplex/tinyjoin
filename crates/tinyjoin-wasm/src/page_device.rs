@@ -181,8 +181,11 @@ fn parse_page_count(value: JsValue) -> Result<PageId> {
 
 fn validate_page_count(value: f64) -> Result<PageId> {
     if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > MAX_PAGE_COUNT as f64 {
+        // Written by zmij, which the bridge already carries, rather than by Rust's float
+        // formatting, which would otherwise be linked in for this message alone.
         return Err(device_error(format!(
-            "JavaScript PageDevice.pageCount() returned {value}; expected an integer between 0 and {MAX_PAGE_COUNT}",
+            "JavaScript PageDevice.pageCount() returned {}; expected an integer between 0 and {MAX_PAGE_COUNT}",
+            zmij::Buffer::new().format(value),
         )));
     }
     Ok(value as PageId)

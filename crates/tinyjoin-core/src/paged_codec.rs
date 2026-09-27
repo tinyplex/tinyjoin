@@ -1,8 +1,9 @@
 use std::borrow::Cow;
 
-use serde::{Serialize, de::DeserializeOwned};
+use serde::Serialize;
 use serde_json::Value;
 
+use crate::model::CatalogModel;
 use crate::row::ValueRef;
 use crate::{
     ColumnType, EngineError, FIRST_DATA_PAGE_ID, IndexDefinition, MAX_PAGE_COUNT, PageId, Result,
@@ -1805,7 +1806,7 @@ fn encode_catalog_item_body(
     Ok(value)
 }
 
-fn decode_catalog_item_value<T: DeserializeOwned + Serialize>(
+fn decode_catalog_item_value<T: CatalogModel>(
     value: &[u8],
     description: &str,
 ) -> Result<(TreeId, Option<PageId>, u64, u64, T)> {
@@ -1832,9 +1833,9 @@ fn decode_catalog_item_value<T: DeserializeOwned + Serialize>(
     }
     let body = &value[CATALOG_ITEM_HEADER_BYTES..];
     let json = decode_canonical_json(body, &format!("catalog {description}"))?;
-    let model: T = serde_json::from_value(json).map_err(|error| {
+    let model = T::from_catalog_json(&json).ok_or_else(|| {
         storage_corrupt(format!(
-            "Catalog {description} JSON does not match its model: {error}"
+            "Catalog {description} JSON does not match its model"
         ))
     })?;
     let normalized = serde_json::to_value(&model).map_err(|error| {
