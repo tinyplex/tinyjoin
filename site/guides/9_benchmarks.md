@@ -7,10 +7,11 @@ and are driven from the page by the same workloads in the same Chromium.
 
 These numbers are published to track progress, not to win an argument.
 TinyJoin's engine is young. It is the smallest download and the quickest to
-open, and it reads every row, runs `LIKE` scans, and groups more quickly than
-either alternative, but most other reads and writes still take one and a half
-to three and a half times as long as the faster of them. Closing that gap is
-ongoing work, and the suite is designed to be rerun after every optimization.
+open, it reads every row and runs `LIKE` scans more quickly than either
+alternative, and it groups about as quickly as PGlite. Most other reads and
+writes take one to about two times as long as the faster of them, and bulk
+deletes two and a half to three times. Closing that gap is ongoing work, and
+the suite is designed to be rerun after every optimization.
 
 {{benchmarks.environment}}
 
@@ -55,31 +56,34 @@ again, opens an existing database, and counts its rows.
 
 In the results above, TinyJoin is the smallest download and the quickest to
 create a new database: PGlite initializes a new PostgreSQL cluster on first
-open. It reads all 10,000 rows in order, runs `LIKE` scans, and groups faster
-than either engine. The rest is slower, but no longer by orders of magnitude: in
-v0.3.0, most workloads took 10 to 1,400 times as long as the fastest engine,
-and none now takes more than about four times as long. The remaining gaps point
-at the work ahead.
+open. It reads all 10,000 rows in order more than three times as fast as either
+engine, runs `LIKE` scans faster than either, and groups about as fast as
+PGlite. The rest is slower, but no longer by orders of magnitude: in v0.3.0,
+most workloads took 10 to 1,400 times as long as the fastest engine, and none
+now takes more than about three times as long. The remaining gaps point at the
+work ahead.
 
-- **Single statements** cost about 50 to 65 microseconds each, which is 1.5 to
-  2.6 times SQLite's cost for a point read, or an update, upsert, or delete by
+- **Single statements** cost about 38 to 52 microseconds each, which is 1.2 to
+  1.8 times SQLite's cost for a point read, or an update, upsert, or delete by
   primary key. Part of every round trip is the message between the page and the
-  Worker, which every engine pays. TinyJoin adds its own Worker layers, which
-  coordinate tabs and check each request and result, and its engine still
-  builds and validates each written row as a map of column names to values.
+  Worker, which every engine pays. In a transaction of inserts, TinyJoin's
+  engine takes about a quarter of each round trip, and its Worker's JavaScript,
+  which coordinates tabs, checks each request and result, and copies each one
+  between threads, takes about as much again.
 - **Scans** take about 1.75 times as long as SQLite's. TinyJoin reads each
   column in place from the stored row, but spends more per row walking the
   B-tree and evaluating the predicate. A range `UPDATE` inside a transaction
   also merges each scan with the transaction's staged rows.
-- **Inserts** take two to three and a half times as long as SQLite's, for the
-  same reason as single statements: each row is normalized, measured, and staged
-  as a map.
-- **Bulk deletes** take about three and a half times as long as PGlite's,
+- **Inserts** take about 1.75 to 2 times as long as SQLite's, for the same
+  reasons as single statements, and because each row is still planned as a map
+  of column names to values before it is encoded.
+- **Bulk deletes** take two and a half to three times as long as PGlite's,
   which, like PostgreSQL, only marks deleted rows and leaves reclaiming their
   space to a later vacuum. TinyJoin removes each row and its index entries at
   once, and rewrites every page they occupied.
-- **Committing each insert alone** is dominated by storage flushes, two per
-  commit, and takes twice as long as PGlite's commits.
+- **Committing each insert alone** is dominated by the storage flush, one per
+  commit. It takes about a tenth longer than PGlite's commits, and a third as
+  long as SQLite's.
 - **Reopening validates every row and index entry**, so a populated database
   reopens a little more slowly than in SQLite.
 
@@ -210,13 +214,16 @@ dependencies. The runner installs them on first use.
 ```sh
 npm ci
 npm run build
-npm run bench:compare -- --publish
+npm run bench:compare -- --publish --samples 9
 npm run build:docs
 ```
 
 Use the Node.js version in `.node-version`, since compressed sizes depend on
-its zlib. A full run takes about half an hour on the machine above. Close
-other applications and avoid concurrent builds or tests while it runs.
+its zlib. A full run of nine samples takes about ten minutes on the machine
+above. Close other applications, pause background work such as photo library
+analysis, and avoid concurrent builds or tests while it runs: a busy machine
+slows every engine, and a burst of load can land on some workloads and not
+others.
 
 `--publish` requires the full suite and writes every sample, the environment,
 and the list of downloaded files to `site/data/benchmarks.json`, from which the

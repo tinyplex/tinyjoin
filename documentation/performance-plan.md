@@ -24,39 +24,40 @@ reliable figures.
 As of 27 September 2026, the `perf/faster-engine` branch carries this plan
 through most of its steps, one commit per step, each gated on the Rust,
 TypeScript, browser and size checks. The ratios below are to the faster of
-SQLite and PGlite in the same run, so machine load largely cancels out. The
-26 September column is the run published in `site/data/benchmarks.json`. The
-27 September column is the range of three full runs on the branch's latest
-commit, which were not published: the machine was heavily loaded, and every
-engine's absolute times were about 1.6 times those of the published run.
+SQLite and PGlite in the same run, so machine load largely cancels out. Both
+later columns are runs published in `site/data/benchmarks.json`: 26 September
+with five samples, and 27 September, on commit `64ce856`, with nine. Three
+earlier runs on 27 September were discarded because background load inflated
+every engine's times; the published one was made with macOS media analysis
+paused, and its SQLite times match the quiet 26 September run's.
 
 | Workload | v0.3.0 | 26 Sep | 27 Sep |
 | --- | ---: | ---: | ---: |
-| `cold-open` | 0.7× | 0.8× | 0.66–0.76× |
-| `reopen` | 3.5× | 1.2× | 1.1–1.3× |
-| `insert-autocommit` | 3.3× | 2.1× | 0.97–1.2× |
-| `insert-transaction` | 9.9× | 2.5× | 1.8–1.9× |
-| `insert-indexed` | 15× | 2.3× | 1.8–1.9× |
-| `insert-batch` | 33× | 3.4× | 2.0–2.4× |
-| `select-pk` | 4.2× | 1.6× | 1.1–1.2× |
-| `select-scan` | 105× | 1.75× | 1.7–1.8× |
-| `select-like` | 39× | 0.9× | 0.93–0.98× |
-| `select-indexed` | 1,406× | 2.4× | 1.5–1.7× |
-| `select-all` | 2.3× | 0.6× | 0.27–0.29× |
-| `group-by` | 22× | 0.95× | 0.81–0.96× |
-| `join` | 175× | 1.4× | 1.1–1.3× |
-| `update-pk` | 1,077× | 2.3× | 1.5–2.0× |
-| `update-scan` | 179× | 2.2× | 2.5–2.7× |
-| `upsert` | 1,362× | 2.5× | 1.8–2.4× |
-| `delete-pk` | 1,105× | 2.6× | 2.1–2.4× |
-| `delete-like` | 95× | 3.7× | 2.5–3.3× |
-| `delete-range` | 249× | 3.7× | 2.9–3.7× |
+| `cold-open` | 0.7× | 0.8× | 0.71× |
+| `reopen` | 3.5× | 1.2× | 1.2× |
+| `insert-autocommit` | 3.3× | 2.1× | 1.1× |
+| `insert-transaction` | 9.9× | 2.5× | 1.7× |
+| `insert-indexed` | 15× | 2.3× | 1.8× |
+| `insert-batch` | 33× | 3.4× | 2.0× |
+| `select-pk` | 4.2× | 1.6× | 1.2× |
+| `select-scan` | 105× | 1.75× | 1.7× |
+| `select-like` | 39× | 0.9× | 0.95× |
+| `select-indexed` | 1,406× | 2.4× | 1.6× |
+| `select-all` | 2.3× | 0.6× | 0.28× |
+| `group-by` | 22× | 0.95× | 1.0× |
+| `join` | 175× | 1.4× | 1.1× |
+| `update-pk` | 1,077× | 2.3× | 1.8× |
+| `update-scan` | 179× | 2.2× | 2.1× |
+| `upsert` | 1,362× | 2.5× | 1.8× |
+| `delete-pk` | 1,105× | 2.6× | 1.8× |
+| `delete-like` | 95× | 3.7× | 2.7× |
+| `delete-range` | 249× | 3.7× | 2.5× |
 | `create-index` | 142× | 1.3× | 1.1× |
 
 The compressed download grew from 296 KiB to 331 KiB. Between two runs on the
 same build, the ratios moved by up to a tenth, and by more under load, so read
 them to one significant figure. `update-scan` did not change natively between
-the two columns; its apparent regression is load.
+the two columns, and `group-by` only by noise: both scan the table.
 
 Done:
 
@@ -100,12 +101,14 @@ Found along the way:
 Remaining, in order of expected value:
 
 1. Per-statement cost in JavaScript. A statement in a transaction takes about
-   38 µs in the browser against SQLite's 20 µs. The engine's share is 7–9 µs.
-   The Worker spends about as much again: sizing each request with a generic
-   walk that looks up every property's descriptor, checking each request and
-   result's shape, walking parameters for the WASM preflight before
-   `serde_wasm_bindgen` walks them again, and posting the response as an
-   object graph. The page checks each response's shape again.
+   36 µs in the browser against SQLite's 20 µs. The engine's share is 7–9 µs.
+   Checking and measuring each request and response is now cheap, with a
+   walk that reads checked data directly, key checks that allocate nothing,
+   and a single-object WASM preflight. What remains is copying each request
+   and response between threads as object graphs, about a tenth of the
+   Worker's time and a seventh of the page's, the layers each request passes
+   through inside the Worker, and parameters crossing into WASM through
+   `serde_wasm_bindgen`.
 2. Bulk deletes. PGlite, like PostgreSQL, marks deleted rows and reclaims them
    later; TinyJoin removes each row and its index entries at once. Deleting a
    contiguous key or index range could drop whole subtrees, using their

@@ -49,12 +49,12 @@ misreading each other's results.
 This release is also much faster. In the
 [comparative benchmarks](/guides/benchmarks/), most workloads in v0.3.0 took 10
 to 1,400 times as long as the faster of SQLite and PGlite. None now takes more
-than about four times as long, and reading every row, `LIKE` scans, and
-`GROUP BY` are quicker than in either.
+than about three times as long, reading every row and `LIKE` scans are quicker
+than in either, and `GROUP BY` is about as quick as in PGlite.
 
 - Updates, upserts, and deletes inside a transaction no longer slow down as the
   transaction grows. Each statement is checked against running totals rather
-  than the whole write set, so a thousand of them take about 60 ms rather than
+  than the whole write set, so a thousand of them take about 50 ms rather than
   more than half a minute.
 - Comparisons, `BETWEEN`, and `LIKE` patterns that start with literal
   characters read a range of an index or of the primary key, rather than every
