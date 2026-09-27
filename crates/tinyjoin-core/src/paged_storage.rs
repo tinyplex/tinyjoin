@@ -1338,19 +1338,28 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
             ))
         })?;
         let types = table_data.column_types(columns)?;
+        // A range is read through the index only while it holds at most `limit` entries, which a
+        // first walk counts without copying any.
+        let mut entries = 0usize;
+        self.walk_index_range(index_root, index.tree_id, types[0], range, &mut |_, _| {
+            entries += 1;
+            Ok(if entries > limit {
+                VisitControl::Stop
+            } else {
+                VisitControl::Continue
+            })
+        })?;
+        if entries > limit {
+            return Ok(None);
+        }
         // Rows are visited in primary-key order, as a table visit would find them.
         let mut primary_keys = BTreeSet::new();
-        let mut over_limit = false;
         self.walk_index_range(
             index_root,
             index.tree_id,
             types[0],
             range,
             &mut |entry, value| {
-                if primary_keys.len() == limit {
-                    over_limit = true;
-                    return Ok(VisitControl::Stop);
-                }
                 primary_keys.insert(ranged_index_primary_key(
                     &index.definition,
                     entry,
@@ -1360,9 +1369,6 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
                 Ok(VisitControl::Continue)
             },
         )?;
-        if over_limit {
-            return Ok(None);
-        }
         for primary_key in &primary_keys {
             let value = Btree::get(
                 &mut self.pager.borrow_mut(),
