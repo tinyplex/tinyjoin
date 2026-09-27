@@ -14,6 +14,32 @@ export const createUrlWorker = (url: string | URL): WorkerLike => {
   return new Worker(url, {name: 'tinyjoin', type: 'module'});
 };
 
+let warmedUp = false;
+
+/**
+ * Compiles the engine's common paths in a short-lived second Worker, once per page. Chromium
+ * compiles WebAssembly one function at a time, when each is first called, and Workers running the
+ * same module share what either compiles, so the database's own Worker then finds them compiled,
+ * and the hottest optimized. Warming up is only ever an optimization, so any failure is ignored.
+ */
+const warmUp = (): void => {
+  if (warmedUp) return;
+  warmedUp = true;
+  try {
+    const warming = new Worker(
+      new URL('./worker/default-entry.js', import.meta.url),
+      {
+        name: 'tinyjoin-warm-up',
+        type: 'module',
+      },
+    );
+    warming.addEventListener('error', (event) => event.preventDefault());
+    warming.postMessage({tinyjoin: 'warmup'});
+  } catch {
+    // The database's own Worker compiles what it needs as it goes.
+  }
+};
+
 /**
  * Constructs the Worker that TinyJoin ships.
  *
@@ -34,6 +60,7 @@ export const createDefaultWorker = (refreshOnResume = false): WorkerLike => {
       type: 'module',
     },
   );
+  warmUp();
   if (!refreshOnResume || typeof document === 'undefined') return worker;
   const refresh = (): void => {
     if (document.visibilityState === 'visible')

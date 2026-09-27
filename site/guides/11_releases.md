@@ -87,6 +87,13 @@ than in either, and `GROUP BY` is about as quick as in PGlite.
   10,000 rows well under half.
 - On the tab that owns a database, statements reach the engine as calls rather
   than as messages checked again at every layer.
+- Once per page, create() also starts a short-lived second Worker that runs
+  the engine's common statements on a scratch in-memory database for about a
+  tenth of a second, and then exits. Chromium compiles WebAssembly one function
+  at a time, as each is first called, and Workers running the same module
+  share what either compiles, so a database's first statements of each kind no
+  longer wait for their code to compile. See
+  [custom Workers](/guides/custom-workers/).
 
 The compressed download is now {{sizes.total.gzip}}, up from 295 KiB in v0.3.0.
 

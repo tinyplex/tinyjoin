@@ -4,6 +4,15 @@ Most applications should use create(). It constructs TinyJoin's packaged
 module Worker and preserves the relative Worker, OPFS runtime, and WebAssembly
 assets during the supported Vite build path.
 
+Once per page, create() also starts a second, short-lived copy of the packaged
+Worker. It runs the engine's common statements on a scratch in-memory database
+for about a tenth of a second, and then exits. Chromium compiles WebAssembly
+one function at a time, as each is first called, and Workers running the same
+module share the code either compiles, so the database's own Worker runs its
+first statements of each kind without stopping to compile them. The second
+Worker needs no permission the first does not, never touches OPFS, and any
+failure in it is ignored. A custom Worker does not start one.
+
 For Node.js, use [`tinyjoin/node`](/guides/node/), which constructs its own
 Worker thread and loads WebAssembly without a custom bootstrap.
 

@@ -32,6 +32,13 @@ is fetched and ends when the first query on a new, empty database returns.
 Reopen runs in a new browser session with a warm HTTP cache: it loads the engine
 again, opens an existing database, and counts its rows.
 
+Every sample starts in a new browser profile, so each engine's WebAssembly is
+compiled afresh, one function at a time as each is first called. As it does in
+any page, TinyJoin's create() also starts a short-lived second Worker that
+compiles the engine's common statements on a scratch database, so its timed
+statements mostly run already compiled. SQLite and PGlite compile theirs as
+they go. See [custom Workers](/guides/custom-workers/).
+
 ### Create
 
 {{benchmarks.create}}

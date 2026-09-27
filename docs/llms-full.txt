@@ -1390,6 +1390,15 @@ Most applications should use create(). It constructs TinyJoin's packaged
 module Worker and preserves the relative Worker, OPFS runtime, and WebAssembly
 assets during the supported Vite build path.
 
+Once per page, create() also starts a second, short-lived copy of the packaged
+Worker. It runs the engine's common statements on a scratch in-memory database
+for about a tenth of a second, and then exits. Chromium compiles WebAssembly
+one function at a time, as each is first called, and Workers running the same
+module share the code either compiles, so the database's own Worker runs its
+first statements of each kind without stopping to compile them. The second
+Worker needs no permission the first does not, never touches OPFS, and any
+failure in it is ignored. A custom Worker does not start one.
+
 For Node.js, use [`tinyjoin/node`](https://tinyjoin.org/guides/node/), which constructs its own
 Worker thread and loads WebAssembly without a custom bootstrap.
 
@@ -1761,6 +1770,13 @@ at quality 11, since servers send either. First open starts before the engine
 is fetched and ends when the first query on a new, empty database returns.
 Reopen runs in a new browser session with a warm HTTP cache: it loads the engine
 again, opens an existing database, and counts its rows.
+
+Every sample starts in a new browser profile, so each engine's WebAssembly is
+compiled afresh, one function at a time as each is first called. As it does in
+any page, TinyJoin's create() also starts a short-lived second Worker that
+compiles the engine's common statements on a scratch database, so its timed
+statements mostly run already compiled. SQLite and PGlite compile theirs as
+they go. See [custom Workers](https://tinyjoin.org/guides/custom-workers/).
 
 ### Create
 
@@ -2296,8 +2312,15 @@ than in either, and `GROUP BY` is about as quick as in PGlite.
   10,000 rows well under half.
 - On the tab that owns a database, statements reach the engine as calls rather
   than as messages checked again at every layer.
+- Once per page, create() also starts a short-lived second Worker that runs
+  the engine's common statements on a scratch in-memory database for about a
+  tenth of a second, and then exits. Chromium compiles WebAssembly one function
+  at a time, as each is first called, and Workers running the same module
+  share what either compiles, so a database's first statements of each kind no
+  longer wait for their code to compile. See
+  [custom Workers](https://tinyjoin.org/guides/custom-workers/).
 
-The compressed download is now 333 KiB, up from 295 KiB in v0.3.0.
+The compressed download is now 334 KiB, up from 295 KiB in v0.3.0.
 
 ## v0.3.0
 

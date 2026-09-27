@@ -10,6 +10,7 @@ import {
   type WorkerResponse,
 } from '../protocol.js';
 import {createDatabaseBroker} from './database-broker.js';
+import {createMemoryWasmEngine} from './engine.js';
 import {
   clientChannel,
   COORDINATION_COMPATIBILITY,
@@ -26,6 +27,7 @@ import {
 import {startWorker, type WorkerScope} from './host.js';
 import {createLocalRpc, type LocalRpc} from './local-rpc.js';
 import {checkedRequestBytes} from './request-size.js';
+import {warmUp} from './warm-up.js';
 
 type Pending = {request: WorkerRequest; bytes: number; epoch?: string};
 
@@ -34,6 +36,20 @@ export const startCoordinatedWorker = (): void => {
   const scope = globalThis as unknown as WorkerScope;
   const firstMessage = (event: MessageEvent<unknown>): void => {
     scope.removeEventListener('message', firstMessage);
+    if (isRecord(event.data) && event.data.tinyjoin === 'warmup') {
+      // This Worker only compiles the engine for the database's own Worker, and then exits.
+      void createMemoryWasmEngine()
+        .then((engine) => {
+          try {
+            warmUp(engine);
+          } finally {
+            engine.close();
+          }
+        })
+        .catch(() => undefined)
+        .finally(() => scope.close());
+      return;
+    }
     if (
       isWorkerRequest(event.data) &&
       event.data.method === 'init' &&

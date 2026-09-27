@@ -14,7 +14,9 @@ import {
   type SqlData,
   type SqlResult,
 } from '../../src/protocol.js';
+import type {WorkerEngine} from '../../src/worker/engine.js';
 import type {PageDevice} from '../../src/worker/page-device.js';
+import {warmUp} from '../../src/worker/warm-up.js';
 import {
   WASM_OPERATION,
   createStructuredWasmEngine,
@@ -106,6 +108,19 @@ const runIfArtifactExists =
     : describe.skip;
 
 runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
+  it('runs every warm-up statement against the real engine', async () => {
+    const wasm = await loadStructuredModule();
+    const {engine} = createRecordingEngine(wasm, new MemoryPageDevice());
+    try {
+      // Each result gets the full check, so a statement the engine rejects fails here.
+      warmUp(engine as unknown as WorkerEngine);
+      expect(engine.inTransaction()).toBe(false);
+      expect(engine.executeSql('SELECT count(*) AS n FROM w', []).rows).toEqual([{n: 537}]);
+    } finally {
+      engine.close();
+    }
+  });
+
   it('executes the documented join boundaries against the real engine', async () => {
     const wasm = await loadStructuredModule();
     const {engine} = createRecordingEngine(wasm, new MemoryPageDevice());
