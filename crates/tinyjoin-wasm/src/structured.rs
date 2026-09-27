@@ -474,9 +474,8 @@ impl Json {
         for (field, position) in fields.iter().zip(&positions) {
             names[*position] = &field.name;
         }
-        // Each field's escaped name and colon, as an object row writes it, one after another.
-        let mut keys = String::with_capacity(if array_rows { 0 } else { fields.len() * 16 });
-        let mut key_ends = Vec::with_capacity(if array_rows { 0 } else { fields.len() });
+        // Each field's escaped name and colon, as an object row writes it.
+        let mut keys = Vec::with_capacity(if array_rows { 0 } else { fields.len() });
         self.raw("{\"fields\":[");
         for (index, field) in fields.iter().enumerate() {
             if index > 0 {
@@ -486,9 +485,10 @@ impl Json {
             let start = self.0.len();
             self.string(&field.name);
             if !array_rows {
-                keys.push_str(&self.0[start..]);
-                keys.push(':');
-                key_ends.push(keys.len());
+                let mut key = String::with_capacity(self.0.len() - start + 1);
+                key.push_str(&self.0[start..]);
+                key.push(':');
+                keys.push(key);
             }
             self.raw(",\"dataTypeID\":");
             self.unsigned(field.data_type_id.into())?;
@@ -516,8 +516,7 @@ impl Json {
                     self.raw(",");
                 }
                 if !array_rows {
-                    let start = if index > 0 { key_ends[index - 1] } else { 0 };
-                    self.raw(&keys[start..key_ends[index]]);
+                    self.raw(&keys[index]);
                 }
                 self.value(values[*position], 1)?;
             }

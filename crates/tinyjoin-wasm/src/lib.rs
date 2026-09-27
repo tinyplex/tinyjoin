@@ -1,14 +1,7 @@
 #![deny(unreachable_pub)]
 
-#[cfg(any(test, all(target_arch = "wasm32", not(target_feature = "atomics"))))]
-mod allocator;
 mod page_device;
 mod structured;
-
-// Only where WebAssembly runs on one thread, which the allocator's lists rely on.
-#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
-#[global_allocator]
-static ALLOCATOR: allocator::Recycling = allocator::Recycling::new();
 
 use tinyjoin_core::{EngineError, PagedEngine};
 use wasm_bindgen::prelude::*;
