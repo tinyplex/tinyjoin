@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 use std::str::FromStr;
 
@@ -6,6 +6,7 @@ use serde_json::{Map, Number, Value};
 
 #[cfg(test)]
 use crate::StorageDriver;
+use crate::paged_codec::encode_primary_key;
 use crate::query::{
     Filter, ParseMode, Token, bind_parameter, is_reserved_keyword, parse_predicate_at,
     primary_key_lookup, tokenize, validate_named_columns, validate_parameter_expansion,
@@ -14,7 +15,7 @@ use crate::query::{
 };
 use crate::row::{HeldRow, RowRef};
 use crate::storage::{
-    estimated_row_bytes, estimated_value_bytes, normalize_row, row_key, schema_with_added_column,
+    estimated_row_bytes, estimated_value_bytes, normalize_row, schema_with_added_column,
     validate_index_columns_for_schema, validate_index_definition_shape,
     validate_primary_storage_key_bound, validate_value,
 };
@@ -268,13 +269,24 @@ pub(crate) fn changed_keys(
     storage: &dyn StorageReader,
     changes: &[RowChange],
 ) -> Result<BTreeMap<String, Vec<Row>>> {
+    fn change_row(change: &RowChange) -> (&String, &Row) {
+        match change {
+            RowChange::Upsert { table, row } => (table, row),
+            RowChange::Delete { table, key } => (table, key),
+        }
+    }
+    // One change reports one key, which needs neither the bound nor ordering.
+    if let [change] = changes {
+        let (table, row) = change_row(change);
+        let key = changed_key(&*storage.table_schema(table)?, row);
+        let mut keys = BTreeMap::new();
+        keys.insert(table.clone(), vec![key]);
+        return Ok(keys);
+    }
     let mut schemas: BTreeMap<String, Rc<TableDefinition>> = BTreeMap::new();
     let mut collector = KeyCollector::default();
     for change in changes {
-        let (table, row) = match change {
-            RowChange::Upsert { table, row } => (table, row),
-            RowChange::Delete { table, key } => (table, key),
-        };
+        let (table, row) = change_row(change);
         let Some(keys) = collector.room(table) else {
             continue;
         };
@@ -284,17 +296,22 @@ pub(crate) fn changed_keys(
                 .entry(table.clone())
                 .or_insert(storage.table_schema(table)?),
         };
-        let mut key = Row::new();
-        for column in &schema.primary_key {
-            // A planned change always carries its table's key columns; a row that somehow does not
-            // is reported without them rather than failing an otherwise valid write.
-            if let Some(value) = row.get(column) {
-                key.insert(column.clone(), value.clone());
-            }
-        }
-        insert_changed_key(keys, key);
+        insert_changed_key(keys, changed_key(schema, row));
     }
     Ok(collector.finish())
+}
+
+/// A changed row's primary-key columns. A planned change always carries its table's key columns;
+/// a row that somehow does not is reported without them rather than failing an otherwise valid
+/// write.
+fn changed_key(schema: &TableDefinition, row: &Row) -> Row {
+    let mut key = Row::new();
+    for column in &schema.primary_key {
+        if let Some(value) = row.get(column) {
+            key.insert(column.clone(), value.clone());
+        }
+    }
+    key
 }
 
 /// Collects primary keys already projected from their rows, as [`changed_keys`] reports them.
@@ -718,9 +735,15 @@ fn plan_insert(
         .transpose()?;
 
     // Canonical primary keys of every row this statement writes, whether inserted or updated. A
-    // lone row with no conflict clause cannot meet another, so its key is not needed.
+    // lone row with no conflict clause cannot meet another, so its key is not needed. Without a
+    // conflict clause, the encoded key is canonical and serves.
     let tracks_keys = conflicts.is_some() || value_rows.len() > 1;
     let mut written = HashSet::with_capacity(if tracks_keys { value_rows.len() } else { 0 });
+    let mut written_keys = HashSet::with_capacity(if conflicts.is_none() && tracks_keys {
+        value_rows.len()
+    } else {
+        0
+    });
     let mut changes = Vec::with_capacity(value_rows.len());
     let mut previous = Vec::with_capacity(value_rows.len());
     let mut kept = KeptRows::default();
@@ -751,12 +774,12 @@ fn plan_insert(
             }
         }
         let row = normalize_row(&schema, row)?;
-        // `row_key` also enforces the stored key bound; the canonical key detects SQL-equal keys.
-        let storage_key = row_key(&schema, &row)?;
+        validate_primary_storage_key_bound(&schema, &row)?;
+        let storage_key = encode_primary_key(&schema, &row)?;
         let key_charge = checked_dml_add(checked_dml_mul(storage_key.len(), 2)?, 64)?;
         work_bytes = checked_dml_add(work_bytes, key_charge)?;
         ensure_dml_work_bytes(work_bytes)?;
-        let key = if tracks_keys {
+        let key = if conflicts.is_some() {
             primary_conflict_key(&schema, &row)?
         } else {
             String::new()
@@ -771,7 +794,15 @@ fn plan_insert(
         let updates = conflicts.as_ref().and_then(ConflictPlan::updates);
         let (row, key, held) = match conflict {
             Conflict::None => {
-                if written.contains(&key) || storage.lookup_primary_key(table, &row)?.is_some() {
+                let repeated = if conflicts.is_some() {
+                    written.contains(&key)
+                } else {
+                    tracks_keys && !written_keys.insert(storage_key)
+                };
+                if repeated
+                    || storage.visit_primary_key(table, &row, &mut |_| Ok(VisitControl::Stop))?
+                        == VisitOutcome::Stopped
+                {
                     return Err(EngineError::constraint_violation(format!(
                         "INSERT into `{table}` would duplicate a primary key"
                     )));
@@ -807,8 +838,6 @@ fn plan_insert(
         work_bytes = retain_dml_change(work_bytes, table)?;
         if let Some(conflicts) = &mut conflicts {
             conflicts.record(&schema, &row, &mut work_bytes)?;
-        }
-        if tracks_keys {
             written.insert(key);
         }
         if let Some(columns) = returning {
@@ -1217,11 +1246,11 @@ fn plan_update(
         })
         .collect::<Result<Vec<_>>>()?;
     struct PlannedUpdate {
-        old_key: String,
+        old_key: Vec<u8>,
         old_primary_key: Row,
         /// The row being updated, when it is kept for the writer.
         old_row: Option<HeldRow>,
-        new_key: String,
+        new_key: Vec<u8>,
         new_row: Row,
     }
 
@@ -1258,7 +1287,7 @@ fn plan_update(
         )?;
         ensure_dml_work_bytes(checked_dml_add(work_bytes, conservative_row_bytes)?)?;
 
-        let old_key = row_key(&schema, &row)?;
+        let old_key = read.encoded_key()?.into_owned();
         let old_primary_key = primary_key_row(&schema, &row)?;
         let old_row = if kept.fits(read.held_bytes()?) {
             Some(read.hold()?)
@@ -1270,7 +1299,8 @@ fn plan_update(
             new_row.insert(column.clone(), value.clone());
         }
         let new_row = normalize_row(&schema, new_row)?;
-        let new_key = row_key(&schema, &new_row)?;
+        validate_primary_storage_key_bound(&schema, &new_row)?;
+        let new_key = encode_primary_key(&schema, &new_row)?;
         work_bytes = checked_dml_add(work_bytes, estimated_row_bytes(&new_row)?)?;
         work_bytes = checked_dml_add(work_bytes, estimated_row_bytes(&old_primary_key)?)?;
         work_bytes = checked_dml_add(
@@ -1299,32 +1329,28 @@ fn plan_update(
     require_complete_dml_scan(visit_outcome, table)?;
 
     let row_count = updates.len();
+    // Encoded keys are canonical, so a spelling-only FLOAT update such as `0` to `-0.0` keeps its
+    // key, and a row moving to a key that another row holds, and that this statement leaves in
+    // place, is a collision.
     let old_keys = updates
         .iter()
-        .map(|update| update.old_key.as_str())
+        .map(|update| update.old_key.as_slice())
         .collect::<HashSet<_>>();
-    let mut destinations = HashMap::with_capacity(row_count);
+    let mut destinations = HashSet::with_capacity(row_count);
     for update in &updates {
-        if destinations
-            .insert(update.new_key.as_str(), update.old_key.as_str())
-            .is_some()
-        {
+        if !destinations.insert(update.new_key.as_slice()) {
             return Err(EngineError::constraint_violation(format!(
                 "UPDATE of `{table}` would duplicate a primary key"
             )));
         }
         if update.new_key != update.old_key
-            && !old_keys.contains(update.new_key.as_str())
-            && let Some(existing) = storage.lookup_primary_key(table, &update.new_row)?
+            && !old_keys.contains(update.new_key.as_slice())
+            && storage.visit_primary_key(table, &update.new_row, &mut |_| Ok(VisitControl::Stop))?
+                == VisitOutcome::Stopped
         {
-            // Page storage canonicalizes typed physical keys. A spelling-only FLOAT update such
-            // as `0` to `-0.0` therefore finds its own source row at the destination key; only a
-            // hit on a different logical source row is a collision.
-            if row_key(&schema, &existing)? != update.old_key {
-                return Err(EngineError::constraint_violation(format!(
-                    "UPDATE of `{table}` would duplicate a primary key"
-                )));
-            }
+            return Err(EngineError::constraint_violation(format!(
+                "UPDATE of `{table}` would duplicate a primary key"
+            )));
         }
     }
 

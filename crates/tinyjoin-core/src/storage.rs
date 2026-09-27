@@ -1110,6 +1110,7 @@ fn column_type_name(data_type: ColumnType) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn row_key(schema: &TableDefinition, row: &Row) -> Result<String> {
     validate_primary_storage_key_bound(schema, row)?;
     let mut values = Vec::with_capacity(schema.primary_key.len());
