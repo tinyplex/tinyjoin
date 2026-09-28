@@ -10,6 +10,7 @@ use crate::RowChange;
 #[cfg(test)]
 use crate::paged_codec::{
     CatalogHeader, encode_catalog_header_record, encode_catalog_index_record,
+    encode_secondary_index_entry_key,
 };
 #[cfg(test)]
 use crate::storage::preflight_row_write_set;
@@ -21,8 +22,8 @@ use crate::{
         IndexEntry, IndexEntryLayout, RecordLayout, StoredEntry, StoredRecord,
         decode_catalog_header_record, decode_catalog_index_record, decode_catalog_key,
         decode_catalog_table_record, encode_catalog_schema,
-        encode_catalog_table_record_with_schema, encode_primary_key, encode_record_index_prefix,
-        encode_secondary_index_entry_key, encode_secondary_index_prefix, index_column_positions,
+        encode_catalog_table_record_with_schema, encode_primary_key, encode_record_index_entry,
+        encode_record_index_prefix, encode_secondary_index_prefix, index_column_positions,
         index_entry_primary_key, leading_key_component, secondary_index_entry_matches_prefix,
         secondary_index_primary_key, secondary_index_primary_key_for_definition,
     },
@@ -1680,10 +1681,11 @@ fn validate_index_tree<D: PageDevice>(
         ))
     })?;
     let layout = RecordLayout::new(&table.schema)?;
+    let positions = index_column_positions(&table.schema, &record.definition)?;
     let mut count = 0_u64;
     let mut unique_prefixes = HashSet::new();
     let mut cursor = Btree::validating_cursor(pager, root, record.tree_id)?;
-    while let Some((entry_key, value)) = cursor.next(pager)? {
+    while let Some((entry_key, value)) = cursor.next_entry(pager)? {
         if !value.is_empty() {
             return Err(storage_corrupt(format!(
                 "Secondary index `{}` contains a non-empty value",
@@ -1693,7 +1695,7 @@ fn validate_index_tree<D: PageDevice>(
         let primary_key = secondary_index_primary_key_for_definition(
             &table.schema,
             &record.definition,
-            &entry_key,
+            entry_key,
         )?;
         let row_value =
             Btree::get(pager, table_root, table.tree_id, primary_key)?.ok_or_else(|| {
@@ -1702,23 +1704,20 @@ fn validate_index_tree<D: PageDevice>(
                     record.definition.name
                 ))
             })?;
-        // Every table row was validated strictly before its indexes are checked.
-        let row = StoredRecord::new(&table.schema, &layout, primary_key, &row_value)?.to_row()?;
-        let expected = encode_secondary_index_entry_key(&table.schema, &record.definition, &row)?;
-        if expected.as_deref() != Some(entry_key.as_slice()) {
+        // Every table row was validated strictly before its indexes are checked, so its entry is
+        // read from its record, as writers read it. A row with a NULL in the tuple has none.
+        let row = StoredRecord::new(&table.schema, &layout, primary_key, &row_value)?;
+        let Some((expected, tuple)) = encode_record_index_entry(&positions, &row)?
+            .filter(|(expected, _)| expected.as_slice() == entry_key)
+        else {
             return Err(storage_corrupt(format!(
                 "Secondary index `{}` entry does not match its table row",
                 record.definition.name
             )));
-        }
+        };
         if record.definition.unique {
-            let prefix = encode_secondary_index_prefix(&table.schema, &record.definition, &row)?
-                .ok_or_else(|| {
-                    storage_corrupt(format!(
-                        "Unique index `{}` contains a NULL entry",
-                        record.definition.name
-                    ))
-                })?;
+            let mut prefix = expected;
+            prefix.truncate(tuple);
             if !unique_prefixes.insert(prefix) {
                 return Err(storage_corrupt(format!(
                     "Unique index `{}` contains duplicate values",
@@ -1765,11 +1764,12 @@ fn expected_index_entry_count<D: PageDevice>(
         return Ok(table.row_count);
     }
     let layout = RecordLayout::new(&table.schema)?;
+    let positions = index_column_positions(&table.schema, definition)?;
     let mut count = 0_u64;
     let mut cursor = Btree::cursor(pager, root, table.tree_id)?;
     while let Some((key, value)) = cursor.next_entry(pager)? {
-        let row = StoredRecord::new(&table.schema, &layout, key, &value)?.to_row()?;
-        if encode_secondary_index_entry_key(&table.schema, definition, &row)?.is_some() {
+        let row = StoredRecord::new(&table.schema, &layout, key, &value)?;
+        if encode_record_index_entry(&positions, &row)?.is_some() {
             count = count
                 .checked_add(1)
                 .ok_or_else(|| storage_corrupt("An expected index entry count overflowed"))?;
