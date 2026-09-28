@@ -27,7 +27,9 @@ pub(crate) const PAGE_HEADER_SIZE: usize = 32;
 pub(crate) const MAX_PAGE_PAYLOAD_SIZE: usize = PAGE_SIZE - PAGE_HEADER_SIZE;
 
 pub(crate) const SUPERBLOCK_PAGE_COUNT: usize = 2;
-pub(crate) const BITMAP_CHUNK_COUNT: usize = 3;
+/// The chunks of the allocation bitmap beyond the part each superblock carries, each kept in two
+/// slots of its own.
+pub(crate) const BITMAP_CHUNK_COUNT: usize = 2;
 pub(crate) const BITMAP_PAGE_COUNT: usize = BITMAP_CHUNK_COUNT * 2;
 pub(crate) const FIRST_DATA_PAGE_ID: PageId =
     SUPERBLOCK_PAGE_COUNT as PageId + BITMAP_PAGE_COUNT as PageId;
@@ -38,15 +40,29 @@ const PAGE_FLAGS: u16 = 0;
 const PAGE_CRC_OFFSET: usize = 28;
 
 const SUPERBLOCK_MAGIC: &[u8; 8] = b"TGRSUPR\0";
-// Page format 3 stores rows as packed records and keys in an order-preserving encoding. Earlier
-// databases are refused with UNSUPPORTED_PAGE rather than read under the wrong layout.
+// Page format 3 stores rows as packed records and keys in an order-preserving encoding, and
+// carries the start of the allocation bitmap in each superblock. Earlier databases are refused
+// with UNSUPPORTED_PAGE rather than read under the wrong layout.
 const SUPERBLOCK_FORMAT_VERSION: u16 = 3;
 const SUPERBLOCK_FLAGS: u16 = 0;
-const SUPERBLOCK_PAYLOAD_SIZE: usize = 96;
+/// The superblock's own fields, which the start of the allocation bitmap follows to fill its page.
+const SUPERBLOCK_FIELDS_SIZE: usize = 128;
+const SUPERBLOCK_BITMAP_BYTES: usize = MAX_PAGE_PAYLOAD_SIZE - SUPERBLOCK_FIELDS_SIZE;
+/// Where each bitmap chunk's entry, sixteen bytes, begins among the superblock's fields.
+const BITMAP_CHUNK_ENTRIES_OFFSET: usize = 72;
+const BITMAP_CHUNK_ENTRY_SIZE: usize = 16;
 
 pub(crate) const ALLOCATION_BITMAP_BYTES: usize = MAX_PAGE_COUNT as usize / 8;
 const BITMAP_CHUNK_HEADER_SIZE: usize = 16;
 const MAX_BITMAP_CHUNK_BYTES: usize = MAX_PAGE_PAYLOAD_SIZE - BITMAP_CHUNK_HEADER_SIZE;
+const _: () = assert!(
+    SUPERBLOCK_BITMAP_BYTES + (BITMAP_CHUNK_COUNT - 1) * MAX_BITMAP_CHUNK_BYTES
+        < ALLOCATION_BITMAP_BYTES
+        && SUPERBLOCK_BITMAP_BYTES + BITMAP_CHUNK_COUNT * MAX_BITMAP_CHUNK_BYTES
+            >= ALLOCATION_BITMAP_BYTES
+        && BITMAP_CHUNK_ENTRIES_OFFSET + BITMAP_CHUNK_COUNT * BITMAP_CHUNK_ENTRY_SIZE
+            <= SUPERBLOCK_FIELDS_SIZE
+);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -187,6 +203,7 @@ impl Page {
         Ok(bytes)
     }
 
+    #[cfg(test)]
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         Self::verify(bytes)?;
         Self::decode_verified(bytes)
@@ -364,6 +381,13 @@ impl BitmapSlot {
     pub(crate) const fn page_id(self, chunk: usize) -> PageId {
         self.first_page_id() + chunk as PageId
     }
+
+    pub(crate) const fn inactive(self) -> Self {
+        match self {
+            Self::A => Self::B,
+            Self::B => Self::A,
+        }
+    }
 }
 
 impl TryFrom<u8> for BitmapSlot {
@@ -380,6 +404,20 @@ impl TryFrom<u8> for BitmapSlot {
     }
 }
 
+/// Where a superblock finds one chunk of its allocation bitmap: the slot that holds it, the
+/// generation whose commit wrote it, and the checksum of the page that commit wrote.
+///
+/// A commit writes only the chunks it changes, each in the slot beside the one its predecessor
+/// reads, so a chunk that no commit has changed since is shared by both roots. The checksum ties a
+/// root to the very page its commit wrote, which a page an abandoned commit wrote in the same slot
+/// at the same generation cannot pass for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BitmapChunk {
+    pub slot: BitmapSlot,
+    pub generation: u64,
+    pub checksum: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Superblock {
     pub slot: SuperblockSlot,
@@ -392,47 +430,28 @@ pub(crate) struct Superblock {
     /// is derived from the catalog and is not authoritative: a reader which distrusts it can
     /// recompute it from the table fingerprints in the catalog.
     pub database_hash: u64,
-    pub bitmap_slot: BitmapSlot,
-    pub bitmap_generation: u64,
     pub catalog_root_page_id: Option<PageId>,
     pub live_data_page_count: u32,
     pub max_page_count: PageId,
     /// The [commit hash](CommitHash) of the data pages this generation's commit wrote: those
     /// its allocation bitmap holds and its predecessor's does not.
     pub commit_hash: u64,
+    /// The chunks of the allocation bitmap beyond the start the superblock carries itself.
+    pub bitmap_chunks: [BitmapChunk; BITMAP_CHUNK_COUNT],
 }
 
 impl Superblock {
-    pub(crate) fn new(slot: SuperblockSlot) -> Self {
-        let bitmap_slot = match slot {
-            SuperblockSlot::A => BitmapSlot::A,
-            SuperblockSlot::B => BitmapSlot::B,
-        };
-        Self {
-            slot,
-            generation: 1,
-            database_revision: 0,
-            database_hash: crate::hash::EMPTY_HASH,
-            bitmap_slot,
-            bitmap_generation: 1,
-            catalog_root_page_id: None,
-            live_data_page_count: 0,
-            max_page_count: MAX_PAGE_COUNT,
-            commit_hash: CommitHash::new().finish(),
-        }
-    }
-
-    pub(crate) fn encode_page(&self) -> Result<[u8; PAGE_SIZE]> {
+    /// Encodes the superblock with the start of `bitmap`, the allocation bitmap it describes.
+    pub(crate) fn encode_page(&self, bitmap: &AllocationBitmap) -> Result<[u8; PAGE_SIZE]> {
         self.validate()?;
-        let id = self.slot.page_id();
-        validate_page_id(id)?;
+        self.validate_bitmap(bitmap)?;
         // Written in place, as every commit writes one.
         let mut bytes = [0; PAGE_SIZE];
         write_page_header(
             &mut bytes,
-            id,
+            self.slot.page_id(),
             PageType::Superblock,
-            SUPERBLOCK_PAYLOAD_SIZE,
+            MAX_PAGE_PAYLOAD_SIZE,
         );
         let payload = &mut bytes[PAGE_HEADER_SIZE..];
         payload[..8].copy_from_slice(SUPERBLOCK_MAGIC);
@@ -443,23 +462,30 @@ impl Superblock {
         put(payload, 24, self.generation.to_le_bytes());
         put(payload, 32, self.database_revision.to_le_bytes());
         put(payload, 40, self.database_hash.to_le_bytes());
-        put(payload, 48, self.bitmap_generation.to_le_bytes());
         put(
             payload,
-            56,
+            48,
             self.catalog_root_page_id.unwrap_or(u64::MAX).to_le_bytes(),
         );
-        put(payload, 64, self.live_data_page_count.to_le_bytes());
-        put(payload, 68, (BITMAP_CHUNK_COUNT as u16).to_le_bytes());
-        payload[70] = self.slot as u8;
-        payload[71] = self.bitmap_slot as u8;
-        put(payload, 72, self.commit_hash.to_le_bytes());
+        put(payload, 56, self.live_data_page_count.to_le_bytes());
+        put(payload, 60, (BITMAP_CHUNK_COUNT as u16).to_le_bytes());
+        payload[62] = self.slot as u8;
+        put(payload, 64, self.commit_hash.to_le_bytes());
+        for (chunk, entry) in self.bitmap_chunks.iter().enumerate() {
+            let at = BITMAP_CHUNK_ENTRIES_OFFSET + chunk * BITMAP_CHUNK_ENTRY_SIZE;
+            put(payload, at, entry.generation.to_le_bytes());
+            put(payload, at + 8, entry.checksum.to_le_bytes());
+            payload[at + 12] = entry.slot as u8;
+        }
+        payload[SUPERBLOCK_FIELDS_SIZE..].copy_from_slice(bitmap.superblock_bits());
         seal(&mut bytes);
         Ok(bytes)
     }
 
-    pub(crate) fn decode_page(bytes: &[u8]) -> Result<Self> {
-        let page = Page::decode(bytes)?;
+    /// Reads a superblock page, and the start of the allocation bitmap it carries.
+    pub(crate) fn decode_page(bytes: &[u8]) -> Result<(Self, &[u8])> {
+        Page::verify(bytes)?;
+        let page = PageRef::decode_verified(bytes)?;
         if page.id >= SUPERBLOCK_PAGE_COUNT as PageId {
             return Err(invalid_page(storage_diagnostic!(
                 "Superblock must occupy page 0 or 1, not page {}",
@@ -469,13 +495,10 @@ impl Superblock {
         if page.page_type != PageType::Superblock {
             return Err(invalid_page("Superblock page has the wrong page type"));
         }
-        if page.payload.len() != SUPERBLOCK_PAYLOAD_SIZE {
-            return Err(invalid_page(storage_diagnostic!(
-                "Superblock payload must be {SUPERBLOCK_PAYLOAD_SIZE} bytes"
-            )));
-        }
-        let payload = &page.payload;
-        if &payload[..8] != SUPERBLOCK_MAGIC {
+        let payload = page.payload;
+        // The format is read before anything it lays out, so that a superblock another format
+        // lays out differently, even at another length, is refused as unsupported.
+        if payload.len() < 12 || &payload[..8] != SUPERBLOCK_MAGIC {
             return Err(invalid_page("Superblock magic does not match"));
         }
         let version = read_u16(payload, 8);
@@ -490,6 +513,9 @@ impl Superblock {
                 "Superblock flags {flags:#06x} are not supported"
             )));
         }
+        if payload.len() != MAX_PAGE_PAYLOAD_SIZE {
+            return Err(invalid_page("Superblock payload must fill its page"));
+        }
         if read_u32(payload, 12) as usize != PAGE_SIZE {
             return Err(unsupported_page(
                 "Superblock page size does not match this build",
@@ -501,15 +527,23 @@ impl Superblock {
                 "Superblock maximum page count does not match this build",
             ));
         }
-        if payload[80..].iter().any(|byte| *byte != 0) {
-            return Err(invalid_page("Superblock reserved bytes must be zero"));
-        }
-        if read_u16(payload, 68) as usize != BITMAP_CHUNK_COUNT {
+        if read_u16(payload, 60) as usize != BITMAP_CHUNK_COUNT {
             return Err(unsupported_page(
                 "Superblock allocation bitmap chunk count is not supported",
             ));
         }
-        let slot = SuperblockSlot::try_from(payload[70])?;
+        let (entries, reserved) = payload[BITMAP_CHUNK_ENTRIES_OFFSET..SUPERBLOCK_FIELDS_SIZE]
+            .split_at(BITMAP_CHUNK_COUNT * BITMAP_CHUNK_ENTRY_SIZE);
+        let entries = entries.as_chunks::<BITMAP_CHUNK_ENTRY_SIZE>().0;
+        if payload[63] != 0
+            || reserved.iter().any(|byte| *byte != 0)
+            || entries
+                .iter()
+                .any(|entry| entry[13..].iter().any(|byte| *byte != 0))
+        {
+            return Err(invalid_page("Superblock reserved bytes must be zero"));
+        }
+        let slot = SuperblockSlot::try_from(payload[62])?;
         if page.id != slot.page_id() {
             return Err(invalid_page(storage_diagnostic!(
                 "Superblock slot {slot:?} must occupy page {}, not page {}",
@@ -517,7 +551,19 @@ impl Superblock {
                 page.id
             )));
         }
-        let catalog_root_page_id = match read_u64(payload, 56) {
+        let mut bitmap_chunks = [BitmapChunk {
+            slot: BitmapSlot::A,
+            generation: 0,
+            checksum: 0,
+        }; BITMAP_CHUNK_COUNT];
+        for (chunk, entry) in bitmap_chunks.iter_mut().zip(entries) {
+            *chunk = BitmapChunk {
+                slot: BitmapSlot::try_from(entry[12])?,
+                generation: read_u64(entry, 0),
+                checksum: read_u32(entry, 8),
+            };
+        }
+        let catalog_root_page_id = match read_u64(payload, 48) {
             u64::MAX => None,
             id => Some(id),
         };
@@ -526,15 +572,14 @@ impl Superblock {
             generation: read_u64(payload, 24),
             database_revision: read_u64(payload, 32),
             database_hash: read_u64(payload, 40),
-            bitmap_generation: read_u64(payload, 48),
-            bitmap_slot: BitmapSlot::try_from(payload[71])?,
             catalog_root_page_id,
-            live_data_page_count: read_u32(payload, 64),
+            live_data_page_count: read_u32(payload, 56),
             max_page_count,
-            commit_hash: read_u64(payload, 72),
+            commit_hash: read_u64(payload, 64),
+            bitmap_chunks,
         };
         superblock.validate()?;
-        Ok(superblock)
+        Ok((superblock, &payload[SUPERBLOCK_FIELDS_SIZE..]))
     }
 
     fn validate(&self) -> Result<()> {
@@ -544,23 +589,16 @@ impl Superblock {
                 error.message
             ))
         })?;
-        if self.generation == 0 || self.bitmap_generation == 0 {
-            return Err(invalid_page(
-                "Superblock and allocation bitmap generations must be non-zero",
-            ));
+        if self.generation == 0 {
+            return Err(invalid_page("Superblock generation must be non-zero"));
         }
-        if self.bitmap_generation != self.generation {
+        if self
+            .bitmap_chunks
+            .iter()
+            .any(|chunk| chunk.generation == 0 || chunk.generation > self.generation)
+        {
             return Err(invalid_page(
-                "Allocation bitmap generation must match the superblock generation",
-            ));
-        }
-        let expected_bitmap_slot = match self.slot {
-            SuperblockSlot::A => BitmapSlot::A,
-            SuperblockSlot::B => BitmapSlot::B,
-        };
-        if self.bitmap_slot != expected_bitmap_slot {
-            return Err(invalid_page(
-                "Superblock and allocation bitmap slots must match",
+                "Allocation bitmap chunk generations must be non-zero and no newer than their superblock",
             ));
         }
         if self.max_page_count != MAX_PAGE_COUNT {
@@ -587,11 +625,6 @@ impl Superblock {
     }
 
     pub(crate) fn validate_bitmap(&self, bitmap: &AllocationBitmap) -> Result<()> {
-        if bitmap.slot() != self.bitmap_slot || bitmap.generation() != self.bitmap_generation {
-            return Err(invalid_page(
-                "Superblock allocation bitmap slot or generation does not match",
-            ));
-        }
         let live_data_pages = bitmap
             .allocated_page_count()
             .checked_sub(FIRST_DATA_PAGE_ID as u32)
@@ -615,40 +648,26 @@ impl Superblock {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Which pages a root allocates, a bit for each. Each superblock carries the bits of the first
+/// pages, and [chunk pages](BitmapChunk) the rest.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AllocationBitmap {
-    generation: u64,
-    slot: BitmapSlot,
     bits: Vec<u8>,
     /// How many bits are set, which every commit reads and records.
     allocated: u32,
 }
 
 impl AllocationBitmap {
-    pub(crate) fn new(generation: u64, slot: BitmapSlot) -> Result<Self> {
-        if generation == 0 {
-            return Err(invalid_page(
-                "Allocation bitmap generation must be non-zero",
-            ));
+    /// A bitmap that allocates only the metadata pages.
+    pub(crate) fn new() -> Self {
+        let mut bits = vec![0; ALLOCATION_BITMAP_BYTES];
+        for id in 0..FIRST_DATA_PAGE_ID as usize {
+            bits[id / 8] |= 1 << (id % 8);
         }
-        let mut bitmap = Self {
-            generation,
-            slot,
-            bits: vec![0; ALLOCATION_BITMAP_BYTES],
-            allocated: 0,
-        };
-        for id in 0..FIRST_DATA_PAGE_ID {
-            bitmap.set_allocated(id, true)?;
+        Self {
+            bits,
+            allocated: FIRST_DATA_PAGE_ID as u32,
         }
-        Ok(bitmap)
-    }
-
-    pub(crate) fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    pub(crate) fn slot(&self) -> BitmapSlot {
-        self.slot
     }
 
     pub(crate) fn is_allocated(&self, id: PageId) -> Result<bool> {
@@ -694,116 +713,40 @@ impl AllocationBitmap {
         pages
     }
 
-    pub(crate) fn encode_pages(&self) -> Result<Vec<[u8; PAGE_SIZE]>> {
-        if self.generation == 0 {
-            return Err(invalid_page(
-                "Allocation bitmap generation must be non-zero",
-            ));
-        }
-        self.validate_metadata_pages()?;
-        // Each page is written in place, as every commit writes all of them.
-        let mut pages = vec![[0; PAGE_SIZE]; BITMAP_CHUNK_COUNT];
-        for (chunk, bytes) in pages.iter_mut().enumerate() {
-            let start = chunk * MAX_BITMAP_CHUNK_BYTES;
-            let end = (start + MAX_BITMAP_CHUNK_BYTES).min(ALLOCATION_BITMAP_BYTES);
-            let bits = &self.bits[start..end];
-            let id = self.slot.page_id(chunk);
-            validate_page_id(id)?;
-            write_page_header(
-                bytes,
-                id,
-                PageType::AllocationBitmap,
-                BITMAP_CHUNK_HEADER_SIZE + bits.len(),
-            );
-            let payload = &mut bytes[PAGE_HEADER_SIZE..];
-            put(payload, 0, self.generation.to_le_bytes());
-            payload[8] = self.slot as u8;
-            payload[9] = chunk as u8;
-            payload[10] = BITMAP_CHUNK_COUNT as u8;
-            put(payload, 12, (bits.len() as u16).to_le_bytes());
-            payload[BITMAP_CHUNK_HEADER_SIZE..BITMAP_CHUNK_HEADER_SIZE + bits.len()]
-                .copy_from_slice(bits);
-            seal(bytes);
-        }
-        Ok(pages)
+    /// The bits each superblock carries.
+    fn superblock_bits(&self) -> &[u8] {
+        &self.bits[..SUPERBLOCK_BITMAP_BYTES]
     }
 
-    #[cfg(test)]
-    pub(crate) fn decode_pages(slot: BitmapSlot, pages: &[[u8; PAGE_SIZE]]) -> Result<Self> {
-        let pages = pages.iter().map(|page| page.as_slice()).collect::<Vec<_>>();
-        Self::decode_page_slices(slot, &pages)
+    fn chunk_bits(&self, chunk: usize) -> &[u8] {
+        &self.bits[bitmap_chunk_range(chunk)]
     }
 
-    fn decode_page_slices(slot: BitmapSlot, pages: &[&[u8]]) -> Result<Self> {
-        if pages.len() != BITMAP_CHUNK_COUNT {
-            return Err(invalid_page(storage_diagnostic!(
-                "Allocation bitmap slot must contain {BITMAP_CHUNK_COUNT} chunks, not {}",
-                pages.len()
-            )));
-        }
-        let mut generation = None;
-        let mut bits = Vec::with_capacity(ALLOCATION_BITMAP_BYTES);
-        for (chunk, bytes) in pages.iter().enumerate() {
-            let page = Page::decode(bytes)?;
-            if page.id != slot.page_id(chunk) {
-                return Err(invalid_page(storage_diagnostic!(
-                    "Allocation bitmap chunk {chunk} has page ID {}, expected {}",
-                    page.id,
-                    slot.page_id(chunk)
-                )));
-            }
-            if page.page_type != PageType::AllocationBitmap {
-                return Err(invalid_page(storage_diagnostic!(
-                    "Allocation bitmap chunk {chunk} has the wrong page type"
-                )));
-            }
-            if page.payload.len() < BITMAP_CHUNK_HEADER_SIZE {
-                return Err(invalid_page(storage_diagnostic!(
-                    "Allocation bitmap chunk {chunk} header is truncated"
-                )));
-            }
-            let chunk_generation = read_u64(&page.payload, 0);
-            if chunk_generation == 0 {
-                return Err(invalid_page(
-                    "Allocation bitmap generation must be non-zero",
-                ));
-            }
-            if let Some(expected) = generation {
-                if chunk_generation != expected {
-                    return Err(invalid_page(
-                        "Allocation bitmap chunks have different generations",
-                    ));
-                }
-            } else {
-                generation = Some(chunk_generation);
-            }
-            if BitmapSlot::try_from(page.payload[8])? != slot {
-                return Err(invalid_page(storage_diagnostic!(
-                    "Allocation bitmap chunk {chunk} belongs to a different slot"
-                )));
-            }
-            if page.payload[9] as usize != chunk || page.payload[10] as usize != BITMAP_CHUNK_COUNT
-            {
-                return Err(invalid_page(storage_diagnostic!(
-                    "Allocation bitmap chunk {chunk} has inconsistent chunk metadata"
-                )));
-            }
-            if page.payload[11] != 0 || page.payload[14..16].iter().any(|byte| *byte != 0) {
-                return Err(invalid_page(
-                    "Allocation bitmap flags and reserved bytes must be zero",
-                ));
-            }
-            let expected_length = bitmap_chunk_length(chunk);
-            let length = read_u16(&page.payload, 12) as usize;
-            if length != expected_length
-                || page.payload.len() != BITMAP_CHUNK_HEADER_SIZE + expected_length
-            {
-                return Err(invalid_page(storage_diagnostic!(
-                    "Allocation bitmap chunk {chunk} has an invalid payload length"
-                )));
-            }
-            bits.extend_from_slice(&page.payload[BITMAP_CHUNK_HEADER_SIZE..]);
-        }
+    /// Chunk `chunk` as the page that holds it in `slot`, written by the commit of `generation`.
+    fn encode_chunk(&self, chunk: usize, slot: BitmapSlot, generation: u64) -> [u8; PAGE_SIZE] {
+        let bits = self.chunk_bits(chunk);
+        // Written in place, as each commit writes the chunks it changes.
+        let mut bytes = [0; PAGE_SIZE];
+        write_page_header(
+            &mut bytes,
+            slot.page_id(chunk),
+            PageType::AllocationBitmap,
+            BITMAP_CHUNK_HEADER_SIZE + bits.len(),
+        );
+        let payload = &mut bytes[PAGE_HEADER_SIZE..];
+        put(payload, 0, generation.to_le_bytes());
+        payload[8] = slot as u8;
+        payload[9] = chunk as u8;
+        payload[10] = BITMAP_CHUNK_COUNT as u8;
+        put(payload, 12, (bits.len() as u16).to_le_bytes());
+        payload[BITMAP_CHUNK_HEADER_SIZE..BITMAP_CHUNK_HEADER_SIZE + bits.len()]
+            .copy_from_slice(bits);
+        seal(&mut bytes);
+        bytes
+    }
+
+    /// The bitmap of every page's bits, which must allocate each metadata page.
+    fn from_bits(bits: Vec<u8>) -> Result<Self> {
         if bits.len() != ALLOCATION_BITMAP_BYTES {
             return Err(invalid_page("Allocation bitmap has the wrong total length"));
         }
@@ -814,12 +757,7 @@ impl AllocationBitmap {
             .map(|word| u64::from_le_bytes(*word).count_ones())
             .sum::<u32>()
             + rest.iter().map(|byte| byte.count_ones()).sum::<u32>();
-        let bitmap = Self {
-            generation: generation.expect("the chunk count is non-zero"),
-            slot,
-            bits,
-            allocated,
-        };
+        let bitmap = Self { bits, allocated };
         bitmap.validate_metadata_pages()?;
         Ok(bitmap)
     }
@@ -834,65 +772,82 @@ impl AllocationBitmap {
         }
         Ok(())
     }
-
-    fn retarget(&self, generation: u64, slot: BitmapSlot) -> Result<Self> {
-        if generation == 0 {
-            return Err(invalid_page(
-                "Allocation bitmap generation must be non-zero",
-            ));
-        }
-        self.validate_metadata_pages()?;
-        Ok(Self {
-            generation,
-            slot,
-            bits: self.bits.clone(),
-            allocated: self.allocated,
-        })
-    }
-
-    fn logically_matches(&self, other: &Self) -> bool {
-        self.generation == other.generation && self.bits == other.bits
-    }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RawMetadataSlot<'a> {
-    pub superblock: Option<&'a [u8]>,
-    pub bitmap_chunks: [Option<&'a [u8]>; BITMAP_CHUNK_COUNT],
+/// The bytes of the allocation bitmap that chunk `chunk` holds.
+fn bitmap_chunk_range(chunk: usize) -> std::ops::Range<usize> {
+    let start = SUPERBLOCK_BITMAP_BYTES + chunk * MAX_BITMAP_CHUNK_BYTES;
+    start..(start + MAX_BITMAP_CHUNK_BYTES).min(ALLOCATION_BITMAP_BYTES)
 }
 
-impl<'a> RawMetadataSlot<'a> {
-    pub(crate) const fn empty() -> Self {
-        Self {
-            superblock: None,
-            bitmap_chunks: [None; BITMAP_CHUNK_COUNT],
-        }
-    }
-
-    pub(crate) const fn new(
-        superblock: &'a [u8],
-        bitmap_chunks: [&'a [u8]; BITMAP_CHUNK_COUNT],
-    ) -> Self {
-        Self {
-            superblock: Some(superblock),
-            bitmap_chunks: [
-                Some(bitmap_chunks[0]),
-                Some(bitmap_chunks[1]),
-                Some(bitmap_chunks[2]),
-            ],
-        }
-    }
-
-    fn is_present(&self) -> bool {
-        self.superblock.is_some() || self.bitmap_chunks.iter().any(Option::is_some)
-    }
+/// The first page whose bit chunk `chunk` holds.
+#[cfg(test)]
+pub(crate) fn first_page_of_bitmap_chunk(chunk: usize) -> PageId {
+    (bitmap_chunk_range(chunk).start * 8) as PageId
 }
 
-impl Default for RawMetadataSlot<'_> {
-    fn default() -> Self {
-        Self::empty()
+/// Reads the bits of chunk `chunk` from the page `entry` names, which must be the very page its
+/// commit wrote there.
+fn decode_bitmap_chunk<'a>(bytes: &'a [u8], chunk: usize, entry: &BitmapChunk) -> Result<&'a [u8]> {
+    Page::verify(bytes)?;
+    if read_u32(bytes, PAGE_CRC_OFFSET) != entry.checksum {
+        return Err(invalid_page(storage_diagnostic!(
+            "Allocation bitmap chunk {chunk} is not the page its superblock recorded"
+        )));
     }
+    let page = PageRef::decode_verified(bytes)?;
+    if page.id != entry.slot.page_id(chunk) {
+        return Err(invalid_page(storage_diagnostic!(
+            "Allocation bitmap chunk {chunk} has page ID {}, expected {}",
+            page.id,
+            entry.slot.page_id(chunk)
+        )));
+    }
+    if page.page_type != PageType::AllocationBitmap {
+        return Err(invalid_page(storage_diagnostic!(
+            "Allocation bitmap chunk {chunk} has the wrong page type"
+        )));
+    }
+    let payload = page.payload;
+    if payload.len() < BITMAP_CHUNK_HEADER_SIZE {
+        return Err(invalid_page(storage_diagnostic!(
+            "Allocation bitmap chunk {chunk} header is truncated"
+        )));
+    }
+    if read_u64(payload, 0) != entry.generation {
+        return Err(invalid_page(storage_diagnostic!(
+            "Allocation bitmap chunk {chunk} was written by another generation"
+        )));
+    }
+    if BitmapSlot::try_from(payload[8])? != entry.slot {
+        return Err(invalid_page(storage_diagnostic!(
+            "Allocation bitmap chunk {chunk} belongs to a different slot"
+        )));
+    }
+    if payload[9] as usize != chunk || payload[10] as usize != BITMAP_CHUNK_COUNT {
+        return Err(invalid_page(storage_diagnostic!(
+            "Allocation bitmap chunk {chunk} has inconsistent chunk metadata"
+        )));
+    }
+    if payload[11] != 0 || payload[14..16].iter().any(|byte| *byte != 0) {
+        return Err(invalid_page(
+            "Allocation bitmap flags and reserved bytes must be zero",
+        ));
+    }
+    let length = bitmap_chunk_range(chunk).len();
+    if read_u16(payload, 12) as usize != length
+        || payload.len() != BITMAP_CHUNK_HEADER_SIZE + length
+    {
+        return Err(invalid_page(storage_diagnostic!(
+            "Allocation bitmap chunk {chunk} has an invalid payload length"
+        )));
+    }
+    Ok(&payload[BITMAP_CHUNK_HEADER_SIZE..])
 }
+
+/// A device's metadata pages by page ID, as they were read. A page the device holds only in part,
+/// or not at all, is shorter than a page.
+pub(crate) type RawMetadata<'a> = [&'a [u8]; FIRST_DATA_PAGE_ID as usize];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveredMetadata {
@@ -901,16 +856,61 @@ pub(crate) struct RecoveredMetadata {
 }
 
 impl RecoveredMetadata {
-    fn logically_matches(&self, other: &Self) -> bool {
-        self.superblock.generation == other.superblock.generation
-            && self.superblock.database_revision == other.superblock.database_revision
-            && self.superblock.bitmap_generation == other.superblock.bitmap_generation
-            && self.superblock.catalog_root_page_id == other.superblock.catalog_root_page_id
-            && self.superblock.live_data_page_count == other.superblock.live_data_page_count
-            && self.superblock.max_page_count == other.superblock.max_page_count
-            && self
+    /// The root of an empty database, at generation 1 in `slot`, with each bitmap chunk in the
+    /// bitmap slot of the same name.
+    pub(crate) fn empty(slot: SuperblockSlot) -> Self {
+        let generation = 1;
+        Self {
+            superblock: Superblock {
+                slot,
+                generation,
+                database_revision: 0,
+                database_hash: crate::hash::EMPTY_HASH,
+                catalog_root_page_id: None,
+                live_data_page_count: 0,
+                max_page_count: MAX_PAGE_COUNT,
+                commit_hash: CommitHash::new().finish(),
+                // Each chunk's checksum is recorded as its page is encoded.
+                bitmap_chunks: [BitmapChunk {
+                    slot: slot.bitmap_slot(),
+                    generation,
+                    checksum: 0,
+                }; BITMAP_CHUNK_COUNT],
+            },
+            allocation_bitmap: AllocationBitmap::new(),
+        }
+    }
+
+    /// Encodes the root's superblock and every chunk of its bitmap, each where the superblock
+    /// names it, recording each chunk's checksum: every page that makes up the root.
+    pub(crate) fn encode_pages(&mut self) -> Result<Vec<(PageId, [u8; PAGE_SIZE])>> {
+        let mut pages = Vec::with_capacity(BITMAP_CHUNK_COUNT + 1);
+        for (chunk, entry) in self.superblock.bitmap_chunks.iter_mut().enumerate() {
+            let bytes = self
                 .allocation_bitmap
-                .logically_matches(&other.allocation_bitmap)
+                .encode_chunk(chunk, entry.slot, entry.generation);
+            entry.checksum = page_checksum(&bytes);
+            pages.push((entry.slot.page_id(chunk), bytes));
+        }
+        pages.push((
+            self.superblock.slot.page_id(),
+            self.superblock.encode_page(&self.allocation_bitmap)?,
+        ));
+        Ok(pages)
+    }
+
+    /// Whether two roots of the same generation hold the same database, wherever their bitmap
+    /// chunks are kept.
+    fn logically_matches(&self, other: &Self) -> bool {
+        let (this, that) = (&self.superblock, &other.superblock);
+        this.generation == that.generation
+            && this.database_revision == that.database_revision
+            && this.database_hash == that.database_hash
+            && this.catalog_root_page_id == that.catalog_root_page_id
+            && this.live_data_page_count == that.live_data_page_count
+            && this.max_page_count == that.max_page_count
+            && this.commit_hash == that.commit_hash
+            && self.allocation_bitmap == other.allocation_bitmap
     }
 }
 
@@ -918,6 +918,9 @@ impl RecoveredMetadata {
 pub(crate) struct PendingMetadata {
     pub superblock: Superblock,
     pub allocation_bitmap: AllocationBitmap,
+    /// The page of each bitmap chunk the commit changed, to be written where the superblock names
+    /// it. Every other chunk stays where the predecessor's superblock names it.
+    pub bitmap_pages: [Option<[u8; PAGE_SIZE]>; BITMAP_CHUNK_COUNT],
 }
 
 /// The newest recoverable metadata root, and the root it replaced when that is recoverable too.
@@ -926,16 +929,10 @@ pub(crate) struct PendingMetadata {
 /// durable together, so an interrupted commit can leave a newest root naming pages that never
 /// became durable. The predecessor is what recovery falls back to then.
 pub(crate) fn recover_metadata(
-    slot_a: RawMetadataSlot<'_>,
-    slot_b: RawMetadataSlot<'_>,
-) -> Result<Option<(RecoveredMetadata, Option<RecoveredMetadata>)>> {
-    let metadata_present = slot_a.is_present() || slot_b.is_present();
-    if !metadata_present {
-        return Ok(None);
-    }
-
-    let candidate_a = decode_metadata_candidate(SuperblockSlot::A, slot_a);
-    let candidate_b = decode_metadata_candidate(SuperblockSlot::B, slot_b);
+    pages: RawMetadata<'_>,
+) -> Result<(RecoveredMetadata, Option<RecoveredMetadata>)> {
+    let candidate_a = decode_metadata_candidate(SuperblockSlot::A, &pages);
+    let candidate_b = decode_metadata_candidate(SuperblockSlot::B, &pages);
     for candidate in [&candidate_a, &candidate_b] {
         if let Err(error) = candidate
             && error.code == "UNSUPPORTED_PAGE"
@@ -951,7 +948,7 @@ pub(crate) fn recover_metadata(
                         "Equal-generation metadata slots contain different logical roots",
                     ));
                 }
-                Ok(Some((candidate_a, None)))
+                Ok((candidate_a, None))
             } else {
                 let (newest, older) =
                     if candidate_a.superblock.generation > candidate_b.superblock.generation {
@@ -962,10 +959,10 @@ pub(crate) fn recover_metadata(
                 let previous = (older.superblock.generation.checked_add(1)
                     == Some(newest.superblock.generation))
                 .then_some(older);
-                Ok(Some((newest, previous)))
+                Ok((newest, previous))
             }
         }
-        (Ok(candidate), Err(_)) | (Err(_), Ok(candidate)) => Ok(Some((candidate, None))),
+        (Ok(candidate), Err(_)) | (Err(_), Ok(candidate)) => Ok((candidate, None)),
         (Err(error_a), Err(error_b)) => Err(invalid_page(format!(
             "No valid metadata root remains; slot A: {}: {}; slot B: {}: {}",
             error_a.code, error_a.message, error_b.code, error_b.message
@@ -973,12 +970,16 @@ pub(crate) fn recover_metadata(
     }
 }
 
+/// The root that publishes `allocation_bitmap` and the rest after `active`, in the other slot.
+///
+/// Each bitmap chunk the commit changes is encoded now, for the slot beside the one `active`
+/// reads, so that `active` keeps every page it names; every other chunk stays where it is.
 pub(crate) fn build_next_metadata(
     active: &RecoveredMetadata,
     database_revision: u64,
     database_hash: u64,
     catalog_root_page_id: Option<PageId>,
-    allocation_bitmap: &AllocationBitmap,
+    allocation_bitmap: AllocationBitmap,
 ) -> Result<PendingMetadata> {
     crate::revision::validate_database_revision(database_revision)?;
     active
@@ -995,73 +996,67 @@ pub(crate) fn build_next_metadata(
             "Database revision cannot move backwards during metadata publication",
         ));
     }
-    let slot = active.superblock.slot.inactive();
-    let bitmap_slot = slot.bitmap_slot();
-    let allocation_bitmap = allocation_bitmap.retarget(generation, bitmap_slot)?;
     let live_data_page_count = allocation_bitmap
         .allocated_page_count()
         .checked_sub(FIRST_DATA_PAGE_ID as u32)
         .ok_or_else(|| invalid_page("Allocation bitmap does not reserve every metadata page"))?;
-    let superblock = Superblock {
-        slot,
+    let mut superblock = Superblock {
+        slot: active.superblock.slot.inactive(),
         generation,
         database_revision,
         database_hash,
-        bitmap_slot,
-        bitmap_generation: generation,
         catalog_root_page_id,
         live_data_page_count,
         max_page_count: MAX_PAGE_COUNT,
         // The pager records the commit's pages once it has written them.
         commit_hash: CommitHash::new().finish(),
+        bitmap_chunks: active.superblock.bitmap_chunks,
     };
+    let mut bitmap_pages = [None; BITMAP_CHUNK_COUNT];
+    for (chunk, entry) in superblock.bitmap_chunks.iter_mut().enumerate() {
+        if allocation_bitmap.chunk_bits(chunk) != active.allocation_bitmap.chunk_bits(chunk) {
+            let slot = entry.slot.inactive();
+            let bytes = allocation_bitmap.encode_chunk(chunk, slot, generation);
+            *entry = BitmapChunk {
+                slot,
+                generation,
+                checksum: page_checksum(&bytes),
+            };
+            bitmap_pages[chunk] = Some(bytes);
+        }
+    }
     superblock.validate()?;
     superblock.validate_bitmap(&allocation_bitmap)?;
     Ok(PendingMetadata {
         superblock,
         allocation_bitmap,
+        bitmap_pages,
     })
 }
 
 fn decode_metadata_candidate(
-    expected_slot: SuperblockSlot,
-    raw: RawMetadataSlot<'_>,
+    slot: SuperblockSlot,
+    pages: &RawMetadata<'_>,
 ) -> Result<RecoveredMetadata> {
-    let superblock_bytes = raw.superblock.ok_or_else(|| {
-        invalid_page(storage_diagnostic!(
-            "Metadata slot {expected_slot:?} has no superblock"
-        ))
-    })?;
-    let superblock = Superblock::decode_page(superblock_bytes)?;
-    if superblock.slot != expected_slot {
+    let (superblock, superblock_bits) = Superblock::decode_page(pages[slot.page_id() as usize])?;
+    if superblock.slot != slot {
         return Err(invalid_page(storage_diagnostic!(
-            "Metadata candidate {expected_slot:?} contains superblock {:?}",
+            "Metadata candidate {slot:?} contains superblock {:?}",
             superblock.slot
         )));
     }
-    let chunks = raw
-        .bitmap_chunks
-        .iter()
-        .enumerate()
-        .map(|(chunk, bytes)| {
-            bytes.ok_or_else(|| {
-                invalid_page(storage_diagnostic!(
-                    "Metadata slot {expected_slot:?} has no bitmap chunk {chunk}"
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let allocation_bitmap = AllocationBitmap::decode_page_slices(superblock.bitmap_slot, &chunks)?;
+    let mut bits = Vec::with_capacity(ALLOCATION_BITMAP_BYTES);
+    bits.extend_from_slice(superblock_bits);
+    for (chunk, entry) in superblock.bitmap_chunks.iter().enumerate() {
+        let bytes = pages[entry.slot.page_id(chunk) as usize];
+        bits.extend_from_slice(decode_bitmap_chunk(bytes, chunk, entry)?);
+    }
+    let allocation_bitmap = AllocationBitmap::from_bits(bits)?;
     superblock.validate_bitmap(&allocation_bitmap)?;
     Ok(RecoveredMetadata {
         superblock,
         allocation_bitmap,
     })
-}
-
-fn bitmap_chunk_length(chunk: usize) -> usize {
-    let start = chunk * MAX_BITMAP_CHUNK_BYTES;
-    (ALLOCATION_BITMAP_BYTES - start).min(MAX_BITMAP_CHUNK_BYTES)
 }
 
 fn validate_page_id(id: PageId) -> Result<()> {
@@ -1111,56 +1106,110 @@ mod tests {
     use super::*;
     use crate::hash::EMPTY_HASH;
 
-    struct EncodedMetadata {
-        superblock: [u8; PAGE_SIZE],
-        bitmap_chunks: Vec<[u8; PAGE_SIZE]>,
-    }
+    /// A device's metadata pages.
+    #[derive(Clone)]
+    struct Image([[u8; PAGE_SIZE]; FIRST_DATA_PAGE_ID as usize]);
 
-    impl EncodedMetadata {
-        fn raw(&self) -> RawMetadataSlot<'_> {
-            RawMetadataSlot::new(
-                &self.superblock,
-                [
-                    &self.bitmap_chunks[0],
-                    &self.bitmap_chunks[1],
-                    &self.bitmap_chunks[2],
-                ],
-            )
+    impl Image {
+        fn zeroed() -> Self {
+            Self([[0; PAGE_SIZE]; FIRST_DATA_PAGE_ID as usize])
+        }
+
+        /// The metadata of an empty database, as a device is initialized with it.
+        fn empty() -> Self {
+            let mut image = Self::zeroed();
+            for slot in [SuperblockSlot::A, SuperblockSlot::B] {
+                image.write(&mut RecoveredMetadata::empty(slot));
+            }
+            image
+        }
+
+        fn raw(&self) -> RawMetadata<'_> {
+            self.0.each_ref().map(|page| page.as_slice())
+        }
+
+        fn recover(&self) -> Result<(RecoveredMetadata, Option<RecoveredMetadata>)> {
+            recover_metadata(self.raw())
+        }
+
+        /// Writes every page of `root`, recording its chunks' checksums.
+        fn write(&mut self, root: &mut RecoveredMetadata) {
+            for (id, bytes) in root.encode_pages().unwrap() {
+                self.0[id as usize] = bytes;
+            }
+        }
+
+        fn commit(&mut self, pending: &PendingMetadata) {
+            for (id, bytes) in commit_writes(pending) {
+                self.0[id as usize] = bytes;
+            }
         }
     }
 
-    fn encoded_metadata(
+    /// The pages a commit of `pending` writes: the bitmap chunks it changed, and its superblock.
+    fn commit_writes(pending: &PendingMetadata) -> Vec<(PageId, [u8; PAGE_SIZE])> {
+        let mut writes = pending
+            .bitmap_pages
+            .iter()
+            .enumerate()
+            .filter_map(|(chunk, page)| {
+                page.map(|page| {
+                    (
+                        pending.superblock.bitmap_chunks[chunk].slot.page_id(chunk),
+                        page,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        writes.push((
+            pending.superblock.slot.page_id(),
+            pending
+                .superblock
+                .encode_page(&pending.allocation_bitmap)
+                .unwrap(),
+        ));
+        writes
+    }
+
+    /// A root at `generation` in `slot`, whose bitmap chunks are all in the bitmap slot of the
+    /// same name and all written at that generation. It allocates a catalog root, and another page
+    /// if `extra_page`.
+    fn root(
         slot: SuperblockSlot,
         generation: u64,
         database_revision: u64,
         extra_page: bool,
-    ) -> EncodedMetadata {
-        let mut allocation_bitmap = AllocationBitmap::new(generation, slot.bitmap_slot()).unwrap();
-        allocation_bitmap
+    ) -> RecoveredMetadata {
+        let mut root = RecoveredMetadata::empty(slot);
+        root.superblock.generation = generation;
+        root.superblock.database_revision = database_revision;
+        for chunk in &mut root.superblock.bitmap_chunks {
+            chunk.generation = generation;
+        }
+        root.superblock.catalog_root_page_id = Some(FIRST_DATA_PAGE_ID);
+        root.allocation_bitmap
             .set_allocated(FIRST_DATA_PAGE_ID, true)
             .unwrap();
         if extra_page {
-            allocation_bitmap
+            root.allocation_bitmap
                 .set_allocated(FIRST_DATA_PAGE_ID + 1, true)
                 .unwrap();
         }
-        let superblock = Superblock {
-            slot,
-            generation,
-            database_revision,
-            database_hash: EMPTY_HASH,
-            bitmap_slot: slot.bitmap_slot(),
-            bitmap_generation: generation,
-            catalog_root_page_id: Some(FIRST_DATA_PAGE_ID),
-            live_data_page_count: if extra_page { 2 } else { 1 },
-            max_page_count: MAX_PAGE_COUNT,
-            commit_hash: CommitHash::new().finish(),
-        };
-        superblock.validate_bitmap(&allocation_bitmap).unwrap();
-        EncodedMetadata {
-            superblock: superblock.encode_page().unwrap(),
-            bitmap_chunks: allocation_bitmap.encode_pages().unwrap(),
-        }
+        root.superblock.live_data_page_count = if extra_page { 2 } else { 1 };
+        root
+    }
+
+    /// An image holding a root at generation 8 in slot A, and its successor at generation 9 in
+    /// slot B, which changed every chunk.
+    fn older_and_newer() -> (Image, RecoveredMetadata, RecoveredMetadata) {
+        let (mut older, mut newer) = (
+            root(SuperblockSlot::A, 8, 20, false),
+            root(SuperblockSlot::B, 9, 21, false),
+        );
+        let mut image = Image::zeroed();
+        image.write(&mut older);
+        image.write(&mut newer);
+        (image, older, newer)
     }
 
     fn rewrite_crc(bytes: &mut [u8; PAGE_SIZE]) {
@@ -1249,22 +1298,40 @@ mod tests {
     }
 
     #[test]
-    fn superblock_round_trips_and_rejects_invalid_metadata() {
+    fn superblock_round_trips_with_the_start_of_its_bitmap() {
         for slot in [SuperblockSlot::A, SuperblockSlot::B] {
-            let mut expected = Superblock::new(slot);
-            expected.generation = 8;
-            expected.database_revision = 31;
-            expected.database_hash = 0xfeed_face_dead_beef;
-            expected.bitmap_generation = 8;
-            expected.catalog_root_page_id = Some(FIRST_DATA_PAGE_ID + 9);
-            expected.live_data_page_count = 17;
-            let page = expected.encode_page().unwrap();
-            assert_eq!(Superblock::decode_page(&page).unwrap(), expected);
+            let mut root = root(slot, 8, 31, false);
+            root.superblock.database_hash = 0xfeed_face_dead_beef;
+            root.superblock.commit_hash = 0x0123_4567_89ab_cdef;
+            root.superblock.bitmap_chunks[1] = BitmapChunk {
+                slot: slot.bitmap_slot().inactive(),
+                generation: 3,
+                checksum: 0xabcd_ef01,
+            };
+            // The last page whose bit the superblock carries.
+            root.allocation_bitmap
+                .set_allocated(first_page_of_bitmap_chunk(0) - 1, true)
+                .unwrap();
+            root.superblock.live_data_page_count += 1;
+            let page = root
+                .superblock
+                .encode_page(&root.allocation_bitmap)
+                .unwrap();
+            let (superblock, bits) = Superblock::decode_page(&page).unwrap();
+            assert_eq!(superblock, root.superblock);
+            assert_eq!(bits, root.allocation_bitmap.superblock_bits());
         }
+    }
 
-        let expected = Superblock::new(SuperblockSlot::A);
-        let page = expected.encode_page().unwrap();
+    #[test]
+    fn superblock_rejects_invalid_and_unsupported_fields() {
+        let root = root(SuperblockSlot::A, 8, 20, false);
+        let page = root
+            .superblock
+            .encode_page(&root.allocation_bitmap)
+            .unwrap();
         for (offset, value, code) in [
+            (0, b'X', "INVALID_PAGE"),
             // Page format 2 databases, from v0.1.0 through v0.3.0, are refused, as is a future
             // format.
             (8, 2, "UNSUPPORTED_PAGE"),
@@ -1273,16 +1340,48 @@ mod tests {
             (12, 1, "UNSUPPORTED_PAGE"),
             (16, 1, "UNSUPPORTED_PAGE"),
             (24, 0, "INVALID_PAGE"),
-            (48, 2, "INVALID_PAGE"),
-            (68, 2, "UNSUPPORTED_PAGE"),
-            (70, 2, "INVALID_PAGE"),
-            (71, 1, "INVALID_PAGE"),
-            (80, 1, "INVALID_PAGE"),
+            (60, 3, "UNSUPPORTED_PAGE"),
+            (62, 2, "INVALID_PAGE"),
+            (63, 1, "INVALID_PAGE"),
+            // A chunk written by no generation, or by a later one than the superblock's.
+            (72, 0, "INVALID_PAGE"),
+            (72, 9, "INVALID_PAGE"),
+            (84, 2, "INVALID_PAGE"),
+            (85, 1, "INVALID_PAGE"),
+            (104, 1, "INVALID_PAGE"),
+            (127, 1, "INVALID_PAGE"),
         ] {
             let mut corrupted = page;
             mutate_payload(&mut corrupted, offset, value);
-            assert_eq!(Superblock::decode_page(&corrupted).unwrap_err().code, code);
+            assert_eq!(
+                Superblock::decode_page(&corrupted).unwrap_err().code,
+                code,
+                "payload byte {offset}"
+            );
         }
+
+        // A superblock of v0.1.0 through v0.3.0 is shorter, and is refused as unsupported
+        // rather than as corrupt; one of this format at that length is corrupt.
+        for (version, code) in [(2_u16, "UNSUPPORTED_PAGE"), (3, "INVALID_PAGE")] {
+            let mut payload = vec![0; 96];
+            payload[..8].copy_from_slice(SUPERBLOCK_MAGIC);
+            payload[8..10].copy_from_slice(&version.to_le_bytes());
+            payload[12..16].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+            payload[16..24].copy_from_slice(&MAX_PAGE_COUNT.to_le_bytes());
+            let short = Page::new(0, PageType::Superblock, payload)
+                .unwrap()
+                .encode()
+                .unwrap();
+            assert_eq!(Superblock::decode_page(&short).unwrap_err().code, code);
+        }
+        let truncated = Page::new(0, PageType::Superblock, SUPERBLOCK_MAGIC.to_vec())
+            .unwrap()
+            .encode()
+            .unwrap();
+        assert_eq!(
+            Superblock::decode_page(&truncated).unwrap_err().code,
+            "INVALID_PAGE"
+        );
 
         let mut wrong_page_id = page;
         wrong_page_id[12..20].copy_from_slice(&1_u64.to_le_bytes());
@@ -1300,79 +1399,83 @@ mod tests {
             "INVALID_PAGE"
         );
 
-        let mut maximum = Superblock::new(SuperblockSlot::A);
-        maximum.database_revision = crate::revision::MAX_DATABASE_REVISION;
-        let page = maximum.encode_page().unwrap();
+        let mut maximum = RecoveredMetadata::empty(SuperblockSlot::A);
+        maximum.superblock.database_revision = crate::revision::MAX_DATABASE_REVISION;
+        let page = maximum
+            .superblock
+            .encode_page(&maximum.allocation_bitmap)
+            .unwrap();
         assert_eq!(
-            Superblock::decode_page(&page).unwrap().database_revision,
+            Superblock::decode_page(&page).unwrap().0.database_revision,
             crate::revision::MAX_DATABASE_REVISION
         );
-        maximum.database_revision = crate::revision::MAX_DATABASE_REVISION + 1;
-        assert_eq!(maximum.encode_page().unwrap_err().code, "UNSUPPORTED_PAGE");
-
-        let mut short_payload = page;
-        short_payload[24..28].copy_from_slice(&95_u32.to_le_bytes());
-        short_payload[PAGE_HEADER_SIZE + 95] = 0;
-        rewrite_crc(&mut short_payload);
+        maximum.superblock.database_revision = crate::revision::MAX_DATABASE_REVISION + 1;
         assert_eq!(
-            Superblock::decode_page(&short_payload).unwrap_err().code,
-            "INVALID_PAGE"
+            maximum
+                .superblock
+                .encode_page(&maximum.allocation_bitmap)
+                .unwrap_err()
+                .code,
+            "UNSUPPORTED_PAGE"
         );
     }
 
     #[test]
-    fn superblock_validates_its_paired_bitmap_generation_slot_and_live_count() {
-        let mut superblock = Superblock::new(SuperblockSlot::B);
-        superblock.generation = 11;
-        superblock.bitmap_generation = 11;
-        superblock.live_data_page_count = 1;
-        superblock.catalog_root_page_id = Some(FIRST_DATA_PAGE_ID);
-        let mut bitmap = AllocationBitmap::new(11, BitmapSlot::B).unwrap();
-        bitmap.set_allocated(FIRST_DATA_PAGE_ID, true).unwrap();
-        superblock.validate_bitmap(&bitmap).unwrap();
+    fn superblock_validates_its_bitmap_live_count_and_root() {
+        let root = root(SuperblockSlot::B, 11, 30, false);
+        root.superblock
+            .validate_bitmap(&root.allocation_bitmap)
+            .unwrap();
 
-        let wrong_generation = AllocationBitmap::new(10, BitmapSlot::B).unwrap();
+        let mut extra = root.allocation_bitmap.clone();
+        extra.set_allocated(FIRST_DATA_PAGE_ID + 1, true).unwrap();
         assert_eq!(
-            superblock
-                .validate_bitmap(&wrong_generation)
-                .unwrap_err()
-                .code,
+            root.superblock.validate_bitmap(&extra).unwrap_err().code,
             "INVALID_PAGE"
         );
-        let wrong_slot = AllocationBitmap::new(11, BitmapSlot::A).unwrap();
         assert_eq!(
-            superblock.validate_bitmap(&wrong_slot).unwrap_err().code,
-            "INVALID_PAGE"
-        );
-        bitmap.set_allocated(FIRST_DATA_PAGE_ID + 1, true).unwrap();
-        assert_eq!(
-            superblock.validate_bitmap(&bitmap).unwrap_err().code,
+            root.superblock.encode_page(&extra).unwrap_err().code,
             "INVALID_PAGE"
         );
 
-        let mut missing_root = AllocationBitmap::new(11, BitmapSlot::B).unwrap();
+        let mut missing_root = AllocationBitmap::new();
         missing_root
             .set_allocated(FIRST_DATA_PAGE_ID + 1, true)
             .unwrap();
         assert_eq!(
-            superblock.validate_bitmap(&missing_root).unwrap_err().code,
+            root.superblock
+                .validate_bitmap(&missing_root)
+                .unwrap_err()
+                .code,
             "INVALID_PAGE"
         );
     }
 
     #[test]
-    fn paired_allocation_bitmaps_round_trip_generation_slot_and_chunks() {
-        for slot in [BitmapSlot::A, BitmapSlot::B] {
-            let mut bitmap = AllocationBitmap::new(17, slot).unwrap();
-            bitmap.set_allocated(FIRST_DATA_PAGE_ID, true).unwrap();
-            bitmap.set_allocated(MAX_PAGE_COUNT - 1, true).unwrap();
-            let pages = bitmap.encode_pages().unwrap();
-            assert_eq!(pages.len(), BITMAP_CHUNK_COUNT);
+    fn allocation_bitmaps_round_trip_through_their_superblock_and_chunks() {
+        for slot in [SuperblockSlot::A, SuperblockSlot::B] {
+            let mut root = root(slot, 17, 40, false);
+            let ids = [
+                FIRST_DATA_PAGE_ID + 1,
+                first_page_of_bitmap_chunk(0) - 1,
+                first_page_of_bitmap_chunk(0),
+                first_page_of_bitmap_chunk(1) - 1,
+                first_page_of_bitmap_chunk(1),
+                MAX_PAGE_COUNT - 1,
+            ];
+            for id in ids {
+                root.allocation_bitmap.set_allocated(id, true).unwrap();
+            }
+            root.superblock.live_data_page_count += ids.len() as u32;
+            let mut image = Image::zeroed();
+            image.write(&mut root);
+            let (recovered, previous) = image.recover().unwrap();
+            assert_eq!(recovered, root);
+            assert!(previous.is_none());
             assert_eq!(
-                AllocationBitmap::decode_pages(slot, &pages).unwrap(),
-                bitmap
+                recovered.allocation_bitmap.allocated_page_count(),
+                FIRST_DATA_PAGE_ID as u32 + 1 + ids.len() as u32
             );
-            assert_eq!(bitmap.allocated_page_count(), FIRST_DATA_PAGE_ID as u32 + 2);
         }
     }
 
@@ -1380,48 +1483,52 @@ mod tests {
     fn metadata_pages_written_in_place_match_their_pages_as_payloads() {
         // Commits write the superblock and bitmap pages in place; each must be byte for byte the
         // page its payload makes.
-        let mut superblock = Superblock::new(SuperblockSlot::B);
-        superblock.generation = 9;
-        superblock.database_revision = 40;
-        superblock.database_hash = 0x0123_4567_89ab_cdef;
-        superblock.bitmap_generation = 9;
-        superblock.catalog_root_page_id = Some(FIRST_DATA_PAGE_ID + 3);
-        superblock.live_data_page_count = 5;
-        superblock.commit_hash = 0xdead_beef;
-        let mut payload = vec![0; SUPERBLOCK_PAYLOAD_SIZE];
+        let mut root = root(SuperblockSlot::B, 9, 40, false);
+        root.superblock.database_hash = 0x0123_4567_89ab_cdef;
+        root.superblock.commit_hash = 0xdead_beef;
+        root.superblock.bitmap_chunks[0] = BitmapChunk {
+            slot: BitmapSlot::A,
+            generation: 7,
+            checksum: 0x1234_5678,
+        };
+        for id in [FIRST_DATA_PAGE_ID + 70, MAX_PAGE_COUNT - 1] {
+            root.allocation_bitmap.set_allocated(id, true).unwrap();
+            root.superblock.live_data_page_count += 1;
+        }
+        let mut payload = vec![0; MAX_PAGE_PAYLOAD_SIZE];
         payload[..8].copy_from_slice(SUPERBLOCK_MAGIC);
         payload[8..10].copy_from_slice(&SUPERBLOCK_FORMAT_VERSION.to_le_bytes());
         payload[10..12].copy_from_slice(&SUPERBLOCK_FLAGS.to_le_bytes());
         payload[12..16].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
-        payload[16..24].copy_from_slice(&superblock.max_page_count.to_le_bytes());
+        payload[16..24].copy_from_slice(&MAX_PAGE_COUNT.to_le_bytes());
         payload[24..32].copy_from_slice(&9_u64.to_le_bytes());
         payload[32..40].copy_from_slice(&40_u64.to_le_bytes());
-        payload[40..48].copy_from_slice(&superblock.database_hash.to_le_bytes());
-        payload[48..56].copy_from_slice(&9_u64.to_le_bytes());
-        payload[56..64].copy_from_slice(&(FIRST_DATA_PAGE_ID + 3).to_le_bytes());
-        payload[64..68].copy_from_slice(&5_u32.to_le_bytes());
-        payload[68..70].copy_from_slice(&(BITMAP_CHUNK_COUNT as u16).to_le_bytes());
-        payload[70] = SuperblockSlot::B as u8;
-        payload[71] = superblock.bitmap_slot as u8;
-        payload[72..80].copy_from_slice(&0xdead_beef_u64.to_le_bytes());
+        payload[40..48].copy_from_slice(&0x0123_4567_89ab_cdef_u64.to_le_bytes());
+        payload[48..56].copy_from_slice(&FIRST_DATA_PAGE_ID.to_le_bytes());
+        payload[56..60].copy_from_slice(&3_u32.to_le_bytes());
+        payload[60..62].copy_from_slice(&(BITMAP_CHUNK_COUNT as u16).to_le_bytes());
+        payload[62] = SuperblockSlot::B as u8;
+        payload[64..72].copy_from_slice(&0xdead_beef_u64.to_le_bytes());
+        payload[72..80].copy_from_slice(&7_u64.to_le_bytes());
+        payload[80..84].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+        payload[84] = BitmapSlot::A as u8;
+        payload[88..96].copy_from_slice(&9_u64.to_le_bytes());
+        payload[100] = BitmapSlot::B as u8;
+        payload[SUPERBLOCK_FIELDS_SIZE..]
+            .copy_from_slice(&root.allocation_bitmap.bits[..SUPERBLOCK_BITMAP_BYTES]);
         let expected = Page::new(SuperblockSlot::B.page_id(), PageType::Superblock, payload)
             .unwrap()
             .encode()
             .unwrap();
-        assert_eq!(superblock.encode_page().unwrap(), expected);
+        assert_eq!(
+            root.superblock
+                .encode_page(&root.allocation_bitmap)
+                .unwrap(),
+            expected
+        );
 
-        let mut bitmap = AllocationBitmap::new(9, BitmapSlot::B).unwrap();
-        for id in [
-            FIRST_DATA_PAGE_ID,
-            FIRST_DATA_PAGE_ID + 70,
-            MAX_PAGE_COUNT - 1,
-        ] {
-            bitmap.set_allocated(id, true).unwrap();
-        }
-        for (chunk, page) in bitmap.encode_pages().unwrap().iter().enumerate() {
-            let start = chunk * MAX_BITMAP_CHUNK_BYTES;
-            let bits =
-                &bitmap.bits[start..(start + MAX_BITMAP_CHUNK_BYTES).min(ALLOCATION_BITMAP_BYTES)];
+        for chunk in 0..BITMAP_CHUNK_COUNT {
+            let bits = &root.allocation_bitmap.bits[bitmap_chunk_range(chunk)];
             let mut payload = 9_u64.to_le_bytes().to_vec();
             payload.extend([
                 BitmapSlot::B as u8,
@@ -1440,66 +1547,96 @@ mod tests {
             .unwrap()
             .encode()
             .unwrap();
-            assert_eq!(*page, expected, "chunk {chunk}");
+            assert_eq!(
+                root.allocation_bitmap.encode_chunk(chunk, BitmapSlot::B, 9),
+                expected,
+                "chunk {chunk}"
+            );
         }
     }
 
     #[test]
-    fn allocation_bitmap_rejects_generation_slot_and_chunk_corruption() {
-        let bitmap = AllocationBitmap::new(17, BitmapSlot::A).unwrap();
-        let pages = bitmap.encode_pages().unwrap();
+    fn bitmap_chunks_must_be_the_pages_their_superblock_recorded() {
+        let bitmap = AllocationBitmap::new();
+        let page = bitmap.encode_chunk(0, BitmapSlot::A, 17);
+        let entry = BitmapChunk {
+            slot: BitmapSlot::A,
+            generation: 17,
+            checksum: page_checksum(&page),
+        };
         assert_eq!(
-            AllocationBitmap::decode_pages(BitmapSlot::A, &pages[..2])
-                .unwrap_err()
-                .code,
-            "INVALID_PAGE"
+            decode_bitmap_chunk(&page, 0, &entry).unwrap(),
+            bitmap.chunk_bits(0)
         );
 
-        for (chunk, offset, value) in [
-            (0, 0, 0),
-            (0, 8, 1),
-            (1, 0, 18),
-            (1, 9, 0),
-            (1, 10, 2),
-            (1, 11, 1),
-            (1, 12, 1),
-            (1, 14, 1),
-        ] {
-            let mut corrupted = pages.clone();
-            mutate_payload(&mut corrupted[chunk], offset, value);
+        for length in [0, PAGE_HEADER_SIZE, PAGE_SIZE - 1] {
             assert_eq!(
-                AllocationBitmap::decode_pages(BitmapSlot::A, &corrupted)
+                decode_bitmap_chunk(&page[..length], 0, &entry)
                     .unwrap_err()
                     .code,
                 "INVALID_PAGE"
             );
         }
 
-        let mut wrong_id = pages.clone();
-        wrong_id[0][12..20].copy_from_slice(&3_u64.to_le_bytes());
-        rewrite_crc(&mut wrong_id[0]);
+        // A sound page other than the one recorded, as an abandoned commit at the same generation
+        // could leave in the slot.
+        let mut other = bitmap.clone();
+        other
+            .set_allocated(first_page_of_bitmap_chunk(0), true)
+            .unwrap();
         assert_eq!(
-            AllocationBitmap::decode_pages(BitmapSlot::A, &wrong_id)
+            decode_bitmap_chunk(&other.encode_chunk(0, BitmapSlot::A, 17), 0, &entry)
                 .unwrap_err()
                 .code,
             "INVALID_PAGE"
         );
 
-        let mut wrong_type = pages.clone();
-        wrong_type[0][20] = PageType::BtreeLeaf as u8;
-        rewrite_crc(&mut wrong_type[0]);
+        // Each field, even of a page whose checksum the superblock recorded.
+        let mut corrupted_pages = Vec::new();
+        for (offset, value) in [
+            (0, 0),
+            (0, 16),
+            (8, 1),
+            (8, 2),
+            (9, 1),
+            (10, 3),
+            (11, 1),
+            (12, 0),
+            (14, 1),
+        ] {
+            let mut corrupted = page;
+            mutate_payload(&mut corrupted, offset, value);
+            corrupted_pages.push(corrupted);
+        }
+        let mut wrong_id = page;
+        wrong_id[12..20].copy_from_slice(&BitmapSlot::A.page_id(1).to_le_bytes());
+        rewrite_crc(&mut wrong_id);
+        corrupted_pages.push(wrong_id);
+        let mut wrong_type = page;
+        wrong_type[20] = PageType::BtreeLeaf as u8;
+        rewrite_crc(&mut wrong_type);
+        corrupted_pages.push(wrong_type);
+        for corrupted in corrupted_pages {
+            let entry = BitmapChunk {
+                checksum: page_checksum(&corrupted),
+                ..entry
+            };
+            assert_eq!(
+                decode_bitmap_chunk(&corrupted, 0, &entry).unwrap_err().code,
+                "INVALID_PAGE"
+            );
+        }
+
+        let mut freed_metadata = AllocationBitmap::new().bits;
+        freed_metadata[0] &= !1;
         assert_eq!(
-            AllocationBitmap::decode_pages(BitmapSlot::A, &wrong_type)
+            AllocationBitmap::from_bits(freed_metadata)
                 .unwrap_err()
                 .code,
             "INVALID_PAGE"
         );
-
-        let mut freed_metadata = pages;
-        freed_metadata[0][PAGE_HEADER_SIZE + BITMAP_CHUNK_HEADER_SIZE] &= !1;
-        rewrite_crc(&mut freed_metadata[0]);
         assert_eq!(
-            AllocationBitmap::decode_pages(BitmapSlot::A, &freed_metadata)
+            AllocationBitmap::from_bits(vec![0xff; ALLOCATION_BITMAP_BYTES - 1])
                 .unwrap_err()
                 .code,
             "INVALID_PAGE"
@@ -1508,8 +1645,9 @@ mod tests {
 
     #[test]
     fn allocation_bitmap_bounds_page_ids() {
-        let mut bitmap = AllocationBitmap::new(1, BitmapSlot::A).unwrap();
+        let mut bitmap = AllocationBitmap::new();
         assert!(bitmap.is_allocated(0).unwrap());
+        assert_eq!(bitmap.allocated_page_count(), FIRST_DATA_PAGE_ID as u32);
         assert_eq!(
             bitmap.set_allocated(MAX_PAGE_COUNT, true).unwrap_err().code,
             "INVALID_PAGE"
@@ -1526,291 +1664,314 @@ mod tests {
 
     #[test]
     fn metadata_recovery_selects_the_highest_complete_generation() {
-        let older = encoded_metadata(SuperblockSlot::A, 8, 20, false);
-        let newer = encoded_metadata(SuperblockSlot::B, 9, 21, false);
-        let (recovered, previous) = recover_metadata(older.raw(), newer.raw()).unwrap().unwrap();
+        let (image, _, _) = older_and_newer();
+        let (recovered, previous) = image.recover().unwrap();
         assert_eq!(recovered.superblock.slot, SuperblockSlot::B);
         assert_eq!(recovered.superblock.generation, 9);
         assert_eq!(recovered.superblock.database_revision, 21);
         // The older root is the newer one's predecessor, which recovery can fall back to.
         assert_eq!(previous.unwrap().superblock.generation, 8);
-        let distant = encoded_metadata(SuperblockSlot::B, 10, 22, false);
-        let (_, previous) = recover_metadata(older.raw(), distant.raw())
-            .unwrap()
-            .unwrap();
+
+        let mut distant = image;
+        distant.write(&mut root(SuperblockSlot::B, 10, 22, false));
+        let (recovered, previous) = distant.recover().unwrap();
+        assert_eq!(recovered.superblock.generation, 10);
         assert!(previous.is_none());
     }
 
     #[test]
-    fn metadata_recovery_falls_back_from_each_torn_or_corrupt_newer_component() {
-        let older = encoded_metadata(SuperblockSlot::A, 8, 20, false);
-        let newer = encoded_metadata(SuperblockSlot::B, 9, 21, false);
-
-        for length in 0..PAGE_HEADER_SIZE {
-            let torn = RawMetadataSlot {
-                superblock: Some(&newer.superblock[..length]),
-                bitmap_chunks: [
-                    Some(&newer.bitmap_chunks[0]),
-                    Some(&newer.bitmap_chunks[1]),
-                    Some(&newer.bitmap_chunks[2]),
-                ],
-            };
-            assert_eq!(
-                recover_metadata(older.raw(), torn)
-                    .unwrap()
-                    .unwrap()
-                    .0
-                    .superblock
-                    .slot,
-                SuperblockSlot::A
-            );
-        }
-        for torn_chunk in 0..BITMAP_CHUNK_COUNT {
-            for length in 0..PAGE_HEADER_SIZE + BITMAP_CHUNK_HEADER_SIZE {
-                let mut chunks: [Option<&[u8]>; BITMAP_CHUNK_COUNT] = [
-                    Some(&newer.bitmap_chunks[0]),
-                    Some(&newer.bitmap_chunks[1]),
-                    Some(&newer.bitmap_chunks[2]),
-                ];
-                chunks[torn_chunk] = Some(&newer.bitmap_chunks[torn_chunk][..length]);
+    fn metadata_recovery_falls_back_from_each_torn_or_corrupt_newer_page() {
+        let (image, older, _) = older_and_newer();
+        let newer_pages = [
+            SuperblockSlot::B.page_id(),
+            BitmapSlot::B.page_id(0),
+            BitmapSlot::B.page_id(1),
+        ];
+        for id in newer_pages {
+            let id = id as usize;
+            for length in [0, 1, PAGE_HEADER_SIZE, PAGE_SIZE / 2, PAGE_SIZE - 1] {
+                let mut raw = image.raw();
+                raw[id] = &image.0[id][..length];
                 assert_eq!(
-                    recover_metadata(
-                        older.raw(),
-                        RawMetadataSlot {
-                            superblock: Some(&newer.superblock),
-                            bitmap_chunks: chunks,
-                        },
-                    )
-                    .unwrap()
-                    .unwrap()
-                    .0
-                    .superblock
-                    .slot,
-                    SuperblockSlot::A
+                    recover_metadata(raw).unwrap().0,
+                    older,
+                    "page {id} {length}"
                 );
             }
-        }
-
-        for component in 0..=BITMAP_CHUNK_COUNT {
-            let mut corrupted_superblock = newer.superblock;
-            let mut corrupted_chunks = newer.bitmap_chunks.clone();
-            if component == 0 {
-                corrupted_superblock[PAGE_SIZE - 1] ^= 1;
-            } else {
-                corrupted_chunks[component - 1][PAGE_SIZE - 1] ^= 1;
+            // A page torn with a tail other than the one written.
+            for split in [1, PAGE_SIZE / 2, PAGE_SIZE - 1] {
+                let mut torn = image.clone();
+                for byte in &mut torn.0[id][split..] {
+                    *byte = !*byte;
+                }
+                assert_eq!(
+                    torn.recover().unwrap().0,
+                    older,
+                    "page {id} torn at {split}"
+                );
             }
-            let corrupted = RawMetadataSlot::new(
-                &corrupted_superblock,
-                [
-                    &corrupted_chunks[0],
-                    &corrupted_chunks[1],
-                    &corrupted_chunks[2],
-                ],
-            );
-            assert_eq!(
-                recover_metadata(older.raw(), corrupted)
-                    .unwrap()
-                    .unwrap()
-                    .0
-                    .superblock
-                    .slot,
-                SuperblockSlot::A
-            );
+            let mut corrupted = image.clone();
+            corrupted.0[id][PAGE_SIZE - 1] ^= 1;
+            assert_eq!(corrupted.recover().unwrap().0, older, "page {id} corrupted");
         }
     }
 
     #[test]
-    fn metadata_recovery_rejects_present_metadata_when_neither_root_is_valid() {
-        assert!(
-            recover_metadata(RawMetadataSlot::empty(), RawMetadataSlot::empty())
-                .unwrap()
-                .is_none()
-        );
-
-        let partial = RawMetadataSlot {
-            superblock: Some(&[0; PAGE_HEADER_SIZE]),
-            bitmap_chunks: [None; BITMAP_CHUNK_COUNT],
-        };
-        let error = recover_metadata(partial, RawMetadataSlot::empty()).unwrap_err();
+    fn metadata_recovery_fails_when_neither_root_is_valid() {
+        let error = Image::zeroed().recover().unwrap_err();
         assert_eq!(error.code, "INVALID_PAGE");
         assert!(error.message.contains("No valid metadata root remains"));
     }
 
     #[test]
-    fn metadata_recovery_falls_back_from_a_mixed_bitmap_generation() {
-        let older = encoded_metadata(SuperblockSlot::A, 8, 20, false);
-        let newer = encoded_metadata(SuperblockSlot::B, 9, 21, false);
-        let stale_bitmap = encoded_metadata(SuperblockSlot::B, 8, 20, false);
-        let mixed = RawMetadataSlot::new(
-            &newer.superblock,
-            [
-                &stale_bitmap.bitmap_chunks[0],
-                &stale_bitmap.bitmap_chunks[1],
-                &stale_bitmap.bitmap_chunks[2],
-            ],
-        );
-        let (recovered, _) = recover_metadata(older.raw(), mixed).unwrap().unwrap();
-        assert_eq!(recovered.superblock.slot, SuperblockSlot::A);
-        assert_eq!(recovered.superblock.generation, 8);
+    fn metadata_recovery_refuses_a_chunk_an_abandoned_commit_wrote() {
+        // A commit that failed before its superblock leaves its chunk in the slot the next commit
+        // at its generation writes. If that commit's superblock becomes durable but its chunk does
+        // not, the chunk left behind has the generation and slot the superblock names, but not
+        // the checksum.
+        let mut active = root(SuperblockSlot::A, 8, 20, false);
+        let mut image = Image::zeroed();
+        image.write(&mut active);
+        let pending = |page| {
+            let mut bitmap = active.allocation_bitmap.clone();
+            bitmap.set_allocated(page, true).unwrap();
+            build_next_metadata(&active, 21, EMPTY_HASH, Some(FIRST_DATA_PAGE_ID), bitmap).unwrap()
+        };
+        let abandoned = pending(first_page_of_bitmap_chunk(0));
+        let retried = pending(first_page_of_bitmap_chunk(0) + 1);
+        let chunk = BitmapSlot::B.page_id(0) as usize;
+        image.0[chunk] = abandoned.bitmap_pages[0].unwrap();
+        let superblock = SuperblockSlot::B.page_id() as usize;
+        image.0[superblock] = retried
+            .superblock
+            .encode_page(&retried.allocation_bitmap)
+            .unwrap();
+        assert_eq!(image.recover().unwrap().0, active);
+
+        image.0[chunk] = retried.bitmap_pages[0].unwrap();
+        let (recovered, previous) = image.recover().unwrap();
+        assert_eq!(recovered.superblock, retried.superblock);
+        assert_eq!(recovered.allocation_bitmap, retried.allocation_bitmap);
+        assert_eq!(previous, Some(active));
+    }
+
+    #[test]
+    fn every_interrupted_commit_recovers_its_predecessor_or_itself() {
+        // Commits that change the bits the superblock carries, either chunk, several, or none.
+        // A commit writes its changed chunks and its superblock, then flushes them together, so an
+        // interruption can leave any of them whole, torn, or unwritten. The root it replaces must
+        // survive every combination, since the commit never writes a page that root reads.
+        let mut image = Image::empty();
+        let (mut active, _) = image.recover().unwrap();
+        let mut next_page = [
+            FIRST_DATA_PAGE_ID,
+            first_page_of_bitmap_chunk(0),
+            first_page_of_bitmap_chunk(1),
+        ];
+        let steps: [&[usize]; 11] = [
+            &[0],
+            &[1],
+            &[0],
+            &[2],
+            &[1, 2],
+            &[],
+            &[0, 1, 2],
+            &[1],
+            &[1],
+            &[2],
+            &[0, 2],
+        ];
+        for (step, parts) in steps.iter().enumerate() {
+            let mut bitmap = active.allocation_bitmap.clone();
+            for &part in *parts {
+                bitmap.set_allocated(next_page[part], true).unwrap();
+                next_page[part] += 1;
+            }
+            let mut pending = build_next_metadata(
+                &active,
+                active.superblock.database_revision + 1,
+                EMPTY_HASH,
+                None,
+                bitmap,
+            )
+            .unwrap();
+            pending.superblock.commit_hash = step as u64;
+            let writes = commit_writes(&pending);
+            assert_eq!(
+                writes.len(),
+                1 + parts.iter().filter(|part| **part > 0).count()
+            );
+            for outcome in 0..3_usize.pow(writes.len() as u32) {
+                let mut cut = image.clone();
+                let mut code = outcome;
+                for (id, bytes) in &writes {
+                    let page = &mut cut.0[*id as usize];
+                    match code % 3 {
+                        0 => {}
+                        1 => *page = *bytes,
+                        _ => page[..PAGE_SIZE / 2].copy_from_slice(&bytes[..PAGE_SIZE / 2]),
+                    }
+                    code /= 3;
+                }
+                let (recovered, previous) = cut.recover().unwrap();
+                if writes
+                    .iter()
+                    .all(|(id, bytes)| cut.0[*id as usize] == *bytes)
+                {
+                    assert_eq!(recovered.superblock, pending.superblock);
+                    assert_eq!(recovered.allocation_bitmap, pending.allocation_bitmap);
+                    assert_eq!(previous.as_ref(), Some(&active));
+                } else {
+                    assert_eq!(recovered, active, "step {step}, outcome {outcome}");
+                }
+            }
+            image.commit(&pending);
+            active = RecoveredMetadata {
+                superblock: pending.superblock,
+                allocation_bitmap: pending.allocation_bitmap,
+            };
+            assert_eq!(image.recover().unwrap().0, active);
+        }
     }
 
     #[test]
     fn equal_generation_roots_must_be_logically_identical() {
-        let slot_a = encoded_metadata(SuperblockSlot::A, 12, 30, false);
-        let slot_b = encoded_metadata(SuperblockSlot::B, 12, 30, false);
-        let (recovered, previous) = recover_metadata(slot_a.raw(), slot_b.raw())
-            .unwrap()
-            .unwrap();
+        let (recovered, previous) = Image::empty().recover().unwrap();
+        let mut empty = RecoveredMetadata::empty(SuperblockSlot::A);
+        empty.encode_pages().unwrap();
+        assert_eq!(recovered, empty);
+        assert!(previous.is_none());
+
+        let mut image = Image::zeroed();
+        image.write(&mut root(SuperblockSlot::A, 12, 30, false));
+        let mut same = image.clone();
+        same.write(&mut root(SuperblockSlot::B, 12, 30, false));
+        let (recovered, previous) = same.recover().unwrap();
         assert_eq!(recovered.superblock.generation, 12);
         assert!(previous.is_none());
 
-        let different_root = encoded_metadata(SuperblockSlot::B, 12, 31, false);
-        assert_eq!(
-            recover_metadata(slot_a.raw(), different_root.raw())
-                .unwrap_err()
-                .code,
-            "INVALID_PAGE"
-        );
-        let different_bitmap = encoded_metadata(SuperblockSlot::B, 12, 30, true);
-        assert_eq!(
-            recover_metadata(slot_a.raw(), different_bitmap.raw())
-                .unwrap_err()
-                .code,
-            "INVALID_PAGE"
-        );
+        for mut different in [
+            root(SuperblockSlot::B, 12, 31, false),
+            root(SuperblockSlot::B, 12, 30, true),
+        ] {
+            let mut image = image.clone();
+            image.write(&mut different);
+            assert_eq!(image.recover().unwrap_err().code, "INVALID_PAGE");
+        }
     }
 
     #[test]
     fn unsupported_metadata_fails_closed_even_with_an_older_valid_root() {
-        let older = encoded_metadata(SuperblockSlot::A, 8, 20, false);
-        let newer = encoded_metadata(SuperblockSlot::B, 9, 21, false);
-        for component in 0..=BITMAP_CHUNK_COUNT {
-            let mut unsupported_superblock = newer.superblock;
-            let mut unsupported_chunks = newer.bitmap_chunks.clone();
-            if component == 0 {
-                unsupported_superblock[8..10].copy_from_slice(&2_u16.to_le_bytes());
-                rewrite_crc(&mut unsupported_superblock);
-            } else {
-                unsupported_chunks[component - 1][8..10].copy_from_slice(&2_u16.to_le_bytes());
-                rewrite_crc(&mut unsupported_chunks[component - 1]);
-            }
-            let unsupported = RawMetadataSlot::new(
-                &unsupported_superblock,
-                [
-                    &unsupported_chunks[0],
-                    &unsupported_chunks[1],
-                    &unsupported_chunks[2],
-                ],
-            );
+        let (image, _, _) = older_and_newer();
+        for id in [
+            SuperblockSlot::B.page_id(),
+            BitmapSlot::B.page_id(0),
+            BitmapSlot::B.page_id(1),
+        ] {
+            let mut unsupported = image.clone();
+            let page = &mut unsupported.0[id as usize];
+            page[8..10].copy_from_slice(&2_u16.to_le_bytes());
+            rewrite_crc(page);
             assert_eq!(
-                recover_metadata(older.raw(), unsupported).unwrap_err().code,
-                "UNSUPPORTED_PAGE"
+                unsupported.recover().unwrap_err().code,
+                "UNSUPPORTED_PAGE",
+                "page {id}"
             );
         }
 
-        let mut unsupported_superblock_payload = newer.superblock;
-        mutate_payload(&mut unsupported_superblock_payload, 8, 2);
-        let unsupported = RawMetadataSlot::new(
-            &unsupported_superblock_payload,
-            [
-                &newer.bitmap_chunks[0],
-                &newer.bitmap_chunks[1],
-                &newer.bitmap_chunks[2],
-            ],
-        );
-        assert_eq!(
-            recover_metadata(older.raw(), unsupported).unwrap_err().code,
-            "UNSUPPORTED_PAGE"
-        );
-
-        let older = encoded_metadata(
-            SuperblockSlot::A,
+        let mut unsupported = image.clone();
+        mutate_payload(
+            &mut unsupported.0[SuperblockSlot::B.page_id() as usize],
             8,
-            crate::revision::MAX_DATABASE_REVISION,
-            false,
+            2,
         );
-        let newer = encoded_metadata(
-            SuperblockSlot::B,
-            9,
-            crate::revision::MAX_DATABASE_REVISION,
-            false,
-        );
-        let mut unsupported_revision = newer.superblock;
-        unsupported_revision[PAGE_HEADER_SIZE + 32..PAGE_HEADER_SIZE + 40]
-            .copy_from_slice(&(crate::revision::MAX_DATABASE_REVISION + 1).to_le_bytes());
-        rewrite_crc(&mut unsupported_revision);
-        let unsupported = RawMetadataSlot::new(
-            &unsupported_revision,
-            [
-                &newer.bitmap_chunks[0],
-                &newer.bitmap_chunks[1],
-                &newer.bitmap_chunks[2],
-            ],
-        );
-        assert_eq!(
-            recover_metadata(older.raw(), unsupported).unwrap_err().code,
-            "UNSUPPORTED_PAGE"
-        );
+        assert_eq!(unsupported.recover().unwrap_err().code, "UNSUPPORTED_PAGE");
+
+        let mut image = Image::zeroed();
+        let maximum = crate::revision::MAX_DATABASE_REVISION;
+        image.write(&mut root(SuperblockSlot::A, 8, maximum, false));
+        image.write(&mut root(SuperblockSlot::B, 9, maximum, false));
+        let superblock = &mut image.0[SuperblockSlot::B.page_id() as usize];
+        superblock[PAGE_HEADER_SIZE + 32..PAGE_HEADER_SIZE + 40]
+            .copy_from_slice(&(maximum + 1).to_le_bytes());
+        rewrite_crc(superblock);
+        assert_eq!(image.recover().unwrap_err().code, "UNSUPPORTED_PAGE");
     }
 
     #[test]
-    fn next_metadata_targets_the_inactive_pair() {
-        let active_bytes = encoded_metadata(SuperblockSlot::A, 8, 20, false);
-        let active = recover_metadata(active_bytes.raw(), RawMetadataSlot::empty())
-            .unwrap()
-            .unwrap()
-            .0;
-        let mut allocation_bitmap = active.allocation_bitmap.clone();
-        allocation_bitmap
-            .set_allocated(FIRST_DATA_PAGE_ID + 1, true)
-            .unwrap();
+    fn next_metadata_writes_only_the_chunks_a_commit_changes() {
+        let mut active = root(SuperblockSlot::A, 8, 20, false);
+        Image::zeroed().write(&mut active);
+
+        // A page whose bit the superblock carries.
+        let mut bitmap = active.allocation_bitmap.clone();
+        bitmap.set_allocated(FIRST_DATA_PAGE_ID + 1, true).unwrap();
         let pending = build_next_metadata(
             &active,
             21,
             EMPTY_HASH,
             Some(FIRST_DATA_PAGE_ID + 1),
-            &allocation_bitmap,
+            bitmap,
         )
         .unwrap();
         assert_eq!(pending.superblock.slot, SuperblockSlot::B);
-        assert_eq!(pending.superblock.bitmap_slot, BitmapSlot::B);
         assert_eq!(pending.superblock.generation, 9);
-        assert_eq!(pending.allocation_bitmap.generation(), 9);
-        assert_eq!(pending.allocation_bitmap.slot(), BitmapSlot::B);
         assert_eq!(pending.superblock.live_data_page_count, 2);
+        assert_eq!(
+            pending.superblock.bitmap_chunks,
+            active.superblock.bitmap_chunks
+        );
+        assert_eq!(pending.bitmap_pages, [None; BITMAP_CHUNK_COUNT]);
+
+        // A page in each chunk moves that chunk alone to the other slot.
+        for chunk in 0..BITMAP_CHUNK_COUNT {
+            let mut bitmap = active.allocation_bitmap.clone();
+            bitmap
+                .set_allocated(first_page_of_bitmap_chunk(chunk) + 3, true)
+                .unwrap();
+            let pending =
+                build_next_metadata(&active, 21, EMPTY_HASH, Some(FIRST_DATA_PAGE_ID), bitmap)
+                    .unwrap();
+            for (other, entry) in pending.superblock.bitmap_chunks.iter().enumerate() {
+                if other == chunk {
+                    assert_eq!(entry.slot, BitmapSlot::B);
+                    assert_eq!(entry.generation, 9);
+                    let page = pending.bitmap_pages[chunk].unwrap();
+                    assert_eq!(
+                        decode_bitmap_chunk(&page, chunk, entry).unwrap(),
+                        pending.allocation_bitmap.chunk_bits(chunk)
+                    );
+                } else {
+                    assert_eq!(*entry, active.superblock.bitmap_chunks[other]);
+                    assert!(pending.bitmap_pages[other].is_none());
+                }
+            }
+        }
     }
 
     #[test]
     fn next_metadata_rejects_generation_wrap_and_backwards_revision() {
-        let active_bytes = encoded_metadata(SuperblockSlot::A, 8, 20, false);
-        let active = recover_metadata(active_bytes.raw(), RawMetadataSlot::empty())
-            .unwrap()
-            .unwrap()
-            .0;
+        let active = root(SuperblockSlot::A, 8, 20, false);
         assert_eq!(
             build_next_metadata(
                 &active,
                 19,
                 EMPTY_HASH,
                 Some(FIRST_DATA_PAGE_ID),
-                &active.allocation_bitmap,
+                active.allocation_bitmap.clone(),
             )
             .unwrap_err()
             .code,
             "INVALID_PAGE"
         );
-        let exhausted_bytes = encoded_metadata(SuperblockSlot::A, u64::MAX, 20, false);
-        let exhausted = recover_metadata(exhausted_bytes.raw(), RawMetadataSlot::empty())
-            .unwrap()
-            .unwrap()
-            .0;
+        let exhausted = root(SuperblockSlot::A, u64::MAX, 20, false);
         assert_eq!(
             build_next_metadata(
                 &exhausted,
                 21,
                 EMPTY_HASH,
                 Some(FIRST_DATA_PAGE_ID),
-                &exhausted.allocation_bitmap,
+                exhausted.allocation_bitmap.clone(),
             )
             .unwrap_err()
             .code,

@@ -105,10 +105,10 @@ Done:
   records its commit writes, and each written row is checked and measured
   once. D1, D6 and D8 were decided as recommended.
 - T1 and T2.
-- C1 to C5, except writing only changed bitmap chunks. A commit writes each
-  run of consecutive pages with one storage call and flushes once; its
-  superblock carries a hash of the pages it wrote, and recovery returns to the
-  previous root when they did not all reach storage.
+- C1 to C5. A commit writes each run of consecutive pages with one storage
+  call and flushes once; its superblock carries a hash of the pages it wrote,
+  and recovery returns to the previous root when they did not all reach
+  storage.
 - O1 follows from R1.
 - An aggregate whose columns an index holds is answered from the index's
   entries without reading the table.
@@ -209,6 +209,18 @@ Done:
   column still plan maps. 1,000 upserts, half of them updates, fell from 9.0
   ms to 8.3 engine-only, for 1.3 KiB compressed, and a test checks that both
   plannings agree statement by statement.
+- Each superblock carries the allocation bitmap of the first 31,488 pages,
+  123 MB, in the rest of its page, and the rest of the bitmap is two chunks,
+  each with two slots of its own, rather than three pages that every commit
+  rewrote beside the superblock. A commit writes only the chunks it changes,
+  in the slot beside the one its predecessor reads, and the superblock
+  records each chunk's slot, generation and page checksum, so that a chunk an
+  abandoned commit left in that slot at the same generation is refused. A
+  commit to a database under 123 MB writes its data pages and its superblock
+  and nothing else: 1,000 inserts each committed alone fell from 212 million
+  instructions to 199 engine-only, and took about 5% less time in Chromium
+  with OPFS, where each write call costs about 17 µs and the flush most of
+  the rest. This is part of page format 3, so it breaks nothing released.
 
 Found along the way:
 
@@ -313,19 +325,15 @@ Remaining, in order of expected value:
    fingerprints and counts, rather than visiting every entry.
 4. [D7](#decisions-needed), remeasured under
    [build settings](#build-settings): keep `z`.
-5. Writing only changed bitmap chunks. This needs per-chunk slots in the
-   superblock, a format change, and would save two page writes per commit.
-   Checksumming the chunks' unused bytes is now nearly free, so what is left
-   is the writes themselves.
-6. O2 and O4. Reopening is within 1.1× of SQLite, but checking an index on
+5. O2 and O4. Reopening is within 1.1× of SQLite, but checking an index on
    reopen looks up its table row for every entry: engine-only, a 10,000-row
    table's index took 26 ms to check, where its rows take 15. After the scan
    and lookup work of 29 September, an index on its text column takes 14.
-7. Size. Each B-tree map type still compiles its own code: a transaction's
+6. Size. Each B-tree map type still compiles its own code: a transaction's
    claims could live in vectors, as the catalog's tables and indexes, and the
    keys a write reports, now do. The hash sets now share one hasher, but each key
    type still compiles its own table code.
-8. Cold code. A single statement over thousands of rows runs much of its
+7. Cold code. A single statement over thousands of rows runs much of its
    per-row code unoptimized the first time (see above), and every benchmark
    sample is a first time. Warming those paths would take a warm-up of tens of
    thousands of row operations, a CPU cost at every page load that is a
@@ -570,7 +578,10 @@ replica. Any canonical encoding meets that; it does not need to be JSON.
 
 Page format 3 replaces the row record and the key encoding in one break, and
 reserves room for sync metadata. It keeps the slotted pages and the
-fingerprint scheme. The v0.4.0 release notes already announce the break.
+fingerprint scheme. The v0.4.0 release notes already announce the break. The
+same break moves the start of the allocation bitmap into each superblock and
+gives the rest of it slots chunk by chunk, so that a commit rewrites only what
+it changed: see [progress](#progress).
 
 ### S1. Packed row records
 

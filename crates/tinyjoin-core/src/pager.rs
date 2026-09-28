@@ -7,9 +7,8 @@ use std::{
 use crate::page::{CommitHash, page_checksum};
 use crate::{
     AllocationBitmap, CandidateId, DEFAULT_PAGE_CACHE_BYTES, EngineError, FIRST_DATA_PAGE_ID,
-    MAX_PAGE_COUNT, PAGE_SIZE, Page, PageCache, PageDevice, PageId, PageRef, RawMetadataSlot,
-    RecoveredMetadata, Result, SUPERBLOCK_PAGE_COUNT, Superblock, SuperblockSlot,
-    build_next_metadata, recover_metadata,
+    MAX_PAGE_COUNT, PAGE_SIZE, Page, PageCache, PageDevice, PageId, PageRef, RecoveredMetadata,
+    Result, SUPERBLOCK_PAGE_COUNT, SuperblockSlot, build_next_metadata, recover_metadata,
 };
 
 // Keep browser pager diagnostics static and let the stable error code carry
@@ -35,9 +34,10 @@ macro_rules! storage_diagnostic {
 ///
 /// `Pager` deliberately permits only one [`PagerWriteTransaction`] at a time. Data pages are
 /// written to locations which are unreachable from the active superblock, then published by
-/// writing the inactive allocation bitmap and superblock and flushing them all together. A failure
-/// after the superblock write is attempted poisons the in-memory pager: callers must reopen the
-/// same device to discover whether the old or new root became durable.
+/// writing the inactive superblock, and any allocation bitmap chunks the write changed, and
+/// flushing them all together. A failure after the superblock write is attempted poisons the
+/// in-memory pager: callers must reopen the same device to discover whether the old or new root
+/// became durable.
 pub(crate) struct Pager<D: PageDevice> {
     device: SharedPageDevice<D>,
     cache: PageCache<SharedPageDevice<D>>,
@@ -405,8 +405,9 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
 
     /// Publishes this candidate with one flush:
     ///
-    /// 1. write the candidate data pages, the inactive bitmap chunks, and the inactive superblock,
-    ///    which records a [commit hash](CommitHash) of the data pages;
+    /// 1. write the candidate data pages, any allocation bitmap chunks they change, and the
+    ///    inactive superblock, which carries the start of the bitmap and records a
+    ///    [commit hash](CommitHash) of the data pages;
     /// 2. flush them together;
     /// 3. install the candidate cache view and swap the in-memory active root.
     ///
@@ -437,22 +438,19 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
             )));
         }
 
+        // Building the metadata validates it, and encodes the bitmap chunks the commit changed,
+        // before any publication I/O, so that a local validation error cannot appear after
+        // candidate data has been written. Only the commit hash, which the pages' checksums
+        // decide and which validation does not read, is added once they have been written.
+        let next_bitmap = std::mem::take(&mut self.next_bitmap);
         let mut pending = match build_next_metadata(
             &self.pager.active,
             database_revision,
             database_hash,
             catalog_root_page_id,
-            &self.next_bitmap,
+            next_bitmap,
         ) {
             Ok(pending) => pending,
-            Err(error) => return self.fail_before_superblock(error),
-        };
-        // Serialize every metadata page before performing any publication I/O, so that a local
-        // validation error cannot appear after candidate data has been written. The superblock
-        // was validated as it was built; only the commit hash, which the pages' checksums decide
-        // and which validation does not read, is added once they have been written.
-        let bitmap_pages = match pending.allocation_bitmap.encode_pages() {
-            Ok(pages) => pages,
             Err(error) => return self.fail_before_superblock(error),
         };
 
@@ -471,19 +469,22 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
             }
         }
         pending.superblock.commit_hash = hash.finish();
-        let superblock_page = match pending.superblock.encode_page() {
+        let superblock_page = match pending.superblock.encode_page(&pending.allocation_bitmap) {
             Ok(page) => page,
             Err(error) => return self.fail_before_superblock(error),
         };
-        // A slot's chunks are consecutive pages, so they are written in one call.
-        if let Err(error) = self.pager.device.write_pages(
-            pending.superblock.bitmap_slot.page_id(0),
-            bitmap_pages.as_flattened(),
-        ) {
-            return self.fail_before_superblock(error);
+        for (chunk, page) in pending.bitmap_pages.iter().enumerate() {
+            if let Some(page) = page
+                && let Err(error) = self.pager.device.write_page(
+                    pending.superblock.bitmap_chunks[chunk].slot.page_id(chunk),
+                    page,
+                )
+            {
+                return self.fail_before_superblock(error);
+            }
         }
 
-        // From this point onward the inactive superblock may name the new bitmap even if the
+        // From this point onward the inactive superblock may hold the new bitmap even if the
         // device reports failure. Continuing to use the old in-memory view could overwrite pages
         // needed by whichever generation actually became durable.
         if let Err(error) = self
@@ -610,11 +611,11 @@ fn initialize_empty_device<D: PageDevice>(
 ) -> Result<RecoveredMetadata> {
     let (active, pages) = empty_metadata_layout()?;
 
-    // Establish the fixed metadata extent densely, but leave both superblocks invalid until both
-    // bitmaps have crossed a durability barrier. Re-running this sequence is safe only after
-    // `is_recoverable_empty_bootstrap` proves that every existing byte is either zero or its
-    // corresponding byte in this deterministic generation-1 empty database. That includes a
-    // target page torn while transitioning in either direction.
+    // Establish the fixed metadata extent densely, but leave both superblocks invalid until the
+    // bitmap chunks they name have crossed a durability barrier. Re-running this sequence is safe
+    // only after `is_recoverable_empty_bootstrap` proves that every existing byte is either zero
+    // or its corresponding byte in this deterministic generation-1 empty database. That includes
+    // a target page torn while transitioning in either direction.
     let zero = [0; PAGE_SIZE];
     let mut direct = device.clone();
     for id in 0..FIRST_DATA_PAGE_ID {
@@ -632,37 +633,21 @@ fn initialize_empty_device<D: PageDevice>(
     Ok(active)
 }
 
+/// The metadata pages of an empty database, whose two superblocks each name bitmap chunks of their
+/// own, and the root in slot A.
 fn empty_metadata_layout() -> Result<(
     RecoveredMetadata,
     [[u8; PAGE_SIZE]; FIRST_DATA_PAGE_ID as usize],
 )> {
-    let allocation_bitmap_a = AllocationBitmap::new(1, SuperblockSlot::A.bitmap_slot())?;
-    let allocation_bitmap_b = AllocationBitmap::new(1, SuperblockSlot::B.bitmap_slot())?;
-    let superblock_a = Superblock::new(SuperblockSlot::A);
-    let superblock_b = Superblock::new(SuperblockSlot::B);
-    let bitmap_pages_a = allocation_bitmap_a.encode_pages()?;
-    let bitmap_pages_b = allocation_bitmap_b.encode_pages()?;
-    let superblock_page_a = superblock_a.encode_page()?;
-    let superblock_page_b = superblock_b.encode_page()?;
     let mut pages = [[0; PAGE_SIZE]; FIRST_DATA_PAGE_ID as usize];
-    pages[superblock_a.slot.page_id() as usize] = superblock_page_a;
-    pages[superblock_b.slot.page_id() as usize] = superblock_page_b;
-    for (slot, bitmap_pages) in [
-        (superblock_a.bitmap_slot, &bitmap_pages_a),
-        (superblock_b.bitmap_slot, &bitmap_pages_b),
-    ] {
-        for (chunk, bytes) in bitmap_pages.iter().enumerate() {
-            pages[slot.page_id(chunk) as usize] = *bytes;
+    let mut roots = [SuperblockSlot::A, SuperblockSlot::B].map(RecoveredMetadata::empty);
+    for root in &mut roots {
+        for (id, bytes) in root.encode_pages()? {
+            pages[id as usize] = bytes;
         }
     }
-
-    Ok((
-        RecoveredMetadata {
-            superblock: superblock_a,
-            allocation_bitmap: allocation_bitmap_a,
-        },
-        pages,
-    ))
+    let [active, _] = roots;
+    Ok((active, pages))
 }
 
 fn is_recoverable_empty_bootstrap<D: PageDevice>(device: &SharedPageDevice<D>) -> Result<bool> {
@@ -700,25 +685,7 @@ fn recover_device_metadata<D: PageDevice>(
     for (id, destination) in pages.iter_mut().enumerate() {
         direct.read_page(id as PageId, destination)?;
     }
-    let slot_a = RawMetadataSlot::new(
-        &pages[SuperblockSlot::A.page_id() as usize],
-        [
-            &pages[SuperblockSlot::A.bitmap_slot().page_id(0) as usize],
-            &pages[SuperblockSlot::A.bitmap_slot().page_id(1) as usize],
-            &pages[SuperblockSlot::A.bitmap_slot().page_id(2) as usize],
-        ],
-    );
-    let slot_b = RawMetadataSlot::new(
-        &pages[SuperblockSlot::B.page_id() as usize],
-        [
-            &pages[SuperblockSlot::B.bitmap_slot().page_id(0) as usize],
-            &pages[SuperblockSlot::B.bitmap_slot().page_id(1) as usize],
-            &pages[SuperblockSlot::B.bitmap_slot().page_id(2) as usize],
-        ],
-    );
-    let (newest, previous) = recover_metadata(slot_a, slot_b)?.ok_or_else(|| {
-        pager_error("A non-empty page device does not contain a recoverable metadata root")
-    })?;
+    let (newest, previous) = recover_metadata(pages.each_ref().map(|page| page.as_slice()))?;
     match previous {
         Some(previous) if !commit_is_durable(&mut direct, &newest, &previous)? => Ok(previous),
         _ => Ok(newest),
@@ -824,7 +791,7 @@ mod tests {
     use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
     use super::*;
-    use crate::page::BITMAP_CHUNK_COUNT;
+    use crate::page::first_page_of_bitmap_chunk;
     use crate::{BitmapSlot, MAX_PAGE_CACHE_BYTES, MemoryPageDevice, PageType};
 
     fn leaf(id: PageId, value: u8) -> Page {
@@ -1015,16 +982,10 @@ mod tests {
             .copied()
             .collect::<Vec<_>>();
         assert_eq!(data_writes, pages);
-        // The consecutive pages go in one call, then the bitmap chunks in one, then the
-        // superblock.
-        let bitmap = BitmapSlot::B.page_id(0);
+        // The consecutive pages go in one call, then the superblock, which carries their bits.
         assert_eq!(
             device.write_calls()[before..],
-            [
-                (pages[0], 3),
-                (bitmap, BITMAP_CHUNK_COUNT),
-                (SuperblockSlot::B.page_id(), 1)
-            ]
+            [(pages[0], 3), (SuperblockSlot::B.page_id(), 1)]
         );
     }
 
@@ -1182,16 +1143,16 @@ mod tests {
 
     #[test]
     fn every_interrupted_empty_bootstrap_can_be_reopened_and_completed() {
-        // Initialization performs eight zero writes, six bitmap writes, a bitmap flush, two
+        // Initialization performs six zero writes, four bitmap writes, a bitmap flush, two
         // superblock writes, and a final flush. A crash after each possible before/after failure
         // may leave a bytewise mix of zero pages and exact generation-1 empty metadata pages.
-        for operation in 1..=18 {
+        for operation in 1..=14 {
             for timing in [FailureTiming::Before, FailureTiming::After] {
                 let device = FaultDevice::default();
                 device.arm(operation, timing);
                 let result = Pager::open_or_create(device.clone());
                 if result.is_ok() {
-                    assert_eq!(operation, 18);
+                    assert_eq!(operation, 14);
                     assert_eq!(timing, FailureTiming::After);
                 }
                 drop(result);
@@ -1287,39 +1248,38 @@ mod tests {
 
     #[test]
     fn every_pre_superblock_publication_cut_reopens_the_old_root() {
-        // commit operations: data write, three bitmap writes, superblock write, and one flush
-        // for all of them.
-        for operation in 1..=4 {
-            for timing in [FailureTiming::Before, FailureTiming::After] {
-                let (device, old_root) = committed_fault_device();
-                let mut pager = Pager::open_or_create(device.clone()).unwrap();
-                let (transaction, new_root) = prepare_replacement(&mut pager, old_root);
-                device.arm(operation, timing);
-                assert_ne!(
-                    transaction
-                        .commit(2, EMPTY_HASH, Some(new_root))
-                        .unwrap_err()
-                        .code,
-                    "RECOVERY_REQUIRED"
-                );
-                assert!(!pager.is_recovery_required());
-                drop(pager);
-                device.crash();
+        // A commit writes its data page and its superblock, then flushes both. The page's bit is
+        // one the superblock carries, so no bitmap chunk is written, and the data write is the
+        // only operation before the superblock's.
+        for timing in [FailureTiming::Before, FailureTiming::After] {
+            let (device, old_root) = committed_fault_device();
+            let mut pager = Pager::open_or_create(device.clone()).unwrap();
+            let (transaction, new_root) = prepare_replacement(&mut pager, old_root);
+            device.arm(1, timing);
+            assert_ne!(
+                transaction
+                    .commit(2, EMPTY_HASH, Some(new_root))
+                    .unwrap_err()
+                    .code,
+                "RECOVERY_REQUIRED"
+            );
+            assert!(!pager.is_recovery_required());
+            drop(pager);
+            device.crash();
 
-                let mut reopened = Pager::open_or_create(device).unwrap();
-                assert_eq!(reopened.catalog_root_page_id(), Some(old_root));
-                assert_eq!(reopened.read_page(old_root).unwrap().payload, vec![1]);
-            }
+            let mut reopened = Pager::open_or_create(device).unwrap();
+            assert_eq!(reopened.catalog_root_page_id(), Some(old_root));
+            assert_eq!(reopened.read_page(old_root).unwrap().payload, vec![1]);
         }
     }
 
     #[test]
     fn ambiguous_superblock_cuts_poison_and_reopen_the_old_or_new_valid_root() {
         for (operation, timing, expected_value) in [
-            (5, FailureTiming::Before, 1),
-            (5, FailureTiming::After, 1),
-            (6, FailureTiming::Before, 1),
-            (6, FailureTiming::After, 2),
+            (2, FailureTiming::Before, 1),
+            (2, FailureTiming::After, 1),
+            (3, FailureTiming::Before, 1),
+            (3, FailureTiming::After, 2),
         ] {
             let (device, old_root) = committed_fault_device();
             let mut pager = Pager::open_or_create(device.clone()).unwrap();
@@ -1431,31 +1391,15 @@ mod tests {
             let pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
             let mut device = pager.into_device();
             let missing = FIRST_DATA_PAGE_ID + 9;
-            let mut bitmap = AllocationBitmap::new(2, BitmapSlot::B).unwrap();
-            bitmap.set_allocated(missing, true).unwrap();
-            let superblock = Superblock {
-                slot: SuperblockSlot::B,
-                generation: 2,
-                database_revision: 1,
-                database_hash: EMPTY_HASH,
-                bitmap_slot: BitmapSlot::B,
-                bitmap_generation: 2,
-                catalog_root_page_id: Some(missing),
-                live_data_page_count: 1,
-                max_page_count: MAX_PAGE_COUNT,
-                commit_hash: CommitHash::new().finish(),
-            };
-            for (chunk, page) in bitmap.encode_pages().unwrap().iter().enumerate() {
-                device
-                    .write_page(BitmapSlot::B.page_id(chunk), page)
-                    .unwrap();
+            let mut root = RecoveredMetadata::empty(SuperblockSlot::B);
+            root.superblock.generation = 2;
+            root.superblock.database_revision = 1;
+            root.superblock.catalog_root_page_id = Some(missing);
+            root.superblock.live_data_page_count = 1;
+            root.allocation_bitmap.set_allocated(missing, true).unwrap();
+            for (id, page) in root.encode_pages().unwrap() {
+                device.write_page(id, &page).unwrap();
             }
-            device
-                .write_page(
-                    SuperblockSlot::B.page_id(),
-                    &superblock.encode_page().unwrap(),
-                )
-                .unwrap();
             if !predecessor {
                 device
                     .write_page(SuperblockSlot::A.page_id(), &[0; PAGE_SIZE])
@@ -1478,9 +1422,13 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Clone, Debug, Default)]
     struct SparseFullDevice {
         pages: HashMap<PageId, [u8; PAGE_SIZE]>,
+        /// The page each write went to, in order.
+        writes: Vec<PageId>,
+        /// A page whose next write lands but reports failure.
+        failing_write: Option<PageId>,
     }
 
     impl PageDevice for SparseFullDevice {
@@ -1495,6 +1443,11 @@ mod tests {
 
         fn write_page(&mut self, id: PageId, source: &[u8]) -> Result<()> {
             self.pages.insert(id, source.try_into().unwrap());
+            self.writes.push(id);
+            if self.failing_write == Some(id) {
+                self.failing_write = None;
+                return Err(EngineError::new("INJECTED_IO", "failure after a write"));
+            }
             Ok(())
         }
 
@@ -1505,31 +1458,19 @@ mod tests {
 
     #[test]
     fn allocator_reports_the_fixed_page_cap_without_allocating_256_mib_in_tests() {
-        let mut bitmap = AllocationBitmap::new(1, BitmapSlot::A).unwrap();
+        let mut root = RecoveredMetadata::empty(SuperblockSlot::A);
         for id in FIRST_DATA_PAGE_ID..MAX_PAGE_COUNT {
-            bitmap.set_allocated(id, true).unwrap();
+            root.allocation_bitmap.set_allocated(id, true).unwrap();
         }
-        let superblock = Superblock {
-            slot: SuperblockSlot::A,
-            generation: 1,
-            database_revision: 1,
-            database_hash: EMPTY_HASH,
-            bitmap_slot: BitmapSlot::A,
-            bitmap_generation: 1,
-            catalog_root_page_id: Some(FIRST_DATA_PAGE_ID),
-            live_data_page_count: (MAX_PAGE_COUNT - FIRST_DATA_PAGE_ID) as u32,
-            max_page_count: MAX_PAGE_COUNT,
-            commit_hash: CommitHash::new().finish(),
-        };
-        let mut pages = HashMap::new();
-        pages.insert(
-            SuperblockSlot::A.page_id(),
-            superblock.encode_page().unwrap(),
-        );
-        for (chunk, page) in bitmap.encode_pages().unwrap().into_iter().enumerate() {
-            pages.insert(BitmapSlot::A.page_id(chunk), page);
-        }
-        let mut pager = Pager::open_or_create(SparseFullDevice { pages }).unwrap();
+        root.superblock.database_revision = 1;
+        root.superblock.catalog_root_page_id = Some(FIRST_DATA_PAGE_ID);
+        root.superblock.live_data_page_count = (MAX_PAGE_COUNT - FIRST_DATA_PAGE_ID) as u32;
+        let pages = root.encode_pages().unwrap().into_iter().collect();
+        let mut pager = Pager::open_or_create(SparseFullDevice {
+            pages,
+            ..SparseFullDevice::default()
+        })
+        .unwrap();
         assert_eq!(
             pager
                 .begin_write()
@@ -1539,6 +1480,98 @@ mod tests {
                 .code,
             "DATABASE_FULL"
         );
+    }
+
+    #[test]
+    fn a_commit_writes_only_the_bitmap_chunks_it_changes_beside_those_its_predecessor_reads() {
+        // Every page whose bit the superblock carries is allocated, so new pages come from bitmap
+        // chunk 0 until one of those is freed.
+        let chunk_start = first_page_of_bitmap_chunk(0);
+        let mut root = RecoveredMetadata::empty(SuperblockSlot::A);
+        for id in FIRST_DATA_PAGE_ID..chunk_start {
+            root.allocation_bitmap.set_allocated(id, true).unwrap();
+        }
+        root.superblock.live_data_page_count = (chunk_start - FIRST_DATA_PAGE_ID) as u32;
+        let pages = root.encode_pages().unwrap().into_iter().collect();
+        let mut pager = Pager::open_or_create(SparseFullDevice {
+            pages,
+            ..SparseFullDevice::default()
+        })
+        .unwrap();
+
+        let commit = |pager: &mut Pager<SparseFullDevice>, free: Option<PageId>| {
+            let revision = pager.database_revision() + 1;
+            let mut transaction = pager.begin_write().unwrap();
+            let page = transaction.allocate_page().unwrap();
+            transaction.write_new_page(&leaf(page, 1)).unwrap();
+            if let Some(free) = free {
+                transaction.free_shared_page(free).unwrap();
+            }
+            transaction.commit(revision, EMPTY_HASH, None).unwrap();
+            let writes = std::mem::take(&mut pager.device.0.borrow_mut().writes);
+            (page, writes)
+        };
+        let chunks = |pager: &Pager<SparseFullDevice>| {
+            pager
+                .active_metadata()
+                .superblock
+                .bitmap_chunks
+                .map(|chunk| (chunk.slot, chunk.generation))
+        };
+
+        // A page in chunk 0 moves that chunk to slot B, and leaves chunk 1 in slot A.
+        let (page, writes) = commit(&mut pager, None);
+        assert_eq!(page, chunk_start);
+        assert_eq!(
+            writes,
+            [page, BitmapSlot::B.page_id(0), SuperblockSlot::B.page_id()]
+        );
+        assert_eq!(chunks(&pager), [(BitmapSlot::B, 2), (BitmapSlot::A, 1)]);
+
+        // A commit whose chunk write fails leaves the active root in place. The chunk it wrote
+        // has the generation and slot the next commit's will, but other bits.
+        let chunk = BitmapSlot::A.page_id(0);
+        pager.device.0.borrow_mut().failing_write = Some(chunk);
+        let mut transaction = pager.begin_write().unwrap();
+        for _ in 0..2 {
+            let page = transaction.allocate_page().unwrap();
+            transaction.write_new_page(&leaf(page, 9)).unwrap();
+        }
+        assert_eq!(
+            transaction.commit(2, EMPTY_HASH, None).unwrap_err().code,
+            "INJECTED_IO"
+        );
+        assert!(!pager.is_recovery_required());
+        assert_eq!(pager.generation(), 2);
+        let abandoned = pager.device.0.borrow().pages[&chunk];
+        pager.device.0.borrow_mut().writes.clear();
+
+        // Another moves chunk 0 back to slot A, beside the copy the active root reads.
+        let (page, writes) = commit(&mut pager, Some(FIRST_DATA_PAGE_ID + 1));
+        assert_eq!(page, chunk_start + 1);
+        assert_eq!(writes, [page, chunk, SuperblockSlot::A.page_id()]);
+        assert_eq!(chunks(&pager), [(BitmapSlot::A, 3), (BitmapSlot::A, 1)]);
+
+        // Had that chunk not become durable with its superblock, leaving the failed commit's in
+        // its place, reopening would return to its predecessor.
+        let mut interrupted = pager.device.0.borrow().clone();
+        interrupted.pages.insert(chunk, abandoned);
+        let reopened = Pager::open_or_create(interrupted).unwrap();
+        assert_eq!(reopened.generation(), 2);
+        assert_eq!(
+            reopened.active_metadata().superblock.bitmap_chunks[0].slot,
+            BitmapSlot::B
+        );
+
+        // Allocating the page freed before changes only bits the superblock carries.
+        let (page, writes) = commit(&mut pager, None);
+        assert_eq!(page, FIRST_DATA_PAGE_ID + 1);
+        assert_eq!(writes, [page, SuperblockSlot::B.page_id()]);
+        assert_eq!(chunks(&pager), [(BitmapSlot::A, 3), (BitmapSlot::A, 1)]);
+
+        let active = pager.active_metadata().clone();
+        let reopened = Pager::open_or_create(pager.into_device()).unwrap();
+        assert_eq!(reopened.active_metadata(), &active);
     }
 
     #[test]

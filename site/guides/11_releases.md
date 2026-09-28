@@ -137,6 +137,12 @@ and building indexes are quicker than in either.
   allocation bitmap and superblock straight into their pages. Committing a
   single insert takes over a third less of the engine's time, and pages read
   back from storage are checked faster too.
+- Each superblock carries the allocation bitmap for the first 123 MB of the
+  database in the rest of its page, and a commit writes the bitmap's other
+  pages only when it changes them, where it rewrote three bitmap pages every
+  time. A commit to a smaller database writes its data pages and its
+  superblock and nothing else: committing a single insert takes about 5% less
+  time with OPFS.
 - Several of the engine's small collections are kept in vectors rather than
   B-tree maps, whose code is compiled anew for each type they hold, which took
   about 15 KiB off the compressed engine. Its hash maps and sets share one

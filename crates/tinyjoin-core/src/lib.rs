@@ -55,8 +55,8 @@ pub(crate) use model::{
 pub(crate) use page::BitmapSlot;
 pub(crate) use page::{
     AllocationBitmap, FIRST_DATA_PAGE_ID, MAX_PAGE_PAYLOAD_SIZE, Page, PageRef, PageType,
-    RawMetadataSlot, RecoveredMetadata, SUPERBLOCK_PAGE_COUNT, Superblock, SuperblockSlot,
-    build_next_metadata, recover_metadata,
+    RecoveredMetadata, SUPERBLOCK_PAGE_COUNT, SuperblockSlot, build_next_metadata,
+    recover_metadata,
 };
 pub use page::{MAX_PAGE_COUNT, PAGE_SIZE, PageId};
 pub use paged_engine::PagedEngine;

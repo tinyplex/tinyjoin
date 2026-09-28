@@ -3703,7 +3703,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
 
     use super::*;
-    use crate::{AllocationBitmap, MemoryPageDevice, PageDevice};
+    use crate::{MemoryPageDevice, PageDevice};
 
     const TREE: TreeId = 7;
 
@@ -3897,29 +3897,19 @@ mod tests {
         pager: Pager<MemoryPageDevice>,
         free_pages: &[PageId],
     ) -> Pager<SparseDevice> {
-        let active = pager.active_metadata().clone();
+        let mut active = pager.active_metadata().clone();
         let mut memory = into_device_without_predecessor(pager);
-        let mut bitmap = active.allocation_bitmap;
         for id in FIRST_DATA_PAGE_ID..MAX_PAGE_COUNT {
-            bitmap.set_allocated(id, true).unwrap();
+            active.allocation_bitmap.set_allocated(id, true).unwrap();
         }
         for id in free_pages {
-            bitmap.set_allocated(*id, false).unwrap();
+            active.allocation_bitmap.set_allocated(*id, false).unwrap();
         }
-        let mut superblock = active.superblock;
-        superblock.live_data_page_count =
+        active.superblock.live_data_page_count =
             (MAX_PAGE_COUNT - FIRST_DATA_PAGE_ID - free_pages.len() as u64) as u32;
-        for (chunk, page) in bitmap.encode_pages().unwrap().iter().enumerate() {
-            memory
-                .write_page(superblock.bitmap_slot.page_id(chunk), page)
-                .unwrap();
+        for (id, page) in active.encode_pages().unwrap() {
+            memory.write_page(id, &page).unwrap();
         }
-        memory
-            .write_page(
-                superblock.slot.page_id(),
-                &superblock.encode_page().unwrap(),
-            )
-            .unwrap();
 
         let physical_count = memory.page_count();
         let mut pages = HashMap::new();
@@ -5074,26 +5064,19 @@ mod tests {
                 > 0
         );
 
-        let active = pager.active_metadata().clone();
+        let mut active = pager.active_metadata().clone();
         let mut memory = into_device_without_predecessor(pager);
-        let mut bitmap: AllocationBitmap = active.allocation_bitmap;
         for id in FIRST_DATA_PAGE_ID..MAX_PAGE_COUNT {
-            bitmap.set_allocated(id, true).unwrap();
+            active.allocation_bitmap.set_allocated(id, true).unwrap();
         }
-        bitmap.set_allocated(MAX_PAGE_COUNT - 1, false).unwrap();
-        let mut superblock = active.superblock;
-        superblock.live_data_page_count = (MAX_PAGE_COUNT - FIRST_DATA_PAGE_ID - 1) as u32;
-        for (chunk, page) in bitmap.encode_pages().unwrap().iter().enumerate() {
-            memory
-                .write_page(superblock.bitmap_slot.page_id(chunk), page)
-                .unwrap();
-        }
-        memory
-            .write_page(
-                superblock.slot.page_id(),
-                &superblock.encode_page().unwrap(),
-            )
+        active
+            .allocation_bitmap
+            .set_allocated(MAX_PAGE_COUNT - 1, false)
             .unwrap();
+        active.superblock.live_data_page_count = (MAX_PAGE_COUNT - FIRST_DATA_PAGE_ID - 1) as u32;
+        for (id, page) in active.encode_pages().unwrap() {
+            memory.write_page(id, &page).unwrap();
+        }
 
         let physical_count = memory.page_count();
         let mut pages = HashMap::new();

@@ -662,10 +662,10 @@ fn cache_error(message: impl Into<String>) -> EngineError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BitmapSlot, MemoryPageDevice};
+    use crate::MemoryPageDevice;
 
     fn active_bitmap() -> AllocationBitmap {
-        AllocationBitmap::new(1, BitmapSlot::A).unwrap()
+        AllocationBitmap::new()
     }
 
     fn bitmap_allocating(active: &AllocationBitmap, ids: &[PageId]) -> AllocationBitmap {
