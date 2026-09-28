@@ -295,7 +295,8 @@ Remaining, in order of expected value:
    is the writes themselves.
 6. O2 and O4. Reopening is within 1.1× of SQLite, but checking an index on
    reopen looks up its table row for every entry: engine-only, a 10,000-row
-   table's index takes 26 ms to check, where its rows take 15.
+   table's index took 26 ms to check, where its rows take 15. After the scan
+   and lookup work of 29 September, an index on its text column takes 14.
 7. Size. Each B-tree map type still compiles its own code: a transaction's
    claims could live in vectors, as the catalog's tables and indexes, and the
    keys a write reports, now do. The hash sets now share one hasher, but each key
