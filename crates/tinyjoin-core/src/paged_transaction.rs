@@ -896,6 +896,8 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
                     _ => Ok(VisitOutcome::Complete),
                 };
             }
+            // The committed row is found by the key encoded above.
+            return self.storage.visit_encoded_key(table, &encoded_key, visitor);
         }
         self.storage.visit_primary_key(table, key, visitor)
     }

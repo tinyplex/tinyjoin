@@ -519,6 +519,35 @@ impl<D: PageDevice> PagedStorage<D> {
         Ok(VisitOutcome::Complete)
     }
 
+    /// [`StorageReader::visit_primary_key`] for a key already encoded as `table`'s B-tree key.
+    pub(crate) fn visit_encoded_key(
+        &self,
+        table: &str,
+        encoded_key: &[u8],
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        self.ensure_ready()?;
+        let table = self.table(table)?;
+        let Some(root) = table.root_page_id else {
+            return Ok(VisitOutcome::Complete);
+        };
+        let value = Btree::get(
+            &mut self.pager.borrow_mut(),
+            root,
+            table.tree_id,
+            encoded_key,
+        )?;
+        match value {
+            Some(value)
+                if visitor(&RowRef::record(table.record(encoded_key, &value)?))?
+                    == VisitControl::Stop =>
+            {
+                Ok(VisitOutcome::Stopped)
+            }
+            _ => Ok(VisitOutcome::Complete),
+        }
+    }
+
     /// Validates one change of a transaction's write set, and measures what it adds to the write
     /// set's usage exactly as [`Self::validate_row_write_set`] does for each change: an upsert of
     /// `row`, which planning normalized, or where `is_delete`, a delete of the key `row`, with the
@@ -1248,30 +1277,8 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
         key: &Row,
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
-        self.ensure_ready()?;
-        let table = self
-            .tables
-            .get(table)
-            .ok_or_else(|| EngineError::table_not_found(table))?;
-        let encoded_key = encode_primary_key(&table.schema, key)?;
-        let Some(root) = table.root_page_id else {
-            return Ok(VisitOutcome::Complete);
-        };
-        let value = Btree::get(
-            &mut self.pager.borrow_mut(),
-            root,
-            table.tree_id,
-            &encoded_key,
-        )?;
-        match value {
-            Some(value)
-                if visitor(&RowRef::record(table.record(&encoded_key, &value)?))?
-                    == VisitControl::Stop =>
-            {
-                Ok(VisitOutcome::Stopped)
-            }
-            _ => Ok(VisitOutcome::Complete),
-        }
+        let encoded_key = encode_primary_key(&self.table(table)?.schema, key)?;
+        self.visit_encoded_key(table, &encoded_key, visitor)
     }
 
     fn index_definition(&self, name: &str) -> Option<IndexDefinition> {
