@@ -1,6 +1,6 @@
 use std::{
     cell::{RefCell, RefMut},
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     rc::Rc,
 };
 
@@ -160,8 +160,7 @@ impl<D: PageDevice> Pager<D> {
             pager: self,
             candidate,
             next_bitmap,
-            new_pages: BTreeSet::new(),
-            written_pages: BTreeSet::new(),
+            new_page_end: 0,
             btree_versions: BTreeMap::new(),
             next_allocation_page_id: FIRST_DATA_PAGE_ID,
             failed: false,
@@ -206,9 +205,11 @@ impl<D: PageDevice> Pager<D> {
 pub(crate) struct PagerWriteTransaction<'a, D: PageDevice> {
     pager: &'a mut Pager<D>,
     candidate: CandidateId,
+    /// The pages allocated once this candidate commits. It allocates only pages free here and in
+    /// the active bitmap, so the pages it allocated are those allocated here and not there.
     next_bitmap: AllocationBitmap,
-    new_pages: BTreeSet<PageId>,
-    written_pages: BTreeSet<PageId>,
+    /// One past the highest page this candidate has allocated.
+    new_page_end: PageId,
     btree_versions: BTreeMap<u64, u64>,
     next_allocation_page_id: PageId,
     failed: bool,
@@ -233,7 +234,18 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
 
     /// Reports whether `id` was allocated by this write transaction.
     pub(crate) fn owns_page(&self, id: PageId) -> bool {
-        !self.finished && self.new_pages.contains(&id)
+        !self.finished && self.is_new(id)
+    }
+
+    /// Whether this candidate allocated `id`.
+    fn is_new(&self, id: PageId) -> bool {
+        self.next_bitmap.is_allocated(id).unwrap_or(false)
+            && !self
+                .pager
+                .active
+                .allocation_bitmap
+                .is_allocated(id)
+                .unwrap_or(true)
     }
 
     /// Prevents a partially-built higher-level structure from being published.
@@ -293,11 +305,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
             id + 1
         };
 
-        let end = self
-            .pager
-            .device
-            .page_count()
-            .max(self.new_pages.last().map_or(0, |last| last + 1));
+        let end = self.pager.device.page_count().max(self.new_page_end);
         if id > end {
             return Err(pager_error(storage_diagnostic!(
                 "Allocator selected non-dense page {id} after a {end}-page file"
@@ -309,13 +317,13 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
             &self.pager.active.allocation_bitmap,
         )?;
         self.next_bitmap.set_allocated(id, true)?;
-        self.new_pages.insert(id);
+        self.new_page_end = self.new_page_end.max(id + 1);
         Ok(id)
     }
 
     pub(crate) fn write_new_page(&mut self, page: &Page) -> Result<()> {
         self.ensure_open()?;
-        if !self.new_pages.contains(&page.id) {
+        if !self.is_new(page.id) {
             return Err(pager_error(storage_diagnostic!(
                 "Page {} was not allocated by this write transaction",
                 page.id
@@ -324,9 +332,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
         let bytes = page.encode_unsealed()?;
         self.pager
             .cache
-            .write_unsealed_candidate_page(self.candidate, page.id, &bytes)?;
-        self.written_pages.insert(page.id);
-        Ok(())
+            .write_unsealed_candidate_page(self.candidate, page.id, &bytes)
     }
 
     pub(crate) fn read_page(&mut self, id: PageId) -> Result<Page> {
@@ -341,7 +347,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
             return Err(page_not_allocated(id));
         }
         let verify = |bytes: &[u8; PAGE_SIZE]| verify_expected_page(id, bytes);
-        let bytes = if self.new_pages.contains(&id) {
+        let bytes = if self.is_new(id) {
             self.pager
                 .cache
                 .read_candidate_page_verified(self.candidate, id, verify)?
@@ -361,7 +367,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
     pub(crate) fn free_shared_page(&mut self, id: PageId) -> Result<()> {
         self.ensure_open()?;
         ensure_data_page(id)?;
-        if self.new_pages.contains(&id) {
+        if self.is_new(id) {
             return Err(pager_error(storage_diagnostic!(
                 "New candidate page {id} cannot be freed before publication"
             )));
@@ -379,7 +385,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
     pub(crate) fn release_new_page(&mut self, id: PageId) -> Result<()> {
         self.ensure_open()?;
         ensure_data_page(id)?;
-        if !self.new_pages.contains(&id) {
+        if !self.is_new(id) {
             return Err(pager_error(storage_diagnostic!(
                 "Page {id} was not allocated by this write transaction"
             )));
@@ -388,8 +394,6 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
             .cache
             .release_candidate_page(self.candidate, id)?;
         self.next_bitmap.set_allocated(id, false)?;
-        self.new_pages.remove(&id);
-        self.written_pages.remove(&id);
         self.next_allocation_page_id = self.next_allocation_page_id.min(id);
         Ok(())
     }
@@ -419,12 +423,15 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
         if let Err(error) = crate::revision::validate_database_revision(database_revision) {
             return self.fail_before_superblock(error);
         }
-        if self.new_pages != self.written_pages {
-            let unwritten = self
-                .new_pages
-                .difference(&self.written_pages)
-                .copied()
-                .collect::<Vec<_>>();
+        let new_pages = self
+            .next_bitmap
+            .allocated_since(&self.pager.active.allocation_bitmap, self.new_page_end);
+        let unwritten = new_pages
+            .iter()
+            .copied()
+            .filter(|id| !self.pager.cache.candidate_page_written(self.candidate, *id))
+            .collect::<Vec<_>>();
+        if !unwritten.is_empty() {
             return self.fail_before_superblock(pager_error(storage_diagnostic!(
                 "Every allocated page must be initialized before commit; unwritten pages: {unwritten:?}"
             )));
@@ -453,7 +460,7 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
             return self.fail_before_superblock(error);
         }
         let mut hash = CommitHash::new();
-        for id in &self.new_pages {
+        for id in &new_pages {
             match self
                 .pager
                 .cache

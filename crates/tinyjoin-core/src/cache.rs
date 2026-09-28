@@ -461,6 +461,13 @@ impl<D: PageDevice> PageCache<D> {
             .count()
     }
 
+    /// Whether the candidate that reserved `id` has written it.
+    pub(crate) fn candidate_page_written(&self, candidate: CandidateId, id: PageId) -> bool {
+        self.reservations
+            .get(&id)
+            .is_some_and(|reservation| reservation.candidate == candidate && reservation.written)
+    }
+
     fn ensure_not_reserved(&self, id: PageId) -> Result<()> {
         if let Some(reservation) = self.reservations.get(&id) {
             return Err(cache_error(storage_diagnostic!(

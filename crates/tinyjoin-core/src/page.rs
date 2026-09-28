@@ -646,6 +646,20 @@ impl AllocationBitmap {
         self.allocated
     }
 
+    /// The pages allocated here but not in `base`, below `end`, in order.
+    pub(crate) fn allocated_since(&self, base: &Self, end: PageId) -> Vec<PageId> {
+        let mut pages = Vec::new();
+        let end = (end as usize).div_ceil(8).min(self.bits.len());
+        for (byte, (bits, base)) in self.bits[..end].iter().zip(&base.bits).enumerate() {
+            let mut fresh = bits & !base;
+            while fresh != 0 {
+                pages.push((byte * 8) as PageId + PageId::from(fresh.trailing_zeros()));
+                fresh &= fresh - 1;
+            }
+        }
+        pages
+    }
+
     pub(crate) fn encode_pages(&self) -> Result<Vec<[u8; PAGE_SIZE]>> {
         if self.generation == 0 {
             return Err(invalid_page(
