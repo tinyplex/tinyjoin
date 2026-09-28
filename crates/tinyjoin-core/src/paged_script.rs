@@ -1,12 +1,12 @@
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     rc::Rc,
 };
 
 use crate::{
-    Btree, ColumnType, EngineError, ExecuteResult, PageDevice, PageId, Pager,
+    Btree, ChangedKeys, ColumnType, EngineError, ExecuteResult, PageDevice, PageId, Pager,
     PagerWriteTransaction, QueryResult, Result, Row, RowChange, StorageReader, TreeId,
     VisitControl, VisitOutcome,
     btree::BatchChange,
@@ -329,7 +329,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
 
     fn execute_write(&mut self, statement: &WriteStatement) -> Result<ExecuteResult> {
         // Only a row mutation reports keys; DDL changes a table without naming rows.
-        let mut keys = BTreeMap::new();
+        let mut keys = ChangedKeys::default();
         let outcome = match statement {
             WriteStatement::CreateTable {
                 schema,
@@ -1156,7 +1156,7 @@ fn execute_query_result(result: QueryResult) -> Result<ExecuteResult> {
         fields: result.fields,
         rows: result.rows,
         tables: vec![],
-        keys: BTreeMap::new(),
+        keys: ChangedKeys::default(),
     })
 }
 

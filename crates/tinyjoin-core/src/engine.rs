@@ -4,8 +4,8 @@ use serde_json::Value;
 
 use crate::storage::StorageReader;
 use crate::{
-    ApplyOutcome, EngineError, ExecuteResult, InMemoryStorage, QueryResult, Result, Row,
-    StorageDriver,
+    ApplyOutcome, ChangedKeys, EngineError, ExecuteResult, InMemoryStorage, QueryResult, Result,
+    Row, StorageDriver,
 };
 
 #[derive(Clone, Debug)]
@@ -106,7 +106,7 @@ impl<S: StorageDriver + Clone> Engine<S> {
             return Ok(ApplyOutcome {
                 revision: self.storage.revision(),
                 tables: vec![],
-                keys: BTreeMap::new(),
+                keys: ChangedKeys::default(),
             });
         }
 
@@ -136,7 +136,7 @@ impl<S: StorageDriver + Clone> Engine<S> {
                     fields: result.fields,
                     rows: result.rows,
                     tables: vec![],
-                    keys: BTreeMap::new(),
+                    keys: ChangedKeys::default(),
                 })
             }
             crate::statement::Statement::Aggregate(plan) => {
@@ -148,7 +148,7 @@ impl<S: StorageDriver + Clone> Engine<S> {
                     fields: result.fields,
                     rows: result.rows,
                     tables: vec![],
-                    keys: BTreeMap::new(),
+                    keys: ChangedKeys::default(),
                 })
             }
             crate::statement::Statement::Join(plan) => {
@@ -160,7 +160,7 @@ impl<S: StorageDriver + Clone> Engine<S> {
                     fields: result.fields,
                     rows: result.rows,
                     tables: vec![],
-                    keys: BTreeMap::new(),
+                    keys: ChangedKeys::default(),
                 })
             }
             crate::statement::Statement::Write(statement) => {

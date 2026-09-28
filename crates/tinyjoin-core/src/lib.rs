@@ -43,7 +43,10 @@ pub use device::PageDevice;
 #[cfg(test)]
 pub(crate) use engine::Engine;
 pub use error::{EngineError, Result};
-pub use model::{ApplyOutcome, ExecuteResult, MAX_CHANGED_KEYS_PER_TABLE, ResultField, Row};
+pub use model::{
+    ApplyOutcome, ChangedKeys, ExecuteResult, MAX_CHANGED_KEYS_PER_TABLE, ResultField, Row,
+    TableKeys,
+};
 pub(crate) use model::{
     ColumnDefinition, ColumnType, ComparisonOperator, IndexDefinition, NullOrder, OrderBy,
     OrderDirection, Predicate, QueryResult, RowChange, SelectColumn, SelectPlan, TableDefinition,

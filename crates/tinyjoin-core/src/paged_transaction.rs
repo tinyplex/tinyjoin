@@ -5,8 +5,9 @@ use std::{
 };
 
 use crate::{
-    EngineError, IndexDefinition, MAX_CHANGED_KEYS_PER_TABLE, PageDevice, PagedStorage, Result,
-    Row, RowChange, StorageReader, TableDefinition, TreeId, VisitControl, VisitOutcome,
+    ChangedKeys, EngineError, IndexDefinition, MAX_CHANGED_KEYS_PER_TABLE, PageDevice,
+    PagedStorage, Result, Row, RowChange, StorageReader, TableDefinition, TableKeys, TreeId,
+    VisitControl, VisitOutcome,
     paged_codec::{EMPTY_RECORD, IndexEntryLayout, RecordLayout, encode_primary_key, encode_row},
     paged_script::{ChangedRow, KeyedRows, TableChanges, held_row_bytes},
     paged_storage::{ChangeCost, ChangeRow, PagedTable, PagedWriteUsage, batch_too_large},
@@ -193,8 +194,8 @@ impl PagedTransaction {
     pub(crate) fn changed_keys<D: PageDevice>(
         &self,
         storage: &PagedStorage<D>,
-    ) -> Result<BTreeMap<String, Vec<Row>>> {
-        let mut keys = BTreeMap::new();
+    ) -> Result<ChangedKeys> {
+        let mut keys = ChangedKeys::default();
         for (table, entries) in &self.entries {
             let changed = || entries.iter().filter(|(_, entry)| entry.changed);
             // A table with a key more than it can report reports none, so none is decoded.
@@ -202,11 +203,18 @@ impl PagedTransaction {
                 continue;
             }
             let paged = storage.table(table)?;
-            let rows = changed()
-                .map(|(key, _)| key_row(paged, key))
-                .collect::<Result<Vec<_>>>()?;
-            if !rows.is_empty() {
-                keys.insert(table.clone(), rows);
+            let mut values = Vec::new();
+            for (key, _) in changed() {
+                paged
+                    .record(key, EMPTY_RECORD)?
+                    .push_key_values(&mut values)?;
+            }
+            if !values.is_empty() {
+                keys.insert(TableKeys {
+                    table: table.clone(),
+                    columns: paged.schema.primary_key.clone(),
+                    values,
+                });
             }
         }
         Ok(keys)
@@ -595,6 +603,7 @@ fn overlay_entry<D: PageDevice>(
 }
 
 /// The primary-key columns of the encoded key `key` of `table`, as a map.
+#[cfg(test)]
 fn key_row(table: &PagedTable, key: &[u8]) -> Result<Row> {
     table.record(key, EMPTY_RECORD)?.key_row()
 }

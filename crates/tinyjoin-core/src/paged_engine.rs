@@ -1,10 +1,10 @@
-use std::{cell::Cell, collections::BTreeMap};
+use std::cell::Cell;
 
 use serde_json::Value;
 
 use crate::{
-    ApplyOutcome, EngineError, ExecuteResult, PageDevice, PagedStorage, PreparedStatementId,
-    QueryResult, Result, StorageReader,
+    ApplyOutcome, ChangedKeys, EngineError, ExecuteResult, PageDevice, PagedStorage,
+    PreparedStatementId, QueryResult, Result, StorageReader,
     paged_transaction::{PagedReadView, PagedTransaction},
     prepared_statement::PreparedStatementRegistry,
     statement::{PlannedDml, Statement, WriteStatement},
@@ -223,7 +223,7 @@ impl<D: PageDevice> PagedEngine<D> {
             return Ok(ApplyOutcome {
                 revision: self.storage.revision(),
                 tables: vec![],
-                keys: BTreeMap::new(),
+                keys: ChangedKeys::default(),
             });
         }
         let outcome = self.storage.commit_transaction(transaction)?;
@@ -321,7 +321,7 @@ fn execute_query_result(result: QueryResult) -> Result<ExecuteResult> {
         fields: result.fields,
         rows: result.rows,
         tables: vec![],
-        keys: BTreeMap::new(),
+        keys: ChangedKeys::default(),
     })
 }
 
@@ -1373,7 +1373,7 @@ mod tests {
             ApplyOutcome {
                 revision,
                 tables: vec![],
-                keys: BTreeMap::new()
+                keys: ChangedKeys::default()
             }
         );
 
@@ -2504,6 +2504,37 @@ mod tests {
             keys_for(&outcome, "accounts"),
             Some([1, 2, 3, 4, 9, 10, 100].map(|id| json!(id)).to_vec())
         );
+    }
+
+    #[test]
+    fn a_composite_key_lists_its_columns_in_key_order() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .execute_sql(
+                "CREATE TABLE members (team TEXT, id INTEGER, role TEXT, PRIMARY KEY (team, id))",
+                &[],
+            )
+            .unwrap();
+        let inserted = engine
+            .execute_sql(
+                "INSERT INTO members (team, id, role) VALUES ('b', 1, 'x'), ('a', 2, 'y')",
+                &[],
+            )
+            .unwrap();
+        let keys = inserted.keys.get("members").unwrap();
+        assert_eq!(keys.columns, ["team", "id"]);
+        assert_eq!(keys.values, [json!("a"), json!(2), json!("b"), json!(1)]);
+
+        // A transaction's statements and its commit list them the same way.
+        engine.begin_transaction().unwrap();
+        let updated = engine
+            .execute_sql("UPDATE members SET role = 'z' WHERE team = 'b'", &[])
+            .unwrap();
+        assert_eq!(updated.keys.get("members").unwrap().columns, ["team", "id"]);
+        let outcome = engine.commit_transaction().unwrap();
+        let keys = outcome.keys.get("members").unwrap();
+        assert_eq!(keys.columns, ["team", "id"]);
+        assert_eq!(keys.values, [json!("b"), json!(1)]);
     }
 
     fn keys_for_result(result: &ExecuteResult, table: &str) -> Vec<u64> {

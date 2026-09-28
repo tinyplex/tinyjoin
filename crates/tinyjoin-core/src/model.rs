@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -277,7 +275,111 @@ pub struct ApplyOutcome {
     /// every one of its changed keys fits within [`MAX_CHANGED_KEYS_PER_TABLE`]; a table that
     /// changed more rows than that is absent, and a subscriber must re-read it instead. Reporting
     /// keys is therefore a bounded best effort that can never grow with the size of a write.
-    pub keys: BTreeMap<String, Vec<Row>>,
+    pub keys: ChangedKeys,
+}
+
+/// The primary keys a write changed, table by table, in table name order.
+///
+/// Each key is its table's primary-key columns, which a result reports as an object of them.
+/// They are kept as rows of values of a table's key columns, rather than as a map for each key.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ChangedKeys(Vec<TableKeys>);
+
+/// One table's changed primary keys.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableKeys {
+    pub table: String,
+    /// The table's primary-key columns, in key order, as a key's object lists them.
+    pub columns: Vec<String>,
+    /// Each key's values in the order of `columns`, one key after another.
+    pub values: Vec<Value>,
+}
+
+impl ChangedKeys {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Each table's keys, in table name order.
+    pub fn tables(&self) -> &[TableKeys] {
+        &self.0
+    }
+
+    pub fn get(&self, table: &str) -> Option<&TableKeys> {
+        self.0
+            .binary_search_by(|keys| keys.table.as_str().cmp(table))
+            .ok()
+            .map(|at| &self.0[at])
+    }
+
+    /// Sets `keys` as its table's keys.
+    pub fn insert(&mut self, keys: TableKeys) {
+        match self
+            .0
+            .binary_search_by(|other| other.table.cmp(&keys.table))
+        {
+            Ok(at) => self.0[at] = keys,
+            Err(at) => self.0.insert(at, keys),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_key(&self, table: &str) -> bool {
+        self.get(table).is_some()
+    }
+
+    /// Each of `table`'s keys as an object of its columns, as a result reports them.
+    #[cfg(test)]
+    pub(crate) fn rows(&self, table: &str) -> Option<Vec<Row>> {
+        self.get(table).map(TableKeys::rows)
+    }
+}
+
+impl TableKeys {
+    /// Each key's values, in the order of the columns.
+    pub fn keys(&self) -> std::slice::Chunks<'_, Value> {
+        self.values.chunks(self.columns.len().max(1))
+    }
+
+    /// Each key as an object of its columns, as a result reports it.
+    #[cfg(test)]
+    pub(crate) fn rows(&self) -> Vec<Row> {
+        self.keys()
+            .map(|values| {
+                self.columns
+                    .iter()
+                    .cloned()
+                    .zip(values.iter().cloned())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.keys().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn iter(&self) -> std::vec::IntoIter<Row> {
+        self.rows().into_iter()
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Index<&str> for ChangedKeys {
+    type Output = TableKeys;
+
+    fn index(&self, table: &str) -> &TableKeys {
+        self.get(table).expect("the table reports its keys")
+    }
+}
+
+#[cfg(test)]
+impl PartialEq<Vec<Row>> for TableKeys {
+    fn eq(&self, rows: &Vec<Row>) -> bool {
+        self.rows() == *rows
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -296,7 +398,7 @@ pub struct ExecuteResult {
     pub rows: Vec<Row>,
     pub tables: Vec<String>,
     /// Changed primary keys per table, under the same bounded contract as [`ApplyOutcome::keys`].
-    pub keys: BTreeMap<String, Vec<Row>>,
+    pub keys: ChangedKeys,
 }
 
 /// The most changed primary keys one table may report in a single change notification.

@@ -166,7 +166,10 @@ Done:
   2.1 KiB compressed. The Worker copies a short ASCII parameter into its
   request rather than calling `TextEncoder`, which costs a Chromium Worker
   0.26 µs a call: 10,000 inserts in a transaction fell by 5% engine-only in
-  Chromium.
+  Chromium. Changed keys are then kept as each table's key columns, in key
+  order, and a row of values for each key, rather than as a map for each key
+  in a map of tables: writes by primary key fell 3% more, and the engine
+  shrank a little.
 - A statement's result that published nothing, a read or a statement inside a
   transaction, passes through the Worker as the text WASM wrote: its header
   and its rows, which only the page parses and checks, as protocol version 10.
@@ -256,9 +259,9 @@ Remaining, in order of expected value:
    as a statement is bound, planned, staged, and reported. Staging and the
    protocol's checks took 5-10% off each point statement in the browser on
    28 September; what remains is spread thinly: the response header's JSON,
-   written in WASM and parsed in the Worker, the parameters' defensive
-   encoding, binding a statement by cloning its template, and the changed
-   keys each write reports as maps. An `UPDATE` that keeps each row's key now
+   written in WASM and, for a result that committed, parsed in the Worker,
+   the parameters' defensive encoding, and binding a statement by cloning its
+   template. An `UPDATE` that keeps each row's key now
    writes the row's new record from its old one, a tenth off 1,000 updates by
    key engine-only; an upsert still plans maps for both its halves. Profiled
    engine-only on 29 September, excluding its commit, such an `UPDATE` spends
@@ -293,9 +296,9 @@ Remaining, in order of expected value:
 6. O2 and O4. Reopening is within 1.1× of SQLite, but checking an index on
    reopen looks up its table row for every entry: engine-only, a 10,000-row
    table's index takes 26 ms to check, where its rows take 15.
-7. Size. Each B-tree map type still compiles its own code: the keys a write
-   reports and a transaction's claims could live in vectors, as the catalog's
-   tables and indexes now do. The hash sets now share one hasher, but each key
+7. Size. Each B-tree map type still compiles its own code: a transaction's
+   claims could live in vectors, as the catalog's tables and indexes, and the
+   keys a write reports, now do. The hash sets now share one hasher, but each key
    type still compiles its own table code.
 8. Cold code. A single statement over thousands of rows runs much of its
    per-row code unoptimized the first time (see above), and every benchmark

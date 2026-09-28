@@ -800,6 +800,22 @@ impl<'a> StoredRecord<'a> {
         Ok(row)
     }
 
+    /// Appends the primary-key values, in key order, decoded from the key alone.
+    pub(crate) fn push_key_values(&self, values: &mut Vec<Value>) -> Result<()> {
+        let mut offset = 0;
+        for data_type in &self.layout.key_types {
+            let end = component_end(self.key, offset, *data_type)?;
+            values.push(decode_component(&self.key[offset..end], *data_type)?.into_value());
+            offset = end;
+        }
+        if offset != self.key.len() {
+            return Err(storage_corrupt(
+                "A stored row key contains trailing bytes after its primary key",
+            ));
+        }
+        Ok(())
+    }
+
     /// The primary-key columns, decoded from the key alone.
     pub(crate) fn key_row(&self) -> Result<Row> {
         let mut row = Row::new();

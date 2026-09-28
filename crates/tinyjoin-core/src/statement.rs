@@ -26,9 +26,9 @@ use crate::storage::{
     validate_primary_storage_key_bound, validate_value,
 };
 use crate::{
-    ColumnDefinition, ColumnType, EngineError, MAX_CHANGED_KEYS_PER_TABLE, Predicate, Result,
-    ResultField, Row, RowChange, SelectPlan, StorageReader, TableDefinition, VisitControl,
-    VisitOutcome,
+    ChangedKeys, ColumnDefinition, ColumnType, EngineError, MAX_CHANGED_KEYS_PER_TABLE, Predicate,
+    Result, ResultField, Row, RowChange, SelectPlan, StorageReader, TableDefinition, TableKeys,
+    VisitControl, VisitOutcome,
 };
 
 const MAX_COLUMNS: usize = 256;
@@ -209,7 +209,7 @@ pub(crate) fn parse_tokens(
 pub(crate) fn execute<S: StorageDriver>(
     storage: &mut S,
     statement: &WriteStatement,
-) -> Result<(WriteOutcome, BTreeMap<String, Vec<Row>>)> {
+) -> Result<(WriteOutcome, ChangedKeys)> {
     match statement {
         WriteStatement::CreateTable {
             schema,
@@ -278,8 +278,8 @@ fn sort_changed_keys(schema: &TableDefinition, keys: &mut [Row]) {
 
 #[cfg(test)]
 /// Pairs a DDL outcome with an empty key set: DDL changes a table without naming rows.
-fn no_changed_keys(outcome: WriteOutcome) -> (WriteOutcome, BTreeMap<String, Vec<Row>>) {
-    (outcome, BTreeMap::new())
+fn no_changed_keys(outcome: WriteOutcome) -> (WriteOutcome, ChangedKeys) {
+    (outcome, ChangedKeys::default())
 }
 
 /// Collects the primary keys a planned write-set touches, per table.
@@ -293,16 +293,17 @@ pub(crate) fn changed_keys(
     storage: &dyn StorageReader,
     changes: &[RowChange],
     previous: &[PreviousRow],
-) -> Result<BTreeMap<String, Vec<Row>>> {
+) -> Result<ChangedKeys> {
+    let mut keys = ChangedKeys::default();
     // One change reports one key, which needs neither the bound nor ordering.
     if let [change] = changes {
         let table = change_table(change);
-        let key = changed_key(storage, &*storage.table_schema(table)?, change)?;
-        let mut keys = BTreeMap::new();
-        keys.insert(table.clone(), vec![key]);
+        let schema = storage.table_schema(table)?;
+        let mut values = Vec::with_capacity(schema.primary_key.len());
+        push_changed_key(storage, &schema, change, &mut values)?;
+        keys.insert(table_keys(table, &schema, values));
         return Ok(keys);
     }
-    let mut keys = BTreeMap::new();
     if exceeds_changed_keys(changes, previous) {
         return Ok(keys);
     }
@@ -331,13 +332,22 @@ pub(crate) fn changed_keys(
         }
         let table = changed[0].table;
         let schema = schema_of(table)?;
-        let rows = changed
-            .iter()
-            .map(|changed| changed_key(storage, &schema, changed.change))
-            .collect::<Result<Vec<_>>>()?;
-        keys.insert(table.clone(), rows);
+        let mut values = Vec::with_capacity(changed.len() * schema.primary_key.len());
+        for changed in changed {
+            push_changed_key(storage, &schema, changed.change, &mut values)?;
+        }
+        keys.insert(table_keys(table, &schema, values));
     }
     Ok(keys)
+}
+
+/// A table's changed keys: its primary-key columns, in key order, and each key's values.
+fn table_keys(table: &str, schema: &TableDefinition, values: Vec<Value>) -> TableKeys {
+    TableKeys {
+        table: table.to_owned(),
+        columns: schema.primary_key.clone(),
+        values,
+    }
 }
 
 /// The table a change is to.
@@ -374,29 +384,28 @@ fn exceeds_changed_keys(changes: &[RowChange], previous: &[PreviousRow]) -> bool
     true
 }
 
-/// A changed row's primary-key columns: projected from the row a change carries, or decoded from
-/// the key of a row planned as its record. A planned map always carries its table's key columns;
-/// one that somehow does not is reported without them rather than failing an otherwise valid
-/// write.
-fn changed_key(
+/// Appends a changed row's primary-key values, in key order: projected from the row a change
+/// carries, or decoded from the key of a row planned as its record. A planned map always carries
+/// its table's key columns; one that somehow does not reports null for them rather than failing an
+/// otherwise valid write.
+fn push_changed_key(
     storage: &dyn StorageReader,
     schema: &TableDefinition,
     change: &RowChange,
-) -> Result<Row> {
-    let row = match change {
-        RowChange::Upsert { row, .. } | RowChange::Delete { key: row, .. } => row,
+    values: &mut Vec<Value>,
+) -> Result<()> {
+    match change {
+        RowChange::Upsert { row, .. } | RowChange::Delete { key: row, .. } => {
+            for name in &schema.primary_key {
+                values.push(row.get(name).cloned().unwrap_or(Value::Null));
+            }
+            Ok(())
+        }
         RowChange::Put { table, key, .. } | RowChange::Remove { table, key } => {
             let layout = storage.record_layout(table).ok_or_else(unplanned_record)?;
-            return StoredRecord::new(schema, &layout, key, EMPTY_RECORD)?.key_row();
-        }
-    };
-    let mut key = Row::new();
-    for column in &schema.primary_key {
-        if let Some(value) = row.get(column) {
-            key.insert(column.clone(), value.clone());
+            StoredRecord::new(schema, &layout, key, EMPTY_RECORD)?.push_key_values(values)
         }
     }
-    Ok(key)
 }
 
 #[cfg(test)]
@@ -408,13 +417,13 @@ fn changed_key(
 pub(crate) fn merge_changed_keys(
     accumulated: &mut BTreeMap<String, Option<Vec<Row>>>,
     tables: &[String],
-    incoming: &BTreeMap<String, Vec<Row>>,
+    incoming: &ChangedKeys,
 ) {
     for table in tables {
         let entry = accumulated
             .entry(table.clone())
             .or_insert_with(|| Some(vec![]));
-        let Some(incoming_keys) = incoming.get(table) else {
+        let Some(incoming_keys) = incoming.rows(table) else {
             *entry = None;
             continue;
         };
@@ -426,8 +435,8 @@ pub(crate) fn merge_changed_keys(
                 *entry = None;
                 break;
             }
-            if !keys.contains(key) {
-                keys.push(key.clone());
+            if !keys.contains(&key) {
+                keys.push(key);
             }
         }
     }
@@ -439,12 +448,19 @@ pub(crate) fn merge_changed_keys(
 pub(crate) fn finish_changed_keys(
     storage: &dyn StorageReader,
     accumulated: BTreeMap<String, Option<Vec<Row>>>,
-) -> Result<BTreeMap<String, Vec<Row>>> {
-    let mut finished = BTreeMap::new();
+) -> Result<ChangedKeys> {
+    let mut finished = ChangedKeys::default();
     for (table, keys) in accumulated {
         if let Some(mut keys) = keys {
-            sort_changed_keys(&*storage.table_schema(&table)?, &mut keys);
-            finished.insert(table, keys);
+            let schema = storage.table_schema(&table)?;
+            sort_changed_keys(&schema, &mut keys);
+            let mut values = Vec::new();
+            for key in &keys {
+                for name in &schema.primary_key {
+                    values.push(key.get(name).cloned().unwrap_or(Value::Null));
+                }
+            }
+            finished.insert(table_keys(&table, &schema, values));
         }
     }
     Ok(finished)

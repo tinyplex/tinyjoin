@@ -1,7 +1,5 @@
-use std::collections::BTreeMap;
-
 use serde_json::{Map, Number, Value};
-use tinyjoin_core::{ApplyOutcome, EngineError, ExecuteResult, Result, Row};
+use tinyjoin_core::{ApplyOutcome, ChangedKeys, EngineError, ExecuteResult, Result};
 use wasm_bindgen::JsValue;
 
 pub(crate) const VERSION: u32 = 4;
@@ -388,21 +386,28 @@ impl Json {
         self.raw("]");
     }
 
-    /// Writes the per-table changed-key map. A table appears only when its complete key set is
-    /// known, so an absent table means "changed, but re-read it" rather than "unchanged".
-    fn changed_keys(&mut self, keys: &BTreeMap<String, Vec<Row>>) -> Result<()> {
+    /// Writes the per-table changed-key map, each key as an object of its columns. A table
+    /// appears only when its complete key set is known, so an absent table means "changed, but
+    /// re-read it" rather than "unchanged".
+    fn changed_keys(&mut self, keys: &ChangedKeys) -> Result<()> {
         self.raw("{");
-        for (index, (table, rows)) in keys.iter().enumerate() {
+        for (index, table) in keys.tables().iter().enumerate() {
             if index > 0 {
                 self.raw(",");
             }
-            self.string(table);
+            self.string(&table.table);
             self.raw(":[");
-            for (index, row) in rows.iter().enumerate() {
-                if index > 0 {
-                    self.raw(",");
+            for (index, values) in table.keys().enumerate() {
+                self.raw(if index > 0 { ",{" } else { "{" });
+                for (index, (column, value)) in table.columns.iter().zip(values).enumerate() {
+                    if index > 0 {
+                        self.raw(",");
+                    }
+                    self.string(column);
+                    self.raw(":");
+                    self.value(value, 1)?;
                 }
-                self.object(row, 0)?;
+                self.raw("}");
             }
             self.raw("]");
         }
@@ -550,7 +555,7 @@ fn serialization() -> EngineError {
 mod tests {
     use super::*;
     use serde_json::json;
-    use tinyjoin_core::ResultField;
+    use tinyjoin_core::{ResultField, TableKeys};
 
     fn result(fields: &[(&str, u32)], rows: Vec<Value>) -> ExecuteResult {
         ExecuteResult {
@@ -569,11 +574,18 @@ mod tests {
                 .map(|row| row.as_object().unwrap().clone())
                 .collect(),
             tables: vec!["items".into()],
-            keys: BTreeMap::from([(
-                "items".into(),
-                vec![json!({"id": 1}).as_object().unwrap().clone()],
-            )]),
+            keys: changed_keys("items", &["id"], vec![json!(1)]),
         }
+    }
+
+    fn changed_keys(table: &str, columns: &[&str], values: Vec<Value>) -> ChangedKeys {
+        let mut keys = ChangedKeys::default();
+        keys.insert(TableKeys {
+            table: table.into(),
+            columns: columns.iter().map(|column| (*column).into()).collect(),
+            values,
+        });
+        keys
     }
 
     fn written(results: &[ExecuteResult], array_rows: bool, list: bool) -> Result<String> {
@@ -633,7 +645,7 @@ mod tests {
             fields: vec![],
             rows: vec![],
             tables: vec![],
-            keys: BTreeMap::new(),
+            keys: ChangedKeys::default(),
         };
         assert_eq!(
             written(&[empty.clone(), empty], false, true).unwrap(),
@@ -643,6 +655,26 @@ mod tests {
                 r#"{"fields":[],"rows":[]}"#,
             ]
             .join("\n")
+        );
+    }
+
+    #[test]
+    fn changed_keys_are_written_as_objects_of_their_columns() {
+        let mut keys = changed_keys(
+            "pairs",
+            &["a", "b"],
+            vec![json!(1), json!("x"), json!(2), json!("y")],
+        );
+        keys.insert(TableKeys {
+            table: "empty".into(),
+            columns: vec!["id".into()],
+            values: vec![],
+        });
+        let mut json = Json::default();
+        json.changed_keys(&keys).unwrap();
+        assert_eq!(
+            json.0,
+            r#"{"empty":[],"pairs":[{"a":1,"b":"x"},{"a":2,"b":"y"}]}"#
         );
     }
 
