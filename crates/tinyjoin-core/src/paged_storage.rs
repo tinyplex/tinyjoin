@@ -1459,8 +1459,10 @@ fn load_and_validate_catalog<D: PageDevice>(
     catalog_root_page_id: PageId,
 ) -> Result<LoadedCatalog> {
     let mut header = None;
-    let mut table_records = BTreeMap::new();
-    let mut index_records = BTreeMap::new();
+    // Catalog keys arrive in order, so each list is in name order, and a name listed twice would
+    // follow itself.
+    let mut table_records: Vec<(String, CatalogTableRecord)> = Vec::new();
+    let mut index_records: Vec<(String, CatalogIndexRecord)> = Vec::new();
     let mut cursor = Btree::validating_cursor(pager, catalog_root_page_id, CATALOG_TREE_ID)?;
     while let Some((key, value)) = cursor.next(pager)? {
         match decode_catalog_key(&key)? {
@@ -1474,19 +1476,21 @@ fn load_and_validate_catalog<D: PageDevice>(
             }
             CatalogKey::Table(name) => {
                 let record = decode_catalog_table_record(&key, &value)?;
-                if table_records.insert(name.clone(), record).is_some() {
+                if table_records.last().is_some_and(|(last, _)| *last >= name) {
                     return Err(storage_corrupt(format!(
-                        "The catalog contains table `{name}` more than once"
+                        "The catalog lists table `{name}` out of order or more than once"
                     )));
                 }
+                table_records.push((name, record));
             }
             CatalogKey::Index(name) => {
                 let record = decode_catalog_index_record(&key, &value)?;
-                if index_records.insert(name.clone(), record).is_some() {
+                if index_records.last().is_some_and(|(last, _)| *last >= name) {
                     return Err(storage_corrupt(format!(
-                        "The catalog contains index `{name}` more than once"
+                        "The catalog lists index `{name}` out of order or more than once"
                     )));
                 }
+                index_records.push((name, record));
             }
         }
     }
@@ -1505,10 +1509,10 @@ fn load_and_validate_catalog<D: PageDevice>(
 
     let mut tree_ids = BTreeSet::new();
     tree_ids.insert(CATALOG_TREE_ID);
-    for record in table_records.values() {
+    for (_, record) in &table_records {
         validate_catalog_tree_id(record.tree_id, header.next_tree_id, &mut tree_ids)?;
     }
-    for record in index_records.values() {
+    for (_, record) in &index_records {
         validate_catalog_tree_id(record.tree_id, header.next_tree_id, &mut tree_ids)?;
         validate_index_against_catalog(&record.definition, &table_records)?;
     }
@@ -1516,10 +1520,10 @@ fn load_and_validate_catalog<D: PageDevice>(
         return Err(storage_corrupt("Catalog tree IDs are not unique"));
     }
 
-    for record in table_records.values() {
+    for (_, record) in &table_records {
         validate_table_tree(pager, record)?;
     }
-    for record in index_records.values() {
+    for (_, record) in &index_records {
         validate_index_tree(pager, record, &table_records)?;
     }
 
@@ -1569,11 +1573,23 @@ fn validate_catalog_tree_id(
     Ok(())
 }
 
+/// The catalog record of the table `name`, from records in name order.
+fn catalog_table<'a>(
+    tables: &'a [(String, CatalogTableRecord)],
+    name: &str,
+) -> Option<&'a CatalogTableRecord> {
+    let position = tables.partition_point(|(table, _)| table.as_str() < name);
+    tables
+        .get(position)
+        .filter(|(table, _)| table == name)
+        .map(|(_, record)| record)
+}
+
 fn validate_index_against_catalog(
     definition: &IndexDefinition,
-    tables: &BTreeMap<String, CatalogTableRecord>,
+    tables: &[(String, CatalogTableRecord)],
 ) -> Result<()> {
-    let table = tables.get(&definition.table).ok_or_else(|| {
+    let table = catalog_table(tables, &definition.table).ok_or_else(|| {
         storage_corrupt(format!(
             "Index `{}` references missing table `{}`",
             definition.name, definition.table
@@ -1639,9 +1655,9 @@ fn validate_table_tree<D: PageDevice>(
 fn validate_index_tree<D: PageDevice>(
     pager: &mut Pager<D>,
     record: &CatalogIndexRecord,
-    tables: &BTreeMap<String, CatalogTableRecord>,
+    tables: &[(String, CatalogTableRecord)],
 ) -> Result<()> {
-    let table = tables.get(&record.definition.table).ok_or_else(|| {
+    let table = catalog_table(tables, &record.definition.table).ok_or_else(|| {
         storage_corrupt(format!(
             "Index `{}` references missing table `{}`",
             record.definition.name, record.definition.table
@@ -2176,7 +2192,7 @@ mod tests {
             entry_count: 1,
         };
         assert_eq!(
-            validate_index_tree(&mut pager, &index, &BTreeMap::new())
+            validate_index_tree(&mut pager, &index, &[])
                 .unwrap_err()
                 .code,
             "STORAGE_CORRUPT"
