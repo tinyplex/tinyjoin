@@ -64,59 +64,57 @@ struct PlannedChange {
     written: bool,
 }
 
-/// One table's changed rows by encoded primary key: a vector while their keys arrive in ascending
-/// order, as a scan in key order plans them, and a map from the first that does not.
-enum TableRows {
-    Sorted(Vec<(Vec<u8>, PlannedChange)>),
-    Map(BTreeMap<Vec<u8>, PlannedChange>),
+/// One table's changed rows, each with its encoded primary key, in the order they arrive. A scan in
+/// key order plans them in key order; once a key arrives out of order, as rows listed in VALUES
+/// can, every key is also kept in `seen`, and the rows are sorted when read.
+#[derive(Default)]
+struct TableRows {
+    rows: Vec<(Vec<u8>, PlannedChange)>,
+    seen: Option<BTreeSet<Vec<u8>>>,
 }
 
 impl TableRows {
     /// The change already planned for `key`, if any.
     #[allow(clippy::ptr_arg)]
     fn get_mut(&mut self, key: &Vec<u8>) -> Option<&mut PlannedChange> {
-        if let Self::Sorted(rows) = self
-            && rows.last().is_some_and(|(last, _)| last > key)
-        {
-            let mut map = BTreeMap::new();
-            for (key, change) in std::mem::take(rows) {
-                map.insert(key, change);
+        if self.seen.is_none() && self.rows.last().is_some_and(|(last, _)| last > key) {
+            let mut seen = BTreeSet::new();
+            for (key, _) in &self.rows {
+                seen.insert(key.clone());
             }
-            *self = Self::Map(map);
+            self.seen = Some(seen);
         }
-        match self {
-            Self::Sorted(rows) => match rows.last_mut() {
-                Some((last, change)) if last == key => Some(change),
-                _ => None,
-            },
-            Self::Map(rows) => rows.get_mut(key),
-        }
+        let row = match &self.seen {
+            None => self.rows.last_mut().filter(|(last, _)| last == key),
+            // Planning never repeats a key it writes, so this search is all but never made.
+            Some(seen) if seen.contains(key) => self.rows.iter_mut().find(|(row, _)| row == key),
+            Some(_) => None,
+        };
+        row.map(|(_, change)| change)
     }
 
     /// Plans the first change of `key`, for which [`Self::get_mut`] found none.
     fn insert(&mut self, key: Vec<u8>, change: PlannedChange) {
-        match self {
-            Self::Sorted(rows) => rows.push((key, change)),
-            Self::Map(rows) => {
-                rows.insert(key, change);
-            }
+        if let Some(seen) = &mut self.seen {
+            seen.insert(key.clone());
         }
+        self.rows.push((key, change));
     }
 
     /// The rows in key order.
     fn changes(&self) -> Vec<(&[u8], &ChangedRow)> {
-        let mut changes = Vec::new();
-        match self {
-            Self::Sorted(rows) => {
-                for (key, change) in rows {
-                    changes.push((key.as_slice(), &change.row));
-                }
+        let mut order = Vec::new();
+        if self.seen.is_some() {
+            for (index, (key, _)) in self.rows.iter().enumerate() {
+                order.push((key.clone(), index));
             }
-            Self::Map(rows) => {
-                for (key, change) in rows {
-                    changes.push((key.as_slice(), &change.row));
-                }
-            }
+            // Keys are unique, so the pairs sort as their keys do.
+            order.sort_unstable();
+        }
+        let mut changes = Vec::with_capacity(self.rows.len());
+        for index in 0..self.rows.len() {
+            let (key, change) = &self.rows[order.get(index).map_or(index, |(_, index)| *index)];
+            changes.push((key.as_slice(), &change.row));
         }
         changes
     }
@@ -537,7 +535,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             .get(&table_name)
             .ok_or_else(|| EngineError::table_not_found(&table_name))?;
         let mut retained_bytes = 0usize;
-        let mut changes = TableRows::Sorted(vec![]);
+        let mut changes = TableRows::default();
         let mut previous = previous.into_iter();
         for change in input_changes {
             let held = previous.next().unwrap_or(PreviousRow::Unread);
