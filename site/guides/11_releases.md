@@ -143,6 +143,10 @@ and building indexes are quicker than in either.
   time. A commit to a smaller database writes its data pages and its
   superblock and nothing else: committing a single insert takes about 5% less
   time with OPFS.
+- A write transaction looks for free pages 64 at a time, rather than one at a
+  time from the start of the file, so that a commit's cost grows much more
+  slowly with the size of the database: committing single inserts into a
+  100,000-row table takes about 30% less of the engine's time.
 - Several of the engine's small collections are kept in vectors rather than
   B-tree maps, whose code is compiled anew for each type they hold, which took
   about 15 KiB off the compressed engine. Its hash maps and sets share one

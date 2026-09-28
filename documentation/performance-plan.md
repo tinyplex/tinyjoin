@@ -227,6 +227,12 @@ Done:
   entries without a tree root is refused, which the count alone had let
   through. Reopening a 10,000-row table with one index fell from 344 million
   instructions to 333 engine-only.
+- A transaction finds a free page by testing 64 pages' bits at a time,
+  rather than looking each page up in both bitmaps in turn from the start of
+  the file, which every write transaction's first allocation did. The
+  benchmark tables are too small to show it, but 1,000 inserts each committed
+  alone into a 100,000-row table fell from 626 million instructions to 472
+  engine-only, and from 76 ms to 54.
 
 Found along the way:
 

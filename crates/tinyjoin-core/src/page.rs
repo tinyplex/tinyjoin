@@ -699,6 +699,30 @@ impl AllocationBitmap {
         self.allocated
     }
 
+    /// The first page from `start` up to `end` that neither this bitmap nor `other` allocates.
+    ///
+    /// Allocated pages are passed over 64 at a time: a database's pages are mostly allocated, and
+    /// a transaction looks for its first new page from the start of the file.
+    pub(crate) fn first_free(&self, other: &Self, start: PageId, end: PageId) -> Option<PageId> {
+        let (words, _) = self.bits.as_chunks::<8>();
+        let (other_words, _) = other.bits.as_chunks::<8>();
+        let end = end.min(MAX_PAGE_COUNT) as usize;
+        let mut id = start as usize;
+        while id < end {
+            let word = id / 64;
+            // The pages before `id` in its word count as allocated.
+            let taken = u64::from_le_bytes(words[word])
+                | u64::from_le_bytes(other_words[word])
+                | ((1_u64 << (id % 64)) - 1);
+            if taken != u64::MAX {
+                let free = word * 64 + (!taken).trailing_zeros() as usize;
+                return (free < end).then_some(free as PageId);
+            }
+            id = (word + 1) * 64;
+        }
+        None
+    }
+
     /// The pages allocated here but not in `base`, below `end`, in order.
     pub(crate) fn allocated_since(&self, base: &Self, end: PageId) -> Vec<PageId> {
         let mut pages = Vec::new();
@@ -1641,6 +1665,60 @@ mod tests {
                 .code,
             "INVALID_PAGE"
         );
+    }
+
+    #[test]
+    fn first_free_finds_the_page_a_page_by_page_search_finds() {
+        let mut random = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            random
+        };
+        for case in 0..32 {
+            let (mut this, mut other) = (AllocationBitmap::new(), AllocationBitmap::new());
+            // Every page allocated in one bitmap or the other up to a point, as a database's pages
+            // are, and some free among them, then a random mix.
+            let full = (next() % MAX_PAGE_COUNT) as usize;
+            for (byte, (this, other)) in this.bits.iter_mut().zip(&mut other.bits).enumerate() {
+                let bits = next() as u8;
+                (*this, *other) = if byte * 8 < full {
+                    (bits, !bits)
+                } else {
+                    (bits, next() as u8)
+                };
+            }
+            for _ in 0..case % 4 {
+                let id = next() as usize % full.max(1);
+                this.bits[id / 8] &= !(1 << (id % 8));
+                other.bits[id / 8] &= !(1 << (id % 8));
+            }
+            for _ in 0..16 {
+                let start = next() % MAX_PAGE_COUNT;
+                let end = start + next() % (MAX_PAGE_COUNT - start + 1);
+                let expected = (start..end).find(|id| {
+                    !this.is_allocated(*id).unwrap() && !other.is_allocated(*id).unwrap()
+                });
+                assert_eq!(
+                    this.first_free(&other, start, end),
+                    expected,
+                    "case {case}, from {start} to {end}"
+                );
+            }
+        }
+        let full = AllocationBitmap {
+            bits: vec![0xff; ALLOCATION_BITMAP_BYTES],
+            allocated: MAX_PAGE_COUNT as u32,
+        };
+        assert_eq!(full.first_free(&full, 0, MAX_PAGE_COUNT), None);
+        let empty = AllocationBitmap::new();
+        assert_eq!(
+            empty.first_free(&empty, 0, MAX_PAGE_COUNT),
+            Some(FIRST_DATA_PAGE_ID)
+        );
+        assert_eq!(empty.first_free(&empty, 70, 70), None);
+        assert_eq!(empty.first_free(&empty, 70, 71), Some(70));
     }
 
     #[test]

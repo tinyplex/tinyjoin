@@ -282,15 +282,10 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
     pub(crate) fn allocate_page(&mut self) -> Result<PageId> {
         self.ensure_open()?;
         let start = self.next_allocation_page_id;
-        let mut selected = None;
-        for id in (start..MAX_PAGE_COUNT).chain(FIRST_DATA_PAGE_ID..start) {
-            if !self.pager.active.allocation_bitmap.is_allocated(id)?
-                && !self.next_bitmap.is_allocated(id)?
-            {
-                selected = Some(id);
-                break;
-            }
-        }
+        let active = &self.pager.active.allocation_bitmap;
+        let selected = active
+            .first_free(&self.next_bitmap, start, MAX_PAGE_COUNT)
+            .or_else(|| active.first_free(&self.next_bitmap, FIRST_DATA_PAGE_ID, start));
         let id = selected.ok_or_else(|| {
             EngineError::new(
                 "DATABASE_FULL",
