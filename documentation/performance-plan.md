@@ -33,33 +33,37 @@ times; the published ones were made with macOS media analysis paused, and their
 SQLite times match the quiet 26 September run's. The `23fe19c` column adds
 planning inserted rows straight into records and the warm-up Worker, the
 `5a3e1d7` column the per-statement work and size reductions of 28 September,
-measured while other applications kept the machine busier, and the `a9e4b08`
-column that evening's bulk-write, checksum, scan, and size work.
+measured while other applications kept the machine busier, the `a9e4b08`
+column that evening's bulk-write, checksum, scan, and size work, and the
+`b3ebbaf` column, published on 29 September, the scan, delete, update, index
+build, and size work of that night. SQLite's times in the last two runs are
+within 2% of each other on average.
 
-| Workload | v0.3.0 | 26 Sep | `64ce856` | `23fe19c` | `5a3e1d7` | `a9e4b08` |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `cold-open` | 0.7× | 0.8× | 0.71× | 0.59× | 0.60× | 0.59× |
-| `reopen` | 3.5× | 1.2× | 1.2× | 1.1× | 1.2× | 1.1× |
-| `insert-autocommit` | 3.3× | 2.1× | 1.1× | 1.1× | 0.98× | 0.93× |
-| `insert-transaction` | 9.9× | 2.5× | 1.7× | 1.7× | 1.6× | 1.5× |
-| `insert-indexed` | 15× | 2.3× | 1.8× | 1.6× | 1.5× | 1.6× |
-| `insert-batch` | 33× | 3.4× | 2.0× | 1.6× | 1.6× | 1.4× |
-| `select-pk` | 4.2× | 1.6× | 1.2× | 1.1× | 1.1× | 1.0× |
-| `select-scan` | 105× | 1.75× | 1.7× | 1.6× | 1.6× | 1.5× |
-| `select-like` | 39× | 0.9× | 0.95× | 0.94× | 0.92× | 0.92× |
-| `select-indexed` | 1,406× | 2.4× | 1.6× | 1.2× | 1.1× | 1.1× |
-| `select-all` | 2.3× | 0.6× | 0.28× | 0.23× | 0.24× | 0.25× |
-| `group-by` | 22× | 0.95× | 1.0× | 0.86× | 0.87× | 0.89× |
-| `join` | 175× | 1.4× | 1.1× | 0.88× | 0.86× | 0.88× |
-| `update-pk` | 1,077× | 2.3× | 1.8× | 1.8× | 1.8× | 1.7× |
-| `update-scan` | 179× | 2.2× | 2.1× | 2.1× | 2.1× | 2.0× |
-| `upsert` | 1,362× | 2.5× | 1.8× | 1.8× | 1.9× | 1.7× |
-| `delete-pk` | 1,105× | 2.6× | 1.8× | 1.8× | 1.7× | 1.6× |
-| `delete-like` | 95× | 3.7× | 2.7× | 1.9× | 2.1× | 1.6× |
-| `delete-range` | 249× | 3.7× | 2.5× | 2.3× | 2.2× | 1.6× |
-| `create-index` | 142× | 1.3× | 1.1× | 1.0× | 1.1× | 1.1× |
+| Workload | v0.3.0 | 26 Sep | `64ce856` | `23fe19c` | `5a3e1d7` | `a9e4b08` | `b3ebbaf` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `cold-open` | 0.7× | 0.8× | 0.71× | 0.59× | 0.60× | 0.59× | 0.61× |
+| `reopen` | 3.5× | 1.2× | 1.2× | 1.1× | 1.2× | 1.1× | 1.05× |
+| `insert-autocommit` | 3.3× | 2.1× | 1.1× | 1.1× | 0.98× | 0.93× | 0.90× |
+| `insert-transaction` | 9.9× | 2.5× | 1.7× | 1.7× | 1.6× | 1.5× | 1.6× |
+| `insert-indexed` | 15× | 2.3× | 1.8× | 1.6× | 1.5× | 1.6× | 1.6× |
+| `insert-batch` | 33× | 3.4× | 2.0× | 1.6× | 1.6× | 1.4× | 1.5× |
+| `select-pk` | 4.2× | 1.6× | 1.2× | 1.1× | 1.1× | 1.0× | 1.0× |
+| `select-scan` | 105× | 1.75× | 1.7× | 1.6× | 1.6× | 1.5× | 1.1× |
+| `select-like` | 39× | 0.9× | 0.95× | 0.94× | 0.92× | 0.92× | 0.86× |
+| `select-indexed` | 1,406× | 2.4× | 1.6× | 1.2× | 1.1× | 1.1× | 1.0× |
+| `select-all` | 2.3× | 0.6× | 0.28× | 0.23× | 0.24× | 0.25× | 0.25× |
+| `group-by` | 22× | 0.95× | 1.0× | 0.86× | 0.87× | 0.89× | 0.77× |
+| `join` | 175× | 1.4× | 1.1× | 0.88× | 0.86× | 0.88× | 0.82× |
+| `update-pk` | 1,077× | 2.3× | 1.8× | 1.8× | 1.8× | 1.7× | 1.6× |
+| `update-scan` | 179× | 2.2× | 2.1× | 2.1× | 2.1× | 2.0× | 1.5× |
+| `upsert` | 1,362× | 2.5× | 1.8× | 1.8× | 1.9× | 1.7× | 1.7× |
+| `delete-pk` | 1,105× | 2.6× | 1.8× | 1.8× | 1.7× | 1.6× | 1.7× |
+| `delete-like` | 95× | 3.7× | 2.7× | 1.9× | 2.1× | 1.6× | 1.6× |
+| `delete-range` | 249× | 3.7× | 2.5× | 2.3× | 2.2× | 1.6× | 1.4× |
+| `create-index` | 142× | 1.3× | 1.1× | 1.0× | 1.1× | 1.1× | 1.0× |
 
-The compressed download grew from 296 KiB to 334 KiB, and is now 306 KiB.
+The compressed download grew from 296 KiB to 334 KiB, and is now 306 KiB, as
+it was at `a9e4b08`.
 Between two runs on the same build, the ratios moved by up to a tenth, and by
 more under load, so read them to one significant figure. In the `23fe19c`
 column, TinyJoin's own times fell by up to a third, most on the workloads whose
@@ -70,7 +74,12 @@ so single-statement writes barely moved against it, and about 8% slower in the
 SQLite's. A full rerun on `1d9e6e7`, after the scan fast paths, put range
 aggregates at 1.2 times SQLite's and a transaction's range `UPDATE`s at 1.8
 times, but ran under more load, with SQLite about 15% slower than in the
-`a9e4b08` run, so it was not published.
+`a9e4b08` run, so it was not published. In the `b3ebbaf` run, range aggregates
+took 1.1 times SQLite's time and a transaction's range `UPDATE`s 1.5 times, the
+largest ratio left fell from 2.0 to 1.7, for upserts, and creating indexes and
+indexed range aggregates matched the faster engine. In memory, range
+aggregates fell from 1.5 times SQLite's to 1.07, and range `UPDATE`s from 2.3
+to 1.6.
 
 Done:
 
@@ -119,6 +128,31 @@ Done:
   out once, and reads only its text and JSON columns.
 - Several small collections moved from B-tree maps to vectors, and three maps
   stopped removing entries: the engine is 15 KiB smaller compressed.
+- A scan inside a transaction that changed its table passes over the rows the
+  transaction replaced by finding them in each leaf, by binary search from the
+  last one found, rather than comparing every row with the next staged key
+  through a closure (T3's merge). A key search reads only each cell's key.
+  Filters compare an integer column with integer bounds as integers, through
+  a range worked out once. Engine-only, a transaction's 100 range `UPDATE`s
+  fell from 71 ms to 57, and 100 range aggregates from 48 ms to 44.
+- A script's `DELETE` plans each stored row as a `Remove` of its encoded key,
+  charged as the map of its key columns through a per-table estimate, rather
+  than as that map; a transaction still plans maps, which its overlay
+  measures. The 8,000-row range delete fell from 5.4 ms to 4.4 engine-only.
+- An `UPDATE` that keeps each row's key, with no `RETURNING`, rewrites the
+  stored record, keeping every unassigned column's bytes, and plans it as a
+  `Put`. A row whose JSON text could pass the row limit, and a table keeping a
+  JSON column the statement does not assign, still plan maps. 1,000 updates by
+  key fell from 12.3 ms to 11.1 engine-only; the 2 KiB this was set aside for
+  shrank to 1.2 KiB by sharing the map path's accounting.
+- Writing a page stores each cell's header and slot as fixed-size stores, and
+  an index key copies text whole: creating two indexes fell from 11.2 ms to
+  10.3 engine-only.
+- Every hash map and set shares one multiplicative hasher: SipHash's keys come
+  from memory addresses on `wasm32-unknown-unknown`, which has no random
+  source, so it resisted nothing. With four sets that needed no hashing moved
+  to vectors, the engine shrank by 3.1 KiB compressed, more than this
+  session's speedups added.
 
 Found along the way:
 
@@ -169,6 +203,16 @@ Found along the way:
 - Messages between the page and the Worker cost about the same whether a
   result crosses as an object or as JSON text the page parses, so the
   protocol keeps objects.
+- `wasm-opt` inlines a function into its only caller even when it loops. The
+  plain scan loop, folded into the transaction reader's larger function, ran
+  5% slower; called from two places, it stays whole.
+- V8 optimizes a WebAssembly function once it has run about 13 million bytes
+  of its code, so a function called once per row is optimized only after tens
+  of thousands of rows. A single statement over 10,000 rows therefore runs
+  much of its per-row code unoptimized the first time: engine-only in Node, the
+  8,000-row range delete takes 10 ms the first time and 5.6 once warm, and 7.3
+  after the warm-up Worker's statements, which touch its paths too lightly to
+  optimize them.
 
 Remaining, in order of expected value:
 
@@ -183,26 +227,23 @@ Remaining, in order of expected value:
    28 September; what remains is spread thinly: the response header's JSON,
    written in WASM and parsed in the Worker, the parameters' defensive
    encoding, binding a statement by cloning its template, and the changed
-   keys each write reports as maps. An `UPDATE` still plans each row as a map: a prototype that
-   writes a row's new record from its old one, copying the columns it does
-   not assign, made 1,000 updates by key 1.27 times as fast natively and 1.14
-   times in WASM, but grew the engine by 2 KiB compressed, for about 3% in
-   the browser, so it was set aside; the engine has since shed 15 KiB. The rest is the Worker's JavaScript, a
+   keys each write reports as maps. An `UPDATE` that keeps each row's key now
+   writes the row's new record from its old one, a tenth off 1,000 updates by
+   key engine-only; an upsert still plans maps for both its halves. The rest
+   is the Worker's JavaScript, a
    few microseconds more than SQLite's: the layers each request passes
    through, and copying requests and results between threads as object
    graphs. Parameters now cross into WASM as bytes the Worker writes while it
    checks them, rather than through `serde_wasm_bindgen`, which cost about
    0.7 µs a statement.
-2. Scans took 1.5 times as long as SQLite's in the `a9e4b08` run; the
-   readers compiled inline since took a further quarter off in Chromium A/B
-   runs. What remains is spent mostly in the cursor and predicate evaluation.
-   Forcing a small fast path inline where every scanned row passes
-   (`#[inline(always)]` on the fast path, not on the general function) paid
-   best: inlining a whole general function grew the engine by a kilobyte or
-   more for less. Inside a transaction, a range `UPDATE` also merges each scan
-   with the staged rows (T3), comparing every row's key with the next staged
-   one, and takes twice as long: the largest ratio left.
-3. Bulk deletes take about 1.6 times as long as PGlite's, and less than
+2. Scans take 1.1 times as long as SQLite's in the `b3ebbaf` run, and a
+   transaction's range `UPDATE`s 1.5 times, down from 1.5 and 2.0. What
+   remains is spent mostly in the cursor, the per-row visitor call, and
+   reading the column a predicate tests. Forcing a small fast path inline
+   where every scanned row passes (`#[inline(always)]` on the fast path, not
+   on the general function) paid best: inlining a whole general function grew
+   the engine by a kilobyte or more for less.
+3. Bulk deletes take 1.4 to 1.6 times as long as PGlite's, and less than
    SQLite's. PGlite, like PostgreSQL, marks deleted rows and reclaims them
    later; TinyJoin removes each row and its index entries at once. Deleting a
    contiguous key or index range could drop whole subtrees, using their
@@ -218,8 +259,15 @@ Remaining, in order of expected value:
    table's index takes 26 ms to check, where its rows take 15.
 7. Size. Each B-tree map type still compiles its own code: the catalog's
    tables and indexes, the keys a write reports, and a transaction's claims
-   could live in vectors, and statement validation builds several hash sets
-   hashed with SipHash, each with its own copy of the table code.
+   could live in vectors. The hash sets now share one hasher, but each key
+   type still compiles its own table code.
+8. Cold code. A single statement over thousands of rows runs much of its
+   per-row code unoptimized the first time (see above), and every benchmark
+   sample is a first time. Warming those paths would take a warm-up of tens of
+   thousands of row operations, a CPU cost at every page load that is a
+   product decision. The engine is compiled from a streamed fetch, whose
+   optimized code Chromium can cache for later visits, which fresh-profile
+   samples never make; whether it does for this module is unmeasured.
 
 ## Where the time goes
 
@@ -333,7 +381,7 @@ For reference, five prototype patches together (R1–R4, plus lighter cursors)
 cut engine-only WASM time:
 
 | Workload | Before | After |
-| --- | ---: | ---: |
+| --- | ---: | ---: | ---: |
 | Range aggregate scan | 88 ms | 17 ms |
 | `SELECT * ORDER BY id` | 150 ms | 26 ms |
 | `GROUP BY` | 95 ms | 22 ms |
@@ -699,7 +747,7 @@ uncompressed. `s` costs 24 KiB for a few percent.
 Remeasured on 27 September 2026, on commit `ee2de97`, in the same way:
 
 | `tinyjoin-core` | Engine gzip | `insert-transaction` | `insert-batch` | `select-scan` | `group-by` | `update-pk` | `delete-range` | `create-index` |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `z` (shipped) | 308 KiB | 78 | 51 | 70 | 16.5 | 12.1 | 8.8 | 11.5 |
 | `s` | +24 KiB | 76 | 51 | 69 | 16.3 | 11.4 | 8.8 | 10.6 |
 | `1` | larger | 80 | 53 | 70 | 18.7 | 12.1 | 9.2 | 10.7 |

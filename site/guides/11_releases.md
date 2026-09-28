@@ -55,9 +55,9 @@ no longer matched its stored text.
 
 This release is also much faster. In the
 [comparative benchmarks](/guides/benchmarks/), most workloads in v0.3.0 took 10
-to 1,400 times as long as the faster of SQLite and PGlite. None now takes more
-than about two and a quarter times as long, and reading every row, `LIKE`
-scans, `GROUP BY`, and joins are quicker than in either.
+to 1,400 times as long as the faster of SQLite and PGlite. None now takes as
+much as twice as long, and reading every row, `LIKE` scans, `GROUP BY`, and
+joins are quicker than in either.
 
 - Updates, upserts, and deletes inside a transaction no longer slow down as the
   transaction grows. Each statement is checked against running totals rather
@@ -95,7 +95,10 @@ scans, `GROUP BY`, and joins are quicker than in either.
 - On the tab that owns a database, statements reach the engine as calls rather
   than as messages checked again at every layer.
 - A plain `INSERT` plans each row straight into the record its commit writes,
-  rather than into a map that staging encodes again.
+  rather than into a map that staging encodes again. So does an `UPDATE` that
+  leaves each row's key in place: it rewrites the stored record, keeping the
+  bytes of every column it does not assign, and 1,000 updates by key take about
+  a tenth less of the engine's time.
 - Staging a single-row statement no longer copies the transaction's
   bookkeeping, and each statement's request and result are checked, and its
   result read, with less work on both sides of the Worker. Point inserts,
@@ -106,14 +109,27 @@ scans, `GROUP BY`, and joins are quicker than in either.
   10,000 rows takes about a quarter less time in the browser.
 - A statement's changed rows are kept in the order its scan finds them, rather
   than sorted into maps as they arrive, so deleting 8,000 rows takes about a
-  fifth less time.
+  fifth less time. A `DELETE` outside a transaction also plans each row by its
+  stored key, rather than as a map of its key columns, which takes a further
+  fifth off.
+- Inside a transaction that has changed a table, a scan finds the rows the
+  transaction replaced leaf by leaf, rather than comparing every row's key with
+  the next staged one, and an integer column is compared with integer bounds
+  as integers. A transaction's 100 range `UPDATE`s take a fifth less of the
+  engine's time, and 100 range aggregates about a tenth less.
+- Writing a page stores each cell's fixed-size header and slot directly, rather
+  than copying them a few bytes at a time, and an index key copies text whole.
+  Creating two indexes over 10,000 rows takes 8% less time.
 - A commit checksums the zero bytes that fill most of each page 256 at a time,
   where it read them one at a time, and encodes less besides. Committing a
   single insert takes a third less of the engine's time, and pages read back
   from storage are checked faster too.
 - Several of the engine's small collections are kept in vectors rather than
   B-tree maps, whose code is compiled anew for each type they hold, which took
-  about 15 KiB off the compressed engine.
+  about 15 KiB off the compressed engine. Its hash maps and sets share one
+  quick hash rather than SipHash, whose resistance to colliding keys needs
+  random keys that WebAssembly without a host source of randomness never gave
+  it, and four sets that needed no hashing became vectors: 3 KiB more.
 - Once per page, create() also starts a short-lived second Worker that runs
   the engine's common statements on a scratch in-memory database for about a
   tenth of a second, and then exits. Chromium compiles WebAssembly one function
