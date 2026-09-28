@@ -9,8 +9,7 @@ import {
   isString,
   isUndefined,
   MAX_U32,
-  objHasOwn,
-  ownKeys,
+  objKeys,
 } from '../common.js';
 import type {JsonValue} from '../protocol.js';
 
@@ -34,8 +33,6 @@ const STRING_OVERHEAD = 12;
 const VECTOR_OVERHEAD = 12;
 const RUST_VALUE_BYTES = 24;
 const RUST_MAP_ENTRY_OVERHEAD = 128;
-
-const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 
 export class WasmBridgeError extends Error {
   readonly code: string;
@@ -245,14 +242,21 @@ const writeJsonValues = (
   depth: number,
   label: string,
 ): void => {
-  const length = denseArrayLength(input, label);
+  if (!isArray(input)) {
+    throw invalidBridgeValue(`${label} must be an array`);
+  }
+  const length = input.length;
+  if (!isCountWithin(length, 0, MAX_OPERATIONS)) {
+    throw resourceLimit();
+  }
   request.vector(length, RUST_VALUE_BYTES);
   writeCount(request, length);
   for (let index = 0; index < length; index += 1) {
-    writeJsonValue(request, indexedDataValue(input, index, label), depth);
-  }
-  if (denseArrayLength(input, label) !== length) {
-    throw invalidBridgeValue('A bridge array changed while it was inspected');
+    const item: unknown = input[index];
+    if (isUndefined(item)) {
+      throw invalidBridgeValue(`${label} cannot be sparse`);
+    }
+    writeJsonValue(request, item, depth);
   }
 };
 
@@ -283,16 +287,13 @@ const writeJsonValue = (
     writeJsonValues(request, value, depth + 1, 'JSON array');
   } else if (isRecord(value)) {
     request.u8(JSON_OBJECT);
-    // The count is written once the entries are.
-    const countAt = request.reserve(4);
-    let count = 0;
-    forEachEnumerableDataEntry(value, (key, child) => {
-      count += 1;
+    const keys = objKeys(value);
+    writeCount(request, keys.length);
+    for (const key of keys) {
       request.string(key);
       request.retain(RUST_VALUE_BYTES + RUST_MAP_ENTRY_OVERHEAD);
-      writeJsonValue(request, child, depth + 1);
-    });
-    view.setUint32(countAt, count, true);
+      writeJsonValue(request, value[key], depth + 1);
+    }
   } else {
     throw invalidBridgeValue('A value is not JSON-compatible');
   }
@@ -305,90 +306,17 @@ const writeCount = (request: RequestWriter, count: number): void => {
   request.u32(count);
 };
 
-const MISSING = Symbol('missing');
-
-// A bridge value may be a hostile object: every read goes through the property
-// descriptor, so that a getter cannot observe the walk or change what WASM then
-// receives. Array.isArray is read through a try/catch for the same reason: a
-// Proxy can throw from any trap.
+// Every request reaches the writer as plain data: a structured clone that the
+// protocol check accepted, or values the Worker built itself. Structured
+// cloning leaves no accessors or proxies, so properties are read directly.
+// Array.isArray is still read through a try/catch, since a revoked proxy
+// throws from it.
 const isArray = (value: unknown): value is unknown[] => {
   try {
     return arrayIsArray(value);
   } catch {
     throw invalidBridgeValue('A bridge array could not be inspected');
   }
-};
-
-const ownDataDescriptor = (
-  value: object,
-  name: string | number,
-): PropertyDescriptor | undefined => {
-  try {
-    return getOwnPropertyDescriptor(value, name);
-  } catch {
-    throw invalidBridgeValue('A bridge property descriptor could not be read');
-  }
-};
-
-const ownDataField = (value: object, name: string | number): unknown => {
-  const descriptor = ownDataDescriptor(value, name);
-  if (isUndefined(descriptor)) {
-    return MISSING;
-  }
-  if (!objHasOwn(descriptor, 'value')) {
-    throw invalidBridgeValue('Bridge accessors are not supported');
-  }
-  return descriptor.value;
-};
-
-const forEachEnumerableDataEntry = (
-  value: object,
-  visit: (key: string, value: unknown) => void,
-): void => {
-  let keys: (string | symbol)[];
-  try {
-    keys = ownKeys(value);
-  } catch {
-    throw invalidBridgeValue('Bridge object keys could not be read');
-  }
-  if (keys.length > MAX_OPERATIONS) {
-    throw resourceLimit();
-  }
-  for (const key of keys) {
-    if (!isString(key)) {
-      continue;
-    }
-    const descriptor = ownDataDescriptor(value, key);
-    if (isUndefined(descriptor) || !objHasOwn(descriptor, 'value')) {
-      throw invalidBridgeValue('Bridge accessors are not supported');
-    }
-    if (descriptor.enumerable) {
-      visit(key, descriptor.value);
-    }
-  }
-};
-
-const denseArrayLength = (value: unknown, label: string): number => {
-  if (!isArray(value)) {
-    throw invalidBridgeValue(`${label} must be an array`);
-  }
-  const length = ownDataField(value, 'length');
-  if (!isCountWithin(length, 0, MAX_OPERATIONS)) {
-    throw resourceLimit();
-  }
-  return length;
-};
-
-const indexedDataValue = (
-  value: unknown,
-  index: number,
-  label: string,
-): unknown => {
-  const item = ownDataField(value as object, index);
-  if (item === MISSING || isUndefined(item)) {
-    throw invalidBridgeValue(`${label} cannot be sparse`);
-  }
-  return item;
 };
 
 const preparedStatementId = (value: unknown): number => {

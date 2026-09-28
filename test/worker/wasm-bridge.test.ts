@@ -299,14 +299,9 @@ describe('WASM engine bridge', () => {
   it('preflights structured requests before entering WASM', () => {
     const raw = new FakeRawEngine();
     const engine = adaptStructuredWasmEngine(raw);
-    const accessor = {} as {value?: number};
-    Object.defineProperty(accessor, 'value', {
-      enumerable: true,
-      get: () => 1,
-    });
 
     expect(() =>
-      engine.executeSql('SELECT $1', [accessor as unknown as Row]),
+      engine.executeSql('SELECT $1', [{value: Number.NaN} as unknown as Row]),
     ).toThrow(expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}));
     expect(raw.calls).toHaveLength(0);
   });

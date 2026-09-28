@@ -196,6 +196,11 @@ Done:
   engine-only. A scalar parameter whose JSON text cannot pass the bound is no
   longer measured exactly, which formatted a float and scanned a string: 1,000
   updates by key fell a further 3%.
+- The Worker writes a request's parameters by reading them directly, rather
+  than through each property's descriptor so that no getter could run: every
+  request reaches it as a structured clone the protocol check accepted, which
+  holds no accessors. Engine-only in a Chromium Worker, 10,000 inserts one at
+  a time or 200 at a time fell by a tenth.
 
 Found along the way:
 
@@ -272,8 +277,7 @@ Remaining, in order of expected value:
    protocol's checks took 5-10% off each point statement in the browser on
    28 September; what remains is spread thinly: the response header's JSON,
    written in WASM and, for a result that committed, parsed in the Worker,
-   the parameters' defensive encoding, and binding a statement by cloning its
-   template. An `UPDATE` that keeps each row's key now
+   and binding a statement by cloning its template. An `UPDATE` that keeps each row's key now
    writes the row's new record from its old one, a tenth off 1,000 updates by
    key engine-only; an upsert still plans maps for both its halves. Profiled
    engine-only on 29 September, excluding its commit, such an `UPDATE` spends

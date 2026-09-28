@@ -109,24 +109,16 @@ describe('WASM request writing', () => {
     ).toEqual({statementId: 4, params: [{a: [1, 'b']}]});
   });
 
-  it('rejects sparse arrays, accessors, revoked proxies, and oversized work', () => {
+  it('rejects sparse arrays, values beyond JSON, revoked proxies, and oversized work', () => {
     const sparse = new Array<JsonValue>(1);
     expect(() => encodeExecuteSql('SELECT $1', sparse, false)).toThrow(
       expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}),
     );
-
-    let getterCalls = 0;
-    const accessor = Object.defineProperty({}, 'id', {
-      enumerable: true,
-      get() {
-        getterCalls += 1;
-        return 1;
-      },
-    });
-    expect(() =>
-      encodeExecuteSql('SELECT $1', [accessor as JsonValue], false),
-    ).toThrow(expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}));
-    expect(getterCalls).toBe(0);
+    for (const value of [Number.NaN, () => 1, {nested: [undefined]}]) {
+      expect(() =>
+        encodeExecuteSql('SELECT $1', [value as JsonValue], false),
+      ).toThrow(expect.objectContaining({code: 'INVALID_BRIDGE_VALUE'}));
+    }
 
     const revoked = Proxy.revocable([], {});
     revoked.revoke();
