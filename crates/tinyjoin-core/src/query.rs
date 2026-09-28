@@ -2352,12 +2352,15 @@ enum FilterNode<'a> {
     },
     /// Adjacent comparisons of one column under `AND`, such as a range's two bounds, which read
     /// the column once. When every bound is a number, `bounds` holds them as `f64`, as they
-    /// compare, so a numeric column is compared without converting them for every row.
+    /// compare, so a numeric column is compared without converting them for every row. When
+    /// every bound is an integer, `integers` holds the inclusive range of integers they accept,
+    /// which an integer, always within the safe range, compares with as it would as `f64`.
     Comparisons {
         column: usize,
         name: &'a str,
         tests: Vec<(ComparisonOperator, &'a Value)>,
         bounds: Vec<(ComparisonOperator, f64)>,
+        integers: Option<(i64, i64)>,
     },
     IsNull {
         column: usize,
@@ -2498,6 +2501,7 @@ impl<'a> FilterNode<'a> {
                                 name,
                                 tests,
                                 bounds: Vec::new(),
+                                integers: None,
                             };
                         }
                         _ => nodes.push(Self::Comparison {
@@ -2509,8 +2513,15 @@ impl<'a> FilterNode<'a> {
                     }
                 }
                 for node in &mut nodes {
-                    if let Self::Comparisons { tests, bounds, .. } = node {
+                    if let Self::Comparisons {
+                        tests,
+                        bounds,
+                        integers,
+                        ..
+                    } = node
+                    {
                         *bounds = numeric_bounds(tests);
+                        *integers = integer_range(tests);
                     }
                 }
                 // AND over one node is that node.
@@ -2532,15 +2543,35 @@ impl<'a> FilterNode<'a> {
                 name,
                 operator,
                 value,
-            } => compare_to_value(&row.column(*column)?, value, *operator, table, name),
+            } => {
+                let actual = row.column(*column)?;
+                // An integer, always within the safe range, orders against an integer bound as it
+                // would as `f64`.
+                if let (ValueRef::Integer(left), Some(right)) = (&actual, value.as_i64()) {
+                    return Ok(if accepts(*operator, left.cmp(&right)) {
+                        Truth::True
+                    } else {
+                        Truth::False
+                    });
+                }
+                compare_to_value(&actual, value, *operator, table, name)
+            }
             // The comparisons combine as they would under `AND`, in order.
             Self::Comparisons {
                 column,
                 name,
                 tests,
                 bounds,
+                integers,
             } => {
                 let actual = row.column(*column)?;
+                if let (ValueRef::Integer(value), Some((low, high))) = (&actual, integers) {
+                    return Ok(if low <= value && value <= high {
+                        Truth::True
+                    } else {
+                        Truth::False
+                    });
+                }
                 let number = match actual {
                     ValueRef::Integer(value) => Some(value as f64),
                     ValueRef::Float(value) => Some(value),
@@ -2653,6 +2684,31 @@ fn numeric_bounds(tests: &[(ComparisonOperator, &Value)]) -> Vec<(ComparisonOper
         }
     }
     bounds
+}
+
+/// The inclusive range of integers a run of comparisons accepts, which is empty when none does,
+/// or none unless every bound is an integer and no test is `<>`.
+fn integer_range(tests: &[(ComparisonOperator, &Value)]) -> Option<(i64, i64)> {
+    const EMPTY: Option<(i64, i64)> = Some((1, 0));
+    let (mut low, mut high) = (i64::MIN, i64::MAX);
+    for (operator, value) in tests {
+        let bound = value.as_i64()?;
+        match operator {
+            ComparisonOperator::Eq => (low, high) = (low.max(bound), high.min(bound)),
+            ComparisonOperator::Gte => low = low.max(bound),
+            ComparisonOperator::Lte => high = high.min(bound),
+            ComparisonOperator::Gt => match bound.checked_add(1) {
+                Some(bound) => low = low.max(bound),
+                None => return EMPTY,
+            },
+            ComparisonOperator::Lt => match bound.checked_sub(1) {
+                Some(bound) => high = high.min(bound),
+                None => return EMPTY,
+            },
+            ComparisonOperator::Neq => return None,
+        }
+    }
+    Some((low, high))
 }
 
 /// Whether a value ordered as `ordering` against a bound satisfies `operator`.
@@ -4297,6 +4353,10 @@ mod tests {
             json!(2.0),
             json!(1.5),
             json!(5),
+            json!(i64::MAX),
+            json!(i64::MIN),
+            json!(u64::MAX),
+            json!(9_007_199_254_740_993_i64),
             json!(""),
             json!("a"),
             json!("abc"),
@@ -4455,6 +4515,54 @@ mod tests {
             checked > 1_000,
             "only {checked} generated predicates were valid"
         );
+    }
+
+    #[test]
+    fn integer_ranges_accept_exactly_the_integers_their_bounds_do() {
+        use ComparisonOperator::{Eq, Gt, Gte, Lt, Lte, Neq};
+        let (max, min) = (json!(i64::MAX), json!(i64::MIN));
+        for (tests, expected) in [
+            (vec![(Gte, json!(3)), (Lt, json!(7))], Some((3, 6))),
+            (vec![(Gt, json!(3)), (Lte, json!(7))], Some((4, 7))),
+            (vec![(Eq, json!(5)), (Gte, json!(3))], Some((5, 5))),
+            (vec![(Gte, json!(9)), (Lte, json!(1))], Some((9, 1))),
+            (vec![(Gt, max.clone())], Some((1, 0))),
+            (vec![(Lt, min.clone())], Some((1, 0))),
+            (vec![(Gte, max.clone())], Some((i64::MAX, i64::MAX))),
+            (vec![(Lte, min.clone())], Some((i64::MIN, i64::MIN))),
+            (vec![(Neq, json!(5)), (Gt, json!(1))], None),
+            (vec![(Gt, json!(1.5)), (Lt, json!(3))], None),
+            (vec![(Gt, json!(1)), (Lt, json!(u64::MAX))], None),
+        ] {
+            let tests = tests
+                .iter()
+                .map(|(operator, value)| (*operator, value))
+                .collect::<Vec<_>>();
+            let range = integer_range(&tests);
+            assert_eq!(range, expected, "{tests:?}");
+            // Each integer the range holds satisfies every test, as `f64` compares it.
+            if let Some((low, high)) = range {
+                for value in [
+                    low.saturating_sub(1),
+                    low,
+                    high,
+                    high.saturating_add(1),
+                    0,
+                    5,
+                ] {
+                    let accepted = tests.iter().all(|(operator, bound)| {
+                        accepts(
+                            *operator,
+                            (value as f64).total_cmp(&bound.as_f64().unwrap()),
+                        )
+                    });
+                    // Stored integers are within the safe range, where `f64` holds them exactly.
+                    if value.unsigned_abs() < 1 << 53 {
+                        assert_eq!(low <= value && value <= high, accepted, "{tests:?} {value}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
