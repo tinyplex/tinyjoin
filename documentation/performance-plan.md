@@ -201,6 +201,14 @@ Done:
   request reaches it as a structured clone the protocol check accepted, which
   holds no accessors. Engine-only in a Chromium Worker, 10,000 inserts one at
   a time or 200 at a time fell by a tenth.
+- A single-row upsert without `RETURNING` that meets a stored row by its
+  primary key rewrites the row's record, as an `UPDATE` keeping its key does,
+  rather than decoding the row into a map, applying `DO UPDATE SET`, and
+  encoding it again. A row whose text could pass the row limit, a table keeping
+  a JSON column the statement does not assign, and an assignment to a key
+  column still plan maps. 1,000 upserts, half of them updates, fell from 9.0
+  ms to 8.3 engine-only, for 1.3 KiB compressed, and a test checks that both
+  plannings agree statement by statement.
 
 Found along the way:
 
@@ -277,15 +285,15 @@ Remaining, in order of expected value:
    protocol's checks took 5-10% off each point statement in the browser on
    28 September; what remains is spread thinly: the response header's JSON,
    written in WASM and, for a result that committed, parsed in the Worker,
-   and binding a statement by cloning its template. An `UPDATE` that keeps each row's key now
-   writes the row's new record from its old one, a tenth off 1,000 updates by
-   key engine-only; an upsert still plans maps for both its halves. Profiled
-   engine-only on 29 September, excluding its commit, such an `UPDATE` spends
-   about 18% building its result's JSON header in WASM and parsing it in the
-   Worker, 6% encoding its parameters, and a third planning, where the key
-   lookup costs most: a key map built from the predicate and then encoded
-   (4%), and the B-tree descent, which reads each probed cell's key (10%).
-   The rest is the Worker's JavaScript, a
+   and binding a statement by cloning its template. An `UPDATE` that keeps
+   each row's key now writes the row's new record from its old one, a tenth
+   off 1,000 updates by key engine-only, and a single-row upsert that meets a
+   stored row does too. Profiled engine-only on 29 September, excluding its
+   commit, such an `UPDATE` spends about 18% building its result's JSON
+   header in WASM and parsing it in the Worker, 6% encoding its parameters,
+   and a third planning, where the key lookup costs most: a key map built
+   from the predicate and then encoded (4%), and the B-tree descent, which
+   reads each probed cell's key (10%). The rest is the Worker's JavaScript, a
    few microseconds more than SQLite's: the layers each request passes
    through, and copying requests and results between threads as object
    graphs. Parameters now cross into WASM as bytes the Worker writes while it

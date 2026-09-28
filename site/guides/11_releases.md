@@ -103,7 +103,8 @@ and building indexes are quicker than in either.
   rather than into a map that staging encodes again. So does an `UPDATE` that
   leaves each row's key in place: it rewrites the stored record, keeping the
   bytes of every column it does not assign, and 1,000 updates by key take about
-  a tenth less of the engine's time.
+  a tenth less of the engine's time. A single-row upsert rewrites the stored
+  row it conflicts with the same way.
 - Staging a single-row statement no longer copies the transaction's
   bookkeeping, and each statement's request and result are checked, and its
   result read, with less work on both sides of the Worker. Point inserts,

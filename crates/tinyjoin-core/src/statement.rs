@@ -820,6 +820,12 @@ fn plan_insert(
     } else {
         None
     };
+    // A lone upsert without RETURNING rewrites a stored row it conflicts with as its record, as an
+    // UPDATE that keeps each row's key does.
+    if let Some(conflicts) = &mut conflicts {
+        conflicts.keeps_stored =
+            lone && returning.is_none() && storage.record_layout(table).is_some();
+    }
     for values in value_rows {
         if !default_values && values.len() != columns.len() {
             return Err(EngineError::invalid_query(format!(
@@ -896,6 +902,41 @@ fn plan_insert(
             None => Conflict::None,
         };
         let updates = conflicts.as_ref().and_then(ConflictPlan::updates);
+        let conflict = match (conflict, updates) {
+            (Conflict::Stored(held, bytes), Some(updates)) => {
+                match rewritten_record(storage, &schema, updates, &held, &row)? {
+                    Some(RewrittenRecord {
+                        key,
+                        record,
+                        bytes: record_bytes,
+                    }) => {
+                        // Charged as the map it replaces, which the record's estimate is.
+                        work_bytes =
+                            checked_dml_add(work_bytes, checked_dml_add(record_bytes, 96)?)?;
+                        ensure_dml_work_bytes(work_bytes)?;
+                        work_bytes = retain_dml_change(work_bytes, table)?;
+                        changes.push(RowChange::Put {
+                            table: table.to_owned(),
+                            key,
+                            record,
+                        });
+                        previous.push(if kept.fits(bytes) {
+                            PreviousRow::Read(Some(held))
+                        } else {
+                            PreviousRow::Unread
+                        });
+                        continue;
+                    }
+                    None => {
+                        Conflict::Existing(held_row(&schema, storage, &held)?, Some((held, bytes)))
+                    }
+                }
+            }
+            (Conflict::Stored(held, bytes), None) => {
+                Conflict::Existing(held_row(&schema, storage, &held)?, Some((held, bytes)))
+            }
+            (conflict, _) => conflict,
+        };
         let (row, key, held) = match conflict {
             Conflict::None => {
                 let repeated = if conflicts.is_some() {
@@ -912,6 +953,7 @@ fn plan_insert(
                 (row, key, PreviousRow::Read(None))
             }
             Conflict::Written | Conflict::Existing(..) if updates.is_none() => continue,
+            Conflict::Stored(..) => unreachable!("a stored conflict was rewritten or read above"),
             Conflict::Written => {
                 return Err(EngineError::constraint_violation(format!(
                     "INSERT ... ON CONFLICT DO UPDATE cannot affect a row in `{table}` a second time"
@@ -1020,6 +1062,9 @@ enum Conflict {
     /// The proposed row conflicts with an existing row. A row found by its primary key also comes
     /// as a writer keeps it, with the bytes that keeps.
     Existing(Row, Option<(HeldRow, usize)>),
+    /// The proposed row conflicts with a stored row found by its primary key, kept as its entry
+    /// with the bytes that keeps, for a lone row that rewrites the record without a map of it.
+    Stored(HeldRow, usize),
 }
 
 /// One arbiter unique index, with the keys this statement has written into it.
@@ -1040,6 +1085,9 @@ struct ConflictPlan {
     primary: bool,
     indexes: Vec<ConflictIndex>,
     updates: Option<Vec<(String, ResolvedConflictValue)>>,
+    /// Whether a stored row found by its primary key comes as its entry, to be rewritten as its
+    /// record, rather than as a map.
+    keeps_stored: bool,
 }
 
 enum ResolvedConflictValue {
@@ -1123,6 +1171,7 @@ impl ConflictPlan {
             primary,
             indexes,
             updates,
+            keeps_stored: false,
         })
     }
 
@@ -1156,11 +1205,16 @@ impl ConflictPlan {
         if self.primary {
             let mut existing = None;
             storage.visit_primary_key(&schema.name, row, &mut |found| {
-                existing = Some((found.to_row()?, (found.hold()?, found.held_bytes()?)));
+                let (held, bytes) = (found.hold()?, found.held_bytes()?);
+                existing = Some(if self.keeps_stored && found.stored().is_some() {
+                    Conflict::Stored(held, bytes)
+                } else {
+                    Conflict::Existing(found.to_row()?, Some((held, bytes)))
+                });
                 Ok(VisitControl::Stop)
             })?;
-            if let Some((existing, held)) = existing {
-                return Ok(Conflict::Existing(existing, Some(held)));
+            if let Some(existing) = existing {
+                return Ok(existing);
             }
         }
         for (index, index_key) in self.indexes.iter_mut().zip(index_keys) {
@@ -1875,13 +1929,90 @@ impl<'a> RecordUpdate<'a> {
     /// value's JSON text takes at most six times its encoded bytes, as escaped text, and at most
     /// 25 as a number.
     fn record<'r, 's>(&self, row: &'r RowRef<'s>) -> Option<&'r StoredRecord<'s>> {
-        let record = row.stored()?;
+        row.stored().filter(|record| self.fits(record))
+    }
+
+    fn fits(&self, record: &StoredRecord<'_>) -> bool {
         let bound = record
             .entry_len()
             .saturating_mul(6)
             .saturating_add(self.assigned.len().saturating_mul(25))
             .saturating_add(self.bound);
-        (bound <= MAX_LOGICAL_ROW_BYTES).then_some(record)
+        bound <= MAX_LOGICAL_ROW_BYTES
+    }
+}
+
+/// A stored row's key, and the record an upsert rewrites it with, estimated at `bytes`, as the map
+/// it replaces is.
+struct RewrittenRecord {
+    key: Vec<u8>,
+    record: Vec<u8>,
+    bytes: usize,
+}
+
+/// The record a lone upsert rewrites the stored row `held` with, keeping its key and the bytes of
+/// every column `DO UPDATE SET` leaves. A row whose text could pass the row limit, a table keeping
+/// a JSON column the statement does not assign, and an assignment to a key column are left to be
+/// planned as maps.
+fn rewritten_record(
+    storage: &dyn StorageReader,
+    schema: &TableDefinition,
+    updates: &[(String, ResolvedConflictValue)],
+    held: &HeldRow,
+    proposed: &Row,
+) -> Result<Option<RewrittenRecord>> {
+    let HeldRow::Stored(entry) = held else {
+        return Ok(None);
+    };
+    let mut assignments = Vec::with_capacity(updates.len());
+    for (column, value) in updates {
+        let value = match value {
+            ResolvedConflictValue::Value(value) => value.clone(),
+            ResolvedConflictValue::Excluded(source) => proposed
+                .get(source)
+                .cloned()
+                .ok_or_else(|| EngineError::column_not_found(source, &schema.name))?,
+        };
+        assignments.push((column.clone(), value));
+    }
+    let Some(plan) = RecordUpdate::new(storage, schema, &assignments, None)? else {
+        return Ok(None);
+    };
+    let record = StoredRecord::new(schema, &plan.layout, entry.key(), entry.value())?;
+    if !plan.fits(&record) {
+        return Ok(None);
+    }
+    // Checked in schema order, as normalizing a map of the row checks them: a proposed value was
+    // checked for its own column, which need not be the one it is assigned to.
+    for (definition, value) in schema.columns.iter().zip(&plan.assigned) {
+        if let Some(value) = value {
+            validate_value(definition, value, &schema.name)?;
+        }
+    }
+    let next = encode_updated_record(&record, &plan.assigned)?;
+    let bytes = estimated_record_bytes(&StoredRecord::new(
+        schema,
+        &plan.layout,
+        entry.key(),
+        &next,
+    )?)?;
+    Ok(Some(RewrittenRecord {
+        key: entry.key().to_vec(),
+        record: next,
+        bytes,
+    }))
+}
+
+/// The row `held` keeps, as a map.
+fn held_row(schema: &TableDefinition, storage: &dyn StorageReader, held: &HeldRow) -> Result<Row> {
+    match held {
+        HeldRow::Map(row) => Ok(row.clone()),
+        HeldRow::Stored(entry) => {
+            let layout = storage
+                .record_layout(&schema.name)
+                .ok_or_else(unplanned_record)?;
+            StoredRecord::new(schema, &layout, entry.key(), entry.value())?.to_row()
+        }
     }
 }
 
