@@ -723,14 +723,25 @@ impl AllocationBitmap {
         None
     }
 
-    /// The pages allocated here but not in `base`, below `end`, in order.
+    /// The pages allocated here but not in `base`, below `end`, in order, found 64 at a time.
     pub(crate) fn allocated_since(&self, base: &Self, end: PageId) -> Vec<PageId> {
         let mut pages = Vec::new();
-        let end = (end as usize).div_ceil(8).min(self.bits.len());
-        for (byte, (bits, base)) in self.bits[..end].iter().zip(&base.bits).enumerate() {
-            let mut fresh = bits & !base;
+        let (words, _) = self.bits.as_chunks::<8>();
+        let (base_words, _) = base.bits.as_chunks::<8>();
+        let end = end.min(MAX_PAGE_COUNT);
+        for (word, (bits, base)) in words
+            .iter()
+            .zip(base_words)
+            .take((end as usize).div_ceil(64))
+            .enumerate()
+        {
+            let mut fresh = u64::from_le_bytes(*bits) & !u64::from_le_bytes(*base);
             while fresh != 0 {
-                pages.push((byte * 8) as PageId + PageId::from(fresh.trailing_zeros()));
+                let id = (word * 64) as PageId + PageId::from(fresh.trailing_zeros());
+                if id >= end {
+                    break;
+                }
+                pages.push(id);
                 fresh &= fresh - 1;
             }
         }

@@ -208,10 +208,13 @@ impl<D: PageDevice> PageCache<D> {
                 "Candidate {candidate} cannot reserve page {id} while it is present in the committed cache view"
             )));
         }
+        // Every reservation belongs to one candidate, so the first shows whether another is
+        // active.
         if let Some(reservation) = self
             .reservations
             .values()
-            .find(|reservation| reservation.candidate != candidate)
+            .next()
+            .filter(|reservation| reservation.candidate != candidate)
         {
             return Err(cache_error(storage_diagnostic!(
                 "Candidate {candidate} cannot reserve page {id}; candidate {} is already active",
@@ -285,26 +288,78 @@ impl<D: PageDevice> PageCache<D> {
         self.ensure_reserved_by(candidate, id)?;
         self.reservations.remove(&id);
         self.remove_entry((Owner::Candidate(candidate), id));
-        if !self
-            .reservations
-            .values()
-            .any(|reservation| reservation.candidate == candidate)
-        {
+        // Every reservation belongs to this candidate, so it has none left once none remain.
+        if self.reservations.is_empty() {
             self.unflushed_owners
                 .retain(|owner| *owner != Owner::Candidate(candidate));
         }
         Ok(())
     }
 
+    /// Writes and flushes every page a candidate reserved, as a commit does with the pages it
+    /// read from its bitmaps.
     #[cfg(test)]
     pub(crate) fn flush_candidate(&mut self, candidate: CandidateId) -> Result<()> {
-        self.flush_owner(Owner::Candidate(candidate))
+        let mut pages = self
+            .reservations
+            .iter()
+            .filter(|(_, reservation)| reservation.candidate == candidate)
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        pages.sort_unstable();
+        self.write_candidate_pages(candidate, &pages)?;
+        self.flush_device()
     }
 
     /// Writes a candidate's dirty pages to the device without flushing it, so that a commit can
     /// make them durable in the same flush as its other pages.
-    pub(crate) fn write_candidate_pages(&mut self, candidate: CandidateId) -> Result<()> {
-        self.write_owner(Owner::Candidate(candidate))
+    ///
+    /// `pages` are every page the candidate allocated, in ascending order, which the pager reads
+    /// from its bitmaps, so that the pages past the end of the file extend it one after another
+    /// and each run of consecutive pages, up to [`MAX_WRITE_RUN_PAGES`], is written in one call.
+    /// Only those pages' entries are visited, not the whole cache. A candidate's pages are cached
+    /// only under the IDs it reserved, which are those it allocated, so none is missed; installing
+    /// the candidate checks that none is left dirty.
+    pub(crate) fn write_candidate_pages(
+        &mut self,
+        candidate: CandidateId,
+        pages: &[PageId],
+    ) -> Result<()> {
+        let owner = Owner::Candidate(candidate);
+        let mut run: Vec<usize> = Vec::new();
+        let mut bytes = Vec::new();
+        for id in pages {
+            let Some(index) = self.lookup.get(&(owner, *id)).copied() else {
+                continue;
+            };
+            if !self.entries[index].dirty {
+                continue;
+            }
+            let follows = run
+                .last()
+                .is_some_and(|last| self.entries[*last].id + 1 == *id);
+            if !follows || run.len() == MAX_WRITE_RUN_PAGES {
+                self.write_run(&mut run, &mut bytes)?;
+            }
+            let entry = &mut self.entries[index];
+            entry.seal();
+            bytes.extend_from_slice(entry.bytes.as_slice());
+            run.push(index);
+        }
+        self.write_run(&mut run, &mut bytes)
+    }
+
+    /// Whether any page the candidate reserved is cached with changes the device lacks. A
+    /// candidate's pages are cached only under the IDs it reserved.
+    fn has_dirty_pages(&self, candidate: CandidateId) -> bool {
+        let owner = Owner::Candidate(candidate);
+        self.reservations.iter().any(|(id, reservation)| {
+            reservation.candidate == candidate
+                && self
+                    .lookup
+                    .get(&(owner, *id))
+                    .is_some_and(|index| self.entries[*index].dirty)
+        })
     }
 
     /// The checksum a candidate's page was last written with. A page is sealed when it is
@@ -338,18 +393,16 @@ impl<D: PageDevice> PageCache<D> {
         Ok(())
     }
 
+    /// Makes a published candidate's pages the committed view, and drops the committed pages its
+    /// commit freed: those `active_bitmap` allocates and `next_bitmap` does not.
     pub(crate) fn install_candidate(
         &mut self,
         candidate: CandidateId,
+        active_bitmap: &AllocationBitmap,
         next_bitmap: &AllocationBitmap,
     ) -> Result<()> {
         let owner = Owner::Candidate(candidate);
-        if self
-            .entries
-            .iter()
-            .any(|entry| entry.owner == owner && entry.dirty)
-            || self.unflushed_owners.contains(&owner)
-        {
+        if self.has_dirty_pages(candidate) || self.unflushed_owners.contains(&owner) {
             return Err(cache_error(storage_diagnostic!(
                 "Candidate {candidate} must be flushed before it is installed"
             )));
@@ -381,13 +434,8 @@ impl<D: PageDevice> PageCache<D> {
                 )));
             }
         }
-        let mut deallocated = Vec::new();
-        for entry in &self.entries {
-            if entry.owner == Owner::Committed && !next_bitmap.is_allocated(entry.id)? {
-                deallocated.push(entry.id);
-            }
-        }
-        for id in deallocated {
+        // Every committed page is inside the file, so the bitmaps are compared only that far.
+        for id in active_bitmap.allocated_since(next_bitmap, self.device.page_count()) {
             self.remove_entry((Owner::Committed, id));
         }
         // Candidate pages are cached only under reserved IDs, so re-keying each reserved ID moves
@@ -556,32 +604,6 @@ impl<D: PageDevice> PageCache<D> {
         ))
     }
 
-    /// Writes an owner's dirty pages in cache order. Until the cache fills, that is the order a
-    /// candidate wrote its pages in, and it writes the pages it allocates past the end of the
-    /// file in the order it allocated them, so they extend the file one after another. Each run of
-    /// consecutive pages, up to [`MAX_WRITE_RUN_PAGES`], is written in one call.
-    fn write_owner(&mut self, owner: Owner) -> Result<()> {
-        let mut run: Vec<usize> = Vec::new();
-        let mut bytes = Vec::new();
-        for index in 0..self.entries.len() {
-            let entry = &self.entries[index];
-            if entry.owner != owner || !entry.dirty {
-                continue;
-            }
-            let follows = run
-                .last()
-                .is_some_and(|last| self.entries[*last].id + 1 == entry.id);
-            if !follows || run.len() == MAX_WRITE_RUN_PAGES {
-                self.write_run(&mut run, &mut bytes)?;
-            }
-            let entry = &mut self.entries[index];
-            entry.seal();
-            bytes.extend_from_slice(entry.bytes.as_slice());
-            run.push(index);
-        }
-        self.write_run(&mut run, &mut bytes)
-    }
-
     /// Writes a run of dirty entries holding consecutive pages, whose bytes are `bytes`, and
     /// empties both. An empty run writes nothing.
     fn write_run(&mut self, run: &mut Vec<usize>, bytes: &mut Vec<u8>) -> Result<()> {
@@ -618,12 +640,6 @@ impl<D: PageDevice> PageCache<D> {
             self.unflushed_owners.push(entry.owner);
         }
         Ok(())
-    }
-
-    #[cfg(test)]
-    fn flush_owner(&mut self, owner: Owner) -> Result<()> {
-        self.write_owner(owner)?;
-        self.flush_device()
     }
 
     /// Removes one cached entry, if present, moving the last entry into its slot so that only one
@@ -804,7 +820,7 @@ mod tests {
             .unwrap();
         cache.flush_candidate(8).unwrap();
         cache
-            .install_candidate(8, &bitmap_allocating(&active, &[page_id]))
+            .install_candidate(8, &active, &bitmap_allocating(&active, &[page_id]))
             .unwrap();
         assert_eq!(cache.read_page(page_id).unwrap(), &[8; PAGE_SIZE]);
     }
@@ -866,14 +882,14 @@ mod tests {
         assert!(cache.len() <= 2);
         assert_eq!(
             cache
-                .install_candidate(21, &bitmap_allocating(&active, &ids))
+                .install_candidate(21, &active, &bitmap_allocating(&active, &ids))
                 .unwrap_err()
                 .code,
             "PAGE_CACHE_ERROR"
         );
         cache.flush_candidate(21).unwrap();
         cache
-            .install_candidate(21, &bitmap_allocating(&active, &ids))
+            .install_candidate(21, &active, &bitmap_allocating(&active, &ids))
             .unwrap();
         assert_eq!(cache.read_page(ids[0]).unwrap(), &[ids[0] as u8; PAGE_SIZE]);
     }
@@ -892,18 +908,24 @@ mod tests {
             .write_candidate_page(9, page_id, &[9; PAGE_SIZE])
             .unwrap();
         assert_eq!(
-            cache.install_candidate(9, &active).unwrap_err().code,
+            cache
+                .install_candidate(9, &active, &active)
+                .unwrap_err()
+                .code,
             "PAGE_CACHE_ERROR"
         );
         cache.flush_candidate(9).unwrap();
         assert_eq!(cache.device().flush_count(), 1);
         assert_eq!(
-            cache.install_candidate(9, &active).unwrap_err().code,
+            cache
+                .install_candidate(9, &active, &active)
+                .unwrap_err()
+                .code,
             "PAGE_CACHE_ERROR"
         );
         assert_eq!(cache.candidate_page_count(9), 1);
         cache
-            .install_candidate(9, &bitmap_allocating(&active, &[page_id]))
+            .install_candidate(9, &active, &bitmap_allocating(&active, &[page_id]))
             .unwrap();
         assert_eq!(cache.read_page(page_id).unwrap(), &[9; PAGE_SIZE]);
         assert_eq!(cache.candidate_page_count(9), 0);
@@ -981,7 +1003,7 @@ mod tests {
         let mut next = active.clone();
         next.set_allocated(freed, false).unwrap();
         next.set_allocated(replacement, true).unwrap();
-        cache.install_candidate(31, &next).unwrap();
+        cache.install_candidate(31, &active, &next).unwrap();
         cache
             .reserve_candidate_page(32, freed, &next)
             .expect("a freed committed page must be reusable");
@@ -1006,14 +1028,14 @@ mod tests {
         assert_eq!(cache.flush_candidate(41).unwrap_err().code, "INJECTED");
         assert_eq!(
             cache
-                .install_candidate(41, &bitmap_allocating(&active, &[page_id]))
+                .install_candidate(41, &active, &bitmap_allocating(&active, &[page_id]))
                 .unwrap_err()
                 .code,
             "PAGE_CACHE_ERROR"
         );
         cache.flush_candidate(41).unwrap();
         cache
-            .install_candidate(41, &bitmap_allocating(&active, &[page_id]))
+            .install_candidate(41, &active, &bitmap_allocating(&active, &[page_id]))
             .unwrap();
         assert_eq!(cache.read_page(page_id).unwrap(), &[4; PAGE_SIZE]);
     }
@@ -1030,7 +1052,7 @@ mod tests {
         cache.flush_candidate(51).unwrap();
         assert_eq!(
             cache
-                .install_candidate(51, &bitmap_allocating(&active, &[first]))
+                .install_candidate(51, &active, &bitmap_allocating(&active, &[first]))
                 .unwrap_err()
                 .code,
             "PAGE_CACHE_ERROR"
@@ -1060,7 +1082,7 @@ mod tests {
             .write_candidate_page(61, page_id, &[6; PAGE_SIZE])
             .unwrap();
         cache.flush_candidate(61).unwrap();
-        cache.install_candidate(61, &next).unwrap();
+        cache.install_candidate(61, &active, &next).unwrap();
         cache.read_page(0).unwrap();
 
         assert_eq!(

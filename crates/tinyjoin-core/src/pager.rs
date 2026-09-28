@@ -449,7 +449,11 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
             Err(error) => return self.fail_before_superblock(error),
         };
 
-        if let Err(error) = self.pager.cache.write_candidate_pages(self.candidate) {
+        if let Err(error) = self
+            .pager
+            .cache
+            .write_candidate_pages(self.candidate, &new_pages)
+        {
             return self.fail_before_superblock(error);
         }
         let mut hash = CommitHash::new();
@@ -500,11 +504,11 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
                 pager_error("injected cache installation failure"),
             );
         }
-        if let Err(error) = self
-            .pager
-            .cache
-            .install_candidate(self.candidate, &pending.allocation_bitmap)
-        {
+        if let Err(error) = self.pager.cache.install_candidate(
+            self.candidate,
+            &self.pager.active.allocation_bitmap,
+            &pending.allocation_bitmap,
+        ) {
             return self.fail_after_superblock("installing the published cache view", error);
         }
 

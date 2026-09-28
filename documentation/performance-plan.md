@@ -233,6 +233,14 @@ Done:
   benchmark tables are too small to show it, but 1,000 inserts each committed
   alone into a 100,000-row table fell from 626 million instructions to 472
   engine-only, and from 76 ms to 54.
+- A commit writes the pages its transaction allocated from the pager's list
+  of them, in page order, and drops the committed pages it freed from the
+  page cache by comparing the two bitmaps, rather than visiting every cached
+  page three times: to write the candidate's, to check none was left dirty,
+  and to look each committed one up in the new bitmap. A cache full of a
+  large table's pages had made every commit slower: those 1,000 inserts into
+  100,000 rows fell again, from 472 million instructions to 268, and from
+  44 ms to 24.
 
 Found along the way:
 
