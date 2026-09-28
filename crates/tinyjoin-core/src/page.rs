@@ -106,6 +106,30 @@ impl CommitHash {
 }
 
 /// Writes a physical page's checksum, which covers the page with its own field read as zero.
+/// Writes `value` at `offset` as one store of its size, where copying it from a slice would call
+/// `memcpy` for a few bytes.
+#[inline(always)]
+fn put<const N: usize>(bytes: &mut [u8], offset: usize, value: [u8; N]) {
+    *<&mut [u8; N]>::try_from(&mut bytes[offset..offset + N]).expect("bounded write") = value;
+}
+
+/// Writes a page's header, which is all but its checksum, for a payload of `payload_length`
+/// bytes that fits the page.
+fn write_page_header(
+    bytes: &mut [u8; PAGE_SIZE],
+    id: PageId,
+    page_type: PageType,
+    payload_length: usize,
+) {
+    debug_assert!(payload_length <= MAX_PAGE_PAYLOAD_SIZE);
+    bytes[..8].copy_from_slice(PAGE_MAGIC);
+    put(bytes, 8, PAGE_FORMAT_VERSION.to_le_bytes());
+    put(bytes, 10, PAGE_FLAGS.to_le_bytes());
+    put(bytes, 12, id.to_le_bytes());
+    bytes[20] = page_type as u8;
+    put(bytes, 24, (payload_length as u32).to_le_bytes());
+}
+
 pub(crate) fn seal(bytes: &mut [u8; PAGE_SIZE]) {
     let checksum = crc32_update(u32::MAX, &bytes[..PAGE_CRC_OFFSET]);
     let checksum = crc32_update(checksum, &[0; 4]);
@@ -137,6 +161,7 @@ impl Page {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn encode(&self) -> Result<[u8; PAGE_SIZE]> {
         let mut bytes = self.encode_unsealed()?;
         seal(&mut bytes);
@@ -156,12 +181,7 @@ impl Page {
         }
 
         let mut bytes = [0; PAGE_SIZE];
-        bytes[..8].copy_from_slice(PAGE_MAGIC);
-        bytes[8..10].copy_from_slice(&PAGE_FORMAT_VERSION.to_le_bytes());
-        bytes[10..12].copy_from_slice(&PAGE_FLAGS.to_le_bytes());
-        bytes[12..20].copy_from_slice(&self.id.to_le_bytes());
-        bytes[20] = self.page_type as u8;
-        bytes[24..28].copy_from_slice(&(self.payload.len() as u32).to_le_bytes());
+        write_page_header(&mut bytes, self.id, self.page_type, self.payload.len());
         bytes[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + self.payload.len()]
             .copy_from_slice(&self.payload);
         Ok(bytes)
@@ -404,24 +424,38 @@ impl Superblock {
 
     pub(crate) fn encode_page(&self) -> Result<[u8; PAGE_SIZE]> {
         self.validate()?;
-        let mut payload = vec![0; SUPERBLOCK_PAYLOAD_SIZE];
+        let id = self.slot.page_id();
+        validate_page_id(id)?;
+        // Written in place, as every commit writes one.
+        let mut bytes = [0; PAGE_SIZE];
+        write_page_header(
+            &mut bytes,
+            id,
+            PageType::Superblock,
+            SUPERBLOCK_PAYLOAD_SIZE,
+        );
+        let payload = &mut bytes[PAGE_HEADER_SIZE..];
         payload[..8].copy_from_slice(SUPERBLOCK_MAGIC);
-        payload[8..10].copy_from_slice(&SUPERBLOCK_FORMAT_VERSION.to_le_bytes());
-        payload[10..12].copy_from_slice(&SUPERBLOCK_FLAGS.to_le_bytes());
-        payload[12..16].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
-        payload[16..24].copy_from_slice(&self.max_page_count.to_le_bytes());
-        payload[24..32].copy_from_slice(&self.generation.to_le_bytes());
-        payload[32..40].copy_from_slice(&self.database_revision.to_le_bytes());
-        payload[40..48].copy_from_slice(&self.database_hash.to_le_bytes());
-        payload[48..56].copy_from_slice(&self.bitmap_generation.to_le_bytes());
-        payload[56..64]
-            .copy_from_slice(&self.catalog_root_page_id.unwrap_or(u64::MAX).to_le_bytes());
-        payload[64..68].copy_from_slice(&self.live_data_page_count.to_le_bytes());
-        payload[68..70].copy_from_slice(&(BITMAP_CHUNK_COUNT as u16).to_le_bytes());
+        put(payload, 8, SUPERBLOCK_FORMAT_VERSION.to_le_bytes());
+        put(payload, 10, SUPERBLOCK_FLAGS.to_le_bytes());
+        put(payload, 12, (PAGE_SIZE as u32).to_le_bytes());
+        put(payload, 16, self.max_page_count.to_le_bytes());
+        put(payload, 24, self.generation.to_le_bytes());
+        put(payload, 32, self.database_revision.to_le_bytes());
+        put(payload, 40, self.database_hash.to_le_bytes());
+        put(payload, 48, self.bitmap_generation.to_le_bytes());
+        put(
+            payload,
+            56,
+            self.catalog_root_page_id.unwrap_or(u64::MAX).to_le_bytes(),
+        );
+        put(payload, 64, self.live_data_page_count.to_le_bytes());
+        put(payload, 68, (BITMAP_CHUNK_COUNT as u16).to_le_bytes());
         payload[70] = self.slot as u8;
         payload[71] = self.bitmap_slot as u8;
-        payload[72..80].copy_from_slice(&self.commit_hash.to_le_bytes());
-        Page::new(self.slot.page_id(), PageType::Superblock, payload)?.encode()
+        put(payload, 72, self.commit_hash.to_le_bytes());
+        seal(&mut bytes);
+        Ok(bytes)
     }
 
     pub(crate) fn decode_page(bytes: &[u8]) -> Result<Self> {
@@ -667,28 +701,29 @@ impl AllocationBitmap {
             ));
         }
         self.validate_metadata_pages()?;
-        let mut pages = Vec::with_capacity(BITMAP_CHUNK_COUNT);
-        for chunk in 0..BITMAP_CHUNK_COUNT {
+        // Each page is written in place, as every commit writes all of them.
+        let mut pages = vec![[0; PAGE_SIZE]; BITMAP_CHUNK_COUNT];
+        for (chunk, bytes) in pages.iter_mut().enumerate() {
             let start = chunk * MAX_BITMAP_CHUNK_BYTES;
             let end = (start + MAX_BITMAP_CHUNK_BYTES).min(ALLOCATION_BITMAP_BYTES);
             let bits = &self.bits[start..end];
-            let mut payload = Vec::with_capacity(BITMAP_CHUNK_HEADER_SIZE + bits.len());
-            payload.extend_from_slice(&self.generation.to_le_bytes());
-            payload.push(self.slot as u8);
-            payload.push(chunk as u8);
-            payload.push(BITMAP_CHUNK_COUNT as u8);
-            payload.push(0);
-            payload.extend_from_slice(&(bits.len() as u16).to_le_bytes());
-            payload.extend_from_slice(&[0, 0]);
-            payload.extend_from_slice(bits);
-            pages.push(
-                Page::new(
-                    self.slot.page_id(chunk),
-                    PageType::AllocationBitmap,
-                    payload,
-                )?
-                .encode()?,
+            let id = self.slot.page_id(chunk);
+            validate_page_id(id)?;
+            write_page_header(
+                bytes,
+                id,
+                PageType::AllocationBitmap,
+                BITMAP_CHUNK_HEADER_SIZE + bits.len(),
             );
+            let payload = &mut bytes[PAGE_HEADER_SIZE..];
+            put(payload, 0, self.generation.to_le_bytes());
+            payload[8] = self.slot as u8;
+            payload[9] = chunk as u8;
+            payload[10] = BITMAP_CHUNK_COUNT as u8;
+            put(payload, 12, (bits.len() as u16).to_le_bytes());
+            payload[BITMAP_CHUNK_HEADER_SIZE..BITMAP_CHUNK_HEADER_SIZE + bits.len()]
+                .copy_from_slice(bits);
+            seal(bytes);
         }
         Ok(pages)
     }
@@ -1338,6 +1373,74 @@ mod tests {
                 bitmap
             );
             assert_eq!(bitmap.allocated_page_count(), FIRST_DATA_PAGE_ID as u32 + 2);
+        }
+    }
+
+    #[test]
+    fn metadata_pages_written_in_place_match_their_pages_as_payloads() {
+        // Commits write the superblock and bitmap pages in place; each must be byte for byte the
+        // page its payload makes.
+        let mut superblock = Superblock::new(SuperblockSlot::B);
+        superblock.generation = 9;
+        superblock.database_revision = 40;
+        superblock.database_hash = 0x0123_4567_89ab_cdef;
+        superblock.bitmap_generation = 9;
+        superblock.catalog_root_page_id = Some(FIRST_DATA_PAGE_ID + 3);
+        superblock.live_data_page_count = 5;
+        superblock.commit_hash = 0xdead_beef;
+        let mut payload = vec![0; SUPERBLOCK_PAYLOAD_SIZE];
+        payload[..8].copy_from_slice(SUPERBLOCK_MAGIC);
+        payload[8..10].copy_from_slice(&SUPERBLOCK_FORMAT_VERSION.to_le_bytes());
+        payload[10..12].copy_from_slice(&SUPERBLOCK_FLAGS.to_le_bytes());
+        payload[12..16].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+        payload[16..24].copy_from_slice(&superblock.max_page_count.to_le_bytes());
+        payload[24..32].copy_from_slice(&9_u64.to_le_bytes());
+        payload[32..40].copy_from_slice(&40_u64.to_le_bytes());
+        payload[40..48].copy_from_slice(&superblock.database_hash.to_le_bytes());
+        payload[48..56].copy_from_slice(&9_u64.to_le_bytes());
+        payload[56..64].copy_from_slice(&(FIRST_DATA_PAGE_ID + 3).to_le_bytes());
+        payload[64..68].copy_from_slice(&5_u32.to_le_bytes());
+        payload[68..70].copy_from_slice(&(BITMAP_CHUNK_COUNT as u16).to_le_bytes());
+        payload[70] = SuperblockSlot::B as u8;
+        payload[71] = superblock.bitmap_slot as u8;
+        payload[72..80].copy_from_slice(&0xdead_beef_u64.to_le_bytes());
+        let expected = Page::new(SuperblockSlot::B.page_id(), PageType::Superblock, payload)
+            .unwrap()
+            .encode()
+            .unwrap();
+        assert_eq!(superblock.encode_page().unwrap(), expected);
+
+        let mut bitmap = AllocationBitmap::new(9, BitmapSlot::B).unwrap();
+        for id in [
+            FIRST_DATA_PAGE_ID,
+            FIRST_DATA_PAGE_ID + 70,
+            MAX_PAGE_COUNT - 1,
+        ] {
+            bitmap.set_allocated(id, true).unwrap();
+        }
+        for (chunk, page) in bitmap.encode_pages().unwrap().iter().enumerate() {
+            let start = chunk * MAX_BITMAP_CHUNK_BYTES;
+            let bits =
+                &bitmap.bits[start..(start + MAX_BITMAP_CHUNK_BYTES).min(ALLOCATION_BITMAP_BYTES)];
+            let mut payload = 9_u64.to_le_bytes().to_vec();
+            payload.extend([
+                BitmapSlot::B as u8,
+                chunk as u8,
+                BITMAP_CHUNK_COUNT as u8,
+                0,
+            ]);
+            payload.extend((bits.len() as u16).to_le_bytes());
+            payload.extend([0, 0]);
+            payload.extend_from_slice(bits);
+            let expected = Page::new(
+                BitmapSlot::B.page_id(chunk),
+                PageType::AllocationBitmap,
+                payload,
+            )
+            .unwrap()
+            .encode()
+            .unwrap();
+            assert_eq!(*page, expected, "chunk {chunk}");
         }
     }
 
