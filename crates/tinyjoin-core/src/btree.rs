@@ -785,6 +785,43 @@ impl BtreeCursor {
         Ok(Some((key, value)))
     }
 
+    /// The index, in the leaf [`Self::next_leaf`] moved to, of the entry [`Self::next_in_leaf`]
+    /// returns next, moving forward.
+    pub(crate) fn leaf_position(&self) -> usize {
+        self.leaf_index
+    }
+
+    /// Finds which of `keys`, in ascending order, the leaf [`Self::next_leaf`] moved to holds at or
+    /// after the cursor, moving forward, and puts their indexes in `positions`. Each key at or
+    /// below the leaf's last is taken from `keys`, since no later leaf can hold it.
+    pub(crate) fn leaf_positions(
+        &self,
+        keys: &mut &[&[u8]],
+        positions: &mut Vec<usize>,
+    ) -> Result<()> {
+        positions.clear();
+        let Some(leaf) = self.leaf.as_ref().filter(|_| !keys.is_empty()) else {
+            return Ok(());
+        };
+        let Some(last) = leaf.len().checked_sub(1) else {
+            return Ok(());
+        };
+        let last = leaf.leaf_key(last)?;
+        // Each key lies after the one before it, so its search starts there.
+        let mut low = self.leaf_index;
+        while let Some((key, rest)) = keys.split_first()
+            && *key <= last
+        {
+            low = leaf.lower_bound_from(low, key)?;
+            if leaf.leaf_key(low)? == *key {
+                positions.push(low);
+                low += 1;
+            }
+            *keys = rest;
+        }
+        Ok(())
+    }
+
     fn load(
         &mut self,
         reader: &mut impl BtreeReadView,
@@ -832,7 +869,7 @@ impl BtreeCursor {
             let child_index = match (bound, self.backward) {
                 (Some(bound), false) => node.child_index_for(bound)?,
                 (Some(bound), true) => {
-                    node.partition(|index| Ok(node.internal_key(index)? < bound))?
+                    node.partition(0, |index| Ok(node.internal_key(index)? < bound))?
                 }
                 (None, false) => 0,
                 (None, true) => node.len(),
@@ -1171,8 +1208,14 @@ impl<'a> NodeView<'a> {
             .then(|| (&bytes[header_end..key_end], &bytes[key_end..value_end]))
     }
 
+    /// The key of leaf cell `index`, reading only the key: binary searches read many keys and
+    /// no values.
     fn leaf_key(&self, index: usize) -> Result<&[u8]> {
-        Ok(self.leaf_cell(index)?.0)
+        let bytes = &*self.bytes;
+        let offset = self.cell_offset(index)?;
+        let header_end = checked_end(offset, LEAF_CELL_HEADER_SIZE, bytes.len())?;
+        let key_length = read_u16(bytes, offset) as usize;
+        Ok(&bytes[header_end..checked_end(header_end, key_length, bytes.len())?])
     }
 
     fn internal_key(&self, index: usize) -> Result<&[u8]> {
@@ -1199,12 +1242,17 @@ impl<'a> NodeView<'a> {
 
     /// The child to follow for `key`: past every separator key at or below it.
     fn child_index_for(&self, key: &[u8]) -> Result<usize> {
-        self.partition(|index| Ok(self.internal_key(index)? <= key))
+        self.partition(0, |index| Ok(self.internal_key(index)? <= key))
     }
 
     /// The first leaf entry at or after `key`.
     fn lower_bound(&self, key: &[u8]) -> Result<usize> {
-        self.partition(|index| Ok(self.leaf_key(index)? < key))
+        self.lower_bound_from(0, key)
+    }
+
+    /// The first leaf entry at or after `key`, among those from `low` on.
+    fn lower_bound_from(&self, low: usize, key: &[u8]) -> Result<usize> {
+        self.partition(low, |index| Ok(self.leaf_key(index)? < key))
     }
 
     /// The leaf entry whose key is exactly `key`.
@@ -1213,9 +1261,14 @@ impl<'a> NodeView<'a> {
         Ok((index < self.item_count && self.leaf_key(index)? == key).then_some(index))
     }
 
-    /// The number of leading entries for which `before` holds, by binary search over sorted cells.
-    fn partition(&self, mut before: impl FnMut(usize) -> Result<bool>) -> Result<usize> {
-        let (mut low, mut high) = (0, self.item_count);
+    /// The number of leading entries for which `before` holds, by binary search over sorted cells,
+    /// all of which before `low` it holds for.
+    fn partition(
+        &self,
+        low: usize,
+        mut before: impl FnMut(usize) -> Result<bool>,
+    ) -> Result<usize> {
+        let (mut low, mut high) = (low.min(self.item_count), self.item_count);
         while low < high {
             let middle = low + (high - low) / 2;
             if before(middle)? {

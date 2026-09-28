@@ -1,6 +1,5 @@
 use std::{
     cell::Cell,
-    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     rc::Rc,
 };
@@ -750,7 +749,10 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
         self.ensure_base_revision()?;
-        let Some(transaction) = self.transaction else {
+        let Some(entries) = self
+            .transaction
+            .and_then(|transaction| transaction.table_entries(table))
+        else {
             // Without a budget to charge, rows go straight to the visitor.
             if self.work.is_none() {
                 return self.storage.visit_table(table, visitor);
@@ -760,42 +762,31 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
                 visitor(row)
             });
         };
-        let entries = transaction.table_entries(table);
-        let paged = self.storage.table(table)?;
-        // Committed rows and staged entries are both in key order, so the staged entry for each
-        // committed row, if any, is found by walking the two together.
-        let mut staged = entries.map(|entries| entries.iter().peekable());
-        let outcome = self.storage.visit_table(table, &mut |row| {
-            self.charge_work(1)?;
-            if let Some(staged) = &mut staged {
-                let key = row.encoded_key()?;
-                // One comparison per row: most committed rows lie before the next staged key.
-                while let Some((staged_key, entry)) = staged.peek() {
-                    match staged_key.as_slice().cmp(key.as_ref()) {
-                        Ordering::Less => {
-                            staged.next();
-                        }
-                        Ordering::Equal if entry.changed => return Ok(VisitControl::Continue),
-                        _ => break,
-                    }
-                }
+        // The committed rows that changed entries replace are passed over, and the entries' rows
+        // visited after the rest. Both are in key order, so the scan finds each replaced row once.
+        let mut replaced = Vec::new();
+        for (key, entry) in entries {
+            if entry.changed {
+                replaced.push(key.as_slice());
             }
-            visitor(row)
-        })?;
-        if outcome == VisitOutcome::Stopped {
-            return Ok(outcome);
         }
-        if let Some(entries) = entries {
-            for (key, entry) in entries {
-                self.charge_work(1)?;
-                if !entry.changed {
-                    continue;
-                }
-                if let Some(record) = &entry.row.next
-                    && visitor(&RowRef::record(paged.record(key, record)?))? == VisitControl::Stop
-                {
-                    return Ok(VisitOutcome::Stopped);
-                }
+        if self
+            .storage
+            .visit_table_except(table, &replaced, self.work, visitor)?
+            == VisitOutcome::Stopped
+        {
+            return Ok(VisitOutcome::Stopped);
+        }
+        let paged = self.storage.table(table)?;
+        for (key, entry) in entries {
+            self.charge_work(1)?;
+            if !entry.changed {
+                continue;
+            }
+            if let Some(record) = &entry.row.next
+                && visitor(&RowRef::record(paged.record(key, record)?))? == VisitControl::Stop
+            {
+                return Ok(VisitOutcome::Stopped);
             }
         }
         Ok(VisitOutcome::Complete)
@@ -1136,6 +1127,95 @@ mod tests {
         );
         assert!(transaction.is_dirty());
         assert_eq!(transaction.changes(&storage).len(), 2);
+    }
+
+    #[test]
+    fn overlay_scans_pass_over_replaced_rows_across_many_leaves() {
+        // Even keys are committed, across many leaves; odd ones are only ever staged.
+        let mut storage = PagedStorage::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let mut statements = vec![
+            crate::statement::parse(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+                &[],
+            )
+            .unwrap(),
+        ];
+        for id in (2..=3000).step_by(2) {
+            statements.push(
+                crate::statement::parse(
+                    &format!("INSERT INTO items (id, name) VALUES ({id}, 'item {id} of many')"),
+                    &[],
+                )
+                .unwrap(),
+            );
+        }
+        storage.execute_script(statements).unwrap();
+        let mut expected = (2..=3000)
+            .step_by(2)
+            .map(|id| (id, format!("item {id} of many")))
+            .collect::<BTreeMap<i64, String>>();
+        let mut transaction = PagedTransaction::new(storage.revision());
+        let mut changes = Vec::new();
+        // Deletes, updates, and upserts of the value a row holds, which change nothing, across
+        // the committed keys, including the first and the last; inserts between and around them.
+        for id in (0..=3002).step_by(2) {
+            let name = if id % 14 == 0 || id == 3000 {
+                None
+            } else if id % 22 == 0 || id == 2 {
+                Some(format!("updated {id}"))
+            } else if id % 6 == 0 {
+                Some(format!("item {id} of many"))
+            } else if id == 0 || id == 3002 {
+                Some(format!("new {id}"))
+            } else {
+                continue;
+            };
+            changes.push(match &name {
+                Some(name) => RowChange::Upsert {
+                    table: "items".to_owned(),
+                    row: row(json!({"id": id, "name": name})),
+                },
+                None => RowChange::Delete {
+                    table: "items".to_owned(),
+                    key: row(json!({"id": id})),
+                },
+            });
+            match name {
+                Some(name) => expected.insert(id, name),
+                None => expected.remove(&id),
+            };
+        }
+        for id in (1..3000).step_by(98) {
+            changes.push(RowChange::Upsert {
+                table: "items".to_owned(),
+                row: row(json!({"id": id, "name": format!("odd {id}")})),
+            });
+            expected.insert(id, format!("odd {id}"));
+        }
+        let staged = changes.len();
+        transaction.stage(&storage, changes, Vec::new()).unwrap();
+
+        let work = Cell::new(0);
+        for view in [
+            PagedReadView::new(&storage, Some(&transaction)),
+            PagedReadView::with_work_budget(&storage, Some(&transaction), &work),
+        ] {
+            let mut visited = Vec::new();
+            view.visit_table("items", &mut |row| {
+                let row = row.to_row()?;
+                visited.push((
+                    row["id"].as_i64().unwrap(),
+                    row["name"].as_str().unwrap().to_owned(),
+                ));
+                Ok(VisitControl::Continue)
+            })
+            .unwrap();
+            let mut sorted = visited.clone();
+            sorted.sort();
+            assert_eq!(sorted, expected.clone().into_iter().collect::<Vec<_>>());
+        }
+        // Every committed row is charged, whether or not it was passed over, and every entry.
+        assert_eq!(work.get(), 1500 + staged);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, HashSet},
     rc::Rc,
 };
@@ -28,6 +28,7 @@ use crate::{
         secondary_index_primary_key, secondary_index_primary_key_for_definition,
     },
     row::{HeldRow, RowRef, ValueRef},
+    sql_script::charge_operations,
     storage::{
         KeyOrder, KeyRange, RowWriteUsage, normalize_row, preflight_record_write,
         preflight_row_write,
@@ -467,6 +468,52 @@ impl<D: PageDevice> PagedStorage<D> {
         Btree::get(&mut self.pager.borrow_mut(), root, table.tree_id, key)?
             .map(|value| Ok(table.record(key, &value)?.to_entry()))
             .transpose()
+    }
+
+    /// Visits the committed rows of `table` in key order, as [`StorageReader::visit_table`] does,
+    /// except those whose encoded keys `except` holds, in ascending order, charging each row to
+    /// `work`, visited or not. Only a leaf that could hold one of `except` looks for it, once, so
+    /// that a scan passing over the rows a transaction replaced compares no row with their keys.
+    /// Plain scans keep to [`StorageReader::visit_table`], whose loop does nothing else.
+    pub(crate) fn visit_table_except(
+        &self,
+        table: &str,
+        mut except: &[&[u8]],
+        work: Option<&Cell<usize>>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        self.ensure_ready()?;
+        let table = self.table(table)?;
+        let Some(root) = table.root_page_id else {
+            return Ok(VisitOutcome::Complete);
+        };
+        let mut cursor = Btree::cursor(&mut self.pager.borrow_mut(), root, table.tree_id)?;
+        // Rows are read from the cursor's copy of each leaf, so the pager is borrowed only to move
+        // between leaves, or to read a value that overflows, and the visitor can read it too.
+        let mut read = |page_id: PageId| self.pager.borrow_mut().read_page(page_id);
+        let mut positions = Vec::new();
+        while cursor.next_leaf(&mut self.pager.borrow_mut())? {
+            cursor.leaf_positions(&mut except, &mut positions)?;
+            let (mut position, mut skipped) = (cursor.leaf_position(), 0);
+            while let Some((key, value)) = cursor.next_in_leaf(&mut read)? {
+                if let Some(work) = work {
+                    charge_operations(work, 1)?;
+                }
+                position += 1;
+                if positions.get(skipped) == Some(&(position - 1)) {
+                    skipped += 1;
+                    continue;
+                }
+                let value = match &value {
+                    Cow::Borrowed(value) => *value,
+                    Cow::Owned(value) => value.as_slice(),
+                };
+                if visitor(&RowRef::record(table.record(key, value)?))? == VisitControl::Stop {
+                    return Ok(VisitOutcome::Stopped);
+                }
+            }
+        }
+        Ok(VisitOutcome::Complete)
     }
 
     /// Validates one change of a transaction's write set, and measures what it adds to the write
@@ -1086,10 +1133,7 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
         self.ensure_ready()?;
-        let table = self
-            .tables
-            .get(table)
-            .ok_or_else(|| EngineError::table_not_found(table))?;
+        let table = self.table(table)?;
         let Some(root) = table.root_page_id else {
             return Ok(VisitOutcome::Complete);
         };
