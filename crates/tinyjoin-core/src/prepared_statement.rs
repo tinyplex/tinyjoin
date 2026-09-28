@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::mem::size_of;
 
 use serde_json::Value;
@@ -118,7 +117,8 @@ impl PreparedStatement {
 
 #[derive(Debug)]
 pub(crate) struct PreparedStatementRegistry {
-    statements: BTreeMap<PreparedStatementId, PreparedStatement>,
+    /// Registered statements in ID order, which is the order they were prepared in.
+    statements: Vec<(PreparedStatementId, PreparedStatement)>,
     next_id: PreparedStatementId,
     retained_bytes: usize,
 }
@@ -126,7 +126,7 @@ pub(crate) struct PreparedStatementRegistry {
 impl Default for PreparedStatementRegistry {
     fn default() -> Self {
         Self {
-            statements: BTreeMap::new(),
+            statements: Vec::new(),
             next_id: 1,
             retained_bytes: 0,
         }
@@ -156,22 +156,30 @@ impl PreparedStatementRegistry {
         let id = self.next_id;
         self.next_id += 1;
         self.retained_bytes = retained_bytes;
-        self.statements.insert(id, statement);
+        self.statements.push((id, statement));
         Ok(id)
     }
 
-    pub(crate) fn bind(&self, id: PreparedStatementId, params: &[Value]) -> Result<Statement> {
+    /// Where the statement registered as `id` is, if it is.
+    fn position(&self, id: PreparedStatementId) -> Option<usize> {
+        let position = self.statements.partition_point(|(entry, _)| *entry < id);
         self.statements
-            .get(&id)
-            .ok_or_else(|| prepared_not_found(id))?
-            .bind(params)
+            .get(position)
+            .is_some_and(|(entry, _)| *entry == id)
+            .then_some(position)
+    }
+
+    pub(crate) fn bind(&self, id: PreparedStatementId, params: &[Value]) -> Result<Statement> {
+        let position = self.position(id).ok_or_else(|| prepared_not_found(id))?;
+        self.statements[position].1.bind(params)
     }
 
     pub(crate) fn close(&mut self, id: PreparedStatementId) -> Result<()> {
         if id == 0 || id >= self.next_id {
             return Err(prepared_not_found(id));
         }
-        if let Some(statement) = self.statements.remove(&id) {
+        if let Some(position) = self.position(id) {
+            let (_, statement) = self.statements.remove(position);
             self.retained_bytes = self
                 .retained_bytes
                 .checked_sub(statement.retained_bytes())

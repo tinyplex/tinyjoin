@@ -445,11 +445,9 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
     }
 
     fn drop_index(&mut self, name: &str) -> Result<()> {
-        let index = Rc::make_mut(&mut self.indexes)
-            .remove(name)
-            .ok_or_else(|| {
-                EngineError::new("INDEX_NOT_FOUND", format!("Index `{name}` is not defined"))
-            })?;
+        let index = remove_entry(Rc::make_mut(&mut self.indexes), name).ok_or_else(|| {
+            EngineError::new("INDEX_NOT_FOUND", format!("Index `{name}` is not defined"))
+        })?;
         if let Some(root) = index.root_page_id {
             Btree::reclaim(&mut self.transaction.borrow_mut(), root, index.tree_id)?;
         }
@@ -466,8 +464,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         for index_name in index_names {
             self.drop_index(&index_name)?;
         }
-        let table = Rc::make_mut(&mut self.tables)
-            .remove(name)
+        let table = remove_entry(Rc::make_mut(&mut self.tables), name)
             .ok_or_else(|| EngineError::table_not_found(name))?;
         if let Some(root) = table.root_page_id {
             Btree::reclaim(&mut self.transaction.borrow_mut(), root, table.tree_id)?;
@@ -980,6 +977,20 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             database_hash,
         })
     }
+}
+
+/// Takes the entry for `name` out of a catalog map by rebuilding the map without it: tables and
+/// indexes are dropped rarely, and a map's code for removing entries in place is large.
+fn remove_entry<V>(map: &mut BTreeMap<String, V>, name: &str) -> Option<V> {
+    let mut removed = None;
+    for (key, value) in std::mem::take(map) {
+        if key == name {
+            removed = Some(value);
+        } else {
+            map.insert(key, value);
+        }
+    }
+    removed
 }
 
 /// Whether two versions of a table have the same catalog record.
