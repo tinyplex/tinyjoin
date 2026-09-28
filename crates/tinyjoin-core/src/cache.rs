@@ -112,7 +112,9 @@ pub(crate) struct PageCache<D: PageDevice> {
     /// Owners with pages which reached the device but have not been covered by a successful
     /// device-wide durability barrier. A PageDevice flush is global, so one successful flush can
     /// make writes from several interleaved owners durable at once.
-    unflushed_owners: HashSet<Owner>,
+    /// The committed view and a candidate or two at most, which a vector holds without a map's
+    /// code.
+    unflushed_owners: Vec<Owner>,
     capacity: usize,
     hand: usize,
 }
@@ -137,7 +139,7 @@ impl<D: PageDevice> PageCache<D> {
             entries: Vec::with_capacity(capacity),
             lookup: PageKeyMap::with_capacity_and_hasher(capacity, Default::default()),
             reservations: PageKeyMap::default(),
-            unflushed_owners: HashSet::new(),
+            unflushed_owners: Vec::new(),
             capacity,
             hand: 0,
         })
@@ -323,7 +325,8 @@ impl<D: PageDevice> PageCache<D> {
             .values()
             .any(|reservation| reservation.candidate == candidate)
         {
-            self.unflushed_owners.remove(&Owner::Candidate(candidate));
+            self.unflushed_owners
+                .retain(|owner| *owner != Owner::Candidate(candidate));
         }
         Ok(())
     }
@@ -440,7 +443,8 @@ impl<D: PageDevice> PageCache<D> {
 
     pub(crate) fn invalidate_candidate(&mut self, candidate: CandidateId) {
         let owner = Owner::Candidate(candidate);
-        self.unflushed_owners.remove(&owner);
+        self.unflushed_owners
+            .retain(|unflushed| *unflushed != owner);
         // Only reserved IDs can hold candidate entries, so a read-only candidate, which reserves
         // nothing, is released without touching the cache.
         let reserved = self
@@ -626,7 +630,9 @@ impl<D: PageDevice> PageCache<D> {
         for index in run.drain(..) {
             let entry = &mut self.entries[index];
             entry.dirty = false;
-            self.unflushed_owners.insert(entry.owner);
+            if !self.unflushed_owners.contains(&entry.owner) {
+                self.unflushed_owners.push(entry.owner);
+            }
         }
         bytes.clear();
         Ok(())
@@ -643,7 +649,9 @@ impl<D: PageDevice> PageCache<D> {
         }
         self.device.write_page(entry.id, entry.bytes.as_slice())?;
         entry.dirty = false;
-        self.unflushed_owners.insert(entry.owner);
+        if !self.unflushed_owners.contains(&entry.owner) {
+            self.unflushed_owners.push(entry.owner);
+        }
         Ok(())
     }
 

@@ -1493,24 +1493,30 @@ fn plan_update(
     let row_count = updates.len();
     // Encoded keys are canonical, so a spelling-only FLOAT update such as `0` to `-0.0` keeps its
     // key, and a row moving to a key that another row holds, and that this statement leaves in
-    // place, is a collision.
-    let old_keys = updates
+    // place, is a collision. Rows keeping their keys, each visited once, collide with none.
+    if updates
         .iter()
-        .map(|update| update.old_key.as_slice())
-        .collect::<HashSet<_>>();
-    let mut destinations = HashSet::with_capacity(row_count);
-    for update in &updates {
-        let new_key = update.new_key();
-        if !destinations.insert(new_key) {
-            return Err(duplicate_primary_key("UPDATE of", table));
+        .any(|update| update.new_key() != update.old_key)
+    {
+        let mut old_keys = HashSet::with_capacity(row_count);
+        for update in &updates {
+            old_keys.insert(update.old_key.clone());
         }
-        if let UpdatedRow::Map { new_row, .. } = &update.next
-            && new_key != update.old_key
-            && !old_keys.contains(new_key)
-            && storage.visit_primary_key(table, new_row, &mut |_| Ok(VisitControl::Stop))?
-                == VisitOutcome::Stopped
-        {
-            return Err(duplicate_primary_key("UPDATE of", table));
+        let mut destinations = HashSet::with_capacity(row_count);
+        for update in &updates {
+            let new_key = update.new_key();
+            if !destinations.insert(new_key.to_vec()) {
+                return Err(duplicate_primary_key("UPDATE of", table));
+            }
+            // New keys are distinct, so adding one reports whether no row held it before.
+            if let UpdatedRow::Map { new_row, .. } = &update.next
+                && new_key != update.old_key
+                && old_keys.insert(new_key.to_vec())
+                && storage.visit_primary_key(table, new_row, &mut |_| Ok(VisitControl::Stop))?
+                    == VisitOutcome::Stopped
+            {
+                return Err(duplicate_primary_key("UPDATE of", table));
+            }
         }
     }
 

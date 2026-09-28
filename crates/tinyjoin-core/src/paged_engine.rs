@@ -788,6 +788,9 @@ mod tests {
 
         for sql in [
             "UPDATE accounts SET id = 1 WHERE id = 2",
+            // Both rows would move to one key, the first to a key the second leaves.
+            "UPDATE accounts SET id = 2 WHERE id >= 1",
+            "UPDATE accounts SET id = 7",
             "UPDATE accounts SET email = 'ada@example.com' WHERE id = 2",
             "INSERT INTO accounts (id, email) VALUES \
                 (3, 'new@example.com'), (1, 'duplicate@example.com')",

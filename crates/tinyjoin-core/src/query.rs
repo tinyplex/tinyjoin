@@ -223,7 +223,7 @@ pub(crate) fn validate_named_columns(schema: &TableDefinition, columns: &[String
     let mut names = (columns.len() > 16).then(|| HashSet::with_capacity(columns.len()));
     for (index, column) in columns.iter().enumerate() {
         let repeated = match &mut names {
-            Some(names) => !names.insert(column),
+            Some(names) => !names.insert(column.as_str()),
             None => columns[..index].contains(column),
         };
         if repeated {

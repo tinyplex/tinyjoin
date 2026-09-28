@@ -1096,7 +1096,7 @@ fn validate_plan(
 
     let mut outputs = HashSet::new();
     let mut fields = Vec::with_capacity(plan.projections.len());
-    let mut projected = HashSet::new();
+    let mut projected = Vec::with_capacity(plan.projections.len());
     for projection in &plan.projections {
         let (source, index, definition) = resolve_column(&projection.source, relations)?;
         if !outputs.insert(projection.output.as_str()) {
@@ -1111,7 +1111,7 @@ fn validate_plan(
                 projection.output
             )));
         }
-        projected.insert((source, index));
+        projected.push((source, index));
         fields.push(ResultField::new(&projection.output, definition.data_type));
     }
     if let Some(predicate) = &plan.predicate {

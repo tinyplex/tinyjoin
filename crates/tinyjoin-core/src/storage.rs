@@ -830,7 +830,7 @@ pub(crate) fn validate_index_columns_for_schema(
     for name in &definition.columns {
         validate_catalog_name_bound(name)
             .map_err(|error| EngineError::invalid_schema(error.message))?;
-        if !seen.insert(name) {
+        if !seen.insert(name.as_str()) {
             return Err(EngineError::invalid_schema(format!(
                 "Index `{}` names column `{name}` more than once",
                 definition.name
@@ -956,7 +956,7 @@ pub(crate) fn validate_schema(schema: &TableDefinition) -> Result<()> {
                 schema.name
             )));
         }
-        if !columns.insert(column) {
+        if !columns.insert(column.as_str()) {
             return Err(EngineError::invalid_schema(format!(
                 "Table `{}` declares primary-key column `{column}` more than once",
                 schema.name
