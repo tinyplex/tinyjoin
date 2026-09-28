@@ -786,6 +786,9 @@ impl<'a> StoredRecord<'a> {
         })
     }
 
+    /// A stored column's value, read into [`Self::column`] itself, which every predicate a scan
+    /// tests reads through: as calls, the two steps below cost scans about 4%.
+    #[inline(always)]
     fn stored_column(
         &self,
         position: usize,
@@ -802,6 +805,7 @@ impl<'a> StoredRecord<'a> {
 
     /// The encoded value of the stored column at `position`, below the record's count, or `None`
     /// for NULL.
+    #[inline(always)]
     fn stored_bytes(&self, position: usize) -> Result<Option<&'a [u8]>> {
         let start = if position == 0 {
             0
