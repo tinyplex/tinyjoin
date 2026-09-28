@@ -1,13 +1,16 @@
+#[cfg(test)]
+use std::collections::BTreeMap;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     rc::Rc,
 };
 
 #[cfg(test)]
 use crate::RowChange;
 use crate::hash::KeySet;
+use crate::name_map::NameMap;
 #[cfg(test)]
 use crate::paged_codec::{
     CatalogHeader, encode_catalog_header_record, encode_catalog_index_record,
@@ -48,8 +51,8 @@ pub(crate) struct PagedStorage<D: PageDevice> {
     revision: u64,
     next_tree_id: TreeId,
     // Shared with each script candidate, which copies them only if it changes the catalog.
-    tables: Rc<BTreeMap<String, PagedTable>>,
-    indexes: Rc<BTreeMap<String, PagedIndex>>,
+    tables: Rc<NameMap<PagedTable>>,
+    indexes: Rc<NameMap<PagedIndex>>,
     recovery_required: bool,
     #[cfg(test)]
     validated_row_count: std::cell::Cell<usize>,
@@ -277,11 +280,7 @@ pub(crate) struct ValidatedRowWrites {
 
 const MAX_PAGED_BATCH_OPERATIONS: usize = 1_000_000;
 const MAX_PAGED_BATCH_BYTES: usize = 16 * 1024 * 1024;
-type LoadedCatalog = (
-    TreeId,
-    BTreeMap<String, PagedTable>,
-    BTreeMap<String, PagedIndex>,
-);
+type LoadedCatalog = (TreeId, NameMap<PagedTable>, NameMap<PagedIndex>);
 
 impl<D: PageDevice> PagedStorage<D> {
     /// Opens and validates a previously published paged database.
@@ -925,8 +924,8 @@ impl<D: PageDevice> PagedStorage<D> {
 #[cfg(test)]
 fn preflight_batch(
     changes: &[RowChange],
-    tables: &BTreeMap<String, PagedTable>,
-    indexes: &BTreeMap<String, PagedIndex>,
+    tables: &NameMap<PagedTable>,
+    indexes: &NameMap<PagedIndex>,
 ) -> Result<PagedWriteUsage> {
     let definitions = indexes
         .values()
@@ -1586,7 +1585,7 @@ fn load_and_validate_catalog<D: PageDevice>(
         validate_index_tree(pager, record, &table_records)?;
     }
 
-    let mut tables = BTreeMap::new();
+    let mut tables = NameMap::new();
     for (name, record) in table_records {
         let row_count = usize::try_from(record.row_count)
             .map_err(|_| storage_corrupt("A table row count cannot fit in memory"))?;
@@ -1599,7 +1598,7 @@ fn load_and_validate_catalog<D: PageDevice>(
         )?;
         tables.insert(name, table);
     }
-    let mut indexes = BTreeMap::new();
+    let mut indexes = NameMap::new();
     for (name, record) in index_records {
         let entry_count = usize::try_from(record.entry_count)
             .map_err(|_| storage_corrupt("An index entry count cannot fit in memory"))?;

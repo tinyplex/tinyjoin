@@ -138,7 +138,9 @@ joins are quicker than in either.
   about 15 KiB off the compressed engine. Its hash maps and sets share one
   quick hash rather than SipHash, whose resistance to colliding keys needs
   random keys that WebAssembly without a host source of randomness never gave
-  it, and four sets that needed no hashing became vectors: 3 KiB more.
+  it, and four sets that needed no hashing became vectors: 3 KiB more. The
+  catalog's tables and indexes, and the keys a write reports, took 5 KiB
+  more.
 - Once per page, create() also starts a short-lived second Worker that runs
   the engine's common statements on a scratch in-memory database for about a
   tenth of a second, and then exits. Chromium compiles WebAssembly one function

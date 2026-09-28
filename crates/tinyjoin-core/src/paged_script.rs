@@ -11,6 +11,7 @@ use crate::{
     VisitControl, VisitOutcome,
     btree::BatchChange,
     hash::{EMPTY_HASH, combine, identify},
+    name_map::NameMap,
     paged_codec::{
         CATALOG_TREE_ID, CatalogHeader, CatalogIndexRecord, IndexEntry, IndexEntryLayout,
         MAX_CATALOG_INDEXES, MAX_CATALOG_TABLES, MAX_TREE_ID, RecordLayout,
@@ -44,8 +45,8 @@ pub(crate) struct ScriptPublication {
     pub(crate) committed: bool,
     pub(crate) revision: u64,
     pub(crate) next_tree_id: TreeId,
-    pub(crate) tables: Rc<BTreeMap<String, PagedTable>>,
-    pub(crate) indexes: Rc<BTreeMap<String, PagedIndex>>,
+    pub(crate) tables: Rc<NameMap<PagedTable>>,
+    pub(crate) indexes: Rc<NameMap<PagedIndex>>,
     pub(crate) results: Vec<ExecuteResult>,
 }
 
@@ -185,11 +186,11 @@ struct PagedScriptCandidate<'a, D: PageDevice> {
     base_revision: u64,
     next_tree_id: TreeId,
     // Shared with the storage until this candidate changes them.
-    tables: Rc<BTreeMap<String, PagedTable>>,
-    indexes: Rc<BTreeMap<String, PagedIndex>>,
+    tables: Rc<NameMap<PagedTable>>,
+    indexes: Rc<NameMap<PagedIndex>>,
     // The catalog as this candidate found it.
-    base_tables: Rc<BTreeMap<String, PagedTable>>,
-    base_indexes: Rc<BTreeMap<String, PagedIndex>>,
+    base_tables: Rc<NameMap<PagedTable>>,
+    base_indexes: Rc<NameMap<PagedIndex>>,
     mutated: bool,
     operations: Cell<usize>,
     result_bytes: usize,
@@ -199,8 +200,8 @@ pub(crate) fn execute<D: PageDevice>(
     pager: &mut Pager<D>,
     base_revision: u64,
     next_tree_id: TreeId,
-    tables: Rc<BTreeMap<String, PagedTable>>,
-    indexes: Rc<BTreeMap<String, PagedIndex>>,
+    tables: Rc<NameMap<PagedTable>>,
+    indexes: Rc<NameMap<PagedIndex>>,
     statements: Vec<Statement>,
 ) -> Result<ScriptPublication> {
     if statements.is_empty() {
@@ -226,8 +227,8 @@ pub(crate) fn execute_changed_rows<D: PageDevice>(
     pager: &mut Pager<D>,
     base_revision: u64,
     next_tree_id: TreeId,
-    tables: Rc<BTreeMap<String, PagedTable>>,
-    indexes: Rc<BTreeMap<String, PagedIndex>>,
+    tables: Rc<NameMap<PagedTable>>,
+    indexes: Rc<NameMap<PagedIndex>>,
     changes: &[TableChanges<'_>],
 ) -> Result<ScriptPublication> {
     let mut candidate = begin_candidate(pager, base_revision, next_tree_id, tables, indexes)?;
@@ -254,8 +255,8 @@ fn begin_candidate<'a, D: PageDevice>(
     pager: &'a mut Pager<D>,
     base_revision: u64,
     next_tree_id: TreeId,
-    tables: Rc<BTreeMap<String, PagedTable>>,
-    indexes: Rc<BTreeMap<String, PagedIndex>>,
+    tables: Rc<NameMap<PagedTable>>,
+    indexes: Rc<NameMap<PagedIndex>>,
 ) -> Result<PagedScriptCandidate<'a, D>> {
     let catalog_root = pager.catalog_root_page_id();
     let transaction = pager.begin_write()?;
@@ -483,9 +484,11 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
     }
 
     fn drop_index(&mut self, name: &str) -> Result<()> {
-        let index = remove_entry(Rc::make_mut(&mut self.indexes), name).ok_or_else(|| {
-            EngineError::new("INDEX_NOT_FOUND", format!("Index `{name}` is not defined"))
-        })?;
+        let index = Rc::make_mut(&mut self.indexes)
+            .remove(name)
+            .ok_or_else(|| {
+                EngineError::new("INDEX_NOT_FOUND", format!("Index `{name}` is not defined"))
+            })?;
         if let Some(root) = index.root_page_id {
             Btree::reclaim(&mut self.transaction.borrow_mut(), root, index.tree_id)?;
         }
@@ -502,7 +505,8 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         for index_name in index_names {
             self.drop_index(&index_name)?;
         }
-        let table = remove_entry(Rc::make_mut(&mut self.tables), name)
+        let table = Rc::make_mut(&mut self.tables)
+            .remove(name)
             .ok_or_else(|| EngineError::table_not_found(name))?;
         if let Some(root) = table.root_page_id {
             Btree::reclaim(&mut self.transaction.borrow_mut(), root, table.tree_id)?;
@@ -726,7 +730,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
     fn apply_row_changes(&mut self, changes: &[TableChanges<'_>]) -> Result<()> {
         for (table_name, table_changes) in changes {
             let table = Rc::make_mut(&mut self.tables)
-                .get_mut(*table_name)
+                .get_mut(table_name)
                 .ok_or_else(|| EngineError::table_not_found(table_name))?;
             let mut transaction = self.transaction.borrow_mut();
             let batch = table_changes
@@ -1013,20 +1017,6 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             database_hash,
         })
     }
-}
-
-/// Takes the entry for `name` out of a catalog map by rebuilding the map without it: tables and
-/// indexes are dropped rarely, and a map's code for removing entries in place is large.
-fn remove_entry<V>(map: &mut BTreeMap<String, V>, name: &str) -> Option<V> {
-    let mut removed = None;
-    for (key, value) in std::mem::take(map) {
-        if key == name {
-            removed = Some(value);
-        } else {
-            map.insert(key, value);
-        }
-    }
-    removed
 }
 
 /// Whether two versions of a table have the same catalog record.

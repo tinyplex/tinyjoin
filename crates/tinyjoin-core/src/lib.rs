@@ -13,6 +13,7 @@ mod error;
 mod hash;
 mod join;
 mod model;
+mod name_map;
 mod page;
 mod paged_codec;
 mod paged_engine;

@@ -171,6 +171,10 @@ Done:
   transaction, passes through the Worker as the text WASM wrote: its header
   and its rows, which only the page parses and checks, as protocol version 10.
   Point statements took 4-7% less time in the browser benchmark, with OPFS.
+- The catalog keeps its tables and indexes in a `NameMap`: names and values in
+  two sorted vectors, whose search one function serves for both, rather than
+  in two B-tree maps with their own code each. The engine shrank by 2.5 KiB
+  compressed.
 
 Found along the way:
 
@@ -283,9 +287,9 @@ Remaining, in order of expected value:
 6. O2 and O4. Reopening is within 1.1× of SQLite, but checking an index on
    reopen looks up its table row for every entry: engine-only, a 10,000-row
    table's index takes 26 ms to check, where its rows take 15.
-7. Size. Each B-tree map type still compiles its own code: the catalog's
-   tables and indexes, the keys a write reports, and a transaction's claims
-   could live in vectors. The hash sets now share one hasher, but each key
+7. Size. Each B-tree map type still compiles its own code: the keys a write
+   reports and a transaction's claims could live in vectors, as the catalog's
+   tables and indexes now do. The hash sets now share one hasher, but each key
    type still compiles its own table code.
 8. Cold code. A single statement over thousands of rows runs much of its
    per-row code unoptimized the first time (see above), and every benchmark
