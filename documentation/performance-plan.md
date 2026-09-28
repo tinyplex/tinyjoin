@@ -178,7 +178,9 @@ Done:
 - A single-row upsert no longer formats its row's canonical conflict key, the
   text that finds another row of the same statement with the same key, which
   a lone row can never meet: 1,000 upserts fell from 10.5 ms to 10.0
-  engine-only.
+  engine-only. A scalar parameter whose JSON text cannot pass the bound is no
+  longer measured exactly, which formatted a float and scanned a string: 1,000
+  updates by key fell a further 3%.
 
 Found along the way:
 

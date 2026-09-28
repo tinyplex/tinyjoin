@@ -6,8 +6,8 @@ use crate::hash::KeySet;
 use crate::paged_codec::{IndexEntryLayout, encode_key_bound, encode_text_prefix_bounds};
 use crate::row::{Columns, RowRef, ValueRef};
 use crate::storage::{
-    KeyOrder, KeyRange, StorageReader, estimated_checked_value_bytes, estimated_row_bytes,
-    estimated_value_bytes, validate_json_value,
+    KeyOrder, KeyRange, MAX_LOGICAL_VALUE_BYTES, StorageReader, estimated_checked_value_bytes,
+    estimated_row_bytes, estimated_value_bytes, json_scalar_bound, validate_json_value,
 };
 use crate::{
     ColumnDefinition, ColumnType, ComparisonOperator, EngineError, NullOrder, OrderBy,
@@ -873,6 +873,11 @@ pub(crate) fn validate_sql_parameters(params: &[Value]) -> Result<()> {
         )));
     }
     for value in params {
+        // A scalar whose JSON text cannot pass the bound needs no exact measure, which a float
+        // would take formatting and a string a pass over its bytes to find.
+        if json_scalar_bound(value).is_some_and(|bound| bound <= MAX_LOGICAL_VALUE_BYTES) {
+            continue;
+        }
         validate_json_value(value).map_err(|error| {
             EngineError::bind_error(format!(
                 "A SQL parameter is outside storage bounds: {}",
