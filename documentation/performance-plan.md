@@ -148,6 +148,11 @@ Done:
 - Writing a page stores each cell's header and slot as fixed-size stores, and
   an index key copies text whole: creating two indexes fell from 11.2 ms to
   10.3 engine-only.
+- A commit writes its three allocation bitmap pages and its superblock
+  straight into their page arrays, rather than through payload vectors copied
+  into pages: 1,000 inserts each committed alone fell from 27 ms to 25
+  engine-only. A transaction's lookup by key hands the key it encoded to the
+  committed tree rather than encoding it again.
 - Every hash map and set shares one multiplicative hasher: SipHash's keys come
   from memory addresses on `wasm32-unknown-unknown`, which has no random
   source, so it resisted nothing. With four sets that needed no hashing moved

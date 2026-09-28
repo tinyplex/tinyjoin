@@ -2435,9 +2435,10 @@ joins are quicker than in either.
   than copying them a few bytes at a time, and an index key copies text whole.
   Creating two indexes over 10,000 rows takes 8% less time.
 - A commit checksums the zero bytes that fill most of each page 256 at a time,
-  where it read them one at a time, and encodes less besides. Committing a
-  single insert takes a third less of the engine's time, and pages read back
-  from storage are checked faster too.
+  where it read them one at a time, and encodes less besides, writing its
+  allocation bitmap and superblock straight into their pages. Committing a
+  single insert takes over a third less of the engine's time, and pages read
+  back from storage are checked faster too.
 - Several of the engine's small collections are kept in vectors rather than
   B-tree maps, whose code is compiled anew for each type they hold, which took
   about 15 KiB off the compressed engine. Its hash maps and sets share one
