@@ -175,6 +175,10 @@ Done:
   two sorted vectors, whose search one function serves for both, rather than
   in two B-tree maps with their own code each. The engine shrank by 2.5 KiB
   compressed.
+- A single-row upsert no longer formats its row's canonical conflict key, the
+  text that finds another row of the same statement with the same key, which
+  a lone row can never meet: 1,000 upserts fell from 10.5 ms to 10.0
+  engine-only.
 
 Found along the way:
 

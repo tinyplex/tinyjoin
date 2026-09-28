@@ -771,9 +771,11 @@ fn plan_insert(
         .transpose()?;
 
     // Canonical primary keys of every row this statement writes, whether inserted or updated. A
-    // lone row with no conflict clause cannot meet another, so its key is not needed. Without a
-    // conflict clause, the encoded key is canonical and serves.
-    let tracks_keys = conflicts.is_some() || value_rows.len() > 1;
+    // lone row cannot meet another, so without a conflict clause its key is not needed, and with
+    // one its canonical key is never looked for. Without a conflict clause, the encoded key is
+    // canonical and serves.
+    let lone = value_rows.len() == 1;
+    let tracks_keys = conflicts.is_some() || !lone;
     let mut written = KeySet::with_capacity_and_hasher(
         if tracks_keys { value_rows.len() } else { 0 },
         Default::default(),
@@ -865,7 +867,7 @@ fn plan_insert(
         let key_charge = checked_dml_add(checked_dml_mul(storage_key.len(), 2)?, 64)?;
         work_bytes = checked_dml_add(work_bytes, key_charge)?;
         ensure_dml_work_bytes(work_bytes)?;
-        let key = if conflicts.is_some() {
+        let key = if conflicts.is_some() && !lone {
             primary_conflict_key(&schema, &row)?
         } else {
             String::new()
@@ -913,7 +915,11 @@ fn plan_insert(
                     existing,
                     &row,
                 )?;
-                let key = primary_conflict_key(&schema, &row)?;
+                let key = if lone {
+                    String::new()
+                } else {
+                    primary_conflict_key(&schema, &row)?
+                };
                 (
                     row,
                     key,
@@ -923,7 +929,9 @@ fn plan_insert(
         };
         work_bytes = retain_dml_row(work_bytes, &row)?;
         work_bytes = retain_dml_change(work_bytes, table)?;
-        if let Some(conflicts) = &mut conflicts {
+        if let Some(conflicts) = &mut conflicts
+            && !lone
+        {
             conflicts.record(&schema, &row, &mut work_bytes)?;
             written.insert(key);
         }
@@ -1145,7 +1153,9 @@ impl ConflictPlan {
             };
             for existing in index.existing(storage, schema, row, &index_key, work_bytes)? {
                 // A row this statement already rewrote was checked above through its new values.
-                if !written.contains(&primary_conflict_key(schema, &existing)?) {
+                if written.is_empty()
+                    || !written.contains(&primary_conflict_key(schema, &existing)?)
+                {
                     return Ok(Conflict::Existing(existing, None));
                 }
             }
