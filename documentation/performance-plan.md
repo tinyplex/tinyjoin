@@ -67,7 +67,10 @@ code the warm-up Worker compiles ahead of them: indexed ranges, bulk inserts,
 joins, grouping, and deletes. SQLite was about 7% faster in the `5a3e1d7` run,
 so single-statement writes barely moved against it, and about 8% slower in the
 `a9e4b08` run, in which bulk deletes fell to 1.6 times PGlite's, quicker than
-SQLite's.
+SQLite's. A full rerun on `1d9e6e7`, after the scan fast paths, put range
+aggregates at 1.2 times SQLite's and a transaction's range `UPDATE`s at 1.8
+times, but ran under more load, with SQLite about 15% slower than in the
+`a9e4b08` run, so it was not published.
 
 Done:
 
