@@ -994,9 +994,9 @@ mod tests {
 
     #[test]
     fn a_page_written_early_keeps_the_file_dense() {
-        // Writing three new pages in reverse order makes the cache write the last of them first,
-        // behind zero-filled placeholders that the others then overwrite. With room for only two
-        // pages, eviction writes one early during the transaction instead.
+        // Three new pages written in reverse order. A commit writes them in page order, so they
+        // extend the file in turn; with room for only two pages, eviction writes the last of
+        // them early, behind zero-filled placeholders that the others then overwrite.
         for capacity in [2 * PAGE_SIZE, crate::cache::DEFAULT_PAGE_CACHE_BYTES] {
             let mut pager =
                 Pager::with_cache_capacity(MemoryPageDevice::new(0).unwrap(), capacity).unwrap();
@@ -1571,6 +1571,32 @@ mod tests {
         let active = pager.active_metadata().clone();
         let reopened = Pager::open_or_create(pager.into_device()).unwrap();
         assert_eq!(reopened.active_metadata(), &active);
+    }
+
+    #[test]
+    fn a_database_of_an_earlier_page_format_is_refused_as_unsupported() {
+        // v0.1.0 through v0.3.0 wrote page format 2, whose superblocks have a 96-byte payload
+        // and whose metadata takes eight pages.
+        let mut device = MemoryPageDevice::new(8).unwrap();
+        for slot in [SuperblockSlot::A, SuperblockSlot::B] {
+            let mut payload = vec![0; 96];
+            payload[..8].copy_from_slice(b"TGRSUPR\0");
+            payload[8..10].copy_from_slice(&2_u16.to_le_bytes());
+            payload[12..16].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+            payload[16..24].copy_from_slice(&MAX_PAGE_COUNT.to_le_bytes());
+            payload[24..32].copy_from_slice(&1_u64.to_le_bytes());
+            payload[70] = slot as u8;
+            let page = Page::new(slot.page_id(), PageType::Superblock, payload)
+                .unwrap()
+                .encode()
+                .unwrap();
+            device.write_page(slot.page_id(), &page).unwrap();
+        }
+        let error = match Pager::open_or_create(device) {
+            Ok(_) => panic!("an earlier page format must not open"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "UNSUPPORTED_PAGE");
     }
 
     #[test]
