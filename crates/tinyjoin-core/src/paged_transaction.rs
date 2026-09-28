@@ -708,6 +708,10 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
     ) -> Result<VisitOutcome> {
         self.ensure_base_revision()?;
         let Some(transaction) = self.transaction else {
+            // Without a budget to charge, rows go straight to the visitor.
+            if self.work.is_none() {
+                return self.storage.visit_table(table, visitor);
+            }
             return self.storage.visit_table(table, &mut |row| {
                 self.charge_work(1)?;
                 visitor(row)
@@ -774,6 +778,9 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
             // Staged rows follow the committed ones rather than taking their places in key order,
             // so a transaction which changed the table visits every row.
             return self.visit_table(table, visitor);
+        }
+        if self.work.is_none() {
+            return self.storage.visit_table_range(table, range, order, visitor);
         }
         self.storage
             .visit_table_range(table, range, order, &mut |row| {
