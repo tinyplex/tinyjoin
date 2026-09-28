@@ -249,11 +249,15 @@ export const createMemoryPageDevice = (): PageDevice => {
       if (pageId > pages.length) {
         throw gap(pageId, pages.length);
       }
+      // A page written before is copied over in place, which allocates nothing.
       for (let offset = 0; offset < source.byteLength; offset += PAGE_SIZE) {
-        pages[pageId + offset / PAGE_SIZE] = source.slice(
-          offset,
-          offset + PAGE_SIZE,
-        );
+        const bytes = source.subarray(offset, offset + PAGE_SIZE);
+        const page = pages[pageId + offset / PAGE_SIZE];
+        if (isUndefined(page)) {
+          pages[pageId + offset / PAGE_SIZE] = bytes.slice();
+        } else {
+          page.set(bytes);
+        }
       }
       return source.byteLength;
     },

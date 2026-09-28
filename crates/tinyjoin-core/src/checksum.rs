@@ -23,11 +23,16 @@ const TABLE: [u32; 256] = {
 /// by `k` zero bytes, so sixteen independent lookups advance the checksum by sixteen bytes, where
 /// one lookup per byte would each wait for the last. They are built on first use, since as
 /// constants they would add 16 KiB to the engine's download.
-static TABLES: OnceLock<Box<[[u32; 256]; 16]>> = OnceLock::new();
+///
+/// Four more advance a checksum over 256 zero bytes: entry `n` of table `16 + k` is what the state
+/// `n << 8k` becomes. Over zero bytes, each bit of the state moves the result independently, so
+/// four lookups pass a run that would take sixty-four. Pages are mostly zero wherever they are
+/// not full, from the free space in a B-tree node to an allocation bitmap's unused pages.
+static TABLES: OnceLock<Box<[[u32; 256]; 20]>> = OnceLock::new();
 
-fn tables() -> &'static [[u32; 256]; 16] {
+fn tables() -> &'static [[u32; 256]; 20] {
     TABLES.get_or_init(|| {
-        let mut tables = Box::new([[0; 256]; 16]);
+        let mut tables = Box::new([[0; 256]; 20]);
         tables[0] = TABLE;
         for slice in 1..16 {
             for byte in 0..256 {
@@ -35,8 +40,28 @@ fn tables() -> &'static [[u32; 256]; 16] {
                 tables[slice][byte] = (previous >> 8) ^ TABLE[(previous & 255) as usize];
             }
         }
+        for bit in 0..32 {
+            let mut state = 1 << bit;
+            for _ in 0..16 {
+                state = skip(&tables, state);
+            }
+            let mask = 1 << (bit % 8);
+            for (value, entry) in tables[16 + bit / 8].iter_mut().enumerate() {
+                if value & mask != 0 {
+                    *entry ^= state;
+                }
+            }
+        }
         tables
     })
+}
+
+/// The state after sixteen zero bytes: a slicing step with nothing but the state folded in.
+fn skip(tables: &[[u32; 256]; 20], state: u32) -> u32 {
+    tables[15][(state & 255) as usize]
+        ^ tables[14][((state >> 8) & 255) as usize]
+        ^ tables[13][((state >> 16) & 255) as usize]
+        ^ tables[12][(state >> 24) as usize]
 }
 
 pub(crate) fn crc32(bytes: &[u8]) -> u32 {
@@ -48,7 +73,26 @@ pub(crate) fn crc32(bytes: &[u8]) -> u32 {
 pub(crate) fn crc32_update(mut checksum: u32, bytes: &[u8]) -> u32 {
     let tables = tables();
     let (chunks, remainder) = bytes.as_chunks::<16>();
-    for chunk in chunks {
+    let mut index = 0;
+    while let Some(chunk) = chunks.get(index) {
+        if u128::from_ne_bytes(*chunk) == 0 {
+            let run = chunks[index..]
+                .iter()
+                .take_while(|chunk| u128::from_ne_bytes(**chunk) == 0)
+                .count();
+            index += run;
+            for _ in 0..run / 16 {
+                checksum = tables[16][(checksum & 255) as usize]
+                    ^ tables[17][((checksum >> 8) & 255) as usize]
+                    ^ tables[18][((checksum >> 16) & 255) as usize]
+                    ^ tables[19][(checksum >> 24) as usize];
+            }
+            for _ in 0..run % 16 {
+                checksum = skip(tables, checksum);
+            }
+            continue;
+        }
+        index += 1;
         let word = |offset: usize| {
             u32::from_le_bytes([
                 chunk[offset],
@@ -152,6 +196,29 @@ mod tests {
         for byte in [0, 255] {
             let page = [byte; 4096];
             assert_eq!(crc32(&page), tableless_crc32(&page));
+        }
+    }
+
+    #[test]
+    fn passes_zero_runs_of_every_length_and_alignment() {
+        let mut state = 0x9e37_79b9u32;
+        let mut noise = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8 | 1
+        };
+        for run in (0..=48).chain([255, 256, 257, 511, 512, 4000, 4096]) {
+            for before in 0..20 {
+                let mut bytes = (0..before).map(|_| noise()).collect::<Vec<_>>();
+                bytes.resize(before + run, 0);
+                bytes.extend((0..19).map(|_| noise()));
+                assert_eq!(
+                    crc32(&bytes),
+                    tableless_crc32(&bytes),
+                    "{run} after {before}"
+                );
+            }
         }
     }
 }

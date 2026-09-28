@@ -586,6 +586,8 @@ pub(crate) struct AllocationBitmap {
     generation: u64,
     slot: BitmapSlot,
     bits: Vec<u8>,
+    /// How many bits are set, which every commit reads and records.
+    allocated: u32,
 }
 
 impl AllocationBitmap {
@@ -599,6 +601,7 @@ impl AllocationBitmap {
             generation,
             slot,
             bits: vec![0; ALLOCATION_BITMAP_BYTES],
+            allocated: 0,
         };
         for id in 0..FIRST_DATA_PAGE_ID {
             bitmap.set_allocated(id, true)?;
@@ -628,22 +631,19 @@ impl AllocationBitmap {
         }
         let byte = id as usize / 8;
         let mask = 1 << (id as usize % 8);
-        if allocated {
-            self.bits[byte] |= mask;
-        } else {
-            self.bits[byte] &= !mask;
+        if (self.bits[byte] & mask != 0) != allocated {
+            self.bits[byte] ^= mask;
+            if allocated {
+                self.allocated += 1;
+            } else {
+                self.allocated -= 1;
+            }
         }
         Ok(())
     }
 
     pub(crate) fn allocated_page_count(&self) -> u32 {
-        // Eight bytes at a time: every commit counts the whole bitmap.
-        let (words, rest) = self.bits.as_chunks::<8>();
-        let words: u32 = words
-            .iter()
-            .map(|word| u64::from_le_bytes(*word).count_ones())
-            .sum();
-        words + rest.iter().map(|byte| byte.count_ones()).sum::<u32>()
+        self.allocated
     }
 
     pub(crate) fn encode_pages(&self) -> Result<Vec<[u8; PAGE_SIZE]>> {
@@ -758,10 +758,18 @@ impl AllocationBitmap {
         if bits.len() != ALLOCATION_BITMAP_BYTES {
             return Err(invalid_page("Allocation bitmap has the wrong total length"));
         }
+        // Eight bytes at a time, as a bitmap is counted only when it is read.
+        let (words, rest) = bits.as_chunks::<8>();
+        let allocated = words
+            .iter()
+            .map(|word| u64::from_le_bytes(*word).count_ones())
+            .sum::<u32>()
+            + rest.iter().map(|byte| byte.count_ones()).sum::<u32>();
         let bitmap = Self {
             generation: generation.expect("the chunk count is non-zero"),
             slot,
             bits,
+            allocated,
         };
         bitmap.validate_metadata_pages()?;
         Ok(bitmap)
@@ -789,6 +797,7 @@ impl AllocationBitmap {
             generation,
             slot,
             bits: self.bits.clone(),
+            allocated: self.allocated,
         })
     }
 

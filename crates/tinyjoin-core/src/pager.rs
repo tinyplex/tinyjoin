@@ -441,15 +441,13 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
             Err(error) => return self.fail_before_superblock(error),
         };
         // Serialize every metadata page before performing any publication I/O, so that a local
-        // validation error cannot appear after candidate data has been written. Only the commit
-        // hash, which the pages' checksums decide, is added once they have been written.
+        // validation error cannot appear after candidate data has been written. The superblock
+        // was validated as it was built; only the commit hash, which the pages' checksums decide
+        // and which validation does not read, is added once they have been written.
         let bitmap_pages = match pending.allocation_bitmap.encode_pages() {
             Ok(pages) => pages,
             Err(error) => return self.fail_before_superblock(error),
         };
-        if let Err(error) = pending.superblock.encode_page() {
-            return self.fail_before_superblock(error);
-        }
 
         if let Err(error) = self.pager.cache.write_candidate_pages(self.candidate) {
             return self.fail_before_superblock(error);
