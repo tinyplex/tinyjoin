@@ -25,7 +25,8 @@ const OVERLAY_ENTRY_BYTES: usize = 128;
 pub(crate) struct PagedTransaction {
     base_revision: u64,
     entries: BTreeMap<String, BTreeMap<Vec<u8>, OverlayEntry>>,
-    touched_tables: BTreeSet<String>,
+    /// The tables a statement has changed, in name order.
+    touched_tables: Vec<String>,
     totals: Totals,
 }
 
@@ -39,8 +40,9 @@ struct Totals {
     overlay_bytes: usize,
     /// The write set's usage, without the catalog operations it is charged once per table.
     usage: PagedWriteUsage,
-    /// How many changed rows each table has.
-    changed_tables: BTreeMap<String, usize>,
+    /// How many changed rows each table a statement has changed has, in name order. A transaction
+    /// changes few tables, which a vector holds without a map's code.
+    changed_tables: Vec<(String, usize)>,
     /// Each unique-index value a changed row holds, with that row's primary key, or with none
     /// once the row gives it up: a map's code for removing entries is large, so a value given up
     /// is left in place, and the map rebuilt once they are many.
@@ -126,7 +128,7 @@ impl PagedTransaction {
         Self {
             base_revision,
             entries: BTreeMap::new(),
-            touched_tables: BTreeSet::new(),
+            touched_tables: Vec::new(),
             totals: Totals::default(),
         }
     }
@@ -139,8 +141,22 @@ impl PagedTransaction {
         !self.touched_tables.is_empty()
     }
 
-    pub(crate) fn touched_tables(&self) -> BTreeSet<String> {
+    pub(crate) fn touched_tables(&self) -> Vec<String> {
         self.touched_tables.clone()
+    }
+
+    /// Records that a statement changed `table`.
+    fn touch(&mut self, table: &str) {
+        let position = self
+            .touched_tables
+            .partition_point(|touched| touched.as_str() < table);
+        if self
+            .touched_tables
+            .get(position)
+            .is_none_or(|touched| touched != table)
+        {
+            self.touched_tables.insert(position, table.to_owned());
+        }
     }
 
     #[cfg(test)]
@@ -213,16 +229,21 @@ impl PagedTransaction {
         // the totals.
         for ((table, entries), changed_rows) in patch.entries.into_iter().zip(change.changed_rows) {
             let count = changed_count(&self.totals.changed_tables, &table, changed_rows);
-            match self.totals.changed_tables.get_mut(&table) {
-                Some(counted) => *counted = count,
+            match self
+                .totals
+                .changed_tables
+                .iter_mut()
+                .find(|(name, _)| *name == table)
+            {
+                Some((_, counted)) => *counted = count,
                 None if count > 0 => {
-                    self.totals.changed_tables.insert(table.clone(), count);
+                    let tables = &mut self.totals.changed_tables;
+                    let position = tables.partition_point(|(name, _)| *name < table);
+                    tables.insert(position, (table.clone(), count));
                 }
                 None => {}
             }
-            if !self.touched_tables.contains(&table) {
-                self.touched_tables.insert(table.clone());
-            }
+            self.touch(&table);
             match self.entries.get_mut(&table) {
                 Some(staged) => staged.extend(entries),
                 None => {
@@ -483,7 +504,7 @@ impl PagedTransaction {
             }
         }
         for ((table, _), changed) in patch.entries.iter().zip(&changed_rows) {
-            if !self.totals.changed_tables.contains_key(table.as_str()) && *changed as isize > 0 {
+            if table_count(&self.totals.changed_tables, table).is_none() && *changed as isize > 0 {
                 operations = operations
                     .checked_add(storage.catalog_operations(table))
                     .ok_or_else(batch_too_large)?;
@@ -600,8 +621,16 @@ fn changes_from_entries<'a, D: PageDevice>(
 }
 
 /// A table's count of changed rows once `changed`, a two's-complement change, is applied to it.
-fn changed_count(counts: &BTreeMap<String, usize>, table: &str, changed: usize) -> usize {
-    let count = counts.get(table).copied().unwrap_or(0);
+/// The number of changed rows `counts` records for `table`.
+fn table_count(counts: &[(String, usize)], table: &str) -> Option<usize> {
+    counts
+        .iter()
+        .find(|(name, _)| name == table)
+        .map(|(_, count)| *count)
+}
+
+fn changed_count(counts: &[(String, usize)], table: &str, changed: usize) -> usize {
+    let count = table_count(counts, table).unwrap_or(0);
     count
         .checked_add_signed(changed as isize)
         .expect("a changed row's table is counted")
@@ -700,11 +729,7 @@ impl<'a, D: PageDevice> PagedReadView<'a, D> {
     /// indexes apply: no transaction has staged a change to it.
     fn reads_committed(&self, table: &str) -> bool {
         self.transaction.is_none_or(|transaction| {
-            transaction
-                .totals
-                .changed_tables
-                .get(table)
-                .is_none_or(|count| *count == 0)
+            table_count(&transaction.totals.changed_tables, table).is_none_or(|count| count == 0)
         })
     }
 }

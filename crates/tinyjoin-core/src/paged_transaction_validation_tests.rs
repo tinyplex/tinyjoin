@@ -101,7 +101,7 @@ fn stage_with_full_validation(
         }),
     ))?;
     for (table, patched) in patch.entries {
-        transaction.touched_tables.insert(table.clone());
+        transaction.touch(&table);
         transaction
             .entries
             .entry(table)
@@ -154,7 +154,7 @@ fn compare_stage(
             totals
                 .changed_tables
                 .iter()
-                .filter(|(_, count)| **count > 0)
+                .filter(|(_, count)| *count > 0)
                 .map(|(table, _)| table.as_str()),
         )
         .unwrap();

@@ -631,7 +631,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 .filter(|index| index.definition.table == *table_name && index.definition.unique)
             {
                 let positions = index_column_positions(&table.schema, &index.definition)?;
-                let mut changed_prefixes = BTreeMap::<Vec<u8>, &[u8]>::new();
+                let mut changed_prefixes = BTreeSet::new();
                 for (primary_key, change) in table_changes {
                     let Some(record) = &change.next else {
                         continue;
@@ -647,10 +647,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                         .checked_add(prefix.len() + primary_key.len() + 64)
                         .ok_or_else(batch_too_large)?;
                     ensure_batch_bytes(retained_bytes)?;
-                    if changed_prefixes
-                        .insert(prefix.clone(), primary_key)
-                        .is_some()
-                    {
+                    if !changed_prefixes.insert(prefix.clone()) {
                         return Err(unique_violation(&index.definition.name));
                     }
                     for existing_primary_key in self.index_primary_keys(index, &prefix)? {
