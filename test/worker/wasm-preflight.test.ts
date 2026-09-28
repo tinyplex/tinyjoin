@@ -45,6 +45,26 @@ describe('WASM request writing', () => {
     ).toEqual({sql: 'CREATE TABLE items; SELECT * FROM items'});
   });
 
+  it('writes short ASCII strings as copies and every other string as UTF-8', () => {
+    const params = [
+      '',
+      'plain',
+      '\u007f',
+      '\u0080',
+      'ends in é',
+      'é begins',
+      'x'.repeat(64),
+      `${'y'.repeat(63)}é`,
+      'z'.repeat(65),
+    ];
+    expect(
+      decodeRequest(
+        WASM_OPERATION.executePrepared,
+        encodeExecutePrepared(2, params, false),
+      ),
+    ).toEqual({statementId: 2, params});
+  });
+
   it('writes a lone surrogate as TextEncoder does, as U+FFFD', () => {
     expect(
       decodeRequest(

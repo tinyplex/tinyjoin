@@ -128,10 +128,25 @@ class RequestWriter {
     const room =
       start + value.length * 3 > MAX_BYTES ? utf8Length(value) : value.length * 3;
     this.reserve(room);
-    const {written} = textEncoder.encodeInto(
-      value,
-      buffer.subarray(start, start + room),
-    );
+    // A short ASCII string, as most parameters are, is copied a unit at a
+    // time: a browser's TextEncoder call costs more than the copy. Any other
+    // is encoded whole.
+    let written = 0;
+    if (value.length <= MAX_COPIED_STRING_LENGTH) {
+      for (; written < value.length; written += 1) {
+        const code = value.charCodeAt(written);
+        if (code >= 0x80) {
+          break;
+        }
+        buffer[start + written] = code;
+      }
+    }
+    if (written !== value.length) {
+      written = textEncoder.encodeInto(
+        value,
+        buffer.subarray(start, start + room),
+      ).written;
+    }
     this.#length = start + written;
     view.setUint32(lengthAt, written, true);
     this.retain(written + STRING_OVERHEAD);
@@ -178,6 +193,7 @@ class RequestWriter {
 }
 
 const MAX_KEPT_BUFFER_BYTES = 1024 * 1024;
+const MAX_COPIED_STRING_LENGTH = 64;
 
 /** Writes a SQL statement and its parameters. */
 export const encodeExecuteSql = (
