@@ -431,7 +431,9 @@ impl<D: PageDevice> PagedStorage<D> {
             let (table_name, input, is_upsert) = match change {
                 RowChange::Upsert { table, row } => (table, row, true),
                 RowChange::Delete { table, key } => (table, key, false),
-                RowChange::Put { .. } => unreachable!("the reference validates rows as maps"),
+                RowChange::Put { .. } | RowChange::Remove { .. } => {
+                    unreachable!("the reference validates rows as maps")
+                }
             };
             let table = self
                 .tables
@@ -725,7 +727,9 @@ impl<D: PageDevice> PagedStorage<D> {
             let (table_name, input, is_delete) = match change {
                 RowChange::Upsert { table, row } => (table, row, false),
                 RowChange::Delete { table, key } => (table, key, true),
-                RowChange::Put { .. } => unreachable!("the reference validates rows as maps"),
+                RowChange::Put { .. } | RowChange::Remove { .. } => {
+                    unreachable!("the reference validates rows as maps")
+                }
             };
             let table = self
                 .tables
@@ -922,7 +926,9 @@ fn preflight_batch(
             RowChange::Upsert { table, row } | RowChange::Delete { table, key: row } => {
                 (table, row)
             }
-            RowChange::Put { .. } => unreachable!("the reference validates rows as maps"),
+            RowChange::Put { .. } | RowChange::Remove { .. } => {
+                unreachable!("the reference validates rows as maps")
+            }
         };
         if !tables.contains_key(table) {
             return Err(EngineError::table_not_found(table));

@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use serde_json::Value;
 
-use crate::paged_codec::{IndexEntryLayout, RecordLayout, StoredRecord};
+use crate::paged_codec::{EMPTY_RECORD, IndexEntryLayout, RecordLayout, StoredRecord};
 use crate::row::{RowRef, ValueRef};
 use crate::{
     ColumnDefinition, ColumnType, EngineError, IndexDefinition, Result, Row, RowChange,
@@ -164,6 +164,12 @@ pub(crate) trait StorageReader {
     /// records, which lets a writer plan rows straight into records. Other readers plan maps.
     fn record_layout(&self, _table: &str) -> Option<Rc<RecordLayout>> {
         None
+    }
+    /// Whether a delete of a stored row may be planned by its encoded key alone, as a
+    /// [`RowChange::Remove`], for a writer that applies it without a map of the key's columns. A
+    /// transaction's overlay measures each delete by that map, so only a script's writer does.
+    fn plans_removals(&self) -> bool {
+        false
     }
     /// Whether a row of `table` holds the encoded primary key `key`, from a reader with record
     /// layouts, charged as a primary-key visit.
@@ -427,7 +433,9 @@ impl StorageDriver for InMemoryStorage {
                     let key = row_key(schema, &key)?;
                     (table, key, None)
                 }
-                RowChange::Put { .. } => return Err(unplanned_record()),
+                RowChange::Put { .. } | RowChange::Remove { .. } => {
+                    return Err(unplanned_record());
+                }
             };
 
             let next_bytes = next.as_ref().map_or(Ok(0), estimated_row_bytes)?;
@@ -1231,6 +1239,16 @@ pub(crate) fn estimated_record_bytes(record: &StoredRecord<'_>) -> Result<usize>
     Ok(bytes)
 }
 
+/// [`estimated_row_bytes`] for the map of a stored row's primary-key columns, which is what a delete
+/// otherwise plans for the row. A key without text takes the same whatever its values, which its
+/// layout measured once; a key with text is measured as the map it decodes to.
+pub(crate) fn estimated_key_bytes(record: &StoredRecord<'_>) -> Result<usize> {
+    match record.key_estimate() {
+        Some(bytes) => Ok(bytes),
+        None => estimated_row_bytes(&record.key_row()?),
+    }
+}
+
 pub(crate) fn estimated_value_bytes(value: &Value) -> Result<usize> {
     validate_json_value(value)?;
     estimated_value_bytes_at_depth(value, 0)
@@ -1600,7 +1618,8 @@ fn preflight_row_changes<'a>(
     for change in changes {
         let (RowChange::Upsert { table, .. }
         | RowChange::Delete { table, .. }
-        | RowChange::Put { table, .. }) = change;
+        | RowChange::Put { table, .. }
+        | RowChange::Remove { table, .. }) = change;
         validate_catalog_name_bound(table)
             .map_err(|error| EngineError::invalid_change(error.message))?;
         let (schema, layout) = tables(table).ok_or_else(|| EngineError::table_not_found(table))?;
@@ -1613,6 +1632,13 @@ fn preflight_row_changes<'a>(
                 let record_bytes = estimated_record_bytes(&record)?;
                 batch_bytes =
                     preflight_record_change(table, &record, record_bytes, indexes, batch_bytes)?;
+                continue;
+            }
+            RowChange::Remove { key, .. } => {
+                // Charged as the map of its key columns a delete otherwise plans.
+                let layout = layout.ok_or_else(unplanned_record)?;
+                let key = StoredRecord::new(schema, layout, key, EMPTY_RECORD)?;
+                batch_bytes = charge_row_write(table, estimated_key_bytes(&key)?, batch_bytes)?;
                 continue;
             }
         };
@@ -1800,6 +1826,12 @@ fn preflight_row_change(
         );
         validate_prospective_storage_keys(schema, input, indexes)?;
     }
+    charge_row_write(table, input_bytes, batch_bytes)
+}
+
+/// Adds a change to `table` of a row of `input_bytes` to a write set's bytes, failing past their
+/// limit.
+fn charge_row_write(table: &str, input_bytes: usize, batch_bytes: usize) -> Result<usize> {
     let batch_bytes = checked_row_write_add(
         batch_bytes,
         checked_row_write_add(table.len(), checked_row_write_add(input_bytes, 64)?)?,

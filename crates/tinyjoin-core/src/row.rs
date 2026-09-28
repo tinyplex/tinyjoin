@@ -139,6 +139,14 @@ impl<'a> RowRef<'a> {
         }
     }
 
+    /// The stored record the row is read from, if it is one.
+    pub(crate) fn stored(&self) -> Option<&StoredRecord<'a>> {
+        match &self.0 {
+            Source::Record(record) => Some(record),
+            _ => None,
+        }
+    }
+
     /// The whole row as an owned map.
     pub(crate) fn to_row(&self) -> Result<Row> {
         match &self.0 {

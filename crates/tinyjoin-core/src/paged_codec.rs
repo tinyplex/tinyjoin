@@ -529,6 +529,10 @@ pub(crate) struct RecordLayout {
     /// and JSON columns at the schema positions in `sized` take more.
     estimate: Option<usize>,
     sized: Vec<usize>,
+    /// The estimated bytes of the map of a primary key's columns, as
+    /// [`crate::storage::estimated_key_bytes`] finds them, when no key column holds text, whose
+    /// values take more than a scalar's 16.
+    key_estimate: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -576,6 +580,13 @@ impl RecordLayout {
                 }
             }
         }
+        let mut key_estimate = Some(32usize);
+        for (name, data_type) in schema.primary_key.iter().zip(&key_types) {
+            key_estimate = key_estimate
+                .filter(|_| !matches!(data_type, ColumnType::Text | ColumnType::Json))
+                .and_then(|bytes| bytes.checked_add(96))
+                .and_then(|bytes| bytes.checked_add(name.len().checked_mul(2)?));
+        }
         Ok(Self {
             slots,
             key_types,
@@ -583,6 +594,7 @@ impl RecordLayout {
             stored,
             estimate,
             sized,
+            key_estimate,
         })
     }
 }
@@ -699,6 +711,11 @@ impl<'a> StoredRecord<'a> {
     /// positions of the text and JSON columns whose values can take more.
     pub(crate) fn scalar_estimate(&self) -> (Option<usize>, &'a [usize]) {
         (self.layout.estimate, &self.layout.sized)
+    }
+
+    /// The estimated bytes of the map of the primary key's columns, when no key column holds text.
+    pub(crate) fn key_estimate(&self) -> Option<usize> {
+        self.layout.key_estimate
     }
 
     /// The length of the entry, its key and its record.
@@ -2576,10 +2593,19 @@ mod tests {
                 crate::storage::estimated_record_bytes(&record).unwrap(),
                 crate::storage::estimated_row_bytes(&decoded).unwrap()
             );
+            let key_row = crate::statement::primary_key_row(&schema, &decoded).unwrap();
             assert_eq!(
                 crate::row::RowRef::record(record).primary_key().unwrap(),
-                crate::statement::primary_key_row(&schema, &decoded).unwrap()
+                key_row
             );
+            // A delete planned by its stored key is charged as the map of its key columns.
+            let key_only = StoredRecord::new(&schema, &layout, &key, EMPTY_RECORD).unwrap();
+            for record in [record, key_only] {
+                assert_eq!(
+                    crate::storage::estimated_key_bytes(&record).unwrap(),
+                    crate::storage::estimated_row_bytes(&key_row).unwrap()
+                );
+            }
             for definition in &indexes {
                 let positions = index_column_positions(&schema, definition).unwrap();
                 assert_eq!(

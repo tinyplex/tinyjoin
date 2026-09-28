@@ -6,7 +6,8 @@ use serde_json::{Map, Value};
 #[cfg(test)]
 use crate::StorageDriver;
 use crate::paged_codec::{
-    RecordLayout, StoredRecord, encode_primary_key, encode_primary_key_values, encode_row_values,
+    EMPTY_RECORD, RecordLayout, StoredRecord, encode_primary_key, encode_primary_key_values,
+    encode_row_values,
 };
 use crate::query::{
     Filter, ParseMode, Token, bind_parameter, is_reserved_keyword, number_literal,
@@ -17,9 +18,9 @@ use crate::query::{
 use crate::row::{HeldRow, RowRef};
 use crate::storage::{
     MAX_LOGICAL_ROW_BYTES, ensure_storage_key_bytes, estimated_checked_value_bytes,
-    estimated_record_bytes, estimated_row_bytes, estimated_value_bytes, json_scalar_bound,
-    normalize_row, row_json_overhead, schema_with_added_column, unplanned_record,
-    validate_index_columns_for_schema, validate_index_definition_shape,
+    estimated_key_bytes, estimated_record_bytes, estimated_row_bytes, estimated_value_bytes,
+    json_scalar_bound, normalize_row, row_json_overhead, schema_with_added_column,
+    unplanned_record, validate_index_columns_for_schema, validate_index_definition_shape,
     validate_primary_storage_key_bound, validate_value,
 };
 use crate::{
@@ -310,7 +311,8 @@ pub(crate) fn change_table(change: &RowChange) -> &String {
     match change {
         RowChange::Upsert { table, .. }
         | RowChange::Delete { table, .. }
-        | RowChange::Put { table, .. } => table,
+        | RowChange::Put { table, .. }
+        | RowChange::Remove { table, .. } => table,
     }
 }
 
@@ -326,7 +328,7 @@ fn exceeds_changed_keys(changes: &[RowChange], previous: &[PreviousRow]) -> bool
     let mut last: Option<&[u8]> = None;
     for (index, change) in changes.iter().enumerate() {
         let key = match (change, previous.get(index)) {
-            (RowChange::Put { key, .. }, _) => key.as_slice(),
+            (RowChange::Put { key, .. } | RowChange::Remove { key, .. }, _) => key.as_slice(),
             (_, Some(PreviousRow::Read(Some(HeldRow::Stored(entry))))) => entry.key(),
             _ => return false,
         };
@@ -349,9 +351,9 @@ fn changed_key(
 ) -> Result<Row> {
     let row = match change {
         RowChange::Upsert { row, .. } | RowChange::Delete { key: row, .. } => row,
-        RowChange::Put { table, key, record } => {
+        RowChange::Put { table, key, .. } | RowChange::Remove { table, key } => {
             let layout = storage.record_layout(table).ok_or_else(unplanned_record)?;
-            return StoredRecord::new(schema, &layout, key, record)?.key_row();
+            return StoredRecord::new(schema, &layout, key, EMPTY_RECORD)?.key_row();
         }
     };
     let mut key = Row::new();
@@ -1521,6 +1523,8 @@ fn plan_delete(
     let mut work_bytes = 0usize;
     let mut result_bytes = 0usize;
     let filter = Filter::new(predicate, &schema, table)?;
+    // A script's writer lets a delete plan each stored row by its key, without a map.
+    let by_key = storage.plans_removals();
     let visit_outcome = visit_dml_candidates(storage, &schema, predicate, &mut |row| {
         scanned = scanned.saturating_add(1);
         if scanned > MAX_DML_SCAN_ROWS {
@@ -1537,24 +1541,27 @@ fn plan_delete(
             )));
         }
         // A delete needs only the row's key; the writer reads the rest from the row it keeps.
-        let key = row.primary_key()?;
-        let mut charge = 32usize;
-        for column in &schema.primary_key {
-            let value = key.get(column).ok_or_else(|| {
-                EngineError::invalid_change(format!(
-                    "Row for `{}` is missing primary-key column `{column}`",
-                    schema.name
-                ))
-            })?;
-            // The key was read from a stored row, within the limits on stored values.
-            charge = checked_dml_add(charge, 64)?;
-            charge = checked_dml_add(charge, checked_dml_mul(column.len(), 2)?)?;
-            charge = checked_dml_add(
-                charge,
-                checked_dml_mul(estimated_checked_value_bytes(value)?, 2)?,
-            )?;
-        }
-        charge = checked_dml_add(charge, 96)?;
+        let (change, charge) = match row.stored().filter(|_| by_key) {
+            // Charged as the map of its key columns, which is what its key's estimate is.
+            Some(record) => (
+                RowChange::Remove {
+                    table: table.to_owned(),
+                    key: record.key().to_vec(),
+                },
+                checked_dml_add(estimated_key_bytes(record)?, 96)?,
+            ),
+            None => {
+                let key = row.primary_key()?;
+                let charge = delete_charge(&schema, &key)?;
+                (
+                    RowChange::Delete {
+                        table: table.to_owned(),
+                        key,
+                    },
+                    charge,
+                )
+            }
+        };
         ensure_dml_work_bytes(checked_dml_add(work_bytes, charge)?)?;
         work_bytes = retain_dml_change(work_bytes, table)?;
         if let Some(columns) = returning {
@@ -1563,10 +1570,7 @@ fn plan_delete(
             returned.push(project_returning_row(&row, columns, table)?);
         }
         work_bytes = checked_dml_add(work_bytes, charge)?;
-        changes.push(RowChange::Delete {
-            table: table.to_owned(),
-            key,
-        });
+        changes.push(change);
         previous.push(if kept.fits(row.held_bytes()?) {
             PreviousRow::Read(Some(row.hold()?))
         } else {
@@ -1590,6 +1594,27 @@ fn plan_delete(
         changes,
         previous,
     })
+}
+
+/// What planning a delete of the row whose key is `key` retains, in bytes.
+fn delete_charge(schema: &TableDefinition, key: &Row) -> Result<usize> {
+    let mut charge = 32usize;
+    for column in &schema.primary_key {
+        let value = key.get(column).ok_or_else(|| {
+            EngineError::invalid_change(format!(
+                "Row for `{}` is missing primary-key column `{column}`",
+                schema.name
+            ))
+        })?;
+        // The key was read from a stored row, within the limits on stored values.
+        charge = checked_dml_add(charge, 64)?;
+        charge = checked_dml_add(charge, checked_dml_mul(column.len(), 2)?)?;
+        charge = checked_dml_add(
+            charge,
+            checked_dml_mul(estimated_checked_value_bytes(value)?, 2)?,
+        )?;
+    }
+    checked_dml_add(charge, 96)
 }
 
 /// Predicate and assignment validation precedes this lookup, and the caller still checks the

@@ -12,7 +12,7 @@ use crate::{
     paged_storage::{ChangeCost, ChangeRow, PagedTable, PagedWriteUsage, batch_too_large},
     row::{HeldRow, RowRef},
     statement::PreviousRow,
-    storage::{KeyOrder, KeyRange, estimated_record_bytes, estimated_row_bytes},
+    storage::{KeyOrder, KeyRange, estimated_record_bytes, estimated_row_bytes, unplanned_record},
 };
 
 const MAX_TRANSACTION_KEYS: usize = 100_000;
@@ -295,6 +295,8 @@ impl PagedTransaction {
                 RowChange::Put { table, key, record } => {
                     (table, PatchRow::Record(record), Some(key))
                 }
+                // A transaction's reader plans deletes as maps, which the overlay measures them by.
+                RowChange::Remove { .. } => return Err(unplanned_record()),
             };
             let is_delete = matches!(row, PatchRow::Delete(_));
             // A stored row planning held is the row the change's key holds, so its entry's key is

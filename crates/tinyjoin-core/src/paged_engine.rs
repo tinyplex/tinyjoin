@@ -2494,6 +2494,13 @@ mod tests {
         // subscriber re-reads rather than mistaking a partial list for a complete one.
         assert_eq!(outcome.tables, vec!["accounts"]);
         assert!(!outcome.keys.contains_key("accounts"));
+        // Deletes, planned by their stored keys, are bounded the same way.
+        let outcome = engine.execute_sql("DELETE FROM accounts", &[]).unwrap();
+        assert_eq!(
+            (outcome.row_count, outcome.tables),
+            (MAX_CHANGED_KEYS_PER_TABLE + 3, vec!["accounts".to_owned()])
+        );
+        assert!(!outcome.keys.contains_key("accounts"));
 
         // Exactly at the bound the keys are still reported in full.
         let mut engine = page_native_fixture(MemoryPageDevice::new(0).unwrap()).unwrap();
@@ -2503,5 +2510,14 @@ mod tests {
             .execute_sql("UPDATE accounts SET active = true", &[])
             .unwrap();
         assert_eq!(outcome.keys["accounts"].len(), MAX_CHANGED_KEYS_PER_TABLE);
+        let outcome = engine.execute_sql("DELETE FROM accounts", &[]).unwrap();
+        let mut deleted = outcome.keys["accounts"]
+            .iter()
+            .map(|key| key["id"].as_u64().unwrap() as usize)
+            .collect::<Vec<_>>();
+        deleted.sort_unstable();
+        let mut expected = vec![1, 2];
+        expected.extend(10..10 + MAX_CHANGED_KEYS_PER_TABLE - 2);
+        assert_eq!(deleted, expected);
     }
 }

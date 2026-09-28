@@ -578,6 +578,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 RowChange::Upsert { row, .. } => (PlannedRow::Map(row), false),
                 RowChange::Delete { key, .. } => (PlannedRow::Map(key), true),
                 RowChange::Put { key, record, .. } => (PlannedRow::Record(key, record), false),
+                RowChange::Remove { key, .. } => (PlannedRow::Record(key, Vec::new()), true),
             };
             // A stored row planning held is the row the change's key holds, so its entry's key is
             // the change's encoded key.
@@ -1300,6 +1301,10 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
         self.tables
             .get(table)
             .map(|table| Rc::clone(table.layout()))
+    }
+
+    fn plans_removals(&self) -> bool {
+        true
     }
 
     fn holds_encoded_key(&self, table: &str, key: &[u8]) -> Result<bool> {

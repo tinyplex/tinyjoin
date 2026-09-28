@@ -177,6 +177,12 @@ pub(crate) enum RowChange {
         key: Vec<u8>,
         record: Vec<u8>,
     },
+    /// A delete planned straight from the stored entry it removes: its encoded primary key. Only a
+    /// reader with record layouts plans deletes this way.
+    Remove {
+        table: String,
+        key: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
