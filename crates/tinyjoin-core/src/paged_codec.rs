@@ -407,12 +407,14 @@ pub(crate) fn encode_row(schema: &TableDefinition, row: &Row) -> Result<Vec<u8>>
     let stored = stored_columns(schema);
     let mut values = Vec::with_capacity(stored.len());
     for column in &stored {
-        values.push(row.get(&column.name).ok_or_else(|| {
-            codec_argument(format!(
-                "Row for `{}` is missing column `{}`",
-                schema.name, column.name
-            ))
-        })?);
+        values.push(StoredValue::Value(row.get(&column.name).ok_or_else(
+            || {
+                codec_argument(format!(
+                    "Row for `{}` is missing column `{}`",
+                    schema.name, column.name
+                ))
+            },
+        )?));
     }
     encode_stored_values(schema, &stored, &values)
 }
@@ -428,24 +430,64 @@ pub(crate) fn encode_row_values(
     let mut stored_values = Vec::with_capacity(layout.stored.len());
     for position in &layout.stored {
         stored.push(&schema.columns[*position]);
-        stored_values.push(values[*position]);
+        stored_values.push(StoredValue::Value(values[*position]));
     }
     encode_stored_values(schema, &stored, &stored_values)
+}
+
+/// Encodes the record of `record`'s row with the columns `assigned` gives values, by schema
+/// position, which planning checked and normalized as it would a map's. Every other column keeps
+/// its encoded bytes, or its default where the record omits it, as [`encode_row`] would encode
+/// the row they decode to, since records are canonical.
+pub(crate) fn encode_updated_record(
+    record: &StoredRecord<'_>,
+    assigned: &[Option<&Value>],
+) -> Result<Vec<u8>> {
+    let (schema, layout) = (record.schema, record.layout);
+    let mut stored = Vec::with_capacity(layout.stored.len());
+    let mut values = Vec::with_capacity(layout.stored.len());
+    for (position, index) in layout.stored.iter().enumerate() {
+        let column = &schema.columns[*index];
+        stored.push(column);
+        values.push(match assigned[*index] {
+            Some(value) => StoredValue::Value(value),
+            None if position >= record.count => {
+                StoredValue::Value(column.default.as_ref().unwrap_or(&Value::Null))
+            }
+            None => StoredValue::Encoded(record.stored_bytes(position)?),
+        });
+    }
+    encode_stored_values(schema, &stored, &values)
+}
+
+/// A stored column's value as a record is written with it: a value to encode, or the encoding of
+/// one, `None` for NULL.
+enum StoredValue<'a> {
+    Value(&'a Value),
+    Encoded(Option<&'a [u8]>),
 }
 
 /// Encodes a record from its stored columns and their values, in record order.
 fn encode_stored_values(
     schema: &TableDefinition,
     stored: &[&crate::ColumnDefinition],
-    values: &[&Value],
+    values: &[StoredValue<'_>],
 ) -> Result<Vec<u8>> {
     let mut data = Vec::new();
     let mut ends = Vec::with_capacity(stored.len());
     let mut nulls = Vec::with_capacity(stored.len());
     for (column, value) in stored.iter().zip(values) {
-        nulls.push(value.is_null());
-        if !value.is_null() {
-            encode_value(column, value, &mut data, &schema.name)?;
+        match value {
+            StoredValue::Value(value) => {
+                nulls.push(value.is_null());
+                if !value.is_null() {
+                    encode_value(column, value, &mut data, &schema.name)?;
+                }
+            }
+            StoredValue::Encoded(bytes) => {
+                nulls.push(bytes.is_none());
+                data.extend_from_slice(bytes.unwrap_or_default());
+            }
         }
         ends.push(data.len());
     }

@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 use crate::StorageDriver;
 use crate::paged_codec::{
     EMPTY_RECORD, RecordLayout, StoredRecord, encode_primary_key, encode_primary_key_values,
-    encode_row_values,
+    encode_row_values, encode_updated_record,
 };
 use crate::query::{
     Filter, ParseMode, Token, bind_parameter, is_reserved_keyword, number_literal,
@@ -1351,12 +1351,29 @@ fn plan_update(
         .collect::<Result<Vec<_>>>()?;
     struct PlannedUpdate {
         old_key: Vec<u8>,
-        old_primary_key: Row,
         /// The row being updated, when it is kept for the writer.
         old_row: Option<HeldRow>,
-        new_key: Vec<u8>,
-        new_row: Row,
+        next: UpdatedRow,
     }
+    enum UpdatedRow {
+        /// A row planned as a map: its old key's columns, its new key, and itself.
+        Map {
+            old_primary_key: Row,
+            new_key: Vec<u8>,
+            new_row: Row,
+        },
+        /// A row that keeps its key, planned as the record it is rewritten with.
+        Record(Vec<u8>),
+    }
+    impl PlannedUpdate {
+        fn new_key(&self) -> &[u8] {
+            match &self.next {
+                UpdatedRow::Map { new_key, .. } => new_key,
+                UpdatedRow::Record(_) => &self.old_key,
+            }
+        }
+    }
+    let records = RecordUpdate::new(storage, &schema, &resolved_assignments, returning)?;
 
     let mut updates = Vec::new();
     let mut kept = KeptRows::default();
@@ -1381,53 +1398,94 @@ fn plan_update(
             )));
         }
 
+        // A stored row keeping its key is rewritten as its record, charged as the map it replaces.
+        let record = records
+            .as_ref()
+            .and_then(|plan| Some((plan, plan.record(row)?)));
+        let map = match record {
+            Some(_) => None,
+            None => Some(row.to_row()?),
+        };
         // Check the retained candidate budget before copying assignment values into the row.
-        let read = row;
-        let row = read.to_row()?;
-        let old_row_bytes = estimated_row_bytes(&row)?;
+        let old_row_bytes = match (&map, record) {
+            (Some(map), _) => estimated_row_bytes(map)?,
+            (None, Some((_, record))) => estimated_record_bytes(record)?,
+            (None, None) => unreachable!("a row is read as a map or a record"),
+        };
         let conservative_row_bytes = checked_dml_add(
             checked_dml_mul(old_row_bytes, 3)?,
             checked_dml_add(assignment_bytes, 256)?,
         )?;
         ensure_dml_work_bytes(checked_dml_add(work_bytes, conservative_row_bytes)?)?;
 
-        let old_key = read.encoded_key()?.into_owned();
-        let old_primary_key = primary_key_row(&schema, &row)?;
-        let old_row = if kept.fits(read.held_bytes()?) {
-            Some(read.hold()?)
+        let old_key = row.encoded_key()?.into_owned();
+        let old_row = if kept.fits(row.held_bytes()?) {
+            Some(row.hold()?)
         } else {
             None
         };
-        let mut new_row = row;
-        for (column, value) in &resolved_assignments {
-            new_row.insert(column.clone(), value.clone());
-        }
-        let new_row = normalize_row(&schema, new_row)?;
-        validate_primary_storage_key_bound(&schema, &new_row)?;
-        let new_key = encode_primary_key(&schema, &new_row)?;
-        work_bytes = checked_dml_add(work_bytes, estimated_row_bytes(&new_row)?)?;
-        work_bytes = checked_dml_add(work_bytes, estimated_row_bytes(&old_primary_key)?)?;
+        let (next, next_bytes, key_bytes) = match (map, record) {
+            (None, Some((plan, record))) => {
+                let next = encode_updated_record(record, &plan.assigned)?;
+                let next_bytes = estimated_record_bytes(&StoredRecord::new(
+                    &schema,
+                    &plan.layout,
+                    &old_key,
+                    &next,
+                )?)?;
+                (
+                    UpdatedRow::Record(next),
+                    next_bytes,
+                    estimated_key_bytes(record)?,
+                )
+            }
+            (map, _) => {
+                let mut new_row = map.expect("a row not read as a record is a map");
+                let old_primary_key = primary_key_row(&schema, &new_row)?;
+                for (column, value) in &resolved_assignments {
+                    new_row.insert(column.clone(), value.clone());
+                }
+                let new_row = normalize_row(&schema, new_row)?;
+                validate_primary_storage_key_bound(&schema, &new_row)?;
+                let new_key = encode_primary_key(&schema, &new_row)?;
+                let (next_bytes, key_bytes) = (
+                    estimated_row_bytes(&new_row)?,
+                    estimated_row_bytes(&old_primary_key)?,
+                );
+                (
+                    UpdatedRow::Map {
+                        old_primary_key,
+                        new_key,
+                        new_row,
+                    },
+                    next_bytes,
+                    key_bytes,
+                )
+            }
+        };
+        let update = PlannedUpdate {
+            old_key,
+            old_row,
+            next,
+        };
+        let new_key = update.new_key();
+        work_bytes = checked_dml_add(work_bytes, next_bytes)?;
+        work_bytes = checked_dml_add(work_bytes, key_bytes)?;
         work_bytes = checked_dml_add(
             work_bytes,
-            checked_dml_add(old_key.len(), checked_dml_add(new_key.len(), 192)?)?,
+            checked_dml_add(update.old_key.len(), checked_dml_add(new_key.len(), 192)?)?,
         )?;
         ensure_dml_work_bytes(work_bytes)?;
         work_bytes = retain_dml_change(work_bytes, table)?;
-        if old_key != new_key {
+        if update.old_key != new_key {
             work_bytes = retain_dml_change(work_bytes, table)?;
         }
 
-        if let Some(columns) = returning {
-            result_bytes = retain_returned_row(result_bytes, &new_row, columns)?;
-            returned.push(project_returning_row(&new_row, columns, table)?);
+        if let (Some(columns), UpdatedRow::Map { new_row, .. }) = (returning, &update.next) {
+            result_bytes = retain_returned_row(result_bytes, new_row, columns)?;
+            returned.push(project_returning_row(new_row, columns, table)?);
         }
-        updates.push(PlannedUpdate {
-            old_key,
-            old_primary_key,
-            old_row,
-            new_key,
-            new_row,
-        });
+        updates.push(update);
         Ok(VisitControl::Continue)
     })?;
     require_complete_dml_scan(visit_outcome, table)?;
@@ -1442,12 +1500,14 @@ fn plan_update(
         .collect::<HashSet<_>>();
     let mut destinations = HashSet::with_capacity(row_count);
     for update in &updates {
-        if !destinations.insert(update.new_key.as_slice()) {
+        let new_key = update.new_key();
+        if !destinations.insert(new_key) {
             return Err(duplicate_primary_key("UPDATE of", table));
         }
-        if update.new_key != update.old_key
-            && !old_keys.contains(update.new_key.as_slice())
-            && storage.visit_primary_key(table, &update.new_row, &mut |_| Ok(VisitControl::Stop))?
+        if let UpdatedRow::Map { new_row, .. } = &update.next
+            && new_key != update.old_key
+            && !old_keys.contains(new_key)
+            && storage.visit_primary_key(table, new_row, &mut |_| Ok(VisitControl::Stop))?
                 == VisitOutcome::Stopped
         {
             return Err(duplicate_primary_key("UPDATE of", table));
@@ -1465,10 +1525,26 @@ fn plan_update(
             let old_row = update
                 .old_row
                 .map_or(PreviousRow::Unread, |row| PreviousRow::Read(Some(row)));
-            if update.old_key != update.new_key {
+            let (old_primary_key, new_key, new_row) = match update.next {
+                UpdatedRow::Record(record) => {
+                    replaced.push(old_row);
+                    upserts.push(RowChange::Put {
+                        table: table.to_owned(),
+                        key: update.old_key,
+                        record,
+                    });
+                    continue;
+                }
+                UpdatedRow::Map {
+                    old_primary_key,
+                    new_key,
+                    new_row,
+                } => (old_primary_key, new_key, new_row),
+            };
+            if update.old_key != new_key {
                 deletes.push(RowChange::Delete {
                     table: table.to_owned(),
-                    key: update.old_primary_key,
+                    key: old_primary_key,
                 });
                 deleted.push(old_row);
                 replaced.push(PreviousRow::Unread);
@@ -1477,7 +1553,7 @@ fn plan_update(
             }
             upserts.push(RowChange::Upsert {
                 table: table.to_owned(),
-                row: update.new_row,
+                row: new_row,
             });
         }
         deletes.extend(upserts);
@@ -1711,6 +1787,79 @@ impl RecordPlan {
             row.push(value);
         }
         (bound <= MAX_LOGICAL_ROW_BYTES).then_some(row)
+    }
+}
+
+/// What rewriting an UPDATE's rows straight into records needs, found once per statement: a
+/// reader with record layouts, assignments that leave every row's key in place, and no RETURNING,
+/// whose rows are maps. The assigned values were checked as normalizing a map of them checks them.
+struct RecordUpdate<'a> {
+    layout: Rc<RecordLayout>,
+    /// Each column's assigned value, by schema position.
+    assigned: Vec<Option<&'a Value>>,
+    /// The most JSON text a row can take apart from its stored values: its punctuation and names,
+    /// the assigned values, and the defaults of the columns its record may omit.
+    bound: usize,
+}
+
+impl<'a> RecordUpdate<'a> {
+    fn new(
+        storage: &dyn StorageReader,
+        schema: &TableDefinition,
+        assignments: &'a [(String, Value)],
+        returning: Option<&[String]>,
+    ) -> Result<Option<Self>> {
+        let Some(layout) = storage
+            .record_layout(&schema.name)
+            .filter(|_| returning.is_none())
+        else {
+            return Ok(None);
+        };
+        let mut assigned = vec![None; schema.columns.len()];
+        for (name, value) in assignments {
+            match schema
+                .columns
+                .iter()
+                .position(|column| column.name == *name)
+            {
+                Some(position) if !schema.primary_key.contains(name) => {
+                    assigned[position] = Some(value);
+                }
+                _ => return Ok(None),
+            }
+        }
+        let mut bound = row_json_overhead(schema)?;
+        for (column, value) in schema.columns.iter().zip(&assigned) {
+            // Only encoding a JSON value a row keeps measures it, which a map would do.
+            let value_bound = match value {
+                Some(value) => json_scalar_bound(value),
+                None if column.data_type == ColumnType::Json => None,
+                None => json_scalar_bound(column.default.as_ref().unwrap_or(&Value::Null)),
+            };
+            let Some(value_bound) = value_bound else {
+                return Ok(None);
+            };
+            bound = bound.saturating_add(value_bound);
+        }
+        Ok(Some(Self {
+            layout,
+            assigned,
+            bound,
+        }))
+    }
+
+    /// The stored record `row` is read from, when its JSON text, with the plan's values assigned,
+    /// cannot pass the row limit, so that no check on a map of it could fail for its size. A stored
+    /// value's JSON text takes at most six times its encoded bytes, as escaped text, and at most
+    /// 25 as a number.
+    fn record<'r, 's>(&self, row: &'r RowRef<'s>) -> Option<&'r StoredRecord<'s>> {
+        let record = row.stored()?;
+        let bound = record
+            .entry_len()
+            .saturating_mul(6)
+            .saturating_add(self.assigned.len().saturating_mul(25))
+            .saturating_add(self.bound);
+        (bound <= MAX_LOGICAL_ROW_BYTES).then_some(record)
     }
 }
 

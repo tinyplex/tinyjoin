@@ -431,7 +431,8 @@ fn generated_mixed_statements_stage_as_full_validation_does() {
     assert!(failures > 20, "only {failures} statements failed");
 }
 
-/// Plans as a reader without record layouts does: every inserted row as a map.
+/// Plans as a reader without record layouts does: every inserted or updated row as a map. It
+/// reads rows exactly as the reader it wraps.
 struct MapsOnly<'a>(PagedReadView<'a, MemoryPageDevice>);
 
 impl StorageReader for MapsOnly<'_> {
@@ -445,6 +446,48 @@ impl StorageReader for MapsOnly<'_> {
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
         self.0.visit_table(table, visitor)
+    }
+
+    fn visits_indexes(&self, table: &str) -> bool {
+        self.0.visits_indexes(table)
+    }
+
+    fn visits_in_key_order(&self, table: &str) -> bool {
+        self.0.visits_in_key_order(table)
+    }
+
+    fn visit_table_range(
+        &self,
+        table: &str,
+        range: &KeyRange,
+        order: KeyOrder,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        self.0.visit_table_range(table, range, order, visitor)
+    }
+
+    fn visit_index_range(
+        &self,
+        table: &str,
+        columns: &[String],
+        range: &KeyRange,
+        limit: usize,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<Option<VisitOutcome>> {
+        self.0
+            .visit_index_range(table, columns, range, limit, visitor)
+    }
+
+    fn visit_index_entries(
+        &self,
+        table: &str,
+        columns: &[String],
+        range: &KeyRange,
+        layout: &IndexEntryLayout,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<Option<VisitOutcome>> {
+        self.0
+            .visit_index_entries(table, columns, range, layout, visitor)
     }
 
     fn table_row_count(&self, table: &str) -> Result<usize> {
@@ -777,5 +820,298 @@ fn inserts_planned_as_records_match_inserts_planned_as_maps() {
     assert!(
         failures > 50 && staged_failures > 5 && unbound < 40,
         "{failures} and {staged_failures} failed, {unbound} did not bind"
+    );
+}
+
+/// Generated UPDATEs of valid and invalid values, defaults, respelled FLOATs, NULLs, text past the
+/// row limit, and key columns plan and stage as rows rewritten as stored records exactly as they
+/// do as maps: the same errors, work, changes, entries, and totals, over rows that keep defaults
+/// their records omit, and over rows the transaction staged before.
+#[test]
+fn updates_planned_as_records_match_updates_planned_as_maps() {
+    struct Random(u64);
+    impl Random {
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as usize) % bound
+        }
+        fn pick(&mut self, values: &[Value]) -> Value {
+            values[self.below(values.len())].clone()
+        }
+    }
+    let mut storage = PagedStorage::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+    let mut script = "CREATE TABLE plain (id INTEGER PRIMARY KEY, name TEXT NOT NULL, \
+                      score FLOAT DEFAULT 1, flag BOOLEAN, note TEXT DEFAULT 'none');\
+                      CREATE UNIQUE INDEX plain_name ON plain (name);\
+                      CREATE INDEX plain_flag ON plain (flag, note);\
+                      CREATE TABLE wide (id INTEGER PRIMARY KEY, name TEXT, doc JSON);\
+                      CREATE TABLE pairs (a TEXT, b FLOAT, v TEXT DEFAULT 'v', PRIMARY KEY (a, b));"
+        .to_owned();
+    for id in 1..=24 {
+        script.push_str(&match id % 3 {
+            0 => format!("INSERT INTO plain (id, name) VALUES ({id}, 'p{id}');"),
+            1 => format!(
+                "INSERT INTO plain VALUES ({id}, 'p{id}', {}, {}, 'n{id}');",
+                id as f64 / 2.0,
+                id % 2 == 0
+            ),
+            _ => format!("INSERT INTO plain (id, name, flag) VALUES ({id}, 'p{id}', NULL);"),
+        });
+        script.push_str(&format!(
+            "INSERT INTO wide VALUES ({id}, 'w{id}', '{{\"k\": {id}}}');\
+             INSERT INTO pairs (a, b) VALUES ('a{}', {});",
+            id % 5,
+            id as f64 / 4.0
+        ));
+    }
+    let statements = crate::sql_script::split(&script)
+        .unwrap()
+        .into_iter()
+        .map(|sql| crate::statement::parse(sql, &[]).unwrap())
+        .collect();
+    storage.execute_script(statements).unwrap();
+
+    fn long(length: usize, fill: char) -> Value {
+        Value::String(fill.to_string().repeat(length))
+    }
+    // Mostly valid values, and now and then one the column cannot hold, or text past the row
+    // limit, which fails in both plannings alike.
+    fn value(random: &mut Random, column: &str) -> Value {
+        let invalid = random.below(16) == 0;
+        match (column, invalid) {
+            ("id", false) => json!(1 + random.below(40)),
+            ("id", true) => random.pick(&[Value::Null, json!("7"), json!(1.5)]),
+            ("name", false) => match random.below(16) {
+                0 => json!("c\u{0}\n\""),
+                1 => long(200_000, '\u{1}'),
+                2 => long(600_000, 'r'),
+                3 => json!(format!("p{}", random.below(30))),
+                // Escaped as JSON, two such values in one row pass the row limit.
+                4 => long(90_000, '\u{1}'),
+                _ => json!(format!("u{}", random.below(1_000))),
+            },
+            ("name", true) => random.pick(&[Value::Null, json!(7)]),
+            ("score", false) => random.pick(&[
+                json!(1),
+                json!(1.0),
+                json!(-0.0),
+                json!(2.5),
+                json!(1e300),
+                Value::Null,
+            ]),
+            ("score", true) => json!("x"),
+            ("flag", false) => random.pick(&[json!(true), json!(false), Value::Null]),
+            ("flag", true) => json!(1),
+            ("note", false) => match random.below(12) {
+                0 => long(600_000, 'n'),
+                1 => Value::Null,
+                2 => json!("none"),
+                3 | 4 => long(90_000, '\u{1}'),
+                _ => json!("n"),
+            },
+            ("note", true) => json!(false),
+            ("doc", _) => random.pick(&[
+                Value::Null,
+                json!(1),
+                json!("s"),
+                json!([1, "two"]),
+                json!({"a": {"b": [null]}}),
+            ]),
+            ("v", false) => random.pick(&[json!("w"), json!("v"), Value::Null]),
+            ("v", true) => json!(2),
+            ("a", _) => json!(format!("a{}", random.below(5))),
+            ("b", _) => random.pick(&[json!(1), json!(0.5), json!(-0.0)]),
+            _ => unreachable!("no column {column}"),
+        }
+    }
+    let tables: [(&str, &[&str]); 3] = [
+        ("plain", &["id", "name", "score", "flag", "note"]),
+        ("wide", &["id", "name", "doc"]),
+        ("pairs", &["a", "b", "v"]),
+    ];
+
+    let mut random = Random(0x5e7);
+    let (mut records, mut maps) = (0, 0);
+    let (mut failures, mut staged_failures) = (0, 0);
+    for _ in 0..60 {
+        let mut with_records = PagedTransaction::new(storage.revision());
+        let mut with_maps = PagedTransaction::new(storage.revision());
+        for _ in 0..10 {
+            // `plain` mostly, whose rows every other column but its key can rewrite in place.
+            let (table, columns) = tables[match random.below(6) {
+                0 => 1,
+                1 => 2,
+                _ => 0,
+            }];
+            // Mostly the key's columns are left alone; a statement assigning one plans maps.
+            let mut assigned = columns
+                .iter()
+                .filter(|column| {
+                    random.below(if ["id", "a", "b"].contains(column) {
+                        8
+                    } else {
+                        2
+                    }) == 0
+                })
+                .collect::<Vec<_>>();
+            if assigned.is_empty() {
+                assigned.push(&columns[columns.len() - 1]);
+            }
+            let mut params = Vec::new();
+            let sets = assigned
+                .iter()
+                .map(|column| {
+                    if random.below(10) == 0 {
+                        format!("{column} = DEFAULT")
+                    } else {
+                        params.push(value(&mut random, column));
+                        format!("{column} = ${}", params.len())
+                    }
+                })
+                .collect::<Vec<_>>();
+            let predicate = match (table, random.below(5)) {
+                ("pairs", 0) => String::new(),
+                ("pairs", _) => {
+                    params.push(json!(format!("a{}", random.below(5))));
+                    format!(" WHERE a = ${}", params.len())
+                }
+                (_, 0) => String::new(),
+                (_, 1) => {
+                    params.push(json!(1 + random.below(30)));
+                    format!(" WHERE id = ${}", params.len())
+                }
+                (_, _) => {
+                    let low = random.below(24);
+                    params.push(json!(low));
+                    params.push(json!(low + random.below(8)));
+                    format!(
+                        " WHERE id >= ${} AND id < ${}",
+                        params.len() - 1,
+                        params.len()
+                    )
+                }
+            };
+            let sql = format!("UPDATE {table} SET {}{predicate}", sets.join(", "));
+            // Parameters past their own limits fail to bind, before either planning.
+            let statement = match crate::statement::parse(&sql, &params) {
+                Ok(crate::statement::Statement::Write(statement)) => statement,
+                Ok(_) => unreachable!("an UPDATE is a write"),
+                Err(error) => {
+                    assert_eq!(error.code, "BIND_ERROR");
+                    continue;
+                }
+            };
+
+            let (records_work, maps_work) = (Cell::new(0), Cell::new(0));
+            let planned_records = crate::statement::plan_dml(
+                &PagedReadView::with_work_budget(&storage, Some(&with_records), &records_work),
+                &statement,
+            );
+            let planned_maps = crate::statement::plan_dml(
+                &MapsOnly(PagedReadView::with_work_budget(
+                    &storage,
+                    Some(&with_maps),
+                    &maps_work,
+                )),
+                &statement,
+            );
+            assert_eq!(records_work.get(), maps_work.get(), "{sql}");
+            let (planned_records, planned_maps) = match (planned_records, planned_maps) {
+                (Err(left), Err(right)) => {
+                    assert_eq!((left.code, left.message), (right.code, right.message));
+                    failures += 1;
+                    continue;
+                }
+                (Ok(left), Ok(right)) => (left, right),
+                (left, right) => panic!(
+                    "{sql}: {:?} vs {:?}",
+                    left.err().map(|error| error.message),
+                    right.err().map(|error| error.message)
+                ),
+            };
+            assert_eq!(
+                format!(
+                    "{:?} {:?}",
+                    planned_records.outcome, planned_records.previous
+                ),
+                format!("{:?} {:?}", planned_maps.outcome, planned_maps.previous),
+                "{sql}"
+            );
+            // Each record decodes to the map the other planning normalized, under its old key.
+            let decoded = planned_records
+                .changes
+                .iter()
+                .map(|change| match change {
+                    RowChange::Put { table, key, record } => {
+                        records += 1;
+                        let paged = storage.table(table).unwrap();
+                        let row = paged.record(key, record).unwrap().to_row().unwrap();
+                        assert_eq!(*key, encode_primary_key(&paged.schema, &row).unwrap());
+                        RowChange::Upsert {
+                            table: table.clone(),
+                            row,
+                        }
+                    }
+                    other => {
+                        maps += 1;
+                        other.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(decoded, planned_maps.changes, "{sql}");
+
+            let staged_records =
+                with_records.stage(&storage, planned_records.changes, planned_records.previous);
+            let staged_maps =
+                with_maps.stage(&storage, planned_maps.changes, planned_maps.previous);
+            if staged_records.is_err() {
+                staged_failures += 1;
+            }
+            assert_eq!(
+                staged_records.map_err(|error| (error.code, error.message)),
+                staged_maps.map_err(|error| (error.code, error.message)),
+                "{sql}"
+            );
+            assert_eq!(
+                overlay_state(&with_records),
+                overlay_state(&with_maps),
+                "{sql}"
+            );
+        }
+        // Both transactions leave every table as the other does.
+        let expected = ["plain", "wide", "pairs"].map(|table| {
+            let mut rows = PagedReadView::new(&storage, Some(&with_maps))
+                .scan_table(table)
+                .unwrap();
+            rows.sort_by_key(|row| {
+                format!(
+                    "{:?}",
+                    encode_primary_key(&storage.table(table).unwrap().schema, row).unwrap()
+                )
+            });
+            rows
+        });
+        storage.commit_transaction(&with_records).unwrap();
+        for (table, expected) in ["plain", "wide", "pairs"].into_iter().zip(expected) {
+            let mut rows = storage.scan_table(table).unwrap();
+            rows.sort_by_key(|row| {
+                format!(
+                    "{:?}",
+                    encode_primary_key(&storage.table(table).unwrap().schema, row).unwrap()
+                )
+            });
+            assert_eq!(rows, expected, "{table}");
+        }
+    }
+    assert!(
+        records > 200 && maps > 50,
+        "{records} records and {maps} maps"
+    );
+    assert!(
+        failures > 30 && staged_failures > 5,
+        "{failures} and {staged_failures} failed"
     );
 }
