@@ -763,7 +763,10 @@ impl BtreeCursor {
             false if self.leaf_index < leaf.len() => self.leaf_index,
             _ => return Ok(None),
         };
-        let (key, value) = leaf.leaf_cell(index)?;
+        let (key, value) = match leaf.inline_leaf_cell(index) {
+            Some((key, value)) => (key, CellValue::Inline(value)),
+            None => leaf.leaf_cell(index)?,
+        };
         let value = match value {
             CellValue::Inline(value) => Cow::Borrowed(value),
             CellValue::Overflow(descriptor) => Cow::Owned(
@@ -1149,6 +1152,23 @@ impl<'a> NodeView<'a> {
             }
         };
         Ok((&bytes[header_end..key_end], value))
+    }
+
+    /// The key and value of leaf cell `index`, if it is well formed and holds its value inline,
+    /// as nearly every cell does. Compiled into the cursor's step, which reads every row a scan
+    /// visits; [`Self::leaf_cell`] reads any other cell, and reports what is wrong with it.
+    #[inline(always)]
+    fn inline_leaf_cell(&self, index: usize) -> Option<(&[u8], &[u8])> {
+        let bytes = &*self.bytes;
+        let offset = self.cell_offset(index).ok()?;
+        let header_end = offset + LEAF_CELL_HEADER_SIZE;
+        if header_end > bytes.len() || read_u16(bytes, offset + 2) != INLINE_CELL_FLAGS {
+            return None;
+        }
+        let key_end = header_end + read_u16(bytes, offset) as usize;
+        let value_end = key_end.checked_add(read_u32(bytes, offset + 4) as usize)?;
+        (value_end <= bytes.len())
+            .then(|| (&bytes[header_end..key_end], &bytes[key_end..value_end]))
     }
 
     fn leaf_key(&self, index: usize) -> Result<&[u8]> {
