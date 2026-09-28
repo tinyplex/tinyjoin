@@ -1,8 +1,9 @@
-use std::{borrow::Cow, collections::HashSet};
+use std::borrow::Cow;
 
 use crate::{
     CandidateId, EngineError, FIRST_DATA_PAGE_ID, MAX_PAGE_COUNT, MAX_PAGE_PAYLOAD_SIZE, Page,
     PageDevice, PageId, PageRef, PageType, Pager, PagerWriteTransaction, Result,
+    cache::PageSet,
     checksum::crc32,
     hash::{EMPTY_HASH, Hasher, combine},
 };
@@ -179,7 +180,7 @@ impl Btree {
         validate_value(value)?;
         let result = (|| {
             let generation = transaction.generation()?;
-            let mut visited = HashSet::new();
+            let mut visited = PageSet::default();
             let inserted = insert_recursive(
                 transaction,
                 root_page_id,
@@ -247,7 +248,7 @@ impl Btree {
         validate_key(key)?;
         let result = (|| {
             let generation = transaction.generation()?;
-            let mut visited = HashSet::new();
+            let mut visited = PageSet::default();
             let deleted = delete_recursive(
                 transaction,
                 root_page_id,
@@ -315,7 +316,7 @@ impl Btree {
                 transaction: &mut *transaction,
                 tree_id,
                 generation: 0,
-                visited: HashSet::new(),
+                visited: PageSet::default(),
                 inserted: 0,
                 removed: 0,
             };
@@ -630,7 +631,7 @@ fn open_cursor(
         leaf: None,
         leaf_index: 0,
         finished: false,
-        visited_pages: HashSet::new(),
+        visited_pages: PageSet::default(),
         backward,
         strict,
     };
@@ -658,7 +659,7 @@ pub(crate) struct BtreeCursor {
     /// past it moving backward.
     leaf_index: usize,
     finished: bool,
-    visited_pages: HashSet<PageId>,
+    visited_pages: PageSet,
     /// Whether the cursor moves toward smaller keys.
     backward: bool,
     strict: bool,
@@ -1896,7 +1897,7 @@ struct BatchWriter<'t, 'p, D: PageDevice> {
     transaction: &'t mut PagerWriteTransaction<'p, D>,
     tree_id: TreeId,
     generation: u64,
-    visited: HashSet<PageId>,
+    visited: PageSet,
     inserted: usize,
     removed: usize,
 }
@@ -2478,7 +2479,7 @@ fn delete_recursive<D: PageDevice>(
     tree_id: TreeId,
     generation: u64,
     key: &[u8],
-    visited: &mut HashSet<PageId>,
+    visited: &mut PageSet,
     depth: usize,
     expected_level: Option<u8>,
     parent_generation: Option<u64>,
@@ -2637,7 +2638,7 @@ fn insert_recursive<D: PageDevice>(
     generation: u64,
     key: &[u8],
     value: &[u8],
-    visited: &mut HashSet<PageId>,
+    visited: &mut PageSet,
     depth: usize,
     expected_level: Option<u8>,
     parent_generation: Option<u64>,
@@ -2958,7 +2959,7 @@ fn reclaim_tree<D: PageDevice>(
         expected_level: None,
         parent_generation: None,
     }];
-    let mut reachable = HashSet::new();
+    let mut reachable = PageSet::default();
     let mut pages = Vec::new();
 
     while let Some(current) = pending.pop() {
@@ -3085,7 +3086,7 @@ fn read_overflow_chain(
     let chunk_count = (descriptor.total_length as usize).div_ceil(MAX_OVERFLOW_CHUNK_BYTES);
     let mut value = Vec::with_capacity(descriptor.total_length as usize);
     let mut pages = Vec::with_capacity(chunk_count);
-    let mut visited = HashSet::with_capacity(chunk_count);
+    let mut visited = PageSet::with_capacity_and_hasher(chunk_count, Default::default());
     let mut page_id = descriptor.first_page_id;
     for index in 0..chunk_count {
         if !visited.insert(page_id) {
@@ -3372,7 +3373,7 @@ fn validate_sorted_internal_entries(
     leftmost_child: PageId,
     entries: &[InternalEntry],
 ) -> Result<()> {
-    let mut children = HashSet::with_capacity(entries.len() + 1);
+    let mut children = PageSet::with_capacity_and_hasher(entries.len() + 1, Default::default());
     children.insert(leftmost_child);
     for entry in entries {
         validate_key(&entry.key)?;

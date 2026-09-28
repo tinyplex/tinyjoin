@@ -40,7 +40,7 @@ pub(crate) const DEFAULT_PAGE_CACHE_PAGES: usize = DEFAULT_PAGE_CACHE_BYTES / PA
 /// Page IDs and candidate numbers are integers the engine assigns, not keys an adversary chooses,
 /// so these maps do not need SipHash's flooding resistance. Its cost dominated cache lookups.
 #[derive(Default)]
-struct PageKeyHasher(u64);
+pub(crate) struct PageKeyHasher(u64);
 
 impl Hasher for PageKeyHasher {
     fn finish(&self) -> u64 {
@@ -67,6 +67,9 @@ impl Hasher for PageKeyHasher {
 }
 
 type PageKeyMap<K, V> = HashMap<K, V, BuildHasherDefault<PageKeyHasher>>;
+
+/// A set of page IDs, hashed as the page cache hashes them.
+pub(crate) type PageSet = HashSet<PageId, BuildHasherDefault<PageKeyHasher>>;
 
 impl CacheEntry {
     fn seal(&mut self) {
