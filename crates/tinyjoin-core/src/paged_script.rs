@@ -67,16 +67,24 @@ struct PlannedChange {
 /// One table's changed rows, each with its encoded primary key, in the order they arrive. A scan in
 /// key order plans them in key order; once a key arrives out of order, as rows listed in VALUES
 /// can, every key is also kept in `seen`, and the rows are sorted when read.
-#[derive(Default)]
-struct TableRows {
-    rows: Vec<(Vec<u8>, PlannedChange)>,
+pub(crate) struct KeyedRows<T> {
+    rows: Vec<(Vec<u8>, T)>,
     seen: Option<BTreeSet<Vec<u8>>>,
 }
 
-impl TableRows {
-    /// The change already planned for `key`, if any.
+impl<T> Default for KeyedRows<T> {
+    fn default() -> Self {
+        Self {
+            rows: Vec::new(),
+            seen: None,
+        }
+    }
+}
+
+impl<T> KeyedRows<T> {
+    /// The row already planned for `key`, if any.
     #[allow(clippy::ptr_arg)]
-    fn get_mut(&mut self, key: &Vec<u8>) -> Option<&mut PlannedChange> {
+    pub(crate) fn get_mut(&mut self, key: &Vec<u8>) -> Option<&mut T> {
         if self.seen.is_none() && self.rows.last().is_some_and(|(last, _)| last > key) {
             let mut seen = BTreeSet::new();
             for (key, _) in &self.rows {
@@ -90,30 +98,60 @@ impl TableRows {
             Some(seen) if seen.contains(key) => self.rows.iter_mut().find(|(row, _)| row == key),
             Some(_) => None,
         };
-        row.map(|(_, change)| change)
+        row.map(|(_, row)| row)
     }
 
-    /// Plans the first change of `key`, for which [`Self::get_mut`] found none.
-    fn insert(&mut self, key: Vec<u8>, change: PlannedChange) {
+    /// Plans the first row of `key`, for which [`Self::get_mut`] found none.
+    pub(crate) fn insert(&mut self, key: Vec<u8>, row: T) {
         if let Some(seen) = &mut self.seen {
             seen.insert(key.clone());
         }
-        self.rows.push((key, change));
+        self.rows.push((key, row));
+    }
+
+    /// Where each row is in key order.
+    fn order(&self) -> Vec<usize> {
+        let mut order = Vec::with_capacity(self.rows.len());
+        if self.seen.is_none() {
+            order.extend(0..self.rows.len());
+            return order;
+        }
+        let mut keys = Vec::with_capacity(self.rows.len());
+        for (index, (key, _)) in self.rows.iter().enumerate() {
+            keys.push((key.clone(), index));
+        }
+        // Keys are unique, so the pairs sort as their keys do.
+        keys.sort_unstable();
+        for (_, index) in keys {
+            order.push(index);
+        }
+        order
     }
 
     /// The rows in key order.
-    fn changes(&self) -> Vec<(&[u8], &ChangedRow)> {
-        let mut order = Vec::new();
-        if self.seen.is_some() {
-            for (index, (key, _)) in self.rows.iter().enumerate() {
-                order.push((key.clone(), index));
-            }
-            // Keys are unique, so the pairs sort as their keys do.
-            order.sort_unstable();
+    pub(crate) fn into_sorted(self) -> Vec<(Vec<u8>, T)> {
+        if self.seen.is_none() {
+            return self.rows;
         }
+        let order = self.order();
+        let mut rows = Vec::with_capacity(self.rows.len());
+        for row in self.rows {
+            rows.push(Some(row));
+        }
+        let mut sorted = Vec::with_capacity(rows.len());
+        for index in order {
+            sorted.push(rows[index].take().expect("each row is taken once"));
+        }
+        sorted
+    }
+}
+
+impl KeyedRows<PlannedChange> {
+    /// The changed rows in key order.
+    fn changes(&self) -> Vec<(&[u8], &ChangedRow)> {
         let mut changes = Vec::with_capacity(self.rows.len());
-        for index in 0..self.rows.len() {
-            let (key, change) = &self.rows[order.get(index).map_or(index, |(_, index)| *index)];
+        for index in self.order() {
+            let (key, change) = &self.rows[index];
             changes.push((key.as_slice(), &change.row));
         }
         changes
@@ -532,7 +570,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             .get(&table_name)
             .ok_or_else(|| EngineError::table_not_found(&table_name))?;
         let mut retained_bytes = 0usize;
-        let mut changes = TableRows::default();
+        let mut changes = KeyedRows::<PlannedChange>::default();
         let mut previous = previous.into_iter();
         for change in input_changes {
             let held = previous.next().unwrap_or(PreviousRow::Unread);

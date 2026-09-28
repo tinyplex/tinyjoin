@@ -1,7 +1,7 @@
 use std::{
     cell::Cell,
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet},
     rc::Rc,
 };
 
@@ -9,7 +9,7 @@ use crate::{
     EngineError, IndexDefinition, MAX_CHANGED_KEYS_PER_TABLE, PageDevice, PagedStorage, Result,
     Row, RowChange, StorageReader, TableDefinition, TreeId, VisitControl, VisitOutcome,
     paged_codec::{EMPTY_RECORD, IndexEntryLayout, RecordLayout, encode_primary_key, encode_row},
-    paged_script::{ChangedRow, TableChanges, held_row_bytes},
+    paged_script::{ChangedRow, KeyedRows, TableChanges, held_row_bytes},
     paged_storage::{ChangeCost, ChangeRow, PagedTable, PagedWriteUsage, batch_too_large},
     row::{HeldRow, RowRef},
     statement::PreviousRow,
@@ -283,7 +283,8 @@ impl PagedTransaction {
         changes: Vec<RowChange>,
         previous: Vec<PreviousRow>,
     ) -> Result<OverlayPatch> {
-        let mut patched = BTreeMap::<String, BTreeMap<Vec<u8>, PatchChange>>::new();
+        // Each table's changes, in name order: a statement changes one.
+        let mut patched: Vec<(String, KeyedRows<PatchChange>)> = Vec::new();
         let mut replaces = false;
         let count = changes.len();
         let mut previous = previous.into_iter();
@@ -317,13 +318,13 @@ impl PagedTransaction {
                     replaces,
                 });
             }
-            if !patched.contains_key(&table) {
-                patched.insert(table.clone(), BTreeMap::new());
+            let position = patched.partition_point(|(name, _)| *name < table);
+            if patched.get(position).is_none_or(|(name, _)| *name != table) {
+                patched.insert(position, (table.clone(), KeyedRows::default()));
             }
-            let entries = patched.get_mut(&table).expect("the table was added above");
-            match entries.entry(key) {
-                Entry::Occupied(mut slot) => {
-                    let slot = slot.get_mut();
+            let entries = &mut patched[position].1;
+            match entries.get_mut(&key) {
+                Some(slot) => {
                     // Keys are canonical, so this also catches spellings SQL considers equal, such
                     // as FLOAT `0` and `-0.0`. A delete and an upsert of one key stay valid.
                     if !is_delete && slot.upserted {
@@ -334,11 +335,11 @@ impl PagedTransaction {
                     slot.upserted |= !is_delete;
                     slot.row = row;
                 }
-                Entry::Vacant(slot) => {
+                None => {
                     let (change, replaced) =
-                        self.first_change(storage, &table, slot.key(), held, row, is_delete)?;
+                        self.first_change(storage, &table, &key, held, row, is_delete)?;
                     replaces |= replaced;
-                    slot.insert(change);
+                    entries.insert(key, change);
                 }
             }
         }
@@ -348,6 +349,7 @@ impl PagedTransaction {
         };
         for (table, changes) in patched {
             let paged = storage.table(&table)?;
+            let changes = changes.into_sorted();
             let mut entries = Vec::with_capacity(changes.len());
             for (key, change) in changes {
                 let entry = overlay_entry(storage, paged, &table, &key, change)?;
