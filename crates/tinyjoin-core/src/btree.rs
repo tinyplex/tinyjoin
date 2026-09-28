@@ -590,7 +590,7 @@ fn get_from(
             };
             let leaf_generation = node.generation;
             return read_overflow_chain(
-                |page_id| reader.read_btree_page(page_id),
+                &mut |page_id| reader.read_btree_page(page_id),
                 tree_id,
                 generation,
                 leaf_generation,
@@ -704,8 +704,31 @@ impl BtreeCursor {
     }
 
     fn next_from(&mut self, reader: &mut impl BtreeReadView) -> Result<Option<CursorEntry<'_>>> {
-        if self.finished {
+        if !self.next_leaf_from(reader)? {
             return Ok(None);
+        }
+        self.next_in_leaf(&mut |page_id| reader.read_btree_page(page_id))
+    }
+
+    /// Moves on to the next leaf holding entries the cursor has not returned, unless the current
+    /// one still holds some, and reports whether there is one. Its entries are then taken with
+    /// [`Self::next_in_leaf`]. The cursor's view is checked here, once for a leaf's entries, so
+    /// whoever takes them must not change the tree in between, as a visitor of rows cannot.
+    pub(crate) fn next_leaf<D: PageDevice>(&mut self, pager: &mut Pager<D>) -> Result<bool> {
+        self.next_leaf_from(pager)
+    }
+
+    /// [`Self::next_leaf`] for a cursor opened in a transaction.
+    pub(crate) fn next_leaf_in_transaction<D: PageDevice>(
+        &mut self,
+        transaction: &mut PagerWriteTransaction<'_, D>,
+    ) -> Result<bool> {
+        self.next_leaf_from(transaction)
+    }
+
+    fn next_leaf_from(&mut self, reader: &mut impl BtreeReadView) -> Result<bool> {
+        if self.finished {
+            return Ok(false);
         }
         self.ensure_view(reader)?;
         loop {
@@ -715,32 +738,38 @@ impl BtreeCursor {
                 self.leaf_index < self.leaf.as_ref().map_or(0, NodeView::len)
             };
             if remaining {
-                break;
+                return Ok(true);
             }
             if !self.advance_leaf(reader)? {
                 self.finished = true;
-                return Ok(None);
+                return Ok(false);
             }
         }
-        let index = if self.backward {
-            self.leaf_index - 1
-        } else {
-            self.leaf_index
+    }
+
+    /// The next entry of the leaf [`Self::next_leaf`] moved to, or `None` once it holds no more.
+    /// The key and an inline value are slices of the cursor's copy of the leaf, so only a value
+    /// held in an overflow chain needs pages read, which `read` reads.
+    pub(crate) fn next_in_leaf(
+        &mut self,
+        read: &mut dyn FnMut(PageId) -> Result<Page>,
+    ) -> Result<Option<CursorEntry<'_>>> {
+        let Some(leaf) = self.leaf.as_ref() else {
+            return Ok(None);
         };
-        let tree_id = self.tree_id;
-        let generation = self.view.generation();
-        let leaf = self
-            .leaf
-            .as_ref()
-            .expect("the loop above found a leaf entry");
+        let index = match self.backward {
+            true if self.leaf_index > 0 => self.leaf_index - 1,
+            false if self.leaf_index < leaf.len() => self.leaf_index,
+            _ => return Ok(None),
+        };
         let (key, value) = leaf.leaf_cell(index)?;
         let value = match value {
             CellValue::Inline(value) => Cow::Borrowed(value),
             CellValue::Overflow(descriptor) => Cow::Owned(
                 read_overflow_chain(
-                    |page_id| reader.read_btree_page(page_id),
-                    tree_id,
-                    generation,
+                    read,
+                    self.tree_id,
+                    self.view.generation(),
                     leaf.generation,
                     &descriptor,
                 )?
@@ -2965,7 +2994,7 @@ fn reclaim_tree<D: PageDevice>(
                     // Reclamation must validate the complete value, including its end-to-end
                     // checksum, before changing the candidate allocation bitmap.
                     let (_, overflow_pages) = read_overflow_chain(
-                        |page_id| transaction.read_page(page_id),
+                        &mut |page_id| transaction.read_page(page_id),
                         tree_id,
                         view_generation,
                         node.generation,
@@ -3023,7 +3052,7 @@ fn release_leaf_value<D: PageDevice>(
     // Validate and materialize the complete chain before changing allocation state. A malformed
     // descriptor must never cause a partially-reclaimed chain.
     let (_, pages) = read_overflow_chain(
-        |page_id| transaction.read_page(page_id),
+        &mut |page_id| transaction.read_page(page_id),
         tree_id,
         view_generation,
         leaf_generation,
@@ -3040,7 +3069,7 @@ fn release_leaf_value<D: PageDevice>(
 }
 
 fn read_overflow_chain(
-    mut read_page: impl FnMut(PageId) -> Result<Page>,
+    read_page: &mut dyn FnMut(PageId) -> Result<Page>,
     tree_id: TreeId,
     view_generation: u64,
     leaf_generation: u64,
@@ -5157,7 +5186,7 @@ mod tests {
         ]);
         assert_eq!(
             read_overflow_chain(
-                |id| Ok(pages.get(&id).unwrap().clone()),
+                &mut |id| Ok(pages.get(&id).unwrap().clone()),
                 TREE,
                 2,
                 2,
@@ -5172,7 +5201,7 @@ mod tests {
         bad_checksum.checksum ^= 1;
         assert_eq!(
             read_overflow_chain(
-                |id| Ok(pages.get(&id).unwrap().clone()),
+                &mut |id| Ok(pages.get(&id).unwrap().clone()),
                 TREE,
                 2,
                 2,

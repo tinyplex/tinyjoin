@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashSet},
     rc::Rc,
@@ -334,18 +335,18 @@ impl<D: PageDevice> PagedStorage<D> {
     ) -> Result<VisitOutcome> {
         let mut cursor =
             Btree::cursor_from(&mut self.pager.borrow_mut(), root, tree_id, range.start())?;
-        loop {
-            let next = cursor.next_entry(&mut self.pager.borrow_mut())?;
-            let Some((entry, value)) = next else {
-                return Ok(VisitOutcome::Complete);
-            };
-            if !range.contains(leading_key_component(entry, leading)?) {
-                return Ok(VisitOutcome::Complete);
-            }
-            if each(entry, &value)? == VisitControl::Stop {
-                return Ok(VisitOutcome::Stopped);
+        let mut read = |page_id: PageId| self.pager.borrow_mut().read_page(page_id);
+        while cursor.next_leaf(&mut self.pager.borrow_mut())? {
+            while let Some((entry, value)) = cursor.next_in_leaf(&mut read)? {
+                if !range.contains(leading_key_component(entry, leading)?) {
+                    return Ok(VisitOutcome::Complete);
+                }
+                if each(entry, &value)? == VisitControl::Stop {
+                    return Ok(VisitOutcome::Stopped);
+                }
             }
         }
+        Ok(VisitOutcome::Complete)
     }
 
     /// The fingerprint of every row in this database, as published in the superblock.
@@ -1092,14 +1093,18 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
             return Ok(VisitOutcome::Complete);
         };
         let mut cursor = Btree::cursor(&mut self.pager.borrow_mut(), root, table.tree_id)?;
-        loop {
-            let next = cursor.next_entry(&mut self.pager.borrow_mut())?;
-            let Some((key, value)) = next else {
-                break;
-            };
-            let row = RowRef::record(table.record(key, &value)?);
-            if visitor(&row)? == VisitControl::Stop {
-                return Ok(VisitOutcome::Stopped);
+        // Rows are read from the cursor's copy of each leaf, so the pager is borrowed only to move
+        // between leaves, or to read a value that overflows, and the visitor can read it too.
+        let mut read = |page_id: PageId| self.pager.borrow_mut().read_page(page_id);
+        while cursor.next_leaf(&mut self.pager.borrow_mut())? {
+            while let Some((key, value)) = cursor.next_in_leaf(&mut read)? {
+                let value = match &value {
+                    Cow::Borrowed(value) => *value,
+                    Cow::Owned(value) => value.as_slice(),
+                };
+                if visitor(&RowRef::record(table.record(key, value)?))? == VisitControl::Stop {
+                    return Ok(VisitOutcome::Stopped);
+                }
             }
         }
         Ok(VisitOutcome::Complete)
@@ -1139,16 +1144,19 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
                 range.end().as_deref(),
             )?,
         };
-        loop {
-            let next = cursor.next_entry(&mut self.pager.borrow_mut())?;
-            let Some((key, value)) = next else {
-                break;
-            };
-            if !range.contains(leading_key_component(key, key_type)?) {
-                break;
-            }
-            if visitor(&RowRef::record(table.record(key, &value)?))? == VisitControl::Stop {
-                return Ok(VisitOutcome::Stopped);
+        let mut read = |page_id: PageId| self.pager.borrow_mut().read_page(page_id);
+        while cursor.next_leaf(&mut self.pager.borrow_mut())? {
+            while let Some((key, value)) = cursor.next_in_leaf(&mut read)? {
+                if !range.contains(leading_key_component(key, key_type)?) {
+                    return Ok(VisitOutcome::Complete);
+                }
+                let value = match &value {
+                    Cow::Borrowed(value) => *value,
+                    Cow::Owned(value) => value.as_slice(),
+                };
+                if visitor(&RowRef::record(table.record(key, value)?))? == VisitControl::Stop {
+                    return Ok(VisitOutcome::Stopped);
+                }
             }
         }
         Ok(VisitOutcome::Complete)

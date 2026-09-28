@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
     rc::Rc,
@@ -851,18 +852,18 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             tree_id,
             range.start(),
         )?;
-        loop {
-            let next = cursor.next_entry_in_transaction(&mut self.transaction.borrow_mut())?;
-            let Some((entry, value)) = next else {
-                return Ok(VisitOutcome::Complete);
-            };
-            if !range.contains(leading_key_component(entry, leading)?) {
-                return Ok(VisitOutcome::Complete);
-            }
-            if each(entry, &value)? == VisitControl::Stop {
-                return Ok(VisitOutcome::Stopped);
+        let mut read = |page_id: PageId| self.transaction.borrow_mut().read_page(page_id);
+        while cursor.next_leaf_in_transaction(&mut self.transaction.borrow_mut())? {
+            while let Some((entry, value)) = cursor.next_in_leaf(&mut read)? {
+                if !range.contains(leading_key_component(entry, leading)?) {
+                    return Ok(VisitOutcome::Complete);
+                }
+                if each(entry, &value)? == VisitControl::Stop {
+                    return Ok(VisitOutcome::Stopped);
+                }
             }
         }
+        Ok(VisitOutcome::Complete)
     }
 
     fn charge_operations(&self, count: usize) -> Result<()> {
@@ -1143,15 +1144,17 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
         };
         let mut cursor =
             Btree::cursor_in_transaction(&mut self.transaction.borrow_mut(), root, table.tree_id)?;
-        loop {
-            let next = cursor.next_entry_in_transaction(&mut self.transaction.borrow_mut())?;
-            let Some((key, value)) = next else {
-                break;
-            };
-            self.charge_operations(1)?;
-            let row = RowRef::record(table.record(key, &value)?);
-            if visitor(&row)? == VisitControl::Stop {
-                return Ok(VisitOutcome::Stopped);
+        let mut read = |page_id: PageId| self.transaction.borrow_mut().read_page(page_id);
+        while cursor.next_leaf_in_transaction(&mut self.transaction.borrow_mut())? {
+            while let Some((key, value)) = cursor.next_in_leaf(&mut read)? {
+                self.charge_operations(1)?;
+                let value = match &value {
+                    Cow::Borrowed(value) => *value,
+                    Cow::Owned(value) => value.as_slice(),
+                };
+                if visitor(&RowRef::record(table.record(key, value)?))? == VisitControl::Stop {
+                    return Ok(VisitOutcome::Stopped);
+                }
             }
         }
         Ok(VisitOutcome::Complete)
@@ -1190,17 +1193,20 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
                 range.end().as_deref(),
             )?,
         };
-        loop {
-            let next = cursor.next_entry_in_transaction(&mut self.transaction.borrow_mut())?;
-            let Some((key, value)) = next else {
-                break;
-            };
-            if !range.contains(leading_key_component(key, key_type)?) {
-                break;
-            }
-            self.charge_operations(1)?;
-            if visitor(&RowRef::record(table.record(key, &value)?))? == VisitControl::Stop {
-                return Ok(VisitOutcome::Stopped);
+        let mut read = |page_id: PageId| self.transaction.borrow_mut().read_page(page_id);
+        while cursor.next_leaf_in_transaction(&mut self.transaction.borrow_mut())? {
+            while let Some((key, value)) = cursor.next_in_leaf(&mut read)? {
+                if !range.contains(leading_key_component(key, key_type)?) {
+                    return Ok(VisitOutcome::Complete);
+                }
+                self.charge_operations(1)?;
+                let value = match &value {
+                    Cow::Borrowed(value) => *value,
+                    Cow::Owned(value) => value.as_slice(),
+                };
+                if visitor(&RowRef::record(table.record(key, value)?))? == VisitControl::Stop {
+                    return Ok(VisitOutcome::Stopped);
+                }
             }
         }
         Ok(VisitOutcome::Complete)

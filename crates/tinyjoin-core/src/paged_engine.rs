@@ -646,6 +646,60 @@ mod tests {
     }
 
     #[test]
+    fn scans_read_rows_whose_values_overflow_their_leaves() {
+        // Scans take a leaf's rows from the cursor's copy of it, reading a value that overflows
+        // the leaf through the pager, in both directions, and inside a write.
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .execute_sql(
+                "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+                &[],
+            )
+            .unwrap();
+        let large = |id: u64| format!("{id} {}", "x".repeat(5_000));
+        for id in 1..=60 {
+            let body = if id % 7 == 0 {
+                large(id)
+            } else {
+                format!("row {id}")
+            };
+            engine
+                .execute_sql(
+                    "INSERT INTO docs (id, body) VALUES ($1, $2)",
+                    &[json!(id), json!(body)],
+                )
+                .unwrap();
+        }
+        let ids = |rows: &[Row]| rows.iter().map(|row| row["id"].clone()).collect::<Vec<_>>();
+        let rows = engine
+            .query_sql(
+                "SELECT id, body FROM docs WHERE id >= 20 ORDER BY id DESC",
+                &[],
+            )
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 41);
+        assert_eq!(rows[0], row(json!({"id": 60, "body": "row 60"})));
+        assert_eq!(rows[7], row(json!({"id": 53, "body": "row 53"})));
+        assert_eq!(rows[5], row(json!({"id": 55, "body": "row 55"})));
+        assert_eq!(rows[4], row(json!({"id": 56, "body": large(56)})));
+        let deleted = engine
+            .execute_sql("DELETE FROM docs WHERE body LIKE '%xxx' RETURNING id", &[])
+            .unwrap();
+        assert_eq!(
+            ids(&deleted.rows),
+            [7, 14, 21, 28, 35, 42, 49, 56].map(|id| json!(id))
+        );
+        assert_eq!(
+            engine
+                .query_sql("SELECT count(*) AS n FROM docs WHERE body LIKE 'row%'", &[])
+                .unwrap()
+                .rows,
+            vec![row(json!({"n": 52}))]
+        );
+    }
+
+    #[test]
     fn page_native_writes_with_keys_out_of_order_match_in_memory() {
         // A statement's changes arrive in key order from a scan, and in any order from VALUES,
         // which the writer handles apart. Each statement here names a key below one before it.
