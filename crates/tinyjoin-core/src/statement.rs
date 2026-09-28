@@ -231,9 +231,11 @@ pub(crate) fn execute<S: StorageDriver>(
         | WriteStatement::Update { .. }
         | WriteStatement::Delete { .. } => {
             let PlannedDml {
-                outcome, changes, ..
+                outcome,
+                changes,
+                previous,
             } = plan_dml(storage, statement)?;
-            let keys = changed_keys(storage, &changes)?;
+            let keys = changed_keys(storage, &changes, &previous)?;
             storage.apply_row_changes_unrevisioned(changes)?;
             Ok((outcome, keys))
         }
@@ -267,18 +269,13 @@ fn no_changed_keys(outcome: WriteOutcome) -> (WriteOutcome, BTreeMap<String, Vec
 /// A table whose change count exceeds [`MAX_CHANGED_KEYS_PER_TABLE`] is dropped entirely rather
 /// than reported partially, so a consumer can read the presence of a table as "this is every key
 /// that changed". Keys are projected from the row the change carries, so a delete reports the row
-/// that is going away and an upsert reports the row that replaces it.
+/// that is going away and an upsert reports the row that replaces it. `previous` is what planning
+/// read at each change's key.
 pub(crate) fn changed_keys(
     storage: &dyn StorageReader,
     changes: &[RowChange],
+    previous: &[PreviousRow],
 ) -> Result<BTreeMap<String, Vec<Row>>> {
-    fn change_table(change: &RowChange) -> &String {
-        match change {
-            RowChange::Upsert { table, .. }
-            | RowChange::Delete { table, .. }
-            | RowChange::Put { table, .. } => table,
-        }
-    }
     // One change reports one key, which needs neither the bound nor ordering.
     if let [change] = changes {
         let table = change_table(change);
@@ -286,6 +283,9 @@ pub(crate) fn changed_keys(
         let mut keys = BTreeMap::new();
         keys.insert(table.clone(), vec![key]);
         return Ok(keys);
+    }
+    if exceeds_changed_keys(changes, previous) {
+        return Ok(BTreeMap::new());
     }
     let mut schemas: BTreeMap<String, Rc<TableDefinition>> = BTreeMap::new();
     let mut collector = KeyCollector::default();
@@ -303,6 +303,39 @@ pub(crate) fn changed_keys(
         insert_changed_key(keys, changed_key(storage, schema, change)?);
     }
     Ok(collector.finish())
+}
+
+/// The table a change is to.
+pub(crate) fn change_table(change: &RowChange) -> &String {
+    match change {
+        RowChange::Upsert { table, .. }
+        | RowChange::Delete { table, .. }
+        | RowChange::Put { table, .. } => table,
+    }
+}
+
+/// Whether changes to one table change more rows than it can report keys for, which is found
+/// without projecting a key where each change's encoded key is at hand: planned as a record, or
+/// the key of the stored row planning read there. Keys encoded differently project differently,
+/// so more changes than the bound, whose encoded keys strictly ascend, report too many keys.
+fn exceeds_changed_keys(changes: &[RowChange], previous: &[PreviousRow]) -> bool {
+    let Some(first) = changes.get(MAX_CHANGED_KEYS_PER_TABLE) else {
+        return false;
+    };
+    let table = change_table(first);
+    let mut last: Option<&[u8]> = None;
+    for (index, change) in changes.iter().enumerate() {
+        let key = match (change, previous.get(index)) {
+            (RowChange::Put { key, .. }, _) => key.as_slice(),
+            (_, Some(PreviousRow::Read(Some(HeldRow::Stored(entry))))) => entry.key(),
+            _ => return false,
+        };
+        if change_table(change) != table || last.is_some_and(|last| last >= key) {
+            return false;
+        }
+        last = Some(key);
+    }
+    true
 }
 
 /// A changed row's primary-key columns: projected from the row a change carries, or decoded from

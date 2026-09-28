@@ -288,7 +288,7 @@ impl<D: PageDevice> PagedEngine<D> {
         ) = {
             let view = self.read_view_with_work(work);
             let planned = crate::statement::plan_dml(&view, statement)?;
-            let keys = crate::statement::changed_keys(&view, &planned.changes)?;
+            let keys = crate::statement::changed_keys(&view, &planned.changes, &planned.previous)?;
             (planned, keys)
         };
         let fields =
@@ -643,6 +643,42 @@ mod tests {
                 .rows,
             vec![row(json!({"id": 4}))]
         );
+    }
+
+    #[test]
+    fn page_native_writes_with_keys_out_of_order_match_in_memory() {
+        // A statement's changes arrive in key order from a scan, and in any order from VALUES,
+        // which the writer handles apart. Each statement here names a key below one before it.
+        let mut expected = Engine::new(source());
+        let mut actual = page_native_fixture(MemoryPageDevice::new(0).unwrap()).unwrap();
+        for sql in [
+            "INSERT INTO accounts (id, email) VALUES \
+                (5, 'e@example.com'), (3, 'c@example.com'), (4, 'd@example.com') RETURNING id",
+            "INSERT INTO accounts (id, email) VALUES \
+                (9, 'i@example.com'), (7, 'g@example.com'), (9, 'again@example.com')",
+            "INSERT INTO accounts (id, email) VALUES (8, 'h@example.com'), (8, 'again@example.com')",
+            "INSERT INTO accounts (id, email) VALUES (5, 'c@example.com'), (3, 'e@example.com') \
+                ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email RETURNING id, email",
+            "INSERT INTO accounts (id, email) VALUES (7, 'x@example.com'), (6, 'x@example.com')",
+            "INSERT INTO accounts (id, email) VALUES (6, 'f@example.com'), (1, 'lin@example.com') \
+                ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email",
+            "INSERT INTO accounts (id, email) VALUES (6, 'f@example.com'), (1, 'a@example.com') \
+                ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email RETURNING id, email",
+            "UPDATE accounts SET active = true WHERE id > 1 RETURNING id",
+            "DELETE FROM accounts WHERE id > 2 RETURNING id",
+        ] {
+            match (actual.execute_sql(sql, &[]), expected.execute_sql(sql, &[])) {
+                (Ok(actual), Ok(expected)) => assert_eq!(actual, expected, "{sql}"),
+                (Err(actual), Err(expected)) => assert_eq!(actual.code, expected.code, "{sql}"),
+                (actual, expected) => panic!("{sql}: {actual:?} is not {expected:?}"),
+            }
+            let select = "SELECT id, email, active FROM accounts ORDER BY id";
+            assert_eq!(
+                actual.query_sql(select, &[]).unwrap().rows,
+                expected.query_sql(select, &[]).unwrap().rows,
+                "{sql}",
+            );
+        }
     }
 
     #[test]

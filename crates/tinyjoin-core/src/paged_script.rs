@@ -1,6 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, BTreeSet, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet},
     rc::Rc,
 };
 
@@ -26,7 +26,7 @@ use crate::{
         storage_corrupt, unique_violation,
     },
     row::{HeldRow, RowRef},
-    statement::{PlannedDml, PreviousRow, Statement, WriteStatement},
+    statement::{PlannedDml, PreviousRow, Statement, WriteStatement, change_table},
     storage::{
         KeyOrder, KeyRange, estimated_record_bytes, estimated_row_bytes, preflight_row_write_set,
         schema_with_added_column, validate_schema,
@@ -56,8 +56,70 @@ pub(crate) struct ChangedRow {
     pub(crate) next: Option<Vec<u8>>,
 }
 
-/// Changed rows by table and encoded primary key.
-type ChangedRows = BTreeMap<String, BTreeMap<Vec<u8>, ChangedRow>>;
+/// A row a statement changes, and whether one of its changes writes a row, which makes a second
+/// write of its key a conflict.
+struct PlannedChange {
+    row: ChangedRow,
+    written: bool,
+}
+
+/// One table's changed rows by encoded primary key: a vector while their keys arrive in ascending
+/// order, as a scan in key order plans them, and a map from the first that does not.
+enum TableRows {
+    Sorted(Vec<(Vec<u8>, PlannedChange)>),
+    Map(BTreeMap<Vec<u8>, PlannedChange>),
+}
+
+impl TableRows {
+    /// The change already planned for `key`, if any.
+    #[allow(clippy::ptr_arg)]
+    fn get_mut(&mut self, key: &Vec<u8>) -> Option<&mut PlannedChange> {
+        if let Self::Sorted(rows) = self
+            && rows.last().is_some_and(|(last, _)| last > key)
+        {
+            let mut map = BTreeMap::new();
+            for (key, change) in std::mem::take(rows) {
+                map.insert(key, change);
+            }
+            *self = Self::Map(map);
+        }
+        match self {
+            Self::Sorted(rows) => match rows.last_mut() {
+                Some((last, change)) if last == key => Some(change),
+                _ => None,
+            },
+            Self::Map(rows) => rows.get_mut(key),
+        }
+    }
+
+    /// Plans the first change of `key`, for which [`Self::get_mut`] found none.
+    fn insert(&mut self, key: Vec<u8>, change: PlannedChange) {
+        match self {
+            Self::Sorted(rows) => rows.push((key, change)),
+            Self::Map(rows) => {
+                rows.insert(key, change);
+            }
+        }
+    }
+
+    /// The rows in key order.
+    fn changes(&self) -> Vec<(&[u8], &ChangedRow)> {
+        let mut changes = Vec::new();
+        match self {
+            Self::Sorted(rows) => {
+                for (key, change) in rows {
+                    changes.push((key.as_slice(), &change.row));
+                }
+            }
+            Self::Map(rows) => {
+                for (key, change) in rows {
+                    changes.push((key.as_slice(), &change.row));
+                }
+            }
+        }
+        changes
+    }
+}
 
 /// A planned change's row: a map, or a key a delete names, or the encoded key and record of a
 /// row planned straight into its stored entry.
@@ -295,7 +357,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                     previous,
                 } = crate::statement::plan_dml(self, statement)?;
                 if outcome.mutated {
-                    keys = crate::statement::changed_keys(self, &changes)?;
+                    keys = crate::statement::changed_keys(self, &changes, &previous)?;
                     self.apply_changes(changes, previous)?;
                 }
                 outcome
@@ -430,13 +492,17 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         self.charge_operations(1)
     }
 
-    /// Applies a statement's planned changes. Planning normalized every row they write, and read
-    /// the row each key held wherever it could, which `previous` reports.
+    /// Applies a statement's planned changes, which change one table. Planning normalized every
+    /// row they write, and read the row each key held wherever it could, which `previous` reports.
     fn apply_changes(
         &mut self,
         input_changes: Vec<RowChange>,
         previous: Vec<PreviousRow>,
     ) -> Result<()> {
+        let Some(first) = input_changes.first() else {
+            return Ok(());
+        };
+        let table_name = change_table(first).clone();
         let definitions = self
             .indexes
             .values()
@@ -451,50 +517,34 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             &definitions,
             Default::default(),
         )?;
-        // A statement changes one table, whose index count is found once.
-        let mut indexed: Option<(&str, usize)> = None;
+        let index_count = definitions
+            .iter()
+            .filter(|definition| definition.table == table_name)
+            .count();
         for change in &input_changes {
-            let table = match change {
-                RowChange::Upsert { table, .. }
-                | RowChange::Delete { table, .. }
-                | RowChange::Put { table, .. } => table,
-            };
-            let index_count = match indexed {
-                Some((name, count)) if name == table => count,
-                _ => {
-                    let count = self
-                        .indexes
-                        .values()
-                        .filter(|index| index.definition.table == *table)
-                        .count();
-                    indexed = Some((table, count));
-                    count
-                }
-            };
+            if *change_table(change) != table_name {
+                return Err(EngineError::new(
+                    "INTERNAL_ERROR",
+                    "A statement's changes name more than one table",
+                ));
+            }
             self.charge_operations(index_count.saturating_mul(2).saturating_add(1))?;
         }
 
-        let mut duplicate_upserts = BTreeMap::<String, BTreeSet<Vec<u8>>>::new();
+        let table = self
+            .tables
+            .get(&table_name)
+            .ok_or_else(|| EngineError::table_not_found(&table_name))?;
         let mut retained_bytes = 0usize;
-        let mut changes = ChangedRows::new();
+        let mut changes = TableRows::Sorted(vec![]);
         let mut previous = previous.into_iter();
         for change in input_changes {
             let held = previous.next().unwrap_or(PreviousRow::Unread);
-            let (table_name, row, is_delete) = match change {
-                RowChange::Upsert { table, row } => (table, PlannedRow::Map(row), false),
-                RowChange::Delete { table, key } => (table, PlannedRow::Map(key), true),
-                RowChange::Put { table, key, record } => {
-                    (table, PlannedRow::Record(key, record), false)
-                }
+            let (row, is_delete) = match change {
+                RowChange::Upsert { row, .. } => (PlannedRow::Map(row), false),
+                RowChange::Delete { key, .. } => (PlannedRow::Map(key), true),
+                RowChange::Put { key, record, .. } => (PlannedRow::Record(key, record), false),
             };
-            let table_name = &table_name;
-            let table = self
-                .tables
-                .get(table_name)
-                .ok_or_else(|| EngineError::table_not_found(table_name))?;
-            if !changes.contains_key(table_name) {
-                changes.insert(table_name.clone(), BTreeMap::new());
-            }
             // A stored row planning held is the row the change's key holds, so its entry's key is
             // the change's encoded key.
             let key = match (&row, &held) {
@@ -505,15 +555,8 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 }
                 (PlannedRow::Map(row), _) => encode_primary_key(&table.schema, row)?,
             };
-            if !is_delete && !duplicate_upserts.contains_key(table_name) {
-                duplicate_upserts.insert(table_name.clone(), BTreeSet::new());
-            }
-            if !is_delete
-                && !duplicate_upserts
-                    .get_mut(table_name)
-                    .expect("the table was added above")
-                    .insert(key.clone())
-            {
+            let existing = changes.get_mut(&key);
+            if !is_delete && existing.as_ref().is_some_and(|existing| existing.written) {
                 return Err(EngineError::constraint_violation(format!(
                     "SQL statement would write canonical primary key in `{table_name}` more than once"
                 )));
@@ -530,27 +573,20 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                     (Some(record), bytes)
                 }
             };
-            let table_changes = changes
-                .get_mut(table_name)
-                .expect("the table was added above");
-            let slot = match table_changes.entry(key) {
-                Entry::Occupied(mut existing) => {
-                    let previous_bytes = match &existing.get().next {
-                        Some(record) => {
-                            estimated_record_bytes(&table.record(existing.key(), record)?)?
-                        }
-                        None => 0,
-                    };
-                    retained_bytes = retained_bytes
-                        .checked_sub(previous_bytes)
-                        .and_then(|bytes| bytes.checked_add(next_bytes))
-                        .ok_or_else(batch_too_large)?;
-                    ensure_batch_bytes(retained_bytes)?;
-                    existing.get_mut().next = next;
-                    continue;
-                }
-                Entry::Vacant(slot) => slot,
-            };
+            if let Some(existing) = existing {
+                let previous_bytes = match &existing.row.next {
+                    Some(record) => estimated_record_bytes(&table.record(&key, record)?)?,
+                    None => 0,
+                };
+                retained_bytes = retained_bytes
+                    .checked_sub(previous_bytes)
+                    .and_then(|bytes| bytes.checked_add(next_bytes))
+                    .ok_or_else(batch_too_large)?;
+                ensure_batch_bytes(retained_bytes)?;
+                existing.row.next = next;
+                existing.written |= !is_delete;
+                continue;
+            }
             let old = match held {
                 PreviousRow::Read(row) => {
                     // Charged as the lookup it replaces.
@@ -558,8 +594,8 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                     row
                 }
                 PreviousRow::Unread => self
-                    .lookup_record(table_name, slot.key())?
-                    .map(|value| Ok::<_, EngineError>(table.record(slot.key(), &value)?.to_entry()))
+                    .lookup_record(&table_name, &key)?
+                    .map(|value| Ok::<_, EngineError>(table.record(&key, &value)?.to_entry()))
                     .transpose()?
                     .map(HeldRow::Stored),
             };
@@ -567,32 +603,32 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 .as_ref()
                 .map_or(Ok(0), |old| held_row_bytes(table, old))?;
             retained_bytes = retained_bytes
-                .checked_add(slot.key().len())
+                .checked_add(key.len())
                 .and_then(|bytes| bytes.checked_add(old_bytes))
                 .and_then(|bytes| bytes.checked_add(next_bytes))
                 .and_then(|bytes| bytes.checked_add(96))
                 .ok_or_else(batch_too_large)?;
             ensure_batch_bytes(retained_bytes)?;
-            slot.insert(ChangedRow { old, next });
+            changes.insert(
+                key,
+                PlannedChange {
+                    row: ChangedRow { old, next },
+                    written: !is_delete,
+                },
+            );
         }
+        let changes = [(table_name.as_str(), changes.changes())];
         self.validate_changed_unique_indexes(&changes, retained_bytes)?;
-        let changes = changes
-            .iter()
-            .map(|(table, rows)| {
-                let rows = rows.iter().map(|(key, row)| (key.as_slice(), row));
-                (table.as_str(), rows.collect())
-            })
-            .collect::<Vec<_>>();
         self.apply_row_changes(&changes)
     }
 
     fn validate_changed_unique_indexes(
         &self,
-        changes: &ChangedRows,
+        changes: &[TableChanges<'_>],
         mut retained_bytes: usize,
     ) -> Result<()> {
         for (table_name, table_changes) in changes {
-            let table = &self.tables[table_name];
+            let table = &self.tables[*table_name];
             for index in self
                 .indexes
                 .values()
@@ -629,8 +665,11 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                         if existing_primary_key == *primary_key {
                             continue;
                         }
-                        let existing_moves = match table_changes.get(&existing_primary_key) {
-                            Some(existing) => match &existing.next {
+                        let existing = table_changes
+                            .binary_search_by(|(key, _)| (*key).cmp(&existing_primary_key))
+                            .map(|position| table_changes[position].1);
+                        let existing_moves = match existing {
+                            Ok(existing) => match &existing.next {
                                 None => true,
                                 Some(record) => {
                                     let record = table.record(&existing_primary_key, record)?;
@@ -638,7 +677,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                                         != Some(prefix.as_slice())
                                 }
                             },
-                            None => false,
+                            Err(_) => false,
                         };
                         if !existing_moves {
                             return Err(unique_violation(&index.definition.name));
