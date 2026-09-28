@@ -1212,21 +1212,21 @@ pub(crate) fn json_scalar_bound(value: &Value) -> Option<usize> {
 
 /// [`estimated_row_bytes`] for the row a stored record decodes to, reading columns in place. The
 /// decoded row holds every column of its schema. A boolean, number, or NULL is estimated at 16
-/// bytes whatever its value, so only text and JSON values are read.
+/// bytes whatever its value, which the record's layout counts once, so only text and JSON values
+/// are read, each adding what it takes beyond that.
 pub(crate) fn estimated_record_bytes(record: &StoredRecord<'_>) -> Result<usize> {
-    let mut bytes = 32usize;
-    for (position, column) in record.schema().columns.iter().enumerate() {
-        let value = match column.data_type {
+    let (estimate, sized) = record.scalar_estimate();
+    let mut bytes = estimate.ok_or_else(row_write_overflow_error)?;
+    for position in sized {
+        let value = match record.schema().columns[*position].data_type {
             // A string takes 24 bytes more than its length, as a NULL takes 16.
-            ColumnType::Text => record.text_len(position)?.map_or(16, |length| 24 + length),
-            ColumnType::Json => record
-                .column(position)?
+            ColumnType::Text => record.text_len(*position)?.map_or(16, |length| 24 + length),
+            _ => record
+                .column(*position)?
                 .owned_bytes(|value| estimated_value_bytes_at_depth(value, 1))?,
-            ColumnType::Boolean | ColumnType::Integer | ColumnType::Float => 16,
         };
-        bytes = checked_row_write_add(bytes, 64)?;
-        bytes = checked_row_write_add(bytes, checked_row_write_mul(column.name.len(), 2)?)?;
-        bytes = checked_row_write_add(bytes, checked_row_write_mul(value, 2)?)?;
+        // Every value's estimate is at least a scalar's.
+        bytes = checked_row_write_add(bytes, checked_row_write_mul(value - 16, 2)?)?;
     }
     Ok(bytes)
 }

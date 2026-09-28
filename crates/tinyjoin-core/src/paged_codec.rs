@@ -524,6 +524,11 @@ pub(crate) struct RecordLayout {
     keys: Vec<usize>,
     /// The schema position of each stored column, in record order.
     stored: Vec<usize>,
+    /// A row's estimated bytes, as [`crate::storage::estimated_record_bytes`] finds them, when
+    /// every value takes a scalar's 16, or `None` where that overflows. Only the values of the text
+    /// and JSON columns at the schema positions in `sized` take more.
+    estimate: Option<usize>,
+    sized: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -547,7 +552,15 @@ impl RecordLayout {
         let mut slots = Vec::with_capacity(schema.columns.len());
         let mut keys = vec![0; key_types.len()];
         let mut stored = Vec::with_capacity(schema.columns.len().saturating_sub(key_types.len()));
+        let mut estimate = Some(32usize);
+        let mut sized = Vec::new();
         for (index, column) in schema.columns.iter().enumerate() {
+            estimate = estimate
+                .and_then(|bytes| bytes.checked_add(96))
+                .and_then(|bytes| bytes.checked_add(column.name.len().checked_mul(2)?));
+            if matches!(column.data_type, ColumnType::Text | ColumnType::Json) {
+                sized.push(index);
+            }
             match schema
                 .primary_key
                 .iter()
@@ -568,6 +581,8 @@ impl RecordLayout {
             key_types,
             keys,
             stored,
+            estimate,
+            sized,
         })
     }
 }
@@ -678,6 +693,12 @@ impl<'a> StoredRecord<'a> {
     /// The schema of the table the entry belongs to.
     pub(crate) fn schema(&self) -> &'a TableDefinition {
         self.schema
+    }
+
+    /// The row's estimated bytes were every value a scalar, if they do not overflow, and the schema
+    /// positions of the text and JSON columns whose values can take more.
+    pub(crate) fn scalar_estimate(&self) -> (Option<usize>, &'a [usize]) {
+        (self.layout.estimate, &self.layout.sized)
     }
 
     /// The length of the entry, its key and its record.
