@@ -116,7 +116,7 @@ impl<S: StorageDriver + Clone> Engine<S> {
             .take()
             .expect("the active transaction was checked above");
         let tables = transaction.tables.into_iter().collect();
-        let keys = crate::statement::finish_changed_keys(transaction.keys);
+        let keys = crate::statement::finish_changed_keys(&transaction.storage, transaction.keys)?;
         self.storage = transaction.storage;
         Ok(ApplyOutcome {
             revision,

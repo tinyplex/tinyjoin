@@ -2466,6 +2466,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn keys_are_reported_once_each_in_primary_key_order() {
+        let mut engine = page_native_fixture(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let ids = |outcome: &ExecuteResult| keys_for_result(outcome, "accounts");
+
+        // Values in no order, and numbers whose text sorts otherwise, report in key order.
+        let inserted = engine
+            .execute_sql(
+                "INSERT INTO accounts (id, email) VALUES \
+                 (100, 'a@x'), (9, 'b@x'), (10, 'c@x'), (3, 'd@x')",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(ids(&inserted), vec![3, 9, 10, 100]);
+
+        // So do rows a scan visits in index order, and a transaction's statements and commit.
+        engine.begin_transaction().unwrap();
+        let updated = engine
+            .execute_sql(
+                "UPDATE accounts SET active = true WHERE email < $1",
+                &[json!("c")],
+            )
+            .unwrap();
+        assert_eq!(ids(&updated), vec![1, 9, 100]);
+        // A key that moves reports both the key it leaves and the one it takes, once each.
+        let moved = engine
+            .execute_sql("UPDATE accounts SET id = 4 WHERE id = 100", &[])
+            .unwrap();
+        assert_eq!(ids(&moved), vec![4, 100]);
+        let deleted = engine
+            .execute_sql("DELETE FROM accounts WHERE email > $1", &[json!("a@x")])
+            .unwrap();
+        assert_eq!(ids(&deleted), vec![1, 2, 3, 9, 10]);
+        let outcome = engine.commit_transaction().unwrap();
+        assert_eq!(
+            keys_for(&outcome, "accounts"),
+            Some([1, 2, 3, 4, 9, 10, 100].map(|id| json!(id)).to_vec())
+        );
+    }
+
+    fn keys_for_result(result: &ExecuteResult, table: &str) -> Vec<u64> {
+        result.keys[table]
+            .iter()
+            .map(|key| key["id"].as_u64().unwrap())
+            .collect()
+    }
+
     /// Seeds `count` accounts in batches small enough to stay inside the SQL token limit.
     fn seed_accounts<D: PageDevice>(engine: &mut PagedEngine<D>, count: usize) {
         for batch in (0..count).collect::<Vec<_>>().chunks(200) {

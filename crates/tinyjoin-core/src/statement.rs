@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -244,20 +245,35 @@ pub(crate) fn execute<S: StorageDriver>(
     }
 }
 
-/// The canonical form of a changed key, which orders a table's changed keys and finds repeats.
+/// A change's table and the encoding of the key it reports, by which a table's changed keys are
+/// ordered and repeats found.
 ///
 /// Changed keys are a set: the paged and in-memory engines reach the same set by different routes
 /// (one applies a whole transaction write-set, the other accumulates statement by statement), so
-/// the reported order must not depend on which engine produced it. `Row` is a sorted map, so its
-/// serialization is canonical, and two keys serialize alike exactly when they are equal.
-fn canonical_key(key: &Row) -> String {
-    serde_json::to_string(key).expect("a map with string keys always serializes")
+/// the reported order must not depend on which engine produced it. A table's keys are reported in
+/// the order of their encodings, which is its primary-key order, and two keys encode alike exactly
+/// when they are equal.
+struct EncodedKey<'a> {
+    table: &'a String,
+    key: Cow<'a, [u8]>,
+    change: &'a RowChange,
+}
+
+/// The encoding of the key a change reports: planned as a record, it carries it. A planned map
+/// always carries its table's key columns; one that somehow does not is ordered first.
+fn encoded_changed_key<'a>(schema: &TableDefinition, change: &'a RowChange) -> Cow<'a, [u8]> {
+    match change {
+        RowChange::Put { key, .. } | RowChange::Remove { key, .. } => Cow::Borrowed(key),
+        RowChange::Upsert { row, .. } | RowChange::Delete { key: row, .. } => {
+            Cow::Owned(encode_primary_key(schema, row).unwrap_or_default())
+        }
+    }
 }
 
 #[cfg(test)]
-/// Orders a table's changed keys canonically.
-fn sort_changed_keys(keys: &mut [Row]) {
-    keys.sort_by_cached_key(canonical_key);
+/// Orders a table's changed keys by their encodings, as [`changed_keys`] reports them.
+fn sort_changed_keys(schema: &TableDefinition, keys: &mut [Row]) {
+    keys.sort_by_cached_key(|key| encode_primary_key(schema, key).unwrap_or_default());
 }
 
 #[cfg(test)]
@@ -286,25 +302,42 @@ pub(crate) fn changed_keys(
         keys.insert(table.clone(), vec![key]);
         return Ok(keys);
     }
+    let mut keys = BTreeMap::new();
     if exceeds_changed_keys(changes, previous) {
-        return Ok(BTreeMap::new());
+        return Ok(keys);
     }
-    let mut schemas: BTreeMap<String, Rc<TableDefinition>> = BTreeMap::new();
-    let mut collector = KeyCollector::default();
+    // A statement changes one table's rows, so the last schema read is almost always the one
+    // needed.
+    let mut schema: Option<Rc<TableDefinition>> = None;
+    let mut schema_of = |table: &String| -> Result<Rc<TableDefinition>> {
+        match &schema {
+            Some(schema) if schema.name == *table => Ok(Rc::clone(schema)),
+            _ => Ok(Rc::clone(schema.insert(storage.table_schema(table)?))),
+        }
+    };
+    let mut encoded = Vec::with_capacity(changes.len());
     for change in changes {
         let table = change_table(change);
-        let Some(keys) = collector.room(table) else {
-            continue;
-        };
-        let schema = match schemas.get(table) {
-            Some(schema) => schema,
-            None => schemas
-                .entry(table.clone())
-                .or_insert(storage.table_schema(table)?),
-        };
-        insert_changed_key(keys, changed_key(storage, schema, change)?);
+        let schema = schema_of(table)?;
+        let key = encoded_changed_key(&schema, change);
+        encoded.push(EncodedKey { table, key, change });
     }
-    Ok(collector.finish())
+    // Keys a scan or ascending values produced are already in order, which the sort checks first.
+    encoded.sort_unstable_by(|left, right| (left.table, &left.key).cmp(&(right.table, &right.key)));
+    encoded.dedup_by(|next, kept| next.table == kept.table && next.key == kept.key);
+    for changed in encoded.chunk_by(|left, right| left.table == right.table) {
+        if changed.len() > MAX_CHANGED_KEYS_PER_TABLE {
+            continue;
+        }
+        let table = changed[0].table;
+        let schema = schema_of(table)?;
+        let rows = changed
+            .iter()
+            .map(|changed| changed_key(storage, &schema, changed.change))
+            .collect::<Result<Vec<_>>>()?;
+        keys.insert(table.clone(), rows);
+    }
+    Ok(keys)
 }
 
 /// The table a change is to.
@@ -366,57 +399,6 @@ fn changed_key(
     Ok(key)
 }
 
-/// Collects primary keys already projected from their rows, as [`changed_keys`] reports them.
-pub(crate) fn collect_changed_keys<'a>(
-    keys: impl IntoIterator<Item = (&'a str, &'a Row)>,
-) -> BTreeMap<String, Vec<Row>> {
-    let mut collector = KeyCollector::default();
-    for (table, key) in keys {
-        if let Some(keys) = collector.room(table) {
-            insert_changed_key(keys, key.clone());
-        }
-    }
-    collector.finish()
-}
-
-/// Each table's changed keys by their canonical form, or `None` for a table that overflowed and
-/// must report nothing.
-#[derive(Default)]
-struct KeyCollector(BTreeMap<String, Option<BTreeMap<String, Row>>>);
-
-impl KeyCollector {
-    /// The keys collected for `table`, if it has room for one more change.
-    fn room(&mut self, table: &str) -> Option<&mut BTreeMap<String, Row>> {
-        if !self.0.contains_key(table) {
-            self.0.insert(table.to_owned(), Some(BTreeMap::new()));
-        }
-        let entry = self.0.get_mut(table).expect("the table was added above");
-        if entry
-            .as_ref()
-            .is_some_and(|keys| keys.len() >= MAX_CHANGED_KEYS_PER_TABLE)
-        {
-            *entry = None;
-        }
-        entry.as_mut()
-    }
-
-    fn finish(self) -> BTreeMap<String, Vec<Row>> {
-        let mut finished = BTreeMap::new();
-        for (table, keys) in self.0 {
-            if let Some(keys) = keys {
-                finished.insert(table, keys.into_values().collect());
-            }
-        }
-        finished
-    }
-}
-
-/// Adds a key once: one statement can touch a key more than once, and a subscriber only needs to
-/// know it moved.
-fn insert_changed_key(keys: &mut BTreeMap<String, Row>, key: Row) {
-    keys.entry(canonical_key(&key)).or_insert(key);
-}
-
 #[cfg(test)]
 /// Accumulates one statement's reported keys into a transaction's running set.
 ///
@@ -452,19 +434,20 @@ pub(crate) fn merge_changed_keys(
 }
 
 #[cfg(test)]
-/// Drops the tables that could not report a complete key set, leaving only usable entries.
+/// Drops the tables that could not report a complete key set, leaving only usable entries, each
+/// in the order [`changed_keys`] reports them.
 pub(crate) fn finish_changed_keys(
+    storage: &dyn StorageReader,
     accumulated: BTreeMap<String, Option<Vec<Row>>>,
-) -> BTreeMap<String, Vec<Row>> {
-    accumulated
-        .into_iter()
-        .filter_map(|(table, keys)| {
-            keys.map(|mut keys| {
-                sort_changed_keys(&mut keys);
-                (table, keys)
-            })
-        })
-        .collect()
+) -> Result<BTreeMap<String, Vec<Row>>> {
+    let mut finished = BTreeMap::new();
+    for (table, keys) in accumulated {
+        if let Some(mut keys) = keys {
+            sort_changed_keys(&*storage.table_schema(&table)?, &mut keys);
+            finished.insert(table, keys);
+        }
+    }
+    Ok(finished)
 }
 
 /// Plans one SQL row mutation without modifying storage.

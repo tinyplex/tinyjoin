@@ -158,6 +158,15 @@ Done:
   source, so it resisted nothing. With four sets that needed no hashing moved
   to vectors, the engine shrank by 3.1 KiB compressed, more than this
   session's speedups added.
+- A statement's changed keys are sorted and deduplicated by their encoded keys,
+  rather than inserted into B-tree maps keyed by their JSON text, and a
+  commit's come straight from its staged entries, already in that order, and
+  are decoded only for a table within the bound. Inserting 10,000 rows 200 at
+  a time fell from 33.2 ms to 30.5 engine-only, and the engine shrank by
+  2.1 KiB compressed. The Worker copies a short ASCII parameter into its
+  request rather than calling `TextEncoder`, which costs a Chromium Worker
+  0.26 µs a call: 10,000 inserts in a transaction fell by 5% engine-only in
+  Chromium.
 
 Found along the way:
 

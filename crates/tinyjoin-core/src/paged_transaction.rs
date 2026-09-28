@@ -187,26 +187,29 @@ impl PagedTransaction {
         changed
     }
 
-    /// The primary keys of the rows [`Self::changed_rows`] reports, as a commit reports them.
+    /// The primary keys of the rows [`Self::changed_rows`] reports, as a commit reports them: a
+    /// table's entries are kept once each in the order of their encoded keys, the order a statement
+    /// reports its keys in.
     pub(crate) fn changed_keys<D: PageDevice>(
         &self,
         storage: &PagedStorage<D>,
     ) -> Result<BTreeMap<String, Vec<Row>>> {
-        let mut keys = Vec::new();
+        let mut keys = BTreeMap::new();
         for (table, entries) in &self.entries {
+            let changed = || entries.iter().filter(|(_, entry)| entry.changed);
+            // A table with a key more than it can report reports none, so none is decoded.
+            if changed().nth(MAX_CHANGED_KEYS_PER_TABLE).is_some() {
+                continue;
+            }
             let paged = storage.table(table)?;
-            // One key more than a table can report shows that it reports none, so no more are read.
-            for (key, _) in entries
-                .iter()
-                .filter(|(_, entry)| entry.changed)
-                .take(MAX_CHANGED_KEYS_PER_TABLE + 1)
-            {
-                keys.push((table.as_str(), key_row(paged, key)?));
+            let rows = changed()
+                .map(|(key, _)| key_row(paged, key))
+                .collect::<Result<Vec<_>>>()?;
+            if !rows.is_empty() {
+                keys.insert(table.clone(), rows);
             }
         }
-        Ok(crate::statement::collect_changed_keys(
-            keys.iter().map(|(table, key)| (*table, key)),
-        ))
+        Ok(keys)
     }
 
     /// Validates and installs one statement's row delta without exposing a partial statement.

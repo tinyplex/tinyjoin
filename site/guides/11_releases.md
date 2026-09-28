@@ -112,6 +112,11 @@ joins are quicker than in either.
   fifth less time. A `DELETE` outside a transaction also plans each row by its
   stored key, rather than as a map of its key columns, which takes a further
   fifth off.
+- A result's and a commit's changed keys are ordered and deduplicated by their
+  encoded keys, rather than by the JSON text of each, so each table's keys are
+  listed in primary-key order: earlier releases listed `{"id": 10}` before
+  `{"id": 9}`. Inserting 10,000 rows 200 at a time takes 8% less of the
+  engine's time.
 - Inside a transaction that has changed a table, a scan finds the rows the
   transaction replaced leaf by leaf, rather than comparing every row's key with
   the next staged one, and an integer column is compared with integer bounds
