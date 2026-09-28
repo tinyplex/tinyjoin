@@ -1407,11 +1407,17 @@ fn push_float_component(key: &mut Vec<u8>, value: f64) {
 }
 
 fn push_text_component(key: &mut Vec<u8>, value: &str) {
-    for byte in value.bytes() {
-        key.push(byte);
-        if byte == 0 {
-            key.push(TEXT_ESCAPED_ZERO);
+    let bytes = value.as_bytes();
+    // Text rarely holds a zero byte, which alone needs escaping, so most is copied whole.
+    if bytes.contains(&0) {
+        for byte in value.bytes() {
+            key.push(byte);
+            if byte == 0 {
+                key.push(TEXT_ESCAPED_ZERO);
+            }
         }
+    } else {
+        key.extend_from_slice(bytes);
     }
     key.extend_from_slice(&[0, TEXT_TERMINATOR]);
 }

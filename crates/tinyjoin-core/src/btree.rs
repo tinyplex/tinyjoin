@@ -1727,8 +1727,11 @@ impl Node {
         for (index, cell) in cells.iter().enumerate() {
             free_end -= cell.len();
             payload[free_end..free_end + cell.len()].copy_from_slice(cell);
-            let slot = NODE_HEADER_SIZE + index * SLOT_SIZE;
-            payload[slot..slot + SLOT_SIZE].copy_from_slice(&(free_end as u16).to_le_bytes());
+            put(
+                &mut payload,
+                NODE_HEADER_SIZE + index * SLOT_SIZE,
+                (free_end as u16).to_le_bytes(),
+            );
         }
         payload[28..30].copy_from_slice(&(free_end as u16).to_le_bytes());
         Ok((Page::new(page_id, page_type, payload)?, self.subtree_hash()))
@@ -2215,8 +2218,8 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
             }
             let mut payload = node.into_payload();
             for (at, child_page_id, child_hash) in references {
-                payload[at..at + 8].copy_from_slice(&child_page_id.to_le_bytes());
-                payload[at + 8..at + 16].copy_from_slice(&child_hash.to_le_bytes());
+                put(&mut payload, at, child_page_id.to_le_bytes());
+                put(&mut payload, at + 8, child_hash.to_le_bytes());
             }
             payload[16..24].copy_from_slice(&self.generation.to_le_bytes());
             let replacing = Some((page_id, owned));
@@ -2345,8 +2348,11 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
                 if slot == 0 {
                     first_key = key.to_vec();
                 }
-                let at = NODE_HEADER_SIZE + slot * SLOT_SIZE;
-                payload[at..at + SLOT_SIZE].copy_from_slice(&(free_end as u16).to_le_bytes());
+                put(
+                    &mut payload,
+                    NODE_HEADER_SIZE + slot * SLOT_SIZE,
+                    (free_end as u16).to_le_bytes(),
+                );
             }
             start += count;
             write_node_header(
@@ -3260,9 +3266,9 @@ fn write_leaf_cell(destination: &mut [u8], key: &[u8], value: &CellValue<'_>) {
         CellValue::Inline(_) => INLINE_CELL_FLAGS,
         CellValue::Overflow(_) => OVERFLOW_CELL_FLAGS,
     };
-    destination[..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    destination[2..4].copy_from_slice(&flags.to_le_bytes());
-    destination[4..8].copy_from_slice(&(value.encoded_len() as u32).to_le_bytes());
+    put(destination, 0, (key.len() as u16).to_le_bytes());
+    put(destination, 2, flags.to_le_bytes());
+    put(destination, 4, (value.encoded_len() as u32).to_le_bytes());
     let key_end = LEAF_CELL_HEADER_SIZE + key.len();
     destination[LEAF_CELL_HEADER_SIZE..key_end].copy_from_slice(key);
     match value {
@@ -3642,6 +3648,13 @@ fn validate_child_generation(
 
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes(bytes[offset..offset + 2].try_into().expect("bounded u16"))
+}
+
+/// Writes `value` at `offset` as one store of its size, where copying it from a slice would call
+/// `memcpy` for a few bytes, once for each cell a page is written with.
+#[inline(always)]
+fn put<const N: usize>(bytes: &mut [u8], offset: usize, value: [u8; N]) {
+    *<&mut [u8; N]>::try_from(&mut bytes[offset..offset + N]).expect("bounded write") = value;
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
