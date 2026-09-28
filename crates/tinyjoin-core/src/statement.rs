@@ -1,10 +1,11 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use serde_json::{Map, Value};
 
 #[cfg(test)]
 use crate::StorageDriver;
+use crate::hash::KeySet;
 use crate::paged_codec::{
     EMPTY_RECORD, RecordLayout, StoredRecord, encode_primary_key, encode_primary_key_values,
     encode_row_values, encode_updated_record,
@@ -790,12 +791,18 @@ fn plan_insert(
     // lone row with no conflict clause cannot meet another, so its key is not needed. Without a
     // conflict clause, the encoded key is canonical and serves.
     let tracks_keys = conflicts.is_some() || value_rows.len() > 1;
-    let mut written = HashSet::with_capacity(if tracks_keys { value_rows.len() } else { 0 });
-    let mut written_keys = HashSet::with_capacity(if conflicts.is_none() && tracks_keys {
-        value_rows.len()
-    } else {
-        0
-    });
+    let mut written = KeySet::with_capacity_and_hasher(
+        if tracks_keys { value_rows.len() } else { 0 },
+        Default::default(),
+    );
+    let mut written_keys = KeySet::with_capacity_and_hasher(
+        if conflicts.is_none() && tracks_keys {
+            value_rows.len()
+        } else {
+            0
+        },
+        Default::default(),
+    );
     let mut changes = Vec::with_capacity(value_rows.len());
     let mut previous = Vec::with_capacity(value_rows.len());
     let mut kept = KeptRows::default();
@@ -1011,7 +1018,7 @@ enum Conflict {
 /// One arbiter unique index, with the keys this statement has written into it.
 struct ConflictIndex {
     definition: crate::IndexDefinition,
-    written: HashSet<String>,
+    written: KeySet<String>,
     /// Existing primary keys by index key, collected with one scan when the storage view cannot
     /// visit this index directly, as inside a transaction.
     scanned: Option<BTreeMap<String, Row>>,
@@ -1045,7 +1052,7 @@ impl ConflictPlan {
             if definition.unique {
                 indexes.push(ConflictIndex {
                     definition,
-                    written: HashSet::new(),
+                    written: KeySet::default(),
                     scanned: None,
                 });
             }
@@ -1122,7 +1129,7 @@ impl ConflictPlan {
         schema: &TableDefinition,
         row: &Row,
         key: &str,
-        written: &HashSet<String>,
+        written: &KeySet<String>,
         work_bytes: &mut usize,
     ) -> Result<Conflict> {
         if self.primary && written.contains(key) {
@@ -1498,11 +1505,11 @@ fn plan_update(
         .iter()
         .any(|update| update.new_key() != update.old_key)
     {
-        let mut old_keys = HashSet::with_capacity(row_count);
+        let mut old_keys = KeySet::with_capacity_and_hasher(row_count, Default::default());
         for update in &updates {
             old_keys.insert(update.old_key.clone());
         }
-        let mut destinations = HashSet::with_capacity(row_count);
+        let mut destinations = KeySet::with_capacity_and_hasher(row_count, Default::default());
         for update in &updates {
             let new_key = update.new_key();
             if !destinations.insert(new_key.to_vec()) {

@@ -1,12 +1,13 @@
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet},
     rc::Rc,
 };
 
 #[cfg(test)]
 use crate::RowChange;
+use crate::hash::KeySet;
 #[cfg(test)]
 use crate::paged_codec::{
     CatalogHeader, encode_catalog_header_record, encode_catalog_index_record,
@@ -1733,7 +1734,7 @@ fn validate_index_tree<D: PageDevice>(
     let layout = RecordLayout::new(&table.schema)?;
     let positions = index_column_positions(&table.schema, &record.definition)?;
     let mut count = 0_u64;
-    let mut unique_prefixes = HashSet::new();
+    let mut unique_prefixes = KeySet::default();
     let mut cursor = Btree::validating_cursor(pager, root, record.tree_id)?;
     while let Some((entry_key, value)) = cursor.next_entry(pager)? {
         if !value.is_empty() {

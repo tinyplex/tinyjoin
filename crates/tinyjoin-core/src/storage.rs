@@ -1,12 +1,12 @@
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::HashSet;
 #[cfg(test)]
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use serde_json::Value;
 
+use crate::hash::KeySet;
 use crate::paged_codec::{EMPTY_RECORD, IndexEntryLayout, RecordLayout, StoredRecord};
 use crate::row::{RowRef, ValueRef};
 use crate::{
@@ -826,7 +826,7 @@ pub(crate) fn validate_index_columns_for_schema(
     schema: &TableDefinition,
 ) -> Result<()> {
     debug_assert_eq!(definition.table, schema.name);
-    let mut seen = HashSet::new();
+    let mut seen = KeySet::default();
     for name in &definition.columns {
         validate_catalog_name_bound(name)
             .map_err(|error| EngineError::invalid_schema(error.message))?;
@@ -946,7 +946,7 @@ pub(crate) fn validate_schema(schema: &TableDefinition) -> Result<()> {
         )));
     }
 
-    let mut columns = HashSet::new();
+    let mut columns = KeySet::default();
     for column in &schema.primary_key {
         validate_catalog_name_bound(column)
             .map_err(|error| EngineError::invalid_schema(error.message))?;
@@ -971,7 +971,7 @@ pub(crate) fn validate_schema(schema: &TableDefinition) -> Result<()> {
         )));
     }
 
-    let mut catalog_columns = HashSet::new();
+    let mut catalog_columns = KeySet::default();
     for column in &schema.columns {
         validate_catalog_name_bound(&column.name)
             .map_err(|error| EngineError::invalid_schema(error.message))?;

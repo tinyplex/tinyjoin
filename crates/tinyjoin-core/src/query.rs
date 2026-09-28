@@ -1,8 +1,8 @@
 use std::cmp::Ordering;
-use std::collections::HashSet;
 
 use serde_json::{Map, Number, Value};
 
+use crate::hash::KeySet;
 use crate::paged_codec::{IndexEntryLayout, encode_key_bound, encode_text_prefix_bounds};
 use crate::row::{Columns, RowRef, ValueRef};
 use crate::storage::{
@@ -148,7 +148,7 @@ fn select_fields(
     let Some(columns) = columns else {
         return projection_fields(schema, None);
     };
-    let mut outputs = HashSet::with_capacity(columns.len());
+    let mut outputs = KeySet::with_capacity_and_hasher(columns.len(), Default::default());
     columns
         .iter()
         .map(|item| {
@@ -220,7 +220,8 @@ impl<'a> Projection<'a> {
 
 pub(crate) fn validate_named_columns(schema: &TableDefinition, columns: &[String]) -> Result<()> {
     // A few names are cheaper to compare with each other than to hash.
-    let mut names = (columns.len() > 16).then(|| HashSet::with_capacity(columns.len()));
+    let mut names = (columns.len() > 16)
+        .then(|| KeySet::with_capacity_and_hasher(columns.len(), Default::default()));
     for (index, column) in columns.iter().enumerate() {
         let repeated = match &mut names {
             Some(names) => !names.insert(column.as_str()),

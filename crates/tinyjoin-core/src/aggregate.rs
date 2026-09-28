@@ -1,10 +1,10 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
-use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 
 use serde_json::{Map, Number, Value};
 
+use crate::hash::{KeyHasher, KeyMap, KeySet};
 use crate::query::{
     Filter, ParseMode, Token, bind_parameter, is_distinct_keyword_at, is_reserved_keyword,
     number_literal, pagination_value, parse_predicate_at, sort_rows_by, validate_predicate_columns,
@@ -363,7 +363,7 @@ fn validate_plan(plan: &AggregatePlan, schema: &TableDefinition) -> Result<()> {
         validate_predicate_types(predicate, schema, &plan.table)?;
     }
 
-    let mut groups = HashSet::new();
+    let mut groups = KeySet::default();
     for column in &plan.group_by {
         if !groups.insert(column.as_str()) {
             return Err(EngineError::invalid_query(format!(
@@ -384,7 +384,7 @@ fn validate_plan(plan: &AggregatePlan, schema: &TableDefinition) -> Result<()> {
         }
     }
 
-    let mut outputs = HashSet::new();
+    let mut outputs = KeySet::default();
     let mut aggregate_count = 0;
     for item in &plan.items {
         if !outputs.insert(item.output.as_str()) {
@@ -1031,7 +1031,7 @@ fn integer_value(value: &Value) -> Result<i128> {
 struct Groups {
     entries: Vec<Group>,
     /// Each group's position, by the hash of its grouped values.
-    index: HashMap<u64, Vec<usize>, BuildHasherDefault<GroupHasher>>,
+    index: KeyMap<u64, Vec<usize>>,
 }
 
 struct Group {
@@ -1153,48 +1153,11 @@ fn incompatible_group_value(column: &str) -> EngineError {
 }
 
 fn group_hash(columns: &[SourceColumn], row: &RowRef<'_>) -> Result<u64> {
-    let mut hasher = GroupHasher::default();
+    let mut hasher = KeyHasher::default();
     for column in columns {
         group_value(column, row.get(column.index)?)?.hash(&mut hasher);
     }
     Ok(hasher.finish())
-}
-
-/// A quick multiplicative hasher for grouped values, and for the hashes that index them.
-#[derive(Default)]
-struct GroupHasher(u64);
-
-impl Hasher for GroupHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.write_u64(u64::from(*byte));
-        }
-    }
-
-    fn write_u64(&mut self, value: u64) {
-        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
-    }
-
-    fn write_u8(&mut self, value: u8) {
-        self.write_u64(u64::from(value));
-    }
-
-    fn write_usize(&mut self, value: usize) {
-        self.write_u64(value as u64);
-    }
-
-    fn write_isize(&mut self, value: isize) {
-        self.write_u64(value as u64);
-    }
-
-    fn write_i128(&mut self, value: i128) {
-        self.write_u64(value as u64);
-        self.write_u64((value >> 64) as u64);
-    }
 }
 
 fn group_key(columns: &[SourceColumn], row: &RowRef<'_>) -> Result<String> {

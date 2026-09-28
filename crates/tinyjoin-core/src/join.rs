@@ -1,9 +1,9 @@
 use std::cmp::Ordering;
-use std::collections::HashSet;
 
 use serde_json::{Map, Value};
 
 use crate::aggregate::{encode_group_key, group_key_part};
+use crate::hash::{KeyMap, KeySet};
 use crate::query::{
     Filter, ParseMode, Token, bind_parameter, is_distinct_keyword_at, is_reserved_keyword,
     number_literal, pagination_value, parse_predicate_at,
@@ -270,7 +270,7 @@ fn execute_unordered(
     let mut rows = Vec::new();
     let mut skipped = 0_usize;
     let mut result_bytes = 0_usize;
-    let mut seen = HashSet::new();
+    let mut seen = KeySet::default();
     visit_joined_rows(storage, join, &mut |bindings, budget| {
         if !filter.matches(bindings, relations)?
             || !first_distinct_row(&mut seen, bindings, plan, relations, budget)?
@@ -307,7 +307,7 @@ fn execute_ordered(
         plan, relations, ..
     } = *join;
     let mut joined_rows = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = KeySet::default();
     visit_joined_rows(storage, join, &mut |bindings, budget| {
         // DISTINCT may keep the first of several equal rows because every ordering key is a
         // projected value, which validation guarantees, so equal rows also sort equally.
@@ -570,7 +570,7 @@ impl KeyPart {
 /// A hash-joined relation's rows that can match, grouped by the values of its `ON` columns.
 struct HashTable {
     rows: Vec<Row>,
-    buckets: std::collections::HashMap<Vec<KeyPart>, Vec<usize>>,
+    buckets: KeyMap<Vec<KeyPart>, Vec<usize>>,
 }
 
 /// Which side of each of a stage's `ON` equalities belongs to its new relation: its own column,
@@ -610,7 +610,7 @@ fn build_hash_table(
     let sides = stage_sides(&join.conditions[source - 1], source);
     let mut table = HashTable {
         rows: Vec::new(),
-        buckets: std::collections::HashMap::new(),
+        buckets: KeyMap::default(),
     };
     let outcome = crate::query::visit_predicate_candidates(
         storage,
@@ -909,7 +909,7 @@ fn lookup_value(data_type: ColumnType, value: &Value) -> Option<Value> {
 /// Reports whether a matching joined row is the first with its projected values, remembering it if
 /// so. Without DISTINCT every row is first. Remembered keys are retained work for the whole join.
 fn first_distinct_row(
-    seen: &mut HashSet<String>,
+    seen: &mut KeySet<String>,
     bindings: &[Option<&Row>],
     plan: &JoinPlan,
     relations: &[Relation],
@@ -1072,7 +1072,7 @@ fn validate_plan(
     plan: &JoinPlan,
     relations: &[Relation],
 ) -> Result<(Vec<Vec<ResolvedCondition>>, Vec<ResultField>)> {
-    let mut aliases = HashSet::new();
+    let mut aliases = KeySet::default();
     for relation in relations {
         validate_relation_shape(relation)?;
         if !aliases.insert(relation.source.alias.as_str()) {
@@ -1094,7 +1094,7 @@ fn validate_plan(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let mut outputs = HashSet::new();
+    let mut outputs = KeySet::default();
     let mut fields = Vec::with_capacity(plan.projections.len());
     let mut projected = Vec::with_capacity(plan.projections.len());
     for projection in &plan.projections {

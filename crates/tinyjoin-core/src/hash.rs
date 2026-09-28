@@ -90,6 +90,56 @@ pub(crate) fn identify(name: &[u8], hash: u64) -> u64 {
     hasher.finish()
 }
 
+/// A quick multiplicative hash for the engine's hash maps and sets, whose keys are page IDs,
+/// names, encoded keys, and grouped or joined values.
+///
+/// SipHash resists keys chosen to collide only when its keys are random, and WebAssembly without
+/// a host source of randomness gives the standard library's hasher none: it derives them from
+/// memory addresses. This hash gives up nothing there, costs less per key, and is a fraction of
+/// SipHash's code.
+#[derive(Default)]
+pub(crate) struct KeyHasher(u64);
+
+impl std::hash::Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.write_u64(u64::from(*byte));
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.write_u64(u64::from(value));
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+
+    fn write_isize(&mut self, value: isize) {
+        self.write_u64(value as u64);
+    }
+
+    fn write_i128(&mut self, value: i128) {
+        self.write_u64(value as u64);
+        self.write_u64((value >> 64) as u64);
+    }
+}
+
+/// A hash map keyed with [`KeyHasher`].
+pub(crate) type KeyMap<K, V> =
+    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<KeyHasher>>;
+
+/// A hash set keyed with [`KeyHasher`].
+pub(crate) type KeySet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<KeyHasher>>;
+
 #[cfg(test)]
 mod tests {
     use super::*;

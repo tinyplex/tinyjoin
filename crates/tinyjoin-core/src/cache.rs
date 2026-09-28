@@ -1,8 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    hash::{BuildHasherDefault, Hasher},
-};
-
+use crate::hash::{KeyMap, KeySet};
 use crate::{
     AllocationBitmap, EngineError, FIRST_DATA_PAGE_ID, PAGE_SIZE, PageDevice, PageId, Result,
 };
@@ -35,41 +31,10 @@ pub(crate) const MAX_PAGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 #[cfg(test)]
 pub(crate) const DEFAULT_PAGE_CACHE_PAGES: usize = DEFAULT_PAGE_CACHE_BYTES / PAGE_SIZE;
 
-/// A multiplicative hash for page-keyed maps.
-///
-/// Page IDs and candidate numbers are integers the engine assigns, not keys an adversary chooses,
-/// so these maps do not need SipHash's flooding resistance. Its cost dominated cache lookups.
-#[derive(Default)]
-pub(crate) struct PageKeyHasher(u64);
-
-impl Hasher for PageKeyHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.write_u64(u64::from(*byte));
-        }
-    }
-
-    fn write_u64(&mut self, value: u64) {
-        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95);
-    }
-
-    fn write_usize(&mut self, value: usize) {
-        self.write_u64(value as u64);
-    }
-
-    fn write_isize(&mut self, value: isize) {
-        self.write_u64(value as u64);
-    }
-}
-
-type PageKeyMap<K, V> = HashMap<K, V, BuildHasherDefault<PageKeyHasher>>;
+type PageKeyMap<K, V> = KeyMap<K, V>;
 
 /// A set of page IDs, hashed as the page cache hashes them.
-pub(crate) type PageSet = HashSet<PageId, BuildHasherDefault<PageKeyHasher>>;
+pub(crate) type PageSet = KeySet<PageId>;
 
 impl CacheEntry {
     fn seal(&mut self) {
