@@ -4,7 +4,9 @@ import {
   isRpcResult,
   isRpcResultHeader,
   isWorkerEvent,
+  isSqlResultText,
   isWorkerResponse,
+  readSqlResult,
   type RpcMethod,
   type RpcMethods,
   type WorkerEvent,
@@ -107,9 +109,30 @@ export const createWorkerRpc = (
       request.reject(new ClientError(event.data.error));
       return;
     }
+    // A statement's result that published nothing arrives as its text, which
+    // only the page reads. One that cannot be read fails alone, as the Worker
+    // would have failed it: the Worker and its database are unharmed.
+    const sent = event.data.result;
+    const text =
+      (request.method === 'executeSql' ||
+        request.method === 'executePrepared') &&
+      isSqlResultText(sent)
+        ? sent
+        : undefined;
+    const result = isUndefined(text) ? sent : readSqlResult(text);
     const isValid =
       resultValidation === 'full' ? isRpcResult : isRpcResultHeader;
-    if (!isValid(request.method, event.data.result)) {
+    if (!isValid(request.method, result)) {
+      if (!isUndefined(text)) {
+        pending.delete(event.data.id);
+        request.reject(
+          clientError(
+            'BRIDGE_SERIALIZATION_ERROR',
+            'WASM returned an invalid structured SQL result',
+          ),
+        );
+        return;
+      }
       dispose(
         clientError(
           MISMATCH,
@@ -120,17 +143,17 @@ export const createWorkerRpc = (
     }
     pending.delete(event.data.id);
     if (isUndefined(request.read)) {
-      request.resolve(event.data.result);
+      request.resolve(result);
       return;
     }
-    let result: unknown;
+    let read: unknown;
     try {
-      result = request.read(event.data.result as never);
+      read = request.read(result as never);
     } catch (error) {
       request.reject(error);
       return;
     }
-    request.resolve(result);
+    request.resolve(read);
   };
 
   const onMessageError = (): void =>

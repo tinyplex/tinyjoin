@@ -8,11 +8,14 @@ import {transformSync} from 'esbuild';
 
 import {
   isRpcResult,
+  isSqlResultText,
+  readSqlResult,
   type JsonValue,
   type Row,
   type RowMode,
   type SqlData,
   type SqlResult,
+  type SqlResultText,
 } from '../../src/protocol.js';
 import type {WorkerEngine} from '../../src/worker/engine.js';
 import type {PageDevice} from '../../src/worker/page-device.js';
@@ -661,9 +664,11 @@ type DecodedResult = Omit<SqlResult, 'data'> & SqlData & {rows: Row[]};
 // Every result the real engine writes gets the full check that a custom
 // Worker's results get on the page, and then its rows are parsed as the page
 // parses them.
-function decode(result: SqlResult): DecodedResult {
+// A result arrives as the page reads it: as text, when it published nothing.
+function decode(sent: SqlResult | SqlResultText): DecodedResult {
+  const result = isSqlResultText(sent) ? readSqlResult(sent) : sent;
   expect(isRpcResult('executeSql', result)).toBe(true);
-  const {data, ...header} = result;
+  const {data, ...header} = result as SqlResult;
   return {...header, ...(JSON.parse(data) as SqlData)} as DecodedResult;
 }
 

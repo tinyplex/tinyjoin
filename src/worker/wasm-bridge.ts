@@ -19,6 +19,7 @@ import {
   type JsonValue,
   type RowMode,
   type SqlResult,
+  type SqlResultText,
 } from '../protocol.js';
 import type {WorkerEngine} from './engine.js';
 import type {PageDevice} from './page-device.js';
@@ -220,7 +221,7 @@ export const adaptStructuredWasmEngine = (
       sql: string,
       params: JsonValue[],
       rowMode?: RowMode,
-    ): SqlResult => {
+    ): SqlResult | SqlResultText => {
       assertCallable();
       return invoke(
         WASM_OPERATION.executeSql,
@@ -244,7 +245,7 @@ export const adaptStructuredWasmEngine = (
       statementId: number,
       params: JsonValue[],
       rowMode?: RowMode,
-    ): SqlResult => {
+    ): SqlResult | SqlResultText => {
       assertCallable();
       return invoke(
         WASM_OPERATION.executePrepared,
@@ -479,10 +480,29 @@ const decodeApplyOutcome = decoder(
     isRpcResultHeader('commitTransaction', payload),
   ),
 );
-const decodeSqlResult = decoder('SQL result', (payload, rest) => {
+const decodeParsedSqlResult = decoder('SQL result', (payload, rest) => {
   const result = withData(payload, rest);
   return isRpcResultHeader('executeSql', result) ? result : INVALID;
 });
+
+// The envelope of a success that published nothing, which a statement's header
+// then follows, closed by `]` at the end of the first line.
+const SAFE_SUCCESS = `[${BRIDGE_VERSION},${SUCCESS},${SAFE_RESPONSE},`;
+
+/**
+ * Reads a statement's result. One that published nothing durable, and so has
+ * no changes for the Worker to announce, passes on as the text WASM wrote,
+ * which only the page parses and checks. Any other is read here.
+ */
+const decodeSqlResult = (value: unknown): SqlResult | SqlResultText => {
+  if (isString(value) && value.startsWith(SAFE_SUCCESS)) {
+    const end = value.indexOf('\n');
+    if (end > SAFE_SUCCESS.length && value.charCodeAt(end - 1) === 0x5d) {
+      return [value.slice(SAFE_SUCCESS.length, end - 1), value.slice(end + 1)];
+    }
+  }
+  return decodeParsedSqlResult(value);
+};
 const decodeSqlResults = decoder('SQL results', (payload, rest) => {
   const lines = rest?.split('\n') ?? [];
   if (!arrayIsArray(payload) || payload.length !== lines.length) {

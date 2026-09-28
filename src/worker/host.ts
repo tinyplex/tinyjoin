@@ -11,9 +11,11 @@ import {
 import {ClientError} from '../client/error.js';
 import {
   PROTOCOL_VERSION,
+  isSqlResultText,
   isWorkerRequest,
   type ApplyOutcome,
   type SerializedError,
+  type SqlResultText,
   type StorageOptions,
   type WorkerEvent,
   type WorkerRequest,
@@ -139,9 +141,16 @@ export const startWorker = (
   };
 
   // Publishes an outcome only outside a transaction: staged changes become
-  // visible when the transaction commits, not as each statement runs.
-  const emitUnlessInTransaction = (outcome: ApplyOutcome): void => {
-    if (isUndefined(activeTransactionId) && outcome.tables.length > 0) {
+  // visible when the transaction commits, not as each statement runs. A result
+  // still in text published nothing, so it has nothing to announce.
+  const emitUnlessInTransaction = (
+    outcome: ApplyOutcome | SqlResultText,
+  ): void => {
+    if (
+      !isSqlResultText(outcome) &&
+      isUndefined(activeTransactionId) &&
+      outcome.tables.length > 0
+    ) {
       emitInvalidation(outcome);
     }
   };

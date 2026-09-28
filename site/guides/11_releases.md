@@ -39,7 +39,7 @@ first key is `title`. Earlier releases sorted the keys alphabetically. Code
 that reads a row by column name is unaffected; only code that depends on key
 order, such as `Object.keys(row)` or `JSON.stringify(row)`, sees a difference.
 
-**The Worker protocol version moves from 8 to 9.** Client and Worker ship
+**The Worker protocol version moves from 8 to 10.** Client and Worker ship
 together and are upgraded together by a normal install, so this affects only a
 deployment that pins or caches a Worker file independently of the client
 bundle. A mismatched pair fails cleanly with `PROTOCOL_MISMATCH`, and tabs
@@ -91,7 +91,10 @@ joins are quicker than in either.
 - Rows travel from the engine to the page as JSON text, which only the page
   parses, rather than as objects built one property at a time and then copied
   between threads. A point query takes about a quarter less time, and reading
-  10,000 rows well under half.
+  10,000 rows well under half. A statement that publishes nothing, such as a
+  read or a statement inside a transaction, passes the rest of its result
+  through the Worker as text too, and point statements take 4 to 7% less
+  time.
 - On the tab that owns a database, statements reach the engine as calls rather
   than as messages checked again at every layer.
 - A plain `INSERT` plans each row straight into the record its commit writes,

@@ -490,6 +490,8 @@ const startCoordinator = (
                 await tenure;
                 return;
               }
+              // A statement result still in text published nothing, so it
+              // holds no newer revision, and its two strings are passed over.
               const noteResult = (result: unknown): void => {
                 for (const value of Array.isArray(result) ? result : [result]) {
                   if (isRecord(value) && typeof value.revision === 'number')

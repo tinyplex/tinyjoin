@@ -167,6 +167,10 @@ Done:
   request rather than calling `TextEncoder`, which costs a Chromium Worker
   0.26 µs a call: 10,000 inserts in a transaction fell by 5% engine-only in
   Chromium.
+- A statement's result that published nothing, a read or a statement inside a
+  transaction, passes through the Worker as the text WASM wrote: its header
+  and its rows, which only the page parses and checks, as protocol version 10.
+  Point statements took 4-7% less time in the browser benchmark, with OPFS.
 
 Found along the way:
 
@@ -215,8 +219,11 @@ Found along the way:
   point statements, and was removed. Removing the allocations served better
   than making them cheaper.
 - Messages between the page and the Worker cost about the same whether a
-  result crosses as an object or as JSON text the page parses, so the
-  protocol keeps objects.
+  result crosses as an object or as JSON text the page parses. What JSON text
+  saves is the Worker's own parse and check of the header, about a microsecond
+  a statement, so a result that published nothing now crosses as text, and
+  one that committed, which the Worker reads to announce its changes, as an
+  object.
 - `wasm-opt` inlines a function into its only caller even when it loops. The
   plain scan loop, folded into the transaction reader's larger function, ran
   5% slower; called from two places, it stays whole.

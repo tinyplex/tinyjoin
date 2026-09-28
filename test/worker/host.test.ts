@@ -216,7 +216,14 @@ describe('startWorker', () => {
         error: {code: 'RESOURCE_LIMIT'},
       });
     }
-    expect(scope.posted[3]).toEqual({v: PROTOCOL_VERSION, id: 4, ok: true, result});
+    // A result that published nothing passes on as the text WASM wrote.
+    const {data, ...header} = result;
+    expect(scope.posted[3]).toEqual({
+      v: PROTOCOL_VERSION,
+      id: 4,
+      ok: true,
+      result: [JSON.stringify(header), data],
+    });
     expect(callStructured.mock.calls.map(([, operation]) => operation)).toEqual([
       WASM_OPERATION.revision,
       WASM_OPERATION.executeSql,

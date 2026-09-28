@@ -80,6 +80,71 @@ describe('WorkerRpc', () => {
     await expect(request).resolves.toEqual(sqlResult(3));
   });
 
+  it('reads a statement result sent as text, and fails alone one it cannot read', async () => {
+    const worker = new FakeWorker();
+    const rpc = createWorkerRpc(worker);
+    const asText = ({data, ...header}: ReturnType<typeof sqlResult>) => [
+      JSON.stringify(header),
+      data,
+    ];
+    const read = rpc.request('executePrepared', {statementId: 1, params: []});
+    const unreadable = rpc.request('executeSql', {sql: 'SELECT 1', params: []});
+    const invalid = rpc.request('executeSql', {sql: 'SELECT 2', params: []});
+    const after = rpc.request('executeSql', {sql: 'SELECT 3', params: []});
+    const [first, second, third, fourth] = worker.posted as WorkerRequest[];
+
+    worker.respond({
+      v: PROTOCOL_VERSION,
+      id: first!.id,
+      ok: true,
+      result: asText(sqlResult(4, [{id: 7}])),
+    });
+    worker.respond({
+      v: PROTOCOL_VERSION,
+      id: second!.id,
+      ok: true,
+      result: ['{"command":', sqlData([], [])],
+    });
+    worker.respond({
+      v: PROTOCOL_VERSION,
+      id: third!.id,
+      ok: true,
+      result: asText({...sqlResult(4), rowCount: -1}),
+    });
+    worker.respond({
+      v: PROTOCOL_VERSION,
+      id: fourth!.id,
+      ok: true,
+      result: sqlResult(5),
+    });
+
+    await expect(read).resolves.toEqual(sqlResult(4, [{id: 7}]));
+    for (const failed of [unreadable, invalid]) {
+      await expect(failed).rejects.toMatchObject({
+        code: 'BRIDGE_SERIALIZATION_ERROR',
+      });
+    }
+    await expect(after).resolves.toEqual(sqlResult(5));
+    expect(worker.terminated).toBe(false);
+  });
+
+  it('rejects a result sent as text for anything but a statement', async () => {
+    const worker = new FakeWorker();
+    const rpc = createWorkerRpc(worker);
+    const request = rpc.request('execSql', {sql: 'SELECT 1'});
+    const [message] = worker.posted as WorkerRequest[];
+
+    worker.respond({
+      v: PROTOCOL_VERSION,
+      id: message!.id,
+      ok: true,
+      result: ['{}', sqlData([], [])],
+    });
+
+    await expect(request).rejects.toMatchObject({code: 'PROTOCOL_MISMATCH'});
+    expect(worker.terminated).toBe(true);
+  });
+
   it('rejects a malformed SQL query success and terminates the worker', async () => {
     const worker = new FakeWorker();
     const rpc = createWorkerRpc(worker);

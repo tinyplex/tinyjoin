@@ -3,19 +3,24 @@ import type {
   JsonValue,
   RowMode,
   SqlResult,
+  SqlResultText,
   StorageOptions,
 } from '../protocol.js';
 import {createMemoryPageDevice, type PageDevice} from './page-device.js';
 import {createStructuredWasmEngine} from './wasm-bridge.js';
 
 export interface WorkerEngine {
-  executeSql(sql: string, params: JsonValue[], rowMode?: RowMode): SqlResult;
+  executeSql(
+    sql: string,
+    params: JsonValue[],
+    rowMode?: RowMode,
+  ): SqlResult | SqlResultText;
   prepareSql(sql: string): number;
   executePrepared(
     statementId: number,
     params: JsonValue[],
     rowMode?: RowMode,
-  ): SqlResult;
+  ): SqlResult | SqlResultText;
   closePrepared(statementId: number): void;
   execSql(sql: string, rowMode?: RowMode): SqlResult[];
   beginTransaction(): void;

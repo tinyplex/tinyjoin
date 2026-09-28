@@ -1,8 +1,12 @@
 import {describe, expect, it} from 'vitest';
 
-import type {
-  Row,
-  SqlResult,
+import {
+  isRpcResultHeader,
+  isSqlResultText,
+  readSqlResult,
+  type Row,
+  type SqlResult,
+  type SqlResultText,
 } from '../../src/protocol.ts';
 import type {PageDevice} from '../../src/worker/page-device.ts';
 import {
@@ -70,6 +74,11 @@ function sqlResult(rows: Row[] = []): SqlResult {
       rows,
     }),
   };
+}
+
+// A statement's result as the page reads it: as text, when it published nothing.
+function read(result: SqlResult | SqlResultText): unknown {
+  return isSqlResultText(result) ? readSqlResult(result) : result;
 }
 
 function sqlResponse(results: SqlResult[], list = false, disposition = SAFE) {
@@ -170,10 +179,10 @@ describe('WASM engine bridge', () => {
     const params = [3, 'three'];
     const preparedParams = [4];
 
-    expect(engine.executeSql('SELECT $1, $2', params)).toEqual(
+    expect(read(engine.executeSql('SELECT $1, $2', params))).toEqual(
       sqlResult([{id: 1}]),
     );
-    expect(engine.executeSql('SELECT $1', [5], 'array')).toEqual(
+    expect(read(engine.executeSql('SELECT $1', [5], 'array'))).toEqual(
       sqlResult([{id: 1}]),
     );
     expect(engine.execSql('SELECT 1; SELECT 2')).toEqual([
@@ -190,7 +199,7 @@ describe('WASM engine bridge', () => {
     expect(engine.inTransaction()).toBe(false);
     expect(engine.revision()).toBe(3);
     expect(engine.prepareSql('SELECT $1')).toBe(9);
-    expect(engine.executePrepared(9, preparedParams)).toEqual(
+    expect(read(engine.executePrepared(9, preparedParams))).toEqual(
       sqlResult([{id: 1}]),
     );
     engine.closePrepared(9);
@@ -269,16 +278,22 @@ describe('WASM engine bridge', () => {
   it('passes the rows of each result on as the JSON text WASM wrote', () => {
     const raw = new FakeRawEngine();
     const data = '{"fields":[{"name":"id","dataTypeID":20}],"rows":[{"id":1}]}';
-    raw.response = envelope(
-      VERSION,
-      SUCCESS,
-      SAFE,
-      {command: 'SELECT', revision: 1, rowCount: 1, tables: [], keys: {}},
-      data,
-    );
+    const header = {command: 'SELECT', revision: 1, rowCount: 1, tables: [], keys: {}};
+    raw.response = envelope(VERSION, SUCCESS, SAFE, header, data);
     const engine = adaptStructuredWasmEngine(raw);
 
-    expect(engine.executeSql('SELECT id FROM items', []).data).toBe(data);
+    // A result that published nothing passes on unread, header and all.
+    expect(engine.executeSql('SELECT id FROM items', [])).toEqual([
+      JSON.stringify(header),
+      data,
+    ]);
+    // One that did is read, to announce its changes, and its rows passed on.
+    const changed = {...header, command: 'INSERT', tables: ['items'], keys: {items: [{id: 1}]}};
+    raw.response = envelope(VERSION, SUCCESS, DURABLE, changed, data);
+    expect(engine.executeSql('INSERT INTO items VALUES (1)', [])).toEqual({
+      ...changed,
+      data,
+    });
   });
 
   it('preflights structured requests before entering WASM', () => {
@@ -300,18 +315,23 @@ describe('WASM engine bridge', () => {
     const raw = new FakeRawEngine();
     const engine = adaptStructuredWasmEngine(raw);
     const {data, ...header} = sqlResult();
+    // A result that published nothing passes on unread, for the page to check.
     for (const response of [
       envelope(VERSION, SUCCESS, SAFE, {...header, rowCount: -1}, data),
-      envelope(VERSION, SUCCESS, SAFE, header),
       envelope(VERSION, SUCCESS, SAFE, {...header, extra: true}, data),
       envelope(VERSION, SUCCESS, SAFE, [header], data, data),
       `${success()}\n${data}`,
     ]) {
       raw.response = response;
-      expect(() => engine.executeSql('UPDATE items SET id = id', [])).toThrow(
-        WasmStructuredDecodeError,
-      );
+      const result = engine.executeSql('UPDATE items SET id = id', []);
+      expect(isSqlResultText(result)).toBe(true);
+      expect(isRpcResultHeader('executeSql', read(result))).toBe(false);
     }
+    // One without its rows is not a statement's result at all.
+    raw.response = envelope(VERSION, SUCCESS, SAFE, header);
+    expect(() => engine.executeSql('UPDATE items SET id = id', [])).toThrow(
+      WasmStructuredDecodeError,
+    );
     raw.response = envelope(VERSION, SUCCESS, SAFE, [header, header], data);
     expect(() => engine.execSql('SELECT 1; SELECT 2')).toThrow(
       WasmStructuredDecodeError,
@@ -324,8 +344,10 @@ describe('WASM engine bridge', () => {
   });
 
   it('poisons durable and unknown malformed mutation results', () => {
+    const {data, ...header} = sqlResult();
     for (const response of [
       success(null, DURABLE),
+      envelope(VERSION, SUCCESS, DURABLE, {...header, rowCount: -1}, data),
       envelope(99, SUCCESS, SAFE, null),
       'not JSON',
       [VERSION, SUCCESS, SAFE, null],
@@ -411,7 +433,9 @@ describe('WASM engine bridge', () => {
 
     for (const transfer of ['read', 'write', 'flush'] as const) {
       firstRaw.transfer = transfer;
-      expect(first.executeSql('SELECT id FROM items', [])).toEqual(sqlResult());
+      expect(read(first.executeSql('SELECT id FROM items', []))).toEqual(
+        sqlResult(),
+      );
       expect(errors).toHaveLength(5);
       for (const error of errors) {
         expect(error).toEqual(
@@ -430,7 +454,9 @@ describe('WASM engine bridge', () => {
 
     // Rejected nested closes did not mutate either bridge lifecycle.
     firstDevice.callback = undefined;
-    expect(second.executeSql('SELECT id FROM items', [])).toEqual(sqlResult());
+    expect(read(second.executeSql('SELECT id FROM items', []))).toEqual(
+      sqlResult(),
+    );
     first.close();
     first.close();
     second.close();

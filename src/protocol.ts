@@ -16,7 +16,7 @@ import {
   objValues,
 } from './common.js';
 
-export const PROTOCOL_VERSION = 9 as const;
+export const PROTOCOL_VERSION = 10 as const;
 
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue =
@@ -69,10 +69,14 @@ export interface ApplyOutcome {
 }
 
 /**
- * A statement's result as the Worker sends it. Its fields and rows travel as
+ * A statement's result as the page reads it. Its fields and rows travel as
  * JSON text that only the page parses, `{"fields": [...], "rows": [...]}`,
  * with each row's values in field order: an object keyed by field name, or an
  * array when the request asked for `rowMode: 'array'`.
+ *
+ * A result that changed nothing durable crosses from the Worker as
+ * {@link SqlResultText}, which the Worker does not parse; one that committed
+ * crosses as this object, which the Worker read to publish its changes.
  */
 export interface SqlResult {
   command: string;
@@ -82,6 +86,12 @@ export interface SqlResult {
   keys: ChangedKeys;
   data: string;
 }
+
+/**
+ * A {@link SqlResult} as JSON text: its header, which is the result without
+ * its `data`, and then its `data`.
+ */
+export type SqlResultText = [header: string, data: string];
 
 /** The fields and rows a {@link SqlResult} carries as JSON text. */
 export interface SqlData {
@@ -503,6 +513,25 @@ export const parseSqlData = (text: string): unknown => {
   } catch {
     return undefined;
   }
+};
+
+/** Whether a statement's result crossed as {@link SqlResultText}. */
+export const isSqlResultText = (value: unknown): value is SqlResultText =>
+  arrayIsArray(value) &&
+  value.length === 2 &&
+  isString(value[0]) &&
+  isString(value[1]);
+
+/**
+ * Reads a statement's result sent as {@link SqlResultText}: its header is
+ * parsed, and its data attached, for the result's checks to judge.
+ */
+export const readSqlResult = (value: SqlResultText): unknown => {
+  const header = parseSqlData(value[0]);
+  if (isRecord(header)) {
+    header.data = value[1];
+  }
+  return header;
 };
 
 const isSqlData = (
