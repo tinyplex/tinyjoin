@@ -101,8 +101,9 @@ scans, `GROUP BY`, and joins are quicker than in either.
   result read, with less work on both sides of the Worker. Point inserts,
   updates, and deletes in a transaction take 5 to 10% less time.
 - Scans take each leaf's rows straight from the copy of the leaf they hold,
-  checking the tree only as they move between leaves. A range aggregate over
-  10,000 rows takes about an eighth less time.
+  checking the tree only as they move between leaves, and read an inline cell
+  and an integer column without the general decoders. A range aggregate over
+  10,000 rows takes about a quarter less time in the browser.
 - A statement's changed rows are kept in the order its scan finds them, rather
   than sorted into maps as they arrive, so deleting 8,000 rows takes about a
   fifth less time.

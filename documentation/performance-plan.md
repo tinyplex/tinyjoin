@@ -108,7 +108,10 @@ Done:
   engine time.
 - Scans take a leaf's rows from the cursor's copy of it, checking the cursor's
   view once per leaf, and pass rows straight to their visitor when no work
-  budget is charged. Range aggregates take 13% less engine time.
+  budget is charged. The cursor's step reads an inline cell itself, a column
+  reader decodes an integer itself, and the pages a walk visits are hashed as
+  the cache hashes them. Range aggregates take 29% less engine time, and a
+  quarter less in Chromium.
 - A stored row's size estimate starts from a total its table's layout works
   out once, and reads only its text and JSON columns.
 - Several small collections moved from B-tree maps to vectors, and three maps
@@ -187,9 +190,13 @@ Remaining, in order of expected value:
    graphs. Parameters now cross into WASM as bytes the Worker writes while it
    checks them, rather than through `serde_wasm_bindgen`, which cost about
    0.7 µs a statement.
-2. Scans take 1.5 times as long as SQLite's, spent mostly in the cursor and
-   predicate evaluation, now that a leaf's rows are read without the cursor's
-   per-row checks. Inside a transaction, a range `UPDATE` also merges each scan
+2. Scans took 1.5 times as long as SQLite's in the `a9e4b08` run; the
+   readers compiled inline since took a further quarter off in Chromium A/B
+   runs. What remains is spent mostly in the cursor and predicate evaluation.
+   Forcing a small fast path inline where every scanned row passes
+   (`#[inline(always)]` on the fast path, not on the general function) paid
+   best: inlining a whole general function grew the engine by a kilobyte or
+   more for less. Inside a transaction, a range `UPDATE` also merges each scan
    with the staged rows (T3), comparing every row's key with the next staged
    one, and takes twice as long: the largest ratio left.
 3. Bulk deletes take about 1.6 times as long as PGlite's, and less than
