@@ -799,7 +799,12 @@ impl<'a> StoredRecord<'a> {
         }
         match self.stored_bytes(position)? {
             None => Ok(ValueRef::Null),
-            Some(bytes) => decode_value(column.data_type, bytes, false),
+            Some(bytes) => match column.data_type {
+                ColumnType::Integer if let Some(value) = integer_value(bytes) => {
+                    Ok(ValueRef::Integer(value))
+                }
+                data_type => decode_value(data_type, bytes, false),
+            },
         }
     }
 
@@ -1023,6 +1028,28 @@ fn integer_length(value: i64) -> usize {
         .expect("eight bytes hold every integer")
 }
 
+/// A stored integer's value, from the little-endian bytes of its two's complement, or `None` when
+/// it is longer than seven bytes or beyond the safe integer range. Compiled into the readers that
+/// every scanned row's predicate uses, since most compare integers.
+#[inline(always)]
+fn integer_value(bytes: &[u8]) -> Option<i64> {
+    if bytes.len() > 7 {
+        return None;
+    }
+    // Gathered byte by byte: copying a slice of the value's length would call memcpy.
+    let mut raw = 0_u64;
+    for (index, byte) in bytes.iter().enumerate() {
+        raw |= u64::from(*byte) << (8 * index);
+    }
+    let shift = 64 - 8 * bytes.len() as u32;
+    let value = if bytes.is_empty() {
+        0
+    } else {
+        ((raw as i64) << shift) >> shift
+    };
+    (value.unsigned_abs() <= MAX_SAFE_INTEGER).then_some(value)
+}
+
 fn decode_value(data_type: ColumnType, bytes: &[u8], strict: bool) -> Result<ValueRef<'_>> {
     let value = match data_type {
         ColumnType::Boolean => match bytes {
@@ -1034,23 +1061,12 @@ fn decode_value(data_type: ColumnType, bytes: &[u8], strict: bool) -> Result<Val
             if bytes.len() > 7 {
                 return Err(storage_corrupt("A stored integer is too long"));
             }
-            // Gathered byte by byte: copying a slice of the value's length would call memcpy.
-            let mut raw = 0_u64;
-            for (index, byte) in bytes.iter().enumerate() {
-                raw |= u64::from(*byte) << (8 * index);
+            match integer_value(bytes) {
+                Some(value) if !strict || integer_length(value) == bytes.len() => {
+                    ValueRef::Integer(value)
+                }
+                _ => return Err(storage_corrupt("A stored integer is not canonical")),
             }
-            let shift = 64 - 8 * bytes.len() as u32;
-            let value = if bytes.is_empty() {
-                0
-            } else {
-                ((raw as i64) << shift) >> shift
-            };
-            if value.unsigned_abs() > MAX_SAFE_INTEGER
-                || strict && integer_length(value) != bytes.len()
-            {
-                return Err(storage_corrupt("A stored integer is not canonical"));
-            }
-            ValueRef::Integer(value)
         }
         ColumnType::Float => {
             let bytes = <[u8; 8]>::try_from(bytes)
