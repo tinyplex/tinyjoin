@@ -229,8 +229,13 @@ Remaining, in order of expected value:
    encoding, binding a statement by cloning its template, and the changed
    keys each write reports as maps. An `UPDATE` that keeps each row's key now
    writes the row's new record from its old one, a tenth off 1,000 updates by
-   key engine-only; an upsert still plans maps for both its halves. The rest
-   is the Worker's JavaScript, a
+   key engine-only; an upsert still plans maps for both its halves. Profiled
+   engine-only on 29 September, excluding its commit, such an `UPDATE` spends
+   about 18% building its result's JSON header in WASM and parsing it in the
+   Worker, 6% encoding its parameters, and a third planning, where the key
+   lookup costs most: a key map built from the predicate and then encoded
+   (4%), and the B-tree descent, which reads each probed cell's key (10%).
+   The rest is the Worker's JavaScript, a
    few microseconds more than SQLite's: the layers each request passes
    through, and copying requests and results between threads as object
    graphs. Parameters now cross into WASM as bytes the Worker writes while it
