@@ -41,9 +41,16 @@ struct Totals {
     usage: PagedWriteUsage,
     /// How many changed rows each table has.
     changed_tables: BTreeMap<String, usize>,
-    /// Each unique-index value a changed row holds, with that row's primary key.
-    claims: BTreeMap<(TreeId, Box<[u8]>), Vec<u8>>,
+    /// Each unique-index value a changed row holds, with that row's primary key, or with none
+    /// once the row gives it up: a map's code for removing entries is large, so a value given up
+    /// is left in place, and the map rebuilt once they are many.
+    claims: Claims,
+    /// How many values were given up since the claims were last rebuilt.
+    released: usize,
 }
+
+/// Unique-index values, each with the primary key of the row claiming it, if one does.
+type Claims = BTreeMap<(TreeId, Box<[u8]>), Option<Vec<u8>>>;
 
 /// One staged key: the committed row it held and the row the transaction stages for it, kept as
 /// the stored entry and the record a commit writes, so that neither is copied or encoded again.
@@ -111,7 +118,7 @@ struct TotalsChange {
     /// The unique-index claims the patch gives up.
     released: BTreeSet<(TreeId, Box<[u8]>)>,
     /// The claims it makes, each with the primary key that makes it.
-    claimed: BTreeMap<(TreeId, Box<[u8]>), Vec<u8>>,
+    claimed: Claims,
 }
 
 impl PagedTransaction {
@@ -226,9 +233,20 @@ impl PagedTransaction {
             }
         }
         for claim in change.released {
-            self.totals.claims.remove(&claim);
+            if let Some(holder) = self.totals.claims.get_mut(&claim) {
+                *holder = None;
+                self.totals.released += 1;
+            }
         }
         self.totals.claims.extend(change.claimed);
+        if self.totals.released > 64 && self.totals.released > self.totals.claims.len() / 2 {
+            for (slot, holder) in std::mem::take(&mut self.totals.claims) {
+                if holder.is_some() {
+                    self.totals.claims.insert(slot, holder);
+                }
+            }
+            self.totals.released = 0;
+        }
         self.totals.overlay_keys = change.overlay_keys;
         self.totals.overlay_bytes = change.overlay_bytes;
         self.totals.usage = change.usage;
@@ -398,13 +416,11 @@ impl PagedTransaction {
             }
         }
 
-        let mut claimed = BTreeMap::<(TreeId, Box<[u8]>), Vec<u8>>::new();
-        let holder = |claimed: &BTreeMap<(TreeId, Box<[u8]>), Vec<u8>>,
-                      slot: &(TreeId, Box<[u8]>)|
-         -> Option<Vec<u8>> {
-            claimed.get(slot).cloned().or_else(|| {
+        let mut claimed = Claims::new();
+        let holder = |claimed: &Claims, slot: &(TreeId, Box<[u8]>)| -> Option<Vec<u8>> {
+            claimed.get(slot).cloned().flatten().or_else(|| {
                 (!released.contains(slot))
-                    .then(|| self.totals.claims.get(slot).cloned())
+                    .then(|| self.totals.claims.get(slot).cloned().flatten())
                     .flatten()
             })
         };
@@ -430,7 +446,7 @@ impl PagedTransaction {
                     {
                         return Err(storage.unique_violation_in(claim.tree_id));
                     }
-                    claimed.insert(slot, key.clone());
+                    claimed.insert(slot, Some(key.clone()));
                 }
             }
         }
@@ -1034,8 +1050,9 @@ mod tests {
             assert_eq!(
                 totals
                     .claims
-                    .keys()
-                    .cloned()
+                    .iter()
+                    .filter(|(_, holder)| holder.is_some())
+                    .map(|(slot, _)| slot.clone())
                     .collect::<crate::paged_storage::UniquePrefixes>(),
                 complete.unique_prefixes
             );

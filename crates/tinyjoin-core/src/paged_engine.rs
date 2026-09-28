@@ -646,6 +646,49 @@ mod tests {
     }
 
     #[test]
+    fn a_transaction_giving_up_many_unique_values_still_checks_them() {
+        // Each update gives up the value before it, and the transaction's claims are rebuilt
+        // once many are given up.
+        let mut engine = page_native_fixture(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine.begin_transaction().unwrap();
+        for round in 0..200 {
+            engine
+                .execute_sql(
+                    "UPDATE accounts SET email = $1 WHERE id = 1",
+                    &[json!(format!("ada{round}@example.com"))],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            engine
+                .execute_sql(
+                    "UPDATE accounts SET email = 'ada199@example.com' WHERE id = 2",
+                    &[],
+                )
+                .unwrap_err()
+                .code,
+            "CONSTRAINT_VIOLATION"
+        );
+        engine
+            .execute_sql(
+                "UPDATE accounts SET email = 'ada100@example.com' WHERE id = 2",
+                &[],
+            )
+            .unwrap();
+        engine.commit_transaction().unwrap();
+        assert_eq!(
+            engine
+                .query_sql("SELECT id, email FROM accounts ORDER BY id", &[])
+                .unwrap()
+                .rows,
+            vec![
+                row(json!({"id": 1, "email": "ada199@example.com"})),
+                row(json!({"id": 2, "email": "ada100@example.com"})),
+            ]
+        );
+    }
+
+    #[test]
     fn scans_read_rows_whose_values_overflow_their_leaves() {
         // Scans take a leaf's rows from the cursor's copy of it, reading a value that overflows
         // the leaf through the pager, in both directions, and inside a write.

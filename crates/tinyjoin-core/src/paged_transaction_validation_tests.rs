@@ -159,8 +159,14 @@ fn compare_stage(
         )
         .unwrap();
     assert_eq!(usage, full.usage);
+    // A value a row gave up stays in the claims without a holder.
     assert_eq!(
-        totals.claims.keys().cloned().collect::<UniquePrefixes>(),
+        totals
+            .claims
+            .iter()
+            .filter(|(_, holder)| holder.is_some())
+            .map(|(slot, _)| slot.clone())
+            .collect::<UniquePrefixes>(),
         full.unique_prefixes
     );
     let (mut keys, mut bytes) = (0, 0);
