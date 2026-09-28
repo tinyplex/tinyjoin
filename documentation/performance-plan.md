@@ -26,45 +26,48 @@ one commit per step, each gated on the Rust, TypeScript, browser and size
 checks. The ratios below are to the faster of SQLite and PGlite in the same
 run, so machine load largely cancels out. The later columns are runs published
 in `site/data/benchmarks.json`: 26 September with five samples, two on 27
-September with nine, on commits `64ce856` and `23fe19c`, and one on 28
-September with nine, on `5a3e1d7`. Three earlier runs on 27 September were
-discarded because background load inflated every engine's times; the published
-ones were made with macOS media analysis paused, and their SQLite times match
-the quiet 26 September run's. The `23fe19c` column adds planning inserted rows
-straight into records and the warm-up Worker, and the `5a3e1d7` column the
-per-statement work and size reductions of 28 September, measured while other
-applications kept the machine busier.
+September with nine, on commits `64ce856` and `23fe19c`, and two on 28
+September with nine, on `5a3e1d7` and `a9e4b08`. Three earlier runs on 27
+September were discarded because background load inflated every engine's
+times; the published ones were made with macOS media analysis paused, and their
+SQLite times match the quiet 26 September run's. The `23fe19c` column adds
+planning inserted rows straight into records and the warm-up Worker, the
+`5a3e1d7` column the per-statement work and size reductions of 28 September,
+measured while other applications kept the machine busier, and the `a9e4b08`
+column that evening's bulk-write, checksum, scan, and size work.
 
-| Workload | v0.3.0 | 26 Sep | `64ce856` | `23fe19c` | `5a3e1d7` |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `cold-open` | 0.7× | 0.8× | 0.71× | 0.59× | 0.60× |
-| `reopen` | 3.5× | 1.2× | 1.2× | 1.1× | 1.2× |
-| `insert-autocommit` | 3.3× | 2.1× | 1.1× | 1.1× | 0.98× |
-| `insert-transaction` | 9.9× | 2.5× | 1.7× | 1.7× | 1.6× |
-| `insert-indexed` | 15× | 2.3× | 1.8× | 1.6× | 1.5× |
-| `insert-batch` | 33× | 3.4× | 2.0× | 1.6× | 1.6× |
-| `select-pk` | 4.2× | 1.6× | 1.2× | 1.1× | 1.1× |
-| `select-scan` | 105× | 1.75× | 1.7× | 1.6× | 1.6× |
-| `select-like` | 39× | 0.9× | 0.95× | 0.94× | 0.92× |
-| `select-indexed` | 1,406× | 2.4× | 1.6× | 1.2× | 1.1× |
-| `select-all` | 2.3× | 0.6× | 0.28× | 0.23× | 0.24× |
-| `group-by` | 22× | 0.95× | 1.0× | 0.86× | 0.87× |
-| `join` | 175× | 1.4× | 1.1× | 0.88× | 0.86× |
-| `update-pk` | 1,077× | 2.3× | 1.8× | 1.8× | 1.8× |
-| `update-scan` | 179× | 2.2× | 2.1× | 2.1× | 2.1× |
-| `upsert` | 1,362× | 2.5× | 1.8× | 1.8× | 1.9× |
-| `delete-pk` | 1,105× | 2.6× | 1.8× | 1.8× | 1.7× |
-| `delete-like` | 95× | 3.7× | 2.7× | 1.9× | 2.1× |
-| `delete-range` | 249× | 3.7× | 2.5× | 2.3× | 2.2× |
-| `create-index` | 142× | 1.3× | 1.1× | 1.0× | 1.1× |
+| Workload | v0.3.0 | 26 Sep | `64ce856` | `23fe19c` | `5a3e1d7` | `a9e4b08` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `cold-open` | 0.7× | 0.8× | 0.71× | 0.59× | 0.60× | 0.59× |
+| `reopen` | 3.5× | 1.2× | 1.2× | 1.1× | 1.2× | 1.1× |
+| `insert-autocommit` | 3.3× | 2.1× | 1.1× | 1.1× | 0.98× | 0.93× |
+| `insert-transaction` | 9.9× | 2.5× | 1.7× | 1.7× | 1.6× | 1.5× |
+| `insert-indexed` | 15× | 2.3× | 1.8× | 1.6× | 1.5× | 1.6× |
+| `insert-batch` | 33× | 3.4× | 2.0× | 1.6× | 1.6× | 1.4× |
+| `select-pk` | 4.2× | 1.6× | 1.2× | 1.1× | 1.1× | 1.0× |
+| `select-scan` | 105× | 1.75× | 1.7× | 1.6× | 1.6× | 1.5× |
+| `select-like` | 39× | 0.9× | 0.95× | 0.94× | 0.92× | 0.92× |
+| `select-indexed` | 1,406× | 2.4× | 1.6× | 1.2× | 1.1× | 1.1× |
+| `select-all` | 2.3× | 0.6× | 0.28× | 0.23× | 0.24× | 0.25× |
+| `group-by` | 22× | 0.95× | 1.0× | 0.86× | 0.87× | 0.89× |
+| `join` | 175× | 1.4× | 1.1× | 0.88× | 0.86× | 0.88× |
+| `update-pk` | 1,077× | 2.3× | 1.8× | 1.8× | 1.8× | 1.7× |
+| `update-scan` | 179× | 2.2× | 2.1× | 2.1× | 2.1× | 2.0× |
+| `upsert` | 1,362× | 2.5× | 1.8× | 1.8× | 1.9× | 1.7× |
+| `delete-pk` | 1,105× | 2.6× | 1.8× | 1.8× | 1.7× | 1.6× |
+| `delete-like` | 95× | 3.7× | 2.7× | 1.9× | 2.1× | 1.6× |
+| `delete-range` | 249× | 3.7× | 2.5× | 2.3× | 2.2× | 1.6× |
+| `create-index` | 142× | 1.3× | 1.1× | 1.0× | 1.1× | 1.1× |
 
-The compressed download grew from 296 KiB to 334 KiB. Between two runs on the
-same build, the ratios moved by up to a tenth, and by more under load, so read
-them to one significant figure. In the last column, TinyJoin's own times fell by
-up to a third, most on the workloads whose code the warm-up Worker compiles
-ahead of them: indexed ranges, bulk inserts, joins, grouping, and deletes.
-SQLite was also about 7% faster in that run, so single-statement writes barely
-moved against it.
+The compressed download grew from 296 KiB to 334 KiB, and is now 306 KiB.
+Between two runs on the same build, the ratios moved by up to a tenth, and by
+more under load, so read them to one significant figure. In the `23fe19c`
+column, TinyJoin's own times fell by up to a third, most on the workloads whose
+code the warm-up Worker compiles ahead of them: indexed ranges, bulk inserts,
+joins, grouping, and deletes. SQLite was about 7% faster in the `5a3e1d7` run,
+so single-statement writes barely moved against it, and about 8% slower in the
+`a9e4b08` run, in which bulk deletes fell to 1.6 times PGlite's, quicker than
+SQLite's.
 
 Done:
 
@@ -95,6 +98,21 @@ Done:
 - Protocol messages are checked with `Object.keys`, a result is read into
   Results as its response arrives, and a ready client sends a direct statement
   at once, rather than after turns of the microtask queue.
+- A statement's changed rows are kept in the order they arrive, and sorted
+  only if a key arrives out of order, rather than inserted into maps; a table
+  with more changes than a change event can name is found without collecting
+  any keys. A range delete of 8,000 rows takes a fifth less engine time.
+- Checksums pass runs of zero bytes 256 at a time. A commit counts allocated
+  pages as they change, encodes its superblock once, and the in-memory device
+  copies a page it holds in place. Committing one insert takes a third less
+  engine time.
+- Scans take a leaf's rows from the cursor's copy of it, checking the cursor's
+  view once per leaf, and pass rows straight to their visitor when no work
+  budget is charged. Range aggregates take 13% less engine time.
+- A stored row's size estimate starts from a total its table's layout works
+  out once, and reads only its text and JSON columns.
+- Several small collections moved from B-tree maps to vectors, and three maps
+  stopped removing entries: the engine is 15 KiB smaller compressed.
 
 Found along the way:
 
@@ -105,6 +123,17 @@ Found along the way:
 - Collecting into a `BTreeMap`, and sorting with a closure, compiles a
   separate copy of the sort for every call site. Replacing nine such sites
   shrank the engine by 13 KiB compressed.
+- Each `BTreeMap` key and value type compiles its own copy of the map's code,
+  1-3 KB compressed, and removing entries compiles its rebalancing too, about
+  5 KB more before compression. The prepared statement registry, the catalog's
+  records while loading, a transaction's per-table counts and unique-value
+  claims, and a write's new pages each had a map type of their own; replacing
+  them with vectors, bitmaps, or maps the engine already had cut 15 KiB
+  compressed, with no statement slower.
+- Most of a page is zero bytes: a B-tree node's free space, the allocation
+  bitmap's unused pages, the superblock's padding. Over zero bytes a CRC-32
+  depends only on its state, so precomputed tables pass 256 of them in four
+  lookups; committing one insert had spent a third of its time checksumming.
 - Allocating a page past the end of the file wrote a zero placeholder for it,
   so commits that grew the file wrote every new page twice.
 - Each OPFS write call costs about 17 µs whatever its size, so a commit's
@@ -152,25 +181,35 @@ Remaining, in order of expected value:
    writes a row's new record from its old one, copying the columns it does
    not assign, made 1,000 updates by key 1.27 times as fast natively and 1.14
    times in WASM, but grew the engine by 2 KiB compressed, for about 3% in
-   the browser, so it was set aside. The rest is the Worker's JavaScript, a
+   the browser, so it was set aside; the engine has since shed 15 KiB. The rest is the Worker's JavaScript, a
    few microseconds more than SQLite's: the layers each request passes
    through, and copying requests and results between threads as object
    graphs. Parameters now cross into WASM as bytes the Worker writes while it
    checks them, rather than through `serde_wasm_bindgen`, which cost about
    0.7 µs a statement.
-2. Bulk deletes take about twice as long as PGlite's. PGlite, like PostgreSQL,
-   marks deleted rows and reclaims them later; TinyJoin removes each row and
-   its index entries at once. Deleting a contiguous key or index range could
-   drop whole subtrees, using their fingerprints and counts, rather than
-   visiting every entry.
-3. Scans take 1.6 times as long as SQLite's, spent mostly in the cursor and
-   predicate evaluation. Inside a transaction, a range `UPDATE` also merges
-   each scan with the staged rows (T3), and takes 2.1 times as long.
+2. Scans take 1.5 times as long as SQLite's, spent mostly in the cursor and
+   predicate evaluation, now that a leaf's rows are read without the cursor's
+   per-row checks. Inside a transaction, a range `UPDATE` also merges each scan
+   with the staged rows (T3), comparing every row's key with the next staged
+   one, and takes twice as long: the largest ratio left.
+3. Bulk deletes take about 1.6 times as long as PGlite's, and less than
+   SQLite's. PGlite, like PostgreSQL, marks deleted rows and reclaims them
+   later; TinyJoin removes each row and its index entries at once. Deleting a
+   contiguous key or index range could drop whole subtrees, using their
+   fingerprints and counts, rather than visiting every entry.
 4. [D7](#decisions-needed), remeasured under
    [build settings](#build-settings): keep `z`.
 5. Writing only changed bitmap chunks. This needs per-chunk slots in the
    superblock, a format change, and would save two page writes per commit.
-6. O2 and O4. Reopening is already within 1.2× of SQLite.
+   Checksumming the chunks' unused bytes is now nearly free, so what is left
+   is the writes themselves.
+6. O2 and O4. Reopening is within 1.1× of SQLite, but checking an index on
+   reopen looks up its table row for every entry: engine-only, a 10,000-row
+   table's index takes 26 ms to check, where its rows take 15.
+7. Size. Each B-tree map type still compiles its own code: the catalog's
+   tables and indexes, the keys a write reports, and a transaction's claims
+   could live in vectors, and statement validation builds several hash sets
+   hashed with SipHash, each with its own copy of the table code.
 
 ## Where the time goes
 

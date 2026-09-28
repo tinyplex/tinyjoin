@@ -100,6 +100,19 @@ scans, `GROUP BY`, and joins are quicker than in either.
   bookkeeping, and each statement's request and result are checked, and its
   result read, with less work on both sides of the Worker. Point inserts,
   updates, and deletes in a transaction take 5 to 10% less time.
+- Scans take each leaf's rows straight from the copy of the leaf they hold,
+  checking the tree only as they move between leaves. A range aggregate over
+  10,000 rows takes about an eighth less time.
+- A statement's changed rows are kept in the order its scan finds them, rather
+  than sorted into maps as they arrive, so deleting 8,000 rows takes about a
+  fifth less time.
+- A commit checksums the zero bytes that fill most of each page 256 at a time,
+  where it read them one at a time, and encodes less besides. Committing a
+  single insert takes a third less of the engine's time, and pages read back
+  from storage are checked faster too.
+- Several of the engine's small collections are kept in vectors rather than
+  B-tree maps, whose code is compiled anew for each type they hold, which took
+  about 15 KiB off the compressed engine.
 - Once per page, create() also starts a short-lived second Worker that runs
   the engine's common statements on a scratch in-memory database for about a
   tenth of a second, and then exits. Chromium compiles WebAssembly one function
