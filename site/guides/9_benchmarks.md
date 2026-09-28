@@ -69,20 +69,19 @@ took 10 to 1,400 times as long as the fastest engine, and none now takes more
 than about two and a quarter times as long. The remaining gaps point at the
 work ahead.
 
-- **Single statements** cost about 33 to 46 microseconds each, which is 1.1 to
-  1.8 times SQLite's cost for a point read, or an update, upsert, or delete by
-  primary key. Part of every round trip is the message between the page and the
-  Worker, which every engine pays. Once its code is compiled, a point read costs
-  about as much as SQLite's, but a write in a transaction costs about 12 to 17
-  microseconds more: TinyJoin's engine takes 6 to 10 microseconds to plan,
-  check, and stage it, and its Worker's JavaScript takes a few more than
-  SQLite's.
+- **Single statements** cost about 32 to 44 microseconds each, which is 1.05
+  to 1.9 times SQLite's cost for a point read, or an update, upsert, or delete
+  by primary key. About 12 microseconds of every round trip is the message
+  between the page and the Worker, which every engine pays. A point read costs
+  about as much as SQLite's, but a write in a transaction costs 15 to 20
+  microseconds more: in TinyJoin's Worker, in planning, checking, and staging
+  the row, and in its share of the commit.
 - **Scans** take about 1.6 times as long as SQLite's. TinyJoin reads each
   column in place from the stored row, but spends more per row walking the
   B-tree and evaluating the predicate. A range `UPDATE` inside a transaction
   also merges each scan with the transaction's staged rows, and takes about
   twice as long as SQLite's.
-- **Inserts** take about 1.6 to 1.7 times as long as SQLite's, for the same
+- **Inserts** take about 1.5 to 1.6 times as long as SQLite's, for the same
   reasons as single statements.
 - **Bulk deletes** take about two to two and a quarter times as long as
   PGlite's, which, like PostgreSQL, only marks deleted rows and leaves
@@ -90,10 +89,65 @@ work ahead.
   index entries at once, and rewrites every page they occupied. Deleting the
   rows a `LIKE` pattern matches is still quicker than in SQLite.
 - **Committing each insert alone** is dominated by the storage flush, one per
-  commit. It takes about a tenth longer than PGlite's commits, and less than a
-  third as long as SQLite's.
+  commit. It takes about as long as PGlite's commits, and less than a third as
+  long as SQLite's.
 - **Reopening validates every row and index entry**, so a populated database
   reopens a little more slowly than in SQLite.
+
+## In memory
+
+The same workloads also run with each engine keeping its database in memory
+rather than in OPFS: TinyJoin's `memory://`, SQLite's `:memory:`, and PGlite's
+`memory://`. Nothing reaches storage, so these results measure each engine's
+own work, and their difference from the results above is what its storage
+costs. Reopening a database does not apply.
+
+{{benchmarks.memory-environment}}
+
+### Download and startup in memory
+
+{{benchmarks.memory-startup}}
+
+### Create in memory
+
+{{benchmarks.memory-create}}
+
+### Read in memory
+
+{{benchmarks.memory-read}}
+
+### Update in memory
+
+{{benchmarks.memory-update}}
+
+### Delete in memory
+
+{{benchmarks.memory-delete}}
+
+### Schema in memory
+
+{{benchmarks.memory-schema}}
+
+In memory, TinyJoin is again the quickest to open, and still reads every row,
+runs `LIKE` scans, groups, and joins faster than either engine. Comparing the
+two sets of results shows what storage costs each engine:
+
+- **Committing each insert alone** takes TinyJoin about 127 microseconds in
+  memory and 500 with OPFS, so most of an OPFS commit is the storage flush.
+  SQLite commits in memory in about 29 microseconds. TinyJoin still writes,
+  checksums, and records every page each commit changes, as it does for OPFS.
+- **Bulk deletes and index builds** take TinyJoin about as long in memory as
+  with OPFS, since it writes the pages they change in a few large calls, while
+  SQLite's and PGlite's take a half to a third as long in memory. What remains
+  is TinyJoin's engine, which takes about three times as long as the others to
+  delete thousands of rows.
+- **Single statements and transactions** cost about the same either way: a
+  transaction commits once, and a single statement's time is spent between the
+  page, the Worker, and the engine.
+
+The in-memory run was measured while other applications kept the machine
+busier than for the results above, which slowed every engine's reads by a
+fifth or so, so compare engines within one run rather than across the two.
 
 ## Features are not equivalent
 
@@ -207,8 +261,8 @@ and that engine skips the workload's remaining samples.
 - Assets are served over loopback HTTP, so download sizes are counted, but
   network transfer time is not.
 - Other configurations can be faster or slower: SQLite's `opfs` file system,
-  community builds such as wa-sqlite, PGlite with IndexedDB or
-  `relaxedDurability`, and TinyJoin with in-memory storage.
+  community builds such as wa-sqlite, and PGlite with IndexedDB or
+  `relaxedDurability`.
 - Concurrency across tabs, very large databases, and long-lived storage
   fragmentation.
 
@@ -223,6 +277,7 @@ dependencies. The runner installs them on first use.
 npm ci
 npm run build
 npm run bench:compare -- --publish --samples 9
+npm run bench:compare -- --publish --storage memory --samples 9
 npm run build:docs
 ```
 
@@ -234,8 +289,9 @@ slows every engine, and a burst of load can land on some workloads and not
 others.
 
 `--publish` requires the full suite and writes every sample, the environment,
-and the list of downloaded files to `site/data/benchmarks.json`, from which the
-documentation build renders these tables.
+and the list of downloaded files to `site/data/benchmarks.json`, or with
+`--storage memory` to `site/data/benchmarks-memory.json`, from which the
+documentation build renders these charts.
 
 When working on TinyJoin's performance, run a subset instead. The runner prints
 each engine's median and TinyJoin's ratio to the fastest:

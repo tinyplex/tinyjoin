@@ -21,40 +21,42 @@ reliable figures.
 
 ## Progress
 
-As of 27 September 2026, the `perf/faster-engine` branch carries this plan
-through most of its steps, one commit per step, each gated on the Rust,
-TypeScript, browser and size checks. The ratios below are to the faster of
-SQLite and PGlite in the same run, so machine load largely cancels out. The
-later columns are runs published in `site/data/benchmarks.json`: 26 September
-with five samples, and two on 27 September with nine, on commits `64ce856` and
-`23fe19c`. Three earlier runs on 27 September were discarded because background
-load inflated every engine's times; the published ones were made with macOS
-media analysis paused, and their SQLite times match the quiet 26 September
-run's. The last column adds planning inserted rows straight into records and
-the warm-up Worker.
+As of 28 September 2026, `main` carries this plan through most of its steps,
+one commit per step, each gated on the Rust, TypeScript, browser and size
+checks. The ratios below are to the faster of SQLite and PGlite in the same
+run, so machine load largely cancels out. The later columns are runs published
+in `site/data/benchmarks.json`: 26 September with five samples, two on 27
+September with nine, on commits `64ce856` and `23fe19c`, and one on 28
+September with nine, on `5a3e1d7`. Three earlier runs on 27 September were
+discarded because background load inflated every engine's times; the published
+ones were made with macOS media analysis paused, and their SQLite times match
+the quiet 26 September run's. The `23fe19c` column adds planning inserted rows
+straight into records and the warm-up Worker, and the `5a3e1d7` column the
+per-statement work and size reductions of 28 September, measured while other
+applications kept the machine busier.
 
-| Workload | v0.3.0 | 26 Sep | `64ce856` | `23fe19c` |
-| --- | ---: | ---: | ---: | ---: |
-| `cold-open` | 0.7× | 0.8× | 0.71× | 0.59× |
-| `reopen` | 3.5× | 1.2× | 1.2× | 1.1× |
-| `insert-autocommit` | 3.3× | 2.1× | 1.1× | 1.1× |
-| `insert-transaction` | 9.9× | 2.5× | 1.7× | 1.7× |
-| `insert-indexed` | 15× | 2.3× | 1.8× | 1.6× |
-| `insert-batch` | 33× | 3.4× | 2.0× | 1.6× |
-| `select-pk` | 4.2× | 1.6× | 1.2× | 1.1× |
-| `select-scan` | 105× | 1.75× | 1.7× | 1.6× |
-| `select-like` | 39× | 0.9× | 0.95× | 0.94× |
-| `select-indexed` | 1,406× | 2.4× | 1.6× | 1.2× |
-| `select-all` | 2.3× | 0.6× | 0.28× | 0.23× |
-| `group-by` | 22× | 0.95× | 1.0× | 0.86× |
-| `join` | 175× | 1.4× | 1.1× | 0.88× |
-| `update-pk` | 1,077× | 2.3× | 1.8× | 1.8× |
-| `update-scan` | 179× | 2.2× | 2.1× | 2.1× |
-| `upsert` | 1,362× | 2.5× | 1.8× | 1.8× |
-| `delete-pk` | 1,105× | 2.6× | 1.8× | 1.8× |
-| `delete-like` | 95× | 3.7× | 2.7× | 1.9× |
-| `delete-range` | 249× | 3.7× | 2.5× | 2.3× |
-| `create-index` | 142× | 1.3× | 1.1× | 1.0× |
+| Workload | v0.3.0 | 26 Sep | `64ce856` | `23fe19c` | `5a3e1d7` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `cold-open` | 0.7× | 0.8× | 0.71× | 0.59× | 0.60× |
+| `reopen` | 3.5× | 1.2× | 1.2× | 1.1× | 1.2× |
+| `insert-autocommit` | 3.3× | 2.1× | 1.1× | 1.1× | 0.98× |
+| `insert-transaction` | 9.9× | 2.5× | 1.7× | 1.7× | 1.6× |
+| `insert-indexed` | 15× | 2.3× | 1.8× | 1.6× | 1.5× |
+| `insert-batch` | 33× | 3.4× | 2.0× | 1.6× | 1.6× |
+| `select-pk` | 4.2× | 1.6× | 1.2× | 1.1× | 1.1× |
+| `select-scan` | 105× | 1.75× | 1.7× | 1.6× | 1.6× |
+| `select-like` | 39× | 0.9× | 0.95× | 0.94× | 0.92× |
+| `select-indexed` | 1,406× | 2.4× | 1.6× | 1.2× | 1.1× |
+| `select-all` | 2.3× | 0.6× | 0.28× | 0.23× | 0.24× |
+| `group-by` | 22× | 0.95× | 1.0× | 0.86× | 0.87× |
+| `join` | 175× | 1.4× | 1.1× | 0.88× | 0.86× |
+| `update-pk` | 1,077× | 2.3× | 1.8× | 1.8× | 1.8× |
+| `update-scan` | 179× | 2.2× | 2.1× | 2.1× | 2.1× |
+| `upsert` | 1,362× | 2.5× | 1.8× | 1.8× | 1.9× |
+| `delete-pk` | 1,105× | 2.6× | 1.8× | 1.8× | 1.7× |
+| `delete-like` | 95× | 3.7× | 2.7× | 1.9× | 2.1× |
+| `delete-range` | 249× | 3.7× | 2.5× | 2.3× | 2.2× |
+| `create-index` | 142× | 1.3× | 1.1× | 1.0× | 1.1× |
 
 The compressed download grew from 296 KiB to 334 KiB. Between two runs on the
 same build, the ratios moved by up to a tenth, and by more under load, so read

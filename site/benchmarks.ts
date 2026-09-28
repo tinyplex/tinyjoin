@@ -1,10 +1,12 @@
 import {readFileSync} from 'node:fs';
 
 // Comparative benchmark results are measured by benchmarks/compare/run.mjs
-// --publish into site/data/benchmarks.json. Reading committed data keeps the
+// --publish into site/data/benchmarks.json, and with --storage memory into
+// site/data/benchmarks-memory.json. Reading committed data keeps the
 // documentation build hermetic, as for site/data/sizes.json.
 //
-// Markdown sources use {{benchmarks.<name>}} placeholders. Text placeholders
+// Markdown sources use {{benchmarks.<name>}} placeholders, and
+// {{benchmarks.memory-<name>}} for the in-memory results. Text placeholders
 // become Markdown before TinyDocs parses a page. A chart placeholder stands
 // alone in its paragraph. On the website, that paragraph is swapped for grouped
 // bar charts after rendering, since guides render Markdown without inline
@@ -312,6 +314,17 @@ const environment = (report: Report): string => {
   );
 };
 
+const MEMORY = 'memory-';
+
+// A placeholder's report, and its name within that report.
+const named = (
+  reports: {opfs: Report; memory: Report},
+  name: string,
+): [Report, string] =>
+  name.startsWith(MEMORY)
+    ? [reports.memory, name.slice(MEMORY.length)]
+    : [reports.opfs, name];
+
 const renderText = (report: Report, name: string): string => {
   switch (name) {
     case 'versions':
@@ -334,24 +347,36 @@ export type Benchmarks = {
   chartReplacers: [RegExp, string][];
 };
 
-const createBenchmarks = (report: Report): Benchmarks => {
-  const charts = new Map(
-    [...new Set(report.results.map(({group}) => group.toLowerCase()))].map(
-      (group) => [group, getCharts(report, group)],
-    ),
-  );
+const createBenchmarks = (reports: {
+  opfs: Report;
+  memory: Report;
+}): Benchmarks => {
+  // Each report's charts, by group, and by memory- and the group for the
+  // in-memory results.
+  const charts = new Map<string, [Report, Chart[]]>();
+  for (const [prefix, report] of [
+    ['', reports.opfs],
+    [MEMORY, reports.memory],
+  ] as const) {
+    for (const group of new Set(
+      report.results.map(({group}) => group.toLowerCase()),
+    )) {
+      charts.set(prefix + group, [report, getCharts(report, group)]);
+    }
+  }
   return {
     renderText: (markdown) =>
       markdown.replaceAll(PLACEHOLDER, (placeholder, name) =>
-        charts.has(name) ? placeholder : renderText(report, name),
+        charts.has(name) ? placeholder : renderText(...named(reports, name)),
       ),
     renderTables: (markdown) =>
       markdown.replaceAll(
         PLACEHOLDER,
         (placeholder, name) =>
-          charts.get(name)?.map(chartMarkdown).join('\n\n') ?? placeholder,
+          charts.get(name)?.[1].map(chartMarkdown).join('\n\n') ??
+          placeholder,
       ),
-    chartReplacers: [...charts].map(([name, list]) => [
+    chartReplacers: [...charts].map(([name, [report, list]]) => [
       new RegExp(`<p>\\{\\{benchmarks\\.${name}\\}\\}</p>`, 'g'),
       // A replacement string, in which $ would otherwise be special.
       (
@@ -367,7 +392,11 @@ const createBenchmarks = (report: Report): Benchmarks => {
 
 let benchmarks: Benchmarks | undefined;
 
+const readReport = (file: string): Report =>
+  JSON.parse(readFileSync(file, 'utf8'));
+
 export const getBenchmarks = (): Benchmarks =>
-  (benchmarks ??= createBenchmarks(
-    JSON.parse(readFileSync('site/data/benchmarks.json', 'utf8')),
-  ));
+  (benchmarks ??= createBenchmarks({
+    opfs: readReport('site/data/benchmarks.json'),
+    memory: readReport('site/data/benchmarks-memory.json'),
+  }));
