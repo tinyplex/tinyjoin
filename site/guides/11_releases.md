@@ -58,8 +58,8 @@ no longer matched its stored text.
 This release is also much faster. In the
 [comparative benchmarks](/guides/benchmarks/), most workloads in v0.3.0 took 10
 to 1,400 times as long as the faster of SQLite and PGlite. None now takes as
-much as twice as long, and reading every row, `LIKE` scans, `GROUP BY`, and
-joins are quicker than in either.
+much as twice as long, and reading every row, `LIKE` scans, `GROUP BY`, joins,
+and building indexes are quicker than in either.
 
 - Updates, upserts, and deletes inside a transaction no longer slow down as the
   transaction grows. Each statement is checked against running totals rather

@@ -36,34 +36,38 @@ planning inserted rows straight into records and the warm-up Worker, the
 measured while other applications kept the machine busier, the `a9e4b08`
 column that evening's bulk-write, checksum, scan, and size work, and the
 `b3ebbaf` column, published on 29 September, the scan, delete, update, index
-build, and size work of that night. SQLite's times in the last two runs are
-within 2% of each other on average.
+build, and size work of that night. SQLite's times in those two runs are
+within 2% of each other on average. The `82ec602` column, published the next
+morning after two noisier runs were discarded, adds that night's
+per-statement work: short parameters copied rather than encoded, results that
+committed nothing passed through the Worker as text, changed keys ordered by
+their encoded keys and kept as rows of values, and a catalog in sorted
+vectors.
 
-| Workload | v0.3.0 | 26 Sep | `64ce856` | `23fe19c` | `5a3e1d7` | `a9e4b08` | `b3ebbaf` |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `cold-open` | 0.7× | 0.8× | 0.71× | 0.59× | 0.60× | 0.59× | 0.61× |
-| `reopen` | 3.5× | 1.2× | 1.2× | 1.1× | 1.2× | 1.1× | 1.05× |
-| `insert-autocommit` | 3.3× | 2.1× | 1.1× | 1.1× | 0.98× | 0.93× | 0.90× |
-| `insert-transaction` | 9.9× | 2.5× | 1.7× | 1.7× | 1.6× | 1.5× | 1.6× |
-| `insert-indexed` | 15× | 2.3× | 1.8× | 1.6× | 1.5× | 1.6× | 1.6× |
-| `insert-batch` | 33× | 3.4× | 2.0× | 1.6× | 1.6× | 1.4× | 1.5× |
-| `select-pk` | 4.2× | 1.6× | 1.2× | 1.1× | 1.1× | 1.0× | 1.0× |
-| `select-scan` | 105× | 1.75× | 1.7× | 1.6× | 1.6× | 1.5× | 1.1× |
-| `select-like` | 39× | 0.9× | 0.95× | 0.94× | 0.92× | 0.92× | 0.86× |
-| `select-indexed` | 1,406× | 2.4× | 1.6× | 1.2× | 1.1× | 1.1× | 1.0× |
-| `select-all` | 2.3× | 0.6× | 0.28× | 0.23× | 0.24× | 0.25× | 0.25× |
-| `group-by` | 22× | 0.95× | 1.0× | 0.86× | 0.87× | 0.89× | 0.77× |
-| `join` | 175× | 1.4× | 1.1× | 0.88× | 0.86× | 0.88× | 0.82× |
-| `update-pk` | 1,077× | 2.3× | 1.8× | 1.8× | 1.8× | 1.7× | 1.6× |
-| `update-scan` | 179× | 2.2× | 2.1× | 2.1× | 2.1× | 2.0× | 1.5× |
-| `upsert` | 1,362× | 2.5× | 1.8× | 1.8× | 1.9× | 1.7× | 1.7× |
-| `delete-pk` | 1,105× | 2.6× | 1.8× | 1.8× | 1.7× | 1.6× | 1.7× |
-| `delete-like` | 95× | 3.7× | 2.7× | 1.9× | 2.1× | 1.6× | 1.6× |
-| `delete-range` | 249× | 3.7× | 2.5× | 2.3× | 2.2× | 1.6× | 1.4× |
-| `create-index` | 142× | 1.3× | 1.1× | 1.0× | 1.1× | 1.1× | 1.0× |
+| Workload | v0.3.0 | 26 Sep | `64ce856` | `23fe19c` | `5a3e1d7` | `a9e4b08` | `b3ebbaf` | `82ec602` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `cold-open` | 0.7× | 0.8× | 0.71× | 0.59× | 0.60× | 0.59× | 0.61× | 0.68× |
+| `reopen` | 3.5× | 1.2× | 1.2× | 1.1× | 1.2× | 1.1× | 1.05× | 1.1× |
+| `insert-autocommit` | 3.3× | 2.1× | 1.1× | 1.1× | 0.98× | 0.93× | 0.90× | 1.1× |
+| `insert-transaction` | 9.9× | 2.5× | 1.7× | 1.7× | 1.6× | 1.5× | 1.6× | 1.4× |
+| `insert-indexed` | 15× | 2.3× | 1.8× | 1.6× | 1.5× | 1.6× | 1.6× | 1.3× |
+| `insert-batch` | 33× | 3.4× | 2.0× | 1.6× | 1.6× | 1.4× | 1.5× | 1.1× |
+| `select-pk` | 4.2× | 1.6× | 1.2× | 1.1× | 1.1× | 1.0× | 1.0× | 0.99× |
+| `select-scan` | 105× | 1.75× | 1.7× | 1.6× | 1.6× | 1.5× | 1.1× | 1.1× |
+| `select-like` | 39× | 0.9× | 0.95× | 0.94× | 0.92× | 0.92× | 0.86× | 0.79× |
+| `select-indexed` | 1,406× | 2.4× | 1.6× | 1.2× | 1.1× | 1.1× | 1.0× | 1.0× |
+| `select-all` | 2.3× | 0.6× | 0.28× | 0.23× | 0.24× | 0.25× | 0.25× | 0.25× |
+| `group-by` | 22× | 0.95× | 1.0× | 0.86× | 0.87× | 0.89× | 0.77× | 0.72× |
+| `join` | 175× | 1.4× | 1.1× | 0.88× | 0.86× | 0.88× | 0.82× | 0.82× |
+| `update-pk` | 1,077× | 2.3× | 1.8× | 1.8× | 1.8× | 1.7× | 1.6× | 1.2× |
+| `update-scan` | 179× | 2.2× | 2.1× | 2.1× | 2.1× | 2.0× | 1.5× | 1.2× |
+| `upsert` | 1,362× | 2.5× | 1.8× | 1.8× | 1.9× | 1.7× | 1.7× | 1.5× |
+| `delete-pk` | 1,105× | 2.6× | 1.8× | 1.8× | 1.7× | 1.6× | 1.7× | 1.3× |
+| `delete-like` | 95× | 3.7× | 2.7× | 1.9× | 2.1× | 1.6× | 1.6× | 1.7× |
+| `delete-range` | 249× | 3.7× | 2.5× | 2.3× | 2.2× | 1.6× | 1.4× | 1.4× |
+| `create-index` | 142× | 1.3× | 1.1× | 1.0× | 1.1× | 1.1× | 1.0× | 0.77× |
 
-The compressed download grew from 296 KiB to 334 KiB, and is now 306 KiB, as
-it was at `a9e4b08`.
+The compressed download grew from 296 KiB to 334 KiB, and is now 302 KiB.
 Between two runs on the same build, the ratios moved by up to a tenth, and by
 more under load, so read them to one significant figure. In the `23fe19c`
 column, TinyJoin's own times fell by up to a third, most on the workloads whose
@@ -80,6 +84,14 @@ largest ratio left fell from 2.0 to 1.7, for upserts, and creating indexes and
 indexed range aggregates matched the faster engine. In memory, range
 aggregates fell from 1.5 times SQLite's to 1.07, and range `UPDATE`s from 2.3
 to 1.6.
+The `82ec602` run's SQLite log-sum matched the `b3ebbaf` run's, but it hid a
+shift: SQLite's reads ran about a sixth faster, and its OPFS writes a tenth to
+a half slower, so the write ratios in that column fell partly because SQLite's
+writes did. TinyJoin's own times fell by 2-29%, its point writes by 11-17%,
+while engine-only in Node the same commits cut its point writes by 19-21% and
+left bulk deletes and scans unchanged. In memory, where SQLite ran about a
+sixth faster than in the `b3ebbaf` run, point writes fell from 2.0-2.2 times
+SQLite's to 1.9-2.2, and 200-row inserts from 1.7 to 1.4.
 
 Done:
 
