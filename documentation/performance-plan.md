@@ -221,6 +221,12 @@ Done:
   instructions to 199 engine-only, and took about 5% less time in Chromium
   with OPFS, where each write call costs about 17 µs and the flush most of
   the rest. This is part of page format 3, so it breaks nothing released.
+- Opening a database counts the rows each index should hold in the pass that
+  validates the table's rows, rather than scanning the table again for every
+  index that is not unique over required columns, and an index that claims
+  entries without a tree root is refused, which the count alone had let
+  through. Reopening a 10,000-row table with one index fell from 344 million
+  instructions to 333 engine-only.
 
 Found along the way:
 
@@ -329,6 +335,10 @@ Remaining, in order of expected value:
    reopen looks up its table row for every entry: engine-only, a 10,000-row
    table's index took 26 ms to check, where its rows take 15. After the scan
    and lookup work of 29 September, an index on its text column takes 14.
+   Checking entries without those lookups would take memory in proportion to
+   the index, or a weaker check than [D2](#decisions-needed) keeps, and on
+   29 September was judged not worth either while reopening stays close to
+   SQLite's.
 6. Size. Each B-tree map type still compiles its own code: a transaction's
    claims could live in vectors, as the catalog's tables and indexes, and the
    keys a write reports, now do. The hash sets now share one hasher, but each key

@@ -1578,11 +1578,23 @@ fn load_and_validate_catalog<D: PageDevice>(
         return Err(storage_corrupt("Catalog tree IDs are not unique"));
     }
 
-    for (_, record) in &table_records {
-        validate_table_tree(pager, record)?;
+    // Each table's rows are validated in one pass, which also counts, for each index on the
+    // table, the rows that should have an entry in it.
+    let mut expected_entry_counts = vec![0; index_records.len()];
+    for (name, record) in &table_records {
+        let mut indexes = Vec::new();
+        for (index, (_, index_record)) in index_records.iter().enumerate() {
+            if index_record.definition.table == *name {
+                indexes.push((
+                    index_column_positions(&record.schema, &index_record.definition)?,
+                    index,
+                ));
+            }
+        }
+        validate_table_tree(pager, record, &indexes, &mut expected_entry_counts)?;
     }
-    for (_, record) in &index_records {
-        validate_index_tree(pager, record, &table_records)?;
+    for ((_, record), expected_entry_count) in index_records.iter().zip(expected_entry_counts) {
+        validate_index_tree(pager, record, &table_records, expected_entry_count)?;
     }
 
     let mut tables = NameMap::new();
@@ -1678,9 +1690,13 @@ fn validate_index_against_catalog(
     Ok(())
 }
 
+/// Validates every row of a table, and counts the rows that should have an entry in each index
+/// on it: in `expected_entry_counts`, at the place given with the positions of its columns.
 fn validate_table_tree<D: PageDevice>(
     pager: &mut Pager<D>,
     record: &CatalogTableRecord,
+    indexes: &[(Vec<usize>, usize)],
+    expected_entry_counts: &mut [u64],
 ) -> Result<()> {
     let Some(root) = record.root_page_id else {
         return if record.row_count == 0 {
@@ -1697,6 +1713,14 @@ fn validate_table_tree<D: PageDevice>(
     let mut cursor = Btree::validating_cursor(pager, root, record.tree_id)?;
     while let Some((key, value)) = cursor.next_entry(pager)? {
         validated_row(&record.schema, &layout, key, &value)?;
+        if !indexes.is_empty() {
+            let row = StoredRecord::new(&record.schema, &layout, key, &value)?;
+            for (positions, index) in indexes {
+                if has_index_entry(&row, positions)? {
+                    expected_entry_counts[*index] += 1;
+                }
+            }
+        }
         count = count
             .checked_add(1)
             .ok_or_else(|| storage_corrupt("A table row count overflowed"))?;
@@ -1710,10 +1734,22 @@ fn validate_table_tree<D: PageDevice>(
     Ok(())
 }
 
+/// Whether a stored row has an entry in the index on the columns at `positions`, as
+/// [`encode_record_index_entry`] finds: whether none of them is NULL.
+fn has_index_entry(row: &StoredRecord<'_>, positions: &[usize]) -> Result<bool> {
+    for position in positions {
+        if row.column(*position)?.is_null() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn validate_index_tree<D: PageDevice>(
     pager: &mut Pager<D>,
     record: &CatalogIndexRecord,
     tables: &[(String, CatalogTableRecord)],
+    expected_entry_count: u64,
 ) -> Result<()> {
     let table = catalog_table(tables, &record.definition.table).ok_or_else(|| {
         storage_corrupt(format!(
@@ -1721,7 +1757,6 @@ fn validate_index_tree<D: PageDevice>(
             record.definition.name, record.definition.table
         ))
     })?;
-    let expected_entry_count = expected_index_entry_count(pager, table, &record.definition)?;
     if record.entry_count != expected_entry_count {
         return Err(storage_corrupt(format!(
             "Index `{}` catalog count {} does not match its {expected_entry_count} eligible table rows",
@@ -1729,7 +1764,14 @@ fn validate_index_tree<D: PageDevice>(
         )));
     }
     let Some(root) = record.root_page_id else {
-        return Ok(());
+        return if record.entry_count == 0 {
+            Ok(())
+        } else {
+            Err(storage_corrupt(format!(
+                "Index `{}` claims {} entries without a tree root",
+                record.definition.name, record.entry_count
+            )))
+        };
     };
     let table_root = table.root_page_id.ok_or_else(|| {
         storage_corrupt(format!(
@@ -1793,46 +1835,6 @@ fn validate_index_tree<D: PageDevice>(
         )));
     }
     Ok(())
-}
-
-fn expected_index_entry_count<D: PageDevice>(
-    pager: &mut Pager<D>,
-    table: &CatalogTableRecord,
-    definition: &IndexDefinition,
-) -> Result<u64> {
-    let Some(root) = table.root_page_id else {
-        return Ok(0);
-    };
-    // Catalog opening has already validated every table row and its declared count.
-    // A unique index without nullable columns must contain one entry per row.
-    // Its entry validation also rejects duplicate prefixes and checks every key
-    // against its row, proving complete coverage without scanning the table again.
-    // Retain the scan for indexes without uniqueness: counts alone do not prove
-    // coverage if a corrupt tree contains duplicate entries across leaves.
-    if definition.unique
-        && definition.columns.iter().all(|name| {
-            table
-                .schema
-                .columns
-                .iter()
-                .any(|column| column.name == *name && !column.nullable)
-        })
-    {
-        return Ok(table.row_count);
-    }
-    let layout = RecordLayout::new(&table.schema)?;
-    let positions = index_column_positions(&table.schema, definition)?;
-    let mut count = 0_u64;
-    let mut cursor = Btree::cursor(pager, root, table.tree_id)?;
-    while let Some((key, value)) = cursor.next_entry(pager)? {
-        let row = StoredRecord::new(&table.schema, &layout, key, &value)?;
-        if encode_record_index_entry(&positions, &row)?.is_some() {
-            count = count
-                .checked_add(1)
-                .ok_or_else(|| storage_corrupt("An expected index entry count overflowed"))?;
-        }
-    }
-    Ok(count)
 }
 
 /// Decodes a stored row, rejecting any encoding this engine would not have written and any row
@@ -2233,7 +2235,9 @@ mod tests {
             hash: crate::hash::EMPTY_HASH,
         };
         assert_eq!(
-            validate_table_tree(&mut pager, &table).unwrap_err().code,
+            validate_table_tree(&mut pager, &table, &[], &mut [])
+                .unwrap_err()
+                .code,
             "STORAGE_CORRUPT"
         );
 
@@ -2249,7 +2253,7 @@ mod tests {
             entry_count: 1,
         };
         assert_eq!(
-            validate_index_tree(&mut pager, &index, &[])
+            validate_index_tree(&mut pager, &index, &[("missing_rows".to_owned(), table)], 1)
                 .unwrap_err()
                 .code,
             "STORAGE_CORRUPT"
