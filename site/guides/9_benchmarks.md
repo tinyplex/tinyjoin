@@ -80,9 +80,8 @@ where engines that tie share a place:
 
 {{benchmarks.placings}}
 
-The rest is slower, but no longer by orders of magnitude: in v0.3.0, most
-workloads took 10 to 1,400 times as long as the fastest engine, and none now
-takes as much as twice as long. The remaining gaps point at the work ahead.
+Where it comes second, it takes at most 1.5 times as long as the faster
+engine.
 
 - **Single statements** cost about 30 to 36 microseconds each, which is 1.0
   to 1.5 times SQLite's cost for a point read, or an update, upsert, or delete
