@@ -22,17 +22,23 @@ workload's bars are as legible as a slow one's. A bar's length and value are
 the median of an engine's runs, and a faint bracket at its end spans that
 engine's fastest run to its slowest.
 
-## Download and startup
+## Download
 
-{{benchmarks.startup}}
+{{benchmarks.download}}
 
 Download size counts every file a page fetched to open a database: JavaScript
 for the page and the Worker, WebAssembly, and PGlite's file system image. It is
 shown uncompressed, compressed with gzip at level 9, and compressed with Brotli
-at quality 11, since servers send either. First open starts before the engine
-is fetched and ends when the first query on a new, empty database returns.
-Reopen runs in a new browser session with a warm HTTP cache: it loads the engine
-again, opens an existing database, and counts its rows.
+at quality 11, since servers send either.
+
+## Startup
+
+{{benchmarks.startup}}
+
+First open starts before the engine is fetched and ends when the first query on
+a new, empty database returns. Reopen runs in a new browser session with a warm
+HTTP cache: it loads the engine again, opens an existing database, and counts
+its rows.
 
 Every sample starts in a new browser profile, so each engine's WebAssembly is
 compiled afresh, one function at a time as each is first called. As it does in
@@ -116,7 +122,11 @@ costs. Reopening a database does not apply.
 
 {{benchmarks.memory-environment}}
 
-## Download and startup in memory
+## Download in memory
+
+{{benchmarks.memory-download}}
+
+## Startup in memory
 
 {{benchmarks.memory-startup}}
 

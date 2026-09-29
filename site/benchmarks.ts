@@ -150,13 +150,6 @@ const groupIds = (report: Report, group: string): string[] =>
     .filter((workload) => workload.group.toLowerCase() == group)
     .map(({id}) => id);
 
-// One chart per workload group. Download size leads the startup group, since
-// it is fetched before either startup time is measured.
-const getCharts = (report: Report, group: string): Chart[] => [
-  ...(group == 'startup' ? [downloadChart(report)] : []),
-  timeChart(report, groupIds(report, group)),
-];
-
 // Each engine's bar length for a measure: a timed-out engine's reaches the
 // time limit, and one that did not complete has none.
 const lengths = (report: Report, {values, timedOut}: Measure) =>
@@ -190,7 +183,7 @@ const fraction = (value: number): string => value.toFixed(4);
 // the full width, so a quick workload's bars are as legible as a slow one's.
 // Each bar is named, carries its value inside it where the value fits, and ends
 // in a faint bracket from its engine's fastest run to its slowest.
-const chartHtml = (report: Report, chart: Chart, legend: boolean): string => {
+const chartHtml = (report: Report, chart: Chart): string => {
   const format = chart.unit == 'ms' ? formatMs : formatBytes;
   const measures = chart.measures.map((measure) => {
     const {label, values, ranges, timedOut, missing, titles} = measure;
@@ -237,18 +230,13 @@ const chartHtml = (report: Report, chart: Chart, legend: boolean): string => {
     });
     return `<dt>${escapeHtml(label)}</dt><dd>${bars.join('')}</dd>`;
   });
-  const keys = ENGINES.map(
-    ([engine, name]) => `<span class="key ${engine}">${name}</span>`,
-  ).join('');
   const note =
     chart.unit == 'ms'
       ? `Median of ${report.samples} runs, fastest first. ` +
         'Brackets span the fastest to the slowest run.'
       : 'Bytes fetched to open a database, smallest first.';
   return (
-    '<figure class="chart"><figcaption>' +
-    (legend ? `<span class="legend">${keys}</span>` : '') +
-    `<span class="note">${note}</span></figcaption>` +
+    `<figure class="chart"><figcaption>${note}</figcaption>` +
     `<dl>${measures.join('')}</dl></figure>`
   );
 };
@@ -376,17 +364,21 @@ const createBenchmarks = (reports: {
   opfs: Report;
   memory: Report;
 }): Benchmarks => {
-  // Each report's charts, by group, and by memory- and the group for the
-  // in-memory results.
-  const charts = new Map<string, [Report, Chart[]]>();
+  // Each report's charts: its download sizes, and one for each workload group,
+  // named by the group, and by memory- and the group for the in-memory results.
+  const charts = new Map<string, [Report, Chart]>();
   for (const [prefix, report] of [
     ['', reports.opfs],
     [MEMORY, reports.memory],
   ] as const) {
+    charts.set(prefix + 'download', [report, downloadChart(report)]);
     for (const group of new Set(
       report.results.map(({group}) => group.toLowerCase()),
     )) {
-      charts.set(prefix + group, [report, getCharts(report, group)]);
+      charts.set(prefix + group, [
+        report,
+        timeChart(report, groupIds(report, group)),
+      ]);
     }
   }
   return {
@@ -397,23 +389,18 @@ const createBenchmarks = (reports: {
     renderTables: (markdown) =>
       markdown.replaceAll(
         PLACEHOLDER,
-        (placeholder, name) =>
-          charts.get(name)?.[1].map(chartMarkdown).join('\n\n') ??
-          placeholder,
+        (placeholder, name) => {
+          const chart = charts.get(name)?.[1];
+          return chart ? chartMarkdown(chart) : placeholder;
+        },
       ),
-    chartReplacers: [...charts].map(([name, [report, list]]) => [
+    chartReplacers: [...charts].map(([name, [report, chart]]) => [
       new RegExp(`<p>\\{\\{benchmarks\\.${name}\\}\\}</p>`, 'g'),
-      // A replacement string, in which $ would otherwise be special. Every bar
-      // is named, so only the page's first chart, startup, has a legend.
-      (
-        '<div class="charts">' +
-        list
-          .map((chart, index) =>
-            chartHtml(report, chart, name == 'startup' && index == 0),
-          )
-          .join('') +
-        '</div>'
-      ).replaceAll('$', '$$$$'),
+      // A replacement string, in which $ would otherwise be special.
+      `<div class="charts">${chartHtml(report, chart)}</div>`.replaceAll(
+        '$',
+        '$$$$',
+      ),
     ]),
   };
 };

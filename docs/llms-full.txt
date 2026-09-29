@@ -1782,7 +1782,7 @@ workload's bars are as legible as a slow one's. A bar's length and value are
 the median of an engine's runs, and a faint bracket at its end spans that
 engine's fastest run to its slowest.
 
-## Download and startup
+## Download
 
 | Size | TinyJoin | SQLite | PGlite |
 | --- | ---: | ---: | ---: |
@@ -1790,18 +1790,22 @@ engine's fastest run to its slowest.
 | Download (gzip) | **302 KiB** | 457 KiB | 5.6 MiB |
 | Download (Brotli) | **245 KiB** | 395 KiB | 3.8 MiB |
 
+Download size counts every file a page fetched to open a database: JavaScript
+for the page and the Worker, WebAssembly, and PGlite's file system image. It is
+shown uncompressed, compressed with gzip at level 9, and compressed with Brotli
+at quality 11, since servers send either.
+
+## Startup
+
 | Median time | TinyJoin | SQLite | PGlite |
 | --- | ---: | ---: | ---: |
 | Load, create an empty database, and read from it | **52.9 ms** | 89.7 ms | 1.12 s |
 | Reopen a 10,000-row database in a new session and count it | **22.3 ms** | 39.2 ms | 218 ms |
 
-Download size counts every file a page fetched to open a database: JavaScript
-for the page and the Worker, WebAssembly, and PGlite's file system image. It is
-shown uncompressed, compressed with gzip at level 9, and compressed with Brotli
-at quality 11, since servers send either. First open starts before the engine
-is fetched and ends when the first query on a new, empty database returns.
-Reopen runs in a new browser session with a warm HTTP cache: it loads the engine
-again, opens an existing database, and counts its rows.
+First open starts before the engine is fetched and ends when the first query on
+a new, empty database returns. Reopen runs in a new browser session with a warm
+HTTP cache: it loads the engine again, opens an existing database, and counts
+its rows.
 
 Every sample starts in a new browser profile, so each engine's WebAssembly is
 compiled afresh, one function at a time as each is first called. As it does in
@@ -1912,13 +1916,15 @@ costs. Reopening a database does not apply.
 
 Measured on 2026-09-29 with headless Chromium 153.0.8010.12 on macOS (25.5.0), Apple M2, 8 logical CPUs, 16 GiB RAM. Each time is the median of 9 samples.
 
-## Download and startup in memory
+## Download in memory
 
 | Size | TinyJoin | SQLite | PGlite |
 | --- | ---: | ---: | ---: |
 | Download (uncompressed) | **730 KiB** | 1.0 MiB | 16.6 MiB |
 | Download (gzip) | **299 KiB** | 457 KiB | 5.6 MiB |
 | Download (Brotli) | **243 KiB** | 395 KiB | 3.8 MiB |
+
+## Startup in memory
 
 | Median time | TinyJoin | SQLite | PGlite |
 | --- | ---: | ---: | ---: |
