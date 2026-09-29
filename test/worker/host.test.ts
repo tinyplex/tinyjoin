@@ -135,6 +135,7 @@ function mockEngine() {
     }),
     inTransaction: vi.fn(() => transactionActive),
     revision: vi.fn(() => revision),
+    check: vi.fn(),
     close: vi.fn(),
   };
   return engine;
@@ -731,6 +732,43 @@ describe('startWorker', () => {
     expect(engine.executeSql).not.toHaveBeenCalled();
     expect(engine.rollbackTransaction).toHaveBeenCalledOnce();
     expect(scope.posted.some((message) => 'event' in message)).toBe(false);
+  });
+
+  it('checks the database only outside a transaction', async () => {
+    const scope = new FakeScope();
+    const engine = mockEngine();
+    startWorker({scope, durableEngineFactory: async () => engine});
+    for (const [id, method] of [
+      [1, 'init'],
+      [2, 'check'],
+      [3, 'beginTransaction'],
+      [4, 'check'],
+    ] as const) {
+      scope.send({
+        v: PROTOCOL_VERSION,
+        id,
+        method,
+        params: method === 'init' ? {storage: {kind: 'memory'}} : undefined,
+      } as WorkerRequest);
+    }
+    await waitForPosted(scope, 4);
+
+    expect(scope.posted).toContainEqual({
+      v: PROTOCOL_VERSION,
+      id: 2,
+      ok: true,
+      result: undefined,
+    });
+    expect(scope.posted).toContainEqual({
+      v: PROTOCOL_VERSION,
+      id: 4,
+      ok: false,
+      error: {
+        code: 'TRANSACTION_ACTIVE',
+        message: 'A TinyJoin transaction is already active',
+      },
+    });
+    expect(engine.check).toHaveBeenCalledOnce();
   });
 
   it('keeps the transaction token active when rollback fails so cleanup can retry', async () => {

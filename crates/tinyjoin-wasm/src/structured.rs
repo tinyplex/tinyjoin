@@ -15,6 +15,7 @@ pub(crate) const OP_ROLLBACK: u32 = 8;
 pub(crate) const OP_IN_TRANSACTION: u32 = 9;
 pub(crate) const OP_REVISION: u32 = 10;
 pub(crate) const OP_CLOSE: u32 = 11;
+pub(crate) const OP_CHECK: u32 = 12;
 
 const SUCCESS: u32 = 0;
 const FAILURE: u32 = 1;
@@ -610,8 +611,9 @@ mod tests {
                 OP_IN_TRANSACTION,
                 OP_REVISION,
                 OP_CLOSE,
+                OP_CHECK,
             ],
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         );
     }
 

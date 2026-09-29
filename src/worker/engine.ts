@@ -28,6 +28,7 @@ export interface WorkerEngine {
   rollbackTransaction(): void;
   inTransaction(): boolean;
   revision(): number;
+  check(): void;
   close(): void;
 }
 

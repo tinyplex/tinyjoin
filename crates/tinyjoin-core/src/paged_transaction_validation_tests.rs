@@ -258,6 +258,7 @@ fn staged_totals_match_full_validation_for_unique_and_mixed_statements() {
         .unwrap();
     storage.commit_transaction(&fast).unwrap();
     let reopened = PagedStorage::open(storage.into_device()).unwrap();
+    reopened.check().unwrap();
     assert_eq!(reopened.scan_table("items").unwrap(), expected);
 }
 
@@ -349,6 +350,7 @@ fn transaction_script_savepoints_restore_staged_rows_and_claims() {
         .unwrap();
     engine.commit_transaction().unwrap();
     let reopened = PagedEngine::open(engine.into_device()).unwrap();
+    reopened.check().unwrap();
     assert_eq!(
         reopened
             .query_sql("SELECT id, email FROM items ORDER BY id", &[])

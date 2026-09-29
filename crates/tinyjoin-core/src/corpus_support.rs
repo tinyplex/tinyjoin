@@ -129,6 +129,12 @@ fn replay_with(
             error_code: None,
         });
     }
+    if let Err(error) = reopened.check() {
+        return Err(Failure {
+            invariant: "check_after_reopen",
+            error_code: Some(error.code),
+        });
+    }
     Ok(outcomes)
 }
 

@@ -55,6 +55,14 @@ neighboring value. In v0.3.0 and earlier, a row holding one could then not be
 read at all: reading it failed with `PAGED_STORAGE_CORRUPT`, because the row
 no longer matched its stored text.
 
+**Opening a database checks its catalog, not every row.** Earlier releases
+read every row and index entry when opening a database, so opening took time
+in proportion to its size, and refused a database that failed. Each page is
+still checked when it is read, and the new check() reads the whole database on
+demand, rejecting with the first problem it finds. A database whose damage no
+statement reads now opens, and only check() reports it. See
+[checking a database](/guides/storage-and-lifecycle/#checking-a-database).
+
 This release is also much faster. In the
 [comparative benchmarks](/guides/benchmarks/), most workloads in v0.3.0 took 10
 to 1,400 times as long as the faster of SQLite and PGlite. None now takes as
@@ -154,6 +162,10 @@ building indexes, and committing a single insert are quicker than in either.
   grows much more slowly with the size of the database: committing single
   inserts into a 100,000-row table takes under half the engine's time it
   did.
+- Opening a database reads its catalog rather than every row and index entry,
+  so it no longer slows down as the database grows. Reopening the benchmark's
+  10,000-row database takes about half as long, and a 100,000-row database
+  with one index opens in 2 ms of the engine's time rather than 270.
 - Several of the engine's small collections are kept in vectors rather than
   B-tree maps, whose code is compiled anew for each type they hold, which took
   about 15 KiB off the compressed engine. Its hash maps and sets share one

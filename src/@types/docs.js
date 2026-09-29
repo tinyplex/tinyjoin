@@ -640,6 +640,26 @@
   /// Client.getRevision
 
   /**
+   * The check method reads every row and index entry of the committed
+   * database, and every page that holds them, and resolves when all of them
+   * are sound.
+   *
+   * Opening a database checks only its catalog, and each page and row is
+   * checked as a statement reads it, so rows that are never read, and whether
+   * each index still matches its table, are checked only here. The check takes
+   * time in proportion to the database, and statements from every Client of
+   * the same OPFS name wait while it runs. Call it outside a transaction.
+   *
+   * TinyJoin cannot yet repair a database that fails its check.
+   * @returns A Promise that resolves when the database is sound, or rejects
+   * with a ClientError whose code names the first problem found, such as
+   * `STORAGE_CORRUPT`.
+   * @category Lifecycle
+   * @since v0.4.0
+   */
+  /// Client.check
+
+  /**
    * The close method detaches this Client and releases its prepared statements
    * and Worker. Other Clients for the same OPFS name stay connected; ownership
    * transfers automatically when necessary.

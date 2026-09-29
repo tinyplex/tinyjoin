@@ -227,7 +227,8 @@ a request, not a guarantee, and TinyJoin does not make that product decision
 during startup.
 
 Treat a TinyJoin database as reconstructable local state. Data that has to
-survive needs a copy the application controls.
+survive needs a copy the application controls. TinyJoin can check a whole
+database with check(), but cannot yet repair one that fails.
 
 A storage or commit-result failure can leave a write's outcome uncertain.
 `RECOVERY_REQUIRED`, `STORAGE_COMMIT_OUTCOME_UNKNOWN`, and
@@ -1032,6 +1033,35 @@ snapshot API. Plan bounded batches and a stable maintenance window for larger
 datasets. Restore schema DDL before the data transaction, including your known
 indexes. If restoring fails, preserve the export and follow the uncertain-write
 recovery rules below before retrying.
+
+## Checking a database
+
+Every page carries a checksum, which TinyJoin verifies when it reads the page,
+and a statement rejects a row it cannot read. A crash or an interrupted write
+therefore surfaces as an error rather than as wrong results, and reopening
+returns to the last complete commit. Opening a database checks its catalog but
+not every row, so a large database opens as quickly as a small one.
+
+Damage that no statement happens to read, such as a row that is never queried
+or an index that no longer matches its table, shows only in a check of the
+whole database. check() reads every row and index entry, and every page that
+holds them, and rejects with the first problem it finds:
+
+```ts
+try {
+  await db.check();
+} catch (error) {
+  // error.code names the first problem, such as STORAGE_CORRUPT.
+}
+```
+
+Such damage would come from a defect in TinyJoin or from other code rewriting
+the database file, not from an interrupted write. A check takes time in
+proportion to the database, and statements from every Client of the same OPFS
+name wait while it runs, so run it while the application is idle, or in tests.
+
+TinyJoin cannot yet repair a database that fails its check. Restore the
+application's own backup, as described above, into a new OPFS name.
 
 ## Resetting and removing obsolete databases
 
@@ -2253,6 +2283,9 @@ do not assume a subscription contains changed rows.
 - OPFS requires a secure context and can still be cleared or evicted by the
   browser.
 - Call db.close() on teardown so storage locks and the Worker are released.
+- Opening checks only the catalog; db.check() reads every row and index entry
+  and rejects with the first problem found. Nothing repairs a failed check:
+  restore an application backup into a new OPFS name.
 - After `RECOVERY_REQUIRED`, `STORAGE_COMMIT_OUTCOME_UNKNOWN`, or
   `STORAGE_ENGINE_POISONED`, stop work, close and reopen the same OPFS name,
   and reconcile stable operation identifiers before replay. `retryable` is
@@ -2373,6 +2406,14 @@ neighboring value. In v0.3.0 and earlier, a row holding one could then not be
 read at all: reading it failed with `PAGED_STORAGE_CORRUPT`, because the row
 no longer matched its stored text.
 
+**Opening a database checks its catalog, not every row.** Earlier releases
+read every row and index entry when opening a database, so opening took time
+in proportion to its size, and refused a database that failed. Each page is
+still checked when it is read, and the new check() reads the whole database on
+demand, rejecting with the first problem it finds. A database whose damage no
+statement reads now opens, and only check() reports it. See
+[checking a database](https://tinyjoin.org/guides/storage-and-lifecycle/#checking-a-database).
+
 This release is also much faster. In the
 [comparative benchmarks](https://tinyjoin.org/guides/benchmarks/), most workloads in v0.3.0 took 10
 to 1,400 times as long as the faster of SQLite and PGlite. None now takes as
@@ -2472,6 +2513,10 @@ building indexes, and committing a single insert are quicker than in either.
   grows much more slowly with the size of the database: committing single
   inserts into a 100,000-row table takes under half the engine's time it
   did.
+- Opening a database reads its catalog rather than every row and index entry,
+  so it no longer slows down as the database grows. Reopening the benchmark's
+  10,000-row database takes about half as long, and a 100,000-row database
+  with one index opens in 2 ms of the engine's time rather than 270.
 - Several of the engine's small collections are kept in vectors rather than
   B-tree maps, whose code is compiled anew for each type they hold, which took
   about 15 KiB off the compressed engine. Its hash maps and sets share one
@@ -3400,6 +3445,26 @@ export class Client {
    * @since v0.0.5
    */
   getRevision(): number;
+
+  /**
+   * The check method reads every row and index entry of the committed
+   * database, and every page that holds them, and resolves when all of them
+   * are sound.
+   *
+   * Opening a database checks only its catalog, and each page and row is
+   * checked as a statement reads it, so rows that are never read, and whether
+   * each index still matches its table, are checked only here. The check takes
+   * time in proportion to the database, and statements from every Client of
+   * the same OPFS name wait while it runs. Call it outside a transaction.
+   *
+   * TinyJoin cannot yet repair a database that fails its check.
+   * @returns A Promise that resolves when the database is sound, or rejects
+   * with a ClientError whose code names the first problem found, such as
+   * `STORAGE_CORRUPT`.
+   * @category Lifecycle
+   * @since v0.4.0
+   */
+  check(): Promise<void>;
 
   /**
    * The close method detaches this Client and releases its prepared statements

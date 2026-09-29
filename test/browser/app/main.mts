@@ -538,6 +538,7 @@ async function persistenceProbe(
   databaseName: string,
   rowCount: number,
 ): Promise<{
+  checkMs: number;
   crashReopenMs: number;
   differentNameOpened: boolean;
   emptyTableRows: number;
@@ -616,8 +617,13 @@ async function persistenceProbe(
       id: number;
       title: string;
     }>('SELECT id, title FROM posts WHERE id = $1', [0]);
+    // Every row and index entry the recovered database holds must pass.
+    const checkStartedAt = performance.now();
+    await afterCrash.client.check();
+    const checkMs = performance.now() - checkStartedAt;
 
     const report = {
+      checkMs,
       crashReopenMs,
       differentNameOpened: true,
       emptyTableRows: empty.rows.length,
@@ -650,6 +656,7 @@ async function createPersistenceTables(database: Client): Promise<void> {
       published BOOLEAN NOT NULL,
       body TEXT NOT NULL
     );
+    CREATE INDEX posts_author ON posts (author);
     CREATE TABLE empty_table (
       id INTEGER PRIMARY KEY
     );

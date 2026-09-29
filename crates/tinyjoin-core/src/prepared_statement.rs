@@ -690,6 +690,7 @@ mod tests {
             }
         }
         let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        reopened.check().unwrap();
         assert_eq!(
             reopened
                 .query_sql("SELECT id, title FROM tasks ORDER BY id", &[])

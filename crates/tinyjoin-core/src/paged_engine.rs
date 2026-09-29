@@ -188,6 +188,15 @@ impl<D: PageDevice> PagedEngine<D> {
         self.storage.revision()
     }
 
+    /// Checks every row and index entry of the committed database, and every page holding them,
+    /// returning the first problem found.
+    ///
+    /// Opening a database checks only its catalog, and every page and row is checked as it is
+    /// read, so this is the one check of the whole database. It reads all of it.
+    pub fn check(&self) -> Result<()> {
+        self.storage.check()
+    }
+
     #[doc(hidden)]
     pub fn ensure_readiness(&self) -> Result<()> {
         self.storage.ensure_readiness()
@@ -603,6 +612,7 @@ mod tests {
         ]);
         let published = engine.database_hash();
         let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        reopened.check().unwrap();
         assert_eq!(reopened.database_hash(), published);
     }
 
@@ -670,6 +680,7 @@ mod tests {
 
         let revision = actual.revision();
         let mut reopened = PagedEngine::open(actual.into_device()).unwrap();
+        reopened.check().unwrap();
         assert_eq!(reopened.revision(), revision);
         assert_eq!(
             reopened
@@ -890,6 +901,7 @@ mod tests {
         );
 
         let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        reopened.check().unwrap();
         assert_eq!(reopened.revision(), revision + 1);
         assert_eq!(
             reopened
@@ -931,6 +943,7 @@ mod tests {
         );
 
         let reopened = PagedEngine::open(actual.into_device()).unwrap();
+        reopened.check().unwrap();
         assert_eq!(
             reopened
                 .query_sql("SELECT id, title FROM tasks ORDER BY id", &[])
@@ -981,6 +994,7 @@ mod tests {
         assert_eq!(actual.revision(), revision);
 
         let reopened = PagedEngine::open(actual.into_device()).unwrap();
+        reopened.check().unwrap();
         assert_eq!(reopened.revision(), revision);
         assert_eq!(
             reopened
@@ -1045,6 +1059,7 @@ mod tests {
         assert_eq!(actual.revision(), revision);
 
         let reopened = PagedEngine::open(actual.into_device()).unwrap();
+        reopened.check().unwrap();
         assert_eq!(reopened.revision(), revision);
         assert_eq!(
             reopened
@@ -1124,6 +1139,7 @@ mod tests {
             .unwrap();
 
         let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        reopened.check().unwrap();
         assert_eq!(
             reopened
                 .query_sql(
@@ -1224,6 +1240,7 @@ mod tests {
             .unwrap();
 
         let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        reopened.check().unwrap();
         assert_eq!(ids(&reopened, ranged), in_range);
         assert_eq!(ids(&reopened, equal), labelled);
     }
@@ -1263,6 +1280,7 @@ mod tests {
 
         let revision = actual.revision();
         let mut reopened = PagedEngine::open(actual.into_device()).unwrap();
+        reopened.check().unwrap();
         assert_eq!(reopened.revision(), revision);
         assert_eq!(
             reopened
@@ -1342,6 +1360,7 @@ mod tests {
         assert!(!actual.in_transaction());
 
         let reopened = PagedEngine::open(actual.into_device()).unwrap();
+        reopened.check().unwrap();
         assert_eq!(reopened.revision(), base_revision + 1);
         assert_eq!(
             reopened
@@ -1530,6 +1549,7 @@ mod tests {
         assert_eq!(outcome.revision, revision + 1);
         assert!(!engine.in_transaction());
         let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        reopened.check().unwrap();
         assert_eq!(reopened.revision(), revision + 1);
         assert_eq!(
             reopened
@@ -1653,6 +1673,7 @@ mod tests {
         check(&engine);
         // Reopening checks that every stored JSON value is canonical.
         let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        reopened.check().unwrap();
         check(&reopened);
     }
 
@@ -1711,6 +1732,7 @@ mod tests {
         engine.commit_transaction().unwrap();
 
         let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        reopened.check().unwrap();
         assert_eq!(
             reopened
                 .query_sql("SELECT label FROM float_keys ORDER BY label", &[])
@@ -1801,6 +1823,7 @@ mod tests {
         assert_eq!(committed.tables, vec!["aliases"]);
 
         let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        reopened.check().unwrap();
         assert_eq!(
             reopened
                 .query_sql("SELECT id, label FROM aliases ORDER BY id", &[])
@@ -1866,6 +1889,7 @@ mod tests {
         engine.commit_transaction().unwrap();
 
         let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        reopened.check().unwrap();
         assert_eq!(
             reopened
                 .query_sql("SELECT id, label FROM float_updates ORDER BY id", &[])
@@ -1919,6 +1943,7 @@ mod tests {
         assert_eq!(engine.revision(), 1);
 
         let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        reopened.check().unwrap();
         assert_eq!(reopened.revision(), 1);
         assert_eq!(
             reopened
@@ -1971,6 +1996,7 @@ mod tests {
         );
 
         let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        reopened.check().unwrap();
         assert_eq!(reopened.revision(), revision);
         assert_eq!(
             reopened
@@ -2047,6 +2073,7 @@ mod tests {
         assert_eq!(outcome.revision, revision + 1);
 
         let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        reopened.check().unwrap();
         assert_eq!(
             reopened
                 .query_sql("SELECT id FROM accounts ORDER BY id", &[])
@@ -2098,6 +2125,7 @@ mod tests {
             vec![row(json!({"marker": 0}))]
         );
         let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        reopened.check().unwrap();
         assert_eq!(reopened.revision(), revision);
         assert_eq!(
             reopened
@@ -2195,6 +2223,7 @@ mod tests {
             vec![row(json!({"changed": false}))]
         );
         let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        reopened.check().unwrap();
         assert_eq!(reopened.revision(), revision);
         assert_eq!(
             reopened
@@ -2433,6 +2462,7 @@ mod tests {
                     engine.commit_transaction().unwrap();
                 }
                 let reopened = PagedEngine::open(engine.into_device()).unwrap();
+                reopened.check().unwrap();
                 assert_eq!(
                     reopened
                         .query_sql("SELECT * FROM items ORDER BY id", &[])

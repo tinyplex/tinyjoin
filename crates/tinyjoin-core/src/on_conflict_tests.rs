@@ -365,6 +365,7 @@ fn composite_targets_match_in_any_order_and_scripts_report_changed_keys() {
         ]
     );
     let reopened = PagedEngine::open(engine.into_device()).unwrap();
+    reopened.check().unwrap();
     assert_eq!(
         reopened
             .query_sql("SELECT weight FROM tags ORDER BY tag", &[])

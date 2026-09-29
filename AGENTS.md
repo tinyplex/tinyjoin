@@ -121,6 +121,9 @@ do not assume a subscription contains changed rows.
 - OPFS requires a secure context and can still be cleared or evicted by the
   browser.
 - Call db.close() on teardown so storage locks and the Worker are released.
+- Opening checks only the catalog; db.check() reads every row and index entry
+  and rejects with the first problem found. Nothing repairs a failed check:
+  restore an application backup into a new OPFS name.
 - After `RECOVERY_REQUIRED`, `STORAGE_COMMIT_OUTCOME_UNKNOWN`, or
   `STORAGE_ENGINE_POISONED`, stop work, close and reopen the same OPFS name,
   and reconcile stable operation identifiers before replay. `retryable` is

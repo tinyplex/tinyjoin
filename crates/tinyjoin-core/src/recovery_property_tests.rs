@@ -491,6 +491,9 @@ fn check_recovery(mode: Execution) {
                     );
                 }
                 assert_model(&recovered, &expected, &codes, &context);
+                recovered.check().unwrap_or_else(|error| {
+                    panic!("recovered database fails its check {context}: {error}")
+                });
                 // Confirm that recovery did not merely produce a readable but
                 // unusable tree/allocation state. Continue, commit, and reopen.
                 recovered
@@ -509,6 +512,9 @@ fn check_recovery(mode: Execution) {
                     &codes,
                     &format!("continuation: {context}"),
                 );
+                reopened.check().unwrap_or_else(|error| {
+                    panic!("continued database fails its check {context}: {error}")
+                });
             }
         }
     }

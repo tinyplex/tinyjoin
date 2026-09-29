@@ -284,8 +284,18 @@ const MAX_PAGED_BATCH_OPERATIONS: usize = 1_000_000;
 const MAX_PAGED_BATCH_BYTES: usize = 16 * 1024 * 1024;
 type LoadedCatalog = (TreeId, NameMap<PagedTable>, NameMap<PagedIndex>);
 
+/// A catalog's table and index records, each list in name order, as the catalog holds them.
+struct CatalogRecords {
+    next_tree_id: TreeId,
+    tables: Vec<(String, CatalogTableRecord)>,
+    indexes: Vec<(String, CatalogIndexRecord)>,
+}
+
 impl<D: PageDevice> PagedStorage<D> {
-    /// Opens and validates a previously published paged database.
+    /// Opens a previously published paged database, checking its catalog.
+    ///
+    /// Rows and index entries are checked as they are read, not all at once here, so that opening
+    /// takes the same time however large the database is; [`Self::check`] checks them all.
     pub(crate) fn open(device: D) -> Result<Self> {
         let mut pager = Pager::open_or_create(device)?;
         let revision = pager.database_revision();
@@ -309,8 +319,7 @@ impl<D: PageDevice> PagedStorage<D> {
             });
         };
 
-        let (next_tree_id, tables, indexes) =
-            load_and_validate_catalog(&mut pager, catalog_root_page_id)?;
+        let (next_tree_id, tables, indexes) = load_catalog(&mut pager, catalog_root_page_id)?;
         Ok(Self {
             pager: RefCell::new(pager),
             revision,
@@ -325,6 +334,21 @@ impl<D: PageDevice> PagedStorage<D> {
 
     pub(crate) fn into_device(self) -> D {
         self.pager.into_inner().into_device()
+    }
+
+    /// Checks every row and index entry of the committed database, and every page holding them.
+    ///
+    /// Each table's rows must decode and match its schema and row count, and each index must hold
+    /// exactly one matching entry for each row with no NULL in its columns, with no duplicate
+    /// values in a unique index. The first problem found is returned.
+    pub(crate) fn check(&self) -> Result<()> {
+        self.ensure_ready()?;
+        let mut pager = self.pager.borrow_mut();
+        let Some(catalog_root_page_id) = pager.catalog_root_page_id() else {
+            return Ok(());
+        };
+        let records = read_catalog_records(&mut pager, catalog_root_page_id)?;
+        check_catalog_contents(&mut pager, &records)
     }
 
     /// Calls `each` with every entry of an index tree whose leading component, of type `leading`,
@@ -1534,10 +1558,51 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
     }
 }
 
-fn load_and_validate_catalog<D: PageDevice>(
+/// Loads the catalog of a database being opened, checking its records against each other.
+fn load_catalog<D: PageDevice>(
     pager: &mut Pager<D>,
     catalog_root_page_id: PageId,
 ) -> Result<LoadedCatalog> {
+    let CatalogRecords {
+        next_tree_id,
+        tables: table_records,
+        indexes: index_records,
+    } = read_catalog_records(pager, catalog_root_page_id)?;
+    let mut tables = NameMap::new();
+    for (name, record) in table_records {
+        let row_count = usize::try_from(record.row_count)
+            .map_err(|_| storage_corrupt("A table row count cannot fit in memory"))?;
+        let table = PagedTable::new(
+            record.schema,
+            record.tree_id,
+            record.root_page_id,
+            row_count,
+            record.hash,
+        )?;
+        tables.insert(name, table);
+    }
+    let mut indexes = NameMap::new();
+    for (name, record) in index_records {
+        let entry_count = usize::try_from(record.entry_count)
+            .map_err(|_| storage_corrupt("An index entry count cannot fit in memory"))?;
+        let index = PagedIndex {
+            definition: record.definition,
+            tree_id: record.tree_id,
+            root_page_id: record.root_page_id,
+            entry_count,
+        };
+        indexes.insert(name, index);
+    }
+    Ok((next_tree_id, tables, indexes))
+}
+
+/// Reads every catalog record, and checks the records against each other: one header, whose
+/// counts match the records, unique tree IDs within its range, and each index on columns its table
+/// has.
+fn read_catalog_records<D: PageDevice>(
+    pager: &mut Pager<D>,
+    catalog_root_page_id: PageId,
+) -> Result<CatalogRecords> {
     let mut header = None;
     // Catalog keys arrive in order, so each list is in name order, and a name listed twice would
     // follow itself.
@@ -1599,13 +1664,24 @@ fn load_and_validate_catalog<D: PageDevice>(
     if tree_ids.len() != 1 + table_records.len() + index_records.len() {
         return Err(storage_corrupt("Catalog tree IDs are not unique"));
     }
+    Ok(CatalogRecords {
+        next_tree_id: header.next_tree_id,
+        tables: table_records,
+        indexes: index_records,
+    })
+}
 
+/// Checks every table's rows and every index's entries against the catalog records.
+fn check_catalog_contents<D: PageDevice>(
+    pager: &mut Pager<D>,
+    records: &CatalogRecords,
+) -> Result<()> {
     // Each table's rows are validated in one pass, which also counts, for each index on the
     // table, the rows that should have an entry in it.
-    let mut expected_entry_counts = vec![0; index_records.len()];
-    for (name, record) in &table_records {
+    let mut expected_entry_counts = vec![0; records.indexes.len()];
+    for (name, record) in &records.tables {
         let mut indexes = Vec::new();
-        for (index, (_, index_record)) in index_records.iter().enumerate() {
+        for (index, (_, index_record)) in records.indexes.iter().enumerate() {
             if index_record.definition.table == *name {
                 indexes.push((
                     index_column_positions(&record.schema, &index_record.definition)?,
@@ -1615,36 +1691,10 @@ fn load_and_validate_catalog<D: PageDevice>(
         }
         validate_table_tree(pager, record, &indexes, &mut expected_entry_counts)?;
     }
-    for ((_, record), expected_entry_count) in index_records.iter().zip(expected_entry_counts) {
-        validate_index_tree(pager, record, &table_records, expected_entry_count)?;
+    for ((_, record), expected_entry_count) in records.indexes.iter().zip(expected_entry_counts) {
+        validate_index_tree(pager, record, &records.tables, expected_entry_count)?;
     }
-
-    let mut tables = NameMap::new();
-    for (name, record) in table_records {
-        let row_count = usize::try_from(record.row_count)
-            .map_err(|_| storage_corrupt("A table row count cannot fit in memory"))?;
-        let table = PagedTable::new(
-            record.schema,
-            record.tree_id,
-            record.root_page_id,
-            row_count,
-            record.hash,
-        )?;
-        tables.insert(name, table);
-    }
-    let mut indexes = NameMap::new();
-    for (name, record) in index_records {
-        let entry_count = usize::try_from(record.entry_count)
-            .map_err(|_| storage_corrupt("An index entry count cannot fit in memory"))?;
-        let index = PagedIndex {
-            definition: record.definition,
-            tree_id: record.tree_id,
-            root_page_id: record.root_page_id,
-            entry_count,
-        };
-        indexes.insert(name, index);
-    }
-    Ok((header.next_tree_id, tables, indexes))
+    Ok(())
 }
 
 fn validate_catalog_tree_id(
@@ -2124,6 +2174,7 @@ mod tests {
         let revision = paged.revision();
         let device = paged.into_device();
         let reopened = PagedStorage::open(device).unwrap();
+        reopened.check().unwrap();
         assert_eq!(reopened.revision(), revision);
         assert_eq!(reopened.table_row_count("posts").unwrap(), 3);
         assert_eq!(
@@ -2294,6 +2345,7 @@ mod tests {
         execute_sql(&mut paged, "CREATE INDEX empty_label ON empty (label)", &[]).unwrap();
         assert_eq!(paged.table_row_count("empty").unwrap(), 0);
         let reopened = PagedStorage::open(paged.into_device()).unwrap();
+        reopened.check().unwrap();
         assert_eq!(reopened.scan_table("empty").unwrap(), Vec::<Row>::new());
         assert_eq!(
             reopened
@@ -2410,8 +2462,14 @@ mod tests {
         assert_eq!(error.code, "STORAGE_CORRUPT");
     }
 
+    /// Opens a database whose catalog is sound, and returns the problem its full check finds.
+    fn check_error(device: MemoryPageDevice) -> EngineError {
+        let storage = PagedStorage::open(device).unwrap();
+        storage.check().unwrap_err()
+    }
+
     #[test]
-    fn reopening_rejects_an_index_missing_eligible_table_rows() {
+    fn checking_rejects_an_index_missing_eligible_table_rows() {
         for index_name in ["posts_author", "posts_rank"] {
             let mut paged = page_native_fixture(MemoryPageDevice::new(0).unwrap()).unwrap();
             execute_sql(
@@ -2446,16 +2504,13 @@ mod tests {
                 .commit(revision, EMPTY_HASH, Some(catalog_root))
                 .unwrap();
 
-            let error = match PagedStorage::open(pager.into_device()) {
-                Ok(_) => panic!("an incomplete secondary index must fail closed"),
-                Err(error) => error,
-            };
+            let error = check_error(pager.into_device());
             assert_eq!(error.code, "STORAGE_CORRUPT");
         }
     }
 
     #[test]
-    fn reopening_validates_required_and_nullable_index_counts() {
+    fn checking_counts_required_and_nullable_index_entries() {
         let mut paged = PagedStorage::open(MemoryPageDevice::new(0).unwrap()).unwrap();
         for sql in [
             "CREATE TABLE items (id INTEGER PRIMARY KEY, category TEXT NOT NULL, rank INTEGER NOT NULL, label TEXT)",
@@ -2469,6 +2524,7 @@ mod tests {
         }
         let expected = paged.scan_table("items").unwrap();
         let reopened = PagedStorage::open(paged.into_device()).unwrap();
+        reopened.check().unwrap();
         assert_eq!(reopened.scan_table("items").unwrap(), expected);
         for (index, entry_count) in [
             ("items_category", 3),
@@ -2494,7 +2550,7 @@ mod tests {
     }
 
     #[test]
-    fn reopening_rejects_null_in_a_required_index_column() {
+    fn checking_rejects_null_in_a_required_index_column() {
         let mut paged = page_native_fixture(MemoryPageDevice::new(0).unwrap()).unwrap();
         execute_sql(
             &mut paged,
@@ -2539,15 +2595,12 @@ mod tests {
         transaction
             .commit(revision, EMPTY_HASH, Some(catalog_root))
             .unwrap();
-        let error = match PagedStorage::open(pager.into_device()) {
-            Ok(_) => panic!("required index columns must still reject stored NULLs"),
-            Err(error) => error,
-        };
+        let error = check_error(pager.into_device());
         assert_eq!(error.code, "STORAGE_CORRUPT");
     }
 
     #[test]
-    fn reopening_rejects_duplicate_required_unique_index_prefixes() {
+    fn checking_rejects_duplicate_required_unique_index_prefixes() {
         let paged = page_native_fixture(MemoryPageDevice::new(0).unwrap()).unwrap();
         // Both posts by author 1 have valid, distinct entry keys and the catalog
         // count is correct. Claiming uniqueness must still reject their shared prefix.
@@ -2576,15 +2629,12 @@ mod tests {
         transaction
             .commit(revision, EMPTY_HASH, Some(catalog_root))
             .unwrap();
-        let error = match PagedStorage::open(pager.into_device()) {
-            Ok(_) => panic!("the correct entry count must not hide duplicate unique values"),
-            Err(error) => error,
-        };
+        let error = check_error(pager.into_device());
         assert_eq!(error.code, "STORAGE_CORRUPT");
     }
 
     #[test]
-    fn reopening_rejects_a_required_index_entry_mismatching_its_row() {
+    fn checking_rejects_a_required_index_entry_mismatching_its_row() {
         let mut paged = page_native_fixture(MemoryPageDevice::new(0).unwrap()).unwrap();
         execute_sql(
             &mut paged,
@@ -2645,10 +2695,7 @@ mod tests {
         transaction
             .commit(revision, EMPTY_HASH, Some(catalog_root))
             .unwrap();
-        let error = match PagedStorage::open(pager.into_device()) {
-            Ok(_) => panic!("an index entry with the correct count must still match its row"),
-            Err(error) => error,
-        };
+        let error = check_error(pager.into_device());
         assert_eq!(error.code, "STORAGE_CORRUPT");
     }
 }

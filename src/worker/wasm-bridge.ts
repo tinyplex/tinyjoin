@@ -47,6 +47,7 @@ export const WASM_OPERATION = {
   inTransaction: 9,
   revision: 10,
   close: 11,
+  check: 12,
 } as const;
 
 const BRIDGE_VERSION = 4;
@@ -313,6 +314,11 @@ export const adaptStructuredWasmEngine = (
         false,
         decodeRevision,
       );
+    },
+
+    check: (): void => {
+      assertCallable();
+      invoke(WASM_OPERATION.check, EMPTY_REQUEST, false, decodeUnit);
     },
 
     close: (): void => {

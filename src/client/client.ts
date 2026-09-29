@@ -121,6 +121,7 @@ export interface Client {
     listener: (event: TablesChangedEvent) => void,
   ): () => void;
   getRevision(): number;
+  check(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -504,6 +505,8 @@ const createClient = (options: ClientOptions): Client => {
     },
 
     getRevision: (): number => revision,
+
+    check: (): Promise<void> => direct(() => rpc.request('check', undefined)),
 
     close: (): Promise<void> => {
       if (isUndefined(closePromise)) {

@@ -44,6 +44,7 @@ function engine(): WorkerEngine {
     rollbackTransaction: vi.fn(),
     inTransaction: vi.fn(() => false),
     revision: vi.fn(() => 0),
+    check: vi.fn(),
     close: vi.fn(),
   };
 }

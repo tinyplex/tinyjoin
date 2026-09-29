@@ -32,6 +32,7 @@ interface Window {
       databaseName: string,
       rowCount: number,
     ): Promise<{
+      checkMs: number;
       crashReopenMs: number;
       differentNameOpened: boolean;
       emptyTableRows: number;

@@ -140,6 +140,35 @@ datasets. Restore schema DDL before the data transaction, including your known
 indexes. If restoring fails, preserve the export and follow the uncertain-write
 recovery rules below before retrying.
 
+## Checking a database
+
+Every page carries a checksum, which TinyJoin verifies when it reads the page,
+and a statement rejects a row it cannot read. A crash or an interrupted write
+therefore surfaces as an error rather than as wrong results, and reopening
+returns to the last complete commit. Opening a database checks its catalog but
+not every row, so a large database opens as quickly as a small one.
+
+Damage that no statement happens to read, such as a row that is never queried
+or an index that no longer matches its table, shows only in a check of the
+whole database. check() reads every row and index entry, and every page that
+holds them, and rejects with the first problem it finds:
+
+```ts
+try {
+  await db.check();
+} catch (error) {
+  // error.code names the first problem, such as STORAGE_CORRUPT.
+}
+```
+
+Such damage would come from a defect in TinyJoin or from other code rewriting
+the database file, not from an interrupted write. A check takes time in
+proportion to the database, and statements from every Client of the same OPFS
+name wait while it runs, so run it while the application is idle, or in tests.
+
+TinyJoin cannot yet repair a database that fails its check. Restore the
+application's own backup, as described above, into a new OPFS name.
+
 ## Resetting and removing obsolete databases
 
 A logical reset can use `DELETE FROM notes` to empty a known table, or

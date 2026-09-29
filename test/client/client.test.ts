@@ -1126,6 +1126,39 @@ describe('Client', () => {
     await client.close();
   });
 
+  it('checks the database and reports the first problem found', async () => {
+    const worker = writableWorker();
+    const answer = worker.onPost!;
+    let checks = 0;
+    worker.onPost = (message) => {
+      if (message.method !== 'check') return answer(message);
+      queueMicrotask(() => {
+        checks += 1;
+        if (checks === 1) return respondOk(worker, message, undefined);
+        worker.respond({
+          v: PROTOCOL_VERSION,
+          id: message.id,
+          ok: false,
+          error: {code: 'STORAGE_CORRUPT', message: 'An index lost a row'},
+        });
+      });
+    };
+    const client = await create({worker});
+
+    await expect(client.check()).resolves.toBeUndefined();
+    await expect(client.check()).rejects.toMatchObject({
+      code: 'STORAGE_CORRUPT',
+      message: 'An index lost a row',
+    });
+    await client.transaction(async () => {
+      await expect(client.check()).rejects.toMatchObject({
+        code: 'TRANSACTION_ACTIVE',
+      });
+    });
+    expect(checks).toBe(2);
+    await client.close();
+  });
+
   it('makes concurrent close calls await the same worker cleanup', async () => {
     const worker = new FakeWorker();
     let closeRequest: Extract<WorkerRequest, {method: 'close'}> | undefined;

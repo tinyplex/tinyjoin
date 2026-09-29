@@ -864,7 +864,8 @@ rows, one non-unique index adds about a second to reopen.
 
   Expected (an estimate): roughly 10× on reopen with indexes.
 - **O3. Decide the guarantee ([D2](#decisions-needed)).** Complete validation
-  at open is documented in the v0.3.0 notes.
+  at open was documented in the v0.3.0 notes. Decided: the full check moved to
+  check(), and open reads only the catalog.
 - **O4. Start faster.**
   - Begin `WebAssembly.compileStreaming` when the Worker starts, overlapping
     lock and OPFS setup.
@@ -923,7 +924,7 @@ download, and the engine is only part of each statement's time in the browser.
 | | Decision | Recommendation |
 | --- | --- | --- |
 | D1 | Validate each record once, when its leaf is loaded or written, and never on every read? | Yes. Page format 3 is built around it, with the full reference validator kept in tests |
-| D2 | Should open keep checking every row and index entry, or accept fingerprints, lazy validation, or checking only trees changed since the last validated generation? | Keep it complete, but make it sequential (O2), and revisit if large databases still open slowly |
+| D2 | Should open keep checking every row and index entry, or accept fingerprints, lazy validation, or checking only trees changed since the last validated generation? | **Decided:** open checks only the catalog, and pages and rows are checked as they are read; the full check runs on demand, as check(), like SQLite's `integrity_check` and PostgreSQL's `amcheck`. Large databases opened slowly: 150 ms natively at 100,000 rows, 270 ms with one index. Nothing repairs a database that fails the check yet |
 | D3 | Join budgets count candidate comparisons, which index and hash joins mostly avoid. The documented limits and the guides' wording must change. | Count work actually done, and update the SQL compatibility and benchmarks guides |
 | D4 | Streaming in primary-key order relaxes the 100,000 ordered-row limit for those queries. | Accept, and document it |
 | D5 | Array transport needs a protocol version bump, which makes mixed-version tabs a `DATABASE_VERSION_MISMATCH`. Object keys would follow column order instead of today's alphabetical order. | **Decided:** accepted for v0.4.0, as protocol version 9, with object rows' keys in field order, as its release notes announce |

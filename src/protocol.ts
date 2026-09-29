@@ -153,6 +153,10 @@ export interface RpcMethods {
     request: {transactionId: string};
     response: undefined;
   };
+  check: {
+    request: undefined;
+    response: undefined;
+  };
   close: {
     request: undefined;
     response: undefined;
@@ -266,6 +270,7 @@ export const isWorkerRequest = (value: unknown): value is WorkerRequest => {
         isTransactionId(params.transactionId)
       );
     case 'beginTransaction':
+    case 'check':
     case 'close':
       return isUndefined(params);
     default:
@@ -320,6 +325,7 @@ const isResult = (
       );
     case 'closePrepared':
     case 'rollbackTransaction':
+    case 'check':
     case 'close':
       return isUndefined(value);
     case 'commitTransaction':

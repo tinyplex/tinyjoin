@@ -296,6 +296,7 @@ fn predicate_matrix_agrees_across_reads_writes_indexes_preparation_and_overlays(
                             }
                             let mut reopened = PagedEngine::open(engine.into_device()).unwrap();
                             assert_eq!(rows(&mut reopened), model, "reopen: {context}");
+                            reopened.check().unwrap();
                         }
                     }
                 }
@@ -964,6 +965,7 @@ fn generated_upserts_agree_with_a_row_at_a_time_model() {
                 .collect::<Vec<_>>();
             let mut reopened = PagedEngine::open(engine.into_device()).unwrap();
             assert_eq!(rows(&mut reopened), expected_rows, "seed={seed:#x}");
+            reopened.check().unwrap();
         }
     }
     let UpsertCoverage {
@@ -1046,6 +1048,7 @@ fn generated_structured_parameters_remain_data_across_prepared_reuse_and_reopen(
         }
         let mut reopened = PagedEngine::open(engine.into_device()).unwrap();
         assert_eq!(rows(&mut reopened), model, "seed={seed:#x}");
+        reopened.check().unwrap();
     }
 }
 

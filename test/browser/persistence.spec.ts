@@ -32,6 +32,7 @@ test('persists complete state across dedicated Worker restarts', async ({
     report.gracefulReopenMs,
     report.mutationCommitMs,
     report.crashReopenMs,
+    report.checkMs,
   ]) {
     expect(Number.isFinite(timing) && timing >= 0).toBe(true);
   }

@@ -135,6 +135,7 @@ describe('WASM engine bridge', () => {
       inTransaction: 9,
       revision: 10,
       close: 11,
+      check: 12,
     });
   });
 

@@ -157,6 +157,11 @@ impl WasmEngine {
                 self.engine()?.ensure_readiness()?;
                 structured::unsigned(revision)
             }
+            structured::OP_CHECK => {
+                request.finish()?;
+                self.engine()?.check()?;
+                structured::unit(false)
+            }
             _ => Err(EngineError::new(
                 "INVALID_BRIDGE_VALUE",
                 "Invalid structured bridge request",

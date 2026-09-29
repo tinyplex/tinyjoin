@@ -3251,6 +3251,7 @@ mod tests {
         engine.commit_transaction().unwrap();
 
         let mut reopened = PagedEngine::open(engine.into_device()).unwrap();
+        reopened.check().unwrap();
         let expected = vec![row(json!({"id": 1, "value": "committed update"}))];
         assert_eq!(
             reopened.query_sql("SELECT * FROM items", &[]).unwrap().rows,

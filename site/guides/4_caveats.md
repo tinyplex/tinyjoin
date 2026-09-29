@@ -95,7 +95,8 @@ a request, not a guarantee, and TinyJoin does not make that product decision
 during startup.
 
 Treat a TinyJoin database as reconstructable local state. Data that has to
-survive needs a copy the application controls.
+survive needs a copy the application controls. TinyJoin can check a whole
+database with check(), but cannot yet repair one that fails.
 
 A storage or commit-result failure can leave a write's outcome uncertain.
 `RECOVERY_REQUIRED`, `STORAGE_COMMIT_OUTCOME_UNKNOWN`, and

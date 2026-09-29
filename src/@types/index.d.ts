@@ -269,6 +269,9 @@ export class Client {
   /// Client.getRevision
   getRevision(): number;
 
+  /// Client.check
+  check(): Promise<void>;
+
   /// Client.close
   close(): Promise<void>;
 }

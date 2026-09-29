@@ -276,6 +276,11 @@ export const startWorker = (
         engine.rollbackTransaction();
         clearTransaction(request.params.transactionId);
         return undefined;
+
+      case 'check':
+        assertNoTransaction();
+        engine.check();
+        return undefined;
     }
   };
 
