@@ -29,8 +29,9 @@ html {
   --hue-5-2: hsl(344, 84%, 43%);
   --hue-6: hsl(35, 99%, 36%);
   // Benchmark chart series, validated together for color vision deficiency:
-  // TinyJoin in the accent, and the others in muted tints of their own hues.
-  --series-tinyjoin: @accentColorLight;
+  // TinyJoin in the text's own ink, and the others in muted tints of their own
+  // hues.
+  --series-tinyjoin: var(--text2);
   --series-sqlite: #b19487;
   --series-pglite: #c0d8cc;
 }

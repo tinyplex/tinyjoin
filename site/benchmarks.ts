@@ -200,8 +200,6 @@ const chartHtml = (report: Report, chart: Chart, legend: boolean): string => {
         Math.max(length ?? 0, timedOut[index] ? 0 : (ranges[index]?.[1] ?? 0)),
       ),
     );
-    const present = values.filter(isNumber);
-    const fastest = present.length > 1 ? Math.min(...present) : null;
     const bars = ranked(report, measure).map((index) => {
       const [engine, name] = ENGINES[index];
       const value = values[index];
@@ -221,10 +219,6 @@ const chartHtml = (report: Report, chart: Chart, legend: boolean): string => {
           : `<span class="range" style="--low:${fraction(low)};` +
             `--high:${fraction(high)}"></span>`;
       const shown = value == null ? missing[index] : format(value);
-      const text =
-        value != null && value == fastest
-          ? `<b>${escapeHtml(shown)}</b>`
-          : escapeHtml(shown);
       // A value inside its bar must end before the bar's range begins.
       const room = Math.min(x, low);
       const fit =
@@ -237,8 +231,8 @@ const chartHtml = (report: Report, chart: Chart, legend: boolean): string => {
         `<span class="${engine}" title="${escapeHtml(titles[index])}">` +
         `<span class="engine">${name}</span><span class="plot">${bar}` +
         `${bracket}<span class="value" data-fit="${fit}" ` +
-        `style="--end:${fraction(Math.max(x, high))}">${text}</span>` +
-        '</span></span>'
+        `style="--end:${fraction(Math.max(x, high))}">${escapeHtml(shown)}` +
+        '</span></span></span>'
       );
     });
     return `<dt>${escapeHtml(label)}</dt><dd>${bars.join('')}</dd>`;

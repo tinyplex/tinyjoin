@@ -1780,8 +1780,7 @@ Each workload lists the engines fastest first, and is drawn to its own linear
 scale from zero, on which its slowest run reaches the full width, so a quick
 workload's bars are as legible as a slow one's. A bar's length and value are
 the median of an engine's runs, and a faint bracket at its end spans that
-engine's fastest run to its slowest. Every bar is named, and in each workload
-the best value is bold.
+engine's fastest run to its slowest.
 
 ## Download and startup
 

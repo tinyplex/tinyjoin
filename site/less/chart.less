@@ -7,8 +7,8 @@
 // above them.
 
 @barHeight: 1rem;
-@barGap: 3px;
-@groupGap: 1.25rem;
+@barGap: 4px;
+@groupGap: 2.25rem;
 @gutter: 0.5rem;
 @labels: 36%;
 @names: 4.25rem;
@@ -18,8 +18,8 @@
   margin: 1.5rem 0 2rem;
 }
 
-// TinyJoin's bars keep their full color, and the others' are muted, so that
-// TinyJoin's place in each measure reads at a glance.
+// TinyJoin's bars are drawn in the text's own ink, and the others' in muted
+// tints, so that TinyJoin's place in each measure reads at a glance.
 .chart {
   container-type: inline-size;
   margin: 0;
@@ -30,7 +30,7 @@
 
   .tinyjoin {
     --series: var(--series-tinyjoin);
-    --on-series: #fff;
+    --on-series: @backColor;
   }
 
   .sqlite {
@@ -142,15 +142,17 @@
     }
   }
 
-  // A faint bracket from the engine's fastest run to its slowest.
+  // A faint bracket from the engine's fastest run to its slowest. It inverts
+  // whatever it crosses, so it shows over a bar as well as beyond one.
   .range {
     background: linear-gradient(currentColor, currentColor) center / 100% 1px
       no-repeat;
     border-inline: 1px solid;
-    color: @text2Color;
+    color: #fff;
     height: 0.5rem;
     left: calc(var(--low) * 100%);
-    opacity: 0.45;
+    mix-blend-mode: difference;
+    opacity: 0.6;
     position: absolute;
     top: calc(50% - 0.25rem);
     width: calc((var(--high) - var(--low)) * 100%);
@@ -164,10 +166,6 @@
     left: calc(var(--end) * 100% + @valueInset);
     position: absolute;
     top: 0;
-
-    b {
-      color: @text2Color;
-    }
   }
 
   .value[data-fit='all'] {
@@ -175,7 +173,7 @@
   }
 
   // Bars change places from one measure to the next, so each is named, and
-  // TinyJoin's name stands out as its bar does.
+  // TinyJoin's name is in the ink its bar is.
   .engine {
     color: @textColor;
     overflow: hidden;
@@ -186,7 +184,6 @@
 
   .tinyjoin .engine {
     color: @text2Color;
-    font-weight: 600;
   }
 }
 
@@ -195,10 +192,6 @@
 .inside() {
   color: var(--on-series);
   left: @valueInset;
-
-  b {
-    color: inherit;
-  }
 }
 
 @container (min-width: 40rem) {
