@@ -67,11 +67,6 @@ type Measure = {
   titles: string[];
 };
 type Chart = {unit: 'ms' | 'bytes'; measures: Measure[]};
-type Scale = {
-  x: (value: number) => number;
-  ticks: [position: number, label: string][];
-  intervals: number;
-};
 
 const PLACEHOLDER = /\{\{benchmarks\.([a-z-]+)\}\}/g;
 const KIB = 1024;
@@ -154,103 +149,73 @@ const getCharts = (report: Report, group: string): Chart[] => [
   timeChart(report, groupIds(report, group)),
 ];
 
-// Each unit applies from its own size upward; an axis uses the largest that
-// its longest bar reaches.
-const UNITS: {[unit in Chart['unit']]: [size: number, name: string][]} = {
-  ms: [
-    [1, 'ms'],
-    [1000, 's'],
-  ],
-  bytes: [
-    [KIB, 'KiB'],
-    [MIB, 'MiB'],
-  ],
-};
+// Each engine's bar length for a measure: a timed-out engine's reaches the
+// time limit, and one that did not complete has none.
+const lengths = (report: Report, {values, timedOut}: Measure) =>
+  values.map((value, index) => (timedOut[index] ? report.timeoutMs : value));
 
-// Every axis is linear from zero, in at most four round steps, so that bar
-// lengths compare directly, however far apart the engines are.
-const linearScale = (values: number[], unit: Chart['unit']): Scale => {
-  const max = Math.max(...values);
-  const [size, name] =
-    UNITS[unit].filter(([from]) => max >= from).at(-1) ?? UNITS[unit][0];
-  const scaled = max / size;
-  const magnitude = 10 ** (Math.floor(Math.log10(scaled)) - 1);
-  const step = [1, 2, 5, 10, 20, 50]
-    .map((multiple) => multiple * magnitude)
-    .find((candidate) => Math.ceil(scaled / candidate) <= 4) as number;
-  const intervals = Math.ceil(scaled / step);
-  return {
-    x: (value) => value / (intervals * step * size),
-    ticks: Array.from({length: intervals + 1}, (_, index) => [
-      index / intervals,
-      index == 0 ? '0' : `${Number((index * step).toPrecision(3))} ${name}`,
-    ]),
-    intervals,
-  };
+// The engines of a measure, fastest first, and those that did not complete
+// last, keeping the engines' own order among equals.
+const ranked = (report: Report, measure: Measure): number[] => {
+  const measured = lengths(report, measure);
+  return ENGINES.map((_, index) => index).sort(
+    (a, b) => (measured[a] ?? Infinity) - (measured[b] ?? Infinity) || a - b,
+  );
 };
 
 // One grouped horizontal bar chart. Each measure is a term in a description
-// list, whose one definition holds a bar per engine, so a long label never
-// pushes the bars apart and assistive technology reads each measure as a label
-// followed by every engine's value. Every bar carries its value at its tip.
+// list, whose one definition holds a bar per engine, fastest first, so a long
+// label never pushes the bars apart and assistive technology reads each measure
+// as a label followed by every engine in the order they finished. Each measure
+// is drawn to its own scale, linear from zero, on which its slowest engine's
+// bar is full length, so a quick workload's bars are as legible as a slow
+// one's. Every bar is labeled with its engine and carries its value at its tip.
 const chartHtml = (report: Report, chart: Chart, legend: boolean): string => {
   const format = chart.unit == 'ms' ? formatMs : formatBytes;
-  const scale = linearScale(
-    chart.measures.flatMap(({values, timedOut}) =>
-      values
-        .map((value, index) => (timedOut[index] ? report.timeoutMs : value))
-        .filter(isNumber),
-    ),
-    chart.unit,
-  );
-  const measures = chart.measures.map(
-    ({label, values, timedOut, missing, titles}) => {
-      const present = values.filter(isNumber);
-      const fastest = present.length > 1 ? Math.min(...present) : null;
-      const bars = ENGINES.map(([engine, name], index) => {
-        // A timed-out engine's bar is striped and reaches the time limit.
-        const measured = values[index];
-        const length = timedOut[index] ? report.timeoutMs : measured;
-        const bar =
-          length == null
-            ? ''
-            : `<span class="bar${timedOut[index] ? ' over' : ''}" ` +
-              `style="--x:${scale.x(length).toFixed(4)}"></span>`;
-        const text =
-          measured == null
-            ? escapeHtml(missing[index])
-            : measured == fastest
-              ? `<b>${format(measured)}</b>`
-              : format(measured);
-        return (
-          `<span class="${engine}" title="${escapeHtml(titles[index])}">` +
-          `<span class="engine">${name} </span>${bar}` +
-          `<span class="value">${text}</span></span>`
-        );
-      });
-      return `<dt>${escapeHtml(label)}</dt><dd>${bars.join('')}</dd>`;
-    },
-  );
+  const measures = chart.measures.map((measure) => {
+    const {label, values, timedOut, missing, titles} = measure;
+    const measured = lengths(report, measure);
+    const longest = Math.max(...measured.filter(isNumber));
+    const present = values.filter(isNumber);
+    const fastest = present.length > 1 ? Math.min(...present) : null;
+    const bars = ranked(report, measure).map((index) => {
+      const [engine, name] = ENGINES[index];
+      const value = values[index];
+      const length = measured[index];
+      // A timed-out engine's bar is striped, since it is a lower bound.
+      const bar =
+        length == null
+          ? ''
+          : `<span class="bar${timedOut[index] ? ' over' : ''}" ` +
+            `style="--x:${(length / longest).toFixed(4)}"></span>`;
+      const text =
+        value == null
+          ? escapeHtml(missing[index])
+          : value == fastest
+            ? `<b>${format(value)}</b>`
+            : format(value);
+      return (
+        `<span class="${engine}" title="${escapeHtml(titles[index])}">` +
+        `<span class="engine">${name}</span><span class="plot">${bar}` +
+        `<span class="value">${text}</span></span></span>`
+      );
+    });
+    return `<dt>${escapeHtml(label)}</dt><dd>${bars.join('')}</dd>`;
+  });
   const keys = ENGINES.map(
     ([engine, name]) => `<span class="key ${engine}">${name}</span>`,
   ).join('');
   const note =
     chart.unit == 'ms'
-      ? `Median of ${report.samples} runs. Shorter is better.`
-      : 'Bytes fetched to open a database. Shorter is better.';
-  const ticks = scale.ticks
-    .map(
-      ([position, label]) =>
-        `<span style="--x:${position.toFixed(4)}">${label}</span>`,
-    )
-    .join('');
+      ? `Median of ${report.samples} runs, fastest first, ` +
+        'each workload to its own scale.'
+      : 'Bytes fetched to open a database, smallest first, ' +
+        'each to its own scale.';
   return (
-    `<figure class="chart" style="--intervals:${scale.intervals}">` +
-    '<figcaption>' +
+    '<figure class="chart"><figcaption>' +
     (legend ? `<span class="legend">${keys}</span>` : '') +
     `<span class="note">${note}</span></figcaption>` +
-    `<dl>${measures.join('')}</dl>` +
-    `<div class="axis" aria-hidden="true">${ticks}</div></figure>`
+    `<dl>${measures.join('')}</dl></figure>`
   );
 };
 
@@ -272,6 +237,30 @@ const chartMarkdown = (chart: Chart): string => {
       );
       return `| ${label} | ${cells.join(' | ')} |`;
     }),
+  ].join('\n');
+};
+
+// How often each engine was the fastest, the second, and the slowest across a
+// report's timed workloads. Engines that tie share a place, and an engine that
+// did not complete counts as the slowest.
+const placings = (report: Report): string => {
+  const counts = ENGINES.map(() => [0, 0, 0]);
+  for (const workload of report.results) {
+    const measure = timeChart(report, [workload.id]).measures[0];
+    const measured = lengths(report, measure).map(
+      (length) => length ?? Infinity,
+    );
+    measured.forEach((length, index) => {
+      const faster = measured.filter((other) => other < length).length;
+      counts[index][Math.min(faster, 2)] += 1;
+    });
+  }
+  return [
+    '| Engine | Fastest | Second | Slowest |',
+    '| --- | ---: | ---: | ---: |',
+    ...ENGINES.map(
+      ([, name], index) => `| ${name} | ${counts[index].join(' | ')} |`,
+    ),
   ].join('\n');
 };
 
@@ -333,6 +322,8 @@ const renderText = (report: Report, name: string): string => {
       return workloads(report);
     case 'environment':
       return environment(report);
+    case 'placings':
+      return placings(report);
     default:
       throw new Error(`Unknown benchmark placeholder: ${name}`);
   }

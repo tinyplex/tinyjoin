@@ -28,10 +28,11 @@ html {
   --hue-5: hsl(5, 74%, 59%);
   --hue-5-2: hsl(344, 84%, 43%);
   --hue-6: hsl(35, 99%, 36%);
-  // Benchmark chart series, validated together for color vision deficiency.
+  // Benchmark chart series, validated together for color vision deficiency:
+  // TinyJoin in the accent, and the others in muted tints of their own hues.
   --series-tinyjoin: @accentColorLight;
-  --series-sqlite: #eb6834;
-  --series-pglite: #1baf7a;
+  --series-sqlite: #cc9278;
+  --series-pglite: #b0e1ca;
 }
 
 .darkTheme() {
@@ -61,8 +62,8 @@ html {
   --hue-5: hsl(355, 65%, 65%);
   --hue-5-2: hsl(5, 48%, 51%);
   --hue-6: hsl(29, 54%, 61%);
-  --series-sqlite: #d95926;
-  --series-pglite: #199e70;
+  --series-sqlite: #8f5a41;
+  --series-pglite: #274b3c;
 }
 
 html.dark {

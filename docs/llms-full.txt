@@ -1776,8 +1776,10 @@ work, and the suite is designed to be rerun after every optimization.
 
 Measured on 2026-09-29 with headless Chromium 153.0.8010.12 on macOS (25.5.0), Apple M2, 8 logical CPUs, 16 GiB RAM. Each time is the median of 9 samples.
 
-Every chart has a linear axis from zero, so bar lengths compare directly, and
-every bar is labeled with its value. In each group, the best value is bold.
+Each workload lists the engines fastest first, and is drawn to its own linear
+scale from zero, on which its slowest engine's bar is full length, so a quick
+workload's bars are as legible as a slow one's. Every bar is labeled with its
+engine and its value, and in each workload the best value is bold.
 
 ## Measured results
 
@@ -1860,10 +1862,18 @@ to reopen one. It reads all 10,000 rows in order four times as fast as either
 engine, runs `LIKE` scans, `GROUP BY`, and joins faster than either, builds
 indexes and commits single inserts faster than either, and deletes rows in
 bulk faster than SQLite. Indexed range aggregates and point reads take as long
-as in the faster engine. The rest is slower, but no longer by orders of
-magnitude: in v0.3.0, most workloads took 10 to 1,400 times as long as the
-fastest engine, and none now takes as much as twice as long. The remaining
-gaps point at the work ahead.
+as in the faster engine. Across the 20 timed workloads, it places like this,
+where engines that tie share a place:
+
+| Engine | Fastest | Second | Slowest |
+| --- | ---: | ---: | ---: |
+| TinyJoin | 10 | 10 | 0 |
+| SQLite | 9 | 5 | 6 |
+| PGlite | 2 | 4 | 14 |
+
+The rest is slower, but no longer by orders of magnitude: in v0.3.0, most
+workloads took 10 to 1,400 times as long as the fastest engine, and none now
+takes as much as twice as long. The remaining gaps point at the work ahead.
 
 - **Single statements** cost about 30 to 36 microseconds each, which is 1.0
   to 1.5 times SQLite's cost for a point read, or an update, upsert, or delete
@@ -1961,8 +1971,15 @@ Measured on 2026-09-29 with headless Chromium 153.0.8010.12 on macOS (25.5.0), A
 In memory, TinyJoin is again the quickest to open, and still reads every row,
 runs `LIKE` scans, groups, and joins faster than either engine. Without
 storage costs, though, it is the slowest at deleting rows in bulk and at
-building indexes. Comparing the two sets of results shows what storage costs
-each engine:
+building indexes:
+
+| Engine | Fastest | Second | Slowest |
+| --- | ---: | ---: | ---: |
+| TinyJoin | 5 | 11 | 3 |
+| SQLite | 14 | 3 | 2 |
+| PGlite | 0 | 5 | 14 |
+
+Comparing the two sets of results shows what storage costs each engine:
 
 - **Committing each insert alone** takes TinyJoin about 83 microseconds in
   memory and 436 with OPFS, so most of an OPFS commit is the storage flush.

@@ -1,26 +1,26 @@
 // Grouped horizontal bar charts, rendered from site/data/benchmarks.json by
 // site/benchmarks.ts. Each measure is a term and one definition in a list: the
-// label, then a bar per engine. A definition's box, less its right padding, is
-// the plot, which carries the gridlines; the padding is a gutter for the value
-// at the tip of the longest bar. Wide charts put labels beside their bars, and
-// narrow ones above them.
+// label, then a bar per engine, fastest first, each after its engine's name. A
+// definition's right padding is a gutter for the value at the tip of the
+// longest bar. Each measure has its own scale, so there are no gridlines to
+// share. Wide charts put labels beside their bars, and narrow ones above them.
 
 @barHeight: 0.875rem;
 @barGap: 2px;
 @groupGap: 0.75rem;
 @gutter: 4.75rem;
-@labels: 40%;
+@labels: 36%;
+@names: 4.25rem;
 
 .charts {
   margin: 1.5rem 0 2rem;
 }
 
-// The chart anchors its visually hidden engine names, which would otherwise
-// be positioned against the page and let the window itself scroll.
+// TinyJoin's bars keep their full color, and the others' are muted, so that
+// TinyJoin's place in each measure reads at a glance.
 .chart {
   container-type: inline-size;
   margin: 0;
-  position: relative;
 
   & + & {
     margin-top: 2rem;
@@ -85,19 +85,7 @@
     text-align: right;
   }
 
-  // A definition stretches to its row, and has no margins, so the gridlines
-  // drawn across it join into continuous lines from one measure to the next.
   dd {
-    background:
-      linear-gradient(to right, @borderColor 0 1px, transparent 1px),
-      repeating-linear-gradient(
-        to right,
-        @back3Color 0 1px,
-        transparent 1px calc(100% / var(--intervals))
-      ),
-      linear-gradient(to left, @back3Color 0 1px, transparent 1px);
-    background-repeat: no-repeat;
-    background-size: calc(100% - @gutter) 100%;
     display: flex;
     flex-direction: column;
     justify-content: center;
@@ -105,8 +93,9 @@
     padding: @groupGap @gutter 0 0;
 
     > span {
-      display: block;
+      display: grid;
       font-size: 0.8125rem;
+      grid-template-columns: @names minmax(0, 1fr);
       height: @barHeight;
       line-height: @barHeight;
       white-space: nowrap;
@@ -119,6 +108,13 @@
         filter: brightness(1.15);
       }
     }
+  }
+
+  // Each bar starts from its measure's baseline, and its value overflows into
+  // the definition's gutter.
+  .plot {
+    border-left: 1px solid @borderColor;
+    min-width: 0;
   }
 
   .bar {
@@ -151,33 +147,20 @@
     }
   }
 
-  // Each value is announced with its engine, which the legend shows visually.
+  // Bars change places from one measure to the next, so each is named, and
+  // TinyJoin's name stands out as its bar does.
   .engine {
-    clip-path: inset(50%);
-    height: 1px;
-    overflow: hidden;
-    position: absolute;
-    white-space: nowrap;
-    width: 1px;
-  }
-
-  // The axis: a baseline under the plot, and a label at every gridline.
-  .axis {
-    border-top: 1px solid @borderColor;
     color: @textColor;
     font-size: 0.75rem;
-    height: 1.25rem;
-    line-height: 1rem;
-    margin: 0 @gutter 0 @labels;
-    position: relative;
+    overflow: hidden;
+    padding-right: 0.5rem;
+    text-align: right;
+    text-overflow: ellipsis;
+  }
 
-    span {
-      left: calc(var(--x) * 100%);
-      position: absolute;
-      top: 0.25rem;
-      transform: translateX(-50%);
-      white-space: nowrap;
-    }
+  .tinyjoin .engine {
+    color: @text2Color;
+    font-weight: 600;
   }
 }
 
@@ -198,19 +181,6 @@
 
     .note {
       margin-left: 0;
-    }
-
-    // With no label column beside it, the axis keeps its end labels inside.
-    .axis {
-      margin-left: 0;
-
-      span:first-child {
-        transform: none;
-      }
-
-      span:last-child {
-        transform: translateX(-100%);
-      }
     }
   }
 }
