@@ -1,11 +1,11 @@
 //! The checksums that stored pages and values carry, and the hash that fingerprints are built from.
 //!
-//! Pages carry the standard IEEE CRC-32. Overflow values and fingerprints use XXH64, the 64-bit
-//! xxHash, which reads eight bytes at a time through four independent lanes, where a table-driven
-//! CRC-32 needs a lookup for every byte.
+//! Superblocks carry the standard IEEE CRC-32, as every page of v0.1.0 through v0.3.0 did. Other
+//! pages, overflow values and fingerprints use XXH64, the 64-bit xxHash, which reads eight bytes at
+//! a time through four independent lanes, where a table-driven CRC-32 needs a lookup for every byte.
 
 // The standard IEEE CRC-32 checksum, sixteen bytes at a time.
-// Keep the polynomial, initial state, and final complement compatible with stored pages.
+// Keep the polynomial, initial state, and final complement compatible with stored superblocks.
 use std::sync::OnceLock;
 
 /// The checksum of each byte value, built at compile time.

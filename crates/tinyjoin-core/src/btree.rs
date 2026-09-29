@@ -5219,7 +5219,7 @@ mod tests {
     }
 
     #[test]
-    fn page_envelope_crc_catches_payload_corruption() {
+    fn page_envelope_checksum_catches_payload_corruption() {
         let page = Node::leaf(
             TREE,
             2,

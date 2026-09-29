@@ -136,9 +136,10 @@ building indexes, and committing a single insert are quicker than in either.
   time, rather than with FNV-1a, which hashed them a byte at a time. Every leaf
   a write creates fingerprints its entries, an index's included, so creating
   two indexes takes 9% less of the engine's time.
-- A commit checksums the zero bytes that fill most of each page 256 at a time,
-  where it read them one at a time, and encodes less besides, writing its
-  allocation bitmap and superblock straight into their pages. Committing a
+- A commit checksums each page with XXH64, which reads eight bytes at a time,
+  rather than with CRC-32, which looks each byte up in a table, and passes over
+  the zero bytes that fill most of each page. It encodes less besides, writing
+  its allocation bitmap and superblock straight into their pages. Committing a
   single insert takes over a third less of the engine's time, and pages read
   back from storage are checked faster too.
 - Each superblock carries the allocation bitmap for the first 123 MB of the

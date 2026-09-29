@@ -312,6 +312,12 @@ Found along the way:
   bitmap's unused pages, the superblock's padding. Over zero bytes a CRC-32
   depends only on its state, so precomputed tables pass 256 of them in four
   lookups; committing one insert had spent a third of its time checksumming.
+- Even sixteen bytes at a time, a CRC-32 looks up every byte in a table.
+  Pages other than superblocks now carry XXH64, over the page's 32-byte
+  stripes that are not all zero and a bitmap of which stripes those are, so
+  zero bytes stay nearly free. Superblocks keep CRC-32: v0.1.0 through v0.3.0
+  check a page's CRC-32 before its version, so a CRC-32 superblock is what
+  lets them refuse a newer database as unsupported rather than corrupt.
 - Allocating a page past the end of the file wrote a zero placeholder for it,
   so commits that grew the file wrote every new page twice.
 - Each OPFS write call costs about 17 µs whatever its size, so a commit's

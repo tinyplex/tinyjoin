@@ -1,4 +1,7 @@
-use crate::{EngineError, Result, checksum::crc32_update};
+use crate::{
+    EngineError, Result,
+    checksum::{Xxh64, crc32_update, fold},
+};
 
 // Keep browser corruption diagnostics static and let the stable error code
 // carry the precise class. Native builds retain the detailed values.
@@ -40,7 +43,7 @@ pub(crate) const PAGE_MAGIC: &[u8; 8] = b"TGRPAGE\0";
 // with UNSUPPORTED_PAGE, where its larger superblock would otherwise fail their checks as corrupt.
 const PAGE_FORMAT_VERSION: u16 = 2;
 const PAGE_FLAGS: u16 = 0;
-const PAGE_CRC_OFFSET: usize = 28;
+const PAGE_CHECKSUM_OFFSET: usize = 28;
 
 pub(crate) const SUPERBLOCK_MAGIC: &[u8; 8] = b"TGRSUPR\0";
 // Page format 3 stores rows as packed records and keys in an order-preserving encoding, and
@@ -97,7 +100,7 @@ impl TryFrom<u8> for PageType {
 /// The checksum a sealed page carries.
 pub(crate) fn page_checksum(bytes: &[u8; PAGE_SIZE]) -> u32 {
     u32::from_le_bytes(
-        bytes[PAGE_CRC_OFFSET..PAGE_CRC_OFFSET + 4]
+        bytes[PAGE_CHECKSUM_OFFSET..PAGE_CHECKSUM_OFFSET + 4]
             .try_into()
             .expect("a checksum is four bytes"),
     )
@@ -153,11 +156,46 @@ fn write_page_header(
 }
 
 pub(crate) fn seal(bytes: &mut [u8; PAGE_SIZE]) {
-    let checksum = crc32_update(u32::MAX, &bytes[..PAGE_CRC_OFFSET]);
-    let checksum = crc32_update(checksum, &[0; 4]);
-    let checksum = !crc32_update(checksum, &bytes[PAGE_CRC_OFFSET + 4..]);
-    bytes[PAGE_CRC_OFFSET..PAGE_CRC_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
+    let checksum = compute_checksum(bytes);
+    put(bytes, PAGE_CHECKSUM_OFFSET, checksum.to_le_bytes());
 }
+
+/// A page's checksum, which covers the page with its own field read as zero.
+///
+/// A superblock carries the standard CRC-32, as every page of v0.1.0 through v0.3.0 did, so that
+/// those releases can read a newer superblock far enough to refuse it. Every other page carries
+/// XXH64 folded to 32 bits, taken over the page's 32-byte stripes that are not all zero and then a
+/// bitmap of which stripes those are. The bitmap keeps every page's message distinct, and pages
+/// are mostly zero wherever they are not full, so a zero stripe costs only the test that finds it.
+fn compute_checksum(bytes: &[u8; PAGE_SIZE]) -> u32 {
+    if bytes[20] == PageType::Superblock as u8 {
+        let checksum = crc32_update(u32::MAX, &bytes[..PAGE_CHECKSUM_OFFSET]);
+        let checksum = crc32_update(checksum, &[0; 4]);
+        return !crc32_update(checksum, &bytes[PAGE_CHECKSUM_OFFSET + 4..]);
+    }
+    let (stripes, _) = bytes.as_chunks::<32>();
+    let mut hash = Xxh64::new(0);
+    let mut present = [0_u64; 2];
+    let mut count = 0;
+    for (index, stripe) in stripes.iter().enumerate() {
+        let mut lanes = Xxh64::lanes(stripe);
+        // The checksum field is the upper half of the first stripe's last lane.
+        if index == 0 {
+            lanes[3] &= u64::from(u32::MAX);
+        }
+        if lanes[0] | lanes[1] | lanes[2] | lanes[3] != 0 {
+            hash.stripe(lanes);
+            present[index / 64] |= 1 << (index % 64);
+            count += 1;
+        }
+    }
+    let mut bitmap = [0; 16];
+    put(&mut bitmap, 0, present[0].to_le_bytes());
+    put(&mut bitmap, 8, present[1].to_le_bytes());
+    fold(hash.finish(count * 32 + 16, &bitmap))
+}
+
+const _: () = assert!(PAGE_CHECKSUM_OFFSET == 28 && PAGE_SIZE == 32 * 128);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Page {
@@ -232,11 +270,9 @@ impl Page {
         // byte into an apparently coherent unsupported format and prevent
         // recovery from the other metadata slot. The checksum covers the page
         // with its own field read as zero.
-        let expected_checksum = read_u32(bytes, PAGE_CRC_OFFSET);
-        let checksum = crc32_update(u32::MAX, &bytes[..PAGE_CRC_OFFSET]);
-        let checksum = crc32_update(checksum, &[0; 4]);
-        let checksum = !crc32_update(checksum, &bytes[PAGE_CRC_OFFSET + 4..]);
-        if checksum != expected_checksum {
+        let expected_checksum = read_u32(bytes, PAGE_CHECKSUM_OFFSET);
+        let page = <&[u8; PAGE_SIZE]>::try_from(bytes).expect("a page is PAGE_SIZE bytes");
+        if compute_checksum(page) != expected_checksum {
             return Err(invalid_page("Page checksum does not match"));
         }
         if &bytes[..8] != PAGE_MAGIC {
@@ -831,7 +867,7 @@ pub(crate) fn first_page_of_bitmap_chunk(chunk: usize) -> PageId {
 /// commit wrote there.
 fn decode_bitmap_chunk<'a>(bytes: &'a [u8], chunk: usize, entry: &BitmapChunk) -> Result<&'a [u8]> {
     Page::verify(bytes)?;
-    if read_u32(bytes, PAGE_CRC_OFFSET) != entry.checksum {
+    if read_u32(bytes, PAGE_CHECKSUM_OFFSET) != entry.checksum {
         return Err(invalid_page(storage_diagnostic!(
             "Allocation bitmap chunk {chunk} is not the page its superblock recorded"
         )));
@@ -1253,15 +1289,61 @@ mod tests {
         (image, older, newer)
     }
 
-    fn rewrite_crc(bytes: &mut [u8; PAGE_SIZE]) {
-        bytes[PAGE_CRC_OFFSET..PAGE_CRC_OFFSET + 4].fill(0);
-        let checksum = crate::checksum::crc32(bytes);
-        bytes[PAGE_CRC_OFFSET..PAGE_CRC_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
-    }
-
     fn mutate_payload(page: &mut [u8; PAGE_SIZE], offset: usize, value: u8) {
         page[PAGE_HEADER_SIZE + offset] = value;
-        rewrite_crc(page);
+        seal(page);
+    }
+
+    /// A leaf with bytes at both ends of its payload and zeros between, as a B-tree node leaves
+    /// its free space.
+    fn sparse_leaf() -> [u8; PAGE_SIZE] {
+        let mut payload = vec![0; MAX_PAGE_PAYLOAD_SIZE];
+        payload[..40].fill(7);
+        payload[MAX_PAGE_PAYLOAD_SIZE - 100..].fill(9);
+        Page::new(42, PageType::BtreeLeaf, payload)
+            .unwrap()
+            .encode()
+            .unwrap()
+    }
+
+    #[test]
+    fn page_checksum_is_xxh64_of_the_stripes_that_are_not_zero_then_their_bitmap() {
+        let page = sparse_leaf();
+        let mut zeroed = page;
+        zeroed[PAGE_CHECKSUM_OFFSET..PAGE_CHECKSUM_OFFSET + 4].fill(0);
+        let mut message = Vec::new();
+        let mut present = 0_u128;
+        for (index, stripe) in zeroed.as_chunks::<32>().0.iter().enumerate() {
+            if stripe.iter().any(|byte| *byte != 0) {
+                message.extend_from_slice(stripe);
+                present |= 1 << index;
+            }
+        }
+        assert_eq!(present.count_ones(), 7);
+        message.extend_from_slice(&present.to_le_bytes());
+        assert_eq!(
+            page_checksum(&page),
+            fold(crate::checksum::xxh64(&message, 0))
+        );
+    }
+
+    #[test]
+    fn page_checksum_catches_every_changed_byte_and_moved_stripe() {
+        let page = sparse_leaf();
+        for offset in 0..PAGE_SIZE {
+            let mut corrupted = page;
+            corrupted[offset] ^= 1;
+            assert_eq!(
+                Page::verify(&corrupted).unwrap_err().code,
+                "INVALID_PAGE",
+                "byte {offset}"
+            );
+        }
+        // The same stripes in another place are another page.
+        let mut moved = page;
+        moved.copy_within(PAGE_SIZE - 128..PAGE_SIZE - 32, PAGE_SIZE - 96);
+        moved[PAGE_SIZE - 128..PAGE_SIZE - 96].fill(0);
+        assert_ne!(compute_checksum(&moved), compute_checksum(&page));
     }
 
     #[test]
@@ -1311,7 +1393,7 @@ mod tests {
         for (offset, value) in [(8, 1), (8, 3), (10, 1)] {
             let mut unsupported = original;
             unsupported[offset] = value;
-            rewrite_crc(&mut unsupported);
+            seal(&mut unsupported);
             assert_eq!(
                 Page::decode(&unsupported).unwrap_err().code,
                 "UNSUPPORTED_PAGE"
@@ -1320,12 +1402,12 @@ mod tests {
 
         let mut invalid_id = original;
         invalid_id[12..20].copy_from_slice(&MAX_PAGE_COUNT.to_le_bytes());
-        rewrite_crc(&mut invalid_id);
+        seal(&mut invalid_id);
         assert_eq!(Page::decode(&invalid_id).unwrap_err().code, "INVALID_PAGE");
 
         let mut invalid_length = original;
         invalid_length[24..28].copy_from_slice(&((MAX_PAGE_PAYLOAD_SIZE + 1) as u32).to_le_bytes());
-        rewrite_crc(&mut invalid_length);
+        seal(&mut invalid_length);
         assert_eq!(
             Page::decode(&invalid_length).unwrap_err().code,
             "INVALID_PAGE"
@@ -1427,7 +1509,7 @@ mod tests {
 
         let mut wrong_page_id = page;
         wrong_page_id[12..20].copy_from_slice(&1_u64.to_le_bytes());
-        rewrite_crc(&mut wrong_page_id);
+        seal(&mut wrong_page_id);
         assert_eq!(
             Superblock::decode_page(&wrong_page_id).unwrap_err().code,
             "INVALID_PAGE"
@@ -1435,7 +1517,7 @@ mod tests {
 
         let mut wrong_type = page;
         wrong_type[20] = PageType::BtreeLeaf as u8;
-        rewrite_crc(&mut wrong_type);
+        seal(&mut wrong_type);
         assert_eq!(
             Superblock::decode_page(&wrong_type).unwrap_err().code,
             "INVALID_PAGE"
@@ -1652,11 +1734,11 @@ mod tests {
         }
         let mut wrong_id = page;
         wrong_id[12..20].copy_from_slice(&BitmapSlot::A.page_id(1).to_le_bytes());
-        rewrite_crc(&mut wrong_id);
+        seal(&mut wrong_id);
         corrupted_pages.push(wrong_id);
         let mut wrong_type = page;
         wrong_type[20] = PageType::BtreeLeaf as u8;
-        rewrite_crc(&mut wrong_type);
+        seal(&mut wrong_type);
         corrupted_pages.push(wrong_type);
         for corrupted in corrupted_pages {
             let entry = BitmapChunk {
@@ -1967,7 +2049,7 @@ mod tests {
             let mut unsupported = image.clone();
             let page = &mut unsupported.0[id as usize];
             page[8..10].copy_from_slice(&(PAGE_FORMAT_VERSION + 1).to_le_bytes());
-            rewrite_crc(page);
+            seal(page);
             assert_eq!(
                 unsupported.recover().unwrap_err().code,
                 "UNSUPPORTED_PAGE",
@@ -1990,7 +2072,7 @@ mod tests {
         let superblock = &mut image.0[SuperblockSlot::B.page_id() as usize];
         superblock[PAGE_HEADER_SIZE + 32..PAGE_HEADER_SIZE + 40]
             .copy_from_slice(&(maximum + 1).to_le_bytes());
-        rewrite_crc(superblock);
+        seal(superblock);
         assert_eq!(image.recover().unwrap_err().code, "UNSUPPORTED_PAGE");
     }
 
