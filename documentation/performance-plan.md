@@ -260,6 +260,11 @@ Done:
   large table's pages had made every commit slower: those 1,000 inserts into
   100,000 rows fell again, from 472 million instructions to 268, and from
   44 ms to 24.
+- The owning tab's statement, when nothing waits ahead of it, is served as
+  its Worker receives it, and its response posted straight to the page,
+  rather than first joining the Worker's pending requests and reaching the
+  owner as a routed message. Point statements took 2-3% less time in the
+  browser benchmark with OPFS, for 91 bytes compressed.
 
 Found along the way:
 

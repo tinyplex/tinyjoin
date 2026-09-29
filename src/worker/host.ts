@@ -347,22 +347,27 @@ export const startWorker = (
   };
 
   // Once the engine is open, a request with nothing ahead of it can be served
-  // at once: this reports whether it was, and passes the outcome to `settle`.
+  // at once, which this reports.
+  const canServeNow = (
+    request: WorkerRequest,
+  ): request is Exclude<WorkerRequest, {method: 'close'}> =>
+    queuedRequests === 0 &&
+    openEngine !== undefined &&
+    request.method !== 'init' &&
+    request.method !== 'close';
+
+  // Serves a request at once, if it can be, passing the outcome to `settle`,
+  // and reports whether it did.
   const serveNow = (
     request: WorkerRequest,
     settle: (ok: boolean, value: unknown) => void,
   ): boolean => {
-    if (
-      queuedRequests !== 0 ||
-      !openEngine ||
-      request.method === 'init' ||
-      request.method === 'close'
-    ) {
+    if (!canServeNow(request)) {
       return false;
     }
     let result: unknown;
     try {
-      result = handleRequest(request, openEngine);
+      result = handleRequest(request, openEngine!);
     } catch (error) {
       settle(false, error);
       return true;
@@ -455,13 +460,14 @@ export const startWorker = (
       ),
 
     requestNow: (request: WorkerRequest): Served | undefined => {
-      let served: Served | undefined;
-      serveNow(request, (ok, value) => {
-        served = ok
-          ? {ok, value}
-          : {ok, error: new ClientError(serializeError(value))};
-      });
-      return served;
+      if (!canServeNow(request)) {
+        return undefined;
+      }
+      try {
+        return {ok: true, value: handleRequest(request, openEngine!)};
+      } catch (error) {
+        return {ok: false, error: new ClientError(serializeError(error))};
+      }
     },
 
     close: async (): Promise<void> => {

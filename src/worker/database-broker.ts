@@ -23,6 +23,7 @@ type Connection = {
   prepared: Map<number, number>;
 };
 type Queued = {message: RoutedRequest; bytes: number};
+type Post = (response: WorkerResponse) => void;
 
 /** Schedules complete transaction callbacks, not just individual RPC messages. */
 export const createDatabaseBroker = (
@@ -40,7 +41,9 @@ export const createDatabaseBroker = (
   let queuedBytes = 0;
   let busy = false;
   let closed = false;
-  let transaction: {client: string; token: string} | undefined;
+  // The host's token for the active transaction, and the id its client knows
+  // it by, which also names this owner's epoch.
+  let transaction: {client: string; token: string; id: string} | undefined;
 
   const reply = (client: string, response: WorkerResponse): void => {
     if (client === localClient) localResponse(response);
@@ -116,8 +119,12 @@ export const createDatabaseBroker = (
         }
       }
       const {transactionId} = await rpc.request('beginTransaction', undefined);
-      transaction = {client, token: transactionId};
-      return {transactionId: `${epoch}/${transactionId}`};
+      transaction = {
+        client,
+        token: transactionId,
+        id: `${epoch}/${transactionId}`,
+      };
+      return {transactionId: transaction.id};
     }
     let forwarded: WorkerRequest = request;
     if (
@@ -127,7 +134,7 @@ export const createDatabaseBroker = (
     ) {
       if (
         transaction?.client !== client ||
-        request.params.transactionId !== `${epoch}/${transaction.token}`
+        request.params.transactionId !== transaction.id
       ) {
         throw coordinationError(
           'TRANSACTION_LOST',
@@ -180,39 +187,39 @@ export const createDatabaseBroker = (
     }
   };
 
-  // A request's outcome, replied to its client, retiring the owner if it left
-  // the engine beyond use.
-  const settle = (message: RoutedRequest, result: unknown): void => {
-    noteResult(result);
-    reply(message.client, {
-      v: PROTOCOL_VERSION,
-      id: message.request.id,
-      ok: true,
-      result,
-    });
-  };
-  const settleError = (message: RoutedRequest, error: unknown): void => {
-    const serialized =
-      asCodedError(error) ??
+  // Posts a request's outcome, retiring this owner when an error left the
+  // engine beyond use.
+  const settle = (post: Post, id: number, ok: boolean, value: unknown): void => {
+    if (ok) {
+      noteResult(value);
+      post({v: PROTOCOL_VERSION, id, ok, result: value});
+      return;
+    }
+    const error =
+      asCodedError(value) ??
       coordinationError(
         'WORKER_OPERATION_FAILED',
-        error instanceof Error ? error.message : String(error),
+        value instanceof Error ? value.message : String(value),
       );
-    fail(message, serialized);
+    post({v: PROTOCOL_VERSION, id, ok, error});
     if (
       [
         'RECOVERY_REQUIRED',
         'STORAGE_COMMIT_OUTCOME_UNKNOWN',
         'STORAGE_ENGINE_POISONED',
-      ].includes(serialized.code)
+      ].includes(error.code)
     )
-      onFailure(serialized);
+      onFailure(error);
   };
 
-  // Serves a statement at once, when nothing is waiting and the host can too,
-  // exactly as handle() would once pump() reached it. Reports whether it did.
-  const serveNow = (message: RoutedRequest): boolean => {
-    const {client, request} = message;
+  // The host's parameters for a client's statement that can be served at once,
+  // when nothing is waiting and the host can serve it too, exactly as handle()
+  // would forward them once pump() reached it; otherwise `undefined`. A stale
+  // transaction, or a statement to prepare again, is left for handle().
+  const immediateParams = (
+    client: string,
+    request: WorkerRequest,
+  ): Record<string, unknown> | undefined => {
     if (
       !rpc.requestNow ||
       busy ||
@@ -223,26 +230,32 @@ export const createDatabaseBroker = (
         request.method !== 'execSql') ||
       (transaction !== undefined && transaction.client !== client)
     )
-      return false;
-    let params = request.params;
+      return undefined;
+    const params: Record<string, unknown> = {...request.params};
     if (params.transactionId !== undefined) {
-      // A stale token is left for handle() to report.
-      if (params.transactionId !== `${epoch}/${transaction?.token}`)
-        return false;
-      params = {...params, transactionId: transaction!.token};
+      if (params.transactionId !== transaction?.id) return undefined;
+      params.transactionId = transaction.token;
     }
     if (request.method === 'executePrepared') {
-      const statementId = connections
+      params.statementId = connections
         .get(client)
         ?.prepared.get(request.params.statementId);
-      // A statement to prepare again is left for handle() too.
-      if (statementId === undefined) return false;
-      params = {...params, statementId} as typeof params;
+      if (params.statementId === undefined) return undefined;
     }
-    const served = rpc.requestNow(request.method, params as never);
+    return params;
+  };
+
+  // Serves a client's statement at once, if it can be, posting its outcome, and
+  // reports whether it did.
+  const serveNow = (
+    client: string,
+    request: WorkerRequest,
+    post: Post,
+  ): boolean => {
+    const params = immediateParams(client, request);
+    const served = params && rpc.requestNow!(request.method, params as never);
     if (!served) return false;
-    if (served.ok) settle(message, served.value);
-    else settleError(message, served.error);
+    settle(post, request.id, served.ok, served.ok ? served.value : served.error);
     return true;
   };
 
@@ -272,10 +285,11 @@ export const createDatabaseBroker = (
           );
           continue;
         }
+        const post: Post = (response) => reply(message.client, response);
         try {
-          settle(message, await handle(message));
+          settle(post, message.request.id, true, await handle(message));
         } catch (error) {
-          settleError(message, error);
+          settle(post, message.request.id, false, error);
         }
       }
     } catch {
@@ -373,11 +387,23 @@ export const createDatabaseBroker = (
         );
         return;
       }
-      if (serveNow(message)) return;
+      if (
+        serveNow(message.client, message.request, (response) =>
+          reply(message.client, response),
+        )
+      )
+        return;
       queue.push({message, bytes});
       queuedBytes += bytes;
       void pump();
     },
+    /**
+     * Serves a statement of the local client at once, if it can be, as a
+     * request queued behind nothing would be served, and posts its response
+     * with `post`. Reports whether it did; if not, nothing happened.
+     */
+    serveLocal: (request: WorkerRequest, post: Post): boolean =>
+      !closed && serveNow(localClient, request, post),
     close: (): void => {
       closed = true;
       for (const connection of connections.values()) {

@@ -10,13 +10,13 @@
     "gzipLabel": "6 KiB"
   },
   "worker": {
-    "raw": 41994,
-    "gzip": 15662,
+    "raw": 42199,
+    "gzip": 15753,
     "gzipLabel": "15 KiB"
   },
   "total": {
-    "raw": 751419,
-    "gzip": 308714,
-    "gzipLabel": "301 KiB"
+    "raw": 751624,
+    "gzip": 308805,
+    "gzipLabel": "302 KiB"
   }
 }

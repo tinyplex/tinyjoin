@@ -2484,7 +2484,7 @@ building indexes, and committing a single insert are quicker than in either.
   longer wait for their code to compile. See
   [custom Workers](https://tinyjoin.org/guides/custom-workers/).
 
-The compressed download is now 301 KiB, up from 295 KiB in v0.3.0.
+The compressed download is now 302 KiB, up from 295 KiB in v0.3.0.
 
 ## v0.3.0
 

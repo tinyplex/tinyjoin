@@ -183,6 +183,7 @@ const startCoordinator = (
       )
       .finally(() => scope.close());
   };
+  const post = (message: WorkerResponse): void => scope.postMessage(message);
   const response = (message: WorkerResponse): void => {
     const entry = pending.get(message.id);
     if (!entry) return;
@@ -414,6 +415,10 @@ const startCoordinator = (
       );
       return;
     }
+    // A statement with nothing waiting ahead of it, which this Worker's own
+    // database owner can serve at once, is served here, without the
+    // bookkeeping that a request waiting its turn needs.
+    if (pending.size === 0 && owner?.serveLocal(request, post)) return;
     const entry = {request, bytes};
     pending.set(request.id, entry);
     pendingBytes += bytes;

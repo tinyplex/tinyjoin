@@ -119,6 +119,7 @@ function harness(
     request,
     requestNow,
     onFailure,
+    serveLocal: broker.serveLocal,
     send(client: string, request: WorkerRequest): void {
       broker.receive({
         kind: 'request',
@@ -201,6 +202,89 @@ describe('database broker scheduling', () => {
       );
       expect(broker.response(owner, 4)).toBeUndefined();
       expect(broker.requestNow).toHaveBeenCalledTimes(2);
+    } finally {
+      broker.close();
+    }
+  });
+
+  it("serves the owner tab's statement without queueing it", async () => {
+    const broker = harness({servesNow: true});
+    const posted: WorkerResponse[] = [];
+    const post = (response: WorkerResponse): void => void posted.push(response);
+    const sql = 'SELECT id FROM items WHERE id = $1';
+    try {
+      expect(broker.serveLocal(query(1, [1]), post)).toBe(true);
+      expect(posted).toEqual([
+        {
+          v: PROTOCOL_VERSION,
+          id: 1,
+          ok: true,
+          result: {command: 'SELECT', params: {sql, params: [1]}},
+        },
+      ]);
+
+      // A statement the engine does not hold is left to be prepared again,
+      // and another client's transaction holds the owner's statements back.
+      const unprepared: WorkerRequest = {
+        v: PROTOCOL_VERSION,
+        id: 2,
+        method: 'executePrepared',
+        params: {statementId: 2, params: []},
+      };
+      expect(broker.serveLocal(unprepared, post)).toBe(false);
+      broker.send(follower, begin(3));
+      await vi.waitFor(() =>
+        expect(broker.response(follower, 3)).toMatchObject({ok: true}),
+      );
+      expect(broker.serveLocal(query(4, [4]), post)).toBe(false);
+      broker.send(follower, {
+        v: PROTOCOL_VERSION,
+        id: 5,
+        method: 'commitTransaction',
+        params: {transactionId: `${epoch}/tx-1`},
+      });
+      await vi.waitFor(() =>
+        expect(broker.response(follower, 5)).toMatchObject({ok: true}),
+      );
+
+      // The owner's own transaction is served with the engine's token, and a
+      // stale token is left for the queue to report.
+      broker.send(owner, begin(6));
+      await vi.waitFor(() =>
+        expect(broker.response(owner, 6)).toMatchObject({ok: true}),
+      );
+      expect(broker.serveLocal(query(7, [7], true), post)).toBe(true);
+      expect(broker.requestNow).toHaveBeenLastCalledWith('executeSql', {
+        sql,
+        params: [7],
+        transactionId: 'tx-1',
+      });
+      const stale = query(8, [8]);
+      Object.assign(stale.params!, {transactionId: 'old-owner/tx-1'});
+      expect(broker.serveLocal(stale, post)).toBe(false);
+      expect(posted.map(({id}) => id)).toEqual([1, 7]);
+
+      // An error that leaves the engine beyond use is posted, and then
+      // retires the owner, which serves nothing more.
+      broker.requestNow.mockReturnValueOnce({
+        ok: false,
+        error: Object.assign(new Error('Injected poisoning'), {
+          code: 'STORAGE_ENGINE_POISONED',
+        }),
+      } as never);
+      expect(broker.serveLocal(query(9, [9], true), post)).toBe(true);
+      const error = {
+        code: 'STORAGE_ENGINE_POISONED',
+        message: 'Injected poisoning',
+      };
+      expect(posted.at(-1)).toEqual({
+        v: PROTOCOL_VERSION,
+        id: 9,
+        ok: false,
+        error,
+      });
+      expect(broker.onFailure).toHaveBeenCalledExactlyOnceWith(error);
+      expect(broker.serveLocal(query(10, [10]), post)).toBe(false);
     } finally {
       broker.close();
     }
