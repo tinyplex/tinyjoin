@@ -271,6 +271,13 @@ Done:
   key's columns into another, and encoding that. Engine-only, reads by key
   took 8% less time and updates and deletes by key 7% less, for 121 bytes
   compressed.
+- A record is encoded into one buffer, sized for its values and the largest
+  header they could need, with the header written in front of the values
+  once they are in, rather than into a growing buffer copied behind a header
+  into another, from separate lists of the columns, their values, their
+  ends, and which are null. A written row allocates five fewer blocks:
+  engine-only, inserts took 7-9% fewer instructions, and updates by key and
+  upserts 4% fewer, and the engine shrank a little.
 
 Found along the way:
 

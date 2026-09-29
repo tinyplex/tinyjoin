@@ -429,19 +429,20 @@ pub(crate) fn secondary_index_primary_key<'a>(entry: &'a [u8], prefix: &[u8]) ->
 /// Encodes a normalized row as a page format 3 record. The primary key is not repeated: it is the
 /// entry's B-tree key.
 pub(crate) fn encode_row(schema: &TableDefinition, row: &Row) -> Result<Vec<u8>> {
-    let stored = stored_columns(schema);
-    let mut values = Vec::with_capacity(stored.len());
-    for column in &stored {
-        values.push(StoredValue::Value(row.get(&column.name).ok_or_else(
-            || {
-                codec_argument(format!(
-                    "Row for `{}` is missing column `{}`",
-                    schema.name, column.name
-                ))
-            },
-        )?));
+    let mut columns = Vec::with_capacity(schema.columns.len());
+    for column in &schema.columns {
+        if schema.primary_key.contains(&column.name) {
+            continue;
+        }
+        let value = row.get(&column.name).ok_or_else(|| {
+            codec_argument(format!(
+                "Row for `{}` is missing column `{}`",
+                schema.name, column.name
+            ))
+        })?;
+        columns.push((column, StoredValue::Value(value)));
     }
-    encode_stored_values(schema, &stored, &values)
+    encode_stored_values(schema, &columns)
 }
 
 /// Encodes a row given as its columns' values in schema order, which planning checked and
@@ -451,13 +452,14 @@ pub(crate) fn encode_row_values(
     layout: &RecordLayout,
     values: &[&Value],
 ) -> Result<Vec<u8>> {
-    let mut stored = Vec::with_capacity(layout.stored.len());
-    let mut stored_values = Vec::with_capacity(layout.stored.len());
+    let mut columns = Vec::with_capacity(layout.stored.len());
     for position in &layout.stored {
-        stored.push(&schema.columns[*position]);
-        stored_values.push(StoredValue::Value(values[*position]));
+        columns.push((
+            &schema.columns[*position],
+            StoredValue::Value(values[*position]),
+        ));
     }
-    encode_stored_values(schema, &stored, &stored_values)
+    encode_stored_values(schema, &columns)
 }
 
 /// Encodes the record of `record`'s row with the columns `assigned` gives values, by schema
@@ -469,20 +471,19 @@ pub(crate) fn encode_updated_record(
     assigned: &[Option<&Value>],
 ) -> Result<Vec<u8>> {
     let (schema, layout) = (record.schema, record.layout);
-    let mut stored = Vec::with_capacity(layout.stored.len());
-    let mut values = Vec::with_capacity(layout.stored.len());
+    let mut columns = Vec::with_capacity(layout.stored.len());
     for (position, index) in layout.stored.iter().enumerate() {
         let column = &schema.columns[*index];
-        stored.push(column);
-        values.push(match assigned[*index] {
+        let value = match assigned[*index] {
             Some(value) => StoredValue::Value(value),
             None if position >= record.count => {
                 StoredValue::Value(column.default.as_ref().unwrap_or(&Value::Null))
             }
             None => StoredValue::Encoded(record.stored_bytes(position)?),
-        });
+        };
+        columns.push((column, value));
     }
-    encode_stored_values(schema, &stored, &values)
+    encode_stored_values(schema, &columns)
 }
 
 /// A stored column's value as a record is written with it: a value to encode, or the encoding of
@@ -492,74 +493,104 @@ enum StoredValue<'a> {
     Encoded(Option<&'a [u8]>),
 }
 
-/// Encodes a record from its stored columns and their values, in record order.
+impl StoredValue<'_> {
+    /// Room for the value's encoding: exactly the bytes of an encoded value or a string, and at
+    /// most a number's, for any other scalar. JSON takes more as its text needs it.
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Encoded(bytes) => bytes.map_or(0, <[u8]>::len),
+            Self::Value(Value::String(text)) => text.len(),
+            Self::Value(_) => 8,
+        }
+    }
+}
+
+/// Encodes a record from its stored columns and their values, in record order. The values are
+/// written first, into a buffer with room for the largest header they could need, and the header
+/// then in front of them, so that the record is the buffer they were written in.
 fn encode_stored_values(
     schema: &TableDefinition,
-    stored: &[&crate::ColumnDefinition],
-    values: &[StoredValue<'_>],
+    columns: &[(&crate::ColumnDefinition, StoredValue<'_>)],
 ) -> Result<Vec<u8>> {
-    let mut data = Vec::new();
-    let mut ends = Vec::with_capacity(stored.len());
-    let mut nulls = Vec::with_capacity(stored.len());
-    for (column, value) in stored.iter().zip(values) {
-        match value {
+    let largest_header =
+        RECORD_HEADER_BYTES + columns.len().div_ceil(8) + columns.len().saturating_sub(1) * 4;
+    let mut data = Vec::with_capacity(
+        columns
+            .iter()
+            .map(|(_, value)| value.capacity())
+            .sum::<usize>()
+            + largest_header,
+    );
+    // Where each column's value ends in the data, and whether it is NULL.
+    let mut ends = Vec::with_capacity(columns.len());
+    for (column, value) in columns {
+        let null = match value {
             StoredValue::Value(value) => {
-                nulls.push(value.is_null());
                 if !value.is_null() {
                     encode_value(column, value, &mut data, &schema.name)?;
                 }
+                value.is_null()
             }
             StoredValue::Encoded(bytes) => {
-                nulls.push(bytes.is_none());
                 data.extend_from_slice(bytes.unwrap_or_default());
+                bytes.is_none()
             }
-        }
-        ends.push(data.len());
+        };
+        ends.push((data.len(), null));
     }
 
     // Omit trailing columns that equal their defaults. A column's default is a literal no later
     // statement can change, so this is canonical, and ADD COLUMN needs no rewrite.
-    let mut count = stored.len();
+    let mut count = columns.len();
     while count > 0 {
-        let start = if count >= 2 { ends[count - 2] } else { 0 };
-        let stored_value = (!nulls[count - 1]).then(|| &data[start..ends[count - 1]]);
-        if !is_default(stored[count - 1], stored_value, &schema.name)? {
+        let start = if count >= 2 { ends[count - 2].0 } else { 0 };
+        let (end, null) = ends[count - 1];
+        let stored_value = (!null).then(|| &data[start..end]);
+        if !is_default(columns[count - 1].0, stored_value, &schema.name)? {
             break;
         }
         count -= 1;
     }
-    data.truncate(if count == 0 { 0 } else { ends[count - 1] });
+    let ends = &ends[..count];
+    let values = ends.last().map_or(0, |(end, _)| *end);
+    data.truncate(values);
 
-    let largest_offset = if count >= 2 { ends[count - 2] } else { 0 };
+    let largest_offset = if count >= 2 { ends[count - 2].0 } else { 0 };
     let (width_code, width) = offset_width(largest_offset);
-    let has_nulls = nulls[..count].iter().any(|null| *null);
+    let has_nulls = ends.iter().any(|(_, null)| *null);
     let bitmap_bytes = if has_nulls { count.div_ceil(8) } else { 0 };
-    let total = RECORD_HEADER_BYTES + bitmap_bytes + count.saturating_sub(1) * width + data.len();
-    if total > MAX_PAGED_VALUE_BYTES {
+    let header = RECORD_HEADER_BYTES + bitmap_bytes + count.saturating_sub(1) * width;
+    if header + values > MAX_PAGED_VALUE_BYTES {
         return Err(value_too_large(format!(
             "An encoded row cannot exceed {MAX_PAGED_VALUE_BYTES} bytes"
         )));
     }
-    let mut record = Vec::with_capacity(total);
-    record.push(width_code | if has_nulls { RECORD_HAS_NULLS } else { 0 });
-    record.push(u8::try_from(count).map_err(|_| {
+    let count = u8::try_from(count).map_err(|_| {
         codec_argument(format!(
             "Table `{}` cannot store more than 255 non-key columns",
             schema.name
         ))
-    })?);
-    if has_nulls {
-        let mut bitmap = vec![0u8; bitmap_bytes];
-        for (index, _) in nulls[..count].iter().enumerate().filter(|(_, null)| **null) {
+    })?;
+    data.resize(header + values, 0);
+    data.copy_within(..values, header);
+    data[0] = width_code | if has_nulls { RECORD_HAS_NULLS } else { 0 };
+    data[1] = count;
+    let bitmap = &mut data[RECORD_HEADER_BYTES..RECORD_HEADER_BYTES + bitmap_bytes];
+    bitmap.fill(0);
+    for (index, (_, null)) in ends.iter().enumerate() {
+        if *null {
             bitmap[index / 8] |= 1 << (index % 8);
         }
-        record.extend_from_slice(&bitmap);
     }
-    for end in &ends[..count.saturating_sub(1)] {
-        record.extend_from_slice(&(*end as u32).to_le_bytes()[..width]);
+    let mut at = RECORD_HEADER_BYTES + bitmap_bytes;
+    for (end, _) in &ends[..ends.len().saturating_sub(1)] {
+        // Byte by byte: copying a slice of the offset's width would call memcpy.
+        for byte in 0..width {
+            data[at + byte] = (end >> (8 * byte)) as u8;
+        }
+        at += width;
     }
-    record.extend_from_slice(&data);
-    Ok(record)
+    Ok(data)
 }
 
 /// Decodes a whole stored table entry, as [`StoredRecord::to_row`] does.
@@ -1024,14 +1055,6 @@ impl<'a> StoredRecord<'a> {
 }
 
 /// A table's non-key columns, in schema order: the columns a row record stores.
-fn stored_columns(schema: &TableDefinition) -> Vec<&crate::ColumnDefinition> {
-    schema
-        .columns
-        .iter()
-        .filter(|column| !schema.primary_key.contains(&column.name))
-        .collect()
-}
-
 /// The value a row holds for a column its record omits: the column's default, normalized as it
 /// would be if it had been stored.
 fn stored_default(column: &crate::ColumnDefinition) -> ValueRef<'_> {
