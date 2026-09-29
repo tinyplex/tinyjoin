@@ -7,11 +7,11 @@ and are driven from the page by the same workloads in the same Chromium.
 
 These numbers are published to track progress, not to win an argument.
 TinyJoin's engine is young. It is the smallest download and the quickest to
-open, and it reads every row, runs `LIKE` scans, groups, joins, and builds
-indexes more quickly than either alternative. Most other reads and writes take
-one to about one and three-quarter times as long as the faster of them. Closing
-that gap is ongoing work, and the suite is designed to be rerun after every
-optimization.
+open, and it reads every row, runs `LIKE` scans, groups, joins, builds
+indexes, and commits single inserts more quickly than either alternative. Most
+other reads and writes take one to 1.6 times as long as the faster of them.
+Closing that gap is ongoing work, and the suite is designed to be rerun after
+every optimization.
 
 {{benchmarks.environment}}
 
@@ -65,35 +65,36 @@ In the results above, TinyJoin is the smallest download and the quickest to
 create a new database: PGlite initializes a new PostgreSQL cluster on first
 open. It reads all 10,000 rows in order four times as fast as either engine,
 runs `LIKE` scans, `GROUP BY`, and joins faster than either, builds indexes
-faster than either, and commits single inserts and deletes rows in bulk faster
+and commits single inserts faster than either, and deletes rows in bulk faster
 than SQLite. Indexed range aggregates and point reads take as long as in the
 faster engine. The rest is slower, but no longer by orders of magnitude: in
 v0.3.0, most workloads took 10 to 1,400 times as long as the fastest engine,
 and none now takes as much as twice as long. The remaining gaps point at the
 work ahead.
 
-- **Single statements** cost about 29 to 37 microseconds each, which is 1.0
-  to 1.5 times SQLite's cost for a point read, or an update, upsert, or delete
+- **Single statements** cost about 30 to 37 microseconds each, which is 1.0
+  to 1.6 times SQLite's cost for a point read, or an update, upsert, or delete
   by primary key. About 14 microseconds of every round trip is the message
   between the page and the Worker, which every engine pays. A point read costs
-  as much as SQLite's, but a write in a transaction costs 6 to 13 microseconds
-  more: in TinyJoin's Worker, in planning, checking, and staging the row, and
-  in its share of the commit.
+  as much as SQLite's, but a write in a transaction costs 12 to 14
+  microseconds more: in TinyJoin's Worker, in planning, checking, and staging
+  the row, and in its share of the commit.
 - **Scans** take under a tenth longer than SQLite's. TinyJoin reads each
   column in place from the stored row, and each leaf's rows from its own copy
   of the leaf, and compares an integer column with integer bounds directly. A
   range `UPDATE` inside a transaction also passes over the rows the
   transaction has already changed, finding them leaf by leaf, and takes about
-  1.2 times as long as SQLite's.
+  1.3 times as long as SQLite's.
 - **Inserts** one at a time take about 1.3 to 1.4 times as long as SQLite's,
   for the same reasons as single statements, and 200 at a time about a tenth
   longer.
-- **Bulk deletes** take about 1.4 to 1.7 times as long as PGlite's, which, like
+- **Bulk deletes** take about 1.3 times as long as PGlite's, which, like
   PostgreSQL, only marks deleted rows and leaves reclaiming their space to a
   later vacuum. TinyJoin removes each row and its index entries at once, and
   rewrites every page they occupied, and is still quicker than SQLite at both.
 - **Committing each insert alone** is dominated by the storage flush, one per
-  commit. It takes about as long as PGlite's commits, and a quarter as long as
+  commit, and writes only the pages the insert changed and the superblock. It
+  takes a tenth less time than PGlite's commits, and a quarter as long as
   SQLite's.
 - **Reopening validates every row and index entry**, so a populated database
   reopens a little more slowly than in SQLite.
@@ -136,23 +137,23 @@ In memory, TinyJoin is again the quickest to open, and still reads every row,
 runs `LIKE` scans, groups, and joins faster than either engine. Comparing the
 two sets of results shows what storage costs each engine:
 
-- **Committing each insert alone** takes TinyJoin about 94 microseconds in
-  memory and 380 with OPFS, so most of an OPFS commit is the storage flush.
+- **Committing each insert alone** takes TinyJoin about 87 microseconds in
+  memory and 440 with OPFS, so most of an OPFS commit is the storage flush.
   SQLite commits in memory in about 28 microseconds. TinyJoin still writes,
   checksums, and records every page each commit changes, as it does for OPFS.
 - **Bulk deletes and index builds** take TinyJoin about as long in memory as
   with OPFS, since it writes the pages they change in a few large calls, while
-  SQLite's take a fifth to a half as long in memory, and PGlite's a tenth less,
-  or half for index builds. What remains is TinyJoin's engine, which takes
-  about 1.7 to 2.1 times as long as the others to delete thousands of rows, and
-  1.5 times as long to build indexes.
+  SQLite's take a quarter to two-fifths as long in memory, and PGlite's a
+  quarter to a third less. What remains is TinyJoin's engine, which takes about
+  1.8 to 2.0 times as long as the others to delete thousands of rows, and 1.6
+  times as long to build indexes.
 - **Single statements and transactions** cost about the same either way: a
   transaction commits once, and a single statement's time is spent between the
   page, the Worker, and the engine.
 
-Every engine's reads ran a tenth to a fifth more slowly in the in-memory run,
-which followed the run above on the same machine, so compare engines within one
-run rather than across the two.
+The in-memory run followed the run above on the same machine, and each
+engine's reads took about as long in both. Machine load still differs between
+runs, so compare engines within one run rather than across the two.
 
 ## Features are not equivalent
 
