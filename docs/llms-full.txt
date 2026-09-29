@@ -1905,104 +1905,6 @@ engine.
   large one as quickly as a small one. The full check of every row and index
   entry runs only when an application calls check().
 
-## In memory
-
-The same workloads also run with each engine keeping its database in memory
-rather than in OPFS: TinyJoin's `memory://`, SQLite's `:memory:`, and PGlite's
-`memory://`. Nothing reaches storage, so these results measure each engine's
-own work, and their difference from the results above is what its storage
-costs. Reopening a database does not apply.
-
-Measured on 2026-09-29 with headless Chromium 153.0.8010.12 on macOS (25.5.0), Apple M2, 8 logical CPUs, 16 GiB RAM. Each time is the median of 9 samples.
-
-## Download in memory
-
-| Size | TinyJoin | SQLite | PGlite |
-| --- | ---: | ---: | ---: |
-| Download (uncompressed) | **730 KiB** | 1.0 MiB | 16.6 MiB |
-| Download (gzip) | **299 KiB** | 457 KiB | 5.6 MiB |
-| Download (Brotli) | **243 KiB** | 395 KiB | 3.8 MiB |
-
-## Startup in memory
-
-| Median time | TinyJoin | SQLite | PGlite |
-| --- | ---: | ---: | ---: |
-| Load, create an empty database, and read from it | **19.5 ms** | 33.6 ms | 774 ms |
-
-## Create in memory
-
-| Median time | TinyJoin | SQLite | PGlite |
-| --- | ---: | ---: | ---: |
-| 1,000 INSERTs, each committed alone | 82.5 ms | **27.7 ms** | 124 ms |
-| One transaction of 10,000 INSERTs | 261 ms | **198 ms** | 1.03 s |
-| One transaction of 10,000 INSERTs, indexed text column | 270 ms | **210 ms** | 1.06 s |
-| One transaction of 50 INSERTs, 200 rows each | 51.5 ms | **39.5 ms** | 91.4 ms |
-
-## Read in memory
-
-| Median time | TinyJoin | SQLite | PGlite |
-| --- | ---: | ---: | ---: |
-| 1,000 SELECTs by primary key | 29.0 ms | **26.0 ms** | 135 ms |
-| 100 range aggregates, no index | 47.7 ms | **43.3 ms** | 76.5 ms |
-| 100 LIKE aggregates on a text column | **113 ms** | 142 ms | 183 ms |
-| 100 range aggregates, indexed column | 4.10 ms | **3.50 ms** | 18.0 ms |
-| Read all 10,000 rows in order | **10.8 ms** | 45.0 ms | 44.7 ms |
-| 10 GROUP BY aggregates over 10,000 rows | **16.1 ms** | 31.3 ms | 20.9 ms |
-| 100 joins: one customer’s orders from 5,000 | **16.2 ms** | 19.8 ms | 32.0 ms |
-
-## Update in memory
-
-| Median time | TinyJoin | SQLite | PGlite |
-| --- | ---: | ---: | ---: |
-| One transaction of 1,000 UPDATEs by primary key | 32.9 ms | **19.2 ms** | 121 ms |
-| One transaction of 100 range UPDATEs, no index | 61.1 ms | **40.3 ms** | 79.0 ms |
-| One transaction of 1,000 upserts, half of them new | 33.9 ms | **21.0 ms** | 125 ms |
-
-## Delete in memory
-
-| Median time | TinyJoin | SQLite | PGlite |
-| --- | ---: | ---: | ---: |
-| One transaction of 1,000 DELETEs by primary key | 31.1 ms | **17.0 ms** | 115 ms |
-| One DELETE matching a LIKE pattern | 4.70 ms | **2.50 ms** | 3.00 ms |
-| One DELETE of 8,000 rows by indexed range | 7.00 ms | **4.10 ms** | 4.70 ms |
-
-## Schema in memory
-
-| Median time | TinyJoin | SQLite | PGlite |
-| --- | ---: | ---: | ---: |
-| Create two indexes over 10,000 rows | 12.9 ms | **9.40 ms** | 10.6 ms |
-
-In memory, TinyJoin is again the quickest to open, and still reads every row,
-runs `LIKE` scans, groups, and joins faster than either engine. Without
-storage costs, though, it is the slowest at deleting rows in bulk and at
-building indexes:
-
-| Engine | Fastest | Second | Slowest |
-| --- | ---: | ---: | ---: |
-| TinyJoin | 5 | 11 | 3 |
-| SQLite | 14 | 3 | 2 |
-| PGlite | 0 | 5 | 14 |
-
-Comparing the two sets of results shows what storage costs each engine:
-
-- **Committing each insert alone** takes TinyJoin about 83 microseconds in
-  memory and 436 with OPFS, so most of an OPFS commit is the storage flush.
-  SQLite commits in memory in about 28 microseconds. TinyJoin still writes,
-  checksums, and records every page each commit changes, as it does for OPFS.
-- **Bulk deletes and index builds** take TinyJoin about as long in memory as
-  with OPFS, since it writes the pages they change in a few large calls, while
-  SQLite's take a quarter to two-fifths as long in memory, and PGlite's about a
-  quarter less. What remains is TinyJoin's engine, which takes about 1.7 to 1.9
-  times as long as the faster engine to delete thousands of rows, and 1.4 times
-  as long to build indexes.
-- **Single statements and transactions** cost about the same either way: a
-  transaction commits once, and a single statement's time is spent between the
-  page, the Worker, and the engine.
-
-The in-memory run followed the run above on the same machine, and each
-engine's reads took about as long in both. Machine load still differs between
-runs, so compare engines within one run rather than across the two.
-
 ## Features are not equivalent
 
 The workloads use only SQL that all three engines accept, which is TinyJoin's
@@ -2156,7 +2058,6 @@ dependencies. The runner installs them on first use.
 npm ci
 npm run build
 npm run bench:compare -- --publish --samples 9
-npm run bench:compare -- --publish --storage memory --samples 9
 npm run build:docs
 ```
 
@@ -2168,8 +2069,7 @@ slows every engine, and a burst of load can land on some workloads and not
 others.
 
 `--publish` requires the full suite and writes every sample, the environment,
-and the list of downloaded files to `site/data/benchmarks.json`, or with
-`--storage memory` to `site/data/benchmarks-memory.json`, from which the
+and the list of downloaded files to `site/data/benchmarks.json`, from which the
 documentation build renders these charts.
 
 When working on TinyJoin's performance, run a subset instead. The runner prints

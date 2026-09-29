@@ -23,12 +23,9 @@ const STORAGE = {
   opfs: {tinyjoin: 'opfs://', sqlite: 'opfs-sahpool', pglite: 'opfs-ahp://'},
   memory: {tinyjoin: 'memory://', sqlite: ':memory:', pglite: 'memory://'},
 };
-// Each storage kind publishes its own results, which the benchmarks guide
-// charts side by side.
-const PUBLISHED = {
-  opfs: resolve(root, 'site/data/benchmarks.json'),
-  memory: resolve(root, 'site/data/benchmarks-memory.json'),
-};
+// The OPFS results are published for the benchmarks guide to chart. The
+// in-memory suite runs for comparison, with its report written by --out.
+const PUBLISHED = resolve(root, 'site/data/benchmarks.json');
 
 const {values: options} = parseArgs({
   options: {
@@ -51,8 +48,8 @@ if (options.help) {
   --storage kind     opfs or memory (default: opfs)
   --timeout s        seconds before a sample is abandoned (default: 60)
   --out file         write the full JSON report
-  --publish          full default run of one storage kind, written to
-                     site/data/benchmarks.json, or benchmarks-memory.json`);
+  --publish          full default OPFS run, written to
+                     site/data/benchmarks.json`);
   process.exit(0);
 }
 
@@ -72,8 +69,8 @@ for (const engine of engines) if (!ENGINES.includes(engine)) throw new Error(`Un
 for (const id of selected) if (!ALL.some((workload) => workload.id === id)) throw new Error(`Unknown workload: ${id}`);
 if (!STORAGE[storage]) throw new Error(`Unknown storage: ${storage}`);
 if (!(samples >= 1) || !(timeoutMs > 0)) throw new Error('--samples and --timeout must be positive');
-if (options.publish && (options.workloads || options.engines !== ENGINES.join(',') || samples < 5 || options.out)) {
-  throw new Error('--publish takes the full default suite: all engines and workloads, at least 5 samples, and no --out');
+if (options.publish && (options.workloads || options.engines !== ENGINES.join(',') || samples < 5 || options.out || storage !== 'opfs')) {
+  throw new Error('--publish takes the full default OPFS suite: all engines and workloads, at least 5 samples, and no --out');
 }
 
 // Byte sizes depend on the zlib bundled with Node, so published sizes use the
@@ -254,7 +251,7 @@ const cell = (result) =>
 
 const save = async () => {
   const text = `${JSON.stringify(report, null, 2)}\n`;
-  if (options.publish) await writeFile(PUBLISHED[storage], text);
+  if (options.publish) await writeFile(PUBLISHED, text);
   if (options.out) await writeFile(resolve(options.out), text);
 };
 
@@ -313,4 +310,4 @@ if (report.results.some((entry) => !entry.checksAgree)) {
   process.exitCode = 1;
   console.error('Engines returned different results for at least one workload; see above.');
 }
-if (options.publish) console.log(`\nWrote ${PUBLISHED[storage]}. Run npm run build:docs to update the site.`);
+if (options.publish) console.log(`\nWrote ${PUBLISHED}. Run npm run build:docs to update the site.`);

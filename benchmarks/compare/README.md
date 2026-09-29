@@ -16,8 +16,8 @@ npm run bench:compare -- --help
   and a check that must agree across engines.
 - `app/engines/` holds one adapter per engine, behind the same five calls.
 - `run.mjs` builds the page with Vite, serves it, drives Chromium, and prints
-  medians. `--publish` writes `site/data/benchmarks.json` for the website,
-  or `site/data/benchmarks-memory.json` with `--storage memory`.
+  medians. `--publish` writes the OPFS results to `site/data/benchmarks.json`
+  for the website; `--out` saves any run's report, in memory or not.
 
 The method, the results, and their limits are written up in
 [the benchmarks guide](https://tinyjoin.org/guides/benchmarks/), whose source

@@ -21,7 +21,6 @@
     "AGENTS.md",
     "site/data/sizes.json",
     "site/data/benchmarks.json",
-    "site/data/benchmarks-memory.json",
     "THIRD_PARTY_NOTICES.txt",
     "RUST_STANDARD_LIBRARY_NOTICES.html"
   ],

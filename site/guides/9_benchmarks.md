@@ -111,71 +111,6 @@ engine.
   large one as quickly as a small one. The full check of every row and index
   entry runs only when an application calls check().
 
-## In memory
-
-The same workloads also run with each engine keeping its database in memory
-rather than in OPFS: TinyJoin's `memory://`, SQLite's `:memory:`, and PGlite's
-`memory://`. Nothing reaches storage, so these results measure each engine's
-own work, and their difference from the results above is what its storage
-costs. Reopening a database does not apply.
-
-{{benchmarks.memory-environment}}
-
-## Download in memory
-
-{{benchmarks.memory-download}}
-
-## Startup in memory
-
-{{benchmarks.memory-startup}}
-
-## Create in memory
-
-{{benchmarks.memory-create}}
-
-## Read in memory
-
-{{benchmarks.memory-read}}
-
-## Update in memory
-
-{{benchmarks.memory-update}}
-
-## Delete in memory
-
-{{benchmarks.memory-delete}}
-
-## Schema in memory
-
-{{benchmarks.memory-schema}}
-
-In memory, TinyJoin is again the quickest to open, and still reads every row,
-runs `LIKE` scans, groups, and joins faster than either engine. Without
-storage costs, though, it is the slowest at deleting rows in bulk and at
-building indexes:
-
-{{benchmarks.memory-placings}}
-
-Comparing the two sets of results shows what storage costs each engine:
-
-- **Committing each insert alone** takes TinyJoin about 83 microseconds in
-  memory and 436 with OPFS, so most of an OPFS commit is the storage flush.
-  SQLite commits in memory in about 28 microseconds. TinyJoin still writes,
-  checksums, and records every page each commit changes, as it does for OPFS.
-- **Bulk deletes and index builds** take TinyJoin about as long in memory as
-  with OPFS, since it writes the pages they change in a few large calls, while
-  SQLite's take a quarter to two-fifths as long in memory, and PGlite's about a
-  quarter less. What remains is TinyJoin's engine, which takes about 1.7 to 1.9
-  times as long as the faster engine to delete thousands of rows, and 1.4 times
-  as long to build indexes.
-- **Single statements and transactions** cost about the same either way: a
-  transaction commits once, and a single statement's time is spent between the
-  page, the Worker, and the engine.
-
-The in-memory run followed the run above on the same machine, and each
-engine's reads took about as long in both. Machine load still differs between
-runs, so compare engines within one run rather than across the two.
-
 ## Features are not equivalent
 
 The workloads use only SQL that all three engines accept, which is TinyJoin's
@@ -304,7 +239,6 @@ dependencies. The runner installs them on first use.
 npm ci
 npm run build
 npm run bench:compare -- --publish --samples 9
-npm run bench:compare -- --publish --storage memory --samples 9
 npm run build:docs
 ```
 
@@ -316,8 +250,7 @@ slows every engine, and a burst of load can land on some workloads and not
 others.
 
 `--publish` requires the full suite and writes every sample, the environment,
-and the list of downloaded files to `site/data/benchmarks.json`, or with
-`--storage memory` to `site/data/benchmarks-memory.json`, from which the
+and the list of downloaded files to `site/data/benchmarks.json`, from which the
 documentation build renders these charts.
 
 When working on TinyJoin's performance, run a subset instead. The runner prints

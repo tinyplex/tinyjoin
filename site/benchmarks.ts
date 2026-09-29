@@ -1,12 +1,10 @@
 import {readFileSync} from 'node:fs';
 
 // Comparative benchmark results are measured by benchmarks/compare/run.mjs
-// --publish into site/data/benchmarks.json, and with --storage memory into
-// site/data/benchmarks-memory.json. Reading committed data keeps the
+// --publish into site/data/benchmarks.json. Reading committed data keeps the
 // documentation build hermetic, as for site/data/sizes.json.
 //
-// Markdown sources use {{benchmarks.<name>}} placeholders, and
-// {{benchmarks.memory-<name>}} for the in-memory results. Text placeholders
+// Markdown sources use {{benchmarks.<name>}} placeholders. Text placeholders
 // become Markdown before TinyDocs parses a page. A chart placeholder stands
 // alone in its paragraph. On the website, that paragraph is swapped for grouped
 // bar charts after rendering, since guides render Markdown without inline
@@ -325,17 +323,6 @@ const environment = (report: Report): string => {
   );
 };
 
-const MEMORY = 'memory-';
-
-// A placeholder's report, and its name within that report.
-const named = (
-  reports: {opfs: Report; memory: Report},
-  name: string,
-): [Report, string] =>
-  name.startsWith(MEMORY)
-    ? [reports.memory, name.slice(MEMORY.length)]
-    : [reports.opfs, name];
-
 const renderText = (report: Report, name: string): string => {
   switch (name) {
     case 'versions':
@@ -360,41 +347,26 @@ export type Benchmarks = {
   chartReplacers: [RegExp, string][];
 };
 
-const createBenchmarks = (reports: {
-  opfs: Report;
-  memory: Report;
-}): Benchmarks => {
-  // Each report's charts: its download sizes, and one for each workload group,
-  // named by the group, and by memory- and the group for the in-memory results.
-  const charts = new Map<string, [Report, Chart]>();
-  for (const [prefix, report] of [
-    ['', reports.opfs],
-    [MEMORY, reports.memory],
-  ] as const) {
-    charts.set(prefix + 'download', [report, downloadChart(report)]);
-    for (const group of new Set(
-      report.results.map(({group}) => group.toLowerCase()),
-    )) {
-      charts.set(prefix + group, [
-        report,
-        timeChart(report, groupIds(report, group)),
-      ]);
-    }
+const createBenchmarks = (report: Report): Benchmarks => {
+  // The report's charts: its download sizes, and one for each workload group,
+  // named by the group.
+  const charts = new Map<string, Chart>([['download', downloadChart(report)]]);
+  for (const group of new Set(
+    report.results.map(({group}) => group.toLowerCase()),
+  )) {
+    charts.set(group, timeChart(report, groupIds(report, group)));
   }
   return {
     renderText: (markdown) =>
       markdown.replaceAll(PLACEHOLDER, (placeholder, name) =>
-        charts.has(name) ? placeholder : renderText(...named(reports, name)),
+        charts.has(name) ? placeholder : renderText(report, name),
       ),
     renderTables: (markdown) =>
-      markdown.replaceAll(
-        PLACEHOLDER,
-        (placeholder, name) => {
-          const chart = charts.get(name)?.[1];
-          return chart ? chartMarkdown(chart) : placeholder;
-        },
-      ),
-    chartReplacers: [...charts].map(([name, [report, chart]]) => [
+      markdown.replaceAll(PLACEHOLDER, (placeholder, name) => {
+        const chart = charts.get(name);
+        return chart ? chartMarkdown(chart) : placeholder;
+      }),
+    chartReplacers: [...charts].map(([name, chart]) => [
       new RegExp(`<p>\\{\\{benchmarks\\.${name}\\}\\}</p>`, 'g'),
       // A replacement string, in which $ would otherwise be special.
       `<div class="charts">${chartHtml(report, chart)}</div>`.replaceAll(
@@ -407,11 +379,7 @@ const createBenchmarks = (reports: {
 
 let benchmarks: Benchmarks | undefined;
 
-const readReport = (file: string): Report =>
-  JSON.parse(readFileSync(file, 'utf8'));
-
 export const getBenchmarks = (): Benchmarks =>
-  (benchmarks ??= createBenchmarks({
-    opfs: readReport('site/data/benchmarks.json'),
-    memory: readReport('site/data/benchmarks-memory.json'),
-  }));
+  (benchmarks ??= createBenchmarks(
+    JSON.parse(readFileSync('site/data/benchmarks.json', 'utf8')),
+  ));
