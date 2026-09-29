@@ -34,8 +34,11 @@ pub(crate) const BITMAP_PAGE_COUNT: usize = BITMAP_CHUNK_COUNT * 2;
 pub(crate) const FIRST_DATA_PAGE_ID: PageId =
     SUPERBLOCK_PAGE_COUNT as PageId + BITMAP_PAGE_COUNT as PageId;
 
-const PAGE_MAGIC: &[u8; 8] = b"TGRPAGE\0";
-const PAGE_FORMAT_VERSION: u16 = 1;
+pub(crate) const PAGE_MAGIC: &[u8; 8] = b"TGRPAGE\0";
+// Page format 3 writes envelope version 2 into every page. v0.1.0 through v0.3.0 check a page's
+// checksum and then this version before anything else, so they refuse a page format 3 database
+// with UNSUPPORTED_PAGE, where its larger superblock would otherwise fail their checks as corrupt.
+const PAGE_FORMAT_VERSION: u16 = 2;
 const PAGE_FLAGS: u16 = 0;
 const PAGE_CRC_OFFSET: usize = 28;
 
@@ -1288,7 +1291,7 @@ mod tests {
             .unwrap();
         for (offset, value) in [
             (0, b'X'),
-            (8, 2),
+            (8, 3),
             (10, 1),
             (12, 43),
             (20, 99),
@@ -1301,9 +1304,10 @@ mod tests {
             assert_eq!(Page::decode(&corrupted).unwrap_err().code, "INVALID_PAGE");
         }
 
-        for offset in [8, 10] {
+        // The envelope of v0.1.0 through v0.3.0, a later one, and flags this build does not know.
+        for (offset, value) in [(8, 1), (8, 3), (10, 1)] {
             let mut unsupported = original;
-            unsupported[offset] = if offset == 8 { 2 } else { 1 };
+            unsupported[offset] = value;
             rewrite_crc(&mut unsupported);
             assert_eq!(
                 Page::decode(&unsupported).unwrap_err().code,
@@ -1959,7 +1963,7 @@ mod tests {
         ] {
             let mut unsupported = image.clone();
             let page = &mut unsupported.0[id as usize];
-            page[8..10].copy_from_slice(&2_u16.to_le_bytes());
+            page[8..10].copy_from_slice(&(PAGE_FORMAT_VERSION + 1).to_le_bytes());
             rewrite_crc(page);
             assert_eq!(
                 unsupported.recover().unwrap_err().code,

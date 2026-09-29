@@ -790,7 +790,7 @@ mod tests {
     use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
     use super::*;
-    use crate::page::{SUPERBLOCK_MAGIC, first_page_of_bitmap_chunk};
+    use crate::page::{PAGE_MAGIC, SUPERBLOCK_MAGIC, first_page_of_bitmap_chunk};
     use crate::{BitmapSlot, MAX_PAGE_CACHE_BYTES, MemoryPageDevice, PageType};
 
     fn leaf(id: PageId, value: u8) -> Page {
@@ -1575,8 +1575,9 @@ mod tests {
 
     #[test]
     fn a_database_of_an_earlier_page_format_is_refused_as_unsupported() {
-        // v0.1.0 through v0.3.0 wrote page format 2, whose superblocks have the same magic and a
-        // 96-byte payload, and whose metadata takes eight pages.
+        // v0.1.0 through v0.3.0 wrote page format 2, whose pages have envelope version 1, whose
+        // superblocks have the same magic and a 96-byte payload, and whose metadata takes eight
+        // pages.
         let mut device = MemoryPageDevice::new(8).unwrap();
         for slot in [SuperblockSlot::A, SuperblockSlot::B] {
             let mut payload = vec![0; 96];
@@ -1586,10 +1587,12 @@ mod tests {
             payload[16..24].copy_from_slice(&MAX_PAGE_COUNT.to_le_bytes());
             payload[24..32].copy_from_slice(&1_u64.to_le_bytes());
             payload[70] = slot as u8;
-            let page = Page::new(slot.page_id(), PageType::Superblock, payload)
+            let mut page = Page::new(slot.page_id(), PageType::Superblock, payload)
                 .unwrap()
                 .encode()
                 .unwrap();
+            page[8..10].copy_from_slice(&1_u16.to_le_bytes());
+            crate::page::seal(&mut page);
             device.write_page(slot.page_id(), &page).unwrap();
         }
         let error = match Pager::open_or_create(device) {
@@ -1597,6 +1600,28 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.code, "UNSUPPORTED_PAGE");
+    }
+
+    #[test]
+    fn an_earlier_release_refuses_this_page_format_as_unsupported() {
+        // v0.1.0 through v0.3.0 read each superblock's CRC-32, taken with its own field as zero,
+        // then its magic, then its envelope version, and refuse any version but 1 as unsupported
+        // before they read its payload, whose length they would otherwise reject as corrupt.
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let mut transaction = pager.begin_write().unwrap();
+        let root = transaction.allocate_page().unwrap();
+        transaction.write_new_page(&leaf(root, 7)).unwrap();
+        transaction.commit(1, EMPTY_HASH, Some(root)).unwrap();
+        let mut device = pager.into_device();
+        for slot in [SuperblockSlot::A, SuperblockSlot::B] {
+            let mut page = [0; PAGE_SIZE];
+            device.read_page(slot.page_id(), &mut page).unwrap();
+            let checksum = u32::from_le_bytes(page[28..32].try_into().unwrap());
+            page[28..32].fill(0);
+            assert_eq!(crate::checksum::crc32(&page), checksum);
+            assert_eq!(&page[..8], PAGE_MAGIC);
+            assert_ne!(u16::from_le_bytes([page[8], page[9]]), 1);
+        }
     }
 
     #[test]
