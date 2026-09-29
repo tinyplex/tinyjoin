@@ -50,30 +50,32 @@ page cache. The `e6ed5eb` column, published that evening after a run in which
 TinyJoin's single-insert commits alone ran more than twice as slowly for ten
 minutes was discarded, adds the owner tab's statements served as they arrive,
 lookups by primary key encoded from the predicate's values, and records
-encoded into one buffer.
+encoded into one buffer. The `2515773` column, published that night, adds
+XXH64 page checksums and entry fingerprints, and an open that reads only the
+catalog, with the full check moved to check().
 
-| Workload | v0.3.0 | 26 Sep | `64ce856` | `23fe19c` | `5a3e1d7` | `a9e4b08` | `b3ebbaf` | `82ec602` | `73042cc` | `e6ed5eb` |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `cold-open` | 0.7× | 0.8× | 0.71× | 0.59× | 0.60× | 0.59× | 0.61× | 0.68× | 0.59× | 0.59× |
-| `reopen` | 3.5× | 1.2× | 1.2× | 1.1× | 1.2× | 1.1× | 1.05× | 1.1× | 1.1× | 1.1× |
-| `insert-autocommit` | 3.3× | 2.1× | 1.1× | 1.1× | 0.98× | 0.93× | 0.90× | 1.1× | 0.90× | 0.90× |
-| `insert-transaction` | 9.9× | 2.5× | 1.7× | 1.7× | 1.6× | 1.5× | 1.6× | 1.4× | 1.4× | 1.35× |
-| `insert-indexed` | 15× | 2.3× | 1.8× | 1.6× | 1.5× | 1.6× | 1.6× | 1.3× | 1.3× | 1.3× |
-| `insert-batch` | 33× | 3.4× | 2.0× | 1.6× | 1.6× | 1.4× | 1.5× | 1.1× | 1.1× | 1.04× |
-| `select-pk` | 4.2× | 1.6× | 1.2× | 1.1× | 1.1× | 1.0× | 1.0× | 0.99× | 1.0× | 0.99× |
-| `select-scan` | 105× | 1.75× | 1.7× | 1.6× | 1.6× | 1.5× | 1.1× | 1.1× | 1.05× | 1.06× |
-| `select-like` | 39× | 0.9× | 0.95× | 0.94× | 0.92× | 0.92× | 0.86× | 0.79× | 0.79× | 0.80× |
-| `select-indexed` | 1,406× | 2.4× | 1.6× | 1.2× | 1.1× | 1.1× | 1.0× | 1.0× | 1.0× | 0.97× |
-| `select-all` | 2.3× | 0.6× | 0.28× | 0.23× | 0.24× | 0.25× | 0.25× | 0.25× | 0.23× | 0.24× |
-| `group-by` | 22× | 0.95× | 1.0× | 0.86× | 0.87× | 0.89× | 0.77× | 0.72× | 0.72× | 0.72× |
-| `join` | 175× | 1.4× | 1.1× | 0.88× | 0.86× | 0.88× | 0.82× | 0.82× | 0.82× | 0.82× |
-| `update-pk` | 1,077× | 2.3× | 1.8× | 1.8× | 1.8× | 1.7× | 1.6× | 1.2× | 1.5× | 1.4× |
-| `update-scan` | 179× | 2.2× | 2.1× | 2.1× | 2.1× | 2.0× | 1.5× | 1.2× | 1.3× | 1.3× |
-| `upsert` | 1,362× | 2.5× | 1.8× | 1.8× | 1.9× | 1.7× | 1.7× | 1.5× | 1.6× | 1.5× |
-| `delete-pk` | 1,105× | 2.6× | 1.8× | 1.8× | 1.7× | 1.6× | 1.7× | 1.3× | 1.5× | 1.5× |
-| `delete-like` | 95× | 3.7× | 2.7× | 1.9× | 2.1× | 1.6× | 1.6× | 1.7× | 1.3× | 1.4× |
-| `delete-range` | 249× | 3.7× | 2.5× | 2.3× | 2.2× | 1.6× | 1.4× | 1.4× | 1.3× | 1.3× |
-| `create-index` | 142× | 1.3× | 1.1× | 1.0× | 1.1× | 1.1× | 1.0× | 0.77× | 0.96× | 0.95× |
+| Workload | v0.3.0 | 26 Sep | `64ce856` | `23fe19c` | `5a3e1d7` | `a9e4b08` | `b3ebbaf` | `82ec602` | `73042cc` | `e6ed5eb` | `2515773` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `cold-open` | 0.7× | 0.8× | 0.71× | 0.59× | 0.60× | 0.59× | 0.61× | 0.68× | 0.59× | 0.59× | 0.59× |
+| `reopen` | 3.5× | 1.2× | 1.2× | 1.1× | 1.2× | 1.1× | 1.05× | 1.1× | 1.1× | 1.1× | 0.57× |
+| `insert-autocommit` | 3.3× | 2.1× | 1.1× | 1.1× | 0.98× | 0.93× | 0.90× | 1.1× | 0.90× | 0.90× | 0.88× |
+| `insert-transaction` | 9.9× | 2.5× | 1.7× | 1.7× | 1.6× | 1.5× | 1.6× | 1.4× | 1.4× | 1.35× | 1.3× |
+| `insert-indexed` | 15× | 2.3× | 1.8× | 1.6× | 1.5× | 1.6× | 1.6× | 1.3× | 1.3× | 1.3× | 1.3× |
+| `insert-batch` | 33× | 3.4× | 2.0× | 1.6× | 1.6× | 1.4× | 1.5× | 1.1× | 1.1× | 1.04× | 1.03× |
+| `select-pk` | 4.2× | 1.6× | 1.2× | 1.1× | 1.1× | 1.0× | 1.0× | 0.99× | 1.0× | 0.99× | 1.00× |
+| `select-scan` | 105× | 1.75× | 1.7× | 1.6× | 1.6× | 1.5× | 1.1× | 1.1× | 1.05× | 1.06× | 1.06× |
+| `select-like` | 39× | 0.9× | 0.95× | 0.94× | 0.92× | 0.92× | 0.86× | 0.79× | 0.79× | 0.80× | 0.80× |
+| `select-indexed` | 1,406× | 2.4× | 1.6× | 1.2× | 1.1× | 1.1× | 1.0× | 1.0× | 1.0× | 0.97× | 1.00× |
+| `select-all` | 2.3× | 0.6× | 0.28× | 0.23× | 0.24× | 0.25× | 0.25× | 0.25× | 0.23× | 0.24× | 0.23× |
+| `group-by` | 22× | 0.95× | 1.0× | 0.86× | 0.87× | 0.89× | 0.77× | 0.72× | 0.72× | 0.72× | 0.75× |
+| `join` | 175× | 1.4× | 1.1× | 0.88× | 0.86× | 0.88× | 0.82× | 0.82× | 0.82× | 0.82× | 0.81× |
+| `update-pk` | 1,077× | 2.3× | 1.8× | 1.8× | 1.8× | 1.7× | 1.6× | 1.2× | 1.5× | 1.4× | 1.35× |
+| `update-scan` | 179× | 2.2× | 2.1× | 2.1× | 2.1× | 2.0× | 1.5× | 1.2× | 1.3× | 1.3× | 1.3× |
+| `upsert` | 1,362× | 2.5× | 1.8× | 1.8× | 1.9× | 1.7× | 1.7× | 1.5× | 1.6× | 1.5× | 1.5× |
+| `delete-pk` | 1,105× | 2.6× | 1.8× | 1.8× | 1.7× | 1.6× | 1.7× | 1.3× | 1.5× | 1.5× | 1.5× |
+| `delete-like` | 95× | 3.7× | 2.7× | 1.9× | 2.1× | 1.6× | 1.6× | 1.7× | 1.3× | 1.4× | 1.3× |
+| `delete-range` | 249× | 3.7× | 2.5× | 2.3× | 2.2× | 1.6× | 1.4× | 1.4× | 1.3× | 1.3× | 1.2× |
+| `create-index` | 142× | 1.3× | 1.1× | 1.0× | 1.1× | 1.1× | 1.0× | 0.77× | 0.96× | 0.95× | 0.94× |
 
 The compressed download grew from 296 KiB to 334 KiB, and is now 302 KiB.
 Between two runs on the same build, the ratios moved by up to a tenth, and by
@@ -124,6 +126,14 @@ faster engine's time, and reads by key match SQLite's. Scans, bulk deletes and
 index builds held; the `LIKE` delete's rise from 1.3 times PGlite's to 1.4 is
 within the spread of both runs' samples. In memory, where the owner tab's lane
 does not apply, point statements took 1-3% less time.
+The `2515773` run was as quiet, with SQLite log-sums of 75.07 with OPFS and
+61.71 in memory; a first in-memory run, at 62.81, was discarded. With OPFS,
+reopening fell from 45 ms to 22, 0.57 times SQLite's, since opening reads only
+the catalog; the `LIKE` delete fell 13%, creating indexes 8%, and updates and
+deletes by key 3-4%, while the rest held within a few percent. TinyJoin was
+the fastest engine in 10 of the 20 workloads and second in the rest. In
+memory, committing each insert alone fell from 90 microseconds to 83, creating
+indexes by 12%, and the `LIKE` delete by 10%.
 
 Done:
 
