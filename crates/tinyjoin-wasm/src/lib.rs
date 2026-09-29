@@ -26,21 +26,23 @@ impl WasmEngine {
         })
     }
 
-    /// Executes one versioned request, written as [`structured::Request`] reads it.
+    /// Executes one versioned request, written as [`structured::Request`] reads it. A failure is
+    /// a response too, so this returns no `Result`, whose glue would read each call's outcome back
+    /// through the shadow stack.
     #[wasm_bindgen(js_name = callStructured)]
     pub fn call_structured(
         &mut self,
         bridge_version: u32,
         operation: u32,
         payload: &[u8],
-    ) -> std::result::Result<JsValue, JsValue> {
+    ) -> JsValue {
         match self.call_structured_inner(bridge_version, operation, payload) {
-            Ok(response) => Ok(response),
+            Ok(response) => response,
             Err(error) => {
                 if fatal_storage_error(&error) {
                     self.poison_and_close();
                 }
-                Ok(structured::error(&error))
+                structured::error(&error)
             }
         }
     }
