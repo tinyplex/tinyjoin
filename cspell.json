@@ -155,6 +155,13 @@
       ]
     },
     {
+      "filename": "crates/tinyjoin-core/src/checksum.rs",
+      "words": [
+        "spammish",
+        "xxhsum"
+      ]
+    },
+    {
       "filename": "crates/tinyjoin-core/src/join.rs",
       "ignoreRegExpList": [
         "/'Rnull2'/g"

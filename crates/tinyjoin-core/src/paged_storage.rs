@@ -166,11 +166,12 @@ impl CatalogSchema {
             "columns": schema.columns,
             "primaryKey": schema.primary_key,
         });
-        let mut hasher = crate::hash::Hasher::new();
-        hasher.write_bytes(&crate::paged_codec::encode_canonical_json(&columns)?);
         Ok(Self {
             encoded: encode_catalog_schema(schema)?,
-            columns_fingerprint: hasher.finish(),
+            columns_fingerprint: crate::checksum::xxh64(
+                &crate::paged_codec::encode_canonical_json(&columns)?,
+                0,
+            ),
         })
     }
 }

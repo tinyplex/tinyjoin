@@ -4,8 +4,8 @@ use crate::{
     CandidateId, EngineError, FIRST_DATA_PAGE_ID, MAX_PAGE_COUNT, MAX_PAGE_PAYLOAD_SIZE, Page,
     PageDevice, PageId, PageRef, PageType, Pager, PagerWriteTransaction, Result,
     cache::PageSet,
-    checksum::crc32,
-    hash::{EMPTY_HASH, Hasher, combine},
+    checksum::{checksum32, xxh64},
+    hash::{EMPTY_HASH, combine},
 };
 
 // Page diagnostics are intentionally compact in the browser build. The stable
@@ -2994,7 +2994,7 @@ fn store_overflow_value<D: PageDevice>(
     for _ in 0..chunk_count {
         page_ids.push(transaction.allocate_page()?);
     }
-    let checksum = crc32(value);
+    let checksum = checksum32(value);
     for (index, page_id) in page_ids.iter().copied().enumerate() {
         let start = index * MAX_OVERFLOW_CHUNK_BYTES;
         let end = (start + MAX_OVERFLOW_CHUNK_BYTES).min(value.len());
@@ -3197,7 +3197,7 @@ fn read_overflow_chain(
             descriptor.total_length
         )));
     }
-    if crc32(&value) != descriptor.checksum {
+    if checksum32(&value) != descriptor.checksum {
         return Err(invalid_overflow(
             "Overflow chain end-to-end checksum does not match",
         ));
@@ -3243,21 +3243,21 @@ fn leaf_entry_hash(entry: &LeafEntry) -> u64 {
 }
 
 /// Fingerprints one entry, as [`leaf_entry_hash`] does, from its key and the value its cell holds.
+///
+/// The XXH64 of the key, which covers its length, seeds the XXH64 of the value, so bytes cannot
+/// move between the two without changing the result. An overflow value's length and checksum are
+/// hashed from the complement of that seed, so they never pass for an inline value of those bytes.
 fn cell_hash(key: &[u8], value: &CellValue<'_>) -> u64 {
-    let mut hasher = Hasher::new();
-    hasher.write_bytes(key);
+    let key_hash = xxh64(key, 0);
     match value {
-        CellValue::Inline(value) => {
-            hasher.write_u8(0);
-            hasher.write_bytes(value);
-        }
+        CellValue::Inline(value) => xxh64(value, key_hash),
         CellValue::Overflow(descriptor) => {
-            hasher.write_u8(1);
-            hasher.write_u64(u64::from(descriptor.total_length));
-            hasher.write_u64(u64::from(descriptor.checksum));
+            let mut summary = [0; 8];
+            summary[..4].copy_from_slice(&descriptor.total_length.to_le_bytes());
+            summary[4..].copy_from_slice(&descriptor.checksum.to_le_bytes());
+            xxh64(&summary, !key_hash)
         }
     }
-    hasher.finish()
 }
 
 /// Writes a leaf cell holding `key` and `value` at the start of `destination`.
@@ -4274,6 +4274,28 @@ mod tests {
     }
 
     #[test]
+    fn entry_fingerprints_keep_the_key_and_value_apart() {
+        // Moving bytes between an entry's key and its value makes a different entry, and so does
+        // storing an overflow value's summary as an inline value of the same bytes.
+        let split = cell_hash(b"ab", &CellValue::Inline(b"c"));
+        assert_ne!(split, cell_hash(b"a", &CellValue::Inline(b"bc")));
+        assert_ne!(split, cell_hash(b"abc", &CellValue::Inline(b"")));
+        let descriptor = OverflowDescriptor {
+            first_page_id: FIRST_DATA_PAGE_ID,
+            generation: 1,
+            total_length: 5_000,
+            checksum: 0x1234_5678,
+        };
+        let mut summary = [0; 8];
+        summary[..4].copy_from_slice(&5_000_u32.to_le_bytes());
+        summary[4..].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+        assert_ne!(
+            cell_hash(b"key", &CellValue::Overflow(descriptor)),
+            cell_hash(b"key", &CellValue::Inline(&summary))
+        );
+    }
+
+    #[test]
     fn overflow_values_are_fingerprinted_from_their_descriptors() {
         // An overflow value is summarized by its length and checksum, so a fingerprint never has
         // to walk a chain of pages. The summary must still follow the content.
@@ -5217,7 +5239,7 @@ mod tests {
     #[test]
     fn overflow_codec_rejects_cycle_truncation_position_tree_generation_and_checksum() {
         let value = vec![9; MAX_OVERFLOW_CHUNK_BYTES + 13];
-        let checksum = crc32(&value);
+        let checksum = checksum32(&value);
         let descriptor = OverflowDescriptor {
             first_page_id: FIRST_DATA_PAGE_ID,
             generation: 2,

@@ -106,21 +106,24 @@ pub(crate) fn page_checksum(bytes: &[u8; PAGE_SIZE]) -> u32 {
 /// The fingerprint of the data pages a commit wrote, from each page's ID and checksum in ascending
 /// page order. A superblock records its commit's, so that recovery can tell whether every page the
 /// commit wrote became durable with it.
-pub(crate) struct CommitHash(crate::hash::Hasher);
+pub(crate) struct CommitHash(u64);
 
 impl CommitHash {
     pub(crate) fn new() -> Self {
-        Self(crate::hash::Hasher::new())
+        Self(0)
     }
 
-    /// Adds the next page, which must follow every page added before it.
+    /// Adds the next page, which must follow every page added before it: the XXH64 of its ID and
+    /// checksum, seeded with the hash of the pages before it.
     pub(crate) fn page(&mut self, id: PageId, checksum: u32) {
-        self.0.write_u64(id);
-        self.0.write_u64(checksum.into());
+        let mut entry = [0; 12];
+        entry[..8].copy_from_slice(&id.to_le_bytes());
+        entry[8..].copy_from_slice(&checksum.to_le_bytes());
+        self.0 = crate::checksum::xxh64(&entry, self.0);
     }
 
     pub(crate) fn finish(self) -> u64 {
-        self.0.finish()
+        self.0
     }
 }
 

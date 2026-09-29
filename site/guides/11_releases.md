@@ -132,6 +132,10 @@ building indexes, and committing a single insert are quicker than in either.
 - Writing a page stores each cell's fixed-size header and slot directly, rather
   than copying them a few bytes at a time, and an index key copies text whole.
   Creating two indexes over 10,000 rows takes 8% less time.
+- Stored entries are fingerprinted with XXH64, which reads eight bytes at a
+  time, rather than with FNV-1a, which hashed them a byte at a time. Every leaf
+  a write creates fingerprints its entries, an index's included, so creating
+  two indexes takes 9% less of the engine's time.
 - A commit checksums the zero bytes that fill most of each page 256 at a time,
   where it read them one at a time, and encodes less besides, writing its
   allocation bitmap and superblock straight into their pages. Committing a
