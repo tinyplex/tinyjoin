@@ -161,7 +161,8 @@ building indexes, and committing a single insert are quicker than in either.
   random keys that WebAssembly without a host source of randomness never gave
   it, and four sets that needed no hashing became vectors: 3 KiB more. The
   catalog's tables and indexes, and the keys a write reports, took 5 KiB
-  more.
+  more, and building the superblock's CRC-32 table when it is first needed,
+  rather than shipping it, 1 KiB more.
 - Once per page, create() also starts a short-lived second Worker that runs
   the engine's common statements on a scratch in-memory database for about a
   tenth of a second, and then exits. Chromium compiles WebAssembly one function

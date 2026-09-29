@@ -8,27 +8,11 @@
 // Keep the polynomial, initial state, and final complement compatible with stored superblocks.
 use std::sync::OnceLock;
 
-/// The checksum of each byte value, built at compile time.
-const TABLE: [u32; 256] = {
-    let mut table = [0; 256];
-    let mut index = 0;
-    while index < table.len() {
-        let mut checksum = index as u32;
-        let mut bit = 0;
-        while bit < 8 {
-            checksum = (checksum >> 1) ^ (0xedb8_8320 & (checksum & 1).wrapping_neg());
-            bit += 1;
-        }
-        table[index] = checksum;
-        index += 1;
-    }
-    table
-};
-
 /// Tables for "slicing by 16": entry `n` of table `k` is the checksum of byte value `n` followed
 /// by `k` zero bytes, so sixteen independent lookups advance the checksum by sixteen bytes, where
-/// one lookup per byte would each wait for the last. They are built on first use, since as
-/// constants they would add 16 KiB to the engine's download.
+/// one lookup per byte would each wait for the last. Table 0 is the checksum of each byte value
+/// alone. They are built on first use, since as constants, even table 0 alone, they would add
+/// their high-entropy bytes to the engine's download.
 ///
 /// Four more advance a checksum over 256 zero bytes: entry `n` of table `16 + k` is what the state
 /// `n << 8k` becomes. Over zero bytes, each bit of the state moves the result independently, so
@@ -39,11 +23,17 @@ static TABLES: OnceLock<Box<[[u32; 256]; 20]>> = OnceLock::new();
 fn tables() -> &'static [[u32; 256]; 20] {
     TABLES.get_or_init(|| {
         let mut tables = Box::new([[0; 256]; 20]);
-        tables[0] = TABLE;
+        for (byte, entry) in tables[0].iter_mut().enumerate() {
+            let mut checksum = byte as u32;
+            for _ in 0..8 {
+                checksum = (checksum >> 1) ^ (0xedb8_8320 & (checksum & 1).wrapping_neg());
+            }
+            *entry = checksum;
+        }
         for slice in 1..16 {
             for byte in 0..256 {
                 let previous = tables[slice - 1][byte];
-                tables[slice][byte] = (previous >> 8) ^ TABLE[(previous & 255) as usize];
+                tables[slice][byte] = (previous >> 8) ^ tables[0][(previous & 255) as usize];
             }
         }
         for bit in 0..32 {
@@ -129,7 +119,7 @@ pub(crate) fn crc32_update(mut checksum: u32, bytes: &[u8]) -> u32 {
             ^ at(0, fourth, 24);
     }
     for byte in remainder {
-        checksum = (checksum >> 8) ^ TABLE[((checksum ^ u32::from(*byte)) & 255) as usize];
+        checksum = (checksum >> 8) ^ tables[0][((checksum ^ u32::from(*byte)) & 255) as usize];
     }
     checksum
 }

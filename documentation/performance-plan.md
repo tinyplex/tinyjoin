@@ -318,6 +318,10 @@ Found along the way:
   zero bytes stay nearly free. Superblocks keep CRC-32: v0.1.0 through v0.3.0
   check a page's CRC-32 before its version, so a CRC-32 superblock is what
   lets them refuse a newer database as unsupported rather than corrupt.
+- A constant table costs its full size compressed, since its bytes look
+  random. The CRC-32 byte table had stayed in the engine's data section after
+  its slicing tables moved out; building it on first use saved 1 KiB
+  compressed.
 - Allocating a page past the end of the file wrote a zero placeholder for it,
   so commits that grew the file wrote every new page twice.
 - Each OPFS write call costs about 17 µs whatever its size, so a commit's
