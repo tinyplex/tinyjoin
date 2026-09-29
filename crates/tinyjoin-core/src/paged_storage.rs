@@ -1,3 +1,4 @@
+use serde_json::Value;
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::{
@@ -23,7 +24,7 @@ use crate::{
     PageId, Pager, Result, Row, StorageReader, TableDefinition, TreeId, VisitControl, VisitOutcome,
     paged_codec::{
         CATALOG_TREE_ID, CatalogIndexRecord, CatalogKey, CatalogTableRecord, FIRST_USER_TREE_ID,
-        IndexEntry, IndexEntryLayout, RecordLayout, StoredEntry, StoredRecord,
+        IndexEntry, IndexEntryLayout, PrimaryKey, RecordLayout, StoredEntry, StoredRecord,
         decode_catalog_header_record, decode_catalog_index_record, decode_catalog_key,
         decode_catalog_table_record, encode_catalog_schema,
         encode_catalog_table_record_with_schema, encode_primary_key, encode_record_index_entry,
@@ -519,6 +520,17 @@ impl<D: PageDevice> PagedStorage<D> {
     }
 
     /// [`StorageReader::visit_primary_key`] for a key already encoded as `table`'s B-tree key.
+    /// Visits the row of primary key `key` in `table`, if it holds one.
+    fn visit_key(
+        &self,
+        table: &str,
+        key: PrimaryKey<'_>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        let encoded_key = key.encode(&self.table(table)?.schema)?;
+        self.visit_encoded_key(table, &encoded_key, visitor)
+    }
+
     pub(crate) fn visit_encoded_key(
         &self,
         table: &str,
@@ -1276,8 +1288,17 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
         key: &Row,
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
-        let encoded_key = encode_primary_key(&self.table(table)?.schema, key)?;
-        self.visit_encoded_key(table, &encoded_key, visitor)
+        self.visit_key(table, PrimaryKey::Row(key), visitor)
+    }
+
+    fn visit_primary_key_values(
+        &self,
+        table: &str,
+        _schema: &TableDefinition,
+        values: &[&Value],
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        self.visit_key(table, PrimaryKey::Values(values), visitor)
     }
 
     fn index_definition(&self, name: &str) -> Option<IndexDefinition> {

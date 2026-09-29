@@ -265,6 +265,12 @@ Done:
   rather than first joining the Worker's pending requests and reaching the
   owner as a routed message. Point statements took 2-3% less time in the
   browser benchmark with OPFS, for 91 bytes compressed.
+- A lookup by primary key encodes its key straight from the values the
+  predicate compares the key columns with, borrowed from the statement,
+  rather than copying every equality the predicate holds into one map, the
+  key's columns into another, and encoding that. Engine-only, reads by key
+  took 8% less time and updates and deletes by key 7% less, for 121 bytes
+  compressed.
 
 Found along the way:
 

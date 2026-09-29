@@ -5,16 +5,18 @@ use std::{
     rc::Rc,
 };
 
+use serde_json::Value;
+
 use crate::{
     Btree, ChangedKeys, ColumnType, EngineError, ExecuteResult, PageDevice, PageId, Pager,
-    PagerWriteTransaction, QueryResult, Result, Row, RowChange, StorageReader, TreeId,
-    VisitControl, VisitOutcome,
+    PagerWriteTransaction, QueryResult, Result, Row, RowChange, StorageReader, TableDefinition,
+    TreeId, VisitControl, VisitOutcome,
     btree::BatchChange,
     hash::{EMPTY_HASH, combine, identify},
     name_map::NameMap,
     paged_codec::{
         CATALOG_TREE_ID, CatalogHeader, CatalogIndexRecord, IndexEntry, IndexEntryLayout,
-        MAX_CATALOG_INDEXES, MAX_CATALOG_TABLES, MAX_TREE_ID, RecordLayout,
+        MAX_CATALOG_INDEXES, MAX_CATALOG_TABLES, MAX_TREE_ID, PrimaryKey, RecordLayout,
         encode_catalog_header_record, encode_catalog_index_key, encode_catalog_index_record,
         encode_catalog_table_key, encode_primary_key, encode_record_index_entry,
         encode_record_index_prefix, encode_row, encode_secondary_index_entry_key,
@@ -828,6 +830,29 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         Ok(())
     }
 
+    /// Visits the row of primary key `key` in `table`, if it holds one.
+    fn visit_key(
+        &self,
+        table: &str,
+        key: PrimaryKey<'_>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        let table_data = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::table_not_found(table))?;
+        let key = key.encode(&table_data.schema)?;
+        match self.lookup_record(table, &key)? {
+            Some(value)
+                if visitor(&RowRef::record(table_data.record(&key, &value)?))?
+                    == VisitControl::Stop =>
+            {
+                Ok(VisitOutcome::Stopped)
+            }
+            _ => Ok(VisitOutcome::Complete),
+        }
+    }
+
     /// The record the encoded primary key `key` holds in `table_name`, if any.
     fn lookup_record(&self, table_name: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let table = self
@@ -1271,20 +1296,17 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
         key: &Row,
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
-        let table_data = self
-            .tables
-            .get(table)
-            .ok_or_else(|| EngineError::table_not_found(table))?;
-        let key = encode_primary_key(&table_data.schema, key)?;
-        match self.lookup_record(table, &key)? {
-            Some(value)
-                if visitor(&RowRef::record(table_data.record(&key, &value)?))?
-                    == VisitControl::Stop =>
-            {
-                Ok(VisitOutcome::Stopped)
-            }
-            _ => Ok(VisitOutcome::Complete),
-        }
+        self.visit_key(table, PrimaryKey::Row(key), visitor)
+    }
+
+    fn visit_primary_key_values(
+        &self,
+        table: &str,
+        _schema: &TableDefinition,
+        values: &[&Value],
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        self.visit_key(table, PrimaryKey::Values(values), visitor)
     }
 
     fn record_layout(&self, table: &str) -> Option<Rc<RecordLayout>> {

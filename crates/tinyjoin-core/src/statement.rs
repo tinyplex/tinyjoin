@@ -12,8 +12,8 @@ use crate::paged_codec::{
     encode_row_values, encode_updated_record,
 };
 use crate::query::{
-    Filter, ParseMode, Token, bind_parameter, is_reserved_keyword, number_literal,
-    parse_predicate_at, primary_key_lookup, tokenize, validate_named_columns,
+    Filter, ParseMode, Token, bind_parameter, exact_equalities, is_reserved_keyword,
+    number_literal, parse_predicate_at, tokenize, validate_named_columns,
     validate_parameter_expansion, validate_predicate_columns, validate_predicate_types,
     validate_sql_input, visit_indexed_candidates,
 };
@@ -21,9 +21,9 @@ use crate::row::{HeldRow, RowRef};
 use crate::storage::{
     MAX_LOGICAL_ROW_BYTES, ensure_storage_key_bytes, estimated_checked_value_bytes,
     estimated_key_bytes, estimated_record_bytes, estimated_row_bytes, estimated_value_bytes,
-    json_scalar_bound, normalize_row, row_json_overhead, schema_with_added_column,
-    unplanned_record, validate_index_columns_for_schema, validate_index_definition_shape,
-    validate_primary_storage_key_bound, validate_value,
+    json_scalar_bound, normalize_row, primary_key_values_fit, row_json_overhead,
+    schema_with_added_column, unplanned_record, validate_index_columns_for_schema,
+    validate_index_definition_shape, validate_primary_storage_key_bound, validate_value,
 };
 use crate::{
     ChangedKeys, ColumnDefinition, ColumnType, EngineError, MAX_CHANGED_KEYS_PER_TABLE, Predicate,
@@ -1779,10 +1779,10 @@ fn visit_dml_candidates(
     visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
 ) -> Result<VisitOutcome> {
     // A valid predicate can name a key too large to store; keep its scan behavior.
-    if let Some(key) = primary_key_lookup(predicate, schema)
-        && validate_primary_storage_key_bound(schema, &key).is_ok()
+    if let Some(values) = exact_equalities(predicate, schema, &schema.primary_key)
+        && primary_key_values_fit(&values)
     {
-        return storage.visit_primary_key(&schema.name, &key, visitor);
+        return storage.visit_primary_key_values(&schema.name, schema, &values, visitor);
     }
     visit_indexed_candidates(
         storage,

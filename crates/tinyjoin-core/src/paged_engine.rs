@@ -461,6 +461,49 @@ mod tests {
     const LEDGER: &str = "CREATE TABLE ledger (id INTEGER PRIMARY KEY, note TEXT)";
 
     #[test]
+    fn a_key_too_long_to_store_fails_a_lookup_and_a_write_scans_for_it() {
+        let mut engine = database_with(&[
+            "CREATE TABLE t (id TEXT PRIMARY KEY, v INTEGER NOT NULL)",
+            "INSERT INTO t (id, v) VALUES ('a', 1)",
+        ]);
+        let oversized = [json!("x".repeat(2_000))];
+        for in_transaction in [false, true] {
+            if in_transaction {
+                engine.begin_transaction().unwrap();
+            }
+            for sql in [
+                "SELECT * FROM t WHERE id = $1",
+                "SELECT * FROM t WHERE v = 1 AND id = $1",
+            ] {
+                let error = engine.execute_sql(sql, &oversized).unwrap_err();
+                assert_eq!(error.code, "PAGED_VALUE_TOO_LARGE", "{sql}");
+            }
+            for sql in [
+                "UPDATE t SET v = 2 WHERE id = $1",
+                "DELETE FROM t WHERE id = $1",
+            ] {
+                let result = engine.execute_sql(sql, &oversized).unwrap();
+                assert_eq!(result.row_count, 0, "{sql}");
+            }
+            // Of two equalities with the key, one is looked up and the other rejects the row.
+            for sql in [
+                "SELECT * FROM t WHERE id = 'a' AND id = 'b'",
+                "SELECT * FROM t WHERE id = 'b' AND (v = 1 AND id = 'a')",
+                "UPDATE t SET v = 3 WHERE id = 'b' AND id = 'a'",
+            ] {
+                assert_eq!(engine.execute_sql(sql, &[]).unwrap().row_count, 0, "{sql}");
+            }
+            let found = engine
+                .execute_sql("SELECT v FROM t WHERE v = 1 AND id = 'a'", &[])
+                .unwrap();
+            assert_eq!(found.rows.len(), 1);
+            if in_transaction {
+                engine.rollback_transaction().unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn the_database_fingerprint_describes_the_rows_and_nothing_else() {
         // Two databases which hold the same rows must agree, however the rows got there. This is
         // the whole point of publishing the fingerprint: a comparison between two databases has to

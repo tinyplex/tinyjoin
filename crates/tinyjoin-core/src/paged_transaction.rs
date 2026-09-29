@@ -4,11 +4,15 @@ use std::{
     rc::Rc,
 };
 
+use serde_json::Value;
+
 use crate::{
     ChangedKeys, EngineError, IndexDefinition, MAX_CHANGED_KEYS_PER_TABLE, PageDevice,
     PagedStorage, Result, Row, RowChange, StorageReader, TableDefinition, TableKeys, TreeId,
     VisitControl, VisitOutcome,
-    paged_codec::{EMPTY_RECORD, IndexEntryLayout, RecordLayout, encode_primary_key, encode_row},
+    paged_codec::{
+        EMPTY_RECORD, IndexEntryLayout, PrimaryKey, RecordLayout, encode_primary_key, encode_row,
+    },
     paged_script::{ChangedRow, KeyedRows, TableChanges, held_row_bytes},
     paged_storage::{ChangeCost, ChangeRow, PagedTable, PagedWriteUsage, batch_too_large},
     row::{HeldRow, RowRef},
@@ -740,6 +744,36 @@ impl<'a, D: PageDevice> PagedReadView<'a, D> {
         }
     }
 
+    /// Visits the row of primary key `key` in `table`: the row the transaction stages there, if it
+    /// stages one, or else the committed row.
+    fn visit_key(
+        &self,
+        table: &str,
+        key: PrimaryKey<'_>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        self.ensure_base_revision()?;
+        self.charge_work(1)?;
+        let paged = self.storage.table(table)?;
+        let encoded_key = key.encode(&paged.schema)?;
+        if let Some(entry) = self
+            .transaction
+            .and_then(|transaction| transaction.table_entries(table))
+            .and_then(|entries| entries.get(&encoded_key))
+        {
+            return match &entry.row.next {
+                Some(record)
+                    if visitor(&RowRef::record(paged.record(&encoded_key, record)?))?
+                        == VisitControl::Stop =>
+                {
+                    Ok(VisitOutcome::Stopped)
+                }
+                _ => Ok(VisitOutcome::Complete),
+            };
+        }
+        self.storage.visit_encoded_key(table, &encoded_key, visitor)
+    }
+
     /// Whether the committed table is exactly what this view sees, so that its key order and
     /// indexes apply: no transaction has staged a change to it.
     fn reads_committed(&self, table: &str) -> bool {
@@ -889,29 +923,17 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
         key: &Row,
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
-        self.ensure_base_revision()?;
-        self.charge_work(1)?;
-        if let Some(transaction) = self.transaction {
-            let paged = self.storage.table(table)?;
-            let encoded_key = encode_primary_key(&paged.schema, key)?;
-            if let Some(entry) = transaction
-                .table_entries(table)
-                .and_then(|entries| entries.get(&encoded_key))
-            {
-                return match &entry.row.next {
-                    Some(record)
-                        if visitor(&RowRef::record(paged.record(&encoded_key, record)?))?
-                            == VisitControl::Stop =>
-                    {
-                        Ok(VisitOutcome::Stopped)
-                    }
-                    _ => Ok(VisitOutcome::Complete),
-                };
-            }
-            // The committed row is found by the key encoded above.
-            return self.storage.visit_encoded_key(table, &encoded_key, visitor);
-        }
-        self.storage.visit_primary_key(table, key, visitor)
+        self.visit_key(table, PrimaryKey::Row(key), visitor)
+    }
+
+    fn visit_primary_key_values(
+        &self,
+        table: &str,
+        _schema: &TableDefinition,
+        values: &[&Value],
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        self.visit_key(table, PrimaryKey::Values(values), visitor)
     }
 
     fn record_layout(&self, table: &str) -> Option<Rc<RecordLayout>> {

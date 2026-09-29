@@ -160,6 +160,22 @@ pub(crate) trait StorageReader {
             _ => Ok(VisitOutcome::Complete),
         }
     }
+    /// Visits the row whose primary key has `values`, one for each of `schema`'s key columns in
+    /// key order, as [`Self::visit_primary_key`] visits the row of the map of them. Readers that
+    /// store records encode the values straight into the key they look up.
+    fn visit_primary_key_values(
+        &self,
+        table: &str,
+        schema: &TableDefinition,
+        values: &[&Value],
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        let mut key = Row::new();
+        for (column, value) in schema.primary_key.iter().zip(values) {
+            key.insert(column.clone(), (*value).clone());
+        }
+        self.visit_primary_key(table, &key, visitor)
+    }
     /// Where `table`'s columns live in its stored records, from a reader whose rows are stored
     /// records, which lets a writer plan rows straight into records. Other readers plan maps.
     fn record_layout(&self, _table: &str) -> Option<Rc<RecordLayout>> {
@@ -1423,6 +1439,22 @@ pub(crate) fn validate_primary_storage_key_bound(
     let bytes = storage_tuple_bytes(schema, &schema.primary_key, row, false)?
         .ok_or_else(|| EngineError::invalid_change("A primary key cannot contain null"))?;
     ensure_storage_key_bytes(bytes)
+}
+
+/// Whether the primary key of `values`, one for each key column in key order and each a value its
+/// column holds, fits a stored key, as [`validate_primary_storage_key_bound`] finds for the map of
+/// them: a boolean is encoded in one byte, a number in eight, and text escapes each zero byte and
+/// ends with two.
+pub(crate) fn primary_key_values_fit(values: &[&Value]) -> bool {
+    let mut bytes = 0usize;
+    for value in values {
+        bytes += match value {
+            Value::Bool(_) => 1,
+            Value::String(text) => text.len() + text.bytes().filter(|byte| *byte == 0).count() + 2,
+            _ => 8,
+        };
+    }
+    bytes <= MAX_STORAGE_KEY_BYTES
 }
 
 #[cfg(test)]

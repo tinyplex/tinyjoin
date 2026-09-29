@@ -421,8 +421,8 @@ pub(crate) fn visit_predicate_candidates(
     order: KeyOrder,
     visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
 ) -> Result<VisitOutcome> {
-    if let Some(key) = primary_key_lookup(predicate, schema) {
-        return storage.visit_primary_key(table, &key, visitor);
+    if let Some(values) = exact_equalities(predicate, schema, &schema.primary_key) {
+        return storage.visit_primary_key_values(table, schema, &values, visitor);
     }
     visit_indexed_candidates(storage, table, predicate, schema, order, visitor)
 }
@@ -765,17 +765,11 @@ fn secondary_index_key(
     predicate: Option<&Predicate>,
     schema: &crate::TableDefinition,
 ) -> Result<Option<(Vec<String>, Row)>> {
-    let mut equalities = Map::new();
-    collect_guaranteed_equalities(predicate, &mut equalities);
     for definition in storage.indexes_for_table(table)? {
-        if definition.columns.iter().all(|column| {
-            equalities
-                .get(column)
-                .is_some_and(|value| exact_primary_key_value(schema, column, value))
-        }) {
+        if let Some(values) = exact_equalities(predicate, schema, &definition.columns) {
             let mut key = Row::new();
-            for column in &definition.columns {
-                key.insert(column.clone(), equalities[column].clone());
+            for (column, value) in definition.columns.iter().zip(values) {
+                key.insert(column.clone(), value.clone());
             }
             return Ok(Some((definition.columns, key)));
         }
@@ -3244,27 +3238,41 @@ fn validate_comparison_value(
     }
 }
 
-pub(crate) fn primary_key_lookup(
-    predicate: Option<&Predicate>,
+/// The values `predicate` guarantees each of `columns`, in their order, when every one is a value
+/// its column holds exactly, so that the rows the predicate can match are found by looking those
+/// values up. The values are borrowed from the predicate rather than copied.
+pub(crate) fn exact_equalities<'p>(
+    predicate: Option<&'p Predicate>,
     schema: &crate::TableDefinition,
-) -> Option<Row> {
-    let mut equalities = Map::new();
-    collect_guaranteed_equalities(predicate, &mut equalities);
-    schema
-        .primary_key
-        .iter()
-        .all(|column| {
-            equalities
-                .get(column)
-                .is_some_and(|value| exact_primary_key_value(schema, column, value))
-        })
-        .then(|| {
-            let mut key = Row::new();
-            for column in &schema.primary_key {
-                key.insert(column.clone(), equalities[column].clone());
-            }
-            key
-        })
+    columns: &[String],
+) -> Option<Vec<&'p Value>> {
+    let predicate = predicate?;
+    let mut values = Vec::with_capacity(columns.len());
+    for column in columns {
+        let value = guaranteed_equality(predicate, column)?;
+        if !exact_primary_key_value(schema, column, value) {
+            return None;
+        }
+        values.push(value);
+    }
+    Some(values)
+}
+
+/// The value a predicate's conjunction of comparisons sets `column` equal to. Where it sets it
+/// equal to more than one, the last is taken; the predicate itself rejects every row then.
+fn guaranteed_equality<'p>(predicate: &'p Predicate, column: &str) -> Option<&'p Value> {
+    match predicate {
+        Predicate::Comparison {
+            column: compared,
+            operator: ComparisonOperator::Eq,
+            value,
+        } if compared == column && value != &Value::Null => Some(value),
+        Predicate::And { predicates } => predicates
+            .iter()
+            .rev()
+            .find_map(|predicate| guaranteed_equality(predicate, column)),
+        _ => None,
+    }
 }
 
 /// A direct B-tree lookup must be semantically indistinguishable from scanning
@@ -3287,24 +3295,6 @@ fn exact_primary_key_value(schema: &crate::TableDefinition, column: &str, value:
         }
         ColumnType::Text => value.is_string(),
         ColumnType::Float | ColumnType::Json => false,
-    }
-}
-
-fn collect_guaranteed_equalities(predicate: Option<&Predicate>, values: &mut Row) {
-    match predicate {
-        Some(Predicate::Comparison {
-            column,
-            operator: ComparisonOperator::Eq,
-            value,
-        }) if value != &Value::Null => {
-            values.insert(column.clone(), value.clone());
-        }
-        Some(Predicate::And { predicates }) => {
-            for predicate in predicates {
-                collect_guaranteed_equalities(Some(predicate), values);
-            }
-        }
-        _ => {}
     }
 }
 

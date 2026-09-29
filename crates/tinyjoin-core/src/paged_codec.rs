@@ -161,6 +161,31 @@ pub(crate) fn encode_primary_key_values(
     Ok(key)
 }
 
+/// A primary key to look a row up by: a map of its columns, or their values in key order, each one
+/// its column holds, so none is null.
+#[derive(Clone, Copy)]
+pub(crate) enum PrimaryKey<'a> {
+    Row(&'a Row),
+    Values(&'a [&'a Value]),
+}
+
+impl PrimaryKey<'_> {
+    /// The key encoded, as [`encode_primary_key`] encodes the map of its columns.
+    pub(crate) fn encode(self, schema: &TableDefinition) -> Result<Vec<u8>> {
+        let values = match self {
+            Self::Row(row) => return encode_primary_key(schema, row),
+            Self::Values(values) => values,
+        };
+        let mut key = Vec::with_capacity(16 * values.len());
+        for (column, value) in schema.primary_key.iter().zip(values) {
+            let data_type = schema_column_type(schema, column)?;
+            encode_component(&mut key, data_type, value, &schema.name, column)?;
+            validate_key_size(&key)?;
+        }
+        Ok(key)
+    }
+}
+
 /// Encodes an index tuple, which prefixes every entry for that tuple.
 ///
 /// `None` follows PostgreSQL's default index semantics for a tuple containing SQL NULL: it is not
