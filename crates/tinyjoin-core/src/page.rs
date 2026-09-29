@@ -39,7 +39,7 @@ const PAGE_FORMAT_VERSION: u16 = 1;
 const PAGE_FLAGS: u16 = 0;
 const PAGE_CRC_OFFSET: usize = 28;
 
-const SUPERBLOCK_MAGIC: &[u8; 8] = b"TGRSUPR\0";
+pub(crate) const SUPERBLOCK_MAGIC: &[u8; 8] = b"TGRSUPR\0";
 // Page format 3 stores rows as packed records and keys in an order-preserving encoding, and
 // carries the start of the allocation bitmap in each superblock. Earlier databases are refused
 // with UNSUPPORTED_PAGE rather than read under the wrong layout.

@@ -790,7 +790,7 @@ mod tests {
     use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
     use super::*;
-    use crate::page::first_page_of_bitmap_chunk;
+    use crate::page::{SUPERBLOCK_MAGIC, first_page_of_bitmap_chunk};
     use crate::{BitmapSlot, MAX_PAGE_CACHE_BYTES, MemoryPageDevice, PageType};
 
     fn leaf(id: PageId, value: u8) -> Page {
@@ -1575,12 +1575,12 @@ mod tests {
 
     #[test]
     fn a_database_of_an_earlier_page_format_is_refused_as_unsupported() {
-        // v0.1.0 through v0.3.0 wrote page format 2, whose superblocks have a 96-byte payload
-        // and whose metadata takes eight pages.
+        // v0.1.0 through v0.3.0 wrote page format 2, whose superblocks have the same magic and a
+        // 96-byte payload, and whose metadata takes eight pages.
         let mut device = MemoryPageDevice::new(8).unwrap();
         for slot in [SuperblockSlot::A, SuperblockSlot::B] {
             let mut payload = vec![0; 96];
-            payload[..8].copy_from_slice(b"TGRSUPR\0");
+            payload[..8].copy_from_slice(SUPERBLOCK_MAGIC);
             payload[8..10].copy_from_slice(&2_u16.to_le_bytes());
             payload[12..16].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
             payload[16..24].copy_from_slice(&MAX_PAGE_COUNT.to_le_bytes());
