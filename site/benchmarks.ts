@@ -242,10 +242,9 @@ const chartHtml = (report: Report, chart: Chart, legend: boolean): string => {
   ).join('');
   const note =
     chart.unit == 'ms'
-      ? `Median of ${report.samples} runs, fastest first, each workload to ` +
-        'its own scale. Brackets span the fastest to the slowest run.'
-      : 'Bytes fetched to open a database, smallest first, each to its own ' +
-        'scale.';
+      ? `Median of ${report.samples} runs, fastest first. ` +
+        'Brackets span the fastest to the slowest run.'
+      : 'Bytes fetched to open a database, smallest first.';
   return (
     '<figure class="chart"><figcaption>' +
     (legend ? `<span class="legend">${keys}</span>` : '') +
