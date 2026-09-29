@@ -17,13 +17,13 @@ work, and the suite is designed to be rerun after every optimization.
 {{benchmarks.environment}}
 
 Each workload lists the engines fastest first, and is drawn to its own linear
-scale from zero, on which its slowest engine's bar is full length, so a quick
-workload's bars are as legible as a slow one's. Every bar is labeled with its
-engine and its value, and in each workload the best value is bold.
+scale from zero, on which its slowest run reaches the full width, so a quick
+workload's bars are as legible as a slow one's. A bar's length and value are
+the median of an engine's runs, and a faint bracket at its end spans that
+engine's fastest run to its slowest. Every bar is named, and in each workload
+the best value is bold.
 
-## Measured results
-
-### Download and startup
+## Download and startup
 
 {{benchmarks.startup}}
 
@@ -42,23 +42,23 @@ compiles the engine's common statements on a scratch database, so its timed
 statements mostly run already compiled. SQLite and PGlite compile theirs as
 they go. See [custom Workers](/guides/custom-workers/).
 
-### Create
+## Create
 
 {{benchmarks.create}}
 
-### Read
+## Read
 
 {{benchmarks.read}}
 
-### Update
+## Update
 
 {{benchmarks.update}}
 
-### Delete
+## Delete
 
 {{benchmarks.delete}}
 
-### Schema
+## Schema
 
 {{benchmarks.schema}}
 
@@ -117,27 +117,27 @@ costs. Reopening a database does not apply.
 
 {{benchmarks.memory-environment}}
 
-### Download and startup in memory
+## Download and startup in memory
 
 {{benchmarks.memory-startup}}
 
-### Create in memory
+## Create in memory
 
 {{benchmarks.memory-create}}
 
-### Read in memory
+## Read in memory
 
 {{benchmarks.memory-read}}
 
-### Update in memory
+## Update in memory
 
 {{benchmarks.memory-update}}
 
-### Delete in memory
+## Delete in memory
 
 {{benchmarks.memory-delete}}
 
-### Schema in memory
+## Schema in memory
 
 {{benchmarks.memory-schema}}
 

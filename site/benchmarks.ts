@@ -58,10 +58,12 @@ const DOWNLOADS: [keyof Download, string][] = [
   ['brotli', 'Download (Brotli)'],
 ];
 
-// One group of bars. A null value did not complete, and `missing` says why.
+// One group of bars. A null value did not complete, and `missing` says why. A
+// range spans an engine's fastest and slowest samples, where it has samples.
 type Measure = {
   label: string;
   values: (number | null)[];
+  ranges: ([min: number, max: number] | null)[];
   timedOut: boolean[];
   missing: string[];
   titles: string[];
@@ -105,6 +107,11 @@ const timeChart = (report: Report, ids: string[]): Chart => ({
     return {
       label: workload.label,
       values: results.map((result) => result?.median ?? null),
+      ranges: results.map((result) =>
+        result?.median == null || result.min == null || result.max == null
+          ? null
+          : [result.min, result.max],
+      ),
       timedOut: results.map((result) => result?.timedOut == true),
       missing,
       titles: results.map(
@@ -125,6 +132,7 @@ const downloadChart = (report: Report): Chart => ({
   measures: DOWNLOADS.map(([key, label]) => ({
     label,
     values: ENGINES.map(([engine]) => report.download[engine]?.[key] ?? null),
+    ranges: ENGINES.map(() => null),
     timedOut: ENGINES.map(() => false),
     missing: ENGINES.map(() => 'not measured'),
     titles: ENGINES.map(
@@ -163,41 +171,74 @@ const ranked = (report: Report, measure: Measure): number[] => {
   );
 };
 
+// The plots, in pixels, that a value can be relied on to fit inside a bar of:
+// any chart's, and one at least 40rem wide.
+const NARROW_PLOT = 244;
+const WIDE_PLOT = 334;
+
+// About how wide a value is inside a bar, in pixels: small tabular figures and
+// a unit, with padding on either side.
+const valueWidth = (text: string): number => text.length * 6.4 + 12;
+
+const fraction = (value: number): string => value.toFixed(4);
+
 // One grouped horizontal bar chart. Each measure is a term in a description
 // list, whose one definition holds a bar per engine, fastest first, so a long
 // label never pushes the bars apart and assistive technology reads each measure
 // as a label followed by every engine in the order they finished. Each measure
-// is drawn to its own scale, linear from zero, on which its slowest engine's
-// bar is full length, so a quick workload's bars are as legible as a slow
-// one's. Every bar is labeled with its engine and carries its value at its tip.
+// is drawn to its own scale, linear from zero, on which its slowest run reaches
+// the full width, so a quick workload's bars are as legible as a slow one's.
+// Each bar is named, carries its value inside it where the value fits, and ends
+// in a faint bracket from its engine's fastest run to its slowest.
 const chartHtml = (report: Report, chart: Chart, legend: boolean): string => {
   const format = chart.unit == 'ms' ? formatMs : formatBytes;
   const measures = chart.measures.map((measure) => {
-    const {label, values, timedOut, missing, titles} = measure;
+    const {label, values, ranges, timedOut, missing, titles} = measure;
     const measured = lengths(report, measure);
-    const longest = Math.max(...measured.filter(isNumber));
+    const longest = Math.max(
+      ...measured.map((length, index) =>
+        Math.max(length ?? 0, timedOut[index] ? 0 : (ranges[index]?.[1] ?? 0)),
+      ),
+    );
     const present = values.filter(isNumber);
     const fastest = present.length > 1 ? Math.min(...present) : null;
     const bars = ranked(report, measure).map((index) => {
       const [engine, name] = ENGINES[index];
       const value = values[index];
-      const length = measured[index];
-      // A timed-out engine's bar is striped, since it is a lower bound.
+      const x = (measured[index] ?? 0) / longest;
+      // A timed-out engine's bar is striped, since it is a lower bound, and
+      // has no range to show.
+      const range = timedOut[index] ? null : ranges[index];
       const bar =
-        length == null
+        measured[index] == null
           ? ''
           : `<span class="bar${timedOut[index] ? ' over' : ''}" ` +
-            `style="--x:${(length / longest).toFixed(4)}"></span>`;
+            `style="--x:${fraction(x)}"></span>`;
+      const [low, high] = range?.map((end) => end / longest) ?? [x, x];
+      const bracket =
+        range == null
+          ? ''
+          : `<span class="range" style="--low:${fraction(low)};` +
+            `--high:${fraction(high)}"></span>`;
+      const shown = value == null ? missing[index] : format(value);
       const text =
-        value == null
-          ? escapeHtml(missing[index])
-          : value == fastest
-            ? `<b>${format(value)}</b>`
-            : format(value);
+        value != null && value == fastest
+          ? `<b>${escapeHtml(shown)}</b>`
+          : escapeHtml(shown);
+      // A value inside its bar must end before the bar's range begins.
+      const room = Math.min(x, low);
+      const fit =
+        room * NARROW_PLOT >= valueWidth(shown)
+          ? 'all'
+          : room * WIDE_PLOT >= valueWidth(shown)
+            ? 'wide'
+            : 'none';
       return (
         `<span class="${engine}" title="${escapeHtml(titles[index])}">` +
         `<span class="engine">${name}</span><span class="plot">${bar}` +
-        `<span class="value">${text}</span></span></span>`
+        `${bracket}<span class="value" data-fit="${fit}" ` +
+        `style="--end:${fraction(Math.max(x, high))}">${text}</span>` +
+        '</span></span>'
       );
     });
     return `<dt>${escapeHtml(label)}</dt><dd>${bars.join('')}</dd>`;
@@ -207,10 +248,10 @@ const chartHtml = (report: Report, chart: Chart, legend: boolean): string => {
   ).join('');
   const note =
     chart.unit == 'ms'
-      ? `Median of ${report.samples} runs, fastest first, ` +
-        'each workload to its own scale.'
-      : 'Bytes fetched to open a database, smallest first, ' +
-        'each to its own scale.';
+      ? `Median of ${report.samples} runs, fastest first, each workload to ` +
+        'its own scale. Brackets span the fastest to the slowest run.'
+      : 'Bytes fetched to open a database, smallest first, each to its own ' +
+        'scale.';
   return (
     '<figure class="chart"><figcaption>' +
     (legend ? `<span class="legend">${keys}</span>` : '') +
@@ -369,11 +410,14 @@ const createBenchmarks = (reports: {
       ),
     chartReplacers: [...charts].map(([name, [report, list]]) => [
       new RegExp(`<p>\\{\\{benchmarks\\.${name}\\}\\}</p>`, 'g'),
-      // A replacement string, in which $ would otherwise be special.
+      // A replacement string, in which $ would otherwise be special. Every bar
+      // is named, so only the page's first chart, startup, has a legend.
       (
         '<div class="charts">' +
         list
-          .map((chart, index) => chartHtml(report, chart, index == 0))
+          .map((chart, index) =>
+            chartHtml(report, chart, name == 'startup' && index == 0),
+          )
           .join('') +
         '</div>'
       ).replaceAll('$', '$$$$'),

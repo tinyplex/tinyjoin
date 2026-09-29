@@ -1,16 +1,18 @@
 // Grouped horizontal bar charts, rendered from site/data/benchmarks.json by
 // site/benchmarks.ts. Each measure is a term and one definition in a list: the
-// label, then a bar per engine, fastest first, each after its engine's name. A
-// definition's right padding is a gutter for the value at the tip of the
-// longest bar. Each measure has its own scale, so there are no gridlines to
-// share. Wide charts put labels beside their bars, and narrow ones above them.
+// label, then a bar per engine, fastest first, each after its engine's name.
+// Each measure has its own scale, so there are no gridlines to share, and a
+// bar's value sits inside it, which leaves its end to the bracket that spans
+// its engine's runs. Wide charts put labels beside their bars, and narrow ones
+// above them.
 
-@barHeight: 0.875rem;
-@barGap: 2px;
-@groupGap: 0.75rem;
-@gutter: 4.75rem;
+@barHeight: 1rem;
+@barGap: 3px;
+@groupGap: 1.25rem;
+@gutter: 0.5rem;
 @labels: 36%;
 @names: 4.25rem;
+@valueInset: 0.375rem;
 
 .charts {
   margin: 1.5rem 0 2rem;
@@ -28,14 +30,17 @@
 
   .tinyjoin {
     --series: var(--series-tinyjoin);
+    --on-series: #fff;
   }
 
   .sqlite {
     --series: var(--series-sqlite);
+    --on-series: @text2Color;
   }
 
   .pglite {
     --series: var(--series-pglite);
+    --on-series: @text2Color;
   }
 
   figcaption {
@@ -85,6 +90,8 @@
     text-align: right;
   }
 
+  // The right padding leaves room for the bracket's cap at the end of the
+  // slowest run.
   dd {
     display: flex;
     flex-direction: column;
@@ -94,7 +101,7 @@
 
     > span {
       display: grid;
-      font-size: 0.8125rem;
+      font-size: 0.75rem;
       grid-template-columns: @names minmax(0, 1fr);
       height: @barHeight;
       line-height: @barHeight;
@@ -110,20 +117,19 @@
     }
   }
 
-  // Each bar starts from its measure's baseline, and its value overflows into
-  // the definition's gutter.
+  // Each bar starts from its measure's baseline.
   .plot {
     border-left: 1px solid @borderColor;
     min-width: 0;
+    position: relative;
   }
 
   .bar {
     background: var(--series);
     border-radius: 0 4px 4px 0;
-    display: inline-block;
+    display: block;
     height: 100%;
     min-width: 2px;
-    vertical-align: top;
     width: calc(var(--x) * 100%);
 
     // A bar that reached the time limit is a lower bound, so it is striped.
@@ -136,22 +142,42 @@
     }
   }
 
+  // A faint bracket from the engine's fastest run to its slowest.
+  .range {
+    background: linear-gradient(currentColor, currentColor) center / 100% 1px
+      no-repeat;
+    border-inline: 1px solid;
+    color: @text2Color;
+    height: 0.5rem;
+    left: calc(var(--low) * 100%);
+    opacity: 0.45;
+    position: absolute;
+    top: calc(50% - 0.25rem);
+    width: calc((var(--high) - var(--low)) * 100%);
+  }
+
+  // A value sits after its bar and bracket, unless it fits inside the bar.
   .value {
     color: @textColor;
+    font-size: 0.6875rem;
     font-variant-numeric: tabular-nums;
-    margin-left: 0.375rem;
-    vertical-align: top;
+    left: calc(var(--end) * 100% + @valueInset);
+    position: absolute;
+    top: 0;
 
     b {
       color: @text2Color;
     }
   }
 
+  .value[data-fit='all'] {
+    .inside();
+  }
+
   // Bars change places from one measure to the next, so each is named, and
   // TinyJoin's name stands out as its bar does.
   .engine {
     color: @textColor;
-    font-size: 0.75rem;
     overflow: hidden;
     padding-right: 0.5rem;
     text-align: right;
@@ -161,6 +187,23 @@
   .tinyjoin .engine {
     color: @text2Color;
     font-weight: 600;
+  }
+}
+
+// Inside its bar, a value starts just after the baseline, in the color that
+// reads on that bar.
+.inside() {
+  color: var(--on-series);
+  left: @valueInset;
+
+  b {
+    color: inherit;
+  }
+}
+
+@container (min-width: 40rem) {
+  .chart .value[data-fit='wide'] {
+    .inside();
   }
 }
 
