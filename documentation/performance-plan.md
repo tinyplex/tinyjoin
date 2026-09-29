@@ -46,30 +46,34 @@ vectors. The `73042cc` column, published that afternoon after two runs spoiled
 by heat and other applications were discarded, adds parameters read directly,
 the lone upsert's record path, each superblock carrying the start of the
 allocation bitmap, and commits whose cost no longer grows with the file or the
-page cache.
+page cache. The `e6ed5eb` column, published that evening after a run in which
+TinyJoin's single-insert commits alone ran more than twice as slowly for ten
+minutes was discarded, adds the owner tab's statements served as they arrive,
+lookups by primary key encoded from the predicate's values, and records
+encoded into one buffer.
 
-| Workload | v0.3.0 | 26 Sep | `64ce856` | `23fe19c` | `5a3e1d7` | `a9e4b08` | `b3ebbaf` | `82ec602` | `73042cc` |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `cold-open` | 0.7× | 0.8× | 0.71× | 0.59× | 0.60× | 0.59× | 0.61× | 0.68× | 0.59× |
-| `reopen` | 3.5× | 1.2× | 1.2× | 1.1× | 1.2× | 1.1× | 1.05× | 1.1× | 1.1× |
-| `insert-autocommit` | 3.3× | 2.1× | 1.1× | 1.1× | 0.98× | 0.93× | 0.90× | 1.1× | 0.90× |
-| `insert-transaction` | 9.9× | 2.5× | 1.7× | 1.7× | 1.6× | 1.5× | 1.6× | 1.4× | 1.4× |
-| `insert-indexed` | 15× | 2.3× | 1.8× | 1.6× | 1.5× | 1.6× | 1.6× | 1.3× | 1.3× |
-| `insert-batch` | 33× | 3.4× | 2.0× | 1.6× | 1.6× | 1.4× | 1.5× | 1.1× | 1.1× |
-| `select-pk` | 4.2× | 1.6× | 1.2× | 1.1× | 1.1× | 1.0× | 1.0× | 0.99× | 1.0× |
-| `select-scan` | 105× | 1.75× | 1.7× | 1.6× | 1.6× | 1.5× | 1.1× | 1.1× | 1.05× |
-| `select-like` | 39× | 0.9× | 0.95× | 0.94× | 0.92× | 0.92× | 0.86× | 0.79× | 0.79× |
-| `select-indexed` | 1,406× | 2.4× | 1.6× | 1.2× | 1.1× | 1.1× | 1.0× | 1.0× | 1.0× |
-| `select-all` | 2.3× | 0.6× | 0.28× | 0.23× | 0.24× | 0.25× | 0.25× | 0.25× | 0.23× |
-| `group-by` | 22× | 0.95× | 1.0× | 0.86× | 0.87× | 0.89× | 0.77× | 0.72× | 0.72× |
-| `join` | 175× | 1.4× | 1.1× | 0.88× | 0.86× | 0.88× | 0.82× | 0.82× | 0.82× |
-| `update-pk` | 1,077× | 2.3× | 1.8× | 1.8× | 1.8× | 1.7× | 1.6× | 1.2× | 1.5× |
-| `update-scan` | 179× | 2.2× | 2.1× | 2.1× | 2.1× | 2.0× | 1.5× | 1.2× | 1.3× |
-| `upsert` | 1,362× | 2.5× | 1.8× | 1.8× | 1.9× | 1.7× | 1.7× | 1.5× | 1.6× |
-| `delete-pk` | 1,105× | 2.6× | 1.8× | 1.8× | 1.7× | 1.6× | 1.7× | 1.3× | 1.5× |
-| `delete-like` | 95× | 3.7× | 2.7× | 1.9× | 2.1× | 1.6× | 1.6× | 1.7× | 1.3× |
-| `delete-range` | 249× | 3.7× | 2.5× | 2.3× | 2.2× | 1.6× | 1.4× | 1.4× | 1.3× |
-| `create-index` | 142× | 1.3× | 1.1× | 1.0× | 1.1× | 1.1× | 1.0× | 0.77× | 0.96× |
+| Workload | v0.3.0 | 26 Sep | `64ce856` | `23fe19c` | `5a3e1d7` | `a9e4b08` | `b3ebbaf` | `82ec602` | `73042cc` | `e6ed5eb` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `cold-open` | 0.7× | 0.8× | 0.71× | 0.59× | 0.60× | 0.59× | 0.61× | 0.68× | 0.59× | 0.59× |
+| `reopen` | 3.5× | 1.2× | 1.2× | 1.1× | 1.2× | 1.1× | 1.05× | 1.1× | 1.1× | 1.1× |
+| `insert-autocommit` | 3.3× | 2.1× | 1.1× | 1.1× | 0.98× | 0.93× | 0.90× | 1.1× | 0.90× | 0.90× |
+| `insert-transaction` | 9.9× | 2.5× | 1.7× | 1.7× | 1.6× | 1.5× | 1.6× | 1.4× | 1.4× | 1.35× |
+| `insert-indexed` | 15× | 2.3× | 1.8× | 1.6× | 1.5× | 1.6× | 1.6× | 1.3× | 1.3× | 1.3× |
+| `insert-batch` | 33× | 3.4× | 2.0× | 1.6× | 1.6× | 1.4× | 1.5× | 1.1× | 1.1× | 1.04× |
+| `select-pk` | 4.2× | 1.6× | 1.2× | 1.1× | 1.1× | 1.0× | 1.0× | 0.99× | 1.0× | 0.99× |
+| `select-scan` | 105× | 1.75× | 1.7× | 1.6× | 1.6× | 1.5× | 1.1× | 1.1× | 1.05× | 1.06× |
+| `select-like` | 39× | 0.9× | 0.95× | 0.94× | 0.92× | 0.92× | 0.86× | 0.79× | 0.79× | 0.80× |
+| `select-indexed` | 1,406× | 2.4× | 1.6× | 1.2× | 1.1× | 1.1× | 1.0× | 1.0× | 1.0× | 0.97× |
+| `select-all` | 2.3× | 0.6× | 0.28× | 0.23× | 0.24× | 0.25× | 0.25× | 0.25× | 0.23× | 0.24× |
+| `group-by` | 22× | 0.95× | 1.0× | 0.86× | 0.87× | 0.89× | 0.77× | 0.72× | 0.72× | 0.72× |
+| `join` | 175× | 1.4× | 1.1× | 0.88× | 0.86× | 0.88× | 0.82× | 0.82× | 0.82× | 0.82× |
+| `update-pk` | 1,077× | 2.3× | 1.8× | 1.8× | 1.8× | 1.7× | 1.6× | 1.2× | 1.5× | 1.4× |
+| `update-scan` | 179× | 2.2× | 2.1× | 2.1× | 2.1× | 2.0× | 1.5× | 1.2× | 1.3× | 1.3× |
+| `upsert` | 1,362× | 2.5× | 1.8× | 1.8× | 1.9× | 1.7× | 1.7× | 1.5× | 1.6× | 1.5× |
+| `delete-pk` | 1,105× | 2.6× | 1.8× | 1.8× | 1.7× | 1.6× | 1.7× | 1.3× | 1.5× | 1.5× |
+| `delete-like` | 95× | 3.7× | 2.7× | 1.9× | 2.1× | 1.6× | 1.6× | 1.7× | 1.3× | 1.4× |
+| `delete-range` | 249× | 3.7× | 2.5× | 2.3× | 2.2× | 1.6× | 1.4× | 1.4× | 1.3× | 1.3× |
+| `create-index` | 142× | 1.3× | 1.1× | 1.0× | 1.1× | 1.1× | 1.0× | 0.77× | 0.96× | 0.95× |
 
 The compressed download grew from 296 KiB to 334 KiB, and is now 302 KiB.
 Between two runs on the same build, the ratios moved by up to a tenth, and by
@@ -111,6 +115,15 @@ before, rose to 0.96 times PGlite's, whose index builds ran a third faster.
 In memory, committing each insert alone fell from 94 microseconds to 87, point
 writes from 1.9-2.2 times SQLite's to 1.7-1.9, and inserts in a transaction
 from 1.4-1.5 to 1.3-1.4.
+The `e6ed5eb` run was as quiet, with SQLite log-sums of 75.10 with OPFS and
+61.75 in memory, and SQLite's times held within a few percent of the
+`73042cc` run's. With OPFS, TinyJoin's updates by key took 6% less time,
+inserts in a transaction 5%, 200-row inserts 7%, reads by key 4%, and upserts
+and deletes by key 2-3%, so no workload now takes more than 1.5 times the
+faster engine's time, and reads by key match SQLite's. Scans, bulk deletes and
+index builds held; the `LIKE` delete's rise from 1.3 times PGlite's to 1.4 is
+within the spread of both runs' samples. In memory, where the owner tab's lane
+does not apply, point statements took 1-3% less time.
 
 Done:
 
@@ -884,7 +897,7 @@ uncompressed. `s` costs 24 KiB for a few percent.
 Remeasured on 27 September 2026, on commit `ee2de97`, in the same way:
 
 | `tinyjoin-core` | Engine gzip | `insert-transaction` | `insert-batch` | `select-scan` | `group-by` | `update-pk` | `delete-range` | `create-index` |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `z` (shipped) | 308 KiB | 78 | 51 | 70 | 16.5 | 12.1 | 8.8 | 11.5 |
 | `s` | +24 KiB | 76 | 51 | 69 | 16.3 | 11.4 | 8.8 | 10.6 |
 | `1` | larger | 80 | 53 | 70 | 18.7 | 12.1 | 9.2 | 10.7 |
