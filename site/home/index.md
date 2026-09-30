@@ -21,7 +21,10 @@
 >
 > The whole database - the main-thread client, the Worker host, and the Rust
 > WASM engine - is {{sizes.total.gzip}} gzipped, and only {{sizes.client.gzip}}
-> of that ever runs on the UI thread. Check our Benchmarks guide for empirical comparisons.
+> of that ever runs on the UI thread.
+> 
+> And it's quite fast! Check our Benchmarks guide for empirical comparisons with
+> other client databases.
 
 | Component      |                     gzip |
 | -------------- | -----------------------: |
