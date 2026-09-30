@@ -31,7 +31,7 @@ for (const [width, searchInMenu] of [
     await primary.getByRole('link', {name: 'API', exact: true}).click();
     await expect(page).toHaveURL(/\/api\/$/);
     await expect(menuState).not.toBeChecked();
-    await expect(links[0]).toBeHidden();
+    await expect(links[0]!).toBeHidden();
 
     if (searchInMenu) {
       await menu.click();
