@@ -121,8 +121,15 @@ body {
 
 @media (min-width: 84rem) {
   body {
+    // Inset the header's contents to the same 84rem column as the page, so
+    // the wordmark and theme toggle line up with the outer edges of the
+    // navigation and the aside.
     > header {
-      justify-content: center;
+      padding: 0 calc(50% - 42rem);
+
+      > nav {
+        max-width: none;
+      }
     }
 
     > main {
