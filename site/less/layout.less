@@ -19,7 +19,6 @@ body {
     position: relative;
 
     > a {
-      min-width: 15rem;
       margin-left: 1rem;
     }
 
@@ -30,7 +29,20 @@ body {
       margin: 0;
     }
 
+    > #hamburger,
     > #dark {
+      flex-shrink: 0;
+    }
+
+    > #hamburger {
+      order: 1;
+      width: 1.25rem;
+      height: 1.25rem;
+      margin: 0 1.5rem 0 auto;
+    }
+
+    > #dark {
+      order: 2;
       width: 1rem;
       margin-right: 1rem;
     }
@@ -103,6 +115,18 @@ body {
   }
 }
 
+@media (min-width: 55rem) {
+  body > header {
+    > a {
+      min-width: 21rem;
+    }
+
+    > #hamburger {
+      display: none;
+    }
+  }
+}
+
 @media (min-width: 50rem) {
   body > main > article {
     min-width: 50rem;
@@ -121,15 +145,8 @@ body {
 
 @media (min-width: 84rem) {
   body {
-    // Inset the header's contents to the same 84rem column as the page, so
-    // the wordmark and theme toggle line up with the outer edges of the
-    // navigation and the aside.
     > header {
-      padding: 0 calc(50% - 42rem);
-
-      > nav {
-        max-width: none;
-      }
+      justify-content: center;
     }
 
     > main {

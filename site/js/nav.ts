@@ -1,4 +1,5 @@
 import {enhanceMain} from './enhance.ts';
+import {closeMenu} from './menu.ts';
 
 const SITE = 'TinyJoin';
 
@@ -35,6 +36,7 @@ export const navLoad = () => {
     url.pathname === currentUrl.pathname && url.search === currentUrl.search;
 
   const go = async (url: URL, push: boolean) => {
+    closeMenu();
     cancelNavigation();
     const id = requestId;
     controller = new AbortController();
@@ -96,6 +98,7 @@ export const navLoad = () => {
     }
     const url = new URL(link.href);
     if (isCurrentDocument(url)) {
+      closeMenu();
       cancelNavigation();
       return;
     }

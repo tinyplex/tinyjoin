@@ -15,6 +15,8 @@ export const Header = () => {
           Tiny<em>Join</em>
         </span>
       </a>
+      <input id="menustate" type="checkbox" aria-label="Menu" />
+      <label id="hamburger" htmlFor="menustate" aria-hidden="true" />
       <nav aria-label="Primary">
         <ul>
           <NodeChildren node={root} />

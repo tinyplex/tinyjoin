@@ -1,3 +1,5 @@
+import {closeMenu} from './menu.ts';
+
 type Page = {u: string; n: string; s: string};
 
 const MAX_RESULTS = 10;
@@ -153,6 +155,10 @@ export const searchLoad = () => {
   };
 
   input.addEventListener('focus', () => {
+    // The search box sits beside the menu here, so close the menu.
+    if (matchMedia('(min-width: 38rem)').matches) {
+      closeMenu();
+    }
     populate();
     show(true);
   });
