@@ -31,6 +31,7 @@
     "build": "node scripts/build.mjs",
     "build:docs": "npm run build && npm run build:docs:built",
     "build:docs:built": "node scripts/build-docs.mjs",
+    "build:card": "npm run build:docs:built && node scripts/benchmark-card.mjs && npm run build:docs:built",
     "build:lib": "node scripts/build-lib.mjs",
     "build:wasm": "node scripts/build-wasm.mjs",
     "cargo": "node scripts/cargo.mjs",

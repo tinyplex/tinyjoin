@@ -5,6 +5,7 @@ import {relative, resolve} from 'node:path';
 import type {Docs, Node} from 'tinydocs';
 import {createDocs, getSorter} from 'tinydocs';
 import {writePackageDocumentation} from '../scripts/package-documentation.mjs';
+import type {Benchmarks} from './benchmarks.ts';
 import {getBenchmarks} from './benchmarks.ts';
 import {MainInner} from './ui/MainInner.tsx';
 import {MarkdownPage} from './ui/MarkdownPage.tsx';
@@ -59,6 +60,21 @@ const getSizeReplacers = (): [RegExp, string][] => {
     new RegExp(`\\{\\{sizes\\.${group}\\.gzip\\}\\}`, 'g'),
     gzipLabel,
   ]);
+};
+
+// The benchmark card, labeled with the newest release, is a page to capture
+// as an image and share. scripts/render-benchmark-card.mjs captures it.
+const getBenchmarkCard = (benchmarks: Benchmarks): string => {
+  const release = /^## (v\d+\.\d+\.\d+)$/m.exec(
+    readFileSync('site/guides/11_releases.md', 'utf8'),
+  )?.[1];
+  if (release == null) {
+    throw new Error('No release heading in site/guides/11_releases.md');
+  }
+  return benchmarks.renderCard(
+    readFileSync('site/benchmark-card.html', 'utf8'),
+    release,
+  );
 };
 
 const RUNTIME_FILES = [
@@ -134,6 +150,7 @@ export const build = async (
     .addLessFile('site/less/index.less')
     .addDir('site/fonts', 'fonts')
     .addDir('site/extras')
+    .addStringFile(getBenchmarkCard(benchmarks), 'benchmark-card.html')
     .addReflectionTransform(hideInheritedErrorMembers)
     .addNodeTransform(collapseEmptyGroups)
     .addNodeTransform((node) => {

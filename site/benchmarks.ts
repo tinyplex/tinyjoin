@@ -125,22 +125,27 @@ const timeChart = (report: Report, ids: string[]): Chart => ({
   }),
 });
 
+const downloadMeasure = (
+  report: Report,
+  [key, label]: [keyof Download, string],
+): Measure => ({
+  label,
+  values: ENGINES.map(([engine]) => report.download[engine]?.[key] ?? null),
+  ranges: ENGINES.map(() => null),
+  timedOut: ENGINES.map(() => false),
+  missing: ENGINES.map(() => 'not measured'),
+  titles: ENGINES.map(
+    ([engine, name]) =>
+      `${name}: ` +
+      (report.download[engine] == null
+        ? 'not measured'
+        : `${report.download[engine][key].toLocaleString('en-US')} bytes`),
+  ),
+});
+
 const downloadChart = (report: Report): Chart => ({
   unit: 'bytes',
-  measures: DOWNLOADS.map(([key, label]) => ({
-    label,
-    values: ENGINES.map(([engine]) => report.download[engine]?.[key] ?? null),
-    ranges: ENGINES.map(() => null),
-    timedOut: ENGINES.map(() => false),
-    missing: ENGINES.map(() => 'not measured'),
-    titles: ENGINES.map(
-      ([engine, name]) =>
-        `${name}: ` +
-        (report.download[engine] == null
-          ? 'not measured'
-          : `${report.download[engine][key].toLocaleString('en-US')} bytes`),
-    ),
-  })),
+  measures: DOWNLOADS.map((download) => downloadMeasure(report, download)),
 });
 
 const groupIds = (report: Report, group: string): string[] =>
@@ -263,7 +268,7 @@ const chartMarkdown = (chart: Chart): string => {
 // How often each engine was the fastest, the second, and the slowest across a
 // report's timed workloads. Engines that tie share a place, and an engine that
 // did not complete counts as the slowest.
-const placings = (report: Report): string => {
+const placingCounts = (report: Report): number[][] => {
   const counts = ENGINES.map(() => [0, 0, 0]);
   for (const workload of report.results) {
     const measure = timeChart(report, [workload.id]).measures[0];
@@ -275,6 +280,11 @@ const placings = (report: Report): string => {
       counts[index][Math.min(faster, 2)] += 1;
     });
   }
+  return counts;
+};
+
+const placings = (report: Report): string => {
+  const counts = placingCounts(report);
   return [
     '| Engine | Fastest | Second | Slowest |',
     '| --- | ---: | ---: | ---: |',
@@ -338,6 +348,187 @@ const renderText = (report: Report, name: string): string => {
   }
 };
 
+// The benchmark card summarizes a report in a 1600x900 page to share as an
+// image. Its template, site/benchmark-card.html, holds the layout and fixed
+// copy, and its {{card.<name>}} placeholders take the measurements below.
+
+// The measures featured in the card's tiles, each with its title: the gzip
+// download, or a timed workload.
+const CARD_TILES: [measure: string, title: string][] = [
+  ['download', 'Download, gzip'],
+  ['cold-open', 'First open'],
+  ['select-all', 'Read 10,000 rows'],
+];
+
+// Short names for the other workloads that the card lists TinyJoin's leads in.
+const CARD_NAMES: {[id: string]: string} = {
+  'cold-open': 'First open',
+  reopen: 'Reopen',
+  'insert-autocommit': 'Autocommit inserts',
+  'insert-transaction': 'Bulk inserts',
+  'insert-indexed': 'Indexed inserts',
+  'insert-batch': 'Batched inserts',
+  'select-pk': 'Point reads',
+  'select-scan': 'Range scans',
+  'select-like': 'LIKE scans',
+  'select-indexed': 'Indexed ranges',
+  'select-all': 'Full reads',
+  'group-by': 'GROUP BY',
+  join: 'Joins',
+  'update-pk': 'Point updates',
+  'update-scan': 'Range updates',
+  upsert: 'Upserts',
+  'delete-pk': 'Point deletes',
+  'delete-like': 'LIKE deletes',
+  'delete-range': 'Range deletes',
+  'create-index': 'Index builds',
+};
+
+const CARD_PLACEHOLDER = /\{\{card\.([a-z]+)\}\}/g;
+
+const formatRatio = (ratio: number): string =>
+  `${ratio >= 10 ? Math.round(ratio) : ratio.toFixed(1)}×`;
+
+// How TinyJoin compares with the nearest other engine in a measure: whether it
+// leads, being faster than every other, and the ratio of the slower of the two
+// to the faster.
+const compare = (
+  report: Report,
+  measure: Measure,
+): {leads: boolean; ratio: number; other: string} => {
+  const measured = lengths(report, measure);
+  const [first, second] = ranked(report, measure);
+  const other = first == 0 ? second : first;
+  const [tinyjoin, nearest] = [measured[0], measured[other]];
+  if (tinyjoin == null || nearest == null) {
+    throw new Error(`Cannot compare the engines in ${measure.label}`);
+  }
+  const leads = first == 0 && nearest > tinyjoin;
+  return {
+    leads,
+    ratio: leads ? nearest / tinyjoin : tinyjoin / nearest,
+    other: ENGINES[other][1],
+  };
+};
+
+// A tile: its title, how TinyJoin compares with the nearest other engine, and
+// a bar per engine, fastest first, on a scale on which the slowest reaches the
+// full width.
+const cardTile = (
+  report: Report,
+  measure: Measure,
+  unit: Chart['unit'],
+  title: string,
+): string => {
+  const {leads, ratio, other} = compare(report, measure);
+  if (!leads) {
+    console.warn(
+      `The benchmark card features ${title}, ` +
+        'in which TinyJoin is not the fastest',
+    );
+  }
+  const format = unit == 'ms' ? formatMs : formatBytes;
+  const comparison =
+    unit == 'ms' ? (leads ? 'faster' : 'slower') : leads ? 'smaller' : 'larger';
+  const measured = lengths(report, measure);
+  const longest = Math.max(...measured.map((length) => length ?? 0));
+  const bars = ranked(report, measure).map((index) => {
+    const [engine, name] = ENGINES[index];
+    const value = measure.values[index];
+    const x = (measured[index] ?? 0) / longest;
+    const shown = value == null ? measure.missing[index] : format(value);
+    return (
+      `<dt class="${engine}">${name}</dt><dd class="${engine}">` +
+      `<span class="bar" style="--x:${fraction(x)}"></span>` +
+      `${escapeHtml(shown)}</dd>`
+    );
+  });
+  return (
+    `<figure class="tile"><figcaption>${escapeHtml(title)}</figcaption>` +
+    `<p><b>${formatRatio(ratio)}</b> ${comparison} than ${other}</p>` +
+    `<dl>${bars.join('')}</dl></figure>`
+  );
+};
+
+const cardTiles = (report: Report): string =>
+  CARD_TILES.map(([measure, title]) =>
+    measure == 'download'
+      ? cardTile(
+          report,
+          downloadMeasure(report, ['gzip', 'Download (gzip)']),
+          'bytes',
+          title,
+        )
+      : cardTile(report, timeChart(report, [measure]).measures[0], 'ms', title),
+  ).join('');
+
+// Every other workload in which TinyJoin is the fastest, by how far ahead it
+// is. Ties, and leads that round to 1.0×, count as fastest in the headline,
+// but are not leads to list.
+const cardWins = (report: Report): string =>
+  report.results
+    .filter(({id}) => !CARD_TILES.some(([measure]) => measure == id))
+    .map(({id, label}) => ({
+      name: CARD_NAMES[id] ?? label,
+      ...compare(report, timeChart(report, [id]).measures[0]),
+    }))
+    .filter(({leads, ratio}) => leads && ratio >= 1.05)
+    .sort((a, b) => b.ratio - a.ratio)
+    .map(
+      ({name, ratio}) =>
+        `<li>${escapeHtml(name)} <b>${formatRatio(ratio)}</b></li>`,
+    )
+    .join('');
+
+const cardHeadline = (report: Report): string => {
+  const [fastest, second, slowest] = placingCounts(report)[0];
+  const total = report.results.length;
+  return (
+    (fastest == total
+      ? `Fastest in all ${total} workloads.`
+      : `Fastest in ${fastest} of ${total} workloads.`) +
+    '<br /><em>' +
+    (slowest == 0
+      ? 'Never the slowest.'
+      : `Second in ${second}, and the slowest in ${slowest}.`) +
+    '</em>'
+  );
+};
+
+const renderCard = (
+  report: Report,
+  template: string,
+  release: string,
+): string => {
+  const {sqlite, pglite} = report.engines;
+  const {browserVersion, cpu} = report.environment;
+  const values: {[name: string]: string} = {
+    release: escapeHtml(release),
+    headline: cardHeadline(report),
+    engines: escapeHtml(
+      `SQLite ${sqlite.engineVersion ?? sqlite.version} ` +
+        `and PGlite ${pglite.version}`,
+    ),
+    tiles: cardTiles(report),
+    wins: cardWins(report),
+    method: escapeHtml(
+      [
+        'Same SQL on every engine',
+        `Median of ${report.samples} runs`,
+        `Chromium ${browserVersion.split('.')[0]}`,
+        cpu,
+        report.measuredAt.slice(0, 10),
+      ].join(' · '),
+    ),
+  };
+  return template.replaceAll(CARD_PLACEHOLDER, (_placeholder, name) => {
+    if (values[name] == null) {
+      throw new Error(`Unknown benchmark card placeholder: ${name}`);
+    }
+    return values[name];
+  });
+};
+
 export type Benchmarks = {
   // Text placeholders to Markdown, leaving chart placeholders in place.
   renderText: (markdown: string) => string;
@@ -345,6 +536,8 @@ export type Benchmarks = {
   renderTables: (markdown: string) => string;
   // Rendered chart paragraphs to chart HTML, for TinyDocs replacers.
   chartReplacers: [RegExp, string][];
+  // The benchmark card's template to HTML, labeled with a release.
+  renderCard: (template: string, release: string) => string;
 };
 
 const createBenchmarks = (report: Report): Benchmarks => {
@@ -374,6 +567,7 @@ const createBenchmarks = (report: Report): Benchmarks => {
         '$$$$',
       ),
     ]),
+    renderCard: (template, release) => renderCard(report, template, release),
   };
 };
 

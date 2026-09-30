@@ -1,0 +1,242 @@
+<!doctype html>
+<!--
+  The benchmark card summarizes the published benchmarks in one 1600x900 image
+  to share. The docs build publishes it as /benchmark-card.html, filling each
+  {{card.<name>}} placeholder from site/data/benchmarks.json and the release
+  from the newest heading in the release notes, and warns if a featured tile
+  is not a lead. site/benchmarks.ts chooses the featured tiles.
+
+  npm run build:card captures the published page as
+  site/extras/benchmark-card.png, which the docs build publishes beside it, and
+  which the benchmarks guide shares as its Open Graph image.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="robots" content="noindex" />
+    <title>TinyJoin benchmark card</title>
+    <style>
+      @font-face {
+        font-family: Inter;
+        src: url(/fonts/inter.woff2);
+      }
+      @font-face {
+        font-family: Inconsolata;
+        src: url(/fonts/inconsolata.woff2);
+      }
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        width: 1600px;
+        height: 900px;
+        background: #111;
+        color: #eee;
+        font-family: Inter;
+        font-variant-numeric: tabular-nums;
+        overflow: hidden;
+        position: relative;
+      }
+      .glow {
+        position: absolute;
+        inset: 0;
+        background:
+          radial-gradient(900px 600px at 85% 8%, #7c3aed40, transparent 70%),
+          radial-gradient(700px 500px at 5% 105%, #7c3aed22, transparent 70%);
+      }
+      .wrap {
+        position: absolute;
+        inset: 0;
+        padding: 64px 88px 60px;
+        display: flex;
+        flex-direction: column;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 22px;
+      }
+      .brand img {
+        width: 76px;
+        height: 76px;
+      }
+      .wordmark {
+        font-size: 68px;
+        font-weight: 800;
+        letter-spacing: -1.5px;
+      }
+      .pill {
+        margin-left: auto;
+        font-size: 34px;
+        font-weight: 700;
+        color: #c4b5fd;
+        border: 3px solid #7c3aed;
+        border-radius: 18px;
+        padding: 8px 24px;
+        box-shadow: 0 0 40px #7c3aed50;
+      }
+      h1 {
+        margin-top: 44px;
+        font-size: 70px;
+        font-weight: 800;
+        letter-spacing: -2px;
+        line-height: 1.04;
+      }
+      h1 em {
+        font-style: normal;
+        color: #a78bfa;
+      }
+      .sub {
+        margin-top: 18px;
+        font-size: 30px;
+        color: #bbb;
+      }
+      .tiles {
+        margin-top: auto;
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 28px;
+      }
+      .tile {
+        background: #1a1a1a;
+        border: 2px solid #2e2e2e;
+        border-radius: 22px;
+        padding: 26px 30px 30px;
+      }
+      .tile figcaption {
+        font-size: 24px;
+        font-weight: 700;
+        color: #bbb;
+      }
+      .tile p {
+        margin-top: 4px;
+        display: flex;
+        align-items: baseline;
+        gap: 14px;
+        font-size: 24px;
+        color: #ddd;
+      }
+      .tile p b {
+        font-size: 64px;
+        font-weight: 800;
+        letter-spacing: -1.5px;
+        color: #a78bfa;
+      }
+      /* One bar per engine, fastest first, each after its engine's name and
+         before its value, drawn to the tile's own scale. */
+      .tile dl {
+        margin-top: 16px;
+        display: grid;
+        grid-template-columns: 96px 1fr;
+        align-items: center;
+        row-gap: 12px;
+        font-size: 20px;
+      }
+      .tile dt {
+        color: #bbb;
+      }
+      .tile dd {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        color: #eee;
+        white-space: nowrap;
+      }
+      .tile .bar {
+        width: calc(var(--x) * (100% - 5.5em));
+        min-width: 3px;
+        height: 16px;
+        border-radius: 0 4px 4px 0;
+        background: var(--series);
+      }
+      .tinyjoin {
+        --series: #8b5cf6;
+      }
+      .sqlite {
+        --series: #5d86a6;
+      }
+      .pglite {
+        --series: #a39150;
+      }
+      .tile dt.tinyjoin,
+      .tile dd.tinyjoin {
+        color: #fff;
+        font-weight: 700;
+      }
+      .wins {
+        margin-top: 26px;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        font-size: 20px;
+        color: #aaa;
+        white-space: nowrap;
+      }
+      .wins ul {
+        display: flex;
+        gap: 10px;
+        list-style: none;
+      }
+      .wins li {
+        color: #eee;
+        background: #1a1a1a;
+        border: 2px solid #2e2e2e;
+        border-radius: 999px;
+        padding: 5px 14px;
+      }
+      .wins li b {
+        color: #a78bfa;
+      }
+      footer {
+        margin-top: 28px;
+        display: flex;
+        align-items: center;
+        gap: 24px;
+        font-size: 24px;
+        color: #888;
+      }
+      footer code {
+        font-family: Inconsolata;
+        font-size: 30px;
+        color: #eee;
+        background: #222;
+        padding: 4px 16px;
+        border-radius: 10px;
+      }
+      footer .method {
+        flex: 1;
+        font-size: 18px;
+        color: #777;
+        text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="glow"></div>
+    <div class="wrap">
+      <header class="brand">
+        <img src="/favicon.svg" alt="" />
+        <span class="wordmark">TinyJoin</span>
+        <span class="pill">{{card.release}} benchmarks</span>
+      </header>
+      <h1>{{card.headline}}</h1>
+      <p class="sub">
+        Against {{card.engines}}, each in a browser Worker on OPFS.
+      </p>
+      <div class="tiles">{{card.tiles}}</div>
+      <div class="wins">
+        <span>Also fastest at</span>
+        <ul>
+          {{card.wins}}
+        </ul>
+      </div>
+      <footer>
+        <code>npm i tinyjoin</code>
+        <span class="method">{{card.method}}</span>
+        <span>tinyjoin.org/guides/benchmarks</span>
+      </footer>
+    </div>
+  </body>
+</html>

@@ -9,6 +9,12 @@ const GTM_ID = 'G-40B96SPQX2';
 const DESCRIPTION =
   'A tiny, worker-first relational database for browser apps.';
 
+// For now, only the benchmarks guide has a share image of its own: the
+// benchmark card, which npm run build:card captures from its results.
+const BENCHMARKS_URL = '/guides/benchmarks/';
+const BENCHMARKS_IMAGE_ALT =
+  "A summary of TinyJoin's benchmark results against SQLite and PGlite";
+
 export const Page = () => {
   const node = usePageNode();
   const root = useRootNode();
@@ -54,6 +60,18 @@ export const Page = () => {
         <meta property="og:title" content={title} />
         <meta property="og:description" content={DESCRIPTION} />
         <meta property="og:url" content={canonical} />
+        {node.url === BENCHMARKS_URL ? (
+          <>
+            <meta
+              property="og:image"
+              content={`${baseUrl}/benchmark-card.png`}
+            />
+            <meta property="og:image:width" content="1600" />
+            <meta property="og:image:height" content="900" />
+            <meta property="og:image:alt" content={BENCHMARKS_IMAGE_ALT} />
+            <meta name="twitter:card" content="summary_large_image" />
+          </>
+        ) : null}
         <link rel="canonical" href={canonical} />
         <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
         <link rel="stylesheet" href="/css/index.css" />

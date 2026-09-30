@@ -1,6 +1,7 @@
 import {readFile, readdir} from 'node:fs/promises';
 import {extname, join, relative, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {benchmarkCardStamp} from './benchmark-card.mjs';
 import {getPackageDocumentation} from './package-documentation.mjs';
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -14,6 +15,8 @@ const requiredFiles = [
   'guides/index.html',
   'guides/node/index.html',
   'guides/benchmarks/index.html',
+  'benchmark-card.html',
+  'benchmark-card.png',
   'demos/index.html',
   'llms.txt',
   'llms-full.txt',
@@ -54,6 +57,25 @@ export async function checkDocs(
   );
   if (!benchmarksGuide.includes('<figure class="chart"')) {
     errors.push('The benchmarks guide must chart the published results');
+  }
+  if (
+    !benchmarksGuide.includes(
+      '<meta property="og:image" content="https://tinyjoin.org/benchmark-card.png">',
+    )
+  ) {
+    errors.push('The benchmarks guide must share the benchmark card image');
+  }
+  // The share image must be captured from the card that this build published,
+  // whose hash npm run build:card stamps the image with.
+  const benchmarkCard = await readFile(
+    resolve(docs, 'benchmark-card.html'),
+    'utf8',
+  );
+  const benchmarkCardImage = await readFile(
+    resolve(docs, 'benchmark-card.png'),
+  );
+  if (!benchmarkCardImage.includes(benchmarkCardStamp(benchmarkCard))) {
+    errors.push('The benchmark card image is stale. Run npm run build:card.');
   }
   if (!homepage.includes('<nav id="actions" aria-label="Get started">')) {
     errors.push('The homepage must contain its explicitly scoped action links');
