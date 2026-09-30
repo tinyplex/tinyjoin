@@ -55,12 +55,13 @@
     margin: 0;
   }
 
-  // Labels sit right-aligned against the baseline, centered on their bars.
+  // Labels sit right-aligned against the baseline, level with the first of
+  // their bars.
   dt {
-    align-self: center;
+    align-self: start;
     color: @text2Color;
     font-size: 0.875rem;
-    line-height: 1.125rem;
+    line-height: @barHeight;
     padding: @groupGap 0.75rem 0 0;
     text-align: right;
   }
