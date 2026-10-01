@@ -13,16 +13,27 @@ import {brotliCompressSync, constants, gzipSync} from 'node:zlib';
 // running in a Worker and storing to OPFS in a real Chromium profile. Every
 // sample gets a fresh browser profile on disk, so storage is never shared or
 // in-memory, and a hung sample can be killed without affecting the next.
-// Diagnostic distributions, never a CI timing threshold.
+// Diagnostic distributions, never a CI timing threshold. Turso can be added
+// with --engines for local comparison; it is never published.
 
 const here = fileURLToPath(new URL('.', import.meta.url));
 const root = resolve(here, '../..');
 const ENGINES = ['tinyjoin', 'sqlite', 'pglite'];
-const PACKAGES = {tinyjoin: 'tinyjoin', sqlite: '@sqlite.org/sqlite-wasm', pglite: '@electric-sql/pglite'};
-const STORAGE = {
-  opfs: {tinyjoin: 'opfs://', sqlite: 'opfs-sahpool', pglite: 'opfs-ahp://'},
-  memory: {tinyjoin: 'memory://', sqlite: ':memory:', pglite: 'memory://'},
+const OPTIONAL_ENGINES = ['turso'];
+const KNOWN_ENGINES = [...ENGINES, ...OPTIONAL_ENGINES];
+const PACKAGES = {
+  tinyjoin: 'tinyjoin',
+  sqlite: '@sqlite.org/sqlite-wasm',
+  pglite: '@electric-sql/pglite',
+  turso: '@tursodatabase/database-wasm',
 };
+const STORAGE = {
+  opfs: {tinyjoin: 'opfs://', sqlite: 'opfs-sahpool', pglite: 'opfs-ahp://', turso: 'OPFS sync access handles'},
+  memory: {tinyjoin: 'memory://', sqlite: ':memory:', pglite: 'memory://', turso: ':memory:'},
+};
+// Turso's threaded WebAssembly needs SharedArrayBuffer, so its page is served
+// cross-origin isolated, from a second origin that only it uses.
+const ISOLATED = new Set(['turso']);
 // The OPFS results are published for the benchmarks guide to chart. The
 // in-memory suite runs for comparison, with its report written by --out.
 const PUBLISHED = resolve(root, 'site/data/benchmarks.json');
@@ -42,7 +53,7 @@ const {values: options} = parseArgs({
 if (options.help) {
   console.log(`Usage: node benchmarks/compare/run.mjs [options]
 
-  --engines a,b      ${ENGINES.join(', ')} (default: all)
+  --engines a,b      ${KNOWN_ENGINES.join(', ')} (default: ${ENGINES.join(',')})
   --workloads a,b    workload ids, including cold-open and reopen (default: all)
   --samples n        samples per engine and workload (default: 5)
   --storage kind     opfs or memory (default: opfs)
@@ -65,7 +76,7 @@ const selected = options.workloads ? options.workloads.split(',') : ALL.map(({id
 const samples = Number(options.samples);
 const storage = options.storage;
 const timeoutMs = Number(options.timeout) * 1000;
-for (const engine of engines) if (!ENGINES.includes(engine)) throw new Error(`Unknown engine: ${engine}`);
+for (const engine of engines) if (!KNOWN_ENGINES.includes(engine)) throw new Error(`Unknown engine: ${engine}`);
 for (const id of selected) if (!ALL.some((workload) => workload.id === id)) throw new Error(`Unknown workload: ${id}`);
 if (!STORAGE[storage]) throw new Error(`Unknown storage: ${storage}`);
 if (!(samples >= 1) || !(timeoutMs > 0)) throw new Error('--samples and --timeout must be positive');
@@ -84,7 +95,7 @@ if (process.version !== `v${pinnedNode}`) {
 
 // The competitors are installed in this directory, not the repository root,
 // so their exact versions are pinned by this directory's lockfile.
-if (!ENGINES.slice(1).every((engine) => existsSync(resolve(here, 'node_modules', PACKAGES[engine], 'package.json')))) {
+if (!KNOWN_ENGINES.slice(1).every((engine) => existsSync(resolve(here, 'node_modules', PACKAGES[engine], 'package.json')))) {
   console.log('Installing comparison engines...');
   execFileSync('npm', ['ci', '--no-audit', '--no-fund'], {cwd: here, stdio: 'inherit'});
 }
@@ -108,7 +119,7 @@ const version = async (engine) =>
   JSON.parse(await readFile(engine === 'tinyjoin' ? resolve(root, 'dist/package.json') : resolve(here, 'node_modules', PACKAGES[engine], 'package.json'), 'utf8')).version;
 const git = (...args) => execFileSync('git', args, {cwd: root, encoding: 'utf8'}).trim();
 
-// One Vite production build holds all three engines, each in its own chunk.
+// One Vite production build holds every engine, each in its own chunk.
 const out = resolve(here, '.build');
 const {build} = await import('vite');
 await build({configFile: resolve(here, 'vite.config.mjs'), logLevel: 'warn'});
@@ -116,7 +127,7 @@ const manifest = JSON.parse(await readFile(resolve(out, '.vite/manifest.json'), 
 const harnessFile = manifest['index.html'].file;
 
 const TYPES = {'.html': 'text/html', '.js': 'text/javascript', '.wasm': 'application/wasm', '.data': 'application/octet-stream'};
-const server = createServer(async (request, response) => {
+const serve = (isolated) => async (request, response) => {
   try {
     const pathname = new URL(request.url, 'http://127.0.0.1').pathname;
     const path = resolve(out, `.${pathname === '/' ? '/index.html' : pathname}`);
@@ -126,17 +137,26 @@ const server = createServer(async (request, response) => {
     // Hashed assets may be cached, as a deployed application's would be;
     // the page itself is always revalidated.
     response.setHeader('Cache-Control', pathname === '/' ? 'no-cache' : 'public, max-age=31536000, immutable');
+    if (isolated) {
+      response.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+      response.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+    }
     response.end(body);
   } catch (error) {
     response.statusCode = 404;
     response.end(String(error));
   }
-});
-await new Promise((resolveListen, reject) => {
-  server.once('error', reject);
-  server.listen(0, '127.0.0.1', resolveListen);
-});
-const origin = `http://127.0.0.1:${server.address().port}`;
+};
+const listen = async (isolated) => {
+  const server = createServer(serve(isolated));
+  await new Promise((resolveListen, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolveListen);
+  });
+  return server;
+};
+const servers = [await listen(false), await listen(true)];
+const [origin, isolatedOrigin] = servers.map((server) => `http://127.0.0.1:${server.address().port}`);
 
 const {chromium} = await import('@playwright/test');
 const report = {
@@ -173,7 +193,7 @@ const compress = (bytes) => ({
   brotli: brotliCompressSync(bytes, {params: {[constants.BROTLI_PARAM_QUALITY]: 11}}).length,
 });
 
-async function session(profile, callback) {
+async function session(engine, profile, callback) {
   const context = await chromium.launchPersistentContext(profile, {headless: true});
   const errors = [];
   const fetched = new Set();
@@ -183,7 +203,7 @@ async function session(profile, callback) {
     page.on('pageerror', (error) => errors.push(String(error)));
     page.on('console', (message) => message.type() === 'error' && errors.push(message.text()));
     page.on('requestfinished', (request) => fetched.add(new URL(request.url()).pathname));
-    await page.goto(origin);
+    await page.goto(ISOLATED.has(engine) ? isolatedOrigin : origin);
     await page.waitForFunction(() => window.benchReady);
     report.environment.userAgent ??= await page.evaluate(() => navigator.userAgent);
     let timer;
@@ -222,16 +242,16 @@ async function sample(engine, id) {
   const profile = await mkdtemp(join(tmpdir(), `tinyjoin-compare-${engine}-`));
   try {
     if (id === 'cold-open') {
-      return await session(profile, async (page, fetched) => {
+      return await session(engine, profile, async (page, fetched) => {
         const result = await page.evaluate(({engine, storage}) => window.bench.coldOpen(engine, storage), {engine, storage});
         return {...result, download: await measureDownload(fetched)};
       });
     }
     if (id === 'reopen') {
-      await session(profile, (page) => page.evaluate(({engine, storage}) => window.bench.seedReopen(engine, storage), {engine, storage}));
-      return await session(profile, (page) => page.evaluate(({engine, storage}) => window.bench.reopen(engine, storage), {engine, storage}));
+      await session(engine, profile, (page) => page.evaluate(({engine, storage}) => window.bench.seedReopen(engine, storage), {engine, storage}));
+      return await session(engine, profile, (page) => page.evaluate(({engine, storage}) => window.bench.reopen(engine, storage), {engine, storage}));
     }
-    return await session(profile, (page) => page.evaluate(({engine, id, storage}) => window.bench.run(engine, id, storage), {engine, id, storage}));
+    return await session(engine, profile, (page) => page.evaluate(({engine, id, storage}) => window.bench.run(engine, id, storage), {engine, id, storage}));
   } finally {
     await rm(profile, {recursive: true, force: true});
   }
@@ -292,7 +312,7 @@ try {
     await save();
   }
 } finally {
-  server.close();
+  for (const server of servers) server.close();
 }
 
 const kib = (bytes) => `${(bytes / 1024).toLocaleString('en-US', {maximumFractionDigits: 0})} KiB`;

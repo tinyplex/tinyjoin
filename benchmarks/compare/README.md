@@ -7,6 +7,12 @@ to OPFS, in a fresh on-disk Chromium profile per sample. With
 (`memory://`, `:memory:`, and `memory://`), which separates the engines from
 the storage beneath them.
 
+Turso (`@tursodatabase/database-wasm`) is an optional fourth engine for local
+comparison: add it with `--engines tinyjoin,sqlite,pglite,turso`. It is not in
+the default set, and `--publish` does not accept it. Unlike the others, its
+engine runs on the page's thread, with a Worker of its own for OPFS, and its
+page is served cross-origin isolated, as its threaded WebAssembly requires.
+
 ```sh
 npm run build
 npm run bench:compare -- --help

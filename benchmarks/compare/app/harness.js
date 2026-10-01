@@ -6,6 +6,7 @@ const engines = {
   tinyjoin: () => import('./engines/tinyjoin.js'),
   sqlite: () => import('./engines/sqlite.js'),
   pglite: () => import('./engines/pglite.js'),
+  turso: () => import('./engines/turso.js'),
 };
 const loader = (engine) => async () => (await engines[engine]()).default;
 
