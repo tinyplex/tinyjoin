@@ -1948,15 +1948,18 @@ fn is_identifier_named(token: Option<&Token>, name: &str) -> bool {
     }
 }
 
-/// Drops the table's name wherever it qualifies a column or `*` in a statement over one table,
-/// which leaves the plain column names that statement's parser reads.
+/// Drops what qualifies a column or `*` in a statement over one table, which leaves the plain
+/// column names that statement's parser reads: the table's alias where it is given, and then
+/// wherever that alias, or without one the table's name, comes before a dot.
 ///
-/// A table named with a schema is qualified by the name after the dot, as it is in a join. A
-/// qualifier that names anything else is left for the parser to refuse, and so is a column
-/// behind two qualifiers. A write names only its own table's columns before its `WHERE` and
-/// `RETURNING` clauses, so it is read from the first of those.
+/// A table named with a schema is qualified by the name after the dot, as it is in a join, and an
+/// alias replaces the table's name rather than joining it. A qualifier that names anything else
+/// is left for the parser to refuse, and so is a column behind two qualifiers. A write names only
+/// its own table's columns before its `WHERE` and `RETURNING` clauses, so it is read from the
+/// first of those, and an `INSERT` takes no alias.
 pub(crate) fn drop_table_qualifiers(tokens: &mut Vec<Token>) {
     let select = is_keyword(tokens.first(), "select");
+    let insert = is_keyword(tokens.first(), "insert");
     let start = if select {
         match tokens
             .iter()
@@ -1967,7 +1970,7 @@ pub(crate) fn drop_table_qualifiers(tokens: &mut Vec<Token>) {
         }
     } else if is_keyword(tokens.first(), "update") {
         1
-    } else if is_keyword(tokens.first(), "delete") || is_keyword(tokens.first(), "insert") {
+    } else if insert || is_keyword(tokens.first(), "delete") {
         2
     } else {
         return;
@@ -1982,6 +1985,15 @@ pub(crate) fn drop_table_qualifiers(tokens: &mut Vec<Token>) {
         };
         qualifier = table;
         end += 2;
+    }
+    // An alias follows the table with or without AS. No word that may follow a table is an
+    // identifier, since each is reserved.
+    if !insert {
+        let aliased = end + usize::from(is_keyword(tokens.get(end), "as"));
+        if let Some(alias) = identifier_name(tokens.get(aliased)) {
+            qualifier = alias;
+            tokens.drain(end..=aliased);
+        }
     }
 
     let first = if select {
@@ -5006,7 +5018,8 @@ mod tests {
         for sql in [
             "SELECT * FROM posts JOIN users ON posts.user_id = users.id",
             "SELECT id + 1 FROM posts",
-            "SELECT * FROM posts AS p",
+            "SELECT * FROM posts AS p (id, title)",
+            "SELECT * FROM posts p q",
             "SELECT DISTINCT * FROM posts",
             "SELECT * FROM posts; SELECT * FROM posts",
             "UPDATE posts SET title = 'no'",

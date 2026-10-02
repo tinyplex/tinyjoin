@@ -2847,6 +2847,99 @@ mod tests {
     }
 
     #[test]
+    fn a_table_alias_qualifies_a_single_table_statement_in_place_of_its_name() {
+        // An alias, with or without AS, is dropped with the qualifiers it gives.
+        for (aliased, plain) in [
+            (
+                "SELECT u.id, u.name AS who FROM users AS u WHERE u.active = $1 ORDER BY u.name",
+                "SELECT id, name AS who FROM users WHERE active = $1 ORDER BY name",
+            ),
+            (
+                "SELECT \"U\".* FROM users \"U\" WHERE \"U\".id = 1",
+                "SELECT * FROM users WHERE id = 1",
+            ),
+            (
+                "SELECT * FROM users users LIMIT 1",
+                "SELECT * FROM users LIMIT 1",
+            ),
+            (
+                "SELECT u.active, COUNT(*) FROM users u GROUP BY u.active ORDER BY u.active",
+                "SELECT active, COUNT(*) FROM users GROUP BY active ORDER BY active",
+            ),
+            (
+                "SELECT DISTINCT n.id FROM app.notes AS n",
+                "SELECT DISTINCT id FROM app.notes",
+            ),
+            (
+                "UPDATE users AS u SET name = $1 WHERE u.id = 2 RETURNING u.name",
+                "UPDATE users SET name = $1 WHERE id = 2 RETURNING name",
+            ),
+            (
+                "UPDATE users u SET active = false",
+                "UPDATE users SET active = false",
+            ),
+            (
+                "DELETE FROM users AS u WHERE u.id = 2 RETURNING u.*",
+                "DELETE FROM users WHERE id = 2 RETURNING *",
+            ),
+            ("DELETE FROM users u", "DELETE FROM users"),
+        ] {
+            let parse = |sql| format!("{:?}", crate::statement::parse(sql, &[json!(true)]));
+            assert!(parse(plain).starts_with("Ok("), "{plain}");
+            assert_eq!(parse(aliased), parse(plain), "{aliased}");
+        }
+
+        let mut engine = users_engine();
+        assert_eq!(
+            engine
+                .execute_sql(
+                    "SELECT u.name AS id FROM users u WHERE u.active = false ORDER BY u.id DESC",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![row(json!({"id": "bob"})), row(json!({"id": "ann"}))]
+        );
+        let renamed = engine
+            .execute_sql(
+                "UPDATE users AS u SET name = 'anne' WHERE u.id = 2 RETURNING u.id, u.name",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(renamed.rows, vec![row(json!({"id": 2, "name": "anne"}))]);
+        assert_eq!(renamed.tables, vec!["users"]);
+
+        // An alias hides the table's name, is one unreserved word, and is not taken by INSERT.
+        for (sql, code) in [
+            ("SELECT users.id FROM users u", "UNSUPPORTED_SQL"),
+            (
+                "SELECT id FROM users u WHERE users.id = 1",
+                "COLUMN_NOT_FOUND",
+            ),
+            ("SELECT id FROM users AS", "UNSUPPORTED_SQL"),
+            ("SELECT id FROM users AS where", "UNSUPPORTED_SQL"),
+            ("SELECT id FROM users AS \"\"", "UNSUPPORTED_SQL"),
+            ("SELECT id FROM users u v", "UNSUPPORTED_SQL"),
+            ("SELECT id FROM users AS u (id)", "UNSUPPORTED_SQL"),
+            (
+                "UPDATE users u SET u.name = 'x' WHERE u.id = 1",
+                "SQL_PARSE_ERROR",
+            ),
+            ("DELETE FROM users u v", "UNSUPPORTED_SQL"),
+            (
+                "INSERT INTO users AS u (id, name) VALUES (9, 'x')",
+                "SQL_PARSE_ERROR",
+            ),
+        ] {
+            assert_eq!(
+                engine.execute_sql(sql, &[]).unwrap_err().code,
+                code,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
     fn a_quoted_name_holding_a_dot_is_one_column_not_a_qualified_one() {
         let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
         engine

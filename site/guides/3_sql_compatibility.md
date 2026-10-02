@@ -156,7 +156,7 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 
 | Keyword or form | Status | TinyJoin form and boundary |
 | --- | --- | --- |
-| `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or a left-deep join over two to eight typed table sources. A simple single-table projection is `*` or a list of plain column names, each optionally renamed with `AS`. A statement over one table may [qualify its columns](#qualified-columns) with that table's name. Join projections require explicit columns: neither `*` nor `table.*` is supported. Duplicate output names return `INVALID_QUERY`, including for empty results and `LIMIT 0`. There is no `SELECT` without `FROM`. |
+| `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or a left-deep join over two to eight typed table sources. A simple single-table projection is `*` or a list of plain column names, each optionally renamed with `AS`. A statement over one table may [qualify its columns](#qualified-columns) with that table's name or alias. Join projections require explicit columns: neither `*` nor `table.*` is supported. Duplicate output names return `INVALID_QUERY`, including for empty results and `LIMIT 0`. There is no `SELECT` without `FROM`. |
 | `WHERE` | Supported | Predicates described below, with SQL three-valued null logic. |
 | `ORDER BY` | Narrow | Up to 32 plain or [qualified](#qualified-columns) columns or projected output names for simple queries, projected output names for grouped/aggregate queries, and projected output names or qualified/unambiguous source columns for joins; `ASC`/`DESC` and `NULLS FIRST`/`LAST`. An output name takes precedence over a source column with the same name. JSON values cannot be ordered. |
 | `LIMIT`, `OFFSET` | Supported | Non-negative integer literal or `$n` parameter. `LIMIT` is at most 100,000; `OFFSET` and `OFFSET + LIMIT` are at most 4,294,967,295. `OFFSET` may appear alone; when both occur, `LIMIT` must precede `OFFSET`. |
@@ -166,7 +166,7 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 | `JOIN`, `INNER JOIN` | Narrow | Adds one typed table to a left-deep chain of at most eight sources. Each `ON` has one or more column equalities joined by `AND`, with at most 32 across the query; every equality connects the incoming source to an earlier source. |
 | `LEFT [OUTER] JOIN` | Narrow | The same bounded chain; an unmatched incoming source is represented by `NULL` columns. A later inner join can remove that null-extended row. |
 | `RIGHT`, `FULL`, `CROSS`, `NATURAL`, `USING`, `LATERAL` | No | No additional join families, parenthesized/derived relations, or join reordering. |
-| `AS` | Narrow | Output aliases on `SELECT` items in single-table, grouped/aggregate, and join queries, plus table aliases in joins. A projection alias requires the `AS` keyword, and one column may be returned under several aliases. Single-table queries do not accept table aliases. |
+| `AS` | Narrow | Output aliases on `SELECT` items in single-table, grouped/aggregate, and join queries, plus a table alias on every table a `SELECT` reads and on the table of an `UPDATE` or `DELETE`. A projection alias requires the `AS` keyword, and one column may be returned under several aliases. A table alias may omit `AS`. `INSERT` does not accept a table alias, and no alias takes a column list. |
 | `SELECT DISTINCT` | Narrow | Removes duplicate rows from an explicit single-table or join projection. `NULL`s compare as equal to each other, and other values compare by SQL equality; JSON columns are rejected. `ORDER BY` must name projected columns: by output name in a single-table query, and by output name or projected source column in a join. A single-table `DISTINCT` compares at most 32 distinct source columns and shares the aggregate group limits. `DISTINCT *`, `DISTINCT ON`, and `DISTINCT` combined with `GROUP BY` or aggregate functions are rejected. |
 | `WITH`, subqueries, `UNION`/`INTERSECT`/`EXCEPT` | No | No CTEs, subqueries, or set operations. |
 | `CREATE TABLE [IF NOT EXISTS]` | Narrow | Typed columns and a required inline or table-level primary key. Up to 256 columns. |
@@ -182,7 +182,7 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 | `INSERT ... SELECT`, `MERGE` | No | No query-sourced insert or merge statement. |
 | `UPDATE ... SET ... [WHERE ...]` | Narrow | Assigns literals, parameters, or `DEFAULT`; optional `RETURNING`. No expressions or `UPDATE ... FROM`. |
 | `DELETE FROM ... [WHERE ...]` | Narrow | Optional `RETURNING`. No `DELETE ... USING`. |
-| `RETURNING` | Narrow | `*` or a list of distinct plain columns, which the table's name may qualify; no expressions or aliases. Duplicate names return `INVALID_QUERY` before any rows are changed, even when no rows match. |
+| `RETURNING` | Narrow | `*` or a list of distinct plain columns, which the table's name or alias may qualify; no expressions or output aliases. Duplicate names return `INVALID_QUERY` before any rows are changed, even when no rows match. |
 | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT` | No | Use the JavaScript callback transaction API. |
 | `PREPARE`, `EXECUTE`, `DEALLOCATE` | No | SQL-level named statements are not implemented. Use the session-local JavaScript prepare() handle and its execute()/close() methods. |
 | `COPY`, `TRUNCATE`, `EXPLAIN`, `VACUUM`, `ANALYZE` | No | No server maintenance or bulk-file SQL commands. |
@@ -267,10 +267,10 @@ serial/identity, enum/domain, and user-defined types. Type modifiers such as
 ### Qualified columns
 
 A `SELECT`, `UPDATE`, or `DELETE` over one table may name a column as
-`table.column`, and `table.*` for `*`, wherever it reads that table's columns:
-in a projection, aggregate argument, `WHERE`, `GROUP BY`, `ORDER BY`, and
-`RETURNING`, including the `RETURNING` of an `INSERT`. The qualified and plain
-spellings are the same statement, and are planned and narrowed alike:
+`table.column`, and write `table.*` for `*`, wherever it reads that table's
+columns: in a projection, aggregate argument, `WHERE`, `GROUP BY`, `ORDER BY`,
+and `RETURNING`, including the `RETURNING` of an `INSERT`. The qualified and
+plain spellings are the same statement, and are planned and narrowed alike:
 
 ```sql
 SELECT tasks.id, tasks.title FROM tasks
@@ -279,10 +279,21 @@ WHERE tasks.done = false ORDER BY tasks.title;
 UPDATE tasks SET done = true WHERE tasks.id = $1 RETURNING tasks.id;
 ```
 
+A table alias, with or without `AS`, takes the place of the table's name as
+the qualifier, as in PostgreSQL, so the name no longer qualifies anything:
+
+```sql
+SELECT t.id, t.title FROM tasks AS t WHERE t.done = false;
+
+DELETE FROM tasks t WHERE t.id = $1;
+```
+
 A table named with a schema, such as `public.tasks`, is qualified by the name
 after the dot, `tasks`, as it is in a join. `public.tasks.id` is rejected.
 Naming any other table is an error, and the columns an `INSERT` lists or an
-`UPDATE` assigns in `SET` are never qualified.
+`UPDATE` assigns in `SET` are never qualified. An alias changes only how a
+statement spells its columns: results, changed tables, and subscriptions name
+the table itself.
 
 In `ORDER BY`, a plain name refers to an output name before a source column,
 but a qualified name is always the table's column. `SELECT title AS id FROM

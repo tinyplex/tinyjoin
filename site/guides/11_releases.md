@@ -19,6 +19,12 @@ lookups and index ranges. In `ORDER BY`, a qualified name is always the table's
 column, where a plain name matches an output alias first. See
 [qualified columns](/guides/sql-compatibility/#qualified-columns).
 
+A single-table `SELECT`, `UPDATE`, or `DELETE` also accepts a table alias, with
+or without `AS`, as each table of a join already did: `SELECT t.id FROM tasks
+AS t WHERE t.done = false`, or `DELETE FROM tasks t WHERE t.id = $1`. As in
+PostgreSQL, the alias replaces the table's name as the qualifier. Results,
+changed tables, and subscriptions still name the table.
+
 **Upgrading from v0.4.0 needs no action.** Install, rebuild, and redeploy. The
 Worker protocol stays at version 10 and the page format stays at format 3, so
 an existing database opens with no migration and no OPFS namespace change. The
