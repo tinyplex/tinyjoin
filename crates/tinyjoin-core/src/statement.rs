@@ -176,21 +176,24 @@ pub(crate) fn parse(sql: &str, params: &[Value]) -> Result<Statement> {
 /// The shared boundary for direct and prepared SQL. Callers check text/parameter bounds
 /// before tokenization; all families share expansion accounting and consume these tokens once.
 pub(crate) fn parse_tokens(
-    tokens: Vec<Token>,
+    mut tokens: Vec<Token>,
     params: &[Value],
     mode: ParseMode,
 ) -> Result<Statement> {
     validate_parameter_expansion(&tokens, params)?;
-    if matches!(
+    let select = matches!(
         tokens.first(),
         Some(Token::Identifier {
             value,
             quoted: false,
         }) if value.eq_ignore_ascii_case("select")
-    ) {
-        if crate::join::is_join_select(&tokens) {
-            return crate::join::parse_tokens(tokens, params, mode).map(Statement::Join);
-        }
+    );
+    if select && crate::join::is_join_select(&tokens) {
+        return crate::join::parse_tokens(tokens, params, mode).map(Statement::Join);
+    }
+    // Every other statement reads one table, whose name may qualify its columns.
+    crate::query::drop_table_qualifiers(&mut tokens);
+    if select {
         // SELECT DISTINCT is grouping by every projected column without aggregates.
         if crate::aggregate::is_aggregate_select(&tokens)
             || crate::query::is_distinct_keyword_at(&tokens, 1)

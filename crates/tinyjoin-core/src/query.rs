@@ -937,7 +937,14 @@ fn binding_limit_exceeded() -> EngineError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Token {
-    Identifier { value: String, quoted: bool },
+    Identifier {
+        value: String,
+        quoted: bool,
+    },
+    /// A column that `ORDER BY` named behind its table's qualifier, which is that table's column
+    /// rather than an output of the same name. [`drop_table_qualifiers`] writes it; the lexer
+    /// never does.
+    Column(String),
     String(String),
     Number(String),
     Placeholder(String),
@@ -1280,23 +1287,12 @@ impl<'a> SqlParser<'a> {
         } else {
             None
         };
-        let mut order_by = if self.consume_keyword("order") {
+        let order_by = if self.consume_keyword("order") {
             self.expect_keyword("by")?;
-            self.parse_order_by()?
+            self.parse_order_by(columns.as_deref().unwrap_or_default())?
         } else {
             Vec::new()
         };
-        // As in PostgreSQL, an ORDER BY name refers to an output column before a source column,
-        // so an alias can be ordered by and can shadow the column it renames.
-        for order in &mut order_by {
-            if let Some(item) = columns
-                .iter()
-                .flatten()
-                .find(|item| item.output == order.column)
-            {
-                order.column.clone_from(&item.column);
-            }
-        }
         let limit = if self.consume_keyword("limit") {
             Some(self.parse_limit()?)
         } else {
@@ -1363,7 +1359,10 @@ impl<'a> SqlParser<'a> {
         Ok(format!("{first}.{second}"))
     }
 
-    fn parse_order_by(&mut self) -> Result<Vec<OrderBy>> {
+    /// As in PostgreSQL, a plain ORDER BY name refers to an output column before a source column,
+    /// so an alias can be ordered by and can shadow the column it renames, while a name behind
+    /// the table's qualifier is always the table's column.
+    fn parse_order_by(&mut self, outputs: &[SelectColumn]) -> Result<Vec<OrderBy>> {
         let mut orders = Vec::new();
         loop {
             if orders.len() >= MAX_ORDER_COLUMNS {
@@ -1371,7 +1370,17 @@ impl<'a> SqlParser<'a> {
                     "A query cannot order by more than {MAX_ORDER_COLUMNS} columns"
                 )));
             }
-            let column = self.parse_identifier()?;
+            let column = if let Some(Token::Column(column)) = self.tokens.get(self.position) {
+                let column = column.clone();
+                self.position += 1;
+                column
+            } else {
+                let name = self.parse_identifier()?;
+                match outputs.iter().find(|item| item.output == name) {
+                    Some(item) => item.column.clone(),
+                    None => name,
+                }
+            };
             let direction = if self.consume_keyword("desc") {
                 OrderDirection::Desc
             } else {
@@ -1885,21 +1894,147 @@ fn is_identifier_continue(character: char) -> bool {
 /// `DISTINCT` is not reserved, so a column may be named `distinct`. The word is a keyword only when
 /// something other than the end of a projection item or aggregate argument follows it.
 pub(crate) fn is_distinct_keyword_at(tokens: &[Token], position: usize) -> bool {
-    let is_keyword = |token: Option<&Token>, keyword: &str| {
-        matches!(
-            token,
-            Some(Token::Identifier {
-                value,
-                quoted: false,
-            }) if value.eq_ignore_ascii_case(keyword)
-        )
-    };
     is_keyword(tokens.get(position), "distinct")
         && tokens.get(position + 1).is_some_and(|next| {
             !matches!(next, Token::Comma | Token::RParen)
                 && !is_keyword(Some(next), "from")
                 && !is_keyword(Some(next), "as")
         })
+}
+
+fn is_keyword(token: Option<&Token>, keyword: &str) -> bool {
+    matches!(
+        token,
+        Some(Token::Identifier {
+            value,
+            quoted: false,
+        }) if value.eq_ignore_ascii_case(keyword)
+    )
+}
+
+/// The name an identifier token gives, as every parser reads it: an unquoted name is not a
+/// reserved word, and is folded to lower case.
+fn identifier_name(token: Option<&Token>) -> Option<String> {
+    match token {
+        Some(Token::Identifier { value, quoted }) if !value.is_empty() => {
+            if *quoted {
+                Some(value.clone())
+            } else {
+                (!is_reserved_keyword(value)).then(|| value.to_ascii_lowercase())
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether a token is an identifier that gives `name`.
+fn is_identifier_named(token: Option<&Token>, name: &str) -> bool {
+    match token {
+        Some(Token::Identifier {
+            value,
+            quoted: true,
+        }) => value == name,
+        Some(Token::Identifier {
+            value,
+            quoted: false,
+        }) => {
+            !is_reserved_keyword(value)
+                && value
+                    .bytes()
+                    .map(|byte| byte.to_ascii_lowercase())
+                    .eq(name.bytes())
+        }
+        _ => false,
+    }
+}
+
+/// Drops the table's name wherever it qualifies a column or `*` in a statement over one table,
+/// which leaves the plain column names that statement's parser reads.
+///
+/// A table named with a schema is qualified by the name after the dot, as it is in a join. A
+/// qualifier that names anything else is left for the parser to refuse, and so is a column
+/// behind two qualifiers. A write names only its own table's columns before its `WHERE` and
+/// `RETURNING` clauses, so it is read from the first of those.
+pub(crate) fn drop_table_qualifiers(tokens: &mut Vec<Token>) {
+    let select = is_keyword(tokens.first(), "select");
+    let start = if select {
+        match tokens
+            .iter()
+            .position(|token| is_keyword(Some(token), "from"))
+        {
+            Some(from) => from + 1,
+            None => return,
+        }
+    } else if is_keyword(tokens.first(), "update") {
+        1
+    } else if is_keyword(tokens.first(), "delete") || is_keyword(tokens.first(), "insert") {
+        2
+    } else {
+        return;
+    };
+    let Some(mut qualifier) = identifier_name(tokens.get(start)) else {
+        return;
+    };
+    let mut end = start + 1;
+    if tokens.get(end) == Some(&Token::Dot) {
+        let Some(table) = identifier_name(tokens.get(end + 1)) else {
+            return;
+        };
+        qualifier = table;
+        end += 2;
+    }
+
+    let first = if select {
+        0
+    } else {
+        tokens[end..]
+            .iter()
+            .position(|token| {
+                is_keyword(Some(token), "where") || is_keyword(Some(token), "returning")
+            })
+            .map_or(tokens.len(), |clause| end + clause)
+    };
+    let mut qualifiers = Vec::new();
+    let mut ordering = false;
+    for index in first..tokens.len() {
+        if (start..end).contains(&index) {
+            continue;
+        }
+        ordering |= select && index > start && is_keyword(tokens.get(index), "order");
+        let column = tokens.get(index + 2);
+        if !is_identifier_named(tokens.get(index), &qualifier)
+            || tokens.get(index + 1) != Some(&Token::Dot)
+            || !matches!(column, Some(Token::Identifier { .. } | Token::Star))
+            || tokens.get(index + 3) == Some(&Token::Dot)
+            || (index > 0 && tokens[index - 1] == Token::Dot)
+        {
+            continue;
+        }
+        // ORDER BY reads a plain name as an output's before a column's, but a qualified name is
+        // the table's column whatever the outputs are called.
+        if ordering {
+            let Some(column) = identifier_name(column) else {
+                continue;
+            };
+            tokens[index + 2] = Token::Column(column);
+        }
+        qualifiers.push(index);
+    }
+
+    let mut index = 0;
+    let mut next = 0;
+    tokens.retain(|_| {
+        let position = index;
+        index += 1;
+        match qualifiers.get(next) {
+            Some(qualifier) if position == *qualifier => false,
+            Some(qualifier) if position == *qualifier + 1 => {
+                next += 1;
+                false
+            }
+            _ => true,
+        }
+    });
 }
 
 pub(crate) fn is_reserved_keyword(identifier: &str) -> bool {

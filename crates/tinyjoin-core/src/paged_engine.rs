@@ -2674,4 +2674,199 @@ mod tests {
         expected.extend(10..10 + MAX_CHANGED_KEYS_PER_TABLE - 2);
         assert_eq!(deleted, expected);
     }
+
+    /// A table of users for statements that qualify its columns.
+    fn users_engine() -> PagedEngine<MemoryPageDevice> {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .exec_sql(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT, \
+                   active BOOLEAN NOT NULL DEFAULT true);\
+                 CREATE INDEX users_name ON users (name);\
+                 INSERT INTO users (id, name, email, active) VALUES \
+                   (1, 'cy', 'c@example.com', true), (2, 'ann', NULL, false), \
+                   (3, 'bob', 'b@example.com', false);",
+            )
+            .unwrap();
+        engine
+    }
+
+    #[test]
+    fn a_statement_over_one_table_reads_columns_qualified_by_its_name() {
+        // A qualified statement is the statement its plain column names spell, so it is planned,
+        // narrowed and validated the same way.
+        for (qualified, plain) in [
+            (
+                "SELECT users.id, \"users\".name AS who FROM users \
+                 WHERE users.active = $1 AND (USERS.id IN (1, 2) OR users.email IS NULL) \
+                 ORDER BY users.name DESC LIMIT 2",
+                "SELECT id, name AS who FROM users \
+                 WHERE active = $1 AND (id IN (1, 2) OR email IS NULL) \
+                 ORDER BY name DESC LIMIT 2",
+            ),
+            (
+                "SELECT users.* FROM users WHERE users.name LIKE 'a%'",
+                "SELECT * FROM users WHERE name LIKE 'a%'",
+            ),
+            (
+                "SELECT DISTINCT users.active FROM users ORDER BY users.active",
+                "SELECT DISTINCT active FROM users ORDER BY active",
+            ),
+            (
+                "SELECT users.active, COUNT(users.id) AS n FROM users \
+                 WHERE users.id BETWEEN 1 AND 3 GROUP BY users.active ORDER BY users.active",
+                "SELECT active, COUNT(id) AS n FROM users \
+                 WHERE id BETWEEN 1 AND 3 GROUP BY active ORDER BY active",
+            ),
+            (
+                "UPDATE users SET name = $1 WHERE users.id = 2 RETURNING users.id, users.name",
+                "UPDATE users SET name = $1 WHERE id = 2 RETURNING id, name",
+            ),
+            (
+                "DELETE FROM users WHERE users.id = 2 RETURNING users.*",
+                "DELETE FROM users WHERE id = 2 RETURNING *",
+            ),
+            (
+                "INSERT INTO users (id, name) VALUES (4, $1) RETURNING users.id",
+                "INSERT INTO users (id, name) VALUES (4, $1) RETURNING id",
+            ),
+            (
+                "SELECT notes.id FROM app.notes WHERE \"notes\".id = 1",
+                "SELECT id FROM app.notes WHERE id = 1",
+            ),
+        ] {
+            let parse = |sql| format!("{:?}", crate::statement::parse(sql, &[json!(true)]));
+            assert!(parse(plain).starts_with("Ok("), "{plain}");
+            assert_eq!(parse(qualified), parse(plain), "{qualified}");
+        }
+
+        let mut engine = users_engine();
+        let names = |engine: &PagedEngine<MemoryPageDevice>, sql: &str| {
+            engine
+                .query_sql(sql, &[])
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|row| row.values().next().unwrap().clone())
+                .collect::<Vec<_>>()
+        };
+
+        // A plain ORDER BY name is an output's before a column's. Behind the table's name it is
+        // the table's column, whatever the outputs are called.
+        assert_eq!(
+            names(
+                &engine,
+                "SELECT name AS id FROM users ORDER BY users.id DESC"
+            ),
+            [json!("bob"), json!("ann"), json!("cy")]
+        );
+        assert_eq!(
+            names(&engine, "SELECT name AS id FROM users ORDER BY id DESC"),
+            [json!("cy"), json!("bob"), json!("ann")]
+        );
+        // An aggregate query is ordered by its outputs, so the table's column stands for the
+        // output that returns it, and for no other output of the same name.
+        assert_eq!(
+            names(
+                &engine,
+                "SELECT active AS a, COUNT(*) AS active FROM users GROUP BY active \
+                 ORDER BY users.active"
+            ),
+            [json!(false), json!(true)]
+        );
+        assert_eq!(
+            names(
+                &engine,
+                "SELECT active AS a, COUNT(*) AS active FROM users GROUP BY active \
+                 ORDER BY active"
+            ),
+            [json!(true), json!(false)]
+        );
+
+        // A prepared statement is qualified the same way, with its parameters where they were.
+        let statement = engine
+            .prepare_sql(
+                "SELECT users.name FROM users WHERE users.id > $1 ORDER BY users.id LIMIT $2",
+            )
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute_prepared(statement, &[json!(1), json!(1)])
+                .unwrap()
+                .rows,
+            vec![row(json!({"name": "ann"}))]
+        );
+        assert_eq!(
+            engine
+                .execute_sql(
+                    "UPDATE users SET name = $1 WHERE users.id = 2 RETURNING users.id, users.name",
+                    &[json!("anne")],
+                )
+                .unwrap()
+                .rows,
+            vec![row(json!({"id": 2, "name": "anne"}))]
+        );
+
+        // Only the table's own name qualifies, in the clauses that read its columns.
+        for (sql, code) in [
+            ("SELECT posts.id FROM users", "UNSUPPORTED_SQL"),
+            (
+                "SELECT id FROM users WHERE posts.id = 1",
+                "COLUMN_NOT_FOUND",
+            ),
+            ("SELECT id FROM users ORDER BY posts.id", "UNSUPPORTED_SQL"),
+            (
+                "SELECT id FROM users WHERE users.id.x = 1",
+                "UNSUPPORTED_SQL",
+            ),
+            (
+                "SELECT id FROM users WHERE app.users.id = 1",
+                "UNSUPPORTED_SQL",
+            ),
+            ("SELECT users.missing FROM users", "COLUMN_NOT_FOUND"),
+            (
+                "SELECT COUNT(*) FROM users GROUP BY active ORDER BY users.count",
+                "COLUMN_NOT_FOUND",
+            ),
+            (
+                "UPDATE users SET users.name = 'x' WHERE id = 1",
+                "SQL_PARSE_ERROR",
+            ),
+            (
+                "INSERT INTO users (users.id, name) VALUES (9, 'x')",
+                "SQL_PARSE_ERROR",
+            ),
+            ("DELETE FROM users WHERE users.key = 1", "SQL_PARSE_ERROR"),
+        ] {
+            assert_eq!(
+                engine.execute_sql(sql, &[]).unwrap_err().code,
+                code,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_quoted_name_holding_a_dot_is_one_column_not_a_qualified_one() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .exec_sql(
+                "CREATE TABLE extra (id INTEGER PRIMARY KEY, value TEXT, \"extra.value\" TEXT);\
+                 INSERT INTO extra VALUES (1, 'plain', 'dotted');",
+            )
+            .unwrap();
+        let rows = engine
+            .execute_sql(
+                "SELECT extra.value, \"extra.value\" FROM extra \
+                 WHERE extra.value = 'plain' AND \"extra.value\" = 'dotted' \
+                 ORDER BY \"extra.value\", extra.\"extra.value\"",
+                &[],
+            )
+            .unwrap()
+            .rows;
+        assert_eq!(
+            rows,
+            vec![row(json!({"value": "plain", "extra.value": "dotted"}))]
+        );
+    }
 }

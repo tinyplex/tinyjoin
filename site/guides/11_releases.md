@@ -5,6 +5,29 @@ compatibility boundaries. Every entry states what upgrading to it requires, so
 check the entries between the version in use and the target before upgrading.
 A release that needs no action says so explicitly.
 
+## v0.5.0 (unreleased)
+
+This release accepts more of the ordinary SQL that hand-written statements and
+query builders use in the [SQL dialect](/guides/sql-compatibility/).
+
+A statement over one table can qualify its columns with the table's name, as a
+join already could: `SELECT tasks.id FROM tasks WHERE tasks.done = false ORDER
+BY tasks.title`, or `tasks.*` for every column. `UPDATE` and `DELETE` accept
+the same in `WHERE` and `RETURNING`, and `INSERT` in `RETURNING`. A qualified
+statement is planned exactly as its plain spelling is, so it uses the same key
+lookups and index ranges. In `ORDER BY`, a qualified name is always the table's
+column, where a plain name matches an output alias first. See
+[qualified columns](/guides/sql-compatibility/#qualified-columns).
+
+**Upgrading from v0.4.0 needs no action.** Install, rebuild, and redeploy. The
+Worker protocol stays at version 10 and the page format stays at format 3, so
+an existing database opens with no migration and no OPFS namespace change. The
+new syntax was previously rejected, so statements that already worked keep
+their meaning, with one exception: where a table has a column whose quoted name
+begins with the table's own name and a dot, such as `"extra.value"` in a table
+named `extra`, an unquoted `extra.value` in `WHERE` used to read that column
+and now reads the table's `value` column. Quote the name to read it.
+
 ## v0.4.0
 
 **Persistent storage breaks compatibility with v0.3.0 and earlier.** v0.4.0

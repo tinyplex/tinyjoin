@@ -1358,7 +1358,7 @@ impl<'a> Parser<'a> {
         }
         let order_by = if self.consume_keyword("order") {
             self.expect_keyword("by")?;
-            self.parse_order_by()?
+            self.parse_order_by(&items)?
         } else {
             vec![]
         };
@@ -1466,7 +1466,10 @@ impl<'a> Parser<'a> {
         Ok(values)
     }
 
-    fn parse_order_by(&mut self) -> Result<Vec<OrderBy>> {
+    /// An aggregate query is ordered by its outputs. A plain name is an output's, and a name
+    /// behind the table's qualifier is the table's column, so it stands for the output that
+    /// returns that column.
+    fn parse_order_by(&mut self, items: &[SelectItem]) -> Result<Vec<OrderBy>> {
         let mut orders = Vec::new();
         loop {
             if orders.len() >= MAX_ORDER_COLUMNS {
@@ -1474,7 +1477,19 @@ impl<'a> Parser<'a> {
                     "A query cannot order by more than {MAX_ORDER_COLUMNS} columns"
                 )));
             }
-            let column = self.parse_identifier()?;
+            let column = if let Some(Token::Column(column)) = self.tokens.get(self.position) {
+                let output = items
+                    .iter()
+                    .find(|item| {
+                        matches!(&item.expression, SelectExpression::Column(name) if name == column)
+                    })
+                    .map(|item| item.output.clone())
+                    .ok_or_else(|| EngineError::column_not_found(column, "aggregate output"))?;
+                self.position += 1;
+                output
+            } else {
+                self.parse_identifier()?
+            };
             let direction = if self.consume_keyword("desc") {
                 OrderDirection::Desc
             } else {

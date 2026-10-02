@@ -156,9 +156,9 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 
 | Keyword or form | Status | TinyJoin form and boundary |
 | --- | --- | --- |
-| `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or a left-deep join over two to eight typed table sources. A simple single-table projection is `*` or a list of plain column names, each optionally renamed with `AS`. Join projections require explicit columns: neither `*` nor `table.*` is supported. Duplicate output names return `INVALID_QUERY`, including for empty results and `LIMIT 0`. There is no `SELECT` without `FROM`. |
+| `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or a left-deep join over two to eight typed table sources. A simple single-table projection is `*` or a list of plain column names, each optionally renamed with `AS`. A statement over one table may [qualify its columns](#qualified-columns) with that table's name. Join projections require explicit columns: neither `*` nor `table.*` is supported. Duplicate output names return `INVALID_QUERY`, including for empty results and `LIMIT 0`. There is no `SELECT` without `FROM`. |
 | `WHERE` | Supported | Predicates described below, with SQL three-valued null logic. |
-| `ORDER BY` | Narrow | Up to 32 plain columns or projected output names for simple queries, projected output names for grouped/aggregate queries, and projected output names or qualified/unambiguous source columns for joins; `ASC`/`DESC` and `NULLS FIRST`/`LAST`. An output name takes precedence over a source column with the same name. JSON values cannot be ordered. |
+| `ORDER BY` | Narrow | Up to 32 plain or [qualified](#qualified-columns) columns or projected output names for simple queries, projected output names for grouped/aggregate queries, and projected output names or qualified/unambiguous source columns for joins; `ASC`/`DESC` and `NULLS FIRST`/`LAST`. An output name takes precedence over a source column with the same name. JSON values cannot be ordered. |
 | `LIMIT`, `OFFSET` | Supported | Non-negative integer literal or `$n` parameter. `LIMIT` is at most 100,000; `OFFSET` and `OFFSET + LIMIT` are at most 4,294,967,295. `OFFSET` may appear alone; when both occur, `LIMIT` must precede `OFFSET`. |
 | `GROUP BY` | Narrow | Up to 32 plain boolean, integer, float, or text columns (not JSON) on one typed table. Every selected non-aggregate column must be grouped explicitly. |
 | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` | Narrow | Every aggregate query requires a typed column catalog, including `COUNT(*)`. Functions accept `COUNT(*)` or one plain column argument. `SUM`/`AVG` accept integer or float; `MIN`/`MAX` accept integer, float, or text. Up to 64 aggregate calls. |
@@ -182,7 +182,7 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 | `INSERT ... SELECT`, `MERGE` | No | No query-sourced insert or merge statement. |
 | `UPDATE ... SET ... [WHERE ...]` | Narrow | Assigns literals, parameters, or `DEFAULT`; optional `RETURNING`. No expressions or `UPDATE ... FROM`. |
 | `DELETE FROM ... [WHERE ...]` | Narrow | Optional `RETURNING`. No `DELETE ... USING`. |
-| `RETURNING` | Narrow | `*` or a list of distinct plain columns; no expressions or aliases. Duplicate names return `INVALID_QUERY` before any rows are changed, even when no rows match. |
+| `RETURNING` | Narrow | `*` or a list of distinct plain columns, which the table's name may qualify; no expressions or aliases. Duplicate names return `INVALID_QUERY` before any rows are changed, even when no rows match. |
 | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT` | No | Use the JavaScript callback transaction API. |
 | `PREPARE`, `EXECUTE`, `DEALLOCATE` | No | SQL-level named statements are not implemented. Use the session-local JavaScript prepare() handle and its execute()/close() methods. |
 | `COPY`, `TRUNCATE`, `EXPLAIN`, `VACUUM`, `ANALYZE` | No | No server maintenance or bulk-file SQL commands. |
@@ -263,6 +263,35 @@ serial/identity, enum/domain, and user-defined types. Type modifiers such as
   `public.tasks` are different TinyJoin table names.
 - There is no `CREATE SCHEMA`, `search_path`, `information_schema`, or
   `pg_catalog`. Index names are global catalog keys.
+
+### Qualified columns
+
+A `SELECT`, `UPDATE`, or `DELETE` over one table may name a column as
+`table.column`, and `table.*` for `*`, wherever it reads that table's columns:
+in a projection, aggregate argument, `WHERE`, `GROUP BY`, `ORDER BY`, and
+`RETURNING`, including the `RETURNING` of an `INSERT`. The qualified and plain
+spellings are the same statement, and are planned and narrowed alike:
+
+```sql
+SELECT tasks.id, tasks.title FROM tasks
+WHERE tasks.done = false ORDER BY tasks.title;
+
+UPDATE tasks SET done = true WHERE tasks.id = $1 RETURNING tasks.id;
+```
+
+A table named with a schema, such as `public.tasks`, is qualified by the name
+after the dot, `tasks`, as it is in a join. `public.tasks.id` is rejected.
+Naming any other table is an error, and the columns an `INSERT` lists or an
+`UPDATE` assigns in `SET` are never qualified.
+
+In `ORDER BY`, a plain name refers to an output name before a source column,
+but a qualified name is always the table's column. `SELECT title AS id FROM
+tasks ORDER BY tasks.id` orders by the `id` column, not by the titles returned
+as `id`. A grouped or aggregate query is ordered by its outputs, so there a
+qualified column stands for the output that returns it, and must be projected.
+
+A quoted name that holds a dot, such as `"extra.value"`, is one column name
+rather than a qualified one.
 
 ## Upserts
 
