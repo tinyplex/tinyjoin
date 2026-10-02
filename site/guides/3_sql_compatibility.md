@@ -156,7 +156,7 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 
 | Keyword or form | Status | TinyJoin form and boundary |
 | --- | --- | --- |
-| `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or a left-deep join over two to eight typed table sources. A simple single-table projection is `*` or a list of plain column names, each optionally renamed with `AS`. A statement over one table may [qualify its columns](#qualified-columns) with that table's name or alias. Join projections require explicit columns: neither `*` nor `table.*` is supported. Duplicate output names return `INVALID_QUERY`, including for empty results and `LIMIT 0`. There is no `SELECT` without `FROM`. |
+| `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or a left-deep join over two to eight typed table sources. A simple single-table projection is `*` or a list of plain column names, each optionally renamed with `AS`. A statement over one table may [qualify its columns](#qualified-columns) with that table's name or alias. Join projections require explicit columns: neither `*` nor `table.*` is supported. Output names must be distinct unless the rows are [read as arrays](#repeated-output-names): otherwise duplicates return `INVALID_QUERY`, including for empty results and `LIMIT 0`. There is no `SELECT` without `FROM`. |
 | `WHERE` | Supported | Predicates described below, with SQL three-valued null logic. |
 | `ORDER BY` | Narrow | Up to 32 plain or [qualified](#qualified-columns) columns or projected output names for simple queries, projected output names for grouped/aggregate queries, and projected output names or qualified/unambiguous source columns for joins; `ASC`/`DESC` and `NULLS FIRST`/`LAST`. An output name takes precedence over a source column with the same name. JSON values cannot be ordered. |
 | `LIMIT`, `OFFSET` | Supported | Non-negative integer literal or `$n` parameter. `LIMIT` is at most 100,000; `OFFSET` and `OFFSET + LIMIT` are at most 4,294,967,295. `OFFSET` may appear alone; when both occur, `LIMIT` must precede `OFFSET`. |
@@ -304,6 +304,36 @@ qualified column stands for the output that returns it, and must be projected.
 A quoted name that holds a dot, such as `"extra.value"`, is one column name
 rather than a qualified one.
 
+### Repeated output names
+
+An object row holds one value for each name, so a `SELECT` whose output names
+repeat returns `INVALID_QUERY`, and each output needs a distinct `AS` alias.
+An array row holds its values by position, so a `SELECT` read with
+`rowMode: "array"` may repeat a name. This is how a query builder that reads
+rows by position, and so never writes an alias, selects a column of the same
+name from each side of a join:
+
+```ts
+const { fields, rows } = await db.query(
+  `SELECT posts.id, users.id, users.name
+   FROM posts JOIN users ON posts.user_id = users.id`,
+  [],
+  { rowMode: "array" },
+);
+// fields: id, id, name
+// rows: [[10, 1, "Ann"], ...]
+```
+
+This applies to single-table, aggregate, and join queries, to prepared
+statements, where each execution's `rowMode` decides, and to each statement of
+an exec() script. An aggregate without an alias takes its function's name, so
+`SELECT COUNT(*), COUNT(email)` returns two fields named `count`.
+
+An `ORDER BY` name that matches more than one output is `INVALID_QUERY`, unless
+those outputs all return the same column or the same aggregate. Order by a
+qualified column, or give the outputs distinct aliases. `RETURNING` columns
+must be distinct in either row mode.
+
 ## Upserts
 
 `INSERT ... ON CONFLICT` inserts each proposed row unless it conflicts with an
@@ -399,7 +429,8 @@ no rows. Integer `SUM` fails beyond the JavaScript-safe range, and integer
 
 Join keys containing `NULL` never match. Integer and float keys may compare;
 JSON join keys are rejected. Every source requires a typed SQL catalog and a
-unique alias, and the result must use distinct JSON object field names.
+unique alias, and the result must use distinct output names unless its rows
+are [read as arrays](#repeated-output-names).
 Unqualified columns are accepted only when exactly one source contains the
 name. Without `ORDER BY`, row order is not part of the contract.
 

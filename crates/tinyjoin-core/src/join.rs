@@ -81,6 +81,8 @@ pub(crate) struct JoinPlan {
     /// `SELECT DISTINCT`: joined rows with equal projected values are returned once.
     distinct: bool,
     projections: Vec<Projection>,
+    /// Whether the outputs are keyed by position because their names repeat.
+    positional: bool,
     first: Source,
     joins: Vec<JoinStage>,
     predicate: Option<Predicate>,
@@ -118,6 +120,36 @@ impl WorkBudget {
     fn ensure_transient(&self, bytes: usize) -> Result<()> {
         ensure_work_budget(checked_add(self.retained, bytes)?)
     }
+}
+
+/// Keys a join's outputs by position if their names repeat. An `ORDER BY` name that is an
+/// output's takes the key of that output.
+pub(crate) fn position_outputs(plan: &mut JoinPlan) -> Result<()> {
+    let projections = &mut plan.projections;
+    plan.positional =
+        crate::query::names_repeat(projections.len(), &|index| &projections[index].output);
+    if !plan.positional {
+        return Ok(());
+    }
+    for (index, projection) in projections.iter_mut().enumerate() {
+        crate::query::position_name(index, &mut projection.output);
+    }
+    for order in &mut plan.order_by {
+        let OrderSource::Output(output) = &mut order.source else {
+            continue;
+        };
+        let mut named = plan
+            .projections
+            .iter()
+            .filter(|projection| projection.output[3..] == *output);
+        if let Some(first) = named.next() {
+            if named.any(|other| other.source != first.source) {
+                return Err(crate::query::ambiguous_order(output));
+            }
+            output.clone_from(&first.output);
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn is_join_select(tokens: &[Token]) -> bool {
@@ -1107,12 +1139,15 @@ fn validate_plan(
         }
         if plan.distinct && definition.data_type == ColumnType::Json {
             return Err(EngineError::type_mismatch(format!(
-                "JSON output column `{}` cannot be compared by SELECT DISTINCT",
-                projection.output
+                "JSON column `{}` cannot be compared by SELECT DISTINCT",
+                projection.source.column
             )));
         }
         projected.push((source, index));
-        fields.push(ResultField::new(&projection.output, definition.data_type));
+        fields.push(ResultField::new(
+            crate::query::field_name(&projection.output, plan.positional),
+            definition.data_type,
+        ));
     }
     if let Some(predicate) = &plan.predicate {
         validate_join_predicate(predicate, relations)?;
@@ -1140,7 +1175,8 @@ fn validate_plan(
                 let (_, _, definition) = resolve_column(&projection.source, relations)?;
                 if definition.data_type == ColumnType::Json {
                     return Err(EngineError::type_mismatch(format!(
-                        "JSON output column `{output}` cannot be ordered"
+                        "JSON column `{}` cannot be ordered",
+                        projection.source.column
                     )));
                 }
             }
@@ -1690,6 +1726,7 @@ impl<'a> Parser<'a> {
         Ok(JoinPlan {
             distinct,
             projections,
+            positional: false,
             first,
             joins,
             predicate,

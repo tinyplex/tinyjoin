@@ -48,6 +48,9 @@
 
 /**
  * The RowMode type selects object rows or positional array rows.
+ *
+ * An object row holds one value for each name, so a SELECT whose output names
+ * repeat is rejected unless its rows are arrays.
  * @category Query results
  * @since v0.0.5
  */
@@ -65,7 +68,8 @@
 {
   /**
    * The rowMode property selects object rows by default, or arrays whose values
-   * follow the order of the fields property.
+   * follow the order of the fields property. Only array rows can return a
+   * SELECT whose output names repeat.
    * @category Option
    * @since v0.0.5
    */

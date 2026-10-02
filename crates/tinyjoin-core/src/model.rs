@@ -259,6 +259,8 @@ pub(crate) struct SelectColumn {
 pub(crate) struct SelectPlan {
     pub(crate) table: String,
     pub(crate) columns: Option<Vec<SelectColumn>>,
+    /// Whether the outputs are keyed by position because their names repeat.
+    pub(crate) positional: bool,
     pub(crate) predicate: Option<Predicate>,
     pub(crate) order_by: Vec<OrderBy>,
     pub(crate) limit: Option<usize>,
@@ -395,6 +397,9 @@ pub struct ExecuteResult {
     pub revision: u64,
     pub row_count: usize,
     pub fields: Vec<ResultField>,
+    /// Each row's values under their fields' names. Where field names repeat, which only an
+    /// execution for array rows returns, each value is instead under its field's position as
+    /// three digits and then its name, so that a row's values come in field order.
     pub rows: Vec<Row>,
     pub tables: Vec<String>,
     /// Changed primary keys per table, under the same bounded contract as [`ApplyOutcome::keys`].

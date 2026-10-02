@@ -25,6 +25,13 @@ AS t WHERE t.done = false`, or `DELETE FROM tasks t WHERE t.id = $1`. As in
 PostgreSQL, the alias replaces the table's name as the qualifier. Results,
 changed tables, and subscriptions still name the table.
 
+A `SELECT` read with `rowMode: "array"` may now return several fields of one
+name, such as the `id` of each table in a join, because an array row holds its
+values by position. Object rows still require distinct output names and reject
+the same statement with `INVALID_QUERY`, as before. Query builders that map
+rows by position, as Drizzle does, depend on this. See
+[repeated output names](/guides/sql-compatibility/#repeated-output-names).
+
 **Upgrading from v0.4.0 needs no action.** Install, rebuild, and redeploy. The
 Worker protocol stays at version 10 and the page format stays at format 3, so
 an existing database opens with no migration and no OPFS namespace change. The

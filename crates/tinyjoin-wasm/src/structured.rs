@@ -467,7 +467,7 @@ impl Json {
         let fields = &result.fields;
         // A row's values come in key order. Each field's position in that order is where its
         // value sits, and the key there must be the field's name.
-        let positions: Vec<usize> = fields
+        let mut positions: Vec<usize> = fields
             .iter()
             .map(|field| {
                 fields
@@ -476,6 +476,21 @@ impl Json {
                     .count()
             })
             .collect();
+        // Fields of one name, which only array rows are returned, instead leave each row's
+        // values keyed by field position, and so already in field order.
+        let positional = (1..fields.len()).any(|index| {
+            fields[..index]
+                .iter()
+                .any(|field| field.name == fields[index].name)
+        });
+        if positional {
+            if !array_rows {
+                return Err(serialization());
+            }
+            for (index, position) in positions.iter_mut().enumerate() {
+                *position = index;
+            }
+        }
         let mut names = vec![""; fields.len()];
         for (field, position) in fields.iter().zip(&positions) {
             names[*position] = &field.name;
@@ -508,7 +523,13 @@ impl Json {
             }
             values.clear();
             for ((key, value), name) in row.iter().zip(&names) {
-                if key != name {
+                // A positional key is three digits and then the field's name.
+                let named = if positional {
+                    key.get(3..)
+                } else {
+                    Some(&**key)
+                };
+                if named != Some(name) {
                     return Err(serialization());
                 }
                 values.push(value);
@@ -657,6 +678,37 @@ mod tests {
                 r#"{"fields":[],"rows":[]}"#,
             ]
             .join("\n")
+        );
+    }
+
+    #[test]
+    fn fields_of_one_name_are_written_as_array_rows_keyed_by_position() {
+        let rows = result(
+            &[("id", 20), ("title", 25), ("id", 20)],
+            vec![json!({"000id": 1, "001title": "one", "002id": 7})],
+        );
+        let written_rows = written(std::slice::from_ref(&rows), true, false).unwrap();
+        assert!(
+            written_rows.ends_with(
+                r#"{"fields":[{"name":"id","dataTypeID":20},{"name":"title","dataTypeID":25},{"name":"id","dataTypeID":20}],"rows":[[1,"one",7]]}"#
+            ),
+            "{written_rows}"
+        );
+        // An object cannot hold them, and the engine returns them only for array rows, under
+        // keys that end in their names.
+        assert_eq!(
+            written(std::slice::from_ref(&rows), false, false)
+                .unwrap_err()
+                .code,
+            "BRIDGE_SERIALIZATION_ERROR"
+        );
+        let misnamed = result(
+            &[("id", 20), ("id", 20)],
+            vec![json!({"000id": 1, "001title": 7})],
+        );
+        assert_eq!(
+            written(&[misnamed], true, false).unwrap_err().code,
+            "BRIDGE_SERIALIZATION_ERROR"
         );
     }
 

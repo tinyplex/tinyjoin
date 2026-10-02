@@ -47,6 +47,20 @@ pub(crate) enum Statement {
     Write(WriteStatement),
 }
 
+impl Statement {
+    /// Keys a `SELECT`'s outputs by position if their names repeat, for a caller that reads each
+    /// row's values in field order rather than by name.
+    pub(crate) fn position_outputs(&mut self) -> Result<()> {
+        match self {
+            Self::Select(plan) => crate::query::position_outputs(plan),
+            Self::Aggregate(plan) => crate::aggregate::position_outputs(plan)?,
+            Self::Join(plan) => crate::join::position_outputs(plan)?,
+            Self::Write(_) => {}
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum WriteStatement {
     CreateTable {

@@ -55,7 +55,25 @@ impl<D: PageDevice> PagedEngine<D> {
     /// pager generation. A statement which matches no rows does not publish a generation or
     /// advance the revision.
     pub fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<ExecuteResult> {
-        let statement = crate::statement::parse(sql, params)?;
+        self.execute_sql_rows(sql, params, false)
+    }
+
+    /// Executes one statement as [`Self::execute_sql`] does, for a caller that with `array_rows`
+    /// reads each row's values in field order rather than by name.
+    ///
+    /// Only such a caller can tell apart fields of one name, so only it may be returned them: a
+    /// `SELECT` whose output names repeat is otherwise refused. Its rows hold each value under
+    /// its field's position, written as three digits, and then its name.
+    pub fn execute_sql_rows(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        array_rows: bool,
+    ) -> Result<ExecuteResult> {
+        let mut statement = crate::statement::parse(sql, params)?;
+        if array_rows {
+            statement.position_outputs()?;
+        }
         self.execute_parsed_statement(statement)
     }
 
@@ -71,7 +89,21 @@ impl<D: PageDevice> PagedEngine<D> {
         id: PreparedStatementId,
         params: &[Value],
     ) -> Result<ExecuteResult> {
-        let statement = self.prepared_statements.bind(id, params)?;
+        self.execute_prepared_rows(id, params, false)
+    }
+
+    /// Executes a retained statement as [`Self::execute_prepared`] does, with fields of one name
+    /// as [`Self::execute_sql_rows`] returns them.
+    pub fn execute_prepared_rows(
+        &mut self,
+        id: PreparedStatementId,
+        params: &[Value],
+        array_rows: bool,
+    ) -> Result<ExecuteResult> {
+        let mut statement = self.prepared_statements.bind(id, params)?;
+        if array_rows {
+            statement.position_outputs()?;
+        }
         self.execute_parsed_statement(statement)
     }
 
@@ -107,16 +139,27 @@ impl<D: PageDevice> PagedEngine<D> {
     /// transaction, scripts are limited to reads and row DML and install their cloned overlay only
     /// after every statement succeeds.
     pub fn exec_sql(&mut self, sql: &str) -> Result<Vec<ExecuteResult>> {
+        self.exec_sql_rows(sql, false)
+    }
+
+    /// Executes a script as [`Self::exec_sql`] does, with fields of one name as
+    /// [`Self::execute_sql_rows`] returns them.
+    pub fn exec_sql_rows(&mut self, sql: &str, array_rows: bool) -> Result<Vec<ExecuteResult>> {
         let script = crate::sql_script::split(sql)?;
         if script.is_empty() {
             return Err(EngineError::invalid_query(
                 "exec SQL must contain at least one statement",
             ));
         }
-        let statements = script
+        let mut statements = script
             .into_iter()
             .map(|sql| crate::statement::parse(sql, &[]))
             .collect::<Result<Vec<_>>>()?;
+        if array_rows {
+            for statement in &mut statements {
+                statement.position_outputs()?;
+            }
+        }
         if self.transaction.is_none() {
             return self.storage.execute_script(statements);
         }
@@ -2937,6 +2980,173 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+
+    #[test]
+    fn array_rows_hold_fields_of_one_name_under_their_positions() {
+        let mut engine = users_engine();
+        engine
+            .exec_sql(
+                "CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, \
+                   title TEXT NOT NULL);\
+                 INSERT INTO posts VALUES (10, 1, 'first'), (11, 3, 'second');",
+            )
+            .unwrap();
+        let revision = engine.revision();
+        let names = |result: &ExecuteResult| {
+            result
+                .fields
+                .iter()
+                .map(|field| field.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // Each shape of SELECT returns its fields under the names it gave them, and its rows
+        // under their positions.
+        let join = "SELECT users.id, posts.id, posts.title FROM users \
+                    JOIN posts ON users.id = posts.user_id ORDER BY posts.id DESC";
+        for (sql, fields, rows) in [
+            (
+                "SELECT id, name, id AS name FROM users WHERE id = 1",
+                vec!["id", "name", "name"],
+                vec![json!({"000id": 1, "001name": "cy", "002name": 1})],
+            ),
+            (
+                join,
+                vec!["id", "id", "title"],
+                vec![
+                    json!({"000id": 3, "001id": 11, "002title": "second"}),
+                    json!({"000id": 1, "001id": 10, "002title": "first"}),
+                ],
+            ),
+            (
+                "SELECT users.id, posts.id, posts.title FROM users \
+                 JOIN posts ON users.id = posts.user_id ORDER BY title LIMIT 1",
+                vec!["id", "id", "title"],
+                vec![json!({"000id": 1, "001id": 10, "002title": "first"})],
+            ),
+            (
+                "SELECT COUNT(*), active, COUNT(email) FROM users GROUP BY active ORDER BY active",
+                vec!["count", "active", "count"],
+                vec![
+                    json!({"000count": 2, "001active": false, "002count": 1}),
+                    json!({"000count": 1, "001active": true, "002count": 1}),
+                ],
+            ),
+            (
+                "SELECT DISTINCT active, active FROM users ORDER BY active DESC",
+                vec!["active", "active"],
+                vec![
+                    json!({"000active": true, "001active": true}),
+                    json!({"000active": false, "001active": false}),
+                ],
+            ),
+            // Outputs of one name that return the same thing can be ordered by that name.
+            (
+                "SELECT id AS n, id AS n FROM users ORDER BY n DESC LIMIT 1",
+                vec!["n", "n"],
+                vec![json!({"000n": 3, "001n": 3})],
+            ),
+            (
+                "SELECT COUNT(*), COUNT(*) FROM users ORDER BY count",
+                vec!["count", "count"],
+                vec![json!({"000count": 3, "001count": 3})],
+            ),
+        ] {
+            let result = engine.execute_sql_rows(sql, &[], true).unwrap();
+            assert_eq!(names(&result), fields, "{sql}");
+            assert_eq!(
+                result.rows,
+                rows.into_iter().map(row).collect::<Vec<_>>(),
+                "{sql}"
+            );
+            // Rows read by name are refused them, as before.
+            assert_eq!(
+                engine.execute_sql(sql, &[]).unwrap_err().code,
+                "INVALID_QUERY",
+                "{sql}"
+            );
+        }
+
+        // Distinct names key array rows as they key any others.
+        assert_eq!(
+            engine
+                .execute_sql_rows("SELECT id, name FROM users WHERE id = 1", &[], true)
+                .unwrap()
+                .rows,
+            vec![row(json!({"id": 1, "name": "cy"}))]
+        );
+
+        // A prepared statement and a script choose with each execution.
+        let statement = engine.prepare_sql(join).unwrap();
+        assert_eq!(
+            engine.execute_prepared(statement, &[]).unwrap_err().code,
+            "INVALID_QUERY"
+        );
+        let prepared = engine.execute_prepared_rows(statement, &[], true).unwrap();
+        assert_eq!(names(&prepared), ["id", "id", "title"]);
+        assert_eq!(prepared.rows.len(), 2);
+        let script = "INSERT INTO posts VALUES (12, 3, 'third'); SELECT id, id FROM posts;";
+        assert_eq!(engine.exec_sql(script).unwrap_err().code, "INVALID_QUERY");
+        assert_eq!(engine.revision(), revision);
+        let results = engine.exec_sql_rows(script, true).unwrap();
+        assert!(results[0].fields.is_empty());
+        assert_eq!(names(&results[1]), ["id", "id"]);
+        assert_eq!(results[1].rows.len(), 3);
+        assert_eq!(engine.revision(), revision + 1);
+
+        // A transaction's reads are returned the same way.
+        engine.begin_transaction().unwrap();
+        let staged = engine
+            .execute_sql_rows("SELECT name, name FROM users WHERE id = 2", &[], true)
+            .unwrap();
+        assert_eq!(
+            staged.rows,
+            vec![row(json!({"000name": "ann", "001name": "ann"}))]
+        );
+        engine.rollback_transaction().unwrap();
+
+        // ORDER BY cannot choose between outputs of one name that return different things, and a
+        // position is not a name. RETURNING names stay distinct.
+        for (sql, code) in [
+            (
+                "SELECT id AS n, name AS n FROM users ORDER BY n",
+                "INVALID_QUERY",
+            ),
+            (
+                "SELECT users.id, posts.id FROM users JOIN posts ON users.id = posts.user_id \
+                 ORDER BY id",
+                "INVALID_QUERY",
+            ),
+            (
+                "SELECT COUNT(*), COUNT(email) FROM users ORDER BY count",
+                "INVALID_QUERY",
+            ),
+            (
+                "SELECT COUNT(*), COUNT(*) FROM users ORDER BY \"000count\"",
+                "COLUMN_NOT_FOUND",
+            ),
+            (
+                "SELECT id, id FROM users ORDER BY \"000id\"",
+                "COLUMN_NOT_FOUND",
+            ),
+            (
+                "SELECT users.id, posts.id FROM users JOIN posts ON users.id = posts.user_id \
+                 ORDER BY \"000id\"",
+                "COLUMN_NOT_FOUND",
+            ),
+            (
+                "UPDATE users SET name = 'x' WHERE id = 1 RETURNING id, id",
+                "INVALID_QUERY",
+            ),
+        ] {
+            assert_eq!(
+                engine.execute_sql_rows(sql, &[], true).unwrap_err().code,
+                code,
+                "{sql}"
+            );
+        }
+        assert_eq!(engine.revision(), revision + 1);
     }
 
     #[test]

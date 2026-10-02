@@ -237,6 +237,52 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
     }
   });
 
+  it('returns duplicate projections to array rows in field order', async () => {
+    const wasm = await loadStructuredModule();
+    const {engine} = createRecordingEngine(wasm, new MemoryPageDevice());
+    try {
+      engine.execSql(
+        `CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+         CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL);
+         INSERT INTO users VALUES (1, 'ann');
+         INSERT INTO posts VALUES (10, 1), (11, 1);`,
+      );
+      const join =
+        'SELECT users.id, posts.id, users.name FROM users ' +
+        'JOIN posts ON users.id = posts.user_id ORDER BY posts.id DESC';
+      const names = ['id', 'id', 'name'];
+      const rows = [
+        [1, 11, 'ann'],
+        [1, 10, 'ann'],
+      ];
+
+      const joined = engine.executeSql(join, [], 'array');
+      expect(joined.fields.map(field => field.name)).toEqual(names);
+      expect(joined.rows).toEqual(rows);
+      const prepared = engine.prepareSql(join);
+      expect(engine.executePrepared(prepared, [], 'array').rows).toEqual(rows);
+      expect(
+        engine.execSql(`SELECT name, name FROM users; ${join}`, 'array'),
+      ).toMatchObject([{rows: [['ann', 'ann']]}, {rows}]);
+      expect(
+        engine.executeSql('SELECT count(*), count(name) FROM users', [], 'array'),
+      ).toMatchObject({
+        fields: [{name: 'count'}, {name: 'count'}],
+        rows: [[1, 1]],
+      });
+
+      // Object rows cannot hold two values under one name.
+      expect(captureError(() => engine.executeSql(join, []))).toMatchObject({
+        code: 'INVALID_QUERY',
+      });
+      expect(
+        captureError(() => engine.executePrepared(prepared, [], 'object')),
+      ).toMatchObject({code: 'INVALID_QUERY'});
+    } finally {
+      engine.close();
+    }
+  });
+
   it('rejects duplicate RETURNING columns before changing durable or staged rows', async () => {
     const wasm = await loadStructuredModule();
     const {engine} = createRecordingEngine(wasm, new MemoryPageDevice());

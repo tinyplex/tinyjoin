@@ -83,7 +83,9 @@ impl WasmEngine {
                 request.finish()?;
                 let was_in_transaction = self.engine()?.in_transaction();
                 let previous_revision = self.engine()?.revision();
-                let result = self.engine_mut()?.execute_sql(sql, &params)?;
+                let result = self
+                    .engine_mut()?
+                    .execute_sql_rows(sql, &params, array_rows)?;
                 let committed = !was_in_transaction && result.revision != previous_revision;
                 self.encode_committed(
                     structured::execute_result(&result, committed, array_rows),
@@ -96,7 +98,7 @@ impl WasmEngine {
                 request.finish()?;
                 let was_in_transaction = self.engine()?.in_transaction();
                 let previous_revision = self.engine()?.revision();
-                let results = self.engine_mut()?.exec_sql(sql)?;
+                let results = self.engine_mut()?.exec_sql_rows(sql, array_rows)?;
                 let committed =
                     !was_in_transaction && self.engine()?.revision() != previous_revision;
                 self.encode_committed(
@@ -117,7 +119,9 @@ impl WasmEngine {
                 request.finish()?;
                 let was_in_transaction = self.engine()?.in_transaction();
                 let previous_revision = self.engine()?.revision();
-                let result = self.engine_mut()?.execute_prepared(statement_id, &params)?;
+                let result =
+                    self.engine_mut()?
+                        .execute_prepared_rows(statement_id, &params, array_rows)?;
                 let committed = !was_in_transaction && result.revision != previous_revision;
                 self.encode_committed(
                     structured::execute_result(&result, committed, array_rows),

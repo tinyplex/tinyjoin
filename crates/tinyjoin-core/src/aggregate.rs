@@ -49,13 +49,13 @@ impl AggregateFunction {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum AggregateArgument {
     Star,
     Column(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum SelectExpression {
     Column(String),
     Aggregate {
@@ -76,11 +76,40 @@ pub(crate) struct AggregatePlan {
     /// `SELECT DISTINCT`, planned as a grouping by every projected column with no aggregates.
     distinct: bool,
     items: Vec<SelectItem>,
+    /// Whether the outputs are keyed by position because their names repeat.
+    positional: bool,
     predicate: Option<Predicate>,
     group_by: Vec<String>,
     order_by: Vec<OrderBy>,
     limit: Option<usize>,
     offset: usize,
+}
+
+/// Keys an aggregate query's outputs by position if their names repeat. Its `ORDER BY` names
+/// outputs, so each of those takes the key of the output it names.
+pub(crate) fn position_outputs(plan: &mut AggregatePlan) -> Result<()> {
+    let items = &mut plan.items;
+    plan.positional = crate::query::names_repeat(items.len(), &|index| &items[index].output);
+    if !plan.positional {
+        return Ok(());
+    }
+    for (index, item) in items.iter_mut().enumerate() {
+        crate::query::position_name(index, &mut item.output);
+    }
+    for order in &mut plan.order_by {
+        let mut named = plan
+            .items
+            .iter()
+            .filter(|item| item.output[3..] == order.column);
+        let first = named
+            .next()
+            .ok_or_else(|| EngineError::column_not_found(&order.column, "aggregate output"))?;
+        if named.any(|other| other.expression != first.expression) {
+            return Err(crate::query::ambiguous_order(&order.column));
+        }
+        order.column.clone_from(&first.output);
+    }
+    Ok(())
 }
 
 pub(crate) fn is_aggregate_select(tokens: &[Token]) -> bool {
@@ -337,7 +366,10 @@ fn result_fields(plan: &AggregatePlan, schema: &TableDefinition) -> Result<Vec<R
                     }
                 },
             };
-            Ok(ResultField::new(&item.output, data_type))
+            Ok(ResultField::new(
+                crate::query::field_name(&item.output, plan.positional),
+                data_type,
+            ))
         })
         .collect()
 }
@@ -1382,6 +1414,7 @@ impl<'a> Parser<'a> {
             table,
             distinct,
             items,
+            positional: false,
             predicate,
             group_by,
             order_by,

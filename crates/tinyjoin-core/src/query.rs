@@ -67,7 +67,7 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &SelectPlan) -> Result<
     }
 
     let schema = storage.table_schema(&plan.table)?;
-    let fields = select_fields(&schema, plan.columns.as_deref())?;
+    let fields = select_fields(&schema, plan.columns.as_deref(), plan.positional)?;
     if let Some(predicate) = &plan.predicate {
         validate_predicate_columns(predicate, &schema, &plan.table)?;
         validate_predicate_types(predicate, &schema, &plan.table)?;
@@ -140,10 +140,12 @@ pub(crate) fn projection_fields(
 }
 
 /// Result fields for a single-table projection. Output names must be distinct because a result row
-/// is a JSON object, but one source column may be returned under several names.
+/// is a JSON object, but one source column may be returned under several names. Names that may
+/// repeat have been [keyed by position](position_outputs) before this.
 fn select_fields(
     schema: &TableDefinition,
     columns: Option<&[SelectColumn]>,
+    positional: bool,
 ) -> Result<Vec<ResultField>> {
     let Some(columns) = columns else {
         return projection_fields(schema, None);
@@ -158,8 +160,9 @@ fn select_fields(
                     item.output
                 )));
             }
-            column_definition(schema, &item.column, &schema.name)
-                .map(|definition| ResultField::new(&item.output, definition.data_type))
+            column_definition(schema, &item.column, &schema.name).map(|definition| {
+                ResultField::new(field_name(&item.output, positional), definition.data_type)
+            })
         })
         .collect()
 }
@@ -216,6 +219,47 @@ impl<'a> Projection<'a> {
     fn project_owned(&self, row: &Row, schema: &TableDefinition) -> Result<Row> {
         self.project(&RowRef::map(row, schema))
     }
+}
+
+/// Whether any of `count` output names, each given by its position, is also an earlier one's.
+/// Rows held as objects of values under those names could not return such a projection, so its
+/// outputs are [keyed by position](position_name) for a caller that reads rows as arrays.
+pub(crate) fn names_repeat<'a>(count: usize, name: &dyn Fn(usize) -> &'a str) -> bool {
+    (1..count).any(|index| (0..index).any(|earlier| name(earlier) == name(index)))
+}
+
+/// Keys an output by its position in a projection whose names repeat: the name gains the position
+/// as three leading digits, which makes a key that is distinct and that sorts where the position
+/// does. [`field_name`] has to be told that a plan's outputs are keyed like this.
+pub(crate) fn position_name(index: usize, output: &mut String) {
+    for (place, divisor) in [100, 10, 1].into_iter().enumerate() {
+        output.insert(place, char::from(b'0' + (index / divisor % 10) as u8));
+    }
+}
+
+/// The name a result's field takes from an output, which holds it after a position where
+/// [`position_name`] has keyed the outputs by one.
+pub(crate) fn field_name(output: &str, positional: bool) -> &str {
+    if positional { &output[3..] } else { output }
+}
+
+/// Keys a single-table projection's outputs by position if their names repeat.
+pub(crate) fn position_outputs(plan: &mut SelectPlan) {
+    let Some(columns) = &mut plan.columns else {
+        return;
+    };
+    plan.positional = names_repeat(columns.len(), &|index| &columns[index].output);
+    if plan.positional {
+        for (index, item) in columns.iter_mut().enumerate() {
+            position_name(index, &mut item.output);
+        }
+    }
+}
+
+pub(crate) fn ambiguous_order(name: &str) -> EngineError {
+    EngineError::invalid_query(format!(
+        "ORDER BY `{name}` is ambiguous because several outputs have that name"
+    ))
 }
 
 pub(crate) fn validate_named_columns(schema: &TableDefinition, columns: &[String]) -> Result<()> {
@@ -1312,6 +1356,7 @@ impl<'a> SqlParser<'a> {
         Ok(SelectPlan {
             table,
             columns,
+            positional: false,
             predicate,
             order_by,
             limit,
@@ -1376,7 +1421,11 @@ impl<'a> SqlParser<'a> {
                 column
             } else {
                 let name = self.parse_identifier()?;
-                match outputs.iter().find(|item| item.output == name) {
+                let mut named = outputs.iter().filter(|item| item.output == name);
+                match named.next() {
+                    Some(item) if named.any(|other| other.column != item.column) => {
+                        return Err(ambiguous_order(&name));
+                    }
                     Some(item) => item.column.clone(),
                     None => name,
                 }
@@ -4838,6 +4887,7 @@ mod tests {
             SelectPlan {
                 table: "posts".to_owned(),
                 columns: Some(vec![select_column("id")]),
+                positional: false,
                 predicate: None,
                 order_by: vec![],
                 limit: None,
@@ -4849,6 +4899,7 @@ mod tests {
             SelectPlan {
                 table: "Posts".to_owned(),
                 columns: Some(vec![select_column("ID")]),
+                positional: false,
                 predicate: None,
                 order_by: vec![],
                 limit: None,
@@ -4870,6 +4921,7 @@ mod tests {
             SelectPlan {
                 table: "public.posts".to_owned(),
                 columns: Some(vec![select_column("display\"name")]),
+                positional: false,
                 predicate: Some(Predicate::And {
                     predicates: vec![
                         Predicate::Comparison {
