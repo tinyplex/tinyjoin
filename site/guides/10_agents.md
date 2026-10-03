@@ -96,6 +96,16 @@ column types TinyJoin has, leave out `.references()`, and avoid relational
 queries with `with`, SQL functions, and nested transactions.
 See the [Drizzle guide](/guides/drizzle/).
 
+## Kysely
+
+To use Kysely, give the `Kysely` constructor a TinyJoinDialect from
+`tinyjoin/kysely`, constructed with `{client}`; the application installs
+`kysely` itself and closes the Client.
+Kysely's Migrator and introspector work. Use the column types TinyJoin has,
+leave out foreign keys, select a join's columns by name rather than with
+`selectAll`, and avoid `jsonArrayFrom`, SQL functions, and savepoints. See the
+[Kysely guide](/guides/kysely/).
+
 ## Transactions and changes
 
 Use db.transaction(callback) for related parameterized `INSERT`, `UPDATE`,

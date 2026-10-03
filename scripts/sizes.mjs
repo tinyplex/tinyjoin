@@ -37,7 +37,8 @@ export async function measureSizes(dist = resolve(root, 'dist')) {
       ALTERNATIVE_ENTRIES.includes(path) ||
       path.startsWith('vite/') ||
       path.startsWith('node/') ||
-      path.startsWith('drizzle/')
+      path.startsWith('drizzle/') ||
+      path.startsWith('kysely/')
     ) {
       continue;
     }

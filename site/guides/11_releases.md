@@ -83,6 +83,14 @@ atomically with the row that records it, so every tab can call it as it
 starts. Relational queries with `with`, Drizzle Kit's `push`, and Drizzle's
 own migrators are not supported. See the [Drizzle guide](/guides/drizzle/).
 
+The new `tinyjoin/kysely` entry point connects the [Kysely](https://kysely.dev)
+query builder to a TinyJoin Client. Its TinyJoinDialect, constructed with
+`{client}`, is a Kysely dialect whose queries run in TinyJoin's dialect, whose transactions are
+TinyJoin's callback transactions, whose introspector reads getSchema(), and
+under which Kysely's Migrator runs, one tab at a time. The application installs
+`kysely` 0.28 or later itself; TinyJoin declares it as an optional peer
+dependency and never bundles it. See the [Kysely guide](/guides/kysely/).
+
 `CREATE TABLE` accepts the constraints and spellings that schema tools write:
 a named primary key, as in `CONSTRAINT tags_pk PRIMARY KEY (post_id, tag)`;
 `UNIQUE` on a column or as a table constraint, which creates a unique index

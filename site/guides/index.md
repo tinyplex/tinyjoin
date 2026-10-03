@@ -5,8 +5,9 @@ storage, transactions, custom Workers, and compatibility details only when they
 become relevant.
 
 The [Node guide](/guides/node/) covers in-memory databases in Node.js with
-the same Client API, and the [Drizzle guide](/guides/drizzle/) covers querying
-TinyJoin with the Drizzle ORM.
+the same Client API, and the [Drizzle](/guides/drizzle/) and
+[Kysely](/guides/kysely/) guides cover querying TinyJoin with those query
+builders.
 
 The [caveats](/guides/caveats/) collect what TinyJoin deliberately does not do,
 and which projects to reach for when that matters.

@@ -54,6 +54,8 @@ const RUNTIME_BUNDLES = [
   // The Drizzle driver extends the application's own drizzle-orm, an optional
   // peer dependency that is never bundled.
   {entry: 'drizzle/index.js', shared: {}, external: ['drizzle-orm', 'drizzle-orm/*']},
+  // So does the Kysely dialect, with the application's own kysely.
+  {entry: 'kysely/index.js', shared: {}, external: ['kysely', 'kysely/*']},
 ];
 
 // Published JavaScript, including the Node entry point and Vite plugin. tsc emits one
@@ -70,6 +72,7 @@ const RUNTIME_FILES = [
   'node/worker-entry.js',
   'vite/index.js',
   'drizzle/index.js',
+  'kysely/index.js',
 ];
 
 // Terser settings shared by every published file. Mangling top-level names is
@@ -165,6 +168,10 @@ manifest.exports = {
   './drizzle': {
     types: './@types/drizzle/index.d.ts',
     import: './drizzle/index.js',
+  },
+  './kysely': {
+    types: './@types/kysely/index.d.ts',
+    import: './kysely/index.js',
   },
 };
 

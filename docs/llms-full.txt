@@ -2030,6 +2030,158 @@ object rather than a string. Reading the column returns the object.
 Drizzle's raw `db.execute` resolves to the rows its statement returns, as
 objects.
 
+# Kysely
+
+Source: https://tinyjoin.org/guides/kysely/
+
+Use `tinyjoin/kysely` to query a TinyJoin database with the
+[Kysely](https://kysely.dev) query builder. Its dialect runs Kysely's queries
+on a TinyJoin Client, runs Kysely's transactions as TinyJoin transactions, and
+lets Kysely's introspector and Migrator read and change the schema.
+
+Kysely writes PostgreSQL, and TinyJoin runs a
+[bounded, PostgreSQL-shaped dialect](https://tinyjoin.org/guides/sql-compatibility/), so most of
+Kysely's query builder works, and some of it does not. This guide says which.
+
+## Get started
+
+Install TinyJoin and Kysely. TinyJoin declares `kysely` 0.28 or later as an
+optional peer dependency, so an application that does not use Kysely never
+installs it.
+
+```sh
+npm install tinyjoin kysely
+```
+
+Describe the tables as a Kysely database interface, and pass the Client to the
+dialect:
+
+```ts
+import {create} from 'tinyjoin';
+import {TinyJoinDialect} from 'tinyjoin/kysely';
+import {Kysely} from 'kysely';
+
+interface Database {
+  tasks: {id: string; title: string; done: boolean; edits: number};
+}
+
+const client = await create('opfs://my-app-v1');
+await client.exec(`
+  CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    title VARCHAR(200) NOT NULL,
+    done BOOLEAN NOT NULL DEFAULT false,
+    edits INTEGER NOT NULL DEFAULT 0
+  )
+`);
+
+const db = new Kysely<Database>({dialect: new TinyJoinDialect({client})});
+await db
+  .insertInto('tasks')
+  .values({id: crypto.randomUUID(), title: 'Try Kysely', done: false, edits: 0})
+  .execute();
+await db
+  .updateTable('tasks')
+  .set((eb) => ({edits: eb('edits', '+', 1)}))
+  .where('done', '=', false)
+  .execute();
+const open = await db.selectFrom('tasks').selectAll().where('done', '=', false).execute();
+```
+
+The Client is still yours: subscribe to it for changes, and close it when the
+database is no longer needed. Kysely's `db.destroy` leaves it open.
+
+## Schemas and migrations
+
+Every table needs a primary key. Kysely's column types map onto TinyJoin's
+five runtime types:
+
+| Kysely data type | TinyJoin type |
+| --- | --- |
+| `boolean` | Boolean |
+| `integer`, `bigint` | Integer, within the JavaScript-safe range |
+| `real`, `double precision` | Float |
+| `text`, `varchar`, `varchar(n)` | Text |
+| `json`, `jsonb` | JSON |
+
+TinyJoin has no `serial`, `uuid`, `timestamp`, `date`, `numeric`, enum, or
+array types. Generate identifiers in the application, and store a time as an
+integer or text column. Leave out `references` and foreign-key constraints:
+TinyJoin cannot enforce them, so it refuses the SQL that declares them.
+
+Kysely's schema builder works within TinyJoin's
+[DDL](https://tinyjoin.org/guides/sql-compatibility/#statements-and-clauses): creating and dropping
+tables and indexes, with primary-key and unique constraints, and altering
+tables to add, rename, and drop columns, change defaults and nullability, and
+rename the table.
+
+Kysely's `Migrator` works as Kysely documents it. It creates its own tables,
+then runs each migration that the database has not recorded. TinyJoin cannot
+run DDL inside a transaction, so, as on MySQL, Kysely runs a migration's
+statements one at a time: a migration that fails partway leaves the statements
+before the failure applied. Write migrations whose statements each stand on
+their own, or that an `IF NOT EXISTS` makes safe to run again. A Web Lock keeps
+one tab of an application migrating at a time, so every tab can migrate as it
+starts.
+
+`db.introspection.getTables` lists the tables, without the Migrator's own,
+from the Client's getSchema(), with each column's PostgreSQL type: `bool`,
+`int8`, `float8`, `text`, `varchar`, or `json`. TinyJoin has no schemas, so
+`getSchemas` lists none.
+
+## Queries
+
+These work as Kysely documents them:
+
+- `selectFrom` with `select`, and `selectAll` on one table;
+- `where` with comparisons, `and`, `or`, `not`, `in` with values or a
+  subquery, `between`, `like`, `ilike`, and `is null`;
+- `orderBy`, `limit`, and `offset`;
+- inner and left joins of up to eight tables, selecting their columns by name;
+- `groupBy` with `countAll`, `count`, `sum`, `avg`, `min`, and `max`;
+- `insertInto` with `values`, `defaultValues`, and `onConflict`, with
+  `doNothing` or `doUpdateSet`;
+- `updateTable` and `deleteFrom`, with `returning` and `returningAll`, and
+  arithmetic and `||` in `set`;
+- `sql` templates in TinyJoin's dialect.
+
+These are refused with an error rather than run:
+
+- `selectAll` over a join;
+- `jsonArrayFrom` and `jsonObjectFrom`, which Kysely writes as correlated JSON
+  subqueries, `exists`, and other correlated subqueries;
+- SQL functions such as `coalesce`, `case`, and casts;
+- `distinctOn`, `having`, a distinct `count`, `with`, and `union`;
+- `updateTable(...).from` and `deleteFrom(...).using`;
+- streaming with `stream`.
+
+A failed query rejects with the TinyJoin
+[ClientError](https://tinyjoin.org/api/tinyjoin/classes/errors/clienterror/), with its `code`.
+The [SQL compatibility contract](https://tinyjoin.org/guides/sql-compatibility/) is the exact list
+of what runs.
+
+## Transactions
+
+Kysely's `db.transaction` and `db.startTransaction` run on the Client's
+[callback transaction](https://tinyjoin.org/guides/transactions-and-changes/). It holds the
+database, and every tab sharing it, until it commits or rolls back, so keep it
+short. A transaction takes no isolation level or access mode, and there are no
+savepoints.
+
+Kysely runs one query at a time on the Client, so a query outside a
+transaction waits until the transaction ends rather than failing. Use the
+transaction Kysely passes inside the callback: a query on `db` there waits for
+the transaction to finish, which waits for the callback. Kysely 0.28 does not
+run queries one at a time, so there a query outside an open transaction fails
+with `TRANSACTION_ACTIVE` instead.
+
+## Results
+
+Rows come back as objects. An integer is a JavaScript number, and a `json`
+column holds the value itself, not JSON text, so pass objects rather than
+`JSON.stringify` output. Updates and deletes report `numUpdatedRows` and
+`numDeletedRows` as Kysely does, as `bigint` values.
+
 # Offline
 
 Source: https://tinyjoin.org/guides/offline/
@@ -2616,6 +2768,16 @@ column types TinyJoin has, leave out `.references()`, and avoid relational
 queries with `with`, SQL functions, and nested transactions.
 See the [Drizzle guide](https://tinyjoin.org/guides/drizzle/).
 
+## Kysely
+
+To use Kysely, give the `Kysely` constructor a TinyJoinDialect from
+`tinyjoin/kysely`, constructed with `{client}`; the application installs
+`kysely` itself and closes the Client.
+Kysely's Migrator and introspector work. Use the column types TinyJoin has,
+leave out foreign keys, select a join's columns by name rather than with
+`selectAll`, and avoid `jsonArrayFrom`, SQL functions, and savepoints. See the
+[Kysely guide](https://tinyjoin.org/guides/kysely/).
+
 ## Transactions and changes
 
 Use db.transaction(callback) for related parameterized `INSERT`, `UPDATE`,
@@ -2808,6 +2970,14 @@ unchanged. Its migrate() function applies the migrations that
 atomically with the row that records it, so every tab can call it as it
 starts. Relational queries with `with`, Drizzle Kit's `push`, and Drizzle's
 own migrators are not supported. See the [Drizzle guide](https://tinyjoin.org/guides/drizzle/).
+
+The new `tinyjoin/kysely` entry point connects the [Kysely](https://kysely.dev)
+query builder to a TinyJoin Client. Its TinyJoinDialect, constructed with
+`{client}`, is a Kysely dialect whose queries run in TinyJoin's dialect, whose transactions are
+TinyJoin's callback transactions, whose introspector reads getSchema(), and
+under which Kysely's Migrator runs, one tab at a time. The application installs
+`kysely` 0.28 or later itself; TinyJoin declares it as an optional peer
+dependency and never bundles it. See the [Kysely guide](https://tinyjoin.org/guides/kysely/).
 
 `CREATE TABLE` accepts the constraints and spellings that schema tools write:
 a named primary key, as in `CONSTRAINT tags_pk PRIMARY KEY (post_id, tag)`;
@@ -3245,8 +3415,9 @@ storage, transactions, custom Workers, and compatibility details only when they
 become relevant.
 
 The [Node guide](https://tinyjoin.org/guides/node/) covers in-memory databases in Node.js with
-the same Client API, and the [Drizzle guide](https://tinyjoin.org/guides/drizzle/) covers querying
-TinyJoin with the Drizzle ORM.
+the same Client API, and the [Drizzle](https://tinyjoin.org/guides/drizzle/) and
+[Kysely](https://tinyjoin.org/guides/kysely/) guides cover querying TinyJoin with those query
+builders.
 
 The [caveats](https://tinyjoin.org/guides/caveats/) collect what TinyJoin deliberately does not do,
 and which projects to reach for when that matters.
@@ -4635,4 +4806,128 @@ export interface MigrationConfig {
 export function migrate<
   TSchema extends Record<string, unknown> = Record<string, never>,
 >(db: TinyJoinDatabase<TSchema>, config: MigrationConfig): Promise<void>;
+````
+
+# Public API: tinyjoin/kysely
+
+Source: https://tinyjoin.org/api/kysely/
+
+````ts
+/**
+ * The kysely module connects the Kysely query builder to a TinyJoin Client. It
+ * needs `kysely` 0.28 or later, which the application installs itself:
+ * TinyJoin declares it as an optional peer dependency and never bundles it.
+ *
+ * Kysely writes PostgreSQL, so its queries run in TinyJoin's
+ * [SQL dialect](https://tinyjoin.org/guides/sql-compatibility/). See the
+ * [Kysely guide](https://tinyjoin.org/guides/kysely/) for what works, and what does not.
+ * @packageDocumentation
+ * @module kysely
+ * @since v0.5.0
+ */
+
+import type {
+  DatabaseIntrospector,
+  Dialect,
+  DialectAdapter,
+  Driver,
+  QueryCompiler,
+} from 'kysely';
+import type {Client} from '../index.js';
+
+/**
+ * The TinyJoinDialectConfig interface configures a TinyJoinDialect.
+ * @category Kysely
+ * @since v0.5.0
+ */
+export interface TinyJoinDialectConfig {
+  /**
+   * The client property is the TinyJoin Client, from create(), on which
+   * Kysely runs its queries. The application closes it: Kysely's `destroy`
+   * leaves it open.
+   * @category Kysely
+   * @since v0.5.0
+   */
+  client: Client;
+}
+
+/**
+ * The TinyJoinDialect class is a Kysely dialect that runs Kysely's PostgreSQL
+ * queries on a TinyJoin Client.
+ *
+ * Kysely runs one query at a time on the Client, so a query outside a
+ * transaction waits until the transaction ends rather than failing. Kysely's
+ * `db.transaction` runs on the Client's callback transaction, which holds the
+ * database, and every tab sharing it, until it commits or rolls back. It takes
+ * no isolation level or access mode, and there are no savepoints.
+ *
+ * Its introspector reads the Client's getSchema, and Kysely's Migrator runs
+ * each migration's statements in turn, since TinyJoin runs DDL outside
+ * transactions, with a Web Lock keeping one tab migrating at a time.
+ * @example
+ * ```ts
+ * import {create} from 'tinyjoin';
+ * import {TinyJoinDialect} from 'tinyjoin/kysely';
+ * import {Kysely} from 'kysely';
+ *
+ * interface Database {
+ *   tasks: {id: string; title: string; done: boolean};
+ * }
+ *
+ * const client = await create('opfs://my-app-v1');
+ * const db = new Kysely<Database>({dialect: new TinyJoinDialect({client})});
+ * const open = await db
+ *   .selectFrom('tasks')
+ *   .select(['id', 'title'])
+ *   .where('done', '=', false)
+ *   .execute();
+ * ```
+ * @category Kysely
+ * @since v0.5.0
+ */
+export class TinyJoinDialect implements Dialect {
+  /**
+   * The constructor creates a dialect over a TinyJoin Client.
+   * @param config The dialect's configuration, with its Client.
+   * @category Kysely
+   * @since v0.5.0
+   */
+  constructor(config: TinyJoinDialectConfig);
+
+  /**
+   * The createDriver method creates the driver that runs Kysely's queries on
+   * the Client. Kysely calls it.
+   * @returns A Kysely driver.
+   * @category Kysely
+   * @since v0.5.0
+   */
+  createDriver(): Driver;
+
+  /**
+   * The createQueryCompiler method creates Kysely's PostgreSQL query compiler.
+   * Kysely calls it.
+   * @returns A Kysely query compiler.
+   * @category Kysely
+   * @since v0.5.0
+   */
+  createQueryCompiler(): QueryCompiler;
+
+  /**
+   * The createAdapter method creates the adapter that tells Kysely how
+   * TinyJoin differs from PostgreSQL. Kysely calls it.
+   * @returns A Kysely dialect adapter.
+   * @category Kysely
+   * @since v0.5.0
+   */
+  createAdapter(): DialectAdapter;
+
+  /**
+   * The createIntrospector method creates the introspector that lists the
+   * database's tables and columns from the Client's getSchema. Kysely calls it.
+   * @returns A Kysely database introspector.
+   * @category Kysely
+   * @since v0.5.0
+   */
+  createIntrospector(): DatabaseIntrospector;
+}
 ````

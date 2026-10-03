@@ -42,6 +42,7 @@ const sortGuides = getSorter([
   'Custom Workers',
   'Node',
   'Drizzle',
+  'Kysely',
   'Offline',
   'Benchmarks',
   '*',
@@ -168,6 +169,7 @@ export const build = async (
     .addApiFile(resolve(typesDir, 'worker/index.d.ts'))
     .addApiFile(resolve(typesDir, 'vite/index.d.ts'))
     .addApiFile(resolve(typesDir, 'drizzle/index.d.ts'))
+    .addApiFile(resolve(typesDir, 'kysely/index.d.ts'))
     .addRootMarkdownFile('site/home/index.md')
     .addMarkdownDir('site/guides')
     .addMarkdownDir('site/demos', true);
@@ -274,6 +276,7 @@ const getFullReference = (
     ['tinyjoin/worker', 'worker/index.d.ts', 'https://tinyjoin.org/api/worker/'],
     ['tinyjoin/vite', 'vite/index.d.ts', 'https://tinyjoin.org/api/vite/'],
     ['tinyjoin/drizzle', 'drizzle/index.d.ts', 'https://tinyjoin.org/api/drizzle/'],
+    ['tinyjoin/kysely', 'kysely/index.d.ts', 'https://tinyjoin.org/api/kysely/'],
   ]) {
     sections.push(
       `# Public API: ${module}\n\nSource: ${source}\n\n` +

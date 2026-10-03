@@ -12,5 +12,5 @@
     "target": "ES2022",
     "types": ["node"]
   },
-  "include": ["types.mts"]
+  "include": ["types.mts", "kysely-types.mts"]
 }

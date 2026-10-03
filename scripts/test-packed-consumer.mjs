@@ -294,6 +294,13 @@ async function exerciseNodeConsumer() {
   if (!drizzleOutput.includes('NODE_DRIZZLE_CONSUMER_OK')) {
     throw new Error(`Drizzle packed consumer did not complete:\n${drizzleOutput}`);
   }
+  // So does the Kysely dialect, the application's own kysely.
+  const kyselyOutput = run(process.execPath, ['node/kysely.mjs'], appDirectory, {
+    timeout: 30_000,
+  });
+  if (!kyselyOutput.includes('NODE_KYSELY_CONSUMER_OK')) {
+    throw new Error(`Kysely packed consumer did not complete:\n${kyselyOutput}`);
+  }
 
   // A damaged install must reject create() and stop its Worker. Keep the
   // installed browser consumer and the repository's build artifacts intact.
@@ -315,6 +322,7 @@ async function exerciseNodeConsumer() {
   console.log('NODE_DECLARATIONS_OK');
   console.log('NODE_MEMORY_CONSUMER_OK');
   console.log('NODE_DRIZZLE_CONSUMER_OK');
+  console.log('NODE_KYSELY_CONSUMER_OK');
   console.log('NODE_MISSING_WASM_REJECTED');
 }
 
@@ -372,6 +380,7 @@ function assertPackedFiles(packed, documentationFiles) {
     '@types/worker/index.d.ts',
     '@types/vite/index.d.ts',
     '@types/drizzle/index.d.ts',
+    '@types/kysely/index.d.ts',
     'LICENSE',
     'README.md',
     'RUST_STANDARD_LIBRARY_NOTICES.html',
@@ -390,6 +399,7 @@ function assertPackedFiles(packed, documentationFiles) {
     'worker/index.js',
     'vite/index.js',
     'drizzle/index.js',
+    'kysely/index.js',
   ].sort();
   const missing = expected.filter((file) => !files.includes(file));
   const unexpected = files.filter((file) => !expected.includes(file));
