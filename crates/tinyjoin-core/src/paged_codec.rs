@@ -651,11 +651,10 @@ impl RecordLayout {
     }
 
     pub(crate) fn new(schema: &TableDefinition) -> Result<Self> {
-        let key_types = schema
-            .primary_key
-            .iter()
-            .map(|name| schema_column_type(schema, name).map_err(as_storage_corruption))
-            .collect::<Result<Vec<_>>>()?;
+        let mut key_types = Vec::with_capacity(schema.primary_key.len());
+        for name in &schema.primary_key {
+            key_types.push(schema_column_type(schema, name).map_err(as_storage_corruption)?);
+        }
         let mut slots = Vec::with_capacity(schema.columns.len());
         let mut keys = vec![0; key_types.len()];
         let mut stored = Vec::with_capacity(schema.columns.len().saturating_sub(key_types.len()));

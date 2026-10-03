@@ -562,24 +562,23 @@ fn plan_access(
             })
         };
         let key = |columns: &[String]| {
-            columns
-                .iter()
-                .map(|column| {
-                    let (source, source_column) = fixed(column)?;
-                    let data_type = relation
-                        .schema
-                        .columns
-                        .iter()
-                        .find(|definition| definition.name == *column)?
-                        .data_type;
-                    Some(KeyColumn {
-                        column: column.clone(),
-                        data_type,
-                        source,
-                        source_column: source_column.clone(),
-                    })
-                })
-                .collect::<Option<Vec<_>>>()
+            let mut key = Vec::with_capacity(columns.len());
+            for column in columns {
+                let (source, source_column) = fixed(column)?;
+                let data_type = relation
+                    .schema
+                    .columns
+                    .iter()
+                    .find(|definition| definition.name == *column)?
+                    .data_type;
+                key.push(KeyColumn {
+                    column: column.clone(),
+                    data_type,
+                    source,
+                    source_column: source_column.clone(),
+                });
+            }
+            Some(key)
         };
         let mut access = key(&relation.schema.primary_key).map(|columns| StageAccess::Lookup {
             index: None,
@@ -761,17 +760,16 @@ fn build_hash_table(
             }
             let row = row.to_row()?;
             // A row with a NULL key matches nothing, so it need not be kept.
-            let Some(key) = sides
-                .iter()
-                .map(|(column, ..)| {
-                    row.get(*column)
-                        .ok_or_else(|| missing_join_column_error(column))
-                        .map(KeyPart::new)
-                })
-                .collect::<Result<Option<Vec<_>>>>()?
-            else {
-                return Ok(VisitControl::Continue);
-            };
+            let mut key = Vec::with_capacity(sides.len());
+            for (column, ..) in &sides {
+                let value = row
+                    .get(*column)
+                    .ok_or_else(|| missing_join_column_error(column))?;
+                let Some(part) = KeyPart::new(value) else {
+                    return Ok(VisitControl::Continue);
+                };
+                key.push(part);
+            }
             *build_count = build_count.saturating_add(1);
             if *build_count > MAX_JOIN_BUILD_ROWS {
                 return Err(build_rows_limit_error());
@@ -807,13 +805,14 @@ fn visit_joined_rows(
     let Join {
         plan, relations, ..
     } = *join;
-    let filters = relations
-        .iter()
-        .zip(&join.access.pushed)
-        .map(|(relation, pushed)| {
-            Filter::new(pushed.as_ref(), &relation.schema, &relation.source.table)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut filters = Vec::with_capacity(relations.len());
+    for (relation, pushed) in relations.iter().zip(&join.access.pushed) {
+        filters.push(Filter::new(
+            pushed.as_ref(),
+            &relation.schema,
+            &relation.source.table,
+        )?);
+    }
     let mut budget = WorkBudget::default();
     let mut scanned = 0_usize;
     let mut build_count = 0_usize;
@@ -918,19 +917,28 @@ impl Extend<'_> {
             },
             StageAccess::Hash => Vec::new(),
         };
-        let candidates: Vec<&Row> = match table {
-            Some(table) => stage_sides(conditions, source)
-                .into_iter()
-                .map(|(_, other, column)| {
-                    earlier_value(bindings, other, column).map(|value| value.and_then(KeyPart::new))
-                })
-                .collect::<Result<Option<Vec<_>>>>()?
-                .and_then(|key| table.buckets.get(&key))
-                .map_or_else(Vec::new, |bucket| {
-                    bucket.iter().map(|index| &table.rows[*index]).collect()
-                }),
-            None => found.iter().collect(),
-        };
+        let mut candidates: Vec<&Row> = Vec::new();
+        match table {
+            Some(table) => {
+                // A NULL in the key matches nothing.
+                let sides = stage_sides(conditions, source);
+                let mut key = Vec::with_capacity(sides.len());
+                for (_, other, column) in sides {
+                    match earlier_value(bindings, other, column)?.and_then(KeyPart::new) {
+                        Some(part) => key.push(part),
+                        None => break,
+                    }
+                }
+                if key.len() == conditions.len()
+                    && let Some(bucket) = table.buckets.get(&key)
+                {
+                    for index in bucket {
+                        candidates.push(&table.rows[*index]);
+                    }
+                }
+            }
+            None => candidates.extend(&found),
+        }
         let mut local = [None; MAX_JOIN_SOURCES];
         local[..bindings.len()].copy_from_slice(bindings);
         let mut matched = false;
@@ -1218,17 +1226,14 @@ fn validate_plan(
             )));
         }
     }
-    let conditions = plan
-        .joins
-        .iter()
-        .enumerate()
-        .map(|(stage, join)| {
-            join.conditions
-                .iter()
-                .map(|condition| resolved_condition(condition, relations, stage + 1))
-                .collect()
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut conditions = Vec::with_capacity(plan.joins.len());
+    for (stage, join) in plan.joins.iter().enumerate() {
+        let mut resolved = Vec::with_capacity(join.conditions.len());
+        for condition in &join.conditions {
+            resolved.push(resolved_condition(condition, relations, stage + 1)?);
+        }
+        conditions.push(resolved);
+    }
 
     let mut outputs = KeySet::default();
     let mut fields = Vec::with_capacity(plan.projections.len());
@@ -1508,20 +1513,21 @@ fn order_keys(
     plan: &JoinPlan,
     relations: &[Relation],
 ) -> Result<Vec<Value>> {
-    plan.order_by
-        .iter()
-        .map(|order| match &order.source {
-            OrderSource::Column(reference) => joined_value(bindings, reference, relations).cloned(),
+    let mut keys = Vec::with_capacity(plan.order_by.len());
+    for order in &plan.order_by {
+        keys.push(match &order.source {
+            OrderSource::Column(reference) => joined_value(bindings, reference, relations)?.clone(),
             OrderSource::Output(output) => {
                 let projection = plan
                     .projections
                     .iter()
                     .find(|projection| projection.output == *output)
                     .expect("output alias was validated");
-                Ok(projected_value(bindings, projection, relations)?.into_owned())
+                projected_value(bindings, projection, relations)?.into_owned()
             }
-        })
-        .collect()
+        });
+    }
+    Ok(keys)
 }
 
 fn order_keys_bytes(

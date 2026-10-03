@@ -166,23 +166,22 @@ pub(crate) fn projection_fields(
     schema: &TableDefinition,
     columns: Option<&[String]>,
 ) -> Result<Vec<ResultField>> {
+    let mut fields = Vec::new();
     match columns {
         Some(columns) => {
             validate_named_columns(schema, columns)?;
-            columns
-                .iter()
-                .map(|name| {
-                    column_definition(schema, name, &schema.name)
-                        .map(|definition| ResultField::new(name, definition.data_type))
-                })
-                .collect()
+            for name in columns {
+                let definition = column_definition(schema, name, &schema.name)?;
+                fields.push(ResultField::new(name, definition.data_type));
+            }
         }
-        None => Ok(schema
-            .columns
-            .iter()
-            .map(|definition| ResultField::new(&definition.name, definition.data_type))
-            .collect()),
+        None => {
+            for definition in &schema.columns {
+                fields.push(ResultField::new(&definition.name, definition.data_type));
+            }
+        }
     }
+    Ok(fields)
 }
 
 /// Result fields for a single-table projection. Output names must be distinct because a result row
@@ -197,21 +196,20 @@ fn select_fields(
         return projection_fields(schema, None);
     };
     let mut outputs = KeySet::with_capacity_and_hasher(columns.len(), Default::default());
-    columns
-        .iter()
-        .map(|item| {
-            if !outputs.insert(item.output.as_str()) {
-                return Err(EngineError::invalid_query(format!(
-                    "SELECT produces output column `{}` more than once; use distinct AS aliases",
-                    item.output
-                )));
-            }
-            Ok(ResultField::new(
-                field_name(&item.output, positional),
-                output_type(item, schema)?,
-            ))
-        })
-        .collect()
+    let mut fields = Vec::with_capacity(columns.len());
+    for item in columns {
+        if !outputs.insert(item.output.as_str()) {
+            return Err(EngineError::invalid_query(format!(
+                "SELECT produces output column `{}` more than once; use distinct AS aliases",
+                item.output
+            )));
+        }
+        fields.push(ResultField::new(
+            field_name(&item.output, positional),
+            output_type(item, schema)?,
+        ));
+    }
+    Ok(fields)
 }
 
 /// The type of an output's values: its column's, or the type of the values its expression gives,
@@ -3031,11 +3029,12 @@ impl<'a> Filter<'a> {
 
 impl<'a> FilterNode<'a> {
     fn new(predicate: &'a Predicate, position: &dyn Fn(&str) -> Result<usize>) -> Result<Self> {
-        let children = |predicates: &'a [Predicate]| {
-            predicates
-                .iter()
-                .map(|predicate| Self::new(predicate, position))
-                .collect::<Result<Vec<_>>>()
+        let children = |predicates: &'a [Predicate]| -> Result<Vec<Self>> {
+            let mut children = Vec::with_capacity(predicates.len());
+            for predicate in predicates {
+                children.push(Self::new(predicate, position)?);
+            }
+            Ok(children)
         };
         Ok(match predicate {
             Predicate::Comparison {

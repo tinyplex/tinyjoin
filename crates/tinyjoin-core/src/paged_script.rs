@@ -358,11 +358,10 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 let outcome =
                     crate::statement::plan_create_table(self, schema, indexes, *if_not_exists)?;
                 if outcome.mutated {
-                    let foreign_keys = schema
-                        .foreign_keys
-                        .iter()
-                        .map(|key| crate::foreign_key::resolve(self, schema, indexes, key))
-                        .collect::<Result<Vec<_>>>()?;
+                    let mut foreign_keys = Vec::with_capacity(schema.foreign_keys.len());
+                    for key in &schema.foreign_keys {
+                        foreign_keys.push(crate::foreign_key::resolve(self, schema, indexes, key)?);
+                    }
                     let schema = TableDefinition {
                         foreign_keys,
                         ..schema.clone()

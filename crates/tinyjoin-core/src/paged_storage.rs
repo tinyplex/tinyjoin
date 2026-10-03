@@ -489,17 +489,18 @@ impl PagedTable {
 
     /// The types of `columns`, in the order given.
     pub(crate) fn column_types(&self, columns: &[String]) -> Result<Vec<ColumnType>> {
-        columns
-            .iter()
-            .map(|name| {
+        let mut types = Vec::with_capacity(columns.len());
+        for name in columns {
+            types.push(
                 self.schema
                     .columns
                     .iter()
                     .find(|column| column.name == *name)
-                    .map(|column| column.data_type)
-                    .ok_or_else(|| EngineError::column_not_found(name, &self.schema.name))
-            })
-            .collect()
+                    .ok_or_else(|| EngineError::column_not_found(name, &self.schema.name))?
+                    .data_type,
+            );
+        }
+        Ok(types)
     }
 }
 

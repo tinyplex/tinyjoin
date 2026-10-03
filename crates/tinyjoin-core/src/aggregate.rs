@@ -216,11 +216,10 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &AggregatePlan) -> Resu
     let mut groups = Groups::default();
     let mut scanned = 0_usize;
     let filter = Filter::new(plan.predicate.as_ref(), &schema, &plan.table)?;
-    let group_columns = plan
-        .group_by
-        .iter()
-        .map(|column| SourceColumn::new(&schema, column, &plan.table))
-        .collect::<Result<Vec<_>>>()?;
+    let mut group_columns = Vec::with_capacity(plan.group_by.len());
+    for column in &plan.group_by {
+        group_columns.push(SourceColumn::new(&schema, column, &plan.table)?);
+    }
     // Grouping never stops early, so narrowing only removes rows the predicate would reject
     // anyway; the per-row filter below remains the authority on membership.
     let read = read_columns(plan, &schema)?;
@@ -361,30 +360,26 @@ fn read_columns(plan: &AggregatePlan, schema: &TableDefinition) -> Result<Vec<us
 }
 
 fn result_fields(plan: &AggregatePlan, schema: &TableDefinition) -> Result<Vec<ResultField>> {
-    plan.items
-        .iter()
-        .map(|item| {
-            let data_type = match &item.expression {
-                SelectExpression::Column(column) => {
-                    column_definition(schema, column, &plan.table)?.data_type
+    let mut fields = Vec::with_capacity(plan.items.len());
+    for item in &plan.items {
+        let data_type = match &item.expression {
+            SelectExpression::Column(column) => {
+                column_definition(schema, column, &plan.table)?.data_type
+            }
+            SelectExpression::Aggregate { function, argument } => match function {
+                AggregateFunction::Count => ColumnType::Integer,
+                AggregateFunction::Avg => ColumnType::Float,
+                AggregateFunction::Sum | AggregateFunction::Min | AggregateFunction::Max => {
+                    aggregate_argument_type(argument, schema, &plan.table)?
                 }
-                SelectExpression::Aggregate { function, argument } => match function {
-                    AggregateFunction::Count => ColumnType::Integer,
-                    AggregateFunction::Avg => ColumnType::Float,
-                    AggregateFunction::Sum => {
-                        aggregate_argument_type(argument, schema, &plan.table)?
-                    }
-                    AggregateFunction::Min | AggregateFunction::Max => {
-                        aggregate_argument_type(argument, schema, &plan.table)?
-                    }
-                },
-            };
-            Ok(ResultField::new(
-                crate::query::field_name(&item.output, plan.positional),
-                data_type,
-            ))
-        })
-        .collect()
+            },
+        };
+        fields.push(ResultField::new(
+            crate::query::field_name(&item.output, plan.positional),
+            data_type,
+        ));
+    }
+    Ok(fields)
 }
 
 fn aggregate_argument_type(

@@ -1651,10 +1651,10 @@ impl Node {
                     return Err(invalid_btree("A leaf node must have level zero"));
                 }
                 validate_sorted_leaf_entries(entries, self.generation)?;
-                let cells = entries
-                    .iter()
-                    .map(encode_leaf_cell)
-                    .collect::<Result<Vec<_>>>()?;
+                let mut cells = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    cells.push(encode_leaf_cell(entry)?);
+                }
                 (PageType::BtreeLeaf, NO_PAGE_ID, EMPTY_HASH, cells)
             }
             NodeKind::Internal(internal) => {
@@ -1667,11 +1667,10 @@ impl Node {
                     internal.leftmost_child,
                     &internal.entries,
                 )?;
-                let cells = internal
-                    .entries
-                    .iter()
-                    .map(encode_internal_cell)
-                    .collect::<Result<Vec<_>>>()?;
+                let mut cells = Vec::with_capacity(internal.entries.len());
+                for entry in &internal.entries {
+                    cells.push(encode_internal_cell(entry)?);
+                }
                 (
                     PageType::BtreeInternal,
                     internal.leftmost_child,
@@ -2395,19 +2394,16 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
             let leftmost = children
                 .next()
                 .expect("every division holds at least one child");
-            let entries = children
-                .by_ref()
-                .take(count - 1)
-                .map(|child| {
-                    Ok(InternalEntry {
-                        key: child
-                            .separator
-                            .ok_or_else(|| invalid_btree("A B-tree child has no separator"))?,
-                        right_child: child.page_id,
-                        child_hash: child.hash,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let mut entries = Vec::with_capacity(count - 1);
+            for child in children.by_ref().take(count - 1) {
+                entries.push(InternalEntry {
+                    key: child
+                        .separator
+                        .ok_or_else(|| invalid_btree("A B-tree child has no separator"))?,
+                    right_child: child.page_id,
+                    child_hash: child.hash,
+                });
+            }
             let page_id = self.page_for(index, replacing)?;
             let hash = write_node(
                 self.transaction,

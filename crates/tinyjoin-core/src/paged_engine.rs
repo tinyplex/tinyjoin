@@ -146,10 +146,10 @@ impl<D: PageDevice> PagedEngine<D> {
                 "exec SQL must contain at least one statement",
             ));
         }
-        let mut statements = script
-            .into_iter()
-            .map(|sql| crate::statement::parse(sql, &[]))
-            .collect::<Result<Vec<_>>>()?;
+        let mut statements = Vec::with_capacity(script.len());
+        for sql in script {
+            statements.push(crate::statement::parse(sql, &[])?);
+        }
         if array_rows {
             for statement in &mut statements {
                 statement.position_outputs()?;
