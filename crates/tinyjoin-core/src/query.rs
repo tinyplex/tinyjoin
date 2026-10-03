@@ -3408,51 +3408,55 @@ fn sort_rows(rows: &mut [Row], order_by: &[OrderBy], table: &str) -> Result<()> 
 
 /// Sorts rows that each hold every ORDER BY column.
 pub(crate) fn sort_rows_by(rows: &mut [Row], order_by: &[OrderBy]) {
-    let mut keys = Vec::with_capacity(rows.len());
-    for row in rows.iter() {
-        let mut key = Vec::with_capacity(order_by.len());
-        for order in order_by {
-            key.push(row.get(&order.column).cloned().unwrap_or(Value::Null));
-        }
-        keys.push(key);
+    if order_by.is_empty() {
+        return;
     }
     let mut order = Vec::with_capacity(order_by.len());
     for term in order_by {
         order.push((term.direction, term.nulls));
     }
+    let positions = {
+        let mut keys = Vec::with_capacity(rows.len() * order_by.len());
+        for row in rows.iter() {
+            for term in order_by {
+                keys.push(row.get(&term.column).unwrap_or(&Value::Null));
+            }
+        }
+        ordered_positions(&keys, &order)
+    };
     let mut taken = Vec::with_capacity(rows.len());
     for row in rows.iter_mut() {
         taken.push(std::mem::take(row));
     }
-    for (row, position) in rows.iter_mut().zip(ordered_positions(keys, &order)) {
+    for (row, position) in rows.iter_mut().zip(positions) {
         *row = std::mem::take(&mut taken[position]);
     }
 }
 
-/// The positions of items in the order of their keys, each the values of an `ORDER BY`'s terms,
-/// which `order` directs, with ties kept in the order the items came. Every ordering of rows
-/// sorts here, so the sort's code is built once.
+/// The positions of items in the order of their keys, the values of an `ORDER BY`'s terms, which
+/// `order` directs, held one item after another in `keys`, with ties kept in the order the items
+/// came. Every ordering of rows sorts here, so the sort's code is built once.
 pub(crate) fn ordered_positions(
-    keys: Vec<Vec<Value>>,
+    keys: &[&Value],
     order: &[(OrderDirection, NullOrder)],
 ) -> Vec<usize> {
-    let mut keyed = Vec::with_capacity(keys.len());
-    for (position, key) in keys.into_iter().enumerate() {
-        keyed.push((key, position));
+    let width = order.len().max(1);
+    let mut positions = Vec::with_capacity(keys.len() / width);
+    for position in 0..keys.len() / width {
+        positions.push(position);
     }
-    keyed.sort_unstable_by(|(left, first), (right, second)| {
+    // A stable sort keeps ties in order, and finds the runs that rows read in key order hold.
+    positions.sort_by(|&first, &second| {
+        let left = &keys[first * width..(first + 1) * width];
+        let right = &keys[second * width..(second + 1) * width];
         for ((left, right), (direction, nulls)) in left.iter().zip(right).zip(order) {
             match compare_ordered(left, right, *direction, *nulls) {
                 Ordering::Equal => {}
                 ordering => return ordering,
             }
         }
-        first.cmp(second)
+        Ordering::Equal
     });
-    let mut positions = Vec::with_capacity(keyed.len());
-    for (_, position) in keyed {
-        positions.push(position);
-    }
     positions
 }
 

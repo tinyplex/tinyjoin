@@ -444,17 +444,20 @@ fn execute_ordered(
         Ok(VisitControl::Continue)
     })?;
 
-    let mut keys = Vec::with_capacity(joined_rows.len());
-    for joined in &mut joined_rows {
-        keys.push(std::mem::take(&mut joined.keys));
-    }
     let mut order = Vec::with_capacity(plan.order_by.len());
     for term in &plan.order_by {
         order.push((term.direction, term.nulls));
     }
+    let positions = {
+        let mut keys = Vec::with_capacity(joined_rows.len() * order.len());
+        for joined in &joined_rows {
+            keys.extend(&joined.keys);
+        }
+        crate::query::ordered_positions(&keys, &order)
+    };
     let mut rows = Vec::new();
     let mut result_bytes = 0_usize;
-    for position in crate::query::ordered_positions(keys, &order)
+    for position in positions
         .into_iter()
         .skip(plan.offset)
         .take(plan.limit.unwrap_or(usize::MAX))
