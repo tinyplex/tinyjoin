@@ -7,7 +7,7 @@
 //! it reads from, and then, for each of those rows, the queries nested in it, with the row's
 //! values bound in place of the columns they read from it.
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::{
     ColumnType, EngineError, NullOrder, OrderBy, OrderDirection, QueryResult, Result, ResultField,
@@ -65,13 +65,18 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &NestedPlan) -> Result<
             "SELECT produces an output column more than once; use distinct AS aliases",
         ));
     }
+    let mut result = Vec::with_capacity(rows.len());
+    for values in rows {
+        let mut row = Row::new();
+        for (key, value) in keys.iter().zip(values) {
+            row.insert(key.clone(), value);
+        }
+        result.push(row);
+    }
     Ok(QueryResult {
         revision: storage.revision(),
         fields,
-        rows: rows
-            .into_iter()
-            .map(|values| object(keys.iter().cloned().zip(values)))
-            .collect(),
+        rows: result,
     })
 }
 
@@ -81,8 +86,8 @@ struct Rows {
     rows: Vec<Vec<Value>>,
 }
 
-/// The rows around a nested query, by alias: each with its columns' names and values.
-type Bindings = Vec<(String, Vec<(String, Value)>)>;
+/// The rows around a nested query, by alias.
+type Bindings = Vec<(String, Row)>;
 
 /// An `alias.column`.
 type Reference = (String, String);
@@ -382,17 +387,8 @@ fn order(terms: &[Token]) -> Result<(Vec<Reference>, Vec<OrderBy>)> {
     Ok((order, order_by))
 }
 
-/// A row, or a JSON object, of names and values.
-fn object(entries: impl Iterator<Item = (String, Value)>) -> Row {
-    let mut object = Map::new();
-    for (name, value) in entries {
-        object.insert(name, value);
-    }
-    object
-}
-
 /// The row bound to `alias`, which an outer reference reads.
-fn bound<'a>(bindings: &'a Bindings, alias: &str) -> Result<&'a [(String, Value)]> {
+fn bound<'a>(bindings: &'a Bindings, alias: &str) -> Result<&'a Row> {
     match bindings.iter().rev().find(|(name, _)| name == alias) {
         Some((_, row)) => Ok(row),
         None => Err(EngineError::invalid_query(format!(
@@ -402,11 +398,8 @@ fn bound<'a>(bindings: &'a Bindings, alias: &str) -> Result<&'a [(String, Value)
 }
 
 fn lookup(bindings: &Bindings, alias: &str, column: &str) -> Result<Value> {
-    match bound(bindings, alias)?
-        .iter()
-        .find(|(name, _)| name == column)
-    {
-        Some((_, value)) => Ok(value.clone()),
+    match bound(bindings, alias)?.get(column) {
+        Some(value) => Ok(value.clone()),
         None => Err(EngineError::column_not_found(column, alias)),
     }
 }
@@ -414,13 +407,14 @@ fn lookup(bindings: &Bindings, alias: &str, column: &str) -> Result<Value> {
 fn value(element: &Element, bindings: &Bindings) -> Result<Value> {
     Ok(match element {
         Element::Column((alias, column)) => lookup(bindings, alias, column)?,
-        Element::Array(references) => Value::Array(
-            references
-                .iter()
-                .map(|(alias, column)| lookup(bindings, alias, column))
-                .collect::<Result<_>>()?,
-        ),
-        Element::Object(alias) => Value::Object(object(bound(bindings, alias)?.iter().cloned())),
+        Element::Array(references) => {
+            let mut values = Vec::with_capacity(references.len());
+            for (alias, column) in references {
+                values.push(lookup(bindings, alias, column)?);
+            }
+            Value::Array(values)
+        }
+        Element::Object(alias) => Value::Object(bound(bindings, alias)?.clone()),
     })
 }
 
@@ -575,8 +569,8 @@ fn evaluate(
     let (fields, base) = base(storage, tokens, &level, params, bindings, budget)?;
 
     // Each output's field, once it is known, and what each json_agg gathers.
-    let mut outputs = items.iter().map(|_| None).collect::<Vec<_>>();
-    let mut gathered = items.iter().map(|_| Vec::new()).collect::<Vec<_>>();
+    let mut outputs = vec![None; items.len()];
+    let mut gathered = vec![Vec::new(); items.len()];
     let mut rows = Vec::new();
     let outside = bindings.len();
     for (values, bound) in base {
@@ -595,7 +589,7 @@ fn evaluate(
                 .next()
                 .unwrap_or_else(|| vec![Value::Null; fields.len()]);
             if let Some(name) = name {
-                bindings.push((name.clone(), named(&fields, row.clone())));
+                bindings.push((name.clone(), named(&fields, &row)));
             }
             read.push((fields, row));
         }
@@ -620,11 +614,12 @@ fn evaluate(
                 Item::Each(element) => value(element, bindings)?,
                 Item::Gathered { element, order, .. } => {
                     // The value, under no name, and what orders it, under their positions.
-                    let mut entries = vec![(String::new(), value(element, bindings)?)];
+                    let mut entry = Row::new();
+                    entry.insert(String::new(), value(element, bindings)?);
                     for (position, (alias, column)) in order.iter().enumerate() {
-                        entries.push((position.to_string(), lookup(bindings, alias, column)?));
+                        entry.insert(position.to_string(), lookup(bindings, alias, column)?);
                     }
-                    gathered[index].push(object(entries.into_iter()));
+                    gathered[index].push(entry);
                     continue;
                 }
             });
@@ -687,7 +682,7 @@ fn base(
     let mut base = Vec::new();
     if let Some(inner) = level.derived {
         let inner = evaluate(storage, inner, params, bindings, budget)?;
-        for row in inner.rows {
+        for row in &inner.rows {
             base.push((
                 Vec::new(),
                 vec![(level.source.clone(), named(&inner.fields, row))],
@@ -726,7 +721,7 @@ fn base(
         let mut start = 0;
         let mut bound = Vec::new();
         for (alias, count) in level.aliases.iter().zip(&counts) {
-            let row = values[level.plain + start..level.plain + start + count].to_vec();
+            let row = &values[level.plain + start..level.plain + start + count];
             bound.push((alias.clone(), named(&hidden[start..], row)));
             start += count;
         }
@@ -736,30 +731,27 @@ fn base(
     Ok((fields, base))
 }
 
-/// A row's values, each with its field's name.
-fn named(fields: &[ResultField], row: Vec<Value>) -> Vec<(String, Value)> {
-    fields
-        .iter()
-        .map(|field| field.name.clone())
-        .zip(row)
-        .collect()
+/// A row's values, each under its field's name.
+fn named(fields: &[ResultField], values: &[Value]) -> Row {
+    let mut row = Row::new();
+    for (field, value) in fields.iter().zip(values) {
+        row.insert(field.name.clone(), value.clone());
+    }
+    row
 }
 
 /// The names that rows key their values by: the fields' names, each prefixed with its position
 /// if they repeat, as the engine keys rows that are read as arrays. And whether they repeat.
 fn keys(fields: &[ResultField]) -> (Vec<String>, bool) {
     let positional = names_repeat(fields.len(), &|index| &fields[index].name);
-    let keys = fields
-        .iter()
-        .enumerate()
-        .map(|(index, field)| {
-            let mut key = field.name.clone();
-            if positional {
-                position_name(index, &mut key);
-            }
-            key
-        })
-        .collect();
+    let mut keys = Vec::with_capacity(fields.len());
+    for (index, field) in fields.iter().enumerate() {
+        let mut key = field.name.clone();
+        if positional {
+            position_name(index, &mut key);
+        }
+        keys.push(key);
+    }
     (keys, positional)
 }
 

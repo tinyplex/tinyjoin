@@ -700,9 +700,8 @@ pub(crate) fn plan_drop_table(
         });
     }
     if !cascade
-        && let Some((child, key)) = crate::foreign_key::referencing(storage, table)
-            .into_iter()
-            .find(|(child, _)| child.name != table)
+        && let Some((child, key)) =
+            crate::foreign_key::referencing(storage, table, &|child, _| child.name != table).first()
     {
         return Err(depended_on(
             &format!("Table `{table}`"),
@@ -762,9 +761,8 @@ pub(crate) fn plan_alter_table(
         } => match storage.index_definition(name) {
             Some(definition) if definition.unique && definition.table == table => {
                 if !cascade
-                    && let Some((child, key)) = crate::foreign_key::needing(storage, &definition)
-                        .into_iter()
-                        .next()
+                    && let Some((child, key)) =
+                        crate::foreign_key::needing(storage, &definition).first()
                 {
                     return Err(depended_on(
                         &format!("Constraint `{name}`"),
@@ -821,11 +819,11 @@ pub(crate) fn plan_alter_table(
             column,
             cascade: false,
             ..
-        } if let Some((child, key)) = crate::foreign_key::referencing(storage, table)
-            .into_iter()
-            .find(|(child, key)| {
+        } if let Some((child, key)) =
+            crate::foreign_key::referencing(storage, table, &|child, key| {
                 child.name != table && key.referenced_columns.contains(column)
-            }) =>
+            })
+            .first() =>
         {
             return Err(depended_on(
                 &format!("Column `{column}`"),
@@ -968,9 +966,7 @@ pub(crate) fn plan_drop_index(
         ));
     };
     if !cascade
-        && let Some((child, key)) = crate::foreign_key::needing(storage, &definition)
-            .into_iter()
-            .next()
+        && let Some((child, key)) = crate::foreign_key::needing(storage, &definition).first()
     {
         return Err(depended_on(
             &format!("Index `{name}`"),

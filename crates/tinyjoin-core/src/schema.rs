@@ -395,27 +395,34 @@ pub(crate) fn schema_statements(
                     column.name
                 )));
             }
-            let mut changes = Vec::new();
             if existing.max_length != column.max_length {
-                changes.push(TableChange::RestateType {
-                    column: column.name.clone(),
-                    data_type: column.data_type,
-                    max_length: column.max_length,
-                });
+                phases[5].push(alter(
+                    name,
+                    TableChange::RestateType {
+                        column: column.name.clone(),
+                        data_type: column.data_type,
+                        max_length: column.max_length,
+                    },
+                ));
             }
             if existing.default != column.default {
-                changes.push(TableChange::SetDefault {
-                    column: column.name.clone(),
-                    default: column.default.clone(),
-                });
+                phases[5].push(alter(
+                    name,
+                    TableChange::SetDefault {
+                        column: column.name.clone(),
+                        default: column.default.clone(),
+                    },
+                ));
             }
             if existing.nullable != column.nullable {
-                changes.push(TableChange::SetNullable {
-                    column: column.name.clone(),
-                    nullable: column.nullable,
-                });
+                phases[5].push(alter(
+                    name,
+                    TableChange::SetNullable {
+                        column: column.name.clone(),
+                        nullable: column.nullable,
+                    },
+                ));
             }
-            phases[5].extend(changes.into_iter().map(|change| alter(name, change)));
         }
         if drop {
             for existing in &columns {
@@ -446,15 +453,16 @@ pub(crate) fn schema_statements(
             .map_or(table.to_owned(), |(_, new)| (*new).to_owned())
     };
     let renamed_columns = |table: &str, columns: &[String]| {
-        columns
-            .iter()
-            .map(|column| {
-                column_renames
-                    .iter()
-                    .find(|(renamed, old, _)| *renamed == table && *old == column)
-                    .map_or(column.clone(), |(_, _, new)| (*new).to_owned())
-            })
-            .collect::<Vec<_>>()
+        let mut renamed = columns.to_vec();
+        for column in &mut renamed {
+            if let Some((_, _, new)) = column_renames
+                .iter()
+                .find(|(renamed, old, _)| *renamed == table && old == column)
+            {
+                (*new).clone_into(column);
+            }
+        }
+        renamed
     };
     for (target, table) in kept_tables {
         let name = &target.definition.name;
@@ -496,7 +504,10 @@ pub(crate) fn schema_statements(
             }
         }
     }
-    let mut statements = phases.into_iter().flatten().collect::<Vec<_>>();
+    let mut statements = Vec::new();
+    for mut phase in phases {
+        statements.append(&mut phase);
+    }
     if target.version != version {
         statements.push(WriteStatement::SetSchemaVersion {
             version: target.version,

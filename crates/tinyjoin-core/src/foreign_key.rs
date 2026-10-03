@@ -91,15 +91,17 @@ pub(crate) fn resolve(
     })
 }
 
-/// The foreign keys that reference `table`, each with the table it belongs to.
+/// The foreign keys that reference `table` and that `keep` keeps, each with the table it belongs
+/// to.
 pub(crate) fn referencing(
     storage: &dyn StorageReader,
     table: &str,
+    keep: &dyn Fn(&TableDefinition, &ForeignKeyDefinition) -> bool,
 ) -> Vec<(Rc<TableDefinition>, ForeignKeyDefinition)> {
     let mut keys = Vec::new();
     for child in storage.tables_with_foreign_keys() {
         for key in &child.foreign_keys {
-            if key.references == table {
+            if key.references == table && keep(&child, key) {
                 keys.push((Rc::clone(&child), key.clone()));
             }
         }
@@ -113,19 +115,26 @@ pub(crate) fn needing(
     storage: &dyn StorageReader,
     index: &IndexDefinition,
 ) -> Vec<(Rc<TableDefinition>, ForeignKeyDefinition)> {
+    match storage.table_schema(&index.table) {
+        Ok(parent) => referencing(storage, &index.table, &|_, key| needs(&parent, index, key)),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Whether foreign key `key` needs unique index `index` of table `parent`, as [`needing`] says.
+pub(crate) fn needs(
+    parent: &TableDefinition,
+    index: &IndexDefinition,
+    key: &ForeignKeyDefinition,
+) -> bool {
     let same = |columns: &[String]| {
         columns.len() == index.columns.len()
             && columns.iter().all(|column| index.columns.contains(column))
     };
-    match storage.table_schema(&index.table) {
-        Ok(parent) if index.unique && !same(&parent.primary_key) => {
-            referencing(storage, &index.table)
-                .into_iter()
-                .filter(|(_, key)| same(&key.referenced_columns))
-                .collect()
-        }
-        _ => Vec::new(),
-    }
+    index.unique
+        && key.references == index.table
+        && !same(&parent.primary_key)
+        && same(&key.referenced_columns)
 }
 
 /// Checks that every row of `table` a new foreign key covers references a row.
@@ -208,18 +217,13 @@ pub(crate) fn enforce(storage: &dyn StorageReader, planned: &mut PlannedDml) -> 
         });
     }
     // A row an UPDATE moved to a new key replaces, at its new key, the row it was.
+    let mut moved = vec![false; changed.len()];
     for &(deleted, written) in &planned.moved {
         changed[written].old = changed[deleted].old.take();
+        moved[deleted] = true;
     }
-    let mut deleted = planned
-        .moved
-        .iter()
-        .map(|(deleted, _)| *deleted)
-        .collect::<Vec<_>>();
-    deleted.sort_unstable();
-    for deleted in deleted.into_iter().rev() {
-        changed.remove(deleted);
-    }
+    let mut moved = moved.into_iter();
+    changed.retain(|_| !moved.next().unwrap_or_default());
     let own = changed.len();
 
     let mut position = 0;
@@ -230,15 +234,16 @@ pub(crate) fn enforce(storage: &dyn StorageReader, planned: &mut PlannedDml) -> 
         };
         let parent = Rc::clone(&changed[position].table);
         let new = changed[position].new.clone();
-        for (child, key) in referencing(storage, &parent.name) {
+        for (child, key) in referencing(storage, &parent.name, &|_, _| true) {
             let Some(old_values) = values(&old, &key.referenced_columns) else {
                 continue;
             };
             let new_values = new.as_ref().map(|new| {
-                key.referenced_columns
-                    .iter()
-                    .map(|column| new.get(column).cloned().unwrap_or(Value::Null))
-                    .collect::<Vec<_>>()
+                let mut values = Vec::with_capacity(key.referenced_columns.len());
+                for column in &key.referenced_columns {
+                    values.push(new.get(column).cloned().unwrap_or(Value::Null));
+                }
+                values
             });
             if new_values.as_ref() == Some(&old_values) {
                 continue;
@@ -427,15 +432,14 @@ fn rows_where(
     values: &[Value],
     limit: Option<usize>,
 ) -> Result<Vec<Row>> {
-    let predicates = columns
-        .iter()
-        .zip(values)
-        .map(|(column, value)| Predicate::Comparison {
+    let mut predicates = Vec::with_capacity(columns.len());
+    for (column, value) in columns.iter().zip(values) {
+        predicates.push(Predicate::Comparison {
             column: column.clone(),
             operator: ComparisonOperator::Eq,
             value: value.clone(),
-        })
-        .collect::<Vec<_>>();
+        });
+    }
     let plan = SelectPlan {
         table: table.to_owned(),
         columns: None,
@@ -452,10 +456,11 @@ fn rows_where(
 
 /// A row's values in `columns`, or none if one of them is NULL, which a foreign key ignores.
 fn values(row: &Row, columns: &[String]) -> Option<Vec<Value>> {
-    columns
-        .iter()
-        .map(|column| row.get(column).filter(|value| !value.is_null()).cloned())
-        .collect()
+    let mut values = Vec::with_capacity(columns.len());
+    for column in columns {
+        values.push(row.get(column).filter(|value| !value.is_null())?.clone());
+    }
+    Some(values)
 }
 
 fn primary_key(schema: &TableDefinition, row: &Row) -> Row {

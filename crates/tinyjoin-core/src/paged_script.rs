@@ -686,15 +686,11 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
     /// Drops an index, and with it any foreign key that needs it, which planning allowed only with
     /// `CASCADE`.
     fn drop_needed_index(&mut self, name: &str) -> Result<()> {
-        if let Some(definition) = self.index_definition(name) {
-            let needing = crate::foreign_key::needing(self, &definition)
-                .into_iter()
-                .map(|(child, key)| (child.name.clone(), key.name))
-                .collect::<Vec<_>>();
-            self.edit_foreign_keys(&mut |child, key| {
-                !needing
-                    .iter()
-                    .any(|(table, name)| table == child && *name == key.name)
+        if let Some(definition) = self.index_definition(name)
+            && let Ok(parent) = self.table_schema(&definition.table)
+        {
+            self.edit_foreign_keys(&mut |_, key| {
+                !crate::foreign_key::needs(&parent, &definition, key)
             })?;
         }
         self.drop_index(name)
