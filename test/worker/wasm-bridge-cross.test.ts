@@ -291,7 +291,7 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
       engine.execSql(
         `CREATE TABLE notes (owner TEXT, id INTEGER, body TEXT DEFAULT 'x',
            meta JSONB DEFAULT NULL, rating REAL NOT NULL, PRIMARY KEY (owner, id));
-         CREATE TABLE "Tags" (name VARCHAR PRIMARY KEY, hot BOOLEAN DEFAULT false);
+         CREATE TABLE "Tags" (name VARCHAR(20) PRIMARY KEY, hot BOOLEAN DEFAULT false);
          CREATE UNIQUE INDEX notes_body ON notes (body, owner);
          CREATE INDEX a_notes_id ON notes (id);
          ALTER TABLE notes ADD COLUMN extra BIGINT;`,
@@ -303,7 +303,7 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
           {
             name: 'Tags',
             columns: [
-              {name: 'name', type: 'text', nullable: false},
+              {name: 'name', type: 'text', nullable: false, maxLength: 20},
               {name: 'hot', type: 'boolean', nullable: true, default: false},
             ],
             primaryKey: ['name'],

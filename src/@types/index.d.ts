@@ -79,6 +79,9 @@ export interface ColumnSchema {
 
   /// ColumnSchema.default
   default?: JsonValue;
+
+  /// ColumnSchema.maxLength
+  maxLength?: number;
 }
 
 /// IndexSchema

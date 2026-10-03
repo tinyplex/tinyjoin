@@ -180,7 +180,7 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 | `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE`, `DROP CONSTRAINT [IF EXISTS]` | Narrow | Adds a unique constraint, as `CREATE UNIQUE INDEX` would, or drops one of the table's unique indexes by name. |
 | `ALTER TABLE ... ALTER [COLUMN] ... SET DEFAULT`, `DROP DEFAULT` | Narrow | A literal default, as `DEFAULT` takes. Existing rows keep their values, so the table's rows are rewritten. |
 | `ALTER TABLE ... ALTER [COLUMN] ... SET NOT NULL`, `DROP NOT NULL` | Narrow | `SET NOT NULL` rewrites the table's rows, and fails with `CONSTRAINT_VIOLATION`, changing nothing, if a row holds `NULL`. A primary-key column stays `NOT NULL`. |
-| `ALTER TABLE ... ALTER [COLUMN] ... [SET DATA] TYPE` | Narrow | Only to another spelling of the column's runtime type, as `bigint` for an `integer` column, which changes nothing. No conversion or `USING`. |
+| `ALTER TABLE ... ALTER [COLUMN] ... [SET DATA] TYPE` | Narrow | Only to another spelling of the column's runtime type, as `bigint` for an `integer` column, which changes nothing, or to a `VARCHAR` of another length, which checks every row when it shortens. No conversion or `USING`. |
 | `ALTER TABLE ... DROP [COLUMN] [IF EXISTS]` | Narrow | Drops a column outside the primary key, with every index on it, and rewrites the table's rows. `CASCADE` and `RESTRICT` are accepted. |
 | `ALTER TABLE ... RENAME [COLUMN] ... TO`, `RENAME TO` | Supported | Renames a column, including a key column, or the table, which keeps any schema that qualifies its name. Indexes follow the new names; statements prepared with the old ones fail. |
 | `ALTER TABLE ... DISABLE ROW LEVEL SECURITY` | Supported | Changes nothing, since no table has row security. Several changes in one `ALTER TABLE`, and other `ALTER` forms, are rejected. |
@@ -326,7 +326,7 @@ semantics.
 | `BOOLEAN`, `BOOL` | JavaScript boolean | No PostgreSQL coercions. |
 | `SMALLINT`, `INTEGER`, `INT`, `INT2`, `INT4`, `BIGINT`, `INT8` | One JavaScript-safe integer type | Range is -9,007,199,254,740,991 through 9,007,199,254,740,991. `SMALLINT`/`INTEGER` are wider and `BIGINT` is narrower than PostgreSQL. |
 | `REAL`, `FLOAT`, `FLOAT4`, `FLOAT8`, `DOUBLE PRECISION` | One finite binary64 JavaScript number | No real/double distinction, `NaN`, or infinity. |
-| `TEXT`, `VARCHAR`, `CHARACTER VARYING` | JavaScript string | No length modifiers or database collation. Ordering is deterministic Unicode code-point ordering. |
+| `TEXT`, `VARCHAR`, `VARCHAR(n)`, `CHARACTER VARYING` | JavaScript string | A `VARCHAR(n)` holds at most `n` characters, and a longer value fails with `CONSTRAINT_VIOLATION`, even when the excess is spaces, which PostgreSQL would trim. No database collation. Ordering is deterministic Unicode code-point ordering. |
 | `JSON`, `JSONB` | The same JSON-compatible value (scalar, array, or object) | No textual/binary distinction, JSON operators, casts, or JSON index type. |
 
 SQL `NULL` and a JSON scalar `null` are the same runtime value, including in a
@@ -342,8 +342,8 @@ TinyJoin, without an error. Pass the value itself. The
 
 There are no implicit PostgreSQL casts. Notable unavailable types include
 `NUMERIC`/`DECIMAL`, date/time/interval types, UUID, `BYTEA`, arrays,
-serial/identity, enum/domain, and user-defined types. Type modifiers such as
-`VARCHAR(100)` are rejected.
+serial/identity, enum/domain, and user-defined types. Type modifiers other than
+a `VARCHAR`'s length, such as `NUMERIC(10, 2)` or `CHAR(3)`, are rejected.
 
 ## Identifiers, comments, and table names
 

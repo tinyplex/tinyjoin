@@ -3994,18 +3994,21 @@ mod tests {
                             data_type: ColumnType::Integer,
                             nullable: false,
                             default: None,
+                            max_length: None,
                         },
                         ColumnDefinition {
                             name: "user_id".to_owned(),
                             data_type: ColumnType::Integer,
                             nullable: false,
                             default: None,
+                            max_length: None,
                         },
                         ColumnDefinition {
                             name: "selected".to_owned(),
                             data_type: ColumnType::Boolean,
                             nullable: true,
                             default: None,
+                            max_length: None,
                         },
                     ],
                 },
@@ -4024,6 +4027,7 @@ mod tests {
                 data_type: ColumnType::Text,
                 nullable: false,
                 default: None,
+                max_length: None,
             });
         }
     }
@@ -4905,6 +4909,7 @@ mod tests {
             data_type,
             nullable: name != "id",
             default,
+            max_length: None,
         };
         let schema = TableDefinition {
             name: "t".to_owned(),

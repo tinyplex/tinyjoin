@@ -1114,7 +1114,18 @@ pub(crate) fn validate_value(column: &ColumnDefinition, value: &Value, table: &s
         ColumnType::Boolean => value.is_boolean(),
         ColumnType::Integer => is_javascript_safe_integer(value),
         ColumnType::Float => value.is_number(),
-        ColumnType::Text => value.is_string(),
+        ColumnType::Text => match (value.as_str(), column.max_length) {
+            // A string has no more characters than bytes, so only a long one is counted.
+            (Some(text), Some(max))
+                if text.len() > max as usize && text.chars().count() > max as usize =>
+            {
+                return Err(EngineError::constraint_violation(format!(
+                    "Column `{}` in `{table}` holds at most {max} characters",
+                    column.name
+                )));
+            }
+            (text, _) => text.is_some(),
+        },
         ColumnType::Json => {
             estimated_value_bytes(value).map_err(|error| {
                 EngineError::invalid_change(format!(
@@ -1929,12 +1940,14 @@ mod tests {
                         data_type: ColumnType::Integer,
                         nullable: false,
                         default: None,
+                        max_length: None,
                     },
                     ColumnDefinition {
                         name: "email".to_owned(),
                         data_type: ColumnType::Text,
                         nullable: true,
                         default: None,
+                        max_length: None,
                     },
                 ],
             })

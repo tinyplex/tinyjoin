@@ -66,6 +66,9 @@ pub struct ColumnDefinition {
     /// The literal `DEFAULT`, where the column declares one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<Value>,
+    /// The most characters a `VARCHAR(n)` column holds, its `n`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<u32>,
 }
 
 /// A table, as its catalog holds it: its columns in declared order, and its primary key's
@@ -148,6 +151,10 @@ impl ColumnDefinition {
             // An absent default is none, and a JSON null is `DEFAULT NULL`, which the catalog
             // writes as it was declared.
             default: object.get("default").cloned(),
+            max_length: match object.get("maxLength") {
+                None => None,
+                Some(length) => Some(u32::try_from(length.as_u64()?).ok()?),
+            },
         })
     }
 }

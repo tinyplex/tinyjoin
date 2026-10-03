@@ -478,6 +478,10 @@ impl Json {
                     self.raw(",\"default\":");
                     self.value(default, 1)?;
                 }
+                if let Some(length) = column.max_length {
+                    self.raw(",\"maxLength\":");
+                    self.unsigned(length.into())?;
+                }
                 self.raw("}");
             }
             self.raw("],\"primaryKey\":");
@@ -797,18 +801,21 @@ mod tests {
                     data_type: ColumnType::Integer,
                     nullable: false,
                     default: None,
+                    max_length: None,
                 },
                 ColumnDefinition {
                     name: "k".into(),
                     data_type: ColumnType::Text,
                     nullable: false,
                     default: Some(json!("x")),
+                    max_length: Some(8),
                 },
                 ColumnDefinition {
                     name: "doc".into(),
                     data_type: ColumnType::Json,
                     nullable: true,
                     default: Some(Value::Null),
+                    max_length: None,
                 },
             ],
         };
@@ -825,7 +832,7 @@ mod tests {
             concat!(
                 r#"{"tables":[{"name":"t\"1","columns":["#,
                 r#"{"name":"id","type":"integer","nullable":false},"#,
-                r#"{"name":"k","type":"text","nullable":false,"default":"x"},"#,
+                r#"{"name":"k","type":"text","nullable":false,"default":"x","maxLength":8},"#,
                 r#"{"name":"doc","type":"json","nullable":true,"default":null}],"#,
                 r#""primaryKey":["id","k"],"indexes":[{"name":"by_k","columns":["k"],"unique":true}]}]}"#,
             )

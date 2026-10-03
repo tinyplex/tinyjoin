@@ -714,13 +714,18 @@ pub(crate) fn plan_alter_table(
         {
             false
         }
-        TableChange::RestateType { column, data_type } => {
-            if schema.columns[column_position(&schema, column)?].data_type != *data_type {
+        TableChange::RestateType {
+            column,
+            data_type,
+            max_length,
+        } => {
+            let existing = &schema.columns[column_position(&schema, column)?];
+            if existing.data_type != *data_type {
                 return Err(EngineError::unsupported_sql(
                     "ALTER COLUMN ... TYPE cannot change a column's runtime type, since TinyJoin cannot convert stored values",
                 ));
             }
-            false
+            existing.max_length != *max_length
         }
         _ => {
             altered_schema(&schema, change)?;
@@ -762,6 +767,12 @@ pub(crate) fn altered_schema(
         TableChange::SetNullable { column, nullable } => {
             let position = column_position(schema, column)?;
             altered.columns[position].nullable = *nullable;
+        }
+        TableChange::RestateType {
+            column, max_length, ..
+        } => {
+            let position = column_position(schema, column)?;
+            altered.columns[position].max_length = *max_length;
         }
         TableChange::DropColumn { column, .. } => {
             let position = column_position(schema, column)?;
@@ -2692,9 +2703,11 @@ impl<'a> MutationParser<'a> {
                 } else {
                     self.expect_keyword("data")?;
                     self.expect_keyword("type")?;
+                    let (data_type, max_length) = self.parse_column_type()?;
                     TableChange::RestateType {
                         column,
-                        data_type: self.parse_column_type()?,
+                        data_type,
+                        max_length,
                     }
                 }
             } else if self.consume_keyword("drop") {
@@ -2713,9 +2726,11 @@ impl<'a> MutationParser<'a> {
                 }
             } else {
                 self.expect_keyword("type")?;
+                let (data_type, max_length) = self.parse_column_type()?;
                 TableChange::RestateType {
                     column,
-                    data_type: self.parse_column_type()?,
+                    data_type,
+                    max_length,
                 }
             }
         } else if self.consume_keyword("drop") {
@@ -2775,7 +2790,7 @@ impl<'a> MutationParser<'a> {
 
     fn parse_column_definition(&mut self) -> Result<(ColumnDefinition, ColumnClauses)> {
         let name = self.parse_identifier()?;
-        let data_type = self.parse_column_type()?;
+        let (data_type, max_length) = self.parse_column_type()?;
         let mut nullable = true;
         let mut default = None;
         let mut clauses = ColumnClauses {
@@ -2826,6 +2841,7 @@ impl<'a> MutationParser<'a> {
                 data_type,
                 nullable,
                 default,
+                max_length,
             },
             clauses,
         ))
@@ -2839,7 +2855,7 @@ impl<'a> MutationParser<'a> {
         if !self.consume(TokenMatcher::Cast) {
             return Ok(value);
         }
-        match (self.parse_column_type()?, value) {
+        match (self.parse_column_type()?.0, value) {
             (ColumnType::Json, Value::String(text)) => serde_json::from_slice(text.as_bytes())
                 .map_err(|_| EngineError::invalid_schema("A JSON default must be JSON text")),
             _ => Err(EngineError::unsupported_sql(
@@ -2848,7 +2864,8 @@ impl<'a> MutationParser<'a> {
         }
     }
 
-    fn parse_column_type(&mut self) -> Result<ColumnType> {
+    /// Reads a column type, and the length of a `VARCHAR(n)`.
+    fn parse_column_type(&mut self) -> Result<(ColumnType, Option<u32>)> {
         let Some(Token::Identifier {
             value,
             quoted: false,
@@ -2879,12 +2896,27 @@ impl<'a> MutationParser<'a> {
                 )));
             }
         };
-        if self.peek_matches(TokenMatcher::LParen) {
-            return Err(EngineError::unsupported_sql(
-                "Type modifiers such as VARCHAR(100) are not supported",
-            ));
+        if !self.consume(TokenMatcher::LParen) {
+            return Ok((data_type, None));
         }
-        Ok(data_type)
+        // As in PostgreSQL, a VARCHAR holds from 1 to 10,485,760 characters.
+        let length = match self.next() {
+            Some(Token::Number(length)) if data_type == ColumnType::Text => {
+                length.parse::<u32>().ok().filter(|length| (1..=10_485_760).contains(length))
+            }
+            _ => {
+                return Err(EngineError::unsupported_sql(
+                    "Only VARCHAR takes a type modifier, its length",
+                ));
+            }
+        };
+        self.expect(TokenMatcher::RParen, "Expected `)` after a VARCHAR length")?;
+        match length {
+            Some(length) => Ok((data_type, Some(length))),
+            None => Err(EngineError::invalid_schema(
+                "A VARCHAR length must be from 1 to 10485760",
+            )),
+        }
     }
 
     fn parse_insert(&mut self) -> Result<WriteStatement> {
@@ -3304,9 +3336,13 @@ pub(crate) enum TableChange {
     /// `DROP NOT NULL`, or `SET NOT NULL`, which every row must already meet.
     SetNullable { column: String, nullable: bool },
     DropColumn { column: String, if_exists: bool },
-    /// `ALTER COLUMN ... TYPE` naming the type the column already has, which changes nothing:
-    /// `VARCHAR` and `TEXT`, or `INTEGER` and `BIGINT`, are one runtime type.
-    RestateType { column: String, data_type: ColumnType },
+    /// `ALTER COLUMN ... TYPE` naming the runtime type the column already has, as `BIGINT` does
+    /// for `INTEGER`, which can change only the length a `VARCHAR` holds.
+    RestateType {
+        column: String,
+        data_type: ColumnType,
+        max_length: Option<u32>,
+    },
 }
 
 enum TableConstraint {
@@ -3498,12 +3534,14 @@ mod tests {
                         data_type: ColumnType::Integer,
                         nullable: false,
                         default: None,
+                        max_length: None,
                     },
                     ColumnDefinition {
                         name: "value".to_owned(),
                         data_type: ColumnType::Text,
                         nullable: false,
                         default: None,
+                        max_length: None,
                     },
                 ],
             })
@@ -3891,12 +3929,14 @@ mod tests {
                         data_type: ColumnType::Integer,
                         nullable: false,
                         default: None,
+                        max_length: None,
                     },
                     ColumnDefinition {
                         name: "payload".to_owned(),
                         data_type: ColumnType::Json,
                         nullable: false,
                         default: None,
+                        max_length: None,
                     },
                 ],
             })

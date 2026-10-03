@@ -287,6 +287,10 @@ describe('WorkerRpc', () => {
         tables: [{...table, columns: [{...column, default: null}]}],
       }),
     ).toBe(true);
+    const text = {name: 'code', type: 'text', nullable: true, maxLength: 3};
+    expect(isRpcResult('schema', {tables: [{...table, columns: [text]}]})).toBe(
+      true,
+    );
     expect(
       isWorkerRequest({
         v: PROTOCOL_VERSION,
@@ -309,6 +313,9 @@ describe('WorkerRpc', () => {
       {tables: [{...table, columns: [{...column, nullable: 0}]}]},
       {tables: [{...table, columns: [{...column, default: undefined}]}]},
       {tables: [{...table, columns: [{...column, extra: true}]}]},
+      {tables: [{...table, columns: [{...column, maxLength: 3}]}]},
+      {tables: [{...table, columns: [{...text, maxLength: 0}]}]},
+      {tables: [{...table, columns: [{...text, maxLength: 1.5}]}]},
       {tables: [{...table, indexes: [{name: 'i', columns: ['id']}]}]},
       {tables: [{...table, columns: new Array(1)}]},
     ]) {

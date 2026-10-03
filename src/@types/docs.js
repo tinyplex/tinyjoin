@@ -82,7 +82,8 @@
  * Each SQL type name maps to one of them: `INTEGER` and `BIGINT` to `integer`,
  * `REAL` and `DOUBLE PRECISION` to `float`, `TEXT` and `VARCHAR` to `text`,
  * and `JSON` and `JSONB` to `json`. The schema keeps the runtime type, not the
- * name the table was declared with.
+ * name the table was declared with, and the length of a `VARCHAR(n)` as its
+ * column's maxLength.
  * @category Schema
  * @since v0.5.0
  */
@@ -125,6 +126,14 @@
    * @since v0.5.0
    */
   /// ColumnSchema.default
+
+  /**
+   * The maxLength property contains the most characters a `VARCHAR(n)` column
+   * holds, its `n`, and is absent for any other column.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// ColumnSchema.maxLength
 }
 
 /**

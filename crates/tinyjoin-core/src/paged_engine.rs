@@ -4365,6 +4365,84 @@ mod tests {
     }
 
     #[test]
+    fn a_varchar_holds_at_most_its_length_in_characters() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .exec_sql(
+                "CREATE TABLE v (id INTEGER PRIMARY KEY, code VARCHAR(3), \
+                   name CHARACTER VARYING(5) DEFAULT 'ab', note VARCHAR);\
+                 INSERT INTO v (id, code, name) VALUES (1, 'abc', 'naïve'), (2, 'ab ', NULL);",
+            )
+            .unwrap();
+        let lengths = |engine: &PagedEngine<MemoryPageDevice>| {
+            engine.schema().unwrap()[0]
+                .0
+                .columns
+                .iter()
+                .map(|column| column.max_length)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lengths(&engine), [None, Some(3), Some(5), None]);
+        for sql in [
+            "INSERT INTO v (id, code) VALUES (3, 'abcd')",
+            // PostgreSQL would trim the excess spaces; TinyJoin refuses them.
+            "INSERT INTO v (id, code) VALUES (3, 'abc ')",
+            "UPDATE v SET code = code || 'x' WHERE id = 1",
+            "UPDATE v SET name = 'too long'",
+            "INSERT INTO v (id, code) VALUES (1, 'abc') ON CONFLICT (id) DO UPDATE SET code = 'abcd'",
+            "INSERT INTO v (id, code) VALUES (1, 'abcd') ON CONFLICT (id) DO UPDATE SET code = EXCLUDED.code",
+            "ALTER TABLE v ALTER COLUMN code TYPE varchar(2)",
+        ] {
+            let error = engine.execute_sql(sql, &[]).unwrap_err();
+            assert_eq!(error.code, "CONSTRAINT_VIOLATION", "{sql}: {}", error.message);
+        }
+        for (sql, code) in [
+            (
+                "CREATE TABLE w (id INTEGER PRIMARY KEY, c VARCHAR(2) DEFAULT 'abc')",
+                "INVALID_SCHEMA",
+            ),
+            ("CREATE TABLE w (id INTEGER PRIMARY KEY, c VARCHAR(0))", "INVALID_SCHEMA"),
+            (
+                "CREATE TABLE w (id INTEGER PRIMARY KEY, c VARCHAR(10485761))",
+                "INVALID_SCHEMA",
+            ),
+            ("CREATE TABLE w (id INTEGER PRIMARY KEY, c INTEGER(5))", "UNSUPPORTED_SQL"),
+            ("CREATE TABLE w (id INTEGER PRIMARY KEY, c VARCHAR(n))", "UNSUPPORTED_SQL"),
+            ("ALTER TABLE v ALTER COLUMN id TYPE varchar(5)", "UNSUPPORTED_SQL"),
+        ] {
+            let error = engine.execute_sql(sql, &[]).unwrap_err();
+            assert_eq!(error.code, code, "{sql}: {}", error.message);
+        }
+
+        // A longer limit, or none, changes only the catalog; a shorter one checks every row.
+        engine
+            .exec_sql(
+                "ALTER TABLE v ALTER COLUMN code TYPE varchar(10);\
+                 INSERT INTO v (id, code) VALUES (5, 'abcdefghij');",
+            )
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute_sql("ALTER TABLE v ALTER COLUMN code SET DATA TYPE varchar(3)", &[])
+                .unwrap_err()
+                .code,
+            "CONSTRAINT_VIOLATION"
+        );
+        engine
+            .exec_sql(
+                "DELETE FROM v WHERE id = 5;\
+                 ALTER TABLE v ALTER COLUMN code TYPE varchar(3);\
+                 ALTER TABLE v ALTER COLUMN note TYPE varchar(4);\
+                 ALTER TABLE v ALTER COLUMN name TYPE text;",
+            )
+            .unwrap();
+        assert_eq!(lengths(&engine), [None, Some(3), None, Some(4)]);
+        engine.check().unwrap();
+        let engine = PagedEngine::open(engine.into_device()).unwrap();
+        assert_eq!(lengths(&engine), [None, Some(3), None, Some(4)]);
+    }
+
+    #[test]
     fn a_table_too_large_for_one_chunk_is_rebuilt_whole() {
         let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
         engine

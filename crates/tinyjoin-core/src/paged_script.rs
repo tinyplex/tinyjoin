@@ -33,7 +33,7 @@ use crate::{
     statement::{PlannedDml, PreviousRow, Statement, TableChange, WriteStatement, change_table},
     storage::{
         KeyOrder, KeyRange, estimated_record_bytes, estimated_row_bytes, preflight_row_write_set,
-        schema_with_added_column, validate_schema,
+        schema_with_added_column, validate_schema, validate_value,
     },
 };
 
@@ -571,6 +571,17 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             TableChange::SetNullable {
                 nullable: false, ..
             } => return self.rebuild_table(name, schema),
+            // A VARCHAR's rows are checked only where it now holds fewer characters.
+            TableChange::RestateType {
+                column,
+                max_length: Some(max),
+                ..
+            } if table.schema.columns.iter().any(|existing| {
+                existing.name == *column && existing.max_length.is_none_or(|old| old > *max)
+            }) =>
+            {
+                return self.rebuild_table(name, schema);
+            }
             _ => {}
         }
         self.replace_schema(name, schema)
@@ -586,7 +597,8 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
 
     /// Writes every row of a table again under `schema`, which reads each row as the table's
     /// schema does but places or leaves out its columns differently, into a new tree that
-    /// replaces the table's, and refuses a row holding NULL where `schema` declares NOT NULL.
+    /// replaces the table's, and refuses a row that `schema` would not hold, such as one holding
+    /// NULL in a column now NOT NULL.
     /// Rows are read in key order, so each chunk extends the new tree.
     fn rebuild_table(&mut self, name: &str, schema: TableDefinition) -> Result<()> {
         let old = self
@@ -610,12 +622,11 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 self.charge_operations(1)?;
                 let row = old.record(&key, &value)?.to_row()?;
                 for column in &table.schema.columns {
-                    if !column.nullable && row.get(&column.name).is_none_or(Value::is_null) {
-                        return Err(EngineError::constraint_violation(format!(
-                            "Column `{}` of `{name}` holds NULL",
-                            column.name
-                        )));
-                    }
+                    validate_value(
+                        column,
+                        row.get(&column.name).unwrap_or(&Value::Null),
+                        name,
+                    )?;
                 }
                 let record = encode_row(&table.schema, &row)?;
                 bytes += key.len() + record.len() + 48;

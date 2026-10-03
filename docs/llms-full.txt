@@ -496,7 +496,7 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 | `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE`, `DROP CONSTRAINT [IF EXISTS]` | Narrow | Adds a unique constraint, as `CREATE UNIQUE INDEX` would, or drops one of the table's unique indexes by name. |
 | `ALTER TABLE ... ALTER [COLUMN] ... SET DEFAULT`, `DROP DEFAULT` | Narrow | A literal default, as `DEFAULT` takes. Existing rows keep their values, so the table's rows are rewritten. |
 | `ALTER TABLE ... ALTER [COLUMN] ... SET NOT NULL`, `DROP NOT NULL` | Narrow | `SET NOT NULL` rewrites the table's rows, and fails with `CONSTRAINT_VIOLATION`, changing nothing, if a row holds `NULL`. A primary-key column stays `NOT NULL`. |
-| `ALTER TABLE ... ALTER [COLUMN] ... [SET DATA] TYPE` | Narrow | Only to another spelling of the column's runtime type, as `bigint` for an `integer` column, which changes nothing. No conversion or `USING`. |
+| `ALTER TABLE ... ALTER [COLUMN] ... [SET DATA] TYPE` | Narrow | Only to another spelling of the column's runtime type, as `bigint` for an `integer` column, which changes nothing, or to a `VARCHAR` of another length, which checks every row when it shortens. No conversion or `USING`. |
 | `ALTER TABLE ... DROP [COLUMN] [IF EXISTS]` | Narrow | Drops a column outside the primary key, with every index on it, and rewrites the table's rows. `CASCADE` and `RESTRICT` are accepted. |
 | `ALTER TABLE ... RENAME [COLUMN] ... TO`, `RENAME TO` | Supported | Renames a column, including a key column, or the table, which keeps any schema that qualifies its name. Indexes follow the new names; statements prepared with the old ones fail. |
 | `ALTER TABLE ... DISABLE ROW LEVEL SECURITY` | Supported | Changes nothing, since no table has row security. Several changes in one `ALTER TABLE`, and other `ALTER` forms, are rejected. |
@@ -642,7 +642,7 @@ semantics.
 | `BOOLEAN`, `BOOL` | JavaScript boolean | No PostgreSQL coercions. |
 | `SMALLINT`, `INTEGER`, `INT`, `INT2`, `INT4`, `BIGINT`, `INT8` | One JavaScript-safe integer type | Range is -9,007,199,254,740,991 through 9,007,199,254,740,991. `SMALLINT`/`INTEGER` are wider and `BIGINT` is narrower than PostgreSQL. |
 | `REAL`, `FLOAT`, `FLOAT4`, `FLOAT8`, `DOUBLE PRECISION` | One finite binary64 JavaScript number | No real/double distinction, `NaN`, or infinity. |
-| `TEXT`, `VARCHAR`, `CHARACTER VARYING` | JavaScript string | No length modifiers or database collation. Ordering is deterministic Unicode code-point ordering. |
+| `TEXT`, `VARCHAR`, `VARCHAR(n)`, `CHARACTER VARYING` | JavaScript string | A `VARCHAR(n)` holds at most `n` characters, and a longer value fails with `CONSTRAINT_VIOLATION`, even when the excess is spaces, which PostgreSQL would trim. No database collation. Ordering is deterministic Unicode code-point ordering. |
 | `JSON`, `JSONB` | The same JSON-compatible value (scalar, array, or object) | No textual/binary distinction, JSON operators, casts, or JSON index type. |
 
 SQL `NULL` and a JSON scalar `null` are the same runtime value, including in a
@@ -658,8 +658,8 @@ TinyJoin, without an error. Pass the value itself. The
 
 There are no implicit PostgreSQL casts. Notable unavailable types include
 `NUMERIC`/`DECIMAL`, date/time/interval types, UUID, `BYTEA`, arrays,
-serial/identity, enum/domain, and user-defined types. Type modifiers such as
-`VARCHAR(100)` are rejected.
+serial/identity, enum/domain, and user-defined types. Type modifiers other than
+a `VARCHAR`'s length, such as `NUMERIC(10, 2)` or `CHAR(3)`, are rejected.
 
 ## Identifiers, comments, and table names
 
@@ -1175,7 +1175,7 @@ Tables, and each table's indexes, are in name order. Columns are in the order
 the table declares them, followed by any that `ALTER TABLE` added. A column's
 `type` is one of the five [runtime types](https://tinyjoin.org/guides/sql-compatibility/#runtime-types),
 not the spelling it was declared with, so `VARCHAR` reads back as `text` and
-`BIGINT` as `integer`. `default` is present only for a column that declares
+`BIGINT` as `integer`; a `VARCHAR(n)` column's `maxLength` is its `n`. `default` is present only for a column that declares
 one, and is `null` for `DEFAULT NULL`. The primary key is not listed among the
 indexes, and its columns are never nullable.
 
@@ -1896,11 +1896,11 @@ runtime types:
 | `boolean` | Boolean |
 | `integer`, `smallint`, `bigint({mode: 'number'})` | Integer, within the JavaScript-safe range |
 | `real`, `doublePrecision` | Float |
-| `text`, `varchar` without a length | Text |
+| `text`, `varchar`, with or without a length | Text |
 | `json`, `jsonb` | JSON |
 
 TinyJoin has no `serial`, `uuid`, `timestamp`, `date`, `numeric`, enum, or
-array types, and no length modifiers. Generate identifiers in the application,
+array types. Generate identifiers in the application,
 as `text('id').primaryKey().$defaultFn(() => crypto.randomUUID())` does, and
 store a time as an integer or text column, or as a Drizzle `customType` over
 one.
@@ -2820,6 +2820,13 @@ that `drizzle-kit generate` writes for new tables, apart from foreign keys,
 which TinyJoin cannot enforce and still rejects, now with an error saying so.
 See [constraints and indexes](https://tinyjoin.org/guides/sql-compatibility/#constraints-and-indexes).
 
+A `VARCHAR(n)` or `CHARACTER VARYING(n)` column holds at most `n` characters,
+and a longer value fails with `CONSTRAINT_VIOLATION`, as in PostgreSQL, except
+that TinyJoin also refuses a value whose excess is spaces, which PostgreSQL
+would trim. `n` was previously rejected, so schemas that ORMs and migration
+tools write with lengths, such as Drizzle's `varchar({length})` and Kysely's
+migration tables, now run. getSchema() reports the length as `maxLength`.
+
 `ALTER TABLE` can now also rename a table or a column, drop a column, set or
 drop a column's default, and set or drop `NOT NULL`, and accepts a column type
 that restates the runtime type it has, as `bigint` does for `integer`. Existing
@@ -2836,7 +2843,10 @@ runtime type, whether it is nullable, and any literal default. See
 
 **Upgrading from v0.4.0 needs no action.** Install, rebuild, and redeploy. The
 page format stays at format 3, so an existing database opens with no migration
-and no OPFS namespace change. The Worker protocol moves from version 10 to 11
+and no OPFS namespace change. A database that holds a `VARCHAR(n)` column
+cannot be opened by v0.4.0, which reports its catalog as corrupt, so do not
+roll back past v0.5.0 once a schema uses one. The Worker protocol moves from
+version 10 to 11
 for the schema request. Client and Worker ship together and are upgraded
 together by a normal install, so this affects only a deployment that pins or
 caches a Worker file independently of the client bundle, where a mismatched
@@ -3026,7 +3036,7 @@ quicker than in either.
   longer wait for their code to compile. See
   [custom Workers](https://tinyjoin.org/guides/custom-workers/).
 
-The compressed download is now 322 KiB, up from 295 KiB in v0.3.0.
+The compressed download is now 323 KiB, up from 295 KiB in v0.3.0.
 
 ## v0.3.0
 
@@ -3441,7 +3451,8 @@ export interface Results<RowType = Row> {
  * Each SQL type name maps to one of them: `INTEGER` and `BIGINT` to `integer`,
  * `REAL` and `DOUBLE PRECISION` to `float`, `TEXT` and `VARCHAR` to `text`,
  * and `JSON` and `JSONB` to `json`. The schema keeps the runtime type, not the
- * name the table was declared with.
+ * name the table was declared with, and the length of a `VARCHAR(n)` as its
+ * column's maxLength.
  * @category Schema
  * @since v0.5.0
  */
@@ -3483,6 +3494,14 @@ export interface ColumnSchema {
    * @since v0.5.0
    */
   default?: JsonValue;
+
+  /**
+   * The maxLength property contains the most characters a `VARCHAR(n)` column
+   * holds, its `n`, and is absent for any other column.
+   * @category Schema
+   * @since v0.5.0
+   */
+  maxLength?: number;
 }
 
 /**

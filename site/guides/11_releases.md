@@ -94,6 +94,13 @@ that `drizzle-kit generate` writes for new tables, apart from foreign keys,
 which TinyJoin cannot enforce and still rejects, now with an error saying so.
 See [constraints and indexes](/guides/sql-compatibility/#constraints-and-indexes).
 
+A `VARCHAR(n)` or `CHARACTER VARYING(n)` column holds at most `n` characters,
+and a longer value fails with `CONSTRAINT_VIOLATION`, as in PostgreSQL, except
+that TinyJoin also refuses a value whose excess is spaces, which PostgreSQL
+would trim. `n` was previously rejected, so schemas that ORMs and migration
+tools write with lengths, such as Drizzle's `varchar({length})` and Kysely's
+migration tables, now run. getSchema() reports the length as `maxLength`.
+
 `ALTER TABLE` can now also rename a table or a column, drop a column, set or
 drop a column's default, and set or drop `NOT NULL`, and accepts a column type
 that restates the runtime type it has, as `bigint` does for `integer`. Existing
@@ -110,7 +117,10 @@ runtime type, whether it is nullable, and any literal default. See
 
 **Upgrading from v0.4.0 needs no action.** Install, rebuild, and redeploy. The
 page format stays at format 3, so an existing database opens with no migration
-and no OPFS namespace change. The Worker protocol moves from version 10 to 11
+and no OPFS namespace change. A database that holds a `VARCHAR(n)` column
+cannot be opened by v0.4.0, which reports its catalog as corrupt, so do not
+roll back past v0.5.0 once a schema uses one. The Worker protocol moves from
+version 10 to 11
 for the schema request. Client and Worker ship together and are upgraded
 together by a normal install, so this affects only a deployment that pins or
 caches a Worker file independently of the client bundle, where a mismatched

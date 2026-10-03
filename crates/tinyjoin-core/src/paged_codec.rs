@@ -2194,6 +2194,7 @@ mod tests {
                     data_type,
                     nullable: false,
                     default: None,
+                    max_length: None,
                 })
                 .collect(),
         }
@@ -3091,6 +3092,7 @@ mod tests {
                 data_type: ColumnType::Text,
                 nullable: true,
                 default: None,
+                max_length: None,
             }));
         assert_eq!(too_many_columns.columns.len(), MAX_COLUMNS + 1);
         assert_eq!(

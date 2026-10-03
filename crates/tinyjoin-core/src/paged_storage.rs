@@ -2007,6 +2007,7 @@ mod tests {
                     data_type: *data_type,
                     nullable: *nullable,
                     default: None,
+                    max_length: None,
                 })
                 .collect(),
         }

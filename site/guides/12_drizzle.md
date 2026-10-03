@@ -67,11 +67,11 @@ runtime types:
 | `boolean` | Boolean |
 | `integer`, `smallint`, `bigint({mode: 'number'})` | Integer, within the JavaScript-safe range |
 | `real`, `doublePrecision` | Float |
-| `text`, `varchar` without a length | Text |
+| `text`, `varchar`, with or without a length | Text |
 | `json`, `jsonb` | JSON |
 
 TinyJoin has no `serial`, `uuid`, `timestamp`, `date`, `numeric`, enum, or
-array types, and no length modifiers. Generate identifiers in the application,
+array types. Generate identifiers in the application,
 as `text('id').primaryKey().$defaultFn(() => crypto.randomUUID())` does, and
 store a time as an integer or text column, or as a Drizzle `customType` over
 one.

@@ -1006,7 +1006,7 @@ mod tests {
         }
         for sql in [
             "CREATE TABLE generated (id SERIAL PRIMARY KEY)",
-            "CREATE TABLE sized (id INTEGER PRIMARY KEY, name VARCHAR(100))",
+            "CREATE TABLE sized (id INTEGER PRIMARY KEY, name INTEGER(100))",
             "INSERT INTO missing SELECT * FROM elsewhere",
             "UPDATE missing SET value = upper(value)",
         ] {

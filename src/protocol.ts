@@ -60,6 +60,8 @@ export interface ColumnSchema {
   nullable: boolean;
   /** The literal `DEFAULT`, present only when the column declares one. */
   default?: JsonValue;
+  /** The most characters a `VARCHAR(n)` column holds. */
+  maxLength?: number;
 }
 
 export interface IndexSchema {
@@ -512,11 +514,13 @@ const isSchema = (value: unknown): value is Schema => {
   const validation = createJsonValidation();
   const isColumn = (column: unknown): boolean =>
     isRecord(column) &&
-    hasOnlyKeys(column, ['name', 'type', 'nullable', 'default']) &&
+    hasOnlyKeys(column, ['name', 'type', 'nullable', 'default', 'maxLength']) &&
     isString(column.name) &&
     COLUMN_TYPES.includes(column.type) &&
     isBoolean(column.nullable) &&
-    (!objHasOwn(column, 'default') || validation.isJson(column.default));
+    (!objHasOwn(column, 'default') || validation.isJson(column.default)) &&
+    (!objHasOwn(column, 'maxLength') ||
+      (column.type === 'text' && isCount(column.maxLength) && column.maxLength > 0));
   const isIndex = (index: unknown): boolean =>
     isRecord(index) &&
     hasExactKeys(index, ['name', 'columns', 'unique']) &&

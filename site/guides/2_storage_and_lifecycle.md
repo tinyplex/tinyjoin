@@ -87,7 +87,7 @@ Tables, and each table's indexes, are in name order. Columns are in the order
 the table declares them, followed by any that `ALTER TABLE` added. A column's
 `type` is one of the five [runtime types](/guides/sql-compatibility/#runtime-types),
 not the spelling it was declared with, so `VARCHAR` reads back as `text` and
-`BIGINT` as `integer`. `default` is present only for a column that declares
+`BIGINT` as `integer`; a `VARCHAR(n)` column's `maxLength` is its `n`. `default` is present only for a column that declares
 one, and is `null` for `DEFAULT NULL`. The primary key is not listed among the
 indexes, and its columns are never nullable.
 
