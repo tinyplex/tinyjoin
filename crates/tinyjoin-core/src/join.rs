@@ -36,7 +36,7 @@ struct ColumnRef {
     column: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct Source {
     table: String,
     alias: String,
@@ -48,20 +48,20 @@ enum JoinKind {
     Left,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct JoinCondition {
     left: ColumnRef,
     right: ColumnRef,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct JoinStage {
     source: Source,
     kind: JoinKind,
     conditions: Vec<JoinCondition>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct Projection {
     source: ColumnRef,
     output: String,
@@ -70,20 +70,20 @@ struct Projection {
     expression: Option<Expression>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct JoinOrder {
     source: OrderSource,
     direction: OrderDirection,
     nulls: NullOrder,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum OrderSource {
     Column(ColumnRef),
     Output(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct JoinPlan {
     /// `SELECT DISTINCT`: joined rows with equal projected values are returned once.
     distinct: bool,
@@ -161,16 +161,16 @@ pub(crate) fn position_outputs(plan: &mut JoinPlan) -> Result<()> {
     Ok(())
 }
 
+/// Whether a statement joins tables, as a subquery it holds may without it doing so.
 pub(crate) fn is_join_select(tokens: &[Token]) -> bool {
-    tokens.iter().any(|token| {
-        matches!(
-            token,
-            Token::Identifier {
-                value,
-                quoted: false,
-            } if value.eq_ignore_ascii_case("join")
-        )
-    })
+    let mut index = 0;
+    while index < tokens.len() {
+        if crate::query::is_keyword(tokens.get(index), "join") {
+            return true;
+        }
+        index = crate::query::next_outer(tokens, index);
+    }
+    false
 }
 
 #[cfg(test)]
@@ -214,6 +214,11 @@ pub(crate) fn bind_plan_parameters(
 }
 
 pub(crate) fn execute(storage: &dyn StorageReader, plan: &JoinPlan) -> Result<QueryResult> {
+    if let Some(predicate) = crate::query::resolved_subqueries(storage, plan.predicate.as_ref())? {
+        let mut plan = plan.clone();
+        plan.predicate = Some(predicate);
+        return execute(storage, &plan);
+    }
     let mut relations = Vec::with_capacity(plan.joins.len() + 1);
     relations.push(Relation {
         schema: storage.table_schema(&plan.first.table)?,
@@ -544,7 +549,8 @@ fn single_source(predicate: &Predicate, relations: &[Relation]) -> Result<Option
             Predicate::Comparison { column, .. }
             | Predicate::IsNull { column, .. }
             | Predicate::In { column, .. }
-            | Predicate::Like { column, .. } => {
+            | Predicate::Like { column, .. }
+            | Predicate::Subquery { column, .. } => {
                 let (source, _, _) = resolve_column(&parse_column_ref_text(column), relations)?;
                 *found = match *found {
                     None => Some(Some(source)),
@@ -587,7 +593,10 @@ fn renamed_to_source(predicate: &Predicate) -> Predicate {
             Predicate::Comparison { column, .. }
             | Predicate::IsNull { column, .. }
             | Predicate::In { column, .. }
-            | Predicate::Like { column, .. } => *column = parse_column_ref_text(column).column,
+            | Predicate::Like { column, .. }
+            | Predicate::Subquery { column, .. } => {
+                *column = parse_column_ref_text(column).column;
+            }
             Predicate::And { predicates } | Predicate::Or { predicates } => {
                 predicates.iter_mut().for_each(rename)
             }
@@ -1253,7 +1262,7 @@ fn validate_join_predicate(predicate: &Predicate, relations: &[Relation]) -> Res
             let (_, _, definition) = resolve_column(&reference, relations)?;
             validate_literal(definition, *operator, value, column)
         }
-        Predicate::IsNull { column, .. } => {
+        Predicate::IsNull { column, .. } | Predicate::Subquery { column, .. } => {
             resolve_column(&parse_column_ref_text(column), relations)?;
             Ok(())
         }

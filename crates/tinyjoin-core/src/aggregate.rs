@@ -64,13 +64,13 @@ enum SelectExpression {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct SelectItem {
     expression: SelectExpression,
     output: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AggregatePlan {
     table: String,
     /// `SELECT DISTINCT`, planned as a grouping by every projected column with no aggregates.
@@ -112,10 +112,14 @@ pub(crate) fn position_outputs(plan: &mut AggregatePlan) -> Result<()> {
     Ok(())
 }
 
+/// Whether a statement groups or aggregates, as a subquery it holds may without it doing so.
 pub(crate) fn is_aggregate_select(tokens: &[Token]) -> bool {
     let mut before_from = true;
-    for (index, token) in tokens.iter().enumerate() {
-        let Token::Identifier { value, quoted } = token else {
+    let mut next = 0;
+    while next < tokens.len() {
+        let index = next;
+        next = crate::query::next_outer(tokens, index);
+        let Token::Identifier { value, quoted } = &tokens[index] else {
             continue;
         };
         if !quoted && value.eq_ignore_ascii_case("from") {
@@ -181,6 +185,11 @@ pub(crate) fn bind_plan_parameters(
 }
 
 pub(crate) fn execute(storage: &dyn StorageReader, plan: &AggregatePlan) -> Result<QueryResult> {
+    if let Some(predicate) = crate::query::resolved_subqueries(storage, plan.predicate.as_ref())? {
+        let mut plan = plan.clone();
+        plan.predicate = Some(predicate);
+        return execute(storage, &plan);
+    }
     let schema = storage.table_schema(&plan.table)?;
     validate_plan(plan, &schema)?;
     let fields = result_fields(plan, &schema)?;
@@ -308,7 +317,8 @@ fn read_columns(plan: &AggregatePlan, schema: &TableDefinition) -> Result<Vec<us
             Predicate::Comparison { column, .. }
             | Predicate::IsNull { column, .. }
             | Predicate::In { column, .. }
-            | Predicate::Like { column, .. } => names.push(column),
+            | Predicate::Like { column, .. }
+            | Predicate::Subquery { column, .. } => names.push(column),
             Predicate::And { predicates } | Predicate::Or { predicates } => {
                 for predicate in predicates {
                     predicate_columns(predicate, names);

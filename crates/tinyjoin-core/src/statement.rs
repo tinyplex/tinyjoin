@@ -15,10 +15,10 @@ use crate::paged_codec::{
     encode_row_values, encode_updated_record,
 };
 use crate::query::{
-    Filter, ParseMode, Token, bind_parameter, column_definition, exact_equalities,
-    is_reserved_keyword, number_literal, parse_predicate_at, tokenize, validate_named_columns,
-    validate_parameter_expansion, validate_predicate_columns, validate_predicate_types,
-    validate_sql_input, visit_indexed_candidates,
+    Filter, ParseMode, Token, bind_parameter, column_definition, exact_equalities, is_keyword,
+    is_reserved_keyword, next_outer, number_literal, parse_predicate_at, resolved_subqueries,
+    tokenize, validate_named_columns, validate_parameter_expansion, validate_predicate_columns,
+    validate_predicate_types, validate_sql_input, visit_indexed_candidates,
 };
 use crate::row::{HeldRow, RowRef};
 use crate::storage::{
@@ -30,11 +30,12 @@ use crate::storage::{
 };
 use crate::{
     ChangedKeys, ColumnDefinition, ColumnType, EngineError, MAX_CHANGED_KEYS_PER_TABLE, Predicate,
-    Result, ResultField, Row, RowChange, SelectPlan, StorageReader, TableDefinition, TableKeys,
-    VisitControl, VisitOutcome,
+    Result, ResultField, Row, RowChange, SelectPlan, StorageReader, Subquery, TableDefinition,
+    TableKeys, VisitControl, VisitOutcome,
 };
 
 const MAX_COLUMNS: usize = 256;
+const MAX_SUBQUERIES: usize = 16;
 const MAX_VALUE_ROWS: usize = 4096;
 const MAX_DML_SCAN_ROWS: usize = 1_000_000;
 const MAX_DML_CHANGED_ROWS: usize = 100_000;
@@ -185,6 +186,31 @@ impl KeptRows {
     }
 }
 
+/// The query of an `IN (SELECT ...)`. Its statement runs it once for the values it returns, so
+/// ORDER BY, LIMIT and OFFSET, which could only choose among those, are refused.
+pub(crate) fn parse_subquery(tokens: Vec<Token>, params: &[Value]) -> Result<Subquery> {
+    let mut index = 0;
+    while index < tokens.len() {
+        if ["order", "limit", "offset"]
+            .iter()
+            .any(|keyword| is_keyword(tokens.get(index), keyword))
+        {
+            return Err(EngineError::unsupported_sql(
+                "A subquery in IN cannot have ORDER BY, LIMIT, or OFFSET",
+            ));
+        }
+        index = next_outer(&tokens, index);
+    }
+    match parse_tokens(tokens, params, ParseMode::Bound)? {
+        Statement::Select(plan) => Ok(Subquery::Select(plan)),
+        Statement::Aggregate(plan) => Ok(Subquery::Aggregate(plan)),
+        Statement::Join(plan) => Ok(Subquery::Join(plan)),
+        Statement::Write(_) => Err(EngineError::invalid_query(
+            "A subquery in IN must be a SELECT",
+        )),
+    }
+}
+
 pub(crate) fn parse(sql: &str, params: &[Value]) -> Result<Statement> {
     validate_sql_input(sql, params)?;
     parse_tokens(tokenize(sql)?, params, ParseMode::Bound)
@@ -198,6 +224,15 @@ pub(crate) fn parse_tokens(
     mode: ParseMode,
 ) -> Result<Statement> {
     validate_parameter_expansion(&tokens, params)?;
+    let subqueries = tokens
+        .windows(2)
+        .filter(|pair| matches!(pair[0], Token::LParen) && is_keyword(Some(&pair[1]), "select"))
+        .count();
+    if subqueries > MAX_SUBQUERIES {
+        return Err(EngineError::invalid_query(format!(
+            "A statement cannot contain more than {MAX_SUBQUERIES} subqueries"
+        )));
+    }
     let select = matches!(
         tokens.first(),
         Some(Token::Identifier {
@@ -1404,6 +1439,8 @@ fn plan_update(
     predicate: Option<&Predicate>,
     returning: Option<&[String]>,
 ) -> Result<PlannedDml> {
+    let resolved = resolved_subqueries(storage, predicate)?;
+    let predicate = resolved.as_ref().or(predicate);
     let schema = storage.table_schema(table)?;
     validate_named_columns(
         &schema,
@@ -1707,6 +1744,8 @@ fn plan_delete(
     predicate: Option<&Predicate>,
     returning: Option<&[String]>,
 ) -> Result<PlannedDml> {
+    let resolved = resolved_subqueries(storage, predicate)?;
+    let predicate = resolved.as_ref().or(predicate);
     let schema = storage.table_schema(table)?;
     if let Some(predicate) = predicate {
         validate_predicate_columns(predicate, &schema, table)?;

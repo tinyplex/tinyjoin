@@ -50,7 +50,8 @@ pub use model::{
 };
 pub(crate) use model::{
     ColumnDefinition, ColumnType, ComparisonOperator, IndexDefinition, NullOrder, OrderBy,
-    OrderDirection, Predicate, QueryResult, RowChange, SelectColumn, SelectPlan, TableDefinition,
+    OrderDirection, Predicate, QueryResult, RowChange, SelectColumn, SelectPlan, Subquery,
+    TableDefinition,
 };
 #[cfg(test)]
 pub(crate) use page::BitmapSlot;

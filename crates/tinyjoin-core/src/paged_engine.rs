@@ -3859,6 +3859,198 @@ mod tests {
     }
 
     #[test]
+    fn in_takes_the_values_a_subquery_returns() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .exec_sql(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);\
+                 CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, score INTEGER);\
+                 CREATE TABLE likes (post_id INTEGER, who TEXT, PRIMARY KEY (post_id, who));\
+                 INSERT INTO users VALUES (1, 'ann'), (2, 'bob'), (3, 'cy');\
+                 INSERT INTO posts VALUES (10, 1, 7), (11, 2, 3), (12, 1, 9), (13, NULL, 1);\
+                 INSERT INTO likes VALUES (11, 'ann'), (12, 'bob');",
+            )
+            .unwrap();
+        let ids = |engine: &mut PagedEngine<MemoryPageDevice>, sql: &str, params: &[Value]| {
+            engine
+                .execute_sql(sql, params)
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|row| row.values().next().unwrap().as_i64().unwrap())
+                .collect::<Vec<_>>()
+        };
+        for (sql, params, expected) in [
+            (
+                "SELECT id FROM users WHERE id IN (SELECT user_id FROM posts WHERE score > 5)",
+                vec![],
+                vec![1],
+            ),
+            (
+                "SELECT id FROM users WHERE users.id IN (SELECT p.user_id FROM posts p \
+                 WHERE p.score < $1) ORDER BY id",
+                vec![json!(8)],
+                vec![1, 2],
+            ),
+            // A NULL among the values leaves NOT IN unknown, as in PostgreSQL.
+            (
+                "SELECT id FROM users WHERE id NOT IN (SELECT user_id FROM posts)",
+                vec![],
+                vec![],
+            ),
+            (
+                "SELECT id FROM users WHERE id NOT IN (SELECT user_id FROM posts \
+                 WHERE user_id IS NOT NULL)",
+                vec![],
+                vec![3],
+            ),
+            (
+                "SELECT id FROM users WHERE id IN (SELECT user_id FROM posts WHERE score > 99)",
+                vec![],
+                vec![],
+            ),
+            // A subquery may group, join, or hold a subquery itself.
+            (
+                "SELECT id FROM users WHERE id IN (SELECT user_id FROM posts GROUP BY user_id) \
+                 ORDER BY id",
+                vec![],
+                vec![1, 2],
+            ),
+            (
+                "SELECT id FROM posts WHERE id IN (SELECT l.post_id AS id FROM likes l \
+                 JOIN users u ON u.name = l.who WHERE u.id = 1)",
+                vec![],
+                vec![11],
+            ),
+            (
+                "SELECT id FROM users WHERE id IN (SELECT user_id FROM posts \
+                 WHERE id IN (SELECT post_id FROM likes)) ORDER BY id",
+                vec![],
+                vec![1, 2],
+            ),
+            // The statement around it may aggregate or join, and is still limited by its own.
+            (
+                "SELECT COUNT(*) FROM posts WHERE user_id IN (SELECT id FROM users \
+                 WHERE name = 'ann')",
+                vec![],
+                vec![2],
+            ),
+            (
+                "SELECT p.id AS id FROM posts p JOIN users u ON u.id = p.user_id \
+                 WHERE p.id IN (SELECT post_id FROM likes) ORDER BY id",
+                vec![],
+                vec![11, 12],
+            ),
+            (
+                "SELECT id FROM posts WHERE user_id IN (SELECT id FROM users) ORDER BY id \
+                 LIMIT $1",
+                vec![json!(1)],
+                vec![10],
+            ),
+        ] {
+            assert_eq!(ids(&mut engine, sql, &params), expected, "{sql}");
+        }
+
+        // Prepared, the subquery's parameters are bound with each execution.
+        let statement = engine
+            .prepare_sql(
+                "SELECT id FROM users WHERE id IN (SELECT user_id FROM posts WHERE score > $1) \
+                 ORDER BY id LIMIT $2",
+            )
+            .unwrap();
+        for (score, expected) in [(8, vec![1]), (2, vec![1, 2])] {
+            assert_eq!(
+                engine
+                    .execute_prepared(statement, &[json!(score), json!(5)])
+                    .unwrap()
+                    .rows
+                    .into_iter()
+                    .map(|row| row["id"].as_i64().unwrap())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+
+        // Writes, and a transaction's staged rows, are read the same way.
+        engine.begin_transaction().unwrap();
+        engine
+            .execute_sql("INSERT INTO posts VALUES (14, 3, 50)", &[])
+            .unwrap();
+        assert_eq!(
+            ids(
+                &mut engine,
+                "UPDATE users SET name = name || '*' WHERE id IN (SELECT user_id FROM posts \
+                 WHERE score > 20) RETURNING id",
+                &[],
+            ),
+            [3]
+        );
+        engine.commit_transaction().unwrap();
+        assert_eq!(
+            ids(
+                &mut engine,
+                "DELETE FROM posts WHERE user_id IN (SELECT id FROM users WHERE name = 'cy*') \
+                 RETURNING id",
+                &[],
+            ),
+            [14]
+        );
+
+        for batch in (0..1025).collect::<Vec<_>>().chunks(200) {
+            let rows = batch
+                .iter()
+                .map(|id| format!("({}, 'x{id}')", id + 100))
+                .collect::<Vec<_>>()
+                .join(", ");
+            engine
+                .execute_sql(&format!("INSERT INTO users VALUES {rows}"), &[])
+                .unwrap();
+        }
+        let nested = "id IN (SELECT id FROM users WHERE ".repeat(17) + "id = 1" + &")".repeat(17);
+        for (sql, code) in [
+            (
+                "SELECT id FROM users WHERE id IN (SELECT id, name FROM users)",
+                "INVALID_QUERY",
+            ),
+            (
+                "SELECT id FROM users WHERE id IN (SELECT * FROM posts)",
+                "INVALID_QUERY",
+            ),
+            (
+                "SELECT id FROM users WHERE id IN (SELECT user_id FROM posts ORDER BY id)",
+                "UNSUPPORTED_SQL",
+            ),
+            (
+                "SELECT id FROM users WHERE id IN (SELECT user_id FROM posts LIMIT 1)",
+                "UNSUPPORTED_SQL",
+            ),
+            (
+                "SELECT id FROM users WHERE id IN (SELECT user_id FROM posts \
+                 WHERE posts.user_id = users.id)",
+                "COLUMN_NOT_FOUND",
+            ),
+            (
+                "SELECT id FROM users WHERE name IN (SELECT score FROM posts)",
+                "TYPE_MISMATCH",
+            ),
+            (
+                "SELECT id FROM users WHERE id IN (SELECT id FROM users)",
+                "QUERY_WORK_LIMIT_EXCEEDED",
+            ),
+            (
+                &format!("SELECT id FROM users WHERE {nested}"),
+                "INVALID_QUERY",
+            ),
+        ] {
+            assert_eq!(
+                engine.execute_sql(sql, &[]).unwrap_err().code,
+                code,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
     fn a_quoted_name_holding_a_dot_is_one_column_not_a_qualified_one() {
         let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
         engine

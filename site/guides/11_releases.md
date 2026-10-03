@@ -56,6 +56,12 @@ named `?column?`, as in PostgreSQL. Aggregate and `SELECT DISTINCT` queries
 still return only columns and aggregates. See
 [expressions](/guides/sql-compatibility/#expressions).
 
+`IN` and `NOT IN` can take the values of a subquery, as in
+`WHERE user_id IN (SELECT id FROM users WHERE team = $1)`, in any statement with
+a `WHERE` clause. The subquery runs once, before the statement reads any row,
+must return one column and at most 1,024 rows, and cannot read the statement
+around it. See [subqueries](/guides/sql-compatibility/#subqueries).
+
 **Upgrading from v0.4.0 needs no action.** Install, rebuild, and redeploy. The
 Worker protocol stays at version 10 and the page format stays at format 3, so
 an existing database opens with no migration and no OPFS namespace change. The

@@ -16,7 +16,7 @@ use crate::storage::{
 use crate::{
     ColumnDefinition, ColumnType, ComparisonOperator, EngineError, NullOrder, OrderBy,
     OrderDirection, Predicate, QueryResult, Result, ResultField, Row, SelectColumn, SelectPlan,
-    TableDefinition, VisitControl, VisitOutcome,
+    Subquery, TableDefinition, VisitControl, VisitOutcome,
 };
 
 const MAX_SQL_BYTES: usize = 64 * 1024;
@@ -35,6 +35,11 @@ const MAX_SCAN_ROWS: usize = 1_000_000;
 const MAX_ORDERED_ROWS: usize = 100_000;
 
 pub(crate) fn execute(storage: &dyn StorageReader, plan: &SelectPlan) -> Result<QueryResult> {
+    if let Some(predicate) = resolved_subqueries(storage, plan.predicate.as_ref())? {
+        let mut plan = plan.clone();
+        plan.predicate = Some(predicate);
+        return execute(storage, &plan);
+    }
     if plan.table.trim().is_empty() {
         return Err(EngineError::invalid_query(
             "A query must name exactly one table",
@@ -1915,6 +1920,15 @@ impl PredicateParser<'_> {
     }
 
     fn parse_in(&mut self, column: String) -> Result<Predicate> {
+        if let Some(end) = subquery_end(self.tokens, self.position) {
+            let tokens = self.tokens[self.position + 1..end].to_vec();
+            let query = crate::statement::parse_subquery(tokens, self.params)?;
+            self.position = end + 1;
+            return self.node(Predicate::Subquery {
+                column,
+                query: Box::new(query),
+            });
+        }
         self.expect_token(TokenMatcher::LParen, "Expected `(` after IN")?;
         let mut values = Vec::new();
         loop {
@@ -2115,7 +2129,36 @@ pub(crate) fn is_distinct_keyword_at(tokens: &[Token], position: usize) -> bool 
         })
 }
 
-fn is_keyword(token: Option<&Token>, keyword: &str) -> bool {
+/// Where the subquery whose `(` is at `index` closes, if a `(SELECT` opens one there.
+pub(crate) fn subquery_end(tokens: &[Token], index: usize) -> Option<usize> {
+    if !matches!(tokens.get(index), Some(Token::LParen))
+        || !is_keyword(tokens.get(index + 1), "select")
+    {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (offset, token) in tokens[index..].iter().enumerate() {
+        match token {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The position after the token at `index` in a statement's own tokens, past any subquery that
+/// opens there, whose tokens are its own.
+pub(crate) fn next_outer(tokens: &[Token], index: usize) -> usize {
+    subquery_end(tokens, index).map_or(index + 1, |end| end + 1)
+}
+
+pub(crate) fn is_keyword(token: Option<&Token>, keyword: &str) -> bool {
     matches!(
         token,
         Some(Token::Identifier {
@@ -2219,7 +2262,16 @@ pub(crate) fn drop_table_qualifiers(tokens: &mut Vec<Token>) {
     let first = if select || update { 0 } else { clauses };
     let mut qualifiers = Vec::new();
     let mut ordering = false;
+    let mut skip_until = 0;
     for index in first..tokens.len() {
+        // A subquery's qualifiers are left to its own parse.
+        if index < skip_until {
+            continue;
+        }
+        if let Some(end) = subquery_end(tokens, index) {
+            skip_until = end + 1;
+            continue;
+        }
         // A column an UPDATE assigns to is followed by `=`, which no value it assigns holds.
         if (start..end).contains(&index)
             || (update && index < clauses && matches!(tokens.get(index + 3), Some(Token::Eq)))
@@ -2411,6 +2463,10 @@ pub(crate) fn bind_predicate_parameters(
         }
         Predicate::Not { predicate } => bind_predicate_parameters(Some(predicate), params),
         Predicate::IsNull { .. } => Ok(()),
+        Predicate::Subquery { query, .. } => {
+            **query = bound_subquery(query, params)?;
+            Ok(())
+        }
         Predicate::Expressions {
             left,
             operator,
@@ -2513,7 +2569,90 @@ pub(crate) fn bound_predicate(predicate: &Predicate, params: &[Value]) -> Result
             bind_expression(&mut right, params)?;
             comparison(left, *operator, right)
         }
+        Predicate::Subquery { column, query } => Predicate::Subquery {
+            column: column.clone(),
+            query: Box::new(bound_subquery(query, params)?),
+        },
     })
+}
+
+/// A copy of a prepared subquery with its parameters bound.
+fn bound_subquery(query: &Subquery, params: &[Value]) -> Result<Subquery> {
+    Ok(match query {
+        Subquery::Select(plan) => {
+            Subquery::Select(bind_select_plan_parameters(plan, params, None, None)?)
+        }
+        Subquery::Aggregate(plan) => Subquery::Aggregate(crate::aggregate::bind_plan_parameters(
+            plan, params, None, None,
+        )?),
+        Subquery::Join(plan) => {
+            Subquery::Join(crate::join::bind_plan_parameters(plan, params, None, None)?)
+        }
+    })
+}
+
+/// A copy of `predicate` in which the query of each `IN (SELECT ...)` has been run against
+/// `storage`, as the statement reads it, and the predicate has become the `In` of the values it
+/// returned, or `None` if it has no subquery.
+pub(crate) fn resolved_subqueries(
+    storage: &dyn StorageReader,
+    predicate: Option<&Predicate>,
+) -> Result<Option<Predicate>> {
+    fn has_subquery(predicate: &Predicate) -> bool {
+        match predicate {
+            Predicate::Subquery { .. } => true,
+            Predicate::And { predicates } | Predicate::Or { predicates } => {
+                predicates.iter().any(has_subquery)
+            }
+            Predicate::Not { predicate } => has_subquery(predicate),
+            _ => false,
+        }
+    }
+    fn resolve(storage: &dyn StorageReader, predicate: &mut Predicate) -> Result<()> {
+        match predicate {
+            Predicate::Subquery { column, query } => {
+                let result = match query.as_ref() {
+                    Subquery::Select(plan) => execute(storage, plan)?,
+                    Subquery::Aggregate(plan) => crate::aggregate::execute(storage, plan)?,
+                    Subquery::Join(plan) => crate::join::execute(storage, plan)?,
+                };
+                if result.fields.len() != 1 {
+                    return Err(EngineError::invalid_query(
+                        "A subquery in IN must return exactly one column",
+                    ));
+                }
+                if result.rows.len() > MAX_IN_VALUES {
+                    return Err(EngineError::new(
+                        "QUERY_WORK_LIMIT_EXCEEDED",
+                        format!("A subquery in IN cannot return more than {MAX_IN_VALUES} rows"),
+                    ));
+                }
+                let field = &result.fields[0].name;
+                let mut values = Vec::with_capacity(result.rows.len());
+                for row in &result.rows {
+                    values.push(row.get(field).cloned().unwrap_or(Value::Null));
+                }
+                *predicate = Predicate::In {
+                    column: std::mem::take(column),
+                    values,
+                };
+            }
+            Predicate::And { predicates } | Predicate::Or { predicates } => {
+                for predicate in predicates {
+                    resolve(storage, predicate)?;
+                }
+            }
+            Predicate::Not { predicate } => resolve(storage, predicate)?,
+            _ => {}
+        }
+        Ok(())
+    }
+    let Some(predicate) = predicate.filter(|predicate| has_subquery(predicate)) else {
+        return Ok(None);
+    };
+    let mut predicate = predicate.clone();
+    resolve(storage, &mut predicate)?;
+    Ok(Some(predicate))
 }
 
 pub(crate) fn bind_nonnegative_integer_parameter(index: usize, params: &[Value]) -> Result<usize> {
@@ -2670,7 +2809,15 @@ fn evaluate_predicate(row: &Row, predicate: &Predicate, table: &str) -> Result<T
             let left = evaluate(left, &mut read)?;
             evaluate_comparison(&left, &evaluate(right, &mut read)?, *operator, table, "")
         }
+        Predicate::Subquery { .. } => Err(unresolved_subquery()),
     }
+}
+
+fn unresolved_subquery() -> EngineError {
+    EngineError::new(
+        "INTERNAL_ERROR",
+        "A subquery was not run before the rows it filters were read",
+    )
 }
 
 fn evaluate_comparison(
@@ -2961,6 +3108,7 @@ impl<'a> FilterNode<'a> {
                     columns,
                 }
             }
+            Predicate::Subquery { .. } => return Err(unresolved_subquery()),
         })
     }
 
@@ -3350,7 +3498,8 @@ pub(crate) fn validate_predicate_columns(
         Predicate::Comparison { column, .. }
         | Predicate::IsNull { column, .. }
         | Predicate::In { column, .. }
-        | Predicate::Like { column, .. } => {
+        | Predicate::Like { column, .. }
+        | Predicate::Subquery { column, .. } => {
             if schema.columns.iter().any(|item| item.name == *column) {
                 Ok(())
             } else {
@@ -3423,7 +3572,8 @@ pub(crate) fn validate_predicate_types(
             *case_insensitive,
             table,
         ),
-        Predicate::IsNull { .. } => Ok(()),
+        // A subquery's values are checked as the `In` it becomes.
+        Predicate::IsNull { .. } | Predicate::Subquery { .. } => Ok(()),
         Predicate::And { predicates } | Predicate::Or { predicates } => {
             for predicate in predicates {
                 validate_predicate_types(predicate, schema, table)?;

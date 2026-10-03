@@ -28,7 +28,8 @@ forms are rejected explicitly rather than silently reinterpreted.
 
 The omissions most likely to matter are:
 
-- No subqueries, CTEs, or `UNION`/`INTERSECT`/`EXCEPT`.
+- Subqueries only as an uncorrelated `IN (SELECT ...)` of up to 1,024 values,
+  and no CTEs or `UNION`/`INTERSECT`/`EXCEPT`.
 - Arithmetic and `||` only in assignments, `WHERE` comparisons, and the select
   lists of queries that do not aggregate, and no casts, `CASE`, or scalar
   functions.

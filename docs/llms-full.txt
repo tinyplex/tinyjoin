@@ -160,7 +160,8 @@ forms are rejected explicitly rather than silently reinterpreted.
 
 The omissions most likely to matter are:
 
-- No subqueries, CTEs, or `UNION`/`INTERSECT`/`EXCEPT`.
+- Subqueries only as an uncorrelated `IN (SELECT ...)` of up to 1,024 values,
+  and no CTEs or `UNION`/`INTERSECT`/`EXCEPT`.
 - Arithmetic and `||` only in assignments, `WHERE` comparisons, and the select
   lists of queries that do not aggregate, and no casts, `CASE`, or scalar
   functions.
@@ -482,7 +483,8 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 | `RIGHT`, `FULL`, `CROSS`, `NATURAL`, `USING`, `LATERAL` | No | No additional join families, parenthesized/derived relations, or join reordering. |
 | `AS` | Narrow | Output aliases on `SELECT` items in single-table, grouped/aggregate, and join queries, plus a table alias on every table a `SELECT` reads and on the table of an `UPDATE` or `DELETE`. A projection alias requires the `AS` keyword, and one column may be returned under several aliases. A table alias may omit `AS`. `INSERT` does not accept a table alias, and no alias takes a column list. |
 | `SELECT DISTINCT` | Narrow | Removes duplicate rows from an explicit single-table or join projection. `NULL`s compare as equal to each other, and other values compare by SQL equality; JSON columns are rejected. `ORDER BY` must name projected columns: by output name in a single-table query, and by output name or projected source column in a join. A single-table `DISTINCT` compares at most 32 distinct source columns and shares the aggregate group limits. `DISTINCT *`, `DISTINCT ON`, and `DISTINCT` combined with `GROUP BY` or aggregate functions are rejected. |
-| `WITH`, subqueries, `UNION`/`INTERSECT`/`EXCEPT` | No | No CTEs, subqueries, or set operations. |
+| `IN (SELECT ...)` | Narrow | An uncorrelated [subquery](https://tinyjoin.org/guides/sql-compatibility/#subqueries) returning one column of at most 1,024 rows. |
+| `WITH`, other subqueries, `UNION`/`INTERSECT`/`EXCEPT` | No | No CTEs, correlated, scalar, `EXISTS`, or `FROM` subqueries, or set operations. |
 | `CREATE TABLE [IF NOT EXISTS]` | Narrow | Typed columns and a required inline or table-level primary key. Up to 256 columns. |
 | `PRIMARY KEY` | Narrow | One inline single-column declaration or one table-level column list (single or composite). It implies `NOT NULL`; JSON keys are rejected. |
 | `NULL`, `NOT NULL`, `DEFAULT` | Narrow | String, number, boolean, or `NULL` literal defaults only. No default expressions, functions, sequences, or parameters. |
@@ -518,7 +520,7 @@ each statement retains the ordinary parser limits below.
 | `=`, `<>`, `!=`, `<`, `<=`, `>`, `>=` | Narrow | Strict scalar comparison, with integer/float cross-comparison. JSON supports structural equality/inequality only. |
 | `AND`, `OR`, `NOT`, parentheses | Supported | Precedence is `NOT`, then `AND`, then `OR`; SQL unknown/null propagation is preserved. |
 | `IS NULL`, `IS NOT NULL` | Supported | Tests the single runtime null value. |
-| `IN (...)`, `NOT IN (...)` | Supported | One to 1,024 literals or parameters with SQL null behavior. |
+| `IN (...)`, `NOT IN (...)` | Supported | One to 1,024 literals or parameters, or a [subquery](https://tinyjoin.org/guides/sql-compatibility/#subqueries), with SQL null behavior. |
 | `BETWEEN`, `NOT BETWEEN` | Narrow | `column BETWEEN low AND high` means exactly `column >= low AND column <= high`, and `NOT BETWEEN` means `column < low OR column > high`, with those comparisons' type and null rules. Each bound is a literal or parameter. There is no `SYMMETRIC` form, so a reversed range matches nothing. |
 | `+`, `-`, `*`, `/`, `%`, `\|\|` | Narrow | In the values `UPDATE` and `ON CONFLICT DO UPDATE` assign, on either side of a comparison, and in the select list of a query that does not aggregate. See [expressions](https://tinyjoin.org/guides/sql-compatibility/#expressions). |
 | Casts, `CASE`, scalar functions | No | There are no casts, conditional expressions, or functions other than the aggregates. |
@@ -529,8 +531,35 @@ each statement retains the ordinary parser limits below.
 Either side of a comparison may be an [expression](https://tinyjoin.org/guides/sql-compatibility/#expressions), including a
 plain column, so `WHERE updated > created` and `WHERE price * quantity > $1`
 compare values worked out from the row. `IN`, `BETWEEN`, `LIKE`, and `IS NULL`
-take a plain column and literal or parameter values, and no predicate takes a
+take a plain column and literal or parameter values, and only `IN` takes a
 subquery. A join's `ON` clause still holds only column equalities.
+
+### Subqueries
+
+`IN` and `NOT IN` can take the values a query returns, in any statement with a
+`WHERE` clause, including joins, aggregates, `UPDATE`, and `DELETE`:
+
+```sql
+SELECT id, title FROM posts
+WHERE user_id IN (SELECT id FROM users WHERE team = $1);
+
+DELETE FROM sessions WHERE user_id NOT IN (SELECT id FROM users);
+```
+
+The subquery runs once, before the statement reads any row, and reads what the
+statement reads: the rows before the statement changes any, and a
+transaction's staged rows. It is a `SELECT` of one table, a join, or an
+aggregate, and may hold subqueries of its own, up to 16 in a statement. It must
+return exactly one column, and at most 1,024 rows, as many values as an `IN`
+list takes, or the statement fails with `QUERY_WORK_LIMIT_EXCEEDED`. As in
+PostgreSQL, a `NULL` among its values leaves `NOT IN` unknown for every row it
+does not match, so `NOT IN` returns no rows then.
+
+A subquery cannot read the statement around it, so a correlated reference such
+as `WHERE posts.user_id = users.id` names an unknown column. It cannot have
+`ORDER BY`, `LIMIT`, or `OFFSET`, and the values it returns are compared as an
+`IN` list's are, so they never narrow the rows the statement reads. A larger or
+correlated set is better written as a join.
 
 ## Expressions
 
@@ -2479,6 +2508,12 @@ named `?column?`, as in PostgreSQL. Aggregate and `SELECT DISTINCT` queries
 still return only columns and aggregates. See
 [expressions](https://tinyjoin.org/guides/sql-compatibility/#expressions).
 
+`IN` and `NOT IN` can take the values of a subquery, as in
+`WHERE user_id IN (SELECT id FROM users WHERE team = $1)`, in any statement with
+a `WHERE` clause. The subquery runs once, before the statement reads any row,
+must return one column and at most 1,024 rows, and cannot read the statement
+around it. See [subqueries](https://tinyjoin.org/guides/sql-compatibility/#subqueries).
+
 **Upgrading from v0.4.0 needs no action.** Install, rebuild, and redeploy. The
 Worker protocol stays at version 10 and the page format stays at format 3, so
 an existing database opens with no migration and no OPFS namespace change. The
@@ -2667,7 +2702,7 @@ quicker than in either.
   longer wait for their code to compile. See
   [custom Workers](https://tinyjoin.org/guides/custom-workers/).
 
-The compressed download is now 313 KiB, up from 295 KiB in v0.3.0.
+The compressed download is now 316 KiB, up from 295 KiB in v0.3.0.
 
 ## v0.3.0
 

@@ -234,6 +234,20 @@ pub(crate) enum Predicate {
         operator: ComparisonOperator,
         right: Expression,
     },
+    /// `column IN (SELECT ...)`. Its query is run once, before the statement reads any row, and
+    /// the predicate becomes the `In` of the values it returns.
+    Subquery {
+        column: String,
+        query: Box<Subquery>,
+    },
+}
+
+/// The query of an `IN (SELECT ...)`, which returns one column.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Subquery {
+    Select(SelectPlan),
+    Aggregate(crate::aggregate::AggregatePlan),
+    Join(crate::join::JoinPlan),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
