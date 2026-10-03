@@ -41,16 +41,7 @@ impl PreparedStatement {
         validate_sql_parameters(&params)?;
         let token_count = tokens.len();
         let statement = crate::statement::parse_tokens(tokens, &params, ParseMode::Template)?;
-        if matches!(
-            statement,
-            Statement::Write(
-                WriteStatement::CreateTable { .. }
-                    | WriteStatement::CreateIndex { .. }
-                    | WriteStatement::DropTable { .. }
-                    | WriteStatement::DropIndex { .. }
-                    | WriteStatement::AddColumn { .. }
-            )
-        ) {
+        if matches!(&statement, Statement::Write(write) if write.is_ddl()) {
             return Err(EngineError::unsupported_sql(
                 "Prepared statements support SELECT, INSERT, UPDATE, and DELETE, but not DDL",
             ));
@@ -304,7 +295,9 @@ fn bind_write_statement(statement: &WriteStatement, params: &[Value]) -> Result<
         | WriteStatement::CreateIndex { .. }
         | WriteStatement::DropTable { .. }
         | WriteStatement::DropIndex { .. }
-        | WriteStatement::AddColumn { .. } => {
+        | WriteStatement::AddColumn { .. }
+        | WriteStatement::DropConstraint { .. }
+        | WriteStatement::DisableRowSecurity { .. } => {
             return Err(EngineError::new(
                 "INTERNAL_ERROR",
                 "A prepared statement registry retained unsupported DDL",

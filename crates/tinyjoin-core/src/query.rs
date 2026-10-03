@@ -1100,6 +1100,8 @@ pub(crate) enum Token {
     LParen,
     RParen,
     Semicolon,
+    /// PostgreSQL's `::` cast, which only a column's `DEFAULT` accepts.
+    Cast,
     Other,
 }
 
@@ -1195,6 +1197,11 @@ impl<'a> Lexer<'a> {
                 ';' => {
                     self.advance();
                     Token::Semicolon
+                }
+                ':' if self.peek_after_current() == Some(':') => {
+                    self.advance();
+                    self.advance();
+                    Token::Cast
                 }
                 '"' => self.quoted_identifier()?,
                 '\'' => self.string_literal()?,

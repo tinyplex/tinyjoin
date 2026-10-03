@@ -164,18 +164,10 @@ impl<D: PageDevice> PagedEngine<D> {
         if self.transaction.is_none() {
             return self.storage.execute_script(statements);
         }
-        if statements.iter().any(|statement| {
-            matches!(
-                statement,
-                Statement::Write(
-                    WriteStatement::CreateTable { .. }
-                        | WriteStatement::CreateIndex { .. }
-                        | WriteStatement::DropTable { .. }
-                        | WriteStatement::DropIndex { .. }
-                        | WriteStatement::AddColumn { .. }
-                )
-            )
-        }) {
+        if statements
+            .iter()
+            .any(|statement| matches!(statement, Statement::Write(write) if write.is_ddl()))
+        {
             return Err(EngineError::unsupported_sql(
                 "SQL scripts inside explicit transactions support SELECT, INSERT, UPDATE, and DELETE, but not DDL",
             ));
@@ -4156,6 +4148,213 @@ mod tests {
         assert_eq!(schema[0].1.len(), 1);
         let reopened = PagedEngine::open(engine.into_device()).unwrap();
         assert_eq!(reopened.schema().unwrap(), schema);
+    }
+
+    #[test]
+    fn constraints_index_methods_and_json_casts_read_as_drizzle_kit_writes_them() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        // The statements of a migration that `drizzle-kit generate` wrote, but its foreign key.
+        engine
+            .exec_sql(
+                r#"CREATE TABLE "post_tags" (
+                    "post_id" integer NOT NULL,
+                    "tag" text NOT NULL,
+                    CONSTRAINT "post_tags_post_id_tag_pk" PRIMARY KEY("post_id","tag")
+                );
+                --> statement-breakpoint
+                CREATE TABLE "users" (
+                    "id" text PRIMARY KEY NOT NULL,
+                    "name" text NOT NULL,
+                    "email" varchar,
+                    "meta" jsonb DEFAULT '{"tags":[]}'::jsonb,
+                    CONSTRAINT "users_email_unique" UNIQUE("email")
+                );
+                --> statement-breakpoint
+                CREATE INDEX "users_name_idx" ON "users" USING btree ("name");
+                CREATE TABLE plain (id INTEGER PRIMARY KEY, code TEXT UNIQUE, a INTEGER,
+                    b INTEGER, UNIQUE (a, b));"#,
+            )
+            .unwrap();
+        let schema = engine.schema().unwrap();
+        let names = |table: usize| {
+            schema[table]
+                .1
+                .iter()
+                .map(|index| (index.name.clone(), index.columns.clone(), index.unique))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(schema[0].0.name, "plain");
+        // An unnamed unique constraint is named for its table and columns, as PostgreSQL names it.
+        assert_eq!(
+            names(0),
+            [
+                ("plain_a_b_key".to_owned(), vec!["a".to_owned(), "b".to_owned()], true),
+                ("plain_code_key".to_owned(), vec!["code".to_owned()], true),
+            ]
+        );
+        assert_eq!(schema[1].0.primary_key, ["post_id", "tag"]);
+        assert!(schema[1].1.is_empty());
+        assert_eq!(
+            names(2),
+            [
+                ("users_email_unique".to_owned(), vec!["email".to_owned()], true),
+                ("users_name_idx".to_owned(), vec!["name".to_owned()], false),
+            ]
+        );
+        assert_eq!(schema[2].0.columns[3].default, Some(json!({"tags": []})));
+        engine
+            .execute_sql("INSERT INTO users (id, name, email) VALUES ('a', 'Ann', 'a@x')", &[])
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute_sql("INSERT INTO users (id, name, email) VALUES ('b', 'Bo', 'a@x')", &[])
+                .unwrap_err()
+                .code,
+            "CONSTRAINT_VIOLATION"
+        );
+        assert_eq!(
+            engine
+                .execute_sql("SELECT meta FROM users", &[])
+                .unwrap()
+                .rows,
+            [Row::from_iter([("meta".to_owned(), json!({"tags": []}))])]
+        );
+
+        // The statements of a later migration: a unique constraint added and dropped, a table
+        // dropped with CASCADE after the row security it never had is disabled.
+        engine
+            .exec_sql(
+                r#"ALTER TABLE "users" ADD CONSTRAINT "users_name_unique" UNIQUE("name");
+                ALTER TABLE "users" DROP CONSTRAINT "users_email_unique";
+                ALTER TABLE "post_tags" DISABLE ROW LEVEL SECURITY;
+                DROP TABLE "post_tags" CASCADE;
+                DROP INDEX "users_name_idx" RESTRICT;"#,
+            )
+            .unwrap();
+        let schema = engine.schema().unwrap();
+        assert_eq!(schema.len(), 2);
+        assert_eq!(
+            schema[1]
+                .1
+                .iter()
+                .map(|index| index.name.as_str())
+                .collect::<Vec<_>>(),
+            ["users_name_unique"]
+        );
+        engine
+            .exec_sql(r#"ALTER TABLE users DROP CONSTRAINT IF EXISTS "users_email_unique""#)
+            .unwrap();
+        let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        assert_eq!(reopened.schema().unwrap(), schema);
+    }
+
+    #[test]
+    fn constraints_and_index_methods_tinyjoin_cannot_enforce_are_refused() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .exec_sql(
+                "CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT);\
+                 CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id TEXT);",
+            )
+            .unwrap();
+        for (sql, code, message) in [
+            (
+                "CREATE TABLE a (id INTEGER PRIMARY KEY, user_id TEXT REFERENCES users (id))",
+                "UNSUPPORTED_SQL",
+                "Foreign keys are not supported",
+            ),
+            (
+                "CREATE TABLE a (id INTEGER PRIMARY KEY, user_id TEXT, \
+                 FOREIGN KEY (user_id) REFERENCES users (id))",
+                "UNSUPPORTED_SQL",
+                "Foreign keys are not supported",
+            ),
+            (
+                r#"ALTER TABLE "posts" ADD CONSTRAINT "posts_user_id_users_id_fk" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE no action ON UPDATE no action"#,
+                "UNSUPPORTED_SQL",
+                "Foreign keys are not supported",
+            ),
+            (
+                "CREATE TABLE a (id INTEGER PRIMARY KEY CHECK (id > 0))",
+                "UNSUPPORTED_SQL",
+                "CHECK constraints",
+            ),
+            (
+                "CREATE TABLE a (id INTEGER PRIMARY KEY, CONSTRAINT positive CHECK (id > 0))",
+                "UNSUPPORTED_SQL",
+                "CHECK constraints",
+            ),
+            (
+                "CREATE INDEX posts_user ON posts USING hash (user_id)",
+                "UNSUPPORTED_SQL",
+                "Index method `hash`",
+            ),
+            (
+                "CREATE TABLE a (id INTEGER PRIMARY KEY, b TEXT DEFAULT 'x'::text)",
+                "UNSUPPORTED_SQL",
+                "cast only a string to JSON",
+            ),
+            (
+                "CREATE TABLE a (id INTEGER PRIMARY KEY, b JSONB DEFAULT '{'::jsonb)",
+                "INVALID_SCHEMA",
+                "JSON text",
+            ),
+            (
+                "CREATE TABLE a (id INTEGER PRIMARY KEY, b FLOAT UNIQUE)",
+                "UNSUPPORTED_SQL",
+                "Index `a_b_key` cannot use float column `b`",
+            ),
+            (
+                "ALTER TABLE posts ADD COLUMN code TEXT UNIQUE",
+                "UNSUPPORTED_SQL",
+                "cannot add a primary key or UNIQUE constraint",
+            ),
+            (
+                "ALTER TABLE posts ADD CONSTRAINT posts_pk PRIMARY KEY (user_id)",
+                "UNSUPPORTED_SQL",
+                "primary key",
+            ),
+            (
+                "ALTER TABLE posts DROP CONSTRAINT posts_missing",
+                "INDEX_NOT_FOUND",
+                "no unique constraint `posts_missing`",
+            ),
+            (
+                "ALTER TABLE missing DISABLE ROW LEVEL SECURITY",
+                "TABLE_NOT_FOUND",
+                "",
+            ),
+            (
+                "ALTER TABLE posts ALTER COLUMN user_id SET NOT NULL",
+                "UNSUPPORTED_SQL",
+                "ALTER TABLE supports",
+            ),
+        ] {
+            let error = engine.exec_sql(sql).unwrap_err();
+            assert_eq!(error.code, code, "{sql}: {}", error.message);
+            assert!(error.message.contains(message), "{sql}: {}", error.message);
+        }
+        // A table whose unique constraint names an index that exists is not created at all.
+        engine.exec_sql("CREATE INDEX taken ON posts (user_id)").unwrap();
+        assert_eq!(
+            engine
+                .exec_sql("CREATE TABLE a (id INTEGER PRIMARY KEY, CONSTRAINT taken UNIQUE (id))")
+                .unwrap_err()
+                .code,
+            "INDEX_ALREADY_EXISTS"
+        );
+        assert_eq!(
+            engine
+                .exec_sql("ALTER TABLE posts DROP CONSTRAINT taken")
+                .unwrap_err()
+                .code,
+            "INDEX_NOT_FOUND"
+        );
+        assert_eq!(engine.schema().unwrap().len(), 2);
+        // Words that name constraints are still column names where a column is expected.
+        engine
+            .exec_sql("CREATE TABLE words (unique INTEGER PRIMARY KEY, constraint TEXT, check TEXT)")
+            .unwrap();
     }
 
     #[test]

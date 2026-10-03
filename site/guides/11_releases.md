@@ -80,6 +80,17 @@ optional peer dependency and never bundles it, so the download sizes are
 unchanged. Relational queries with `with`, Drizzle Kit, and Drizzle's
 migrators are not supported. See the [Drizzle guide](/guides/drizzle/).
 
+`CREATE TABLE` accepts the constraints and spellings that schema tools write:
+a named primary key, as in `CONSTRAINT tags_pk PRIMARY KEY (post_id, tag)`;
+`UNIQUE` on a column or as a table constraint, which creates a unique index
+named as PostgreSQL would name it; a JSON default written as `'{}'::jsonb`; and
+`USING btree` on an index. `ALTER TABLE` can add and drop a unique constraint,
+and accepts `DISABLE ROW LEVEL SECURITY`, which changes nothing. `DROP TABLE`
+and `DROP INDEX` accept `CASCADE` and `RESTRICT`. Together these run the SQL
+that `drizzle-kit generate` writes for new tables, apart from foreign keys,
+which TinyJoin cannot enforce and still rejects, now with an error saying so.
+See [constraints and indexes](/guides/sql-compatibility/#constraints-and-indexes).
+
 The new getSchema() method on the Client reads the database's tables, with
 their columns, primary keys, and indexes, as typed objects rather than through
 SQL catalog tables, which TinyJoin does not have. Each column carries its

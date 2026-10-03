@@ -82,9 +82,11 @@ Create tables with SQL through the Client, idempotently with
 does not have (its Client reads the same facts with getSchema()), and Drizzle's
 migrators create a `SERIAL` table in a schema of
 their own, so none of them works. The SQL that `drizzle-kit generate` writes
-is a useful start, but TinyJoin refuses its foreign keys, table-level `UNIQUE`
-constraints, and `USING btree` index methods; write the equivalent
-`CREATE UNIQUE INDEX` instead.
+for new tables runs as it is, with its `UNIQUE` constraints, composite primary
+keys, `USING btree` indexes, and JSON defaults, except for foreign keys, which
+TinyJoin cannot enforce: leave `.references()` out of the schema. Drizzle's
+relations need no foreign keys. A later migration's `ALTER COLUMN`,
+`DROP COLUMN`, and renames are rejected.
 
 ## Queries
 

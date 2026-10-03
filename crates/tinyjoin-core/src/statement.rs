@@ -29,9 +29,9 @@ use crate::storage::{
     validate_index_definition_shape, validate_primary_storage_key_bound, validate_value,
 };
 use crate::{
-    ChangedKeys, ColumnDefinition, ColumnType, EngineError, MAX_CHANGED_KEYS_PER_TABLE, Predicate,
-    Result, ResultField, Row, RowChange, SelectPlan, StorageReader, Subquery, TableDefinition,
-    TableKeys, VisitControl, VisitOutcome,
+    ChangedKeys, ColumnDefinition, ColumnType, EngineError, IndexDefinition,
+    MAX_CHANGED_KEYS_PER_TABLE, Predicate, Result, ResultField, Row, RowChange, SelectPlan,
+    StorageReader, Subquery, TableDefinition, TableKeys, VisitControl, VisitOutcome,
 };
 
 const MAX_COLUMNS: usize = 256;
@@ -65,10 +65,22 @@ impl Statement {
     }
 }
 
+impl WriteStatement {
+    /// Whether this statement changes the schema, which only a standalone statement or script can.
+    pub(crate) fn is_ddl(&self) -> bool {
+        !matches!(
+            self,
+            Self::Insert { .. } | Self::Update { .. } | Self::Delete { .. }
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum WriteStatement {
     CreateTable {
         schema: TableDefinition,
+        /// The unique indexes that the table's `UNIQUE` constraints create.
+        indexes: Vec<IndexDefinition>,
         if_not_exists: bool,
     },
     CreateIndex {
@@ -87,6 +99,16 @@ pub(crate) enum WriteStatement {
         table: String,
         column: ColumnDefinition,
         if_not_exists: bool,
+    },
+    /// `ALTER TABLE ... DROP CONSTRAINT`, which drops one of the table's unique indexes.
+    DropConstraint {
+        table: String,
+        name: String,
+        if_exists: bool,
+    },
+    /// `ALTER TABLE ... DISABLE ROW LEVEL SECURITY`, which changes nothing: no table has any.
+    DisableRowSecurity {
+        table: String,
     },
     Insert {
         table: String,
@@ -268,8 +290,9 @@ pub(crate) fn execute<S: StorageDriver>(
     match statement {
         WriteStatement::CreateTable {
             schema,
+            indexes,
             if_not_exists,
-        } => create_table(storage, schema, *if_not_exists).map(no_changed_keys),
+        } => create_table(storage, schema, indexes, *if_not_exists).map(no_changed_keys),
         WriteStatement::CreateIndex {
             definition,
             if_not_exists,
@@ -285,6 +308,20 @@ pub(crate) fn execute<S: StorageDriver>(
             column,
             if_not_exists,
         } => add_column(storage, table, column, *if_not_exists).map(no_changed_keys),
+        WriteStatement::DropConstraint {
+            table,
+            name,
+            if_exists,
+        } => {
+            let outcome = plan_drop_constraint(storage, table, name, *if_exists)?;
+            if outcome.mutated {
+                storage.drop_index(name)?;
+            }
+            Ok(no_changed_keys(outcome))
+        }
+        WriteStatement::DisableRowSecurity { table } => {
+            plan_disable_row_security(storage, table).map(no_changed_keys)
+        }
         WriteStatement::Insert { .. }
         | WriteStatement::Update { .. }
         | WriteStatement::Delete { .. } => {
@@ -565,7 +602,9 @@ pub(crate) fn plan_dml(
         | WriteStatement::CreateIndex { .. }
         | WriteStatement::DropTable { .. }
         | WriteStatement::DropIndex { .. }
-        | WriteStatement::AddColumn { .. } => Err(EngineError::unsupported_sql(
+        | WriteStatement::AddColumn { .. }
+        | WriteStatement::DropConstraint { .. }
+        | WriteStatement::DisableRowSecurity { .. } => Err(EngineError::unsupported_sql(
             "Page-native SQL currently supports SELECT, CREATE TABLE, INSERT, UPDATE, and DELETE",
         )),
     }
@@ -645,6 +684,46 @@ fn drop_index<S: StorageDriver>(
         storage.drop_index(name)?;
     }
     Ok(outcome)
+}
+
+pub(crate) fn plan_drop_constraint(
+    storage: &dyn StorageReader,
+    table: &str,
+    name: &str,
+    if_exists: bool,
+) -> Result<WriteOutcome> {
+    storage.table_schema(table)?;
+    let mutated = match storage.index_definition(name) {
+        Some(definition) if definition.unique && definition.table == table => true,
+        _ if if_exists => false,
+        _ => {
+            return Err(EngineError::new(
+                "INDEX_NOT_FOUND",
+                format!("Table `{table}` has no unique constraint `{name}`"),
+            ));
+        }
+    };
+    Ok(WriteOutcome {
+        command: "ALTER TABLE",
+        row_count: 0,
+        rows: vec![],
+        tables: if mutated { vec![table.to_owned()] } else { vec![] },
+        mutated,
+    })
+}
+
+pub(crate) fn plan_disable_row_security(
+    storage: &dyn StorageReader,
+    table: &str,
+) -> Result<WriteOutcome> {
+    storage.table_schema(table)?;
+    Ok(WriteOutcome {
+        command: "ALTER TABLE",
+        row_count: 0,
+        rows: vec![],
+        tables: vec![],
+        mutated: false,
+    })
 }
 
 pub(crate) fn plan_drop_index(
@@ -775,11 +854,15 @@ pub(crate) fn plan_create_index(
 fn create_table<S: StorageDriver>(
     storage: &mut S,
     schema: &TableDefinition,
+    indexes: &[IndexDefinition],
     if_not_exists: bool,
 ) -> Result<WriteOutcome> {
-    let outcome = plan_create_table(storage, schema, if_not_exists)?;
+    let outcome = plan_create_table(storage, schema, indexes, if_not_exists)?;
     if outcome.mutated {
         storage.define_table(schema.clone())?;
+        for definition in indexes {
+            storage.define_index(definition.clone())?;
+        }
     }
     Ok(outcome)
 }
@@ -787,6 +870,7 @@ fn create_table<S: StorageDriver>(
 pub(crate) fn plan_create_table(
     storage: &dyn StorageReader,
     schema: &TableDefinition,
+    indexes: &[IndexDefinition],
     if_not_exists: bool,
 ) -> Result<WriteOutcome> {
     if storage.table_schema(&schema.name).is_ok() {
@@ -800,6 +884,18 @@ pub(crate) fn plan_create_table(
             });
         }
         return Err(EngineError::table_already_exists(&schema.name));
+    }
+    // Every unique index is checked before the table is created, so none is left half made.
+    for (position, definition) in indexes.iter().enumerate() {
+        if storage.index_definition(&definition.name).is_some()
+            || indexes[..position]
+                .iter()
+                .any(|previous| previous.name == definition.name)
+        {
+            return Err(EngineError::index_already_exists(&definition.name));
+        }
+        validate_index_definition_shape(definition)?;
+        validate_index_columns_for_schema(definition, schema)?;
     }
 
     Ok(WriteOutcome {
@@ -2304,47 +2400,46 @@ impl<'a> MutationParser<'a> {
     }
 
     fn parse_create_table(&mut self) -> Result<WriteStatement> {
-        let if_not_exists = if self.consume_keyword("if") {
-            self.expect_keyword("not")?;
-            self.expect_keyword("exists")?;
-            true
-        } else {
-            false
-        };
+        let if_not_exists = self.parse_if_exists(true)?;
         let name = self.parse_table_name()?;
         self.expect(TokenMatcher::LParen, "Expected `(` after table name")?;
 
         let mut columns = Vec::new();
         let mut inline_primary_key = None;
         let mut table_primary_key = None;
+        let mut indexes = Vec::new();
         loop {
-            if self.consume_keyword("primary") {
-                self.expect_keyword("key")?;
-                if table_primary_key.is_some() || inline_primary_key.is_some() {
-                    return Err(EngineError::invalid_schema(
-                        "A table can declare only one primary key",
-                    ));
+            if let Some(constraint) = self.parse_table_constraint()? {
+                match constraint {
+                    TableConstraint::PrimaryKey(key) => {
+                        if table_primary_key.is_some() || inline_primary_key.is_some() {
+                            return Err(EngineError::invalid_schema(
+                                "A table can declare only one primary key",
+                            ));
+                        }
+                        table_primary_key = Some(key);
+                    }
+                    TableConstraint::Unique(constraint, key) => {
+                        indexes.push(unique_index(&name, constraint, key));
+                    }
                 }
-                self.expect(TokenMatcher::LParen, "Expected `(` after PRIMARY KEY")?;
-                table_primary_key = Some(self.parse_identifier_list(TokenMatcher::RParen)?);
-                self.expect(
-                    TokenMatcher::RParen,
-                    "Expected `)` after PRIMARY KEY columns",
-                )?;
             } else {
                 if columns.len() >= MAX_COLUMNS {
                     return Err(EngineError::invalid_schema(format!(
                         "A table cannot contain more than {MAX_COLUMNS} columns"
                     )));
                 }
-                let (column, primary_key) = self.parse_column_definition()?;
-                if primary_key {
+                let (column, clauses) = self.parse_column_definition()?;
+                if clauses.primary_key {
                     if inline_primary_key.is_some() || table_primary_key.is_some() {
                         return Err(EngineError::invalid_schema(
                             "A table can declare only one primary key",
                         ));
                     }
                     inline_primary_key = Some(column.name.clone());
+                }
+                if let Some(constraint) = clauses.unique {
+                    indexes.push(unique_index(&name, constraint, vec![column.name.clone()]));
                 }
                 columns.push(column);
             }
@@ -2376,21 +2471,66 @@ impl<'a> MutationParser<'a> {
                 primary_key,
                 columns,
             },
+            indexes,
             if_not_exists,
         })
     }
 
-    fn parse_create_index(&mut self, unique: bool) -> Result<WriteStatement> {
-        let if_not_exists = if self.consume_keyword("if") {
-            self.expect_keyword("not")?;
-            self.expect_keyword("exists")?;
-            true
+    /// Reads a table constraint if one comes next, which may be named. A primary key's name is
+    /// not kept, since nothing can refer to it, and a unique constraint is a unique index of that
+    /// name. A foreign key and `CHECK` are refused: TinyJoin enforces neither.
+    fn parse_table_constraint(&mut self) -> Result<Option<TableConstraint>> {
+        let named = self.keyword_at(0, "constraint")
+            && ["primary", "unique", "foreign", "check"]
+                .iter()
+                .any(|keyword| self.keyword_at(2, keyword));
+        let constraint = if named {
+            self.position += 1;
+            Some(self.parse_identifier()?)
         } else {
-            false
+            None
         };
+        if self.consume_keyword("primary") {
+            self.expect_keyword("key")?;
+            return Ok(Some(TableConstraint::PrimaryKey(
+                self.parse_constraint_columns()?,
+            )));
+        }
+        if (named || self.token_at(1, TokenMatcher::LParen)) && self.consume_keyword("unique") {
+            return Ok(Some(TableConstraint::Unique(
+                constraint,
+                self.parse_constraint_columns()?,
+            )));
+        }
+        if self.keyword_at(0, "foreign") && (named || self.keyword_at(1, "key")) {
+            return Err(foreign_keys_unsupported());
+        }
+        if self.keyword_at(0, "check") && (named || self.token_at(1, TokenMatcher::LParen)) {
+            return Err(check_unsupported());
+        }
+        Ok(None)
+    }
+
+    fn parse_constraint_columns(&mut self) -> Result<Vec<String>> {
+        self.expect(TokenMatcher::LParen, "Expected `(` before constraint columns")?;
+        let columns = self.parse_identifier_list(TokenMatcher::RParen)?;
+        self.expect(TokenMatcher::RParen, "Expected `)` after constraint columns")?;
+        Ok(columns)
+    }
+
+    fn parse_create_index(&mut self, unique: bool) -> Result<WriteStatement> {
+        let if_not_exists = self.parse_if_exists(true)?;
         let name = self.parse_identifier()?;
         self.expect_keyword("on")?;
         let table = self.parse_table_name()?;
+        if self.consume_keyword("using") {
+            let method = self.parse_identifier()?;
+            if method != "btree" {
+                return Err(EngineError::unsupported_sql(format!(
+                    "Index method `{method}` is not supported; every TinyJoin index is a B-tree"
+                )));
+            }
+        }
         self.expect(TokenMatcher::LParen, "Expected `(` after indexed table")?;
         let columns = self.parse_identifier_list(TokenMatcher::RParen)?;
         self.expect(TokenMatcher::RParen, "Expected `)` after indexed columns")?;
@@ -2412,41 +2552,85 @@ impl<'a> MutationParser<'a> {
             self.expect_keyword("index")?;
             false
         };
-        let if_exists = if self.consume_keyword("if") {
-            self.expect_keyword("exists")?;
-            true
-        } else {
-            false
-        };
-        if table {
-            Ok(WriteStatement::DropTable {
+        let if_exists = self.parse_if_exists(false)?;
+        let statement = if table {
+            WriteStatement::DropTable {
                 table: self.parse_table_name()?,
                 if_exists,
-            })
+            }
         } else {
-            Ok(WriteStatement::DropIndex {
+            WriteStatement::DropIndex {
                 name: self.parse_identifier()?,
                 if_exists,
-            })
+            }
+        };
+        self.consume_drop_behavior();
+        Ok(statement)
+    }
+
+    /// Reads `IF EXISTS`, or `IF NOT EXISTS` where `not` is set, reporting whether it was there.
+    fn parse_if_exists(&mut self, not: bool) -> Result<bool> {
+        if !self.consume_keyword("if") {
+            return Ok(false);
         }
+        if not {
+            self.expect_keyword("not")?;
+        }
+        self.expect_keyword("exists")?;
+        Ok(true)
+    }
+
+    // Nothing in TinyJoin depends on a table but its own indexes, which go with it, and nothing
+    // depends on an index or a constraint, so `CASCADE` and `RESTRICT` drop the same objects.
+    fn consume_drop_behavior(&mut self) {
+        let _ = self.consume_keyword("cascade") || self.consume_keyword("restrict");
     }
 
     fn parse_alter_table(&mut self) -> Result<WriteStatement> {
         self.expect_keyword("table")?;
         let table = self.parse_table_name()?;
-        self.expect_keyword("add")?;
+        if self.consume_keyword("disable") {
+            self.expect_keyword("row")?;
+            self.expect_keyword("level")?;
+            self.expect_keyword("security")?;
+            return Ok(WriteStatement::DisableRowSecurity { table });
+        }
+        if self.consume_keyword("drop") {
+            if !self.consume_keyword("constraint") {
+                return Err(unsupported_alter());
+            }
+            let if_exists = self.parse_if_exists(false)?;
+            let name = self.parse_identifier()?;
+            self.consume_drop_behavior();
+            return Ok(WriteStatement::DropConstraint {
+                table,
+                name,
+                if_exists,
+            });
+        }
+        if !self.consume_keyword("add") {
+            return Err(unsupported_alter());
+        }
+        match self.parse_table_constraint()? {
+            Some(TableConstraint::Unique(constraint, columns)) => {
+                return Ok(WriteStatement::CreateIndex {
+                    definition: unique_index(&table, constraint, columns),
+                    if_not_exists: false,
+                });
+            }
+            Some(TableConstraint::PrimaryKey(_)) => {
+                return Err(EngineError::unsupported_sql(
+                    "ALTER TABLE cannot change a table's primary key",
+                ));
+            }
+            None => {}
+        }
         self.consume_keyword("column");
-        let if_not_exists = if self.consume_keyword("if") {
-            self.expect_keyword("not")?;
-            self.expect_keyword("exists")?;
-            true
-        } else {
-            false
-        };
-        let (column, primary_key) = self.parse_column_definition()?;
-        if primary_key {
+        let if_not_exists = self.parse_if_exists(true)?;
+        let (column, clauses) = self.parse_column_definition()?;
+        if clauses.primary_key || clauses.unique.is_some() {
             return Err(EngineError::unsupported_sql(
-                "ALTER TABLE ADD COLUMN cannot add a primary key",
+                "ALTER TABLE ADD COLUMN cannot add a primary key or UNIQUE constraint",
             ));
         }
         Ok(WriteStatement::AddColumn {
@@ -2456,18 +2640,33 @@ impl<'a> MutationParser<'a> {
         })
     }
 
-    fn parse_column_definition(&mut self) -> Result<(ColumnDefinition, bool)> {
+    fn parse_column_definition(&mut self) -> Result<(ColumnDefinition, ColumnClauses)> {
         let name = self.parse_identifier()?;
         let data_type = self.parse_column_type()?;
         let mut nullable = true;
         let mut default = None;
-        let mut primary_key = false;
+        let mut clauses = ColumnClauses {
+            primary_key: false,
+            unique: None,
+        };
 
         loop {
+            // A constraint's name matters only for a unique constraint, whose index it names.
+            let constraint = if self.consume_keyword("constraint") {
+                Some(self.parse_identifier()?)
+            } else {
+                None
+            };
             if self.consume_keyword("primary") {
                 self.expect_keyword("key")?;
-                primary_key = true;
+                clauses.primary_key = true;
                 nullable = false;
+            } else if self.consume_keyword("unique") {
+                clauses.unique = Some(constraint);
+            } else if self.consume_keyword("references") {
+                return Err(foreign_keys_unsupported());
+            } else if self.consume_keyword("check") {
+                return Err(check_unsupported());
             } else if self.consume_keyword("not") {
                 self.expect_keyword("null")?;
                 nullable = false;
@@ -2479,7 +2678,16 @@ impl<'a> MutationParser<'a> {
                         "Column `{name}` declares DEFAULT more than once"
                     )));
                 }
-                default = Some(self.parse_literal()?);
+                let value = self.parse_literal()?;
+                default = Some(if self.consume(TokenMatcher::Cast) {
+                    self.parse_default_cast(value)?
+                } else {
+                    value
+                });
+            } else if constraint.is_some() {
+                return Err(EngineError::parse_error(
+                    "Expected a column constraint after its name",
+                ));
             } else {
                 break;
             }
@@ -2491,8 +2699,20 @@ impl<'a> MutationParser<'a> {
                 nullable,
                 default,
             },
-            primary_key,
+            clauses,
         ))
+    }
+
+    /// Reads the cast of a string to `json` or `jsonb` with which PostgreSQL tools write a JSON
+    /// column's default, as in `DEFAULT '{}'::jsonb`, by parsing the string as JSON text.
+    fn parse_default_cast(&mut self, value: Value) -> Result<Value> {
+        match (self.parse_column_type()?, value) {
+            (ColumnType::Json, Value::String(text)) => serde_json::from_slice(text.as_bytes())
+                .map_err(|_| EngineError::invalid_schema("A JSON default must be JSON text")),
+            _ => Err(EngineError::unsupported_sql(
+                "A DEFAULT can cast only a string to JSON, as in '{}'::jsonb",
+            )),
+        }
     }
 
     fn parse_column_type(&mut self) -> Result<ColumnType> {
@@ -2866,6 +3086,20 @@ impl<'a> MutationParser<'a> {
         }
     }
 
+    fn keyword_at(&self, offset: usize, keyword: &str) -> bool {
+        matches!(
+            self.tokens.get(self.position + offset),
+            Some(Token::Identifier {
+                value,
+                quoted: false,
+            }) if value.eq_ignore_ascii_case(keyword)
+        )
+    }
+
+    fn token_at(&self, offset: usize, matcher: TokenMatcher) -> bool {
+        token_matches(self.tokens.get(self.position + offset), matcher)
+    }
+
     fn expect(&mut self, matcher: TokenMatcher, message: &str) -> Result<()> {
         if self.consume(matcher) {
             Ok(())
@@ -2884,16 +3118,7 @@ impl<'a> MutationParser<'a> {
     }
 
     fn peek_matches(&self, matcher: TokenMatcher) -> bool {
-        matches!(
-            (self.tokens.get(self.position), matcher),
-            (Some(Token::Star), TokenMatcher::Star)
-                | (Some(Token::Comma), TokenMatcher::Comma)
-                | (Some(Token::Dot), TokenMatcher::Dot)
-                | (Some(Token::Eq), TokenMatcher::Eq)
-                | (Some(Token::LParen), TokenMatcher::LParen)
-                | (Some(Token::RParen), TokenMatcher::RParen)
-                | (Some(Token::Semicolon), TokenMatcher::Semicolon)
-        )
+        self.token_at(0, matcher)
     }
 
     fn next(&mut self) -> Option<Token> {
@@ -2916,11 +3141,75 @@ enum TokenMatcher {
     LParen,
     RParen,
     Semicolon,
+    Cast,
+}
+
+fn token_matches(token: Option<&Token>, matcher: TokenMatcher) -> bool {
+    matches!(
+        (token, matcher),
+        (Some(Token::Star), TokenMatcher::Star)
+            | (Some(Token::Comma), TokenMatcher::Comma)
+            | (Some(Token::Dot), TokenMatcher::Dot)
+            | (Some(Token::Eq), TokenMatcher::Eq)
+            | (Some(Token::LParen), TokenMatcher::LParen)
+            | (Some(Token::RParen), TokenMatcher::RParen)
+            | (Some(Token::Semicolon), TokenMatcher::Semicolon)
+            | (Some(Token::Cast), TokenMatcher::Cast)
+    )
+}
+
+enum TableConstraint {
+    PrimaryKey(Vec<String>),
+    /// A unique constraint's name, if it has one, and its columns.
+    Unique(Option<String>, Vec<String>),
+}
+
+struct ColumnClauses {
+    primary_key: bool,
+    /// The name of the column's unique constraint, if it has one and that constraint is named.
+    unique: Option<Option<String>>,
+}
+
+/// The unique index a unique constraint creates. As in PostgreSQL, one without a name is named
+/// for its table and columns, as in `users_email_key`.
+fn unique_index(table: &str, name: Option<String>, columns: Vec<String>) -> IndexDefinition {
+    let name = name.unwrap_or_else(|| {
+        let mut name = table
+            .bytes()
+            .rposition(|byte| byte == b'.')
+            .map_or(table, |dot| &table[dot + 1..])
+            .to_owned();
+        for column in &columns {
+            name.push('_');
+            name.push_str(column);
+        }
+        name + "_key"
+    });
+    IndexDefinition {
+        name,
+        table: table.to_owned(),
+        columns,
+        unique: true,
+    }
+}
+
+fn foreign_keys_unsupported() -> EngineError {
+    EngineError::unsupported_sql("Foreign keys are not supported; TinyJoin cannot enforce them")
+}
+
+fn check_unsupported() -> EngineError {
+    EngineError::unsupported_sql("CHECK constraints are not supported")
+}
+
+fn unsupported_alter() -> EngineError {
+    EngineError::unsupported_sql(
+        "ALTER TABLE supports ADD COLUMN, ADD CONSTRAINT ... UNIQUE, DROP CONSTRAINT, and DISABLE ROW LEVEL SECURITY",
+    )
 }
 
 fn unsupported_statement() -> EngineError {
     EngineError::unsupported_sql(
-        "Supported statements are SELECT, CREATE TABLE, CREATE INDEX, ALTER TABLE ADD COLUMN, DROP TABLE, DROP INDEX, INSERT, UPDATE, and DELETE",
+        "Supported statements are SELECT, CREATE TABLE, CREATE INDEX, ALTER TABLE, DROP TABLE, DROP INDEX, INSERT, UPDATE, and DELETE",
     )
 }
 

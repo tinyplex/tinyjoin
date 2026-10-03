@@ -170,13 +170,17 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 | `SELECT DISTINCT` | Narrow | Removes duplicate rows from an explicit single-table or join projection. `NULL`s compare as equal to each other, and other values compare by SQL equality; JSON columns are rejected. `ORDER BY` must name projected columns: by output name in a single-table query, and by output name or projected source column in a join. A single-table `DISTINCT` compares at most 32 distinct source columns and shares the aggregate group limits. `DISTINCT *`, `DISTINCT ON`, and `DISTINCT` combined with `GROUP BY` or aggregate functions are rejected. |
 | `IN (SELECT ...)` | Narrow | An uncorrelated [subquery](#subqueries) returning one column of at most 1,024 rows. |
 | `WITH`, other subqueries, `UNION`/`INTERSECT`/`EXCEPT` | No | No CTEs, correlated, scalar, `EXISTS`, or `FROM` subqueries, or set operations. |
-| `CREATE TABLE [IF NOT EXISTS]` | Narrow | Typed columns and a required inline or table-level primary key. Up to 256 columns. |
-| `PRIMARY KEY` | Narrow | One inline single-column declaration or one table-level column list (single or composite). It implies `NOT NULL`; JSON keys are rejected. |
-| `NULL`, `NOT NULL`, `DEFAULT` | Narrow | String, number, boolean, or `NULL` literal defaults only. No default expressions, functions, sequences, or parameters. |
-| `CREATE [UNIQUE] INDEX [IF NOT EXISTS]` | Narrow | One or more boolean, integer, or text columns. No methods, expressions, predicates, `INCLUDE`, ordering, or concurrent build. |
-| `ALTER TABLE ... ADD [COLUMN] [IF NOT EXISTS]` | Narrow | Adds one non-primary-key column and atomically backfills its literal default or `NULL`. On a nonempty table, `NOT NULL` requires a non-null default. Other `ALTER` forms are rejected. |
-| `DROP TABLE [IF EXISTS]` | Narrow | Drops the table and its indexes. No `CASCADE`/`RESTRICT` dependency model. |
-| `DROP INDEX [IF EXISTS]` | Supported | Drops one globally named index. |
+| `CREATE TABLE [IF NOT EXISTS]` | Narrow | Typed columns, a required inline or table-level primary key, and `UNIQUE` constraints. Up to 256 columns. |
+| `PRIMARY KEY` | Narrow | One inline single-column declaration or one table-level column list (single or composite), which `CONSTRAINT name` may name. It implies `NOT NULL`; JSON keys are rejected. |
+| `UNIQUE` | Narrow | A column's `UNIQUE`, or a table's `[CONSTRAINT name] UNIQUE (columns)`, creates a unique index of that name. An unnamed one is named as PostgreSQL names it, for its table and columns, as in `users_email_key`. The columns follow the `CREATE UNIQUE INDEX` rules. |
+| `REFERENCES`, `FOREIGN KEY`, `CHECK` | No | Foreign keys and check constraints are rejected, inline or as table constraints, since TinyJoin enforces neither. |
+| `NULL`, `NOT NULL`, `DEFAULT` | Narrow | String, number, boolean, or `NULL` literal defaults, and a string cast to JSON, as in `DEFAULT '{}'::jsonb`. No other casts, default expressions, functions, sequences, or parameters. |
+| `CREATE [UNIQUE] INDEX [IF NOT EXISTS]` | Narrow | One or more boolean, integer, or text columns. `USING btree` is accepted, since every index is a B-tree; no other methods, expressions, predicates, `INCLUDE`, ordering, or concurrent build. |
+| `ALTER TABLE ... ADD [COLUMN] [IF NOT EXISTS]` | Narrow | Adds one non-primary-key column and atomically backfills its literal default or `NULL`. On a nonempty table, `NOT NULL` requires a non-null default. The column cannot declare `UNIQUE`; add the constraint after it. |
+| `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE`, `DROP CONSTRAINT [IF EXISTS]` | Narrow | Adds a unique constraint, as `CREATE UNIQUE INDEX` would, or drops one of the table's unique indexes by name. |
+| `ALTER TABLE ... DISABLE ROW LEVEL SECURITY` | Supported | Changes nothing, since no table has row security. `ALTER COLUMN`, `DROP COLUMN`, `RENAME`, and other `ALTER` forms are rejected. |
+| `DROP TABLE [IF EXISTS]` | Narrow | Drops the table and its indexes. `CASCADE` and `RESTRICT` are accepted and drop the same, since nothing else can depend on a table. |
+| `DROP INDEX [IF EXISTS]` | Supported | Drops one globally named index. `CASCADE` and `RESTRICT` are accepted. |
 | `INSERT ... VALUES` | Narrow | Optional column list, up to 4,096 literal/parameter rows, per-cell `DEFAULT`, and optional `RETURNING`. |
 | `INSERT ... DEFAULT VALUES` | Supported | Inserts one row using defaults and `NULL` values. |
 | `INSERT ... ON CONFLICT` | Narrow | `ON CONFLICT [(columns)] DO NOTHING` or `ON CONFLICT (columns) DO UPDATE SET column = value, ...`, before any `RETURNING`. See [upserts](#upserts). |
@@ -208,7 +212,7 @@ each statement retains the ordinary parser limits below.
 | `IN (...)`, `NOT IN (...)` | Supported | One to 1,024 literals or parameters, or a [subquery](#subqueries), with SQL null behavior. |
 | `BETWEEN`, `NOT BETWEEN` | Narrow | `column BETWEEN low AND high` means exactly `column >= low AND column <= high`, and `NOT BETWEEN` means `column < low OR column > high`, with those comparisons' type and null rules. Each bound is a literal or parameter. There is no `SYMMETRIC` form, so a reversed range matches nothing. |
 | `+`, `-`, `*`, `/`, `%`, `\|\|` | Narrow | In the values `UPDATE` and `ON CONFLICT DO UPDATE` assign, on either side of a comparison, and in the select list of a query that does not aggregate. See [expressions](#expressions). |
-| Casts, `CASE`, scalar functions | No | There are no casts, conditional expressions, or functions other than the aggregates. |
+| Casts, `CASE`, scalar functions | No | There are no casts, apart from a JSON column's `DEFAULT '...'::jsonb`, and no conditional expressions or functions other than the aggregates. |
 | `LIKE`, `NOT LIKE`, `ILIKE`, `NOT ILIKE` | Narrow | Matches a whole text column value against a literal or parameter pattern, where `%` matches any run of characters and `_` exactly one character; a non-text column is rejected. Backslash makes the next pattern character literal unless `ESCAPE` names another single character, or `''` for none; a pattern ending in its escape character is rejected. `ILIKE` folds only ASCII letters, as PostgreSQL does under the C locale. A `NULL` operand is unknown. A `LIKE` pattern that begins with literal characters, such as `'abc%'`, reads only the part of an index or primary key that can match; other patterns scan. |
 | `IS DISTINCT FROM`, `SIMILAR TO`, `ANY`, `ALL` | No | These PostgreSQL predicate families are not implemented. |
 | JSON/path operators | No | JSON can be stored, returned, and compared for structural equality only. |
@@ -480,7 +484,11 @@ Every SQL-created table has a primary key. TinyJoin currently implements:
 - primary-key uniqueness and non-nullability;
 - column `NOT NULL`;
 - scalar literal column defaults; and
-- separate unique indexes.
+- unique indexes, which `CREATE UNIQUE INDEX` or a `UNIQUE` constraint creates.
+
+A `UNIQUE` constraint is a unique index of the constraint's name, so getSchema()
+lists it among the table's indexes, and either `DROP CONSTRAINT` or `DROP INDEX`
+removes it.
 
 It does not implement foreign keys, `CHECK`, exclusion constraints, generated
 columns, sequences, triggers, or dependency cascades.

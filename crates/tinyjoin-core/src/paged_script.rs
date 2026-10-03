@@ -335,9 +335,11 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         let outcome = match statement {
             WriteStatement::CreateTable {
                 schema,
+                indexes,
                 if_not_exists,
             } => {
-                let outcome = crate::statement::plan_create_table(self, schema, *if_not_exists)?;
+                let outcome =
+                    crate::statement::plan_create_table(self, schema, indexes, *if_not_exists)?;
                 if outcome.mutated {
                     validate_schema(schema)?;
                     if self.tables.len() == MAX_CATALOG_TABLES as usize {
@@ -348,6 +350,9 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                     let tree_id = self.allocate_tree_id()?;
                     let table = PagedTable::new(schema.clone(), tree_id, None, 0, EMPTY_HASH)?;
                     Rc::make_mut(&mut self.tables).insert(schema.name.clone(), table);
+                    for definition in indexes {
+                        self.create_index(definition)?;
+                    }
                 }
                 outcome
             }
@@ -387,6 +392,21 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                     self.add_column(table, column)?;
                 }
                 outcome
+            }
+            WriteStatement::DropConstraint {
+                table,
+                name,
+                if_exists,
+            } => {
+                let outcome =
+                    crate::statement::plan_drop_constraint(self, table, name, *if_exists)?;
+                if outcome.mutated {
+                    self.drop_index(name)?;
+                }
+                outcome
+            }
+            WriteStatement::DisableRowSecurity { table } => {
+                crate::statement::plan_disable_row_security(self, table)?
             }
             WriteStatement::Insert { .. }
             | WriteStatement::Update { .. }
