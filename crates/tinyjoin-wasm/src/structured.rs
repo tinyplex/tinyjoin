@@ -1,8 +1,13 @@
+use std::rc::Rc;
+
 use serde_json::{Map, Number, Value};
-use tinyjoin_core::{ApplyOutcome, ChangedKeys, EngineError, ExecuteResult, Result};
+use tinyjoin_core::{
+    ApplyOutcome, ChangedKeys, ColumnType, EngineError, ExecuteResult, IndexDefinition, Result,
+    TableDefinition,
+};
 use wasm_bindgen::JsValue;
 
-pub(crate) const VERSION: u32 = 4;
+pub(crate) const VERSION: u32 = 5;
 
 pub(crate) const OP_EXECUTE_SQL: u32 = 1;
 pub(crate) const OP_EXEC_SQL: u32 = 2;
@@ -16,6 +21,7 @@ pub(crate) const OP_IN_TRANSACTION: u32 = 9;
 pub(crate) const OP_REVISION: u32 = 10;
 pub(crate) const OP_CLOSE: u32 = 11;
 pub(crate) const OP_CHECK: u32 = 12;
+pub(crate) const OP_SCHEMA: u32 = 13;
 
 const SUCCESS: u32 = 0;
 const FAILURE: u32 = 1;
@@ -167,6 +173,14 @@ pub(crate) fn unsigned(value: u64) -> Result<JsValue> {
 
 pub(crate) fn prepared_statement_id(value: u32) -> Result<JsValue> {
     unsigned(value.into())
+}
+
+/// Writes the schema as the payload.
+pub(crate) fn schema(tables: &[(Rc<TableDefinition>, Vec<IndexDefinition>)]) -> Result<JsValue> {
+    let mut json = Json::success(false);
+    json.schema(tables)?;
+    json.raw("]");
+    json.finish()
 }
 
 pub(crate) fn apply_outcome(outcome: &ApplyOutcome, committed: bool) -> Result<JsValue> {
@@ -431,6 +445,65 @@ impl Json {
         self.raw("}");
     }
 
+    /// Writes the schema as an object of its tables, each with its columns, the columns of its
+    /// primary key, and its indexes, all in the order the engine gives them.
+    fn schema(&mut self, tables: &[(Rc<TableDefinition>, Vec<IndexDefinition>)]) -> Result<()> {
+        self.raw("{\"tables\":[");
+        for (position, (table, indexes)) in tables.iter().enumerate() {
+            if position > 0 {
+                self.raw(",");
+            }
+            self.raw("{\"name\":");
+            self.string(&table.name);
+            self.raw(",\"columns\":[");
+            for (position, column) in table.columns.iter().enumerate() {
+                if position > 0 {
+                    self.raw(",");
+                }
+                self.raw("{\"name\":");
+                self.string(&column.name);
+                self.raw(match column.data_type {
+                    ColumnType::Boolean => ",\"type\":\"boolean\"",
+                    ColumnType::Integer => ",\"type\":\"integer\"",
+                    ColumnType::Float => ",\"type\":\"float\"",
+                    ColumnType::Text => ",\"type\":\"text\"",
+                    ColumnType::Json => ",\"type\":\"json\"",
+                });
+                self.raw(if column.nullable {
+                    ",\"nullable\":true"
+                } else {
+                    ",\"nullable\":false"
+                });
+                if let Some(default) = &column.default {
+                    self.raw(",\"default\":");
+                    self.value(default, 1)?;
+                }
+                self.raw("}");
+            }
+            self.raw("],\"primaryKey\":");
+            self.strings(&table.primary_key);
+            self.raw(",\"indexes\":[");
+            for (position, index) in indexes.iter().enumerate() {
+                if position > 0 {
+                    self.raw(",");
+                }
+                self.raw("{\"name\":");
+                self.string(&index.name);
+                self.raw(",\"columns\":");
+                self.strings(&index.columns);
+                self.raw(if index.unique {
+                    ",\"unique\":true}"
+                } else {
+                    ",\"unique\":false}"
+                });
+            }
+            self.raw("]}");
+            self.bounded()?;
+        }
+        self.raw("]}");
+        Ok(())
+    }
+
     /// Writes each result's header as the payload, or with `list` an array of them, closes the
     /// envelope, and then writes each result's fields and rows on a line of its own.
     fn results(&mut self, results: &[ExecuteResult], array_rows: bool, list: bool) -> Result<()> {
@@ -577,7 +650,7 @@ fn serialization() -> EngineError {
 mod tests {
     use super::*;
     use serde_json::json;
-    use tinyjoin_core::{ResultField, TableKeys};
+    use tinyjoin_core::{ColumnDefinition, ResultField, TableKeys};
 
     fn result(fields: &[(&str, u32)], rows: Vec<Value>) -> ExecuteResult {
         ExecuteResult {
@@ -618,7 +691,7 @@ mod tests {
 
     #[test]
     fn operation_numbers_are_dense_and_stable() {
-        assert_eq!(VERSION, 4);
+        assert_eq!(VERSION, 5);
         assert_eq!(
             [
                 OP_EXECUTE_SQL,
@@ -633,8 +706,9 @@ mod tests {
                 OP_REVISION,
                 OP_CLOSE,
                 OP_CHECK,
+                OP_SCHEMA,
             ],
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
         );
     }
 
@@ -653,12 +727,12 @@ mod tests {
         assert_eq!(
             written(std::slice::from_ref(&rows), false, false).unwrap(),
             format!(
-                "[4,0,1,{header}]\n{fields},\"rows\":[{{\"title\":\"one\",\"id\":1}},{{\"title\":null,\"id\":2}}]}}"
+                "[5,0,1,{header}]\n{fields},\"rows\":[{{\"title\":\"one\",\"id\":1}},{{\"title\":null,\"id\":2}}]}}"
             )
         );
         assert_eq!(
             written(std::slice::from_ref(&rows), true, false).unwrap(),
-            format!("[4,0,1,{header}]\n{fields},\"rows\":[[\"one\",1],[null,2]]}}")
+            format!("[5,0,1,{header}]\n{fields},\"rows\":[[\"one\",1],[null,2]]}}")
         );
 
         let empty = ExecuteResult {
@@ -673,7 +747,7 @@ mod tests {
         assert_eq!(
             written(&[empty.clone(), empty], false, true).unwrap(),
             [
-                r#"[4,0,1,[{"command":"UPDATE","revision":8,"rowCount":3,"tables":[],"keys":{}},{"command":"UPDATE","revision":8,"rowCount":3,"tables":[],"keys":{}}]]"#,
+                r#"[5,0,1,[{"command":"UPDATE","revision":8,"rowCount":3,"tables":[],"keys":{}},{"command":"UPDATE","revision":8,"rowCount":3,"tables":[],"keys":{}}]]"#,
                 r#"{"fields":[],"rows":[]}"#,
                 r#"{"fields":[],"rows":[]}"#,
             ]
@@ -710,6 +784,55 @@ mod tests {
             written(&[misnamed], true, false).unwrap_err().code,
             "BRIDGE_SERIALIZATION_ERROR"
         );
+    }
+
+    #[test]
+    fn a_schema_is_written_with_its_columns_keys_and_indexes() {
+        let table = TableDefinition {
+            name: "t\"1".into(),
+            primary_key: vec!["id".into(), "k".into()],
+            columns: vec![
+                ColumnDefinition {
+                    name: "id".into(),
+                    data_type: ColumnType::Integer,
+                    nullable: false,
+                    default: None,
+                },
+                ColumnDefinition {
+                    name: "k".into(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                    default: Some(json!("x")),
+                },
+                ColumnDefinition {
+                    name: "doc".into(),
+                    data_type: ColumnType::Json,
+                    nullable: true,
+                    default: Some(Value::Null),
+                },
+            ],
+        };
+        let index = IndexDefinition {
+            name: "by_k".into(),
+            table: "t\"1".into(),
+            columns: vec!["k".into()],
+            unique: true,
+        };
+        let mut json = Json::default();
+        json.schema(&[(Rc::new(table), vec![index])]).unwrap();
+        assert_eq!(
+            json.0,
+            concat!(
+                r#"{"tables":[{"name":"t\"1","columns":["#,
+                r#"{"name":"id","type":"integer","nullable":false},"#,
+                r#"{"name":"k","type":"text","nullable":false,"default":"x"},"#,
+                r#"{"name":"doc","type":"json","nullable":true,"default":null}],"#,
+                r#""primaryKey":["id","k"],"indexes":[{"name":"by_k","columns":["k"],"unique":true}]}]}"#,
+            )
+        );
+        let mut json = Json::default();
+        json.schema(&[]).unwrap();
+        assert_eq!(json.0, r#"{"tables":[]}"#);
     }
 
     #[test]
@@ -793,11 +916,11 @@ mod tests {
         let error = EngineError::new("CONSTRAINT", "a \"quoted\" failure").with_retryable(true);
         assert_eq!(
             error_text(&error),
-            r#"[4,1,0,{"code":"CONSTRAINT","message":"a \"quoted\" failure","retryable":true}]"#
+            r#"[5,1,0,{"code":"CONSTRAINT","message":"a \"quoted\" failure","retryable":true}]"#
         );
         assert_eq!(
             error_text(&EngineError::new("HUGE", "x".repeat(MAX_BYTES))),
-            r#"[4,1,0,{"code":"BRIDGE_SERIALIZATION_ERROR","message":"TinyJoin could not encode a structured bridge error","retryable":false}]"#
+            r#"[5,1,0,{"code":"BRIDGE_SERIALIZATION_ERROR","message":"TinyJoin could not encode a structured bridge error","retryable":false}]"#
         );
     }
 

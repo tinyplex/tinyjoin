@@ -767,6 +767,22 @@ impl<D: PageDevice> PagedStorage<D> {
 
     /// The operations a write set is charged once for each table it changes: the table's own
     /// catalog entry, and one for each of its indexes.
+    /// Every table, in name order, with the indexes on it, also in name order.
+    pub(crate) fn schema(&self) -> Result<Vec<(Rc<TableDefinition>, Vec<IndexDefinition>)>> {
+        self.ensure_ready()?;
+        let mut tables = Vec::with_capacity(self.tables.len());
+        for table in self.tables.values() {
+            let mut indexes = Vec::new();
+            for index in self.indexes.values() {
+                if index.definition.table == table.schema.name {
+                    indexes.push(index.definition.clone());
+                }
+            }
+            tables.push((Rc::clone(&table.schema), indexes));
+        }
+        Ok(tables)
+    }
+
     pub(crate) fn catalog_operations(&self, table: &str) -> usize {
         1 + self
             .indexes

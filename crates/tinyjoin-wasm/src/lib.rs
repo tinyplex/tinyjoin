@@ -166,6 +166,10 @@ impl WasmEngine {
                 self.engine()?.check()?;
                 structured::unit(false)
             }
+            structured::OP_SCHEMA => {
+                request.finish()?;
+                structured::schema(&self.engine()?.schema()?)
+            }
             _ => Err(EngineError::new(
                 "INVALID_BRIDGE_VALUE",
                 "Invalid structured bridge request",

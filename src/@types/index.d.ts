@@ -63,6 +63,57 @@ export interface Results<RowType = Row> {
   keys: ChangedKeys;
 }
 
+/// ColumnType
+export type ColumnType = 'boolean' | 'integer' | 'float' | 'text' | 'json';
+
+/// ColumnSchema
+export interface ColumnSchema {
+  /// ColumnSchema.name
+  name: string;
+
+  /// ColumnSchema.type
+  type: ColumnType;
+
+  /// ColumnSchema.nullable
+  nullable: boolean;
+
+  /// ColumnSchema.default
+  default?: JsonValue;
+}
+
+/// IndexSchema
+export interface IndexSchema {
+  /// IndexSchema.name
+  name: string;
+
+  /// IndexSchema.columns
+  columns: string[];
+
+  /// IndexSchema.unique
+  unique: boolean;
+}
+
+/// TableSchema
+export interface TableSchema {
+  /// TableSchema.name
+  name: string;
+
+  /// TableSchema.columns
+  columns: ColumnSchema[];
+
+  /// TableSchema.primaryKey
+  primaryKey: string[];
+
+  /// TableSchema.indexes
+  indexes: IndexSchema[];
+}
+
+/// Schema
+export interface Schema {
+  /// Schema.tables
+  tables: TableSchema[];
+}
+
 /// SerializedError
 export interface SerializedError {
   /// SerializedError.code
@@ -268,6 +319,9 @@ export class Client {
 
   /// Client.getRevision
   getRevision(): number;
+
+  /// Client.getSchema
+  getSchema(): Promise<Schema>;
 
   /// Client.check
   check(): Promise<void>;

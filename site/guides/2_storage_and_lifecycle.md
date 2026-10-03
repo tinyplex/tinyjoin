@@ -63,11 +63,44 @@ best-effort storage under pressure. An application that needs stronger local
 retention can make a user-appropriate `navigator.storage.persist()` request.
 TinyJoin does not make that product decision during startup.
 
+## Reading the schema
+
+getSchema() returns the database's tables as typed objects, with their columns,
+primary keys, and indexes, rather than through SQL catalog tables, which
+TinyJoin does not have:
+
+```ts
+const {tables} = await db.getSchema();
+const tasks = tables.find(({name}) => name === 'tasks');
+// -> {
+//   name: 'tasks',
+//   columns: [
+//     {name: 'id', type: 'text', nullable: false},
+//     {name: 'done', type: 'boolean', nullable: false, default: false},
+//   ],
+//   primaryKey: ['id'],
+//   indexes: [{name: 'tasks_done', columns: ['done'], unique: false}],
+// }
+```
+
+Tables, and each table's indexes, are in name order. Columns are in the order
+the table declares them, followed by any that `ALTER TABLE` added. A column's
+`type` is one of the five [runtime types](/guides/sql-compatibility/#runtime-types),
+not the spelling it was declared with, so `VARCHAR` reads back as `text` and
+`BIGINT` as `integer`. `default` is present only for a column that declares
+one, and is `null` for `DEFAULT NULL`. The primary key is not listed among the
+indexes, and its columns are never nullable.
+
+Use it to confirm that a database matches the schema the application expects,
+to decide which migration steps an older database still needs, or to generate
+code from the tables. It reads only the catalog, not rows, so it is cheap even
+for a large database. Call it outside a transaction.
+
 ## Application backups and restoration
 
 TinyJoin has no general public export, import, list-databases, or
-delete-database API. There is no SQL catalog introspection or portable binary
-backup contract. Keep schemas and migration rules in your application. For
+delete-database API, and no portable binary backup contract. Keep schemas and
+migration rules in your application. For
 reconstructible data, fetching it again from its original source may be simpler
 than a backup.
 

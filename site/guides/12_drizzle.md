@@ -79,7 +79,8 @@ one.
 Create tables with SQL through the Client, idempotently with
 `IF NOT EXISTS`, and version the OPFS name with the schema. Drizzle Kit's
 `push`, `pull`, and Studio read PostgreSQL's system catalogs, which TinyJoin
-does not have, and Drizzle's migrators create a `SERIAL` table in a schema of
+does not have (its Client reads the same facts with getSchema()), and Drizzle's
+migrators create a `SERIAL` table in a schema of
 their own, so none of them works. The SQL that `drizzle-kit generate` writes
 is a useful start, but TinyJoin refuses its foreign keys, table-level `UNIQUE`
 constraints, and `USING btree` index methods; write the equivalent

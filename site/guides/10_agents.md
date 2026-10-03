@@ -73,6 +73,8 @@ and has no OPFS, filesystem persistence, or remote synchronization. See the
   `UPDATE counters SET hits = hits + 1 WHERE id = $1`, rather than reading it
   first.
 - Keep schema setup idempotent with `IF NOT EXISTS` where appropriate.
+- Read tables, columns, primary keys, and indexes with db.getSchema(). There is
+  no `information_schema` or `pg_catalog` to query.
 - Treat a row generic as a TypeScript assertion, not runtime validation.
 - Consult the
   [SQL compatibility contract](https://tinyjoin.org/guides/sql-compatibility/)

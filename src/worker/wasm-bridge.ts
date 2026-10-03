@@ -18,6 +18,7 @@ import {
   type ApplyOutcome,
   type JsonValue,
   type RowMode,
+  type Schema,
   type SqlResult,
   type SqlResultText,
 } from '../protocol.js';
@@ -48,9 +49,10 @@ export const WASM_OPERATION = {
   revision: 10,
   close: 11,
   check: 12,
+  schema: 13,
 } as const;
 
-const BRIDGE_VERSION = 4;
+const BRIDGE_VERSION = 5;
 const SUCCESS = 0;
 const FAILURE = 1;
 const SAFE_RESPONSE = 0;
@@ -321,6 +323,11 @@ export const adaptStructuredWasmEngine = (
       invoke(WASM_OPERATION.check, EMPTY_REQUEST, false, decodeUnit);
     },
 
+    schema: (): Schema => {
+      assertCallable();
+      return invoke(WASM_OPERATION.schema, EMPTY_REQUEST, false, decodeSchema);
+    },
+
     close: (): void => {
       assertNotInPageDeviceCallback();
       if (state === 'closed') {
@@ -476,6 +483,10 @@ const decodeUnit = decoder(
 );
 const decodeBoolean = decoder('boolean result', single(isBoolean));
 const decodeRevision = decoder('revision', single(isCount));
+const decodeSchema = decoder(
+  'schema',
+  single((payload): payload is Schema => isRpcResultHeader('schema', payload)),
+);
 const decodePreparedStatementId = decoder(
   'prepared statement ID',
   single((payload): payload is number => isCountWithin(payload, 1, MAX_U32)),

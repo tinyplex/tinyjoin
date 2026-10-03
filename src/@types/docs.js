@@ -77,6 +77,145 @@
 }
 
 /**
+ * The ColumnType type names one of the five runtime types a column holds.
+ *
+ * Each SQL type name maps to one of them: `INTEGER` and `BIGINT` to `integer`,
+ * `REAL` and `DOUBLE PRECISION` to `float`, `TEXT` and `VARCHAR` to `text`,
+ * and `JSON` and `JSONB` to `json`. The schema keeps the runtime type, not the
+ * name the table was declared with.
+ * @category Schema
+ * @since v0.5.0
+ */
+/// ColumnType
+
+/**
+ * The ColumnSchema interface describes one column of a table.
+ * @category Schema
+ * @since v0.5.0
+ */
+/// ColumnSchema
+{
+  /**
+   * The name property contains the column's name, as the table declares it.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// ColumnSchema.name
+
+  /**
+   * The type property contains the column's runtime ColumnType.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// ColumnSchema.type
+
+  /**
+   * The nullable property is false when the column is declared `NOT NULL` or
+   * is part of the primary key.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// ColumnSchema.nullable
+
+  /**
+   * The default property contains the column's literal `DEFAULT` value, and is
+   * absent when the column declares none. A column declared `DEFAULT NULL` has
+   * a default of `null`.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// ColumnSchema.default
+}
+
+/**
+ * The IndexSchema interface describes one secondary index on a table.
+ *
+ * A primary key is not listed as an index; TableSchema's primaryKey holds it.
+ * @category Schema
+ * @since v0.5.0
+ */
+/// IndexSchema
+{
+  /**
+   * The name property contains the index's name.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// IndexSchema.name
+
+  /**
+   * The columns property contains the indexed column names, in index order.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// IndexSchema.columns
+
+  /**
+   * The unique property is true for an index created with `CREATE UNIQUE
+   * INDEX`.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// IndexSchema.unique
+}
+
+/**
+ * The TableSchema interface describes one table, its columns, its primary
+ * key, and its indexes.
+ * @category Schema
+ * @since v0.5.0
+ */
+/// TableSchema
+{
+  /**
+   * The name property contains the table's name.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// TableSchema.name
+
+  /**
+   * The columns property describes the table's columns, in declaration order,
+   * including any added later by `ALTER TABLE`.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// TableSchema.columns
+
+  /**
+   * The primaryKey property contains the primary-key column names, in key
+   * order. A composite key has more than one.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// TableSchema.primaryKey
+
+  /**
+   * The indexes property describes the table's secondary indexes, in name
+   * order.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// TableSchema.indexes
+}
+
+/**
+ * The Schema interface is returned by the getSchema method, and describes
+ * every table in the database.
+ * @category Schema
+ * @since v0.5.0
+ */
+/// Schema
+{
+  /**
+   * The tables property describes the database's tables, in name order.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// Schema.tables
+}
+
+/**
  * The ChangedKeys type maps a table name to the primary keys that changed in
  * it.
  *
@@ -643,6 +782,33 @@
    * @since v0.0.5
    */
   /// Client.getRevision
+
+  /**
+   * The getSchema method reads the database's tables, with their columns,
+   * primary keys, and indexes, as the engine's catalog holds them.
+   *
+   * Tables and each table's indexes are in name order, and columns and key
+   * columns are in the order the table declares them. Call it outside a
+   * transaction.
+   * @returns A Promise resolving to the Schema.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   *
+   * const db = await create();
+   * await db.exec(`
+   *   CREATE TABLE tasks (id TEXT PRIMARY KEY, done BOOLEAN NOT NULL DEFAULT false);
+   *   CREATE INDEX tasks_done ON tasks (done);
+   * `);
+   * const {tables} = await db.getSchema();
+   * console.log(tables[0].columns[1]);
+   * // -> {name: 'done', type: 'boolean', nullable: false, default: false}
+   * await db.close();
+   * ```
+   * @category Lifecycle
+   * @since v0.5.0
+   */
+  /// Client.getSchema
 
   /**
    * The check method reads every row and index entry of the committed

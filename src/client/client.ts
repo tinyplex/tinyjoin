@@ -20,6 +20,7 @@ import {
   type ResultField,
   type Results,
   type Row,
+  type Schema,
   type SqlResult,
   type StorageOptions,
 } from '../protocol.js';
@@ -121,6 +122,7 @@ export interface Client {
     listener: (event: TablesChangedEvent) => void,
   ): () => void;
   getRevision(): number;
+  getSchema(): Promise<Schema>;
   check(): Promise<void>;
   close(): Promise<void>;
 }
@@ -505,6 +507,9 @@ const createClient = (options: ClientOptions): Client => {
     },
 
     getRevision: (): number => revision,
+
+    getSchema: (): Promise<Schema> =>
+      direct(() => rpc.request('schema', undefined)),
 
     check: (): Promise<void> => direct(() => rpc.request('check', undefined)),
 

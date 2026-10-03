@@ -128,6 +128,7 @@ function mockEngine(): WorkerEngine {
     inTransaction: vi.fn(() => false),
     revision: vi.fn(() => 0),
     check: vi.fn(),
+    schema: vi.fn(() => ({tables: []})),
     close: vi.fn(),
   };
 }

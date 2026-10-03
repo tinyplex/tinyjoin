@@ -136,6 +136,7 @@ function mockEngine() {
     inTransaction: vi.fn(() => transactionActive),
     revision: vi.fn(() => revision),
     check: vi.fn(),
+    schema: vi.fn(() => ({tables: []})),
     close: vi.fn(),
   };
   return engine;
@@ -165,10 +166,10 @@ describe('startWorker', () => {
     const callStructured = vi.fn((_version: number, operation: number) => {
       if (operation === WASM_OPERATION.executeSql) {
         const {data, ...header} = result;
-        return `${JSON.stringify([4, 0, 0, header])}\n${data}`;
+        return `${JSON.stringify([5, 0, 0, header])}\n${data}`;
       }
       return JSON.stringify([
-        4,
+        5,
         0,
         0,
         operation === WASM_OPERATION.revision ? 0 : null,
@@ -769,6 +770,47 @@ describe('startWorker', () => {
       },
     });
     expect(engine.check).toHaveBeenCalledOnce();
+  });
+
+  it('reads the schema, even with a transaction active', async () => {
+    const scope = new FakeScope();
+    const engine = mockEngine();
+    const schema = {
+      tables: [
+        {
+          name: 'posts',
+          columns: [{name: 'id', type: 'integer' as const, nullable: false}],
+          primaryKey: ['id'],
+          indexes: [],
+        },
+      ],
+    };
+    vi.mocked(engine.schema).mockReturnValue(schema);
+    startWorker({scope, durableEngineFactory: async () => engine});
+    for (const [id, method] of [
+      [1, 'init'],
+      [2, 'schema'],
+      [3, 'beginTransaction'],
+      [4, 'schema'],
+    ] as const) {
+      scope.send({
+        v: PROTOCOL_VERSION,
+        id,
+        method,
+        params: method === 'init' ? {storage: {kind: 'memory'}} : undefined,
+      } as WorkerRequest);
+    }
+    await waitForPosted(scope, 4);
+
+    for (const id of [2, 4]) {
+      expect(scope.posted).toContainEqual({
+        v: PROTOCOL_VERSION,
+        id,
+        ok: true,
+        result: schema,
+      });
+    }
+    expect(engine.schema).toHaveBeenCalledTimes(2);
   });
 
   it('keeps the transaction token active when rollback fails so cleanup can retry', async () => {

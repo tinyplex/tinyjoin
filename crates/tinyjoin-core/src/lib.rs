@@ -45,13 +45,12 @@ pub use device::PageDevice;
 pub(crate) use engine::Engine;
 pub use error::{EngineError, Result};
 pub use model::{
-    ApplyOutcome, ChangedKeys, ExecuteResult, MAX_CHANGED_KEYS_PER_TABLE, ResultField, Row,
-    TableKeys,
+    ApplyOutcome, ChangedKeys, ColumnDefinition, ColumnType, ExecuteResult, IndexDefinition,
+    MAX_CHANGED_KEYS_PER_TABLE, ResultField, Row, TableDefinition, TableKeys,
 };
 pub(crate) use model::{
-    ColumnDefinition, ColumnType, ComparisonOperator, IndexDefinition, NullOrder, OrderBy,
-    OrderDirection, Predicate, QueryResult, RowChange, SelectColumn, SelectPlan, Subquery,
-    TableDefinition,
+    ComparisonOperator, NullOrder, OrderBy, OrderDirection, Predicate, QueryResult, RowChange,
+    SelectColumn, SelectPlan, Subquery,
 };
 #[cfg(test)]
 pub(crate) use page::BitmapSlot;

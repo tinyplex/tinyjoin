@@ -80,9 +80,19 @@ optional peer dependency and never bundles it, so the download sizes are
 unchanged. Relational queries with `with`, Drizzle Kit, and Drizzle's
 migrators are not supported. See the [Drizzle guide](/guides/drizzle/).
 
+The new getSchema() method on the Client reads the database's tables, with
+their columns, primary keys, and indexes, as typed objects rather than through
+SQL catalog tables, which TinyJoin does not have. Each column carries its
+runtime type, whether it is nullable, and any literal default. See
+[reading the schema](/guides/storage-and-lifecycle/#reading-the-schema).
+
 **Upgrading from v0.4.0 needs no action.** Install, rebuild, and redeploy. The
-Worker protocol stays at version 10 and the page format stays at format 3, so
-an existing database opens with no migration and no OPFS namespace change. The
+page format stays at format 3, so an existing database opens with no migration
+and no OPFS namespace change. The Worker protocol moves from version 10 to 11
+for the schema request. Client and Worker ship together and are upgraded
+together by a normal install, so this affects only a deployment that pins or
+caches a Worker file independently of the client bundle, where a mismatched
+pair fails cleanly with `PROTOCOL_MISMATCH`. The
 new syntax was previously rejected, so statements that already worked keep
 their meaning, with one exception: where a table has a column whose quoted name
 begins with the table's own name and a dot, such as `"extra.value"` in a table

@@ -11,6 +11,9 @@ export type {
 export {ClientError} from './client/error.js';
 export type {
   ChangedKeys,
+  ColumnSchema,
+  ColumnType,
+  IndexSchema,
   JsonPrimitive,
   JsonValue,
   QueryOptions,
@@ -18,5 +21,7 @@ export type {
   Results,
   Row,
   RowMode,
+  Schema,
   SerializedError,
+  TableSchema,
 } from './protocol.js';

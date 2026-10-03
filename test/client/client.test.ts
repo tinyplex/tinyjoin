@@ -1159,6 +1159,37 @@ describe('Client', () => {
     await client.close();
   });
 
+  it('reads the schema the Worker returns, outside a transaction', async () => {
+    const worker = writableWorker();
+    const answer = worker.onPost!;
+    const schema = {
+      tables: [
+        {
+          name: 'posts',
+          columns: [
+            {name: 'id', type: 'integer', nullable: false},
+            {name: 'done', type: 'boolean', nullable: false, default: false},
+          ],
+          primaryKey: ['id'],
+          indexes: [{name: 'posts_done', columns: ['done'], unique: false}],
+        },
+      ],
+    };
+    worker.onPost = (message) => {
+      if (message.method !== 'schema') return answer(message);
+      queueMicrotask(() => respondOk(worker, message, schema));
+    };
+    const client = await create({worker});
+
+    await expect(client.getSchema()).resolves.toEqual(schema);
+    await client.transaction(async () => {
+      await expect(client.getSchema()).rejects.toMatchObject({
+        code: 'TRANSACTION_ACTIVE',
+      });
+    });
+    await client.close();
+  });
+
   it('makes concurrent close calls await the same worker cleanup', async () => {
     const worker = new FakeWorker();
     let closeRequest: Extract<WorkerRequest, {method: 'close'}> | undefined;

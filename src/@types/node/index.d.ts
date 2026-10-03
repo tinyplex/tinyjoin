@@ -8,6 +8,9 @@ export {ClientError} from '../index.js';
 /// node.sharedTypes
 export type {
   Client,
+  ColumnSchema,
+  ColumnType,
+  IndexSchema,
   JsonPrimitive,
   JsonValue,
   PreparedStatement,
@@ -16,8 +19,10 @@ export type {
   Results,
   Row,
   RowMode,
+  Schema,
   SerializedError,
   SubscriptionOptions,
+  TableSchema,
   TablesChangedEvent,
   Transaction,
 } from '../index.js';

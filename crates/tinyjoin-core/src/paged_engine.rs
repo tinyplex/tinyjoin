@@ -1,10 +1,11 @@
 use std::cell::Cell;
+use std::rc::Rc;
 
 use serde_json::Value;
 
 use crate::{
-    ApplyOutcome, ChangedKeys, EngineError, ExecuteResult, PageDevice, PagedStorage,
-    PreparedStatementId, QueryResult, Result, StorageReader,
+    ApplyOutcome, ChangedKeys, EngineError, ExecuteResult, IndexDefinition, PageDevice,
+    PagedStorage, PreparedStatementId, QueryResult, Result, StorageReader, TableDefinition,
     paged_transaction::{PagedReadView, PagedTransaction},
     prepared_statement::PreparedStatementRegistry,
     statement::{PlannedDml, Statement, WriteStatement},
@@ -229,6 +230,13 @@ impl<D: PageDevice> PagedEngine<D> {
 
     pub fn revision(&self) -> u64 {
         self.storage.revision()
+    }
+
+    /// The database's tables, in name order, each with the indexes on it, also in name order.
+    ///
+    /// DDL cannot run inside a transaction, so a transaction sees the committed schema.
+    pub fn schema(&self) -> Result<Vec<(Rc<TableDefinition>, Vec<IndexDefinition>)>> {
+        self.storage.schema()
     }
 
     /// Checks every row and index entry of the committed database, and every page holding them,
@@ -4071,6 +4079,83 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+
+    #[test]
+    fn the_schema_lists_each_table_with_its_columns_key_and_indexes() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        assert!(engine.schema().unwrap().is_empty());
+        engine
+            .exec_sql(
+                "CREATE TABLE \"Zebra\" (id TEXT PRIMARY KEY);\
+                 CREATE TABLE notes (owner INTEGER, id INTEGER, body TEXT NOT NULL DEFAULT 'x', \
+                   rating FLOAT, doc JSON DEFAULT NULL, PRIMARY KEY (owner, id));\
+                 CREATE UNIQUE INDEX notes_body ON notes (body, owner);\
+                 CREATE INDEX a_notes_rating ON notes (id);\
+                 ALTER TABLE notes ADD COLUMN done BOOLEAN NOT NULL DEFAULT false;",
+            )
+            .unwrap();
+        let schema = engine.schema().unwrap();
+        // Tables and indexes come in name order, columns as declared, and keys in key order.
+        let names = schema
+            .iter()
+            .map(|(table, _)| table.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["Zebra", "notes"]);
+        let (notes, indexes) = &schema[1];
+        assert_eq!(notes.primary_key, ["owner", "id"]);
+        let columns = notes
+            .columns
+            .iter()
+            .map(|column| {
+                (
+                    column.name.as_str(),
+                    column.data_type,
+                    column.nullable,
+                    column.default.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            columns,
+            [
+                ("owner", ColumnType::Integer, false, None),
+                ("id", ColumnType::Integer, false, None),
+                ("body", ColumnType::Text, false, Some(json!("x"))),
+                ("rating", ColumnType::Float, true, None),
+                ("doc", ColumnType::Json, true, Some(Value::Null)),
+                ("done", ColumnType::Boolean, false, Some(json!(false))),
+            ]
+        );
+        let indexes = indexes
+            .iter()
+            .map(|index| (index.name.as_str(), index.columns.clone(), index.unique))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            indexes,
+            [
+                ("a_notes_rating", vec!["id".to_owned()], false),
+                (
+                    "notes_body",
+                    vec!["body".to_owned(), "owner".to_owned()],
+                    true
+                ),
+            ]
+        );
+
+        // A transaction reads the committed schema, which its statements cannot change, and a
+        // dropped index or table leaves it.
+        engine.begin_transaction().unwrap();
+        assert_eq!(engine.schema().unwrap(), schema);
+        engine.rollback_transaction().unwrap();
+        engine
+            .exec_sql("DROP INDEX a_notes_rating; DROP TABLE \"Zebra\";")
+            .unwrap();
+        let schema = engine.schema().unwrap();
+        assert_eq!(schema.len(), 1);
+        assert_eq!(schema[0].1.len(), 1);
+        let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        assert_eq!(reopened.schema().unwrap(), schema);
     }
 
     #[test]

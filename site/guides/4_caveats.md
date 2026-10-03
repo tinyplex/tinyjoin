@@ -120,7 +120,8 @@ before composing asynchronous application work.
 
 TinyJoin has no PostgreSQL wire protocol, server process, roles or grants,
 system catalogs, extensions, stored procedures, WAL, replication, or
-point-in-time recovery. It does not synchronize with a remote database and does
+point-in-time recovery. getSchema() reads its tables, columns, keys, and
+indexes in place of a catalog. It does not synchronize with a remote database and does
 not propagate offline writes. Its storage is TinyJoin's own page format, not a
 PostgreSQL data directory.
 

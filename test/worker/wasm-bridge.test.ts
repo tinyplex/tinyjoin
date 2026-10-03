@@ -20,7 +20,7 @@ import {
 } from '../../src/worker/wasm-bridge.ts';
 import {decodeRequest} from '../helpers/wasm-request.ts';
 
-const VERSION = 4;
+const VERSION = 5;
 const SUCCESS = 0;
 const FAILURE = 1;
 const SAFE = 0;
@@ -136,6 +136,7 @@ describe('WASM engine bridge', () => {
       revision: 10,
       close: 11,
       check: 12,
+      schema: 13,
     });
   });
 
@@ -367,6 +368,37 @@ describe('WASM engine bridge', () => {
         expect.objectContaining({code: 'STORAGE_ENGINE_POISONED'}),
       );
     }
+  });
+
+  it('reads a schema, and keeps a malformed one nonfatal', () => {
+    const raw = new FakeRawEngine();
+    const schema = {
+      tables: [
+        {
+          name: 'notes',
+          columns: [
+            {name: 'id', type: 'integer', nullable: false},
+            {name: 'body', type: 'text', nullable: true, default: null},
+          ],
+          primaryKey: ['id'],
+          indexes: [{name: 'notes_body', columns: ['body'], unique: false}],
+        },
+      ],
+    };
+    raw.response = success(schema);
+    const engine = adaptStructuredWasmEngine(raw);
+
+    expect(engine.schema()).toEqual(schema);
+    expect(raw.calls).toEqual([
+      {
+        bridgeVersion: VERSION,
+        operation: WASM_OPERATION.schema,
+        payload: undefined,
+      },
+    ]);
+    raw.response = success({tables: [{name: 'notes'}]});
+    expect(() => engine.schema()).toThrow(WasmStructuredDecodeError);
+    expect(raw.closeCalls).toBe(0);
   });
 
   it('keeps malformed nonmutating control results nonfatal', () => {

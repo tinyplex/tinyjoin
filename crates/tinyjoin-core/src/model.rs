@@ -5,9 +5,10 @@ use crate::expression::Expression;
 
 pub type Row = Map<String, Value>;
 
+/// One of the five runtime types a column holds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum ColumnType {
+pub enum ColumnType {
     Boolean,
     Integer,
     Float,
@@ -55,31 +56,36 @@ impl ResultField {
     }
 }
 
+/// A column of a table, as its catalog holds it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ColumnDefinition {
-    pub(crate) name: String,
-    pub(crate) data_type: ColumnType,
-    pub(crate) nullable: bool,
+pub struct ColumnDefinition {
+    pub name: String,
+    pub data_type: ColumnType,
+    pub nullable: bool,
+    /// The literal `DEFAULT`, where the column declares one.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) default: Option<Value>,
+    pub default: Option<Value>,
 }
 
+/// A table, as its catalog holds it: its columns in declared order, and its primary key's
+/// columns in key order.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct TableDefinition {
-    pub(crate) name: String,
-    pub(crate) primary_key: Vec<String>,
-    pub(crate) columns: Vec<ColumnDefinition>,
+pub struct TableDefinition {
+    pub name: String,
+    pub primary_key: Vec<String>,
+    pub columns: Vec<ColumnDefinition>,
 }
 
+/// An index on a table, as its catalog holds it, with its columns in index order.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct IndexDefinition {
-    pub(crate) name: String,
-    pub(crate) table: String,
-    pub(crate) columns: Vec<String>,
-    pub(crate) unique: bool,
+pub struct IndexDefinition {
+    pub name: String,
+    pub table: String,
+    pub columns: Vec<String>,
+    pub unique: bool,
 }
 
 /// A catalog model read back from the JSON its [`Serialize`] implementation writes. Reading it by

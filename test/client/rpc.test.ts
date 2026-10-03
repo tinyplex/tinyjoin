@@ -271,6 +271,51 @@ describe('WorkerRpc', () => {
     ).toBe(false);
   });
 
+  it('validates a schema result strictly', () => {
+    const column = {name: 'id', type: 'integer', nullable: false};
+    const table = {
+      name: 'notes',
+      columns: [column, {name: 'body', type: 'json', nullable: true, default: {a: [1]}}],
+      primaryKey: ['id'],
+      indexes: [{name: 'notes_body', columns: ['body'], unique: true}],
+    };
+
+    expect(isRpcResult('schema', {tables: []})).toBe(true);
+    expect(isRpcResult('schema', {tables: [table]})).toBe(true);
+    expect(
+      isRpcResult('schema', {
+        tables: [{...table, columns: [{...column, default: null}]}],
+      }),
+    ).toBe(true);
+    expect(
+      isWorkerRequest({
+        v: PROTOCOL_VERSION,
+        id: 1,
+        method: 'schema',
+        params: undefined,
+      }),
+    ).toBe(true);
+    expect(
+      isWorkerRequest({v: PROTOCOL_VERSION, id: 1, method: 'schema', params: {}}),
+    ).toBe(false);
+
+    for (const invalid of [
+      undefined,
+      {},
+      {tables: [], extra: true},
+      {tables: [{...table, extra: true}]},
+      {tables: [{...table, primaryKey: 'id'}]},
+      {tables: [{...table, columns: [{...column, type: 'bigint'}]}]},
+      {tables: [{...table, columns: [{...column, nullable: 0}]}]},
+      {tables: [{...table, columns: [{...column, default: undefined}]}]},
+      {tables: [{...table, columns: [{...column, extra: true}]}]},
+      {tables: [{...table, indexes: [{name: 'i', columns: ['id']}]}]},
+      {tables: [{...table, columns: new Array(1)}]},
+    ]) {
+      expect(isRpcResult('schema', invalid)).toBe(false);
+    }
+  });
+
   it('rejects extra request envelope and parameter keys', () => {
     const requests = [
       {

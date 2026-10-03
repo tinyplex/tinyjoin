@@ -2,6 +2,7 @@ import type {
   ApplyOutcome,
   JsonValue,
   RowMode,
+  Schema,
   SqlResult,
   SqlResultText,
   StorageOptions,
@@ -29,6 +30,7 @@ export interface WorkerEngine {
   inTransaction(): boolean;
   revision(): number;
   check(): void;
+  schema(): Schema;
   close(): void;
 }
 

@@ -1,4 +1,4 @@
-import {Client, create} from 'tinyjoin';
+import {Client, create, type Schema} from 'tinyjoin';
 
 type Post = {
   id: number;
@@ -548,6 +548,7 @@ async function persistenceProbe(
   mutationCommitMs: number;
   revision: number;
   rowCount: number;
+  schema: Schema;
   updatedTitle: string;
 }> {
   if (!Number.isSafeInteger(rowCount) || rowCount < 1 || rowCount > 10_000) {
@@ -621,6 +622,7 @@ async function persistenceProbe(
     const checkStartedAt = performance.now();
     await afterCrash.client.check();
     const checkMs = performance.now() - checkStartedAt;
+    const schema = await afterCrash.client.getSchema();
 
     const report = {
       checkMs,
@@ -633,6 +635,7 @@ async function persistenceProbe(
       mutationCommitMs,
       revision: afterCrashResult.revision,
       rowCount: restored.rows.length,
+      schema,
       updatedTitle: afterCrashResult.rows[0]?.title ?? '',
     };
     await afterCrash.client.close();

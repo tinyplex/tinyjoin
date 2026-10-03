@@ -27,6 +27,28 @@ test('persists complete state across dedicated Worker restarts', async ({
   expect(report.emptyTableRows).toBe(0);
   expect(report.revision).toBe(3);
   expect(report.updatedTitle).toBe('Persisted after forced termination');
+  expect(report.schema).toEqual({
+    tables: [
+      {
+        name: 'empty_table',
+        columns: [{name: 'id', type: 'integer', nullable: false}],
+        primaryKey: ['id'],
+        indexes: [],
+      },
+      {
+        name: 'posts',
+        columns: [
+          {name: 'id', type: 'integer', nullable: false},
+          {name: 'title', type: 'text', nullable: false},
+          {name: 'author', type: 'text', nullable: false},
+          {name: 'published', type: 'boolean', nullable: false},
+          {name: 'body', type: 'text', nullable: false},
+        ],
+        primaryKey: ['id'],
+        indexes: [{name: 'posts_author', columns: ['author'], unique: false}],
+      },
+    ],
+  });
   for (const timing of [
     report.initialCommitMs,
     report.gracefulReopenMs,

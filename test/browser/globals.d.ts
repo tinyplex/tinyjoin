@@ -42,6 +42,7 @@ interface Window {
       mutationCommitMs: number;
       revision: number;
       rowCount: number;
+      schema: import('tinyjoin').Schema;
       updatedTitle: string;
     }>;
     writableDatabaseProbe(databaseName: string): Promise<{

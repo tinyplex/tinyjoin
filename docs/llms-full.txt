@@ -252,7 +252,8 @@ before composing asynchronous application work.
 
 TinyJoin has no PostgreSQL wire protocol, server process, roles or grants,
 system catalogs, extensions, stored procedures, WAL, replication, or
-point-in-time recovery. It does not synchronize with a remote database and does
+point-in-time recovery. getSchema() reads its tables, columns, keys, and
+indexes in place of a catalog. It does not synchronize with a remote database and does
 not propagate offline writes. Its storage is TinyJoin's own page format, not a
 PostgreSQL data directory.
 
@@ -1137,11 +1138,44 @@ best-effort storage under pressure. An application that needs stronger local
 retention can make a user-appropriate `navigator.storage.persist()` request.
 TinyJoin does not make that product decision during startup.
 
+## Reading the schema
+
+getSchema() returns the database's tables as typed objects, with their columns,
+primary keys, and indexes, rather than through SQL catalog tables, which
+TinyJoin does not have:
+
+```ts
+const {tables} = await db.getSchema();
+const tasks = tables.find(({name}) => name === 'tasks');
+// -> {
+//   name: 'tasks',
+//   columns: [
+//     {name: 'id', type: 'text', nullable: false},
+//     {name: 'done', type: 'boolean', nullable: false, default: false},
+//   ],
+//   primaryKey: ['id'],
+//   indexes: [{name: 'tasks_done', columns: ['done'], unique: false}],
+// }
+```
+
+Tables, and each table's indexes, are in name order. Columns are in the order
+the table declares them, followed by any that `ALTER TABLE` added. A column's
+`type` is one of the five [runtime types](https://tinyjoin.org/guides/sql-compatibility/#runtime-types),
+not the spelling it was declared with, so `VARCHAR` reads back as `text` and
+`BIGINT` as `integer`. `default` is present only for a column that declares
+one, and is `null` for `DEFAULT NULL`. The primary key is not listed among the
+indexes, and its columns are never nullable.
+
+Use it to confirm that a database matches the schema the application expects,
+to decide which migration steps an older database still needs, or to generate
+code from the tables. It reads only the catalog, not rows, so it is cheap even
+for a large database. Call it outside a transaction.
+
 ## Application backups and restoration
 
 TinyJoin has no general public export, import, list-databases, or
-delete-database API. There is no SQL catalog introspection or portable binary
-backup contract. Keep schemas and migration rules in your application. For
+delete-database API, and no portable binary backup contract. Keep schemas and
+migration rules in your application. For
 reconstructible data, fetching it again from its original source may be simpler
 than a backup.
 
@@ -1861,7 +1895,8 @@ one.
 Create tables with SQL through the Client, idempotently with
 `IF NOT EXISTS`, and version the OPFS name with the schema. Drizzle Kit's
 `push`, `pull`, and Studio read PostgreSQL's system catalogs, which TinyJoin
-does not have, and Drizzle's migrators create a `SERIAL` table in a schema of
+does not have (its Client reads the same facts with getSchema()), and Drizzle's
+migrators create a `SERIAL` table in a schema of
 their own, so none of them works. The SQL that `drizzle-kit generate` writes
 is a useful start, but TinyJoin refuses its foreign keys, table-level `UNIQUE`
 constraints, and `USING btree` index methods; write the equivalent
@@ -2489,6 +2524,8 @@ and has no OPFS, filesystem persistence, or remote synchronization. See the
   `UPDATE counters SET hits = hits + 1 WHERE id = $1`, rather than reading it
   first.
 - Keep schema setup idempotent with `IF NOT EXISTS` where appropriate.
+- Read tables, columns, primary keys, and indexes with db.getSchema(). There is
+  no `information_schema` or `pg_catalog` to query.
 - Treat a row generic as a TypeScript assertion, not runtime validation.
 - Consult the
   [SQL compatibility contract](https://tinyjoin.org/guides/sql-compatibility/)
@@ -2698,9 +2735,19 @@ optional peer dependency and never bundles it, so the download sizes are
 unchanged. Relational queries with `with`, Drizzle Kit, and Drizzle's
 migrators are not supported. See the [Drizzle guide](https://tinyjoin.org/guides/drizzle/).
 
+The new getSchema() method on the Client reads the database's tables, with
+their columns, primary keys, and indexes, as typed objects rather than through
+SQL catalog tables, which TinyJoin does not have. Each column carries its
+runtime type, whether it is nullable, and any literal default. See
+[reading the schema](https://tinyjoin.org/guides/storage-and-lifecycle/#reading-the-schema).
+
 **Upgrading from v0.4.0 needs no action.** Install, rebuild, and redeploy. The
-Worker protocol stays at version 10 and the page format stays at format 3, so
-an existing database opens with no migration and no OPFS namespace change. The
+page format stays at format 3, so an existing database opens with no migration
+and no OPFS namespace change. The Worker protocol moves from version 10 to 11
+for the schema request. Client and Worker ship together and are upgraded
+together by a normal install, so this affects only a deployment that pins or
+caches a Worker file independently of the client bundle, where a mismatched
+pair fails cleanly with `PROTOCOL_MISMATCH`. The
 new syntax was previously rejected, so statements that already worked keep
 their meaning, with one exception: where a table has a column whose quoted name
 begins with the table's own name and a dot, such as `"extra.value"` in a table
@@ -3296,6 +3343,141 @@ export interface Results<RowType = Row> {
 }
 
 /**
+ * The ColumnType type names one of the five runtime types a column holds.
+ *
+ * Each SQL type name maps to one of them: `INTEGER` and `BIGINT` to `integer`,
+ * `REAL` and `DOUBLE PRECISION` to `float`, `TEXT` and `VARCHAR` to `text`,
+ * and `JSON` and `JSONB` to `json`. The schema keeps the runtime type, not the
+ * name the table was declared with.
+ * @category Schema
+ * @since v0.5.0
+ */
+export type ColumnType = 'boolean' | 'integer' | 'float' | 'text' | 'json';
+
+/**
+ * The ColumnSchema interface describes one column of a table.
+ * @category Schema
+ * @since v0.5.0
+ */
+export interface ColumnSchema {
+  /**
+   * The name property contains the column's name, as the table declares it.
+   * @category Schema
+   * @since v0.5.0
+   */
+  name: string;
+
+  /**
+   * The type property contains the column's runtime ColumnType.
+   * @category Schema
+   * @since v0.5.0
+   */
+  type: ColumnType;
+
+  /**
+   * The nullable property is false when the column is declared `NOT NULL` or
+   * is part of the primary key.
+   * @category Schema
+   * @since v0.5.0
+   */
+  nullable: boolean;
+
+  /**
+   * The default property contains the column's literal `DEFAULT` value, and is
+   * absent when the column declares none. A column declared `DEFAULT NULL` has
+   * a default of `null`.
+   * @category Schema
+   * @since v0.5.0
+   */
+  default?: JsonValue;
+}
+
+/**
+ * The IndexSchema interface describes one secondary index on a table.
+ *
+ * A primary key is not listed as an index; TableSchema's primaryKey holds it.
+ * @category Schema
+ * @since v0.5.0
+ */
+export interface IndexSchema {
+  /**
+   * The name property contains the index's name.
+   * @category Schema
+   * @since v0.5.0
+   */
+  name: string;
+
+  /**
+   * The columns property contains the indexed column names, in index order.
+   * @category Schema
+   * @since v0.5.0
+   */
+  columns: string[];
+
+  /**
+   * The unique property is true for an index created with `CREATE UNIQUE
+   * INDEX`.
+   * @category Schema
+   * @since v0.5.0
+   */
+  unique: boolean;
+}
+
+/**
+ * The TableSchema interface describes one table, its columns, its primary
+ * key, and its indexes.
+ * @category Schema
+ * @since v0.5.0
+ */
+export interface TableSchema {
+  /**
+   * The name property contains the table's name.
+   * @category Schema
+   * @since v0.5.0
+   */
+  name: string;
+
+  /**
+   * The columns property describes the table's columns, in declaration order,
+   * including any added later by `ALTER TABLE`.
+   * @category Schema
+   * @since v0.5.0
+   */
+  columns: ColumnSchema[];
+
+  /**
+   * The primaryKey property contains the primary-key column names, in key
+   * order. A composite key has more than one.
+   * @category Schema
+   * @since v0.5.0
+   */
+  primaryKey: string[];
+
+  /**
+   * The indexes property describes the table's secondary indexes, in name
+   * order.
+   * @category Schema
+   * @since v0.5.0
+   */
+  indexes: IndexSchema[];
+}
+
+/**
+ * The Schema interface is returned by the getSchema method, and describes
+ * every table in the database.
+ * @category Schema
+ * @since v0.5.0
+ */
+export interface Schema {
+  /**
+   * The tables property describes the database's tables, in name order.
+   * @category Schema
+   * @since v0.5.0
+   */
+  tables: TableSchema[];
+}
+
+/**
  * The SerializedError interface is the stable error envelope sent by the
  * Worker.
  * @category Errors
@@ -3805,6 +3987,33 @@ export class Client {
   getRevision(): number;
 
   /**
+   * The getSchema method reads the database's tables, with their columns,
+   * primary keys, and indexes, as the engine's catalog holds them.
+   *
+   * Tables and each table's indexes are in name order, and columns and key
+   * columns are in the order the table declares them. Call it outside a
+   * transaction.
+   * @returns A Promise resolving to the Schema.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   *
+   * const db = await create();
+   * await db.exec(`
+   *   CREATE TABLE tasks (id TEXT PRIMARY KEY, done BOOLEAN NOT NULL DEFAULT false);
+   *   CREATE INDEX tasks_done ON tasks (done);
+   * `);
+   * const {tables} = await db.getSchema();
+   * console.log(tables[0].columns[1]);
+   * // -> {name: 'done', type: 'boolean', nullable: false, default: false}
+   * await db.close();
+   * ```
+   * @category Lifecycle
+   * @since v0.5.0
+   */
+  getSchema(): Promise<Schema>;
+
+  /**
    * The check method reads every row and index entry of the committed
    * database, and every page that holds them, and resolves when all of them
    * are sound.
@@ -3991,6 +4200,9 @@ export {ClientError} from '../index.js';
  */
 export type {
   Client,
+  ColumnSchema,
+  ColumnType,
+  IndexSchema,
   JsonPrimitive,
   JsonValue,
   PreparedStatement,
@@ -3999,8 +4211,10 @@ export type {
   Results,
   Row,
   RowMode,
+  Schema,
   SerializedError,
   SubscriptionOptions,
+  TableSchema,
   TablesChangedEvent,
   Transaction,
 } from '../index.js';

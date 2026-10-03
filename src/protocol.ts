@@ -16,7 +16,7 @@ import {
   objValues,
 } from './common.js';
 
-export const PROTOCOL_VERSION = 10 as const;
+export const PROTOCOL_VERSION = 11 as const;
 
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue =
@@ -49,6 +49,35 @@ export interface Results<RowType = Row> {
   tables: string[];
   /** TinyJoin extension: primary keys changed by this statement, per table. */
   keys: ChangedKeys;
+}
+
+/** One of the five runtime types a column holds. */
+export type ColumnType = 'boolean' | 'integer' | 'float' | 'text' | 'json';
+
+export interface ColumnSchema {
+  name: string;
+  type: ColumnType;
+  nullable: boolean;
+  /** The literal `DEFAULT`, present only when the column declares one. */
+  default?: JsonValue;
+}
+
+export interface IndexSchema {
+  name: string;
+  columns: string[];
+  unique: boolean;
+}
+
+export interface TableSchema {
+  name: string;
+  columns: ColumnSchema[];
+  primaryKey: string[];
+  indexes: IndexSchema[];
+}
+
+/** The database's tables, in name order, as the engine's catalog holds them. */
+export interface Schema {
+  tables: TableSchema[];
 }
 
 export type StorageOptions = {kind: 'memory'} | {kind: 'opfs'; name: string};
@@ -156,6 +185,10 @@ export interface RpcMethods {
   check: {
     request: undefined;
     response: undefined;
+  };
+  schema: {
+    request: undefined;
+    response: Schema;
   };
   close: {
     request: undefined;
@@ -271,6 +304,7 @@ export const isWorkerRequest = (value: unknown): value is WorkerRequest => {
       );
     case 'beginTransaction':
     case 'check':
+    case 'schema':
     case 'close':
       return isUndefined(params);
     default:
@@ -330,6 +364,8 @@ const isResult = (
       return isUndefined(value);
     case 'commitTransaction':
       return isApplyOutcome(value);
+    case 'schema':
+      return isSchema(value);
     case 'executeSql':
     case 'executePrepared':
       return isSqlResult(value, validation);
@@ -462,6 +498,43 @@ const isJsonValues = (value: unknown): value is JsonValue[] => {
     }
   }
   return true;
+};
+
+const COLUMN_TYPES: readonly unknown[] = [
+  'boolean',
+  'integer',
+  'float',
+  'text',
+  'json',
+];
+
+const isSchema = (value: unknown): value is Schema => {
+  const validation = createJsonValidation();
+  const isColumn = (column: unknown): boolean =>
+    isRecord(column) &&
+    hasOnlyKeys(column, ['name', 'type', 'nullable', 'default']) &&
+    isString(column.name) &&
+    COLUMN_TYPES.includes(column.type) &&
+    isBoolean(column.nullable) &&
+    (!objHasOwn(column, 'default') || validation.isJson(column.default));
+  const isIndex = (index: unknown): boolean =>
+    isRecord(index) &&
+    hasExactKeys(index, ['name', 'columns', 'unique']) &&
+    isString(index.name) &&
+    isStrings(index.columns) &&
+    isBoolean(index.unique);
+  const isTable = (table: unknown): boolean =>
+    isRecord(table) &&
+    hasExactKeys(table, ['name', 'columns', 'primaryKey', 'indexes']) &&
+    isString(table.name) &&
+    isDenseArray(table.columns, isColumn) &&
+    isStrings(table.primaryKey) &&
+    isDenseArray(table.indexes, isIndex);
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, ['tables']) &&
+    isDenseArray(value.tables, isTable)
+  );
 };
 
 const isApplyOutcome = (value: unknown): value is ApplyOutcome =>

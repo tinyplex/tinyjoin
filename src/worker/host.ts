@@ -281,6 +281,10 @@ export const startWorker = (
         assertNoTransaction();
         engine.check();
         return undefined;
+
+      // DDL cannot run in a transaction, so one in progress leaves the schema as committed.
+      case 'schema':
+        return engine.schema();
     }
   };
 

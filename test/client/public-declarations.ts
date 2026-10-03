@@ -2,8 +2,11 @@ import {
   type Client as ClientImplementation,
   type ClientError as ClientErrorImplementation,
   type ClientOptions as ClientOptionsImplementation,
+  type ColumnSchema as ColumnSchemaImplementation,
+  type ColumnType as ColumnTypeImplementation,
   create as createImplementation,
   type DataDir as DataDirImplementation,
+  type IndexSchema as IndexSchemaImplementation,
   type JsonPrimitive as JsonPrimitiveImplementation,
   type JsonValue as JsonValueImplementation,
   type PreparedStatement as PreparedStatementImplementation,
@@ -12,8 +15,10 @@ import {
   type Results as ResultsImplementation,
   type Row as RowImplementation,
   type RowMode as RowModeImplementation,
+  type Schema as SchemaImplementation,
   type SerializedError as SerializedErrorImplementation,
   type SubscriptionOptions as SubscriptionOptionsImplementation,
+  type TableSchema as TableSchemaImplementation,
   type TablesChangedEvent as TablesChangedEventImplementation,
   type Transaction as TransactionImplementation,
   type WorkerLike as WorkerLikeImplementation,
@@ -22,8 +27,11 @@ import type {
   Client as ClientDeclaration,
   ClientError as ClientErrorDeclaration,
   ClientOptions as ClientOptionsDeclaration,
+  ColumnSchema as ColumnSchemaDeclaration,
+  ColumnType as ColumnTypeDeclaration,
   create as createDeclaration,
   DataDir as DataDirDeclaration,
+  IndexSchema as IndexSchemaDeclaration,
   JsonPrimitive as JsonPrimitiveDeclaration,
   JsonValue as JsonValueDeclaration,
   PreparedStatement as PreparedStatementDeclaration,
@@ -32,8 +40,10 @@ import type {
   Results as ResultsDeclaration,
   Row as RowDeclaration,
   RowMode as RowModeDeclaration,
+  Schema as SchemaDeclaration,
   SerializedError as SerializedErrorDeclaration,
   SubscriptionOptions as SubscriptionOptionsDeclaration,
+  TableSchema as TableSchemaDeclaration,
   TablesChangedEvent as TablesChangedEventDeclaration,
   Transaction as TransactionDeclaration,
   WorkerLike as WorkerLikeDeclaration,
@@ -100,7 +110,10 @@ type PublicValueParity = [
 ];
 type PublicTypeParity = [
   Assert<Equivalent<ClientOptionsImplementation, ClientOptionsDeclaration>>,
+  Assert<Equivalent<ColumnSchemaImplementation, ColumnSchemaDeclaration>>,
+  Assert<Equivalent<ColumnTypeImplementation, ColumnTypeDeclaration>>,
   Assert<Equivalent<DataDirImplementation, DataDirDeclaration>>,
+  Assert<Equivalent<IndexSchemaImplementation, IndexSchemaDeclaration>>,
   Assert<Equivalent<JsonPrimitiveImplementation, JsonPrimitiveDeclaration>>,
   Assert<Equivalent<JsonValueImplementation, JsonValueDeclaration>>,
   Assert<
@@ -114,6 +127,7 @@ type PublicTypeParity = [
   Assert<Equivalent<ResultsImplementation, ResultsDeclaration>>,
   Assert<Equivalent<RowImplementation, RowDeclaration>>,
   Assert<Equivalent<RowModeImplementation, RowModeDeclaration>>,
+  Assert<Equivalent<SchemaImplementation, SchemaDeclaration>>,
   Assert<Equivalent<SerializedErrorImplementation, SerializedErrorDeclaration>>,
   Assert<
     Equivalent<
@@ -124,6 +138,7 @@ type PublicTypeParity = [
   Assert<
     Equivalent<TablesChangedEventImplementation, TablesChangedEventDeclaration>
   >,
+  Assert<Equivalent<TableSchemaImplementation, TableSchemaDeclaration>>,
   Assert<Equivalent<TransactionImplementation, TransactionDeclaration>>,
   Assert<Equivalent<WorkerLikeImplementation, WorkerLikeDeclaration>>,
 ];

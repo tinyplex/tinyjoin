@@ -28,7 +28,7 @@ import {
 } from '../../src/worker/wasm-bridge.js';
 import {decodeRequest} from '../helpers/wasm-request.js';
 
-const BRIDGE_VERSION = 4;
+const BRIDGE_VERSION = 5;
 const artifactDirectory =
   process.env.TINYJOIN_PAGED_WASM_DIR ?? resolve('dist/wasm');
 const artifactModule = `${artifactDirectory}/tinyjoin_wasm.js`;
@@ -278,6 +278,59 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
       expect(
         captureError(() => engine.executePrepared(prepared, [], 'object')),
       ).toMatchObject({code: 'INVALID_QUERY'});
+    } finally {
+      engine.close();
+    }
+  });
+
+  it('reads the schema the real engine holds', async () => {
+    const wasm = await loadStructuredModule();
+    const {engine} = createRecordingEngine(wasm, new MemoryPageDevice());
+    try {
+      expect(engine.schema()).toEqual({tables: []});
+      engine.execSql(
+        `CREATE TABLE notes (owner TEXT, id INTEGER, body TEXT DEFAULT 'x',
+           meta JSONB DEFAULT NULL, rating REAL NOT NULL, PRIMARY KEY (owner, id));
+         CREATE TABLE "Tags" (name VARCHAR PRIMARY KEY, hot BOOLEAN DEFAULT false);
+         CREATE UNIQUE INDEX notes_body ON notes (body, owner);
+         CREATE INDEX a_notes_id ON notes (id);
+         ALTER TABLE notes ADD COLUMN extra BIGINT;`,
+      );
+      const schema = engine.schema();
+      expect(isRpcResult('schema', schema)).toBe(true);
+      expect(schema).toEqual({
+        tables: [
+          {
+            name: 'Tags',
+            columns: [
+              {name: 'name', type: 'text', nullable: false},
+              {name: 'hot', type: 'boolean', nullable: true, default: false},
+            ],
+            primaryKey: ['name'],
+            indexes: [],
+          },
+          {
+            name: 'notes',
+            columns: [
+              {name: 'owner', type: 'text', nullable: false},
+              {name: 'id', type: 'integer', nullable: false},
+              {name: 'body', type: 'text', nullable: true, default: 'x'},
+              {name: 'meta', type: 'json', nullable: true, default: null},
+              {name: 'rating', type: 'float', nullable: false},
+              {name: 'extra', type: 'integer', nullable: true},
+            ],
+            primaryKey: ['owner', 'id'],
+            indexes: [
+              {name: 'a_notes_id', columns: ['id'], unique: false},
+              {name: 'notes_body', columns: ['body', 'owner'], unique: true},
+            ],
+          },
+        ],
+      });
+
+      engine.beginTransaction();
+      expect(engine.schema()).toEqual(schema);
+      engine.rollbackTransaction();
     } finally {
       engine.close();
     }
