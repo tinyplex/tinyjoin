@@ -76,17 +76,69 @@ as `text('id').primaryKey().$defaultFn(() => crypto.randomUUID())` does, and
 store a time as an integer or text column, or as a Drizzle `customType` over
 one.
 
-Create tables with SQL through the Client, idempotently with
-`IF NOT EXISTS`, and version the OPFS name with the schema. Drizzle Kit's
-`push`, `pull`, and Studio read PostgreSQL's system catalogs, which TinyJoin
-does not have (its Client reads the same facts with getSchema()), and Drizzle's
-migrators create a `SERIAL` table in a schema of
-their own, so none of them works. The SQL that `drizzle-kit generate` writes
-for new tables runs as it is, with its `UNIQUE` constraints, composite primary
-keys, `USING btree` indexes, and JSON defaults, except for foreign keys, which
-TinyJoin cannot enforce: leave `.references()` out of the schema. Drizzle's
-relations need no foreign keys. A later migration's `ALTER COLUMN`,
-`DROP COLUMN`, and renames are rejected.
+Leave `.references()` out of the schema: TinyJoin cannot enforce foreign keys,
+so it refuses the SQL that declares them. Drizzle's relations need no foreign
+keys.
+
+Create the tables with SQL through the Client, idempotently with
+`IF NOT EXISTS`, or apply the migrations that Drizzle Kit generates, as the next
+section describes. Drizzle Kit's `push`, `pull`, and Studio read PostgreSQL's
+system catalogs, which TinyJoin does not have; the Client reads the same facts
+with getSchema().
+
+## Migrations
+
+`drizzle-kit generate` compares the schema with the last one it saw and writes
+the SQL that turns one into the other, with a journal of every migration so
+far. Configure it for PostgreSQL:
+
+```ts
+// drizzle.config.ts
+import {defineConfig} from 'drizzle-kit';
+
+export default defineConfig({
+  dialect: 'postgresql',
+  schema: './src/schema.ts',
+  out: './drizzle',
+});
+```
+
+Drizzle's own migrators read those files from disk and record them in a
+`SERIAL` table of a schema of their own, so they cannot run here. migrate()
+from `tinyjoin/drizzle` applies the same migrations from SQL that the
+application bundles. With Vite:
+
+```ts
+import {create} from 'tinyjoin';
+import {drizzle, migrate} from 'tinyjoin/drizzle';
+import journal from '../drizzle/meta/_journal.json';
+import * as schema from './schema';
+
+const db = drizzle(await create('opfs://my-app-v1'), {schema});
+await migrate(db, {
+  journal,
+  migrations: import.meta.glob<string>('../drizzle/*.sql', {
+    query: '?raw',
+    import: 'default',
+    eager: true,
+  }),
+});
+```
+
+migrate() applies, in the journal's order, each migration that the database
+has not recorded, and records it in a `__drizzle_migrations` table. A migration
+runs as one script together with its record, so it commits whole or not at
+all: one that fails rejects with its error and leaves the database as the
+migration before it left it. Every tab can call migrate() as it starts, since
+a migration that another tab applied first is skipped. A migration must fit in
+one script, of at most 255 statements and 1 MiB of SQL.
+
+The SQL that `drizzle-kit generate` writes runs as it is for new tables, with
+their `UNIQUE` constraints, composite primary keys, `USING btree` indexes, and
+JSON defaults, and for added columns, indexes, and constraints, and dropped
+tables, indexes, and constraints. TinyJoin's `ALTER TABLE` cannot yet change,
+drop, or rename a column, or rename a table, so a migration that does is
+refused, and changes nothing.
 
 ## Queries
 

@@ -89,9 +89,11 @@ floating-point numbers, strings, JSON-compatible values, and `null`.
 
 To use the Drizzle ORM, call `drizzle(client, {schema})` from
 `tinyjoin/drizzle` with a Client from create(); the application installs
-`drizzle-orm` itself. Create tables with DDL through client.exec() rather than
-Drizzle Kit or Drizzle's migrators, use the column types TinyJoin has, and
-avoid relational queries with `with`, SQL functions, and nested transactions.
+`drizzle-orm` itself. Create tables with DDL through client.exec(), or apply
+`drizzle-kit generate` migrations, bundled into the application, with migrate()
+from `tinyjoin/drizzle`; Drizzle's own migrators and `push` do not work. Use the
+column types TinyJoin has, leave out `.references()`, and avoid relational
+queries with `with`, SQL functions, and nested transactions.
 See the [Drizzle guide](/guides/drizzle/).
 
 ## Transactions and changes

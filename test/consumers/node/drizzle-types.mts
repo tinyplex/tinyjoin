@@ -1,6 +1,11 @@
 import {eq} from 'drizzle-orm';
 import {integer, pgTable, text} from 'drizzle-orm/pg-core';
-import {type TinyJoinDatabase, drizzle} from 'tinyjoin/drizzle';
+import {
+  type MigrationConfig,
+  type TinyJoinDatabase,
+  drizzle,
+  migrate,
+} from 'tinyjoin/drizzle';
 import {type Client, create} from 'tinyjoin/node';
 
 const notes = pgTable('notes', {
@@ -14,6 +19,12 @@ export async function exerciseDrizzleDeclarations(): Promise<void> {
     const db: TinyJoinDatabase<{notes: typeof notes}> = drizzle(client, {
       schema: {notes},
     });
+    const config: MigrationConfig = {
+      journal: {entries: [{tag: '0000_notes', when: 1}]},
+      migrations: {'0000_notes.sql': 'CREATE TABLE notes (id INTEGER PRIMARY KEY)'},
+    };
+    const migrated: Promise<void> = migrate(db, config);
+    await migrated;
     const $client: Client = db.$client;
     const rows: {id: number; body: string}[] = await db
       .select()

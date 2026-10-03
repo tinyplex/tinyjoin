@@ -94,7 +94,7 @@ function getExportNames(source, label) {
 
   const names = new Set(
     [...source.matchAll(
-      /^export\s+(?:declare\s+)?(?:type|interface|class|function|const|let|var|enum|namespace)\s+([A-Za-z_$][\w$]*)/gm,
+      /^export\s+(?:declare\s+)?(?:async\s+)?(?:type|interface|class|function|const|let|var|enum|namespace)\s+([A-Za-z_$][\w$]*)/gm,
     )].map(([, name]) => name),
   );
   for (const [, exports] of source.matchAll(

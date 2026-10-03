@@ -66,3 +66,94 @@
  * @since v0.5.0
  */
 /// drizzle.drizzle
+
+/**
+ * The MigrationJournal interface is the journal that `drizzle-kit generate`
+ * writes beside its migrations, as `meta/_journal.json`, of which the migrate
+ * function reads each entry's tag and time.
+ * @category Migrations
+ * @since v0.5.0
+ */
+/// MigrationJournal
+{
+  /**
+   * The entries property lists the migrations in the order to apply them, each
+   * with its tag, which names its SQL file, and the time it was generated.
+   * @category Migrations
+   * @since v0.5.0
+   */
+  /// MigrationJournal.entries
+}
+
+/**
+ * The MigrationConfig interface describes the migrations that the migrate
+ * function applies.
+ * @category Migrations
+ * @since v0.5.0
+ */
+/// MigrationConfig
+{
+  /**
+   * The journal property is the Drizzle Kit journal, which an application can
+   * import from `meta/_journal.json`.
+   * @category Migrations
+   * @since v0.5.0
+   */
+  /// MigrationConfig.journal
+
+  /**
+   * The migrations property maps each migration's file to its SQL text. A key
+   * may be the migration's tag, its file name, or any path ending in its file
+   * name, so the object that a bundler's glob import returns can be passed as
+   * it is.
+   * @category Migrations
+   * @since v0.5.0
+   */
+  /// MigrationConfig.migrations
+
+  /**
+   * The migrationsTable property names the table that records the migrations
+   * applied, `__drizzle_migrations` unless it is given.
+   * @category Migrations
+   * @since v0.5.0
+   */
+  /// MigrationConfig.migrationsTable
+}
+
+/**
+ * The migrate function applies the migrations that `drizzle-kit generate`
+ * wrote, which the database has not yet recorded, in the journal's order.
+ *
+ * Each migration runs as one script together with the row that records it, so
+ * it commits whole or not at all, and a migration that fails leaves the
+ * database as the previous one left it, and rejects with its error. A
+ * migration another Client of the same database applied first is skipped, so
+ * every tab of an application can call migrate as it starts.
+ *
+ * A migration is recorded by its tag and applied once: a file changed after it
+ * was applied is not applied again, and a migration that joins the journal
+ * before others already applied is still applied. The migrations need no file
+ * system, so a browser application bundles them.
+ * @param db The Drizzle database, from drizzle.
+ * @param config The journal and the SQL text of each migration.
+ * @returns A Promise that resolves when every migration has been applied.
+ * @example
+ * ```ts
+ * import {create} from 'tinyjoin';
+ * import {drizzle, migrate} from 'tinyjoin/drizzle';
+ * import journal from './drizzle/meta/_journal.json';
+ *
+ * const db = drizzle(await create('opfs://my-app-v1'));
+ * await migrate(db, {
+ *   journal,
+ *   migrations: import.meta.glob<string>('./drizzle/*.sql', {
+ *     query: '?raw',
+ *     import: 'default',
+ *     eager: true,
+ *   }),
+ * });
+ * ```
+ * @category Migrations
+ * @since v0.5.0
+ */
+/// drizzle.migrate

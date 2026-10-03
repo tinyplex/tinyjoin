@@ -1,4 +1,4 @@
-import {existsSync} from 'node:fs';
+import {existsSync, readFileSync, readdirSync} from 'node:fs';
 import {resolve} from 'node:path';
 import {pathToFileURL} from 'node:url';
 
@@ -19,7 +19,12 @@ import {
 import {alias, boolean, integer, jsonb, pgTable, text} from 'drizzle-orm/pg-core';
 import {afterEach, beforeEach, describe, expect, it} from 'vitest';
 
-import {drizzle, type TinyJoinDatabase} from '../../src/drizzle/index.js';
+import {
+  drizzle,
+  migrate,
+  type MigrationJournal,
+  type TinyJoinDatabase,
+} from '../../src/drizzle/index.js';
 import type {Client} from '../../src/index.js';
 
 // The driver runs against the real engine, through the Node entry point the
@@ -274,3 +279,132 @@ runIfBuilt('the Drizzle driver', () => {
     expect((failure as DrizzleQueryError).cause).toMatchObject({code: 'TYPE_MISMATCH'});
   });
 });
+
+// Two migrations that `drizzle-kit generate` wrote: the first creates two tables,
+// and the second drops one and adds a column and an index to the other.
+const migrationsFolder = resolve(import.meta.dirname, 'migrations');
+const journal = JSON.parse(
+  readFileSync(resolve(migrationsFolder, 'meta/_journal.json'), 'utf8'),
+) as MigrationJournal;
+// Keyed as a bundler's glob import keys them.
+const migrations = Object.fromEntries(
+  readdirSync(migrationsFolder)
+    .filter((file) => file.endsWith('.sql'))
+    .map((file) => [
+      `./drizzle/${file}`,
+      readFileSync(resolve(migrationsFolder, file), 'utf8'),
+    ]),
+);
+
+runIfBuilt('the Drizzle migrator', () => {
+  let client: Client;
+  let db: TinyJoinDatabase;
+
+  beforeEach(async () => {
+    const {create} = (await import(pathToFileURL(nodeEntry).href)) as {
+      create: () => Promise<Client>;
+    };
+    client = await create();
+    db = drizzle(client);
+  });
+
+  afterEach(async () => {
+    await client.close();
+  });
+
+  const applied = async (table = '__drizzle_migrations') =>
+    (await client.query(`SELECT tag FROM "${table}" ORDER BY created_at`)).rows;
+
+  it('applies each migration once, in journal order', async () => {
+    await migrate(db, {journal: {entries: journal.entries.slice(0, 1)}, migrations});
+    expect((await client.getSchema()).tables.map(({name}) => name)).toEqual([
+      '__drizzle_migrations',
+      'post_tags',
+      'users',
+    ]);
+
+    await migrate(db, {journal, migrations});
+    const {tables} = await client.getSchema();
+    expect(tables.map(({name}) => name)).toEqual(['__drizzle_migrations', 'users']);
+    expect(tables[1]).toEqual({
+      name: 'users',
+      columns: [
+        {name: 'id', type: 'text', nullable: false},
+        {name: 'name', type: 'text', nullable: false},
+        {name: 'email', type: 'text', nullable: true},
+        {name: 'active', type: 'boolean', nullable: false, default: true},
+        {name: 'meta', type: 'json', nullable: true, default: {tags: []}},
+        {name: 'visits', type: 'integer', nullable: false, default: 0},
+      ],
+      primaryKey: ['id'],
+      indexes: [
+        {name: 'users_active_idx', columns: ['active'], unique: false},
+        {name: 'users_email_unique', columns: ['email'], unique: true},
+        {name: 'users_name_idx', columns: ['name'], unique: false},
+      ],
+    });
+    expect(await applied()).toEqual([
+      {tag: '0000_create_users'},
+      {tag: '0001_add_visits'},
+    ]);
+
+    const revision = client.getRevision();
+    await migrate(db, {journal, migrations});
+    expect(client.getRevision()).toBe(revision);
+  });
+
+  it('records migrations in the table it is given', async () => {
+    const migrationsTable = 'app "migrations"';
+    await migrate(db, {journal, migrations, migrationsTable});
+    expect(await applied('app ""migrations""')).toHaveLength(2);
+    expect(
+      (await client.getSchema()).tables.some(
+        ({name}) => name === '__drizzle_migrations',
+      ),
+    ).toBe(false);
+  });
+
+  it('leaves a failed migration unapplied and unrecorded', async () => {
+    const failing = {
+      entries: [...journal.entries, {tag: '0002_bad', when: 2e12}],
+    };
+    const failure = await migrate(db, {
+      journal: failing,
+      migrations: {
+        ...migrations,
+        '0002_bad.sql': `CREATE TABLE notes (id INTEGER PRIMARY KEY);
+          CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id TEXT REFERENCES users (id));`,
+      },
+    }).catch((error: unknown) => error);
+    expect(failure).toMatchObject({code: 'UNSUPPORTED_SQL'});
+    expect(await applied()).toHaveLength(2);
+    expect(
+      (await client.getSchema()).tables.some(({name}) => name === 'notes'),
+    ).toBe(false);
+
+    await expect(
+      migrate(db, {journal: failing, migrations}),
+    ).rejects.toThrow('Migration 0002_bad matches 0 of the migrations given');
+  });
+
+  it('skips a migration another Client applied first', async () => {
+    let raced = false;
+    // The other Client applies the migration just before this one tries to.
+    const racing = {
+      $client: {
+        query: client.query.bind(client),
+        exec: async (sql: string) => {
+          if (sql.startsWith('INSERT') && !raced) {
+            raced = true;
+            await client.exec(sql);
+          }
+          return client.exec(sql);
+        },
+      },
+    } as unknown as TinyJoinDatabase;
+    await migrate(racing, {journal, migrations});
+    expect(raced).toBe(true);
+    expect(await applied()).toHaveLength(2);
+  });
+});
+

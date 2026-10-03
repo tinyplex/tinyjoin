@@ -77,8 +77,11 @@ TinyJoin's dialect, whose transactions are TinyJoin's callback transactions,
 and whose JSON columns store JSON values rather than JSON text. The application
 installs `drizzle-orm` 0.45 or later itself; TinyJoin declares it as an
 optional peer dependency and never bundles it, so the download sizes are
-unchanged. Relational queries with `with`, Drizzle Kit, and Drizzle's
-migrators are not supported. See the [Drizzle guide](/guides/drizzle/).
+unchanged. Its migrate() function applies the migrations that
+`drizzle-kit generate` writes, from SQL the application bundles, each
+atomically with the row that records it, so every tab can call it as it
+starts. Relational queries with `with`, Drizzle Kit's `push`, and Drizzle's
+own migrators are not supported. See the [Drizzle guide](/guides/drizzle/).
 
 `CREATE TABLE` accepts the constraints and spellings that schema tools write:
 a named primary key, as in `CONSTRAINT tags_pk PRIMARY KEY (post_id, tag)`;

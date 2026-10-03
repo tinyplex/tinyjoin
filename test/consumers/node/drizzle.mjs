@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 
 import {eq, sql} from 'drizzle-orm';
 import {integer, jsonb, pgTable, text} from 'drizzle-orm/pg-core';
-import {drizzle} from 'tinyjoin/drizzle';
+import {drizzle, migrate} from 'tinyjoin/drizzle';
 import {create} from 'tinyjoin/node';
 
 const notes = pgTable('notes', {
@@ -13,10 +13,16 @@ const notes = pgTable('notes', {
 
 const client = await create();
 try {
-  await client.exec(
-    'CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, meta JSONB)',
-  );
   const db = drizzle(client, {schema: {notes}});
+  const migration = {
+    journal: {entries: [{tag: '0000_notes', when: 1}]},
+    migrations: {
+      './drizzle/0000_notes.sql':
+        'CREATE TABLE "notes" ("id" integer PRIMARY KEY NOT NULL, "body" text NOT NULL, "meta" jsonb);',
+    },
+  };
+  await migrate(db, migration);
+  await migrate(db, migration);
   assert.equal(db.$client, client);
   await db.insert(notes).values({id: 1, body: 'Hello', meta: {from: 'drizzle'}});
   await db.transaction(async (tx) => {

@@ -200,3 +200,71 @@ export function drizzle<
   }
   return db;
 }
+
+/** The journal that `drizzle-kit generate` writes as `meta/_journal.json`. */
+export interface MigrationJournal {
+  entries: {tag: string; when: number}[];
+}
+
+export interface MigrationConfig {
+  journal: MigrationJournal;
+  migrations: Record<string, string>;
+  migrationsTable?: string;
+}
+
+const quoteIdentifier = (name: string): string =>
+  `"${name.replaceAll('"', '""')}"`;
+
+/**
+ * Applies each migration in a Drizzle Kit journal that the database has not
+ * recorded, in journal order, each atomically with its record.
+ */
+export async function migrate<
+  TSchema extends Record<string, unknown> = Record<string, never>,
+>(db: TinyJoinDatabase<TSchema>, config: MigrationConfig): Promise<void> {
+  const client = db.$client;
+  const table = quoteIdentifier(
+    config.migrationsTable ?? '__drizzle_migrations',
+  );
+  await client.exec(
+    `CREATE TABLE IF NOT EXISTS ${table} (tag TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`,
+  );
+  const applied = new Set(
+    (await client.query<{tag: string}>(`SELECT tag FROM ${table}`)).rows.map(
+      ({tag}) => tag,
+    ),
+  );
+  const isApplied = async (tag: string): Promise<boolean> =>
+    (await client.query(`SELECT tag FROM ${table} WHERE tag = $1`, [tag])).rows
+      .length > 0;
+  const keys = Object.keys(config.migrations);
+  for (const {tag, when} of config.journal.entries) {
+    if (applied.has(tag)) {
+      continue;
+    }
+    if (!Number.isSafeInteger(when)) {
+      throw new TypeError(`Migration ${tag} has no whole-number time`);
+    }
+    const files = keys.filter(
+      (key) => key === tag || key === `${tag}.sql` || key.endsWith(`/${tag}.sql`),
+    );
+    if (files.length !== 1) {
+      throw new Error(
+        `Migration ${tag} matches ${files.length} of the migrations given`,
+      );
+    }
+    // A script is atomic, so the migration and its record commit together. The
+    // record goes first, so a migration another Client of the database applied
+    // since it was read fails at once, and changes nothing.
+    try {
+      await client.exec(
+        `INSERT INTO ${table} (tag, created_at) VALUES ('${tag.replaceAll("'", "''")}', ${when});\n${config.migrations[files[0]!]}`,
+      );
+    } catch (error) {
+      if (!(await isApplied(tag).catch(() => false))) {
+        throw error;
+      }
+    }
+  }
+}
+
