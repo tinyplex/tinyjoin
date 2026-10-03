@@ -517,10 +517,21 @@ struct CatalogSchema {
 
 impl CatalogSchema {
     fn new(schema: &TableDefinition) -> Result<Self> {
-        let columns = serde_json::json!({
-            "columns": schema.columns,
-            "primaryKey": schema.primary_key,
-        });
+        // Built as `json!` would build it, without its unwrapping, which would link the
+        // formatting of serde's errors.
+        let value = |value: std::result::Result<Value, serde_json::Error>| {
+            value.map_err(|error| storage_corrupt(format!("A schema cannot be encoded: {error}")))
+        };
+        let mut columns = serde_json::Map::new();
+        columns.insert(
+            "columns".to_owned(),
+            value(serde_json::to_value(&schema.columns))?,
+        );
+        columns.insert(
+            "primaryKey".to_owned(),
+            value(serde_json::to_value(&schema.primary_key))?,
+        );
+        let columns = Value::Object(columns);
         Ok(Self {
             encoded: encode_catalog_schema(schema)?,
             columns_fingerprint: crate::checksum::xxh64(

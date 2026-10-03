@@ -279,7 +279,9 @@ pub(crate) fn schema_statements(
             (Some(existing), _) => Some(existing),
             (None, Some(old)) if !declared(old) => find(old).inspect(|_| {
                 // A rename keeps the schema that qualifies a name, so the new name must too.
-                let to = name.rsplit('.').next().unwrap_or(name);
+                let to = name
+                    .rsplit_once('.')
+                    .map_or(name.as_str(), |(_, last)| last);
                 phases[0].push(alter(old, TableChange::RenameTable(to.to_owned())));
                 table_renames.push((old.as_str(), name.as_str()));
             }),
@@ -300,8 +302,11 @@ pub(crate) fn schema_statements(
             continue;
         };
         kept_tables.push((target, table));
-        if crate::statement::renamed_table(&table.name, name.rsplit('.').next().unwrap_or(name))
-            != *name
+        if crate::statement::renamed_table(
+            &table.name,
+            name.rsplit_once('.')
+                .map_or(name.as_str(), |(_, last)| last),
+        ) != *name
         {
             return Err(EngineError::unsupported_sql(format!(
                 "Table `{}` cannot move to another schema as `{name}`",

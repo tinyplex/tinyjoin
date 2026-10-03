@@ -197,10 +197,18 @@ fn dollar_delimiter(sql: &str, start: usize) -> Option<(usize, &str)> {
 }
 
 fn scan_dollar_quote(sql: &str, body_start: usize, delimiter: &str) -> Result<usize> {
-    sql[body_start..]
-        .find(delimiter)
-        .map(|offset| body_start + offset + delimiter.len())
-        .ok_or_else(|| EngineError::parse_error("Unterminated dollar-quoted string in SQL text"))
+    // A delimiter is a few bytes, so a plain scan finds it as quickly as a substring search would.
+    let (bytes, delimiter) = (sql.as_bytes(), delimiter.as_bytes());
+    let mut position = body_start;
+    while position + delimiter.len() <= bytes.len() {
+        if bytes[position..].starts_with(delimiter) {
+            return Ok(position + delimiter.len());
+        }
+        position += 1;
+    }
+    Err(EngineError::parse_error(
+        "Unterminated dollar-quoted string in SQL text",
+    ))
 }
 
 #[cfg(test)]
