@@ -1946,6 +1946,29 @@ mod tests {
     }
 
     #[test]
+    fn a_column_declared_default_null_reopens() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .exec_sql(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT DEFAULT NULL, doc JSON);\
+                 ALTER TABLE notes ADD COLUMN rating FLOAT DEFAULT NULL;\
+                 INSERT INTO notes (id, doc) VALUES (1, '{\"a\":1}');",
+            )
+            .unwrap();
+        let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        reopened.check().unwrap();
+        assert_eq!(
+            reopened
+                .query_sql("SELECT id, body, doc, rating FROM notes", &[])
+                .unwrap()
+                .rows,
+            vec![row(
+                json!({"id": 1, "body": null, "doc": "{\"a\":1}", "rating": null})
+            )]
+        );
+    }
+
+    #[test]
     fn exec_sql_requires_at_least_one_statement() {
         let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
         for sql in ["", ";;;", "-- comment only ;\n/* still empty */"] {

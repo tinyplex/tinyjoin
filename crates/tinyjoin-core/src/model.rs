@@ -139,11 +139,9 @@ impl ColumnDefinition {
                 None => true,
                 Some(nullable) => nullable.as_bool()?,
             },
-            // A JSON null is no default, as an optional field reads it.
-            default: object
-                .get("default")
-                .filter(|value| !value.is_null())
-                .cloned(),
+            // An absent default is none, and a JSON null is `DEFAULT NULL`, which the catalog
+            // writes as it was declared.
+            default: object.get("default").cloned(),
         })
     }
 }
