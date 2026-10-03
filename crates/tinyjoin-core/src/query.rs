@@ -3406,18 +3406,54 @@ fn sort_rows(rows: &mut [Row], order_by: &[OrderBy], table: &str) -> Result<()> 
     Ok(())
 }
 
-/// Sorts rows that each hold every ORDER BY column. Queries and aggregates both sort here, so the
-/// sort's code is built once.
+/// Sorts rows that each hold every ORDER BY column.
 pub(crate) fn sort_rows_by(rows: &mut [Row], order_by: &[OrderBy]) {
-    rows.sort_by(|left, right| {
+    let mut keys = Vec::with_capacity(rows.len());
+    for row in rows.iter() {
+        let mut key = Vec::with_capacity(order_by.len());
         for order in order_by {
-            match compare_order_column(left, right, order) {
+            key.push(row.get(&order.column).cloned().unwrap_or(Value::Null));
+        }
+        keys.push(key);
+    }
+    let mut order = Vec::with_capacity(order_by.len());
+    for term in order_by {
+        order.push((term.direction, term.nulls));
+    }
+    let mut taken = Vec::with_capacity(rows.len());
+    for row in rows.iter_mut() {
+        taken.push(std::mem::take(row));
+    }
+    for (row, position) in rows.iter_mut().zip(ordered_positions(keys, &order)) {
+        *row = std::mem::take(&mut taken[position]);
+    }
+}
+
+/// The positions of items in the order of their keys, each the values of an `ORDER BY`'s terms,
+/// which `order` directs, with ties kept in the order the items came. Every ordering of rows
+/// sorts here, so the sort's code is built once.
+pub(crate) fn ordered_positions(
+    keys: Vec<Vec<Value>>,
+    order: &[(OrderDirection, NullOrder)],
+) -> Vec<usize> {
+    let mut keyed = Vec::with_capacity(keys.len());
+    for (position, key) in keys.into_iter().enumerate() {
+        keyed.push((key, position));
+    }
+    keyed.sort_unstable_by(|(left, first), (right, second)| {
+        for ((left, right), (direction, nulls)) in left.iter().zip(right).zip(order) {
+            match compare_ordered(left, right, *direction, *nulls) {
                 Ordering::Equal => {}
                 ordering => return ordering,
             }
         }
-        Ordering::Equal
+        first.cmp(second)
     });
+    let mut positions = Vec::with_capacity(keyed.len());
+    for (_, position) in keyed {
+        positions.push(position);
+    }
+    positions
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -3452,13 +3488,18 @@ fn validate_order_values(rows: &[Row], order_by: &[OrderBy], table: &str) -> Res
     Ok(())
 }
 
-fn compare_order_column(left: &Row, right: &Row, order: &OrderBy) -> Ordering {
-    let left = &left[&order.column];
-    let right = &right[&order.column];
-    let nulls_first = match order.nulls {
+/// Orders two values of an `ORDER BY` term as SQL does: NULLs last ascending and first descending,
+/// unless the term places them, and values of different kinds as equal.
+fn compare_ordered(
+    left: &Value,
+    right: &Value,
+    direction: OrderDirection,
+    nulls: NullOrder,
+) -> Ordering {
+    let nulls_first = match nulls {
         NullOrder::First => true,
         NullOrder::Last => false,
-        NullOrder::Default => order.direction == OrderDirection::Desc,
+        NullOrder::Default => direction == OrderDirection::Desc,
     };
     let ordering = match (left == &Value::Null, right == &Value::Null) {
         (true, true) => Ordering::Equal,
@@ -3486,7 +3527,7 @@ fn compare_order_column(left: &Row, right: &Row, order: &OrderBy) -> Ordering {
             _ => Ordering::Equal,
         },
     };
-    if order.direction == OrderDirection::Desc {
+    if direction == OrderDirection::Desc {
         // Explicit null placement is independent of direction.
         if left == &Value::Null || right == &Value::Null {
             ordering

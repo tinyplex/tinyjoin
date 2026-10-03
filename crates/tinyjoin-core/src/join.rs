@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::cmp::Ordering;
 
 use serde_json::{Map, Value};
 
@@ -112,7 +111,6 @@ struct OrderedJoinedRow {
     row: Row,
     keys: Vec<Value>,
     projected_bytes: usize,
-    ordinal: usize,
 }
 
 #[derive(Default)]
@@ -442,23 +440,29 @@ fn execute_ordered(
             row: project_joined_row(bindings, plan, relations)?,
             keys: order_keys(bindings, plan, relations)?,
             projected_bytes,
-            ordinal: joined_rows.len(),
         });
         Ok(VisitControl::Continue)
     })?;
 
-    joined_rows.sort_unstable_by(|first, second| compare_joined_rows(first, second, plan));
-
+    let mut keys = Vec::with_capacity(joined_rows.len());
+    for joined in &mut joined_rows {
+        keys.push(std::mem::take(&mut joined.keys));
+    }
+    let mut order = Vec::with_capacity(plan.order_by.len());
+    for term in &plan.order_by {
+        order.push((term.direction, term.nulls));
+    }
     let mut rows = Vec::new();
     let mut result_bytes = 0_usize;
-    for joined in joined_rows
+    for position in crate::query::ordered_positions(keys, &order)
         .into_iter()
         .skip(plan.offset)
         .take(plan.limit.unwrap_or(usize::MAX))
     {
+        let joined = &mut joined_rows[position];
         let next_result_bytes = checked_add(result_bytes, joined.projected_bytes)?;
         ensure_result_budget(next_result_bytes)?;
-        rows.push(joined.row);
+        rows.push(std::mem::take(&mut joined.row));
         result_bytes = next_result_bytes;
     }
     Ok(rows)
@@ -1554,59 +1558,6 @@ fn order_keys_bytes(
         bytes = checked_add(bytes, owned_value_bytes(&value)?)?;
     }
     Ok(bytes)
-}
-
-fn compare_joined_rows(
-    first: &OrderedJoinedRow,
-    second: &OrderedJoinedRow,
-    plan: &JoinPlan,
-) -> Ordering {
-    for ((first_value, second_value), order) in
-        first.keys.iter().zip(&second.keys).zip(&plan.order_by)
-    {
-        let ordering = compare_values(first_value, second_value, order);
-        if ordering != Ordering::Equal {
-            return ordering;
-        }
-    }
-    first.ordinal.cmp(&second.ordinal)
-}
-
-fn compare_values(left: &Value, right: &Value, order: &JoinOrder) -> Ordering {
-    let nulls_first = match order.nulls {
-        NullOrder::First => true,
-        NullOrder::Last => false,
-        NullOrder::Default => order.direction == OrderDirection::Desc,
-    };
-    let ordering = match (left, right) {
-        (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Null, _) => {
-            if nulls_first {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        }
-        (_, Value::Null) => {
-            if nulls_first {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
-        (Value::Number(left), Value::Number(right)) => left
-            .as_f64()
-            .partial_cmp(&right.as_f64())
-            .unwrap_or(Ordering::Equal),
-        (Value::String(left), Value::String(right)) => left.cmp(right),
-        (Value::Bool(left), Value::Bool(right)) => left.cmp(right),
-        _ => Ordering::Equal,
-    };
-    if order.direction == OrderDirection::Desc && left != &Value::Null && right != &Value::Null {
-        ordering.reverse()
-    } else {
-        ordering
-    }
 }
 
 fn projected_row_bytes(

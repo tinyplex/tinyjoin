@@ -266,7 +266,8 @@ impl Json {
         let mut json = Self(String::with_capacity(512));
         json.raw("[");
         for value in [VERSION, status, disposition] {
-            json.raw(itoa::Buffer::new().format(value));
+            // Written as a u64, which numbers are written as anyway.
+            json.raw(itoa::Buffer::new().format(u64::from(value)));
             json.raw(",");
         }
         json
