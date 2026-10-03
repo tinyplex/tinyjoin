@@ -71,7 +71,9 @@ pub(crate) fn resolve(
     // The referenced columns must hold each value once: be a primary or unique key.
     let same = |columns: &[String]| {
         columns.len() == referenced_columns.len()
-            && columns.iter().all(|column| referenced_columns.contains(column))
+            && columns
+                .iter()
+                .all(|column| referenced_columns.contains(column))
     };
     if !same(&parent.primary_key)
         && !unique
@@ -134,7 +136,13 @@ pub(crate) fn check_rows(
 ) -> Result<()> {
     for row in rows_where(storage, &table.name, &[], &[], None)? {
         if let Some(values) = values(&row, &key.columns)
-            && !survives(storage, &[], &key.references, &key.referenced_columns, &values)?
+            && !survives(
+                storage,
+                &[],
+                &key.references,
+                &key.referenced_columns,
+                &values,
+            )?
         {
             return Err(referencing_violation(&table.name, key));
         }
@@ -181,7 +189,9 @@ pub(crate) fn enforce(storage: &dyn StorageReader, planned: &mut PlannedDml) -> 
                 let row = decode(key, record)?;
                 (primary_key(&schema, &row), Some(row))
             }
-            RowChange::Remove { key, .. } => (primary_key(&schema, &decode(key, EMPTY_RECORD)?), None),
+            RowChange::Remove { key, .. } => {
+                (primary_key(&schema, &decode(key, EMPTY_RECORD)?), None)
+            }
         };
         let old = match planned.previous.get(position) {
             Some(PreviousRow::Read(None)) => None,
@@ -201,7 +211,11 @@ pub(crate) fn enforce(storage: &dyn StorageReader, planned: &mut PlannedDml) -> 
     for &(deleted, written) in &planned.moved {
         changed[written].old = changed[deleted].old.take();
     }
-    let mut deleted = planned.moved.iter().map(|(deleted, _)| *deleted).collect::<Vec<_>>();
+    let mut deleted = planned
+        .moved
+        .iter()
+        .map(|(deleted, _)| *deleted)
+        .collect::<Vec<_>>();
     deleted.sort_unstable();
     for deleted in deleted.into_iter().rev() {
         changed.remove(deleted);
@@ -316,8 +330,11 @@ pub(crate) fn enforce(storage: &dyn StorageReader, planned: &mut PlannedDml) -> 
             };
             // An unchanged reference is checked again only if the statement changes the table it
             // references.
-            if item.old.as_ref().and_then(|old| values(old, &key.columns)) == Some(new_values.clone())
-                && !changed.iter().any(|other| other.table.name == key.references)
+            if item.old.as_ref().and_then(|old| values(old, &key.columns))
+                == Some(new_values.clone())
+                && !changed
+                    .iter()
+                    .any(|other| other.table.name == key.references)
             {
                 continue;
             }
@@ -378,7 +395,12 @@ fn survives(
     };
     if changed.iter().any(|item| {
         item.table.name == table
-            && item.new.as_ref().and_then(|new| self::values(new, columns)).as_deref() == Some(values)
+            && item
+                .new
+                .as_ref()
+                .and_then(|new| self::values(new, columns))
+                .as_deref()
+                == Some(values)
     }) {
         return Ok(true);
     }
@@ -430,7 +452,10 @@ fn values(row: &Row, columns: &[String]) -> Option<Vec<Value>> {
 fn primary_key(schema: &TableDefinition, row: &Row) -> Row {
     let mut key = Row::new();
     for column in &schema.primary_key {
-        key.insert(column.clone(), row.get(column).cloned().unwrap_or(Value::Null));
+        key.insert(
+            column.clone(),
+            row.get(column).cloned().unwrap_or(Value::Null),
+        );
     }
     key
 }

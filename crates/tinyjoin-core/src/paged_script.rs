@@ -9,9 +9,8 @@ use serde_json::Value;
 
 use crate::{
     Btree, ChangedKeys, ColumnType, EngineError, ExecuteResult, ForeignKeyDefinition, PageDevice,
-    PageId, Pager,
-    PagerWriteTransaction, QueryResult, Result, Row, RowChange, StorageReader, TableDefinition,
-    TreeId, VisitControl, VisitOutcome,
+    PageId, Pager, PagerWriteTransaction, QueryResult, Result, Row, RowChange, StorageReader,
+    TableDefinition, TreeId, VisitControl, VisitOutcome,
     btree::BatchChange,
     hash::{EMPTY_HASH, combine, identify},
     name_map::NameMap,
@@ -408,8 +407,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 if_exists,
                 cascade,
             } => {
-                let outcome =
-                    crate::statement::plan_drop_table(self, table, *if_exists, *cascade)?;
+                let outcome = crate::statement::plan_drop_table(self, table, *if_exists, *cascade)?;
                 if outcome.mutated {
                     // CASCADE drops the other tables' foreign keys that reference it.
                     self.edit_foreign_keys(&mut |child, keys| {
@@ -424,8 +422,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 if_exists,
                 cascade,
             } => {
-                let outcome =
-                    crate::statement::plan_drop_index(self, name, *if_exists, *cascade)?;
+                let outcome = crate::statement::plan_drop_index(self, name, *if_exists, *cascade)?;
                 if outcome.mutated {
                     self.drop_needed_index(name)?;
                 }
@@ -578,12 +575,13 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             .cloned()
             .ok_or_else(|| EngineError::table_not_found(name))?;
         let schema = match change {
-            TableChange::DropConstraint { name: constraint, .. }
-                if !table
-                    .schema
-                    .foreign_keys
-                    .iter()
-                    .any(|key| key.name == *constraint) =>
+            TableChange::DropConstraint {
+                name: constraint, ..
+            } if !table
+                .schema
+                .foreign_keys
+                .iter()
+                .any(|key| key.name == *constraint) =>
             {
                 return self.drop_needed_index(constraint);
             }
@@ -795,11 +793,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 self.charge_operations(1)?;
                 let row = old.record(&key, &value)?.to_row()?;
                 for column in &table.schema.columns {
-                    validate_value(
-                        column,
-                        row.get(&column.name).unwrap_or(&Value::Null),
-                        name,
-                    )?;
+                    validate_value(column, row.get(&column.name).unwrap_or(&Value::Null), name)?;
                 }
                 let record = encode_row(&table.schema, &row)?;
                 bytes += key.len() + record.len() + 48;

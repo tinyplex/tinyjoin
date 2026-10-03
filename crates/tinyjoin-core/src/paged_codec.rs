@@ -2927,7 +2927,10 @@ mod tests {
         };
         let (key, mut value) = encode_catalog_header_record(&versioned).unwrap();
         assert_eq!(value.len(), VERSIONED_CATALOG_HEADER_BYTES);
-        assert_eq!(decode_catalog_header_record(&key, &value).unwrap(), versioned);
+        assert_eq!(
+            decode_catalog_header_record(&key, &value).unwrap(),
+            versioned
+        );
         value[20..].fill(0);
         assert_eq!(
             decode_catalog_header_record(&key, &value).unwrap_err().code,

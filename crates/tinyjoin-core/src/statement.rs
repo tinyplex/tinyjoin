@@ -31,8 +31,8 @@ use crate::storage::{
 };
 use crate::{
     ChangedKeys, ColumnDefinition, ColumnType, EngineError, ForeignKeyAction, ForeignKeyDefinition,
-    IndexDefinition, MAX_CHANGED_KEYS_PER_TABLE, Predicate, Result, ResultField, Row, RowChange, SelectPlan,
-    StorageReader, Subquery, TableDefinition, TableKeys, VisitControl, VisitOutcome,
+    IndexDefinition, MAX_CHANGED_KEYS_PER_TABLE, Predicate, Result, ResultField, Row, RowChange,
+    SelectPlan, StorageReader, Subquery, TableDefinition, TableKeys, VisitControl, VisitOutcome,
 };
 
 const MAX_COLUMNS: usize = 256;
@@ -106,14 +106,9 @@ pub(crate) enum WriteStatement {
         if_not_exists: bool,
     },
     /// Every `ALTER TABLE` but `ADD COLUMN` and `ADD CONSTRAINT`, which are other statements.
-    AlterTable {
-        table: String,
-        change: TableChange,
-    },
+    AlterTable { table: String, change: TableChange },
     /// Records the version of the schema an application set, which no SQL statement can.
-    SetSchemaVersion {
-        version: u64,
-    },
+    SetSchemaVersion { version: u64 },
     Insert {
         table: String,
         columns: Option<Vec<String>>,
@@ -682,7 +677,11 @@ pub(crate) fn plan_drop_table(
             .into_iter()
             .find(|(child, _)| child.name != table)
     {
-        return Err(depended_on(&format!("Table `{table}`"), &child.name, &key.name));
+        return Err(depended_on(
+            &format!("Table `{table}`"),
+            &child.name,
+            &key.name,
+        ));
     }
     Ok(WriteOutcome {
         command: "DROP TABLE",
@@ -736,8 +735,9 @@ pub(crate) fn plan_alter_table(
         } => match storage.index_definition(name) {
             Some(definition) if definition.unique && definition.table == table => {
                 if !cascade
-                    && let Some((child, key)) =
-                        crate::foreign_key::needing(storage, &definition).into_iter().next()
+                    && let Some((child, key)) = crate::foreign_key::needing(storage, &definition)
+                        .into_iter()
+                        .next()
                 {
                     return Err(depended_on(
                         &format!("Constraint `{name}`"),
@@ -766,12 +766,7 @@ pub(crate) fn plan_alter_table(
                     key.name
                 )));
             }
-            crate::foreign_key::resolve(
-                storage,
-                &schema,
-                &storage.indexes_for_table(table)?,
-                key,
-            )?;
+            crate::foreign_key::resolve(storage, &schema, &storage.indexes_for_table(table)?, key)?;
             true
         }
         TableChange::RenameTable(name) => {
@@ -788,14 +783,22 @@ pub(crate) fn plan_alter_table(
             column,
             if_exists: true,
             ..
-        } if !schema.columns.iter().any(|existing| &existing.name == column) => false,
+        } if !schema
+            .columns
+            .iter()
+            .any(|existing| &existing.name == column) =>
+        {
+            false
+        }
         TableChange::DropColumn {
             column,
             cascade: false,
             ..
         } if let Some((child, key)) = crate::foreign_key::referencing(storage, table)
             .into_iter()
-            .find(|(child, key)| child.name != table && key.referenced_columns.contains(column)) =>
+            .find(|(child, key)| {
+                child.name != table && key.referenced_columns.contains(column)
+            }) =>
         {
             return Err(depended_on(
                 &format!("Column `{column}`"),
@@ -851,7 +854,11 @@ pub(crate) fn altered_schema(
             }
             for key in &mut altered.foreign_keys {
                 let referenced = (key.references == own).then_some(&mut key.referenced_columns);
-                for column in key.columns.iter_mut().chain(referenced.into_iter().flatten()) {
+                for column in key
+                    .columns
+                    .iter_mut()
+                    .chain(referenced.into_iter().flatten())
+                {
                     if column == from {
                         column.clone_from(to);
                     }
@@ -938,7 +945,11 @@ pub(crate) fn plan_drop_index(
             .into_iter()
             .next()
     {
-        return Err(depended_on(&format!("Index `{name}`"), &child.name, &key.name));
+        return Err(depended_on(
+            &format!("Index `{name}`"),
+            &child.name,
+            &key.name,
+        ));
     }
     Ok(WriteOutcome {
         command: "DROP INDEX",
@@ -2817,9 +2828,15 @@ impl<'a> MutationParser<'a> {
     }
 
     fn parse_constraint_columns(&mut self) -> Result<Vec<String>> {
-        self.expect(TokenMatcher::LParen, "Expected `(` before constraint columns")?;
+        self.expect(
+            TokenMatcher::LParen,
+            "Expected `(` before constraint columns",
+        )?;
         let columns = self.parse_identifier_list(TokenMatcher::RParen)?;
-        self.expect(TokenMatcher::RParen, "Expected `)` after constraint columns")?;
+        self.expect(
+            TokenMatcher::RParen,
+            "Expected `)` after constraint columns",
+        )?;
         Ok(columns)
     }
 
@@ -3150,9 +3167,10 @@ impl<'a> MutationParser<'a> {
         }
         // As in PostgreSQL, a VARCHAR holds from 1 to 10,485,760 characters.
         let length = match self.next() {
-            Some(Token::Number(length)) if data_type == ColumnType::Text => {
-                length.parse::<u32>().ok().filter(|length| (1..=10_485_760).contains(length))
-            }
+            Some(Token::Number(length)) if data_type == ColumnType::Text => length
+                .parse::<u32>()
+                .ok()
+                .filter(|length| (1..=10_485_760).contains(length)),
             _ => {
                 return Err(EngineError::unsupported_sql(
                     "Only VARCHAR takes a type modifier, its length",
@@ -3584,11 +3602,20 @@ pub(crate) enum TableChange {
     },
     AddForeignKey(ForeignKeyDefinition),
     RenameTable(String),
-    RenameColumn { from: String, to: String },
+    RenameColumn {
+        from: String,
+        to: String,
+    },
     /// `SET DEFAULT`, or `DROP DEFAULT` where the default is `None`.
-    SetDefault { column: String, default: Option<Value> },
+    SetDefault {
+        column: String,
+        default: Option<Value>,
+    },
     /// `DROP NOT NULL`, or `SET NOT NULL`, which every row must already meet.
-    SetNullable { column: String, nullable: bool },
+    SetNullable {
+        column: String,
+        nullable: bool,
+    },
     DropColumn {
         column: String,
         if_exists: bool,

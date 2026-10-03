@@ -343,7 +343,10 @@ pub(crate) fn field_name(output: &str, positional: bool) -> &str {
 pub(crate) fn position_outputs(plan: &mut SelectPlan) {
     // The names a `*` lists are known only once the table is read, which positions them.
     plan.array_rows = true;
-    let Some(columns) = plan.columns.as_mut().filter(|columns| !columns.iter().any(|item| item.star))
+    let Some(columns) = plan
+        .columns
+        .as_mut()
+        .filter(|columns| !columns.iter().any(|item| item.star))
     else {
         return;
     };

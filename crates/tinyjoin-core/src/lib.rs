@@ -46,7 +46,6 @@ pub use device::PageDevice;
 #[cfg(test)]
 pub(crate) use engine::Engine;
 pub use error::{EngineError, Result};
-pub use schema::{SchemaDefinition, TableTarget};
 pub use model::{
     ApplyOutcome, ChangedKeys, ColumnDefinition, ColumnType, ExecuteResult, ForeignKeyAction,
     ForeignKeyDefinition, IndexDefinition, MAX_CHANGED_KEYS_PER_TABLE, ResultField, Row,
@@ -68,6 +67,7 @@ pub use paged_engine::PagedEngine;
 pub(crate) use paged_storage::PagedStorage;
 pub(crate) use pager::{Pager, PagerWriteTransaction};
 pub use prepared_statement::PreparedStatementId;
+pub use schema::{SchemaDefinition, TableTarget};
 #[cfg(test)]
 pub(crate) use storage::InMemoryStorage;
 #[cfg(test)]

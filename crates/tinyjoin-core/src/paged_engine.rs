@@ -3162,8 +3162,10 @@ mod tests {
                     .execute_sql("SELECT *, id * 2 AS double FROM users WHERE id = 1", &[])
                     .unwrap()
             ),
-            [json!({"id": 1, "name": "cy", "email": "c@example.com", "active": true,
-                "double": 2})]
+            [
+                json!({"id": 1, "name": "cy", "email": "c@example.com", "active": true,
+                "double": 2})
+            ]
         );
         let repeated = "SELECT u.id, u.* FROM users u WHERE u.id = 2";
         assert_eq!(
@@ -3172,8 +3174,10 @@ mod tests {
         );
         assert_eq!(
             rows(engine.execute_sql_rows(repeated, &[], true).unwrap()),
-            [json!({"000id": 2, "001id": 2, "002name": "ann", "003email": null,
-                "004active": false})]
+            [
+                json!({"000id": 2, "001id": 2, "002name": "ann", "003email": null,
+                "004active": false})
+            ]
         );
     }
 
@@ -4360,7 +4364,11 @@ mod tests {
         assert_eq!(
             names(0),
             [
-                ("plain_a_b_key".to_owned(), vec!["a".to_owned(), "b".to_owned()], true),
+                (
+                    "plain_a_b_key".to_owned(),
+                    vec!["a".to_owned(), "b".to_owned()],
+                    true
+                ),
                 ("plain_code_key".to_owned(), vec!["code".to_owned()], true),
             ]
         );
@@ -4369,17 +4377,27 @@ mod tests {
         assert_eq!(
             names(2),
             [
-                ("users_email_unique".to_owned(), vec!["email".to_owned()], true),
+                (
+                    "users_email_unique".to_owned(),
+                    vec!["email".to_owned()],
+                    true
+                ),
                 ("users_name_idx".to_owned(), vec!["name".to_owned()], false),
             ]
         );
         assert_eq!(schema[2].0.columns[3].default, Some(json!({"tags": []})));
         engine
-            .execute_sql("INSERT INTO users (id, name, email) VALUES ('a', 'Ann', 'a@x')", &[])
+            .execute_sql(
+                "INSERT INTO users (id, name, email) VALUES ('a', 'Ann', 'a@x')",
+                &[],
+            )
             .unwrap();
         assert_eq!(
             engine
-                .execute_sql("INSERT INTO users (id, name, email) VALUES ('b', 'Bo', 'a@x')", &[])
+                .execute_sql(
+                    "INSERT INTO users (id, name, email) VALUES ('b', 'Bo', 'a@x')",
+                    &[]
+                )
                 .unwrap_err()
                 .code,
             "CONSTRAINT_VIOLATION"
@@ -4532,7 +4550,10 @@ mod tests {
         engine.check().unwrap();
         let mut engine = PagedEngine::open(engine.into_device()).unwrap();
         assert_eq!(engine.schema().unwrap(), schema);
-        assert_eq!(rows(&mut engine, "SELECT ident FROM tee ORDER BY ident").len(), 5);
+        assert_eq!(
+            rows(&mut engine, "SELECT ident FROM tee ORDER BY ident").len(),
+            5
+        );
         engine.check().unwrap();
     }
 
@@ -4566,21 +4587,37 @@ mod tests {
             "ALTER TABLE v ALTER COLUMN code TYPE varchar(2)",
         ] {
             let error = engine.execute_sql(sql, &[]).unwrap_err();
-            assert_eq!(error.code, "CONSTRAINT_VIOLATION", "{sql}: {}", error.message);
+            assert_eq!(
+                error.code, "CONSTRAINT_VIOLATION",
+                "{sql}: {}",
+                error.message
+            );
         }
         for (sql, code) in [
             (
                 "CREATE TABLE w (id INTEGER PRIMARY KEY, c VARCHAR(2) DEFAULT 'abc')",
                 "INVALID_SCHEMA",
             ),
-            ("CREATE TABLE w (id INTEGER PRIMARY KEY, c VARCHAR(0))", "INVALID_SCHEMA"),
+            (
+                "CREATE TABLE w (id INTEGER PRIMARY KEY, c VARCHAR(0))",
+                "INVALID_SCHEMA",
+            ),
             (
                 "CREATE TABLE w (id INTEGER PRIMARY KEY, c VARCHAR(10485761))",
                 "INVALID_SCHEMA",
             ),
-            ("CREATE TABLE w (id INTEGER PRIMARY KEY, c INTEGER(5))", "UNSUPPORTED_SQL"),
-            ("CREATE TABLE w (id INTEGER PRIMARY KEY, c VARCHAR(n))", "UNSUPPORTED_SQL"),
-            ("ALTER TABLE v ALTER COLUMN id TYPE varchar(5)", "UNSUPPORTED_SQL"),
+            (
+                "CREATE TABLE w (id INTEGER PRIMARY KEY, c INTEGER(5))",
+                "UNSUPPORTED_SQL",
+            ),
+            (
+                "CREATE TABLE w (id INTEGER PRIMARY KEY, c VARCHAR(n))",
+                "UNSUPPORTED_SQL",
+            ),
+            (
+                "ALTER TABLE v ALTER COLUMN id TYPE varchar(5)",
+                "UNSUPPORTED_SQL",
+            ),
         ] {
             let error = engine.execute_sql(sql, &[]).unwrap_err();
             assert_eq!(error.code, code, "{sql}: {}", error.message);
@@ -4595,7 +4632,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             engine
-                .execute_sql("ALTER TABLE v ALTER COLUMN code SET DATA TYPE varchar(3)", &[])
+                .execute_sql(
+                    "ALTER TABLE v ALTER COLUMN code SET DATA TYPE varchar(3)",
+                    &[]
+                )
                 .unwrap_err()
                 .code,
             "CONSTRAINT_VIOLATION"
@@ -4690,8 +4730,18 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
             [
-                ("posts_user_id_fkey", vec!["user_id".to_owned()], "users", vec!["id".to_owned()]),
-                ("posts_author_fk", vec!["author".to_owned()], "users", vec!["email".to_owned()]),
+                (
+                    "posts_user_id_fkey",
+                    vec!["user_id".to_owned()],
+                    "users",
+                    vec!["id".to_owned()]
+                ),
+                (
+                    "posts_author_fk",
+                    vec!["author".to_owned()],
+                    "users",
+                    vec!["email".to_owned()]
+                ),
             ]
         );
 
@@ -4708,7 +4758,11 @@ mod tests {
             "INSERT INTO users VALUES (1, 'q@x') ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email",
         ] {
             let error = engine.execute_sql(sql, &[]).unwrap_err();
-            assert_eq!(error.code, "CONSTRAINT_VIOLATION", "{sql}: {}", error.message);
+            assert_eq!(
+                error.code, "CONSTRAINT_VIOLATION",
+                "{sql}: {}",
+                error.message
+            );
         }
         assert_eq!(engine.revision(), revision);
         // A row no reference names can go, and a reference can name a row its own statement
@@ -4748,7 +4802,12 @@ mod tests {
         engine.commit_transaction().unwrap();
         assert_eq!(
             query_values(&engine, "SELECT id FROM posts ORDER BY id"),
-            [json!({"id": 10}), json!({"id": 11}), json!({"id": 12}), json!({"id": 13})]
+            [
+                json!({"id": 10}),
+                json!({"id": 11}),
+                json!({"id": 12}),
+                json!({"id": 13})
+            ]
         );
         let reopened = PagedEngine::open(engine.into_device()).unwrap();
         assert_eq!(reopened.schema().unwrap(), schema);
@@ -4800,7 +4859,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             query_values(&engine, "SELECT id, user_id FROM posts ORDER BY id"),
-            [json!({"id": 11, "user_id": 30}), json!({"id": 12, "user_id": 1})]
+            [
+                json!({"id": 11, "user_id": 30}),
+                json!({"id": 12, "user_id": 1})
+            ]
         );
 
         // A table can reference itself, and a cascade follows it down.
@@ -4947,14 +5009,32 @@ mod tests {
         for (sql, code) in [
             ("ALTER TABLE t DROP COLUMN id", "UNSUPPORTED_SQL"),
             ("ALTER TABLE t DROP COLUMN missing", "COLUMN_NOT_FOUND"),
-            ("ALTER TABLE t RENAME COLUMN a TO b", "COLUMN_ALREADY_EXISTS"),
-            ("ALTER TABLE t RENAME COLUMN missing TO c", "COLUMN_NOT_FOUND"),
+            (
+                "ALTER TABLE t RENAME COLUMN a TO b",
+                "COLUMN_ALREADY_EXISTS",
+            ),
+            (
+                "ALTER TABLE t RENAME COLUMN missing TO c",
+                "COLUMN_NOT_FOUND",
+            ),
             ("ALTER TABLE t RENAME TO u", "TABLE_ALREADY_EXISTS"),
-            ("ALTER TABLE t ALTER COLUMN b SET DEFAULT 'x'", "INVALID_SCHEMA"),
-            ("ALTER TABLE t ALTER COLUMN id DROP NOT NULL", "INVALID_SCHEMA"),
+            (
+                "ALTER TABLE t ALTER COLUMN b SET DEFAULT 'x'",
+                "INVALID_SCHEMA",
+            ),
+            (
+                "ALTER TABLE t ALTER COLUMN id DROP NOT NULL",
+                "INVALID_SCHEMA",
+            ),
             ("ALTER TABLE t ALTER COLUMN b TYPE text", "UNSUPPORTED_SQL"),
-            ("ALTER TABLE t ALTER COLUMN b TYPE text USING b::text", "UNSUPPORTED_SQL"),
-            ("ALTER TABLE t ALTER COLUMN b SET STATISTICS 100", "SQL_PARSE_ERROR"),
+            (
+                "ALTER TABLE t ALTER COLUMN b TYPE text USING b::text",
+                "UNSUPPORTED_SQL",
+            ),
+            (
+                "ALTER TABLE t ALTER COLUMN b SET STATISTICS 100",
+                "SQL_PARSE_ERROR",
+            ),
             ("ALTER TABLE t OWNER TO someone", "UNSUPPORTED_SQL"),
         ] {
             let error = engine.exec_sql(sql).unwrap_err();
@@ -5043,7 +5123,9 @@ mod tests {
             assert!(error.message.contains(message), "{sql}: {}", error.message);
         }
         // A table whose unique constraint names an index that exists is not created at all.
-        engine.exec_sql("CREATE INDEX taken ON posts (user_id)").unwrap();
+        engine
+            .exec_sql("CREATE INDEX taken ON posts (user_id)")
+            .unwrap();
         assert_eq!(
             engine
                 .exec_sql("CREATE TABLE a (id INTEGER PRIMARY KEY, CONSTRAINT taken UNIQUE (id))")
@@ -5061,7 +5143,9 @@ mod tests {
         assert_eq!(engine.schema().unwrap().len(), 2);
         // Words that name constraints are still column names where a column is expected.
         engine
-            .exec_sql("CREATE TABLE words (unique INTEGER PRIMARY KEY, constraint TEXT, check TEXT)")
+            .exec_sql(
+                "CREATE TABLE words (unique INTEGER PRIMARY KEY, constraint TEXT, check TEXT)",
+            )
             .unwrap();
     }
 
@@ -5127,12 +5211,16 @@ mod tests {
             "indexes": [{"name": "tasks_done", "columns": ["done"], "unique": false}],
             "foreignKeys": [],
         }]});
-        let outcome = engine.set_schema(&schema_target(first.clone()), false).unwrap();
+        let outcome = engine
+            .set_schema(&schema_target(first.clone()), false)
+            .unwrap();
         assert_eq!(outcome.tables, ["tasks"]);
         assert_eq!(schema_json(&engine), first);
         // A schema the database already has changes nothing.
         let revision = engine.revision();
-        let outcome = engine.set_schema(&schema_target(first.clone()), false).unwrap();
+        let outcome = engine
+            .set_schema(&schema_target(first.clone()), false)
+            .unwrap();
         assert!(outcome.tables.is_empty());
         assert_eq!(outcome.revision, revision);
         engine
@@ -5169,10 +5257,15 @@ mod tests {
                 "foreignKeys": [],
             },
         ]});
-        let outcome = engine.set_schema(&schema_target(second.clone()), false).unwrap();
+        let outcome = engine
+            .set_schema(&schema_target(second.clone()), false)
+            .unwrap();
         assert_eq!(outcome.tables, ["tasks", "todos", "notes"]);
         let mut expected = second.clone();
-        expected["tables"][0].as_object_mut().unwrap().remove("renamedFrom");
+        expected["tables"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("renamedFrom");
         expected["tables"][0]["columns"][1]
             .as_object_mut()
             .unwrap()
@@ -5182,7 +5275,10 @@ mod tests {
         assert_eq!(schema_json(&engine), expected);
         assert_eq!(
             engine
-                .execute_sql("SELECT id, name, done, priority FROM todos ORDER BY id", &[])
+                .execute_sql(
+                    "SELECT id, name, done, priority FROM todos ORDER BY id",
+                    &[]
+                )
                 .unwrap()
                 .rows
                 .into_iter()
@@ -5232,10 +5328,14 @@ mod tests {
             "indexes": [{"name": "todos_name", "columns": ["name"], "unique": true}],
             "foreignKeys": [],
         }]});
-        engine.set_schema(&schema_target(third.clone()), false).unwrap();
+        engine
+            .set_schema(&schema_target(third.clone()), false)
+            .unwrap();
         assert_eq!(engine.schema().unwrap().len(), 2);
         assert_eq!(engine.schema().unwrap()[1].0.columns.len(), 4);
-        engine.set_schema(&schema_target(third.clone()), true).unwrap();
+        engine
+            .set_schema(&schema_target(third.clone()), true)
+            .unwrap();
         assert_eq!(schema_json(&engine), third);
         engine.check().unwrap();
         let engine = PagedEngine::open(engine.into_device()).unwrap();

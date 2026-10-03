@@ -9,7 +9,9 @@ use crate::{
     ColumnDefinition, ColumnType, EngineError, ForeignKeyDefinition, IndexDefinition, Result,
     TableDefinition,
     statement::{TableChange, WriteStatement},
-    storage::{validate_index_columns_for_schema, validate_index_definition_shape, validate_schema},
+    storage::{
+        validate_index_columns_for_schema, validate_index_definition_shape, validate_schema,
+    },
 };
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -275,12 +277,11 @@ pub(crate) fn schema_statements(
         let name = &target.definition.name;
         let existing = match (find(name), &target.renamed_from) {
             (Some(existing), _) => Some(existing),
-            (None, Some(old)) if !declared(old) => find(old).map(|existing| {
+            (None, Some(old)) if !declared(old) => find(old).inspect(|_| {
                 // A rename keeps the schema that qualifies a name, so the new name must too.
                 let to = name.rsplit('.').next().unwrap_or(name);
                 phases[0].push(alter(old, TableChange::RenameTable(to.to_owned())));
                 table_renames.push((old.as_str(), name.as_str()));
-                existing
             }),
             _ => None,
         };
@@ -316,7 +317,11 @@ pub(crate) fn schema_statements(
         for (column, old) in target.definition.columns.iter().zip(&target.column_renames) {
             let Some(old) = old else { continue };
             if columns.iter().any(|existing| existing.name == column.name)
-                || target.definition.columns.iter().any(|other| other.name == *old)
+                || target
+                    .definition
+                    .columns
+                    .iter()
+                    .any(|other| other.name == *old)
             {
                 continue;
             }
@@ -324,10 +329,11 @@ pub(crate) fn schema_statements(
                 continue;
             };
             existing.name.clone_from(&column.name);
-            for renamed in primary_key
-                .iter_mut()
-                .chain(renamed_indexes.iter_mut().flat_map(|index| &mut index.columns))
-            {
+            for renamed in primary_key.iter_mut().chain(
+                renamed_indexes
+                    .iter_mut()
+                    .flat_map(|index| &mut index.columns),
+            ) {
                 if renamed == old {
                     renamed.clone_from(&column.name);
                 }

@@ -2001,6 +2001,15 @@ pub(crate) fn storage_corrupt(message: impl Into<String>) -> EngineError {
     EngineError::new("STORAGE_CORRUPT", message)
 }
 
+/// Every table of a catalog that has a foreign key.
+pub(crate) fn tables_with_foreign_keys(tables: &NameMap<PagedTable>) -> Vec<Rc<TableDefinition>> {
+    tables
+        .values()
+        .filter(|table| !table.schema.foreign_keys.is_empty())
+        .map(|table| Rc::clone(&table.schema))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::hash::EMPTY_HASH;
@@ -2738,13 +2747,4 @@ mod tests {
         let error = check_error(pager.into_device());
         assert_eq!(error.code, "STORAGE_CORRUPT");
     }
-}
-
-/// Every table of a catalog that has a foreign key.
-pub(crate) fn tables_with_foreign_keys(tables: &NameMap<PagedTable>) -> Vec<Rc<TableDefinition>> {
-    tables
-        .values()
-        .filter(|table| !table.schema.foreign_keys.is_empty())
-        .map(|table| Rc::clone(&table.schema))
-        .collect()
 }
