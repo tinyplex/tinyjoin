@@ -4,7 +4,7 @@ use serde_json::{Map, Number, Value};
 
 use crate::expression::{
     Expression, Names, bind_expression, check_comparison, comparison, evaluate, folded,
-    parse_expression_at,
+    parse_expression_at, value_type,
 };
 use crate::hash::KeySet;
 use crate::paged_codec::{IndexEntryLayout, encode_key_bound, encode_text_prefix_bounds};
@@ -77,8 +77,17 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &SelectPlan) -> Result<
         validate_predicate_types(predicate, &schema, &plan.table)?;
     }
     for order in &plan.order_by {
-        let definition = column_definition(&schema, &order.column, &plan.table)?;
-        if definition.data_type == ColumnType::Json {
+        let data_type = match plan.columns.as_deref().filter(|_| plan.ordered_by_outputs) {
+            Some(outputs) => {
+                let item = outputs
+                    .iter()
+                    .find(|item| item.output == order.column)
+                    .ok_or_else(|| EngineError::column_not_found(&order.column, "output"))?;
+                output_type(item, &schema)?
+            }
+            None => column_definition(&schema, &order.column, &plan.table)?.data_type,
+        };
+        if data_type == ColumnType::Json {
             return Err(EngineError::type_mismatch(format!(
                 "JSON column `{}` in `{}` cannot be ordered",
                 order.column, plan.table
@@ -164,17 +173,35 @@ fn select_fields(
                     item.output
                 )));
             }
-            column_definition(schema, &item.column, &schema.name).map(|definition| {
-                ResultField::new(field_name(&item.output, positional), definition.data_type)
-            })
+            Ok(ResultField::new(
+                field_name(&item.output, positional),
+                output_type(item, schema)?,
+            ))
         })
         .collect()
 }
 
+/// The type of an output's values: its column's, or the type of the values its expression gives,
+/// which is text where it gives only NULL, as PostgreSQL types an untyped NULL.
+fn output_type(item: &SelectColumn, schema: &TableDefinition) -> Result<ColumnType> {
+    let column_type = |column: &str| Ok(column_definition(schema, column, &schema.name)?.data_type);
+    match &item.expression {
+        Some(expression) => Ok(value_type(expression, &column_type)?.unwrap_or(ColumnType::Text)),
+        None => column_type(&item.column),
+    }
+}
+
 /// An explicit projection resolved once per query rather than once per row: each item's output
-/// name and the schema position of its source column.
+/// name and where its value comes from.
 struct Projection<'a> {
-    items: Vec<(&'a str, usize)>,
+    items: Vec<(&'a str, Output<'a>)>,
+}
+
+enum Output<'a> {
+    /// The schema position of the column returned.
+    Column(usize),
+    /// An expression worked out from the row, with the position of each column it reads.
+    Computed(&'a Expression, Vec<(&'a str, usize)>),
 }
 
 impl<'a> Projection<'a> {
@@ -186,36 +213,66 @@ impl<'a> Projection<'a> {
         let Some(columns) = columns else {
             return Ok(None);
         };
-        let items = columns
-            .iter()
-            .map(|item| {
-                schema
-                    .columns
-                    .iter()
-                    .position(|definition| definition.name == item.column)
-                    .map(|position| (item.output.as_str(), position))
-                    .ok_or_else(|| EngineError::column_not_found(&item.column, table))
-            })
-            .collect::<Result<_>>()?;
+        let position = |column: &str| {
+            schema
+                .columns
+                .iter()
+                .position(|definition| definition.name == column)
+                .ok_or_else(|| EngineError::column_not_found(column, table))
+        };
+        let mut items = Vec::with_capacity(columns.len());
+        for item in columns {
+            let output = match &item.expression {
+                Some(expression) => {
+                    let mut names = Vec::new();
+                    expression.column_names(&mut names);
+                    let mut positions = Vec::with_capacity(names.len());
+                    for name in names {
+                        positions.push((name, position(name)?));
+                    }
+                    Output::Computed(expression, positions)
+                }
+                None => Output::Column(position(&item.column)?),
+            };
+            items.push((item.output.as_str(), output));
+        }
         Ok(Some(Self { items }))
     }
 
-    /// The estimated bytes of the projected row, computed before building it.
+    /// The estimated bytes of the projected row, computed before building it. An output worked
+    /// out from the row is worked out to be measured, one at a time.
     fn estimated_bytes(&self, row: &RowRef<'_>) -> Result<usize> {
         let mut bytes = 32_usize;
-        for (output, column) in &self.items {
-            let value_bytes = row.get(*column)?.owned_bytes(owned_value_bytes)?;
+        for (output, value) in &self.items {
+            let value_bytes = match value {
+                Output::Column(column) => row.get(*column)?.owned_bytes(owned_value_bytes)?,
+                Output::Computed(..) => owned_value_bytes(&self.value(value, row)?)?,
+            };
             bytes = checked_result_add(bytes, 64)?;
             bytes = checked_result_add(bytes, checked_result_mul(output.len(), 2)?)?;
             bytes = checked_result_add(bytes, checked_result_mul(value_bytes, 2)?)?;
+            ensure_result_budget(bytes)?;
         }
         Ok(bytes)
     }
 
+    fn value(&self, output: &Output<'_>, row: &RowRef<'_>) -> Result<Value> {
+        match output {
+            Output::Column(column) => Ok(row.get(*column)?.into_value()),
+            Output::Computed(expression, positions) => evaluate(expression, &mut |name, _| {
+                let (_, column) = positions
+                    .iter()
+                    .find(|(column, _)| *column == name)
+                    .ok_or_else(|| EngineError::column_not_found(name, "output"))?;
+                Ok(row.get(*column)?.into_value())
+            }),
+        }
+    }
+
     fn project(&self, row: &RowRef<'_>) -> Result<Row> {
         let mut projected = Map::new();
-        for (output, column) in &self.items {
-            projected.insert((*output).to_owned(), row.get(*column)?.into_value());
+        for (output, value) in &self.items {
+            projected.insert((*output).to_owned(), self.value(value, row)?);
         }
         Ok(projected)
     }
@@ -247,7 +304,9 @@ pub(crate) fn field_name(output: &str, positional: bool) -> &str {
     if positional { &output[3..] } else { output }
 }
 
-/// Keys a single-table projection's outputs by position if their names repeat.
+/// Keys a single-table projection's outputs by position if their names repeat. An `ORDER BY`
+/// that names outputs takes the key of the first it names, which parsing found to return what any
+/// other of that name does.
 pub(crate) fn position_outputs(plan: &mut SelectPlan) {
     let Some(columns) = &mut plan.columns else {
         return;
@@ -256,6 +315,13 @@ pub(crate) fn position_outputs(plan: &mut SelectPlan) {
     if plan.positional {
         for (index, item) in columns.iter_mut().enumerate() {
             position_name(index, &mut item.output);
+        }
+        if plan.ordered_by_outputs {
+            for order in &mut plan.order_by {
+                if let Some(item) = columns.iter().find(|item| item.output[3..] == order.column) {
+                    order.column.clone_from(&item.output);
+                }
+            }
         }
     }
 }
@@ -302,6 +368,9 @@ fn row_order(plan: &SelectPlan, schema: &TableDefinition) -> RowOrder {
     let Some(first) = plan.order_by.first() else {
         return RowOrder::Any;
     };
+    if plan.ordered_by_outputs {
+        return RowOrder::Sorted;
+    }
     let complete = match first.direction {
         OrderDirection::Asc => plan.order_by.len() <= schema.primary_key.len(),
         OrderDirection::Desc => plan.order_by.len() == schema.primary_key.len(),
@@ -382,6 +451,10 @@ fn execute_ordered(
     let mut ordered_bytes = 0_usize;
     let mut rows = Vec::new();
     let filter = Filter::new(plan.predicate.as_ref(), schema, &plan.table)?;
+    let projection = Projection::new(plan.columns.as_deref(), schema, &plan.table)?;
+    // Ordered by its outputs, a row is projected before rows are sorted, since an output worked
+    // out from the row is in no row read.
+    let projected_first = projection.as_ref().filter(|_| plan.ordered_by_outputs);
     visit_candidate_rows(storage, plan, schema, KeyOrder::Ascending, &mut |row| {
         count_scanned_row(&mut scanned)?;
         if filter.matches(row)? {
@@ -393,7 +466,16 @@ fn execute_ordered(
                     ),
                 ));
             }
-            let row = row.to_row()?;
+            let row = match projected_first {
+                Some(projection) => {
+                    ensure_result_budget(checked_result_add(
+                        ordered_bytes,
+                        projection.estimated_bytes(row)?,
+                    )?)?;
+                    projection.project(row)?
+                }
+                None => row.to_row()?,
+            };
             let next_ordered_bytes = checked_result_add(ordered_bytes, owned_row_bytes(&row)?)?;
             ensure_result_budget(next_ordered_bytes)?;
             rows.push(row);
@@ -406,7 +488,7 @@ fn execute_ordered(
     let mut remaining_ordered_bytes = ordered_bytes;
     let mut result_bytes = 0_usize;
     let mut projected_rows = Vec::new();
-    let projection = Projection::new(plan.columns.as_deref(), schema, &plan.table)?;
+    let projection = projection.as_ref().filter(|_| !plan.ordered_by_outputs);
     for (index, row) in rows.into_iter().enumerate() {
         if index >= plan.offset && projected_rows.len() == take {
             break;
@@ -1361,11 +1443,11 @@ impl<'a> SqlParser<'a> {
         } else {
             None
         };
-        let order_by = if self.consume_keyword("order") {
+        let (order_by, ordered_by_outputs) = if self.consume_keyword("order") {
             self.expect_keyword("by")?;
             self.parse_order_by(columns.as_deref().unwrap_or_default())?
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
         let limit = if self.consume_keyword("limit") {
             Some(self.parse_limit()?)
@@ -1387,6 +1469,7 @@ impl<'a> SqlParser<'a> {
             table,
             columns,
             positional: false,
+            ordered_by_outputs,
             predicate,
             order_by,
             limit,
@@ -1406,13 +1489,28 @@ impl<'a> SqlParser<'a> {
                     "A projection cannot contain more than {MAX_PROJECTION_COLUMNS} columns"
                 )));
             }
-            let column = self.parse_identifier()?;
+            let (column, expression) = match parse_expression_at(
+                &self.tokens,
+                &mut self.position,
+                self.params,
+                Names::Row,
+            )? {
+                Expression::Column(column) => (column, None),
+                expression => (String::new(), Some(expression)),
+            };
             let output = if self.consume_keyword("as") {
                 self.parse_identifier()?
+            } else if expression.is_some() {
+                // As in PostgreSQL, an expression without an alias is unnamed.
+                "?column?".to_owned()
             } else {
                 column.clone()
             };
-            columns.push(SelectColumn { column, output });
+            columns.push(SelectColumn {
+                column,
+                output,
+                expression,
+            });
             if !self.consume(TokenMatcher::Comma) {
                 break;
             }
@@ -1437,29 +1535,42 @@ impl<'a> SqlParser<'a> {
     /// As in PostgreSQL, a plain ORDER BY name refers to an output column before a source column,
     /// so an alias can be ordered by and can shadow the column it renames, while a name behind
     /// the table's qualifier is always the table's column.
-    fn parse_order_by(&mut self, outputs: &[SelectColumn]) -> Result<Vec<OrderBy>> {
+    ///
+    /// An output worked out from the row has no column to sort by. Ordering by one sorts the
+    /// outputs, so then every name must be an output's, and the plan is `ordered_by_outputs`.
+    fn parse_order_by(&mut self, outputs: &[SelectColumn]) -> Result<(Vec<OrderBy>, bool)> {
         let mut orders = Vec::new();
+        // The position of the output each order names, if it names one.
+        let mut named = Vec::new();
         loop {
             if orders.len() >= MAX_ORDER_COLUMNS {
                 return Err(EngineError::invalid_query(format!(
                     "A query cannot order by more than {MAX_ORDER_COLUMNS} columns"
                 )));
             }
-            let column = if let Some(Token::Column(column)) = self.tokens.get(self.position) {
-                let column = column.clone();
-                self.position += 1;
-                column
-            } else {
-                let name = self.parse_identifier()?;
-                let mut named = outputs.iter().filter(|item| item.output == name);
-                match named.next() {
-                    Some(item) if named.any(|other| other.column != item.column) => {
-                        return Err(ambiguous_order(&name));
+            let (column, output) =
+                if let Some(Token::Column(column)) = self.tokens.get(self.position) {
+                    let column = column.clone();
+                    self.position += 1;
+                    (column, None)
+                } else {
+                    let name = self.parse_identifier()?;
+                    let mut matching = outputs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, item)| item.output == name);
+                    match matching.next() {
+                        Some((_, item))
+                            if matching.any(|(_, other)| {
+                                other.column != item.column || other.expression != item.expression
+                            }) =>
+                        {
+                            return Err(ambiguous_order(&name));
+                        }
+                        Some((index, item)) => (item.column.clone(), Some(index)),
+                        None => (name, None),
                     }
-                    Some(item) => item.column.clone(),
-                    None => name,
-                }
-            };
+                };
             let direction = if self.consume_keyword("desc") {
                 OrderDirection::Desc
             } else {
@@ -1484,11 +1595,35 @@ impl<'a> SqlParser<'a> {
                 direction,
                 nulls,
             });
+            named.push(output);
             if !self.consume(TokenMatcher::Comma) {
                 break;
             }
         }
-        Ok(orders)
+        let by_outputs = named
+            .iter()
+            .flatten()
+            .any(|index| outputs[*index].expression.is_some());
+        if by_outputs {
+            for (order, output) in orders.iter_mut().zip(named) {
+                // A column is ordered by through the output that returns it.
+                let index = output
+                    .or_else(|| {
+                        outputs.iter().position(|item| {
+                            item.expression.is_none() && item.column == order.column
+                        })
+                    })
+                    .ok_or_else(|| {
+                        EngineError::unsupported_sql(format!(
+                            "ORDER BY cannot name `{}`, which is not returned, beside an output \
+                             worked out from the row",
+                            order.column
+                        ))
+                    })?;
+                order.column.clone_from(&outputs[index].output);
+            }
+        }
+        Ok((orders, by_outputs))
     }
 
     fn parse_limit(&mut self) -> Result<usize> {
@@ -2231,6 +2366,11 @@ pub(crate) fn bind_select_plan_parameters(
 ) -> Result<SelectPlan> {
     let mut plan = plan.clone();
     bind_predicate_parameters(plan.predicate.as_mut(), params)?;
+    for item in plan.columns.iter_mut().flatten() {
+        if let Some(expression) = &mut item.expression {
+            bind_expression(expression, params)?;
+        }
+    }
     if let Some(index) = limit_parameter {
         plan.limit = Some(bind_nonnegative_integer_parameter(index, params)?);
     }
@@ -3644,6 +3784,7 @@ mod tests {
         SelectColumn {
             column: column.to_owned(),
             output: column.to_owned(),
+            expression: None,
         }
     }
 
@@ -5012,6 +5153,7 @@ mod tests {
                 table: "posts".to_owned(),
                 columns: Some(vec![select_column("id")]),
                 positional: false,
+                ordered_by_outputs: false,
                 predicate: None,
                 order_by: vec![],
                 limit: None,
@@ -5024,6 +5166,7 @@ mod tests {
                 table: "Posts".to_owned(),
                 columns: Some(vec![select_column("ID")]),
                 positional: false,
+                ordered_by_outputs: false,
                 predicate: None,
                 order_by: vec![],
                 limit: None,
@@ -5046,6 +5189,7 @@ mod tests {
                 table: "public.posts".to_owned(),
                 columns: Some(vec![select_column("display\"name")]),
                 positional: false,
+                ordered_by_outputs: false,
                 predicate: Some(Predicate::And {
                     predicates: vec![
                         Predicate::Comparison {
@@ -5193,7 +5337,7 @@ mod tests {
     fn rejects_every_unimplemented_query_shape() {
         for sql in [
             "SELECT * FROM posts JOIN users ON posts.user_id = users.id",
-            "SELECT id + 1 FROM posts",
+            "SELECT upper(title) FROM posts",
             "SELECT * FROM posts AS p (id, title)",
             "SELECT * FROM posts p q",
             "SELECT DISTINCT * FROM posts",

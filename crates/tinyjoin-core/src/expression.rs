@@ -13,7 +13,7 @@ const MAX_EXPRESSION_NODES: usize = 256;
 const MAX_EXPRESSION_DEPTH: usize = 32;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Expression {
     /// A literal, or a parameter's value.
     Value(Value),

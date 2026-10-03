@@ -47,7 +47,14 @@ can compare two columns, as in `WHERE updated > created`, or a value worked out
 from the row, as in `WHERE price * quantity > $1`. A comparison of a column with
 a value worked out from literals and parameters, such as
 `created > $1 - 86400`, still reads only a range of an index or the primary
-key. See [expressions](/guides/sql-compatibility/#expressions).
+key.
+
+A single-table or join query can also return expressions, as in
+`SELECT id, price * quantity AS total FROM items ORDER BY total DESC`, and
+`ORDER BY` can name an expression's alias. An expression without an alias is
+named `?column?`, as in PostgreSQL. Aggregate and `SELECT DISTINCT` queries
+still return only columns and aggregates. See
+[expressions](/guides/sql-compatibility/#expressions).
 
 **Upgrading from v0.4.0 needs no action.** Install, rebuild, and redeploy. The
 Worker protocol stays at version 10 and the page format stays at format 3, so

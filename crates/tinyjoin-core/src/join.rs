@@ -1,8 +1,12 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
 
 use serde_json::{Map, Value};
 
 use crate::aggregate::{encode_group_key, group_key_part};
+use crate::expression::{
+    Expression, Names, bind_expression, evaluate, parse_expression_at, value_type,
+};
 use crate::hash::{KeyMap, KeySet};
 use crate::query::{
     Filter, ParseMode, Token, bind_parameter, is_distinct_keyword_at, is_reserved_keyword,
@@ -61,6 +65,9 @@ struct JoinStage {
 struct Projection {
     source: ColumnRef,
     output: String,
+    /// An output worked out from the joined row rather than read from `source`, which is then
+    /// empty.
+    expression: Option<Expression>,
 }
 
 #[derive(Clone, Debug)]
@@ -143,7 +150,9 @@ pub(crate) fn position_outputs(plan: &mut JoinPlan) -> Result<()> {
             .iter()
             .filter(|projection| projection.output[3..] == *output);
         if let Some(first) = named.next() {
-            if named.any(|other| other.source != first.source) {
+            if named
+                .any(|other| other.source != first.source || other.expression != first.expression)
+            {
                 return Err(crate::query::ambiguous_order(output));
             }
             output.clone_from(&first.output);
@@ -188,6 +197,11 @@ pub(crate) fn bind_plan_parameters(
 ) -> Result<JoinPlan> {
     let mut plan = plan.clone();
     crate::query::bind_predicate_parameters(plan.predicate.as_mut(), params)?;
+    for projection in &mut plan.projections {
+        if let Some(expression) = &mut projection.expression {
+            bind_expression(expression, params)?;
+        }
+    }
     if let Some(index) = limit_parameter {
         plan.limit = Some(crate::query::bind_nonnegative_integer_parameter(
             index, params,
@@ -1148,23 +1162,34 @@ fn validate_plan(
     let mut fields = Vec::with_capacity(plan.projections.len());
     let mut projected = Vec::with_capacity(plan.projections.len());
     for projection in &plan.projections {
-        let (source, index, definition) = resolve_column(&projection.source, relations)?;
         if !outputs.insert(projection.output.as_str()) {
             return Err(EngineError::invalid_query(format!(
                 "SELECT produces output column `{}` more than once; use distinct AS aliases",
                 projection.output
             )));
         }
-        if plan.distinct && definition.data_type == ColumnType::Json {
-            return Err(EngineError::type_mismatch(format!(
-                "JSON column `{}` cannot be compared by SELECT DISTINCT",
-                projection.source.column
-            )));
-        }
-        projected.push((source, index));
+        let data_type = match &projection.expression {
+            Some(_) if plan.distinct => {
+                return Err(EngineError::unsupported_sql(
+                    "SELECT DISTINCT cannot compare an output worked out from the row",
+                ));
+            }
+            Some(_) => projection_type(projection, relations)?,
+            None => {
+                let (source, index, definition) = resolve_column(&projection.source, relations)?;
+                if plan.distinct && definition.data_type == ColumnType::Json {
+                    return Err(EngineError::type_mismatch(format!(
+                        "JSON column `{}` cannot be compared by SELECT DISTINCT",
+                        projection.source.column
+                    )));
+                }
+                projected.push((source, index));
+                definition.data_type
+            }
+        };
         fields.push(ResultField::new(
             crate::query::field_name(&projection.output, plan.positional),
-            definition.data_type,
+            data_type,
         ));
     }
     if let Some(predicate) = &plan.predicate {
@@ -1190,8 +1215,7 @@ fn validate_plan(
                     .iter()
                     .find(|projection| projection.output == *output)
                     .ok_or_else(|| EngineError::column_not_found(output, "joined output"))?;
-                let (_, _, definition) = resolve_column(&projection.source, relations)?;
-                if definition.data_type == ColumnType::Json {
+                if projection_type(projection, relations)? == ColumnType::Json {
                     return Err(EngineError::type_mismatch(format!(
                         "JSON column `{}` cannot be ordered",
                         projection.source.column
@@ -1352,6 +1376,34 @@ fn compatible_join_types(left: ColumnType, right: ColumnType) -> bool {
         )
 }
 
+/// The type of an output's values: its column's, or the type of the values its expression gives,
+/// which is text where it gives only NULL, as PostgreSQL types an untyped NULL.
+fn projection_type(projection: &Projection, relations: &[Relation]) -> Result<ColumnType> {
+    let column_type = |name: &str| {
+        let (_, _, definition) = resolve_column(&parse_column_ref_text(name), relations)?;
+        Ok(definition.data_type)
+    };
+    match &projection.expression {
+        Some(expression) => Ok(value_type(expression, &column_type)?.unwrap_or(ColumnType::Text)),
+        None => Ok(resolve_column(&projection.source, relations)?.2.data_type),
+    }
+}
+
+/// An output's value in a joined row: its column's, or the one its expression works out.
+fn projected_value<'a>(
+    bindings: &[Option<&'a Row>],
+    projection: &Projection,
+    relations: &[Relation],
+) -> Result<Cow<'a, Value>> {
+    match &projection.expression {
+        Some(expression) => evaluate(expression, &mut |name, _| {
+            joined_value(bindings, &parse_column_ref_text(name), relations).cloned()
+        })
+        .map(Cow::Owned),
+        None => joined_value(bindings, &projection.source, relations).map(Cow::Borrowed),
+    }
+}
+
 fn project_joined_row(
     bindings: &[Option<&Row>],
     plan: &JoinPlan,
@@ -1361,7 +1413,7 @@ fn project_joined_row(
     for projection in &plan.projections {
         projected.insert(
             projection.output.clone(),
-            joined_value(bindings, &projection.source, relations)?.clone(),
+            projected_value(bindings, projection, relations)?.into_owned(),
         );
     }
     Ok(projected)
@@ -1394,7 +1446,7 @@ fn order_keys(
                     .iter()
                     .find(|projection| projection.output == *output)
                     .expect("output alias was validated");
-                joined_value(bindings, &projection.source, relations).cloned()
+                Ok(projected_value(bindings, projection, relations)?.into_owned())
             }
         })
         .collect()
@@ -1408,18 +1460,20 @@ fn order_keys_bytes(
     let mut bytes = 0;
     for order in &plan.order_by {
         let value = match &order.source {
-            OrderSource::Column(reference) => joined_value(bindings, reference, relations)?,
+            OrderSource::Column(reference) => {
+                Cow::Borrowed(joined_value(bindings, reference, relations)?)
+            }
             OrderSource::Output(output) => {
                 let projection = plan
                     .projections
                     .iter()
                     .find(|projection| projection.output == *output)
                     .expect("output alias was validated");
-                joined_value(bindings, &projection.source, relations)?
+                projected_value(bindings, projection, relations)?
             }
         };
         bytes = checked_add(bytes, 32)?;
-        bytes = checked_add(bytes, owned_value_bytes(value)?)?;
+        bytes = checked_add(bytes, owned_value_bytes(&value)?)?;
     }
     Ok(bytes)
 }
@@ -1489,7 +1543,7 @@ fn projected_row_bytes(
         bytes = checked_add(
             bytes,
             checked_mul(
-                owned_value_bytes(joined_value(bindings, &projection.source, relations)?)?,
+                owned_value_bytes(projected_value(bindings, projection, relations)?.as_ref())?,
                 2,
             )?,
         )?;
@@ -1775,13 +1829,28 @@ impl<'a> Parser<'a> {
                     "A JOIN projection cannot contain more than {MAX_PROJECTIONS} columns"
                 )));
             }
-            let source = self.parse_column_ref()?;
+            let (source, expression) = match parse_expression_at(
+                &self.tokens,
+                &mut self.position,
+                self.params,
+                Names::Row,
+            )? {
+                Expression::Column(column) => (parse_column_ref_text(&column), None),
+                expression => (parse_column_ref_text(""), Some(expression)),
+            };
             let output = if self.consume_keyword("as") {
                 self.parse_identifier()?
+            } else if expression.is_some() {
+                // As in PostgreSQL, an expression without an alias is unnamed.
+                "?column?".to_owned()
             } else {
                 source.column.clone()
             };
-            projections.push(Projection { source, output });
+            projections.push(Projection {
+                source,
+                output,
+                expression,
+            });
             if !self.consume_comma() {
                 break;
             }

@@ -29,8 +29,9 @@ forms are rejected explicitly rather than silently reinterpreted.
 The omissions most likely to matter are:
 
 - No subqueries, CTEs, or `UNION`/`INTERSECT`/`EXCEPT`.
-- Arithmetic and `||` only in assignments and `WHERE` comparisons, and no
-  casts, `CASE`, or scalar functions.
+- Arithmetic and `||` only in assignments, `WHERE` comparisons, and the select
+  lists of queries that do not aggregate, and no casts, `CASE`, or scalar
+  functions.
 - No regular expressions, full-text search, `ANY`/`ALL`, or JSON path
   operators. `LIKE` and `ILIKE` scan rather than use an index, and `ILIKE`
   folds only ASCII letters.

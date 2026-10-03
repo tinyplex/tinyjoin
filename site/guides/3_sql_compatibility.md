@@ -156,7 +156,7 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 
 | Keyword or form | Status | TinyJoin form and boundary |
 | --- | --- | --- |
-| `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or a left-deep join over two to eight typed table sources. A simple single-table projection is `*` or a list of plain column names, each optionally renamed with `AS`. A statement over one table may [qualify its columns](#qualified-columns) with that table's name or alias. Join projections require explicit columns: neither `*` nor `table.*` is supported. Output names must be distinct unless the rows are [read as arrays](#repeated-output-names): otherwise duplicates return `INVALID_QUERY`, including for empty results and `LIMIT 0`. There is no `SELECT` without `FROM`. |
+| `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or a left-deep join over two to eight typed table sources. A single-table projection is `*` or a list of columns and [expressions](#expressions), each optionally renamed with `AS`. A statement over one table may [qualify its columns](#qualified-columns) with that table's name or alias. Join projections list columns and expressions explicitly: neither `*` nor `table.*` is supported. Output names must be distinct unless the rows are [read as arrays](#repeated-output-names): otherwise duplicates return `INVALID_QUERY`, including for empty results and `LIMIT 0`. There is no `SELECT` without `FROM`. |
 | `WHERE` | Supported | Predicates described below, with SQL three-valued null logic. |
 | `ORDER BY` | Narrow | Up to 32 plain or [qualified](#qualified-columns) columns or projected output names for simple queries, projected output names for grouped/aggregate queries, and projected output names or qualified/unambiguous source columns for joins; `ASC`/`DESC` and `NULLS FIRST`/`LAST`. An output name takes precedence over a source column with the same name. JSON values cannot be ordered. |
 | `LIMIT`, `OFFSET` | Supported | Non-negative integer literal or `$n` parameter. `LIMIT` is at most 100,000; `OFFSET` and `OFFSET + LIMIT` are at most 4,294,967,295. `OFFSET` may appear alone; when both occur, `LIMIT` must precede `OFFSET`. |
@@ -206,7 +206,7 @@ each statement retains the ordinary parser limits below.
 | `IS NULL`, `IS NOT NULL` | Supported | Tests the single runtime null value. |
 | `IN (...)`, `NOT IN (...)` | Supported | One to 1,024 literals or parameters with SQL null behavior. |
 | `BETWEEN`, `NOT BETWEEN` | Narrow | `column BETWEEN low AND high` means exactly `column >= low AND column <= high`, and `NOT BETWEEN` means `column < low OR column > high`, with those comparisons' type and null rules. Each bound is a literal or parameter. There is no `SYMMETRIC` form, so a reversed range matches nothing. |
-| `+`, `-`, `*`, `/`, `%`, `\|\|` | Narrow | In the values `UPDATE` and `ON CONFLICT DO UPDATE` assign, and on either side of a comparison. See [expressions](#expressions). |
+| `+`, `-`, `*`, `/`, `%`, `\|\|` | Narrow | In the values `UPDATE` and `ON CONFLICT DO UPDATE` assign, on either side of a comparison, and in the select list of a query that does not aggregate. See [expressions](#expressions). |
 | Casts, `CASE`, scalar functions | No | There are no casts, conditional expressions, or functions other than the aggregates. |
 | `LIKE`, `NOT LIKE`, `ILIKE`, `NOT ILIKE` | Narrow | Matches a whole text column value against a literal or parameter pattern, where `%` matches any run of characters and `_` exactly one character; a non-text column is rejected. Backslash makes the next pattern character literal unless `ESCAPE` names another single character, or `''` for none; a pattern ending in its escape character is rejected. `ILIKE` folds only ASCII letters, as PostgreSQL does under the C locale. A `NULL` operand is unknown. A `LIKE` pattern that begins with literal characters, such as `'abc%'`, reads only the part of an index or primary key that can match; other patterns scan. |
 | `IS DISTINCT FROM`, `SIMILAR TO`, `ANY`, `ALL` | No | These PostgreSQL predicate families are not implemented. |
@@ -221,14 +221,15 @@ subquery. A join's `ON` clause still holds only column equalities.
 ## Expressions
 
 An `UPDATE` or `ON CONFLICT DO UPDATE` assignment can work its value out from
-the row it updates, and a `WHERE` comparison can compare values worked out from
-the rows it reads:
+the row it updates, a `WHERE` comparison can compare values worked out from
+the rows it reads, and a query can return them:
 
 ```sql
 UPDATE counters SET hits = hits + 1, label = label || ' (edited)'
 WHERE id = $1;
 
-SELECT id FROM counters WHERE hits * 2 > target - $1;
+SELECT id, hits * 2 AS doubled FROM counters
+WHERE hits * 2 > target - $1 ORDER BY doubled DESC;
 
 INSERT INTO counters (id, hits) VALUES ($1, 1)
 ON CONFLICT (id) DO UPDATE SET hits = counters.hits + EXCLUDED.hits;
@@ -264,6 +265,15 @@ In `ON CONFLICT DO UPDATE`, a column of the stored row is named with the
 table's name, such as `counters.hits`, and a column of the row proposed for
 insertion with `EXCLUDED`. A plain name could mean either, so, as in PostgreSQL,
 it is rejected.
+
+In a single-table or join query, a select-list expression's field is named by
+its `AS` alias, or `?column?` without one, as in PostgreSQL. Two expressions
+without aliases therefore share a name, which only
+[array rows](#repeated-output-names) can hold. The field's type is the type of the values the expression gives, and
+text for an expression that gives only `NULL`. `ORDER BY` can name an
+expression's alias; it then sorts the returned rows, so each of its names must
+be an output, or a column an output returns. Aggregate and `SELECT DISTINCT`
+queries return only columns and aggregates.
 
 Casts, `CASE`, functions, and comparisons inside an expression are not
 supported.

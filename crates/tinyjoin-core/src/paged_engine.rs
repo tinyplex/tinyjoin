@@ -385,8 +385,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        Engine, InMemoryStorage, MAX_CHANGED_KEYS_PER_TABLE, MemoryPageDevice, PAGE_SIZE, PageId,
-        Row,
+        ColumnType, Engine, InMemoryStorage, MAX_CHANGED_KEYS_PER_TABLE, MemoryPageDevice,
+        PAGE_SIZE, PageId, ResultField, Row,
     };
 
     #[derive(Default)]
@@ -2852,7 +2852,7 @@ mod tests {
 
         // Only the table's own name qualifies, in the clauses that read its columns.
         for (sql, code) in [
-            ("SELECT posts.id FROM users", "UNSUPPORTED_SQL"),
+            ("SELECT posts.id FROM users", "COLUMN_NOT_FOUND"),
             (
                 "SELECT id FROM users WHERE posts.id = 1",
                 "COLUMN_NOT_FOUND",
@@ -2954,7 +2954,7 @@ mod tests {
 
         // An alias hides the table's name, is one unreserved word, and is not taken by INSERT.
         for (sql, code) in [
-            ("SELECT users.id FROM users u", "UNSUPPORTED_SQL"),
+            ("SELECT users.id FROM users u", "COLUMN_NOT_FOUND"),
             (
                 "SELECT id FROM users u WHERE users.id = 1",
                 "COLUMN_NOT_FOUND",
@@ -3661,6 +3661,200 @@ mod tests {
                 .unwrap_err()
                 .code,
             "COLUMN_NOT_FOUND"
+        );
+    }
+
+    #[test]
+    fn a_select_list_returns_values_worked_out_from_the_row() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .exec_sql(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, price FLOAT, qty INTEGER, \
+                   name TEXT, doc JSON);\
+                 INSERT INTO items VALUES (1, 2.5, 4, 'pen', NULL), (2, 1.0, 3, 'cup', NULL), \
+                   (3, 9.0, NULL, 'box', NULL);",
+            )
+            .unwrap();
+        let rows = |engine: &mut PagedEngine<MemoryPageDevice>, sql: &str, params: &[Value]| {
+            engine.execute_sql(sql, params).unwrap().rows
+        };
+        assert_eq!(
+            rows(
+                &mut engine,
+                "SELECT id, price * qty AS total, name || '!' AS shout FROM items WHERE id < 3",
+                &[],
+            ),
+            vec![
+                row(json!({"id": 1, "total": 10.0, "shout": "pen!"})),
+                row(json!({"id": 2, "total": 3.0, "shout": "cup!"})),
+            ]
+        );
+        // The fields carry each value's type; an expression without an alias is unnamed, and one
+        // that gives only NULL is text.
+        let result = engine
+            .execute_sql(
+                "SELECT qty + 1, price - qty AS gap, NULL AS nothing FROM items WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            result.fields,
+            vec![
+                ResultField::new("?column?", ColumnType::Integer),
+                ResultField::new("gap", ColumnType::Float),
+                ResultField::new("nothing", ColumnType::Text),
+            ]
+        );
+        assert_eq!(
+            result.rows,
+            vec![row(json!({"?column?": 5, "gap": -1.5, "nothing": null}))]
+        );
+
+        // An output worked out from the row can be ordered by, beside others, as can the column
+        // a plain output returns; NULL sorts as it does for a column.
+        for (sql, expected) in [
+            (
+                "SELECT id, price * qty AS total FROM items ORDER BY total DESC",
+                vec![3, 1, 2],
+            ),
+            (
+                "SELECT id, price * qty AS total FROM items ORDER BY total NULLS FIRST",
+                vec![3, 2, 1],
+            ),
+            (
+                "SELECT id, qty % 2 AS odd FROM items ORDER BY odd, id DESC LIMIT 2",
+                vec![1, 2],
+            ),
+            (
+                "SELECT id AS ident, -id AS reversed FROM items ORDER BY reversed OFFSET 1",
+                vec![2, 1],
+            ),
+            (
+                "SELECT id, price * 2 AS twice FROM items ORDER BY items.price",
+                vec![2, 1, 3],
+            ),
+            // A column that is not returned is ordered by as ever, beside outputs of any kind.
+            (
+                "SELECT id, price * 2 AS twice FROM items ORDER BY name",
+                vec![3, 2, 1],
+            ),
+        ] {
+            let ids = rows(&mut engine, sql, &[])
+                .into_iter()
+                .map(|row| row.values().next().unwrap().as_i64().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(ids, expected, "{sql}");
+        }
+
+        // Parameters in a prepared projection are bound with each execution.
+        let statement = engine
+            .prepare_sql("SELECT price * $1 AS scaled FROM items WHERE id = $2")
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute_prepared(statement, &[json!(2), json!(2)])
+                .unwrap()
+                .rows,
+            vec![row(json!({"scaled": 2.0}))]
+        );
+        // Expressions without aliases share a name, which array rows hold by position.
+        assert_eq!(
+            engine
+                .execute_sql_rows(
+                    "SELECT id + 1, id * 10 FROM items WHERE id = 2 ORDER BY id",
+                    &[],
+                    true,
+                )
+                .unwrap()
+                .rows,
+            vec![row(json!({"000?column?": 3, "001?column?": 20}))]
+        );
+
+        for (sql, code) in [
+            ("SELECT name * 2 AS x FROM items LIMIT 0", "TYPE_MISMATCH"),
+            ("SELECT id + missing AS x FROM items", "COLUMN_NOT_FOUND"),
+            ("SELECT id + 1, id + 2 FROM items", "INVALID_QUERY"),
+            (
+                "SELECT id + 1 AS x FROM items ORDER BY x, name",
+                "UNSUPPORTED_SQL",
+            ),
+            (
+                "SELECT doc AS d, id + 1 AS x FROM items ORDER BY x, d",
+                "TYPE_MISMATCH",
+            ),
+            ("SELECT id / 0 AS x FROM items", "DIVISION_BY_ZERO"),
+            ("SELECT lower(name) FROM items", "UNSUPPORTED_SQL"),
+            ("SELECT DISTINCT id + 1 AS x FROM items", "UNSUPPORTED_SQL"),
+            (
+                "SELECT id + 1 AS x, COUNT(*) FROM items GROUP BY id",
+                "UNSUPPORTED_SQL",
+            ),
+        ] {
+            assert_eq!(
+                engine.execute_sql(sql, &[]).unwrap_err().code,
+                code,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_join_returns_values_worked_out_from_its_tables() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .exec_sql(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);\
+                 CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, score INTEGER);\
+                 INSERT INTO users VALUES (1, 'ann'), (2, 'bob');\
+                 INSERT INTO posts VALUES (10, 1, 7), (11, 2, 3), (12, 1, 12);",
+            )
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute_sql(
+                    "SELECT p.id AS id, u.name || '#' || u.name AS tag, p.score * 2 AS doubled \
+                     FROM posts p JOIN users u ON u.id = p.user_id ORDER BY doubled DESC LIMIT 2",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![
+                row(json!({"id": 12, "tag": "ann#ann", "doubled": 24})),
+                row(json!({"id": 10, "tag": "ann#ann", "doubled": 14})),
+            ]
+        );
+        let statement = engine
+            .prepare_sql(
+                "SELECT p.score - $1 AS rest FROM posts p JOIN users u ON u.id = p.user_id \
+                 WHERE u.name = $2 ORDER BY rest",
+            )
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute_prepared(statement, &[json!(3), json!("ann")])
+                .unwrap()
+                .rows,
+            vec![row(json!({"rest": 4})), row(json!({"rest": 9}))]
+        );
+        assert_eq!(
+            engine
+                .execute_sql(
+                    "SELECT DISTINCT p.score + 1 AS x FROM posts p JOIN users u ON u.id = p.user_id",
+                    &[],
+                )
+                .unwrap_err()
+                .code,
+            "UNSUPPORTED_SQL"
+        );
+        assert_eq!(
+            engine
+                .execute_sql(
+                    "SELECT u.name + 1 AS x FROM posts p JOIN users u ON u.id = p.user_id",
+                    &[],
+                )
+                .unwrap_err()
+                .code,
+            "TYPE_MISMATCH"
         );
     }
 

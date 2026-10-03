@@ -262,6 +262,8 @@ pub(crate) struct OrderBy {
 pub(crate) struct SelectColumn {
     pub(crate) column: String,
     pub(crate) output: String,
+    /// An output worked out from the row rather than read from `column`, which is then empty.
+    pub(crate) expression: Option<Expression>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -270,6 +272,9 @@ pub(crate) struct SelectPlan {
     pub(crate) columns: Option<Vec<SelectColumn>>,
     /// Whether the outputs are keyed by position because their names repeat.
     pub(crate) positional: bool,
+    /// Whether `order_by` names outputs rather than the table's columns, because an output it
+    /// orders by is worked out from the row.
+    pub(crate) ordered_by_outputs: bool,
     pub(crate) predicate: Option<Predicate>,
     pub(crate) order_by: Vec<OrderBy>,
     pub(crate) limit: Option<usize>,

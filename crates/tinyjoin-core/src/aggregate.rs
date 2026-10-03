@@ -1439,6 +1439,21 @@ impl<'a> Parser<'a> {
         } else {
             SelectExpression::Column(normalize_identifier(value, quoted)?)
         };
+        if matches!(
+            self.tokens.get(self.position),
+            Some(
+                Token::Plus
+                    | Token::Minus
+                    | Token::Star
+                    | Token::Slash
+                    | Token::Percent
+                    | Token::Concat
+            )
+        ) {
+            return Err(EngineError::unsupported_sql(
+                "An aggregate or DISTINCT query returns columns and aggregates, not expressions",
+            ));
+        }
         let default_output = match &expression {
             SelectExpression::Column(column) => column.clone(),
             SelectExpression::Aggregate { function, .. } => function.name().to_owned(),
