@@ -709,6 +709,8 @@ rather than growing without bound.
 | exec() row, index, scan, and join operations | 1,000,000 across the script |
 | exec() retained result work | 16 MiB across the script |
 | Predicate nodes / nesting / `IN` values | 256 / 32 / 1,024 |
+| Expression terms / nesting | 256 / 32 |
+| Subqueries in a statement / rows a subquery returns | 16 / 1,024 |
 | Rows in one `INSERT ... VALUES` | 4,096 |
 | Explicit `LIMIT` / `OFFSET` / `OFFSET + LIMIT` | 100,000 / 4,294,967,295 / 4,294,967,295 |
 | Rows scanned / returned by a query | 1,000,000 / 100,000 |

@@ -123,13 +123,13 @@ boundaries in full.
 | | TinyJoin | SQLite | PGlite |
 | --- | --- | --- | --- |
 | SQL dialect | A bounded, PostgreSQL-shaped subset | SQLite | PostgreSQL |
-| Subqueries, CTEs, set operations | No | Yes | Yes |
-| Expressions, casts, scalar functions | No | Yes | Yes |
+| Subqueries, CTEs, set operations | Uncorrelated `IN (SELECT ...)` only | Yes | Yes |
+| Expressions, casts, scalar functions | Arithmetic and `\|\|`, without casts or functions | Yes | Yes |
 | `HAVING`, window functions | No | Yes | Yes |
 | Views, triggers | No | Yes | Yes |
 | Joins | Up to eight sources, evaluated as written, through key lookups, indexes, or hash tables | Query planner, with indexes | Query planner, with indexes |
 | `INSERT ... SELECT`, `UPDATE ... FROM` | No | Yes | Yes |
-| Upserts | `ON CONFLICT`, assigning values from `EXCLUDED` | Yes | Yes |
+| Upserts | `ON CONFLICT`, assigning expressions of the stored and proposed rows | Yes | Yes |
 | Types | Boolean, safe integer, float, text, JSON | Dynamic: integer, real, text, blob | The PostgreSQL type system |
 | JSON | Stored, returned, and compared for equality | JSON functions | `json` and `jsonb` operators and functions |
 | Full-text search | No | FTS5 | `tsvector` |
@@ -206,9 +206,9 @@ seed, so it is identical for every engine and every run.
 Several workloads are adapted from the classic SQLite database speed
 comparison, which [PGlite](https://pglite.dev/benchmarks) also publishes
 results for. The adaptations add a primary key to every table, use smaller
-counts, and replace the forms TinyJoin cannot run: arithmetic in `UPDATE ...
-SET` becomes a literal assignment, and the `INSERT ... SELECT` tests are
-omitted.
+counts, and replace the forms TinyJoin could not run when they were written:
+arithmetic in `UPDATE ... SET` becomes a literal assignment, and the
+`INSERT ... SELECT` tests, which it still cannot run, are omitted.
 
 The join places 5,000 orders across 100 customers, and each query reads one
 customer's orders through the index on `customer_id`.

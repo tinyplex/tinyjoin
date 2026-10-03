@@ -95,7 +95,8 @@
 /// ResultField
 {
   /**
-   * The name property contains the projected column name or alias.
+   * The name property contains the projected column name or alias, or
+   * `?column?` for an expression without an alias.
    * @category Result
    * @since v0.0.5
    */
