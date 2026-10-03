@@ -1,8 +1,8 @@
 {
   "wasm": {
-    "raw": 790544,
-    "gzip": 326841,
-    "gzipLabel": "319 KiB"
+    "raw": 788025,
+    "gzip": 325697,
+    "gzipLabel": "318 KiB"
   },
   "client": {
     "raw": 16888,
@@ -15,8 +15,8 @@
     "gzipLabel": "15 KiB"
   },
   "total": {
-    "raw": 849846,
-    "gzip": 349364,
-    "gzipLabel": "341 KiB"
+    "raw": 847327,
+    "gzip": 348220,
+    "gzipLabel": "340 KiB"
   }
 }

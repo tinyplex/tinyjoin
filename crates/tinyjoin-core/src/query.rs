@@ -2008,29 +2008,9 @@ impl PredicateParser<'_> {
     }
 
     fn parse_value(&mut self) -> Result<Value> {
-        let Some(token) = self.next() else {
-            return Err(EngineError::parse_error("Expected a SQL value"));
-        };
-        match token {
-            Token::String(value) => Ok(Value::String(value)),
-            Token::Number(value) => number_literal(&value).map(Value::Number).ok_or_else(|| {
-                EngineError::invalid_query(format!("Invalid number literal `{value}`"))
-            }),
-            Token::Placeholder(index) => bind_parameter(&index, self.params),
-            Token::Identifier {
-                value,
-                quoted: false,
-            } if value.eq_ignore_ascii_case("null") => Ok(Value::Null),
-            Token::Identifier {
-                value,
-                quoted: false,
-            } if value.eq_ignore_ascii_case("true") => Ok(Value::Bool(true)),
-            Token::Identifier {
-                value,
-                quoted: false,
-            } if value.eq_ignore_ascii_case("false") => Ok(Value::Bool(false)),
-            _ => Err(unsupported_shape()),
-        }
+        let token = self.tokens.get(self.position);
+        self.position += 1;
+        literal(token, self.params).unwrap_or_else(|| Err(unsupported_shape()))
     }
 
     fn node(&mut self, predicate: Predicate) -> Result<Predicate> {
@@ -2683,6 +2663,23 @@ pub(crate) fn bind_nonnegative_integer_parameter(index: usize, params: &[Value])
     pagination_value(value, ParseMode::Bound)
 }
 
+/// The value of the literal or parameter `token`, if it is one: a string, a number, a parameter,
+/// or `NULL`, `TRUE`, or `FALSE`. No token at all is an error.
+pub(crate) fn literal(token: Option<&Token>, params: &[Value]) -> Option<Result<Value>> {
+    Some(match token {
+        None => Err(EngineError::parse_error("Expected a SQL value")),
+        Some(Token::String(value)) => Ok(Value::String(value.clone())),
+        Some(Token::Number(value)) => number_literal(value)
+            .map(Value::Number)
+            .ok_or_else(|| EngineError::invalid_query(format!("Invalid number literal `{value}`"))),
+        Some(Token::Placeholder(index)) => bind_parameter(index, params),
+        _ if is_keyword(token, "null") => Ok(Value::Null),
+        _ if is_keyword(token, "true") => Ok(Value::Bool(true)),
+        _ if is_keyword(token, "false") => Ok(Value::Bool(false)),
+        _ => return None,
+    })
+}
+
 /// Reads a statement's `LIMIT` and `OFFSET`, if it has them, at `position`: each a number literal
 /// or a parameter.
 pub(crate) fn parse_limit_offset(
@@ -2696,13 +2693,9 @@ pub(crate) fn parse_limit_offset(
             return Ok(None);
         }
         let value = match tokens.get(*position + 1) {
-            Some(Token::Number(value)) => {
-                number_literal(value).map(Value::Number).ok_or_else(|| {
-                    EngineError::invalid_query(format!("Invalid number literal `{value}`"))
-                })?
+            token @ Some(Token::Number(_) | Token::Placeholder(_)) | token @ None => {
+                literal(token, params).unwrap_or_else(|| Err(unsupported_shape()))?
             }
-            Some(Token::Placeholder(index)) => bind_parameter(index, params)?,
-            None => return Err(EngineError::parse_error("Expected a LIMIT or OFFSET value")),
             Some(_) => Value::Null,
         };
         *position += 2;

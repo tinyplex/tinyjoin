@@ -5,7 +5,7 @@ use std::mem::discriminant;
 
 use serde_json::Value;
 
-use crate::query::{Token, bind_parameter, bound_value, is_reserved_keyword, number_literal};
+use crate::query::{Token, bound_value, is_reserved_keyword, literal, number_literal};
 use crate::storage::{MAX_LOGICAL_VALUE_BYTES, column_type_name};
 use crate::{ColumnDefinition, ColumnType, ComparisonOperator, EngineError, Predicate, Result};
 
@@ -293,35 +293,21 @@ impl Parser<'_> {
             let operand = self.unary(depth + 1)?;
             return self.node(Expression::Negate(Box::new(operand)));
         }
-        let tokens = self.tokens;
-        let Some(token) = tokens.get(self.position) else {
-            return Err(EngineError::parse_error("Expected a SQL value"));
-        };
+        let token = self.tokens.get(self.position);
+        if let Some(value) = literal(token, self.params) {
+            self.position += 1;
+            return self.node(Expression::Value(value?));
+        }
         self.position += 1;
         let expression = match token {
-            Token::LParen => {
+            Some(Token::LParen) => {
                 let inner = self.concatenation(depth + 1)?;
                 if !self.consume(&Token::RParen) {
                     return Err(EngineError::parse_error("Expected `)` after an expression"));
                 }
                 return Ok(inner);
             }
-            Token::String(value) => Expression::Value(Value::String(value.clone())),
-            Token::Number(value) => Expression::Value(self.number(value)?),
-            Token::Placeholder(index) => Expression::Value(bind_parameter(index, self.params)?),
-            Token::Identifier {
-                value,
-                quoted: false,
-            } if value.eq_ignore_ascii_case("null") => Expression::Value(Value::Null),
-            Token::Identifier {
-                value,
-                quoted: false,
-            } if value.eq_ignore_ascii_case("true") => Expression::Value(Value::Bool(true)),
-            Token::Identifier {
-                value,
-                quoted: false,
-            } if value.eq_ignore_ascii_case("false") => Expression::Value(Value::Bool(false)),
-            Token::Identifier { .. } => {
+            Some(Token::Identifier { .. }) => {
                 self.position -= 1;
                 self.column()?
             }

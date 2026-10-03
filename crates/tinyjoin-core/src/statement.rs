@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -9,16 +10,16 @@ use crate::StorageDriver;
 use crate::expression::{
     Expression, Names, check_assignment, constant, evaluate, parse_expression_at,
 };
-use crate::hash::KeySet;
+use crate::hash::{KeyMap, KeySet};
 use crate::paged_codec::{
     EMPTY_RECORD, RecordLayout, StoredRecord, encode_primary_key, encode_primary_key_values,
     encode_row_values, encode_updated_record,
 };
 use crate::query::{
-    Filter, ParseMode, Token, bind_parameter, column_definition, exact_equalities, is_keyword,
-    is_reserved_keyword, next_outer, number_literal, parse_predicate_at, resolved_subqueries,
-    tokenize, validate_named_columns, validate_parameter_expansion, validate_predicate_columns,
-    validate_predicate_types, validate_sql_input, visit_indexed_candidates,
+    Filter, ParseMode, Token, column_definition, exact_equalities, is_keyword, is_reserved_keyword,
+    next_outer, parse_predicate_at, resolved_subqueries, tokenize, validate_named_columns,
+    validate_parameter_expansion, validate_predicate_columns, validate_predicate_types,
+    validate_sql_input, visit_indexed_candidates,
 };
 use crate::row::{HeldRow, RowRef};
 use crate::storage::{
@@ -1475,7 +1476,7 @@ struct ConflictIndex {
     written: KeySet<String>,
     /// Existing primary keys by index key, collected with one scan when the storage view cannot
     /// visit this index directly, as inside a transaction.
-    scanned: Option<BTreeMap<String, Row>>,
+    scanned: Option<KeyMap<String, Row>>,
 }
 
 /// A validated `ON CONFLICT` clause for one table.
@@ -1749,9 +1750,9 @@ impl ConflictIndex {
         storage: &dyn StorageReader,
         schema: &TableDefinition,
         work_bytes: &mut usize,
-    ) -> Result<BTreeMap<String, Row>> {
+    ) -> Result<KeyMap<String, Row>> {
         let mut scanned = 0usize;
-        let mut keys = BTreeMap::new();
+        let mut keys = KeyMap::default();
         let outcome = storage.visit_table(&schema.name, &mut |row| {
             scanned = scanned.saturating_add(1);
             if scanned > MAX_DML_SCAN_ROWS {
@@ -3465,33 +3466,14 @@ impl<'a> MutationParser<'a> {
     }
 
     fn parse_sql_value(&mut self, allow_default: bool) -> Result<SqlValue> {
-        let Some(token) = self.next() else {
-            return Err(EngineError::parse_error("Expected a SQL value"));
-        };
-        match token {
-            Token::String(value) => Ok(SqlValue::Value(Value::String(value))),
-            Token::Number(value) => number_literal(&value)
-                .map(Value::Number)
-                .map(SqlValue::Value)
-                .ok_or_else(|| EngineError::invalid_query(format!("Invalid number `{value}`"))),
-            Token::Placeholder(index) => bind_parameter(&index, self.params).map(SqlValue::Value),
-            Token::Identifier {
-                value,
-                quoted: false,
-            } if value.eq_ignore_ascii_case("null") => Ok(SqlValue::Value(Value::Null)),
-            Token::Identifier {
-                value,
-                quoted: false,
-            } if value.eq_ignore_ascii_case("true") => Ok(SqlValue::Value(Value::Bool(true))),
-            Token::Identifier {
-                value,
-                quoted: false,
-            } if value.eq_ignore_ascii_case("false") => Ok(SqlValue::Value(Value::Bool(false))),
-            Token::Identifier {
-                value,
-                quoted: false,
-            } if allow_default && value.eq_ignore_ascii_case("default") => Ok(SqlValue::Default),
-            _ => Err(unsupported_expression()),
+        let token = self.tokens.get(self.position);
+        self.position += 1;
+        if allow_default && is_keyword(token, "default") {
+            return Ok(SqlValue::Default);
+        }
+        match crate::query::literal(token, self.params) {
+            Some(value) => value.map(SqlValue::Value),
+            None => Err(unsupported_expression()),
         }
     }
 
