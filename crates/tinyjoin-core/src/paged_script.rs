@@ -406,8 +406,8 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 let outcome = crate::statement::plan_drop_table(self, table, *if_exists, *cascade)?;
                 if outcome.mutated {
                     // CASCADE drops the other tables' foreign keys that reference it.
-                    self.edit_foreign_keys(&mut |child, keys| {
-                        keys.retain(|key| key.references != *table || child == table);
+                    self.edit_foreign_keys(&mut |child, key| {
+                        key.references != *table || child == table
                     })?;
                     self.drop_table(table)?;
                 }
@@ -603,12 +603,11 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 }
                 self.replace_schema(&to, schema)?;
                 // Foreign keys follow the table they reference, its own included.
-                return self.edit_foreign_keys(&mut |_, keys| {
-                    for key in keys {
-                        if key.references == name {
-                            key.references.clone_from(&to);
-                        }
+                return self.edit_foreign_keys(&mut |_, key| {
+                    if key.references == name {
+                        key.references.clone_from(&to);
                     }
+                    true
                 });
             }
             _ => crate::statement::altered_schema(&table.schema, change)?,
@@ -625,26 +624,23 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                     }
                 }
                 self.replace_schema(name, schema)?;
-                return self.edit_foreign_keys(&mut |child, keys| {
-                    for key in keys {
-                        if key.references == name && child != name {
-                            for column in &mut key.referenced_columns {
-                                if column == from {
-                                    column.clone_from(to);
-                                }
+                return self.edit_foreign_keys(&mut |child, key| {
+                    if key.references == name && child != name {
+                        for column in &mut key.referenced_columns {
+                            if column == from {
+                                column.clone_from(to);
                             }
                         }
                     }
+                    true
                 });
             }
             TableChange::DropColumn { column, .. } => {
                 // CASCADE drops the other tables' foreign keys that reference the column.
-                self.edit_foreign_keys(&mut |child, keys| {
-                    keys.retain(|key| {
-                        child == name
-                            || key.references != name
-                            || !key.referenced_columns.contains(column)
-                    });
+                self.edit_foreign_keys(&mut |child, key| {
+                    child == name
+                        || key.references != name
+                        || !key.referenced_columns.contains(column)
                 })?;
                 // As in PostgreSQL, a column takes every index on it with it.
                 let indexes = self
@@ -695,25 +691,26 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 .into_iter()
                 .map(|(child, key)| (child.name.clone(), key.name))
                 .collect::<Vec<_>>();
-            self.edit_foreign_keys(&mut |child, keys| {
-                keys.retain(|key| {
-                    !needing
-                        .iter()
-                        .any(|(table, name)| table == child && *name == key.name)
-                });
+            self.edit_foreign_keys(&mut |child, key| {
+                !needing
+                    .iter()
+                    .any(|(table, name)| table == child && *name == key.name)
             })?;
         }
         self.drop_index(name)
     }
 
-    /// Changes the foreign keys of each table that has any, as `edit` changes them.
+    /// Changes each foreign key of each table that has any, as `edit` changes it, keeping it if
+    /// `edit` returns true.
     fn edit_foreign_keys(
         &mut self,
-        edit: &mut dyn FnMut(&str, &mut Vec<ForeignKeyDefinition>),
+        edit: &mut dyn FnMut(&str, &mut ForeignKeyDefinition) -> bool,
     ) -> Result<()> {
         for schema in crate::paged_storage::tables_with_foreign_keys(&self.tables) {
             let mut edited = (*schema).clone();
-            edit(&schema.name, &mut edited.foreign_keys);
+            crate::foreign_key::retain(&mut edited.foreign_keys, &mut |key| {
+                edit(&schema.name, key)
+            });
             if edited.foreign_keys != schema.foreign_keys {
                 self.replace_schema(&schema.name, edited)?;
             }

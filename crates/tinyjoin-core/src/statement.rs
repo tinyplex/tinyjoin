@@ -915,13 +915,13 @@ pub(crate) fn altered_schema(
             }
             altered.columns.remove(position);
             // As in PostgreSQL, the table's foreign keys on the column go with it.
-            altered.foreign_keys.retain(|key| {
+            crate::foreign_key::retain(&mut altered.foreign_keys, &mut |key| {
                 !key.columns.contains(column)
                     && !(key.references == schema.name && key.referenced_columns.contains(column))
             });
         }
         TableChange::DropConstraint { name, .. } => {
-            altered.foreign_keys.retain(|key| key.name != *name);
+            crate::foreign_key::retain(&mut altered.foreign_keys, &mut |key| key.name != *name);
         }
         _ => {}
     }

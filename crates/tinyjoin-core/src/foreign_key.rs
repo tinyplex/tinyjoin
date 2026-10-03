@@ -370,6 +370,15 @@ pub(crate) fn enforce(storage: &dyn StorageReader, planned: &mut PlannedDml) -> 
     Ok(())
 }
 
+/// Keeps the keys that `keep` keeps, after it changes them as it needs to. Every caller shares
+/// this one loop.
+pub(crate) fn retain(
+    keys: &mut Vec<ForeignKeyDefinition>,
+    keep: &mut dyn FnMut(&mut ForeignKeyDefinition) -> bool,
+) {
+    keys.retain_mut(|key| keep(key));
+}
+
 fn referencing_violation(table: &str, key: &ForeignKeyDefinition) -> EngineError {
     EngineError::constraint_violation(format!(
         "A row of `{table}` breaks foreign key `{}`: no row of `{}` has its values",
