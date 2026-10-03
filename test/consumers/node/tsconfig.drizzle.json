@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // drizzle-orm's own declarations do not pass a library check under these
+    // settings, which is theirs to fix; TinyJoin's are still checked in full.
+    "skipLibCheck": true
+  },
+  "include": ["drizzle-types.mts"]
+}

@@ -83,6 +83,15 @@ and has no OPFS, filesystem persistence, or remote synchronization. See the
 Supported runtime values are booleans, JavaScript-safe integers, finite
 floating-point numbers, strings, JSON-compatible values, and `null`.
 
+## Drizzle
+
+To use the Drizzle ORM, call `drizzle(client, {schema})` from
+`tinyjoin/drizzle` with a Client from create(); the application installs
+`drizzle-orm` itself. Create tables with DDL through client.exec() rather than
+Drizzle Kit or Drizzle's migrators, use the column types TinyJoin has, and
+avoid relational queries with `with`, SQL functions, and nested transactions.
+See the [Drizzle guide](/guides/drizzle/).
+
 ## Transactions and changes
 
 Use db.transaction(callback) for related parameterized `INSERT`, `UPDATE`,

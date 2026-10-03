@@ -62,6 +62,16 @@ a `WHERE` clause. The subquery runs once, before the statement reads any row,
 must return one column and at most 1,024 rows, and cannot read the statement
 around it. See [subqueries](/guides/sql-compatibility/#subqueries).
 
+The new `tinyjoin/drizzle` entry point connects the
+[Drizzle ORM](https://orm.drizzle.team) to a TinyJoin Client:
+`drizzle(client, {schema})` returns a Drizzle database whose queries run in
+TinyJoin's dialect, whose transactions are TinyJoin's callback transactions,
+and whose JSON columns store JSON values rather than JSON text. The application
+installs `drizzle-orm` 0.45 or later itself; TinyJoin declares it as an
+optional peer dependency and never bundles it, so the download sizes are
+unchanged. Relational queries with `with`, Drizzle Kit, and Drizzle's
+migrators are not supported. See the [Drizzle guide](/guides/drizzle/).
+
 **Upgrading from v0.4.0 needs no action.** Install, rebuild, and redeploy. The
 Worker protocol stays at version 10 and the page format stays at format 3, so
 an existing database opens with no migration and no OPFS namespace change. The

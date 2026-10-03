@@ -639,6 +639,13 @@ SQL `NULL` and a JSON scalar `null` are the same runtime value, including in a
 JSON column. TinyJoin cannot distinguish them for `NOT NULL`, `IS NULL`,
 aggregates, or defaults.
 
+A parameter is the JavaScript value it is, so a string bound to a JSON column
+is stored as a JSON string. PostgreSQL and PGlite parse a string bound to a
+`json` or `jsonb` column as JSON text instead, so code that passes
+`JSON.stringify(value)` there stores an object in PGlite and a string in
+TinyJoin, without an error. Pass the value itself. The
+[Drizzle driver](https://tinyjoin.org/guides/drizzle/) does this for Drizzle's JSON columns.
+
 There are no implicit PostgreSQL casts. Notable unavailable types include
 `NUMERIC`/`DECIMAL`, date/time/interval types, UUID, `BYTEA`, arrays,
 serial/identity, enum/domain, and user-defined types. Type modifiers such as
@@ -1771,6 +1778,154 @@ or remote synchronization. The Node entry point does not accept the browser
 create() options or custom Worker configuration. Use the browser entry point
 for [persistent browser storage](https://tinyjoin.org/guides/storage-and-lifecycle/).
 
+# Drizzle
+
+Source: https://tinyjoin.org/guides/drizzle/
+
+Use `tinyjoin/drizzle` to query a TinyJoin database with the
+[Drizzle ORM](https://orm.drizzle.team) query builder. It connects Drizzle to a
+TinyJoin Client, runs Drizzle's transactions as TinyJoin transactions, and
+binds JSON values as JSON.
+
+Drizzle writes PostgreSQL, and TinyJoin runs a
+[bounded, PostgreSQL-shaped dialect](https://tinyjoin.org/guides/sql-compatibility/), so most of
+Drizzle's query builder works, and some of it does not. This guide says which.
+
+## Get started
+
+Install TinyJoin and Drizzle. TinyJoin declares `drizzle-orm` 0.45 or later as
+an optional peer dependency, so an application that does not use Drizzle never
+installs it.
+
+```sh
+npm install tinyjoin drizzle-orm
+```
+
+Describe the tables with Drizzle's PostgreSQL columns, create them with SQL,
+and query them through Drizzle:
+
+```ts
+import {create} from 'tinyjoin';
+import {drizzle} from 'tinyjoin/drizzle';
+import {eq, sql} from 'drizzle-orm';
+import {boolean, integer, pgTable, text} from 'drizzle-orm/pg-core';
+
+const tasks = pgTable('tasks', {
+  id: text('id').primaryKey(),
+  title: text('title').notNull(),
+  done: boolean('done').notNull().default(false),
+  edits: integer('edits').notNull().default(0),
+});
+
+const client = await create('opfs://my-app-v1');
+await client.exec(`
+  CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    done BOOLEAN NOT NULL DEFAULT false,
+    edits INTEGER NOT NULL DEFAULT 0
+  )
+`);
+
+const db = drizzle(client, {schema: {tasks}});
+await db.insert(tasks).values({id: crypto.randomUUID(), title: 'Try Drizzle'});
+await db
+  .update(tasks)
+  .set({title: 'Tried Drizzle', edits: sql`${tasks.edits} + 1`})
+  .where(eq(tasks.done, false));
+const open = await db.select().from(tasks).where(eq(tasks.done, false));
+```
+
+The Client is still yours: subscribe to it for changes, and close it when the
+database is no longer needed. `db.$client` returns it.
+
+## Schemas
+
+Every table needs a primary key. Drizzle's columns map onto TinyJoin's five
+runtime types:
+
+| Drizzle column | TinyJoin type |
+| --- | --- |
+| `boolean` | Boolean |
+| `integer`, `smallint`, `bigint({mode: 'number'})` | Integer, within the JavaScript-safe range |
+| `real`, `doublePrecision` | Float |
+| `text`, `varchar` without a length | Text |
+| `json`, `jsonb` | JSON |
+
+TinyJoin has no `serial`, `uuid`, `timestamp`, `date`, `numeric`, enum, or
+array types, and no length modifiers. Generate identifiers in the application,
+as `text('id').primaryKey().$defaultFn(() => crypto.randomUUID())` does, and
+store a time as an integer or text column, or as a Drizzle `customType` over
+one.
+
+Create tables with SQL through the Client, idempotently with
+`IF NOT EXISTS`, and version the OPFS name with the schema. Drizzle Kit's
+`push`, `pull`, and Studio read PostgreSQL's system catalogs, which TinyJoin
+does not have, and Drizzle's migrators create a `SERIAL` table in a schema of
+their own, so none of them works. The SQL that `drizzle-kit generate` writes
+is a useful start, but TinyJoin refuses its foreign keys, table-level `UNIQUE`
+constraints, and `USING btree` index methods; write the equivalent
+`CREATE UNIQUE INDEX` instead.
+
+## Queries
+
+These work as Drizzle documents them:
+
+- `select`, `insert`, `update`, and `delete`, with `returning`;
+- filters such as `eq`, `ne`, `gt`, `and`, `or`, `not`, `isNull`, `like`,
+  `ilike`, `between`, and `inArray`, including `inArray` with a subquery;
+- comparisons of two columns, and `sql` expressions with `+`, `-`, `*`, `/`,
+  `%`, and `||`, in filters, select lists, and `set`;
+- `orderBy`, `limit`, and `offset`;
+- inner and left joins of up to eight tables, including columns that share a
+  name, and table aliases;
+- `groupBy` with `count`, `sum`, `avg`, `min`, and `max`, `$count`, and
+  `selectDistinct`;
+- `onConflictDoNothing` and `onConflictDoUpdate`, assigning `excluded.column`
+  in an `sql` template, or an expression of the stored row's columns;
+- prepared statements and placeholders;
+- relational queries, `db.query.table.findMany()` and `findFirst()`, without
+  `with`.
+
+These are refused with an error rather than run:
+
+- relational queries with `with`, which Drizzle writes as lateral joins of
+  JSON aggregates;
+- SQL functions such as `lower()`, `coalesce()`, and `now()`, casts, and
+  `CASE`;
+- `having`, window functions, `$with` CTEs, `union`, correlated subqueries,
+  and `exists`;
+- right, full, and cross joins, `insert ... select`, and `update ... from`;
+- JSON operators.
+
+A failed query rejects with Drizzle's `DrizzleQueryError`, whose `cause` is the
+TinyJoin [ClientError](https://tinyjoin.org/api/tinyjoin/classes/errors/clienterror/) with its
+`code`. The [SQL compatibility contract](https://tinyjoin.org/guides/sql-compatibility/) is the
+exact list of what runs.
+
+## Transactions
+
+Drizzle's `db.transaction` runs on the Client's
+[callback transaction](https://tinyjoin.org/guides/transactions-and-changes/). It holds the
+database, and every tab sharing it, until the callback finishes, so keep it
+short. Use the `tx` it passes, not `db`, inside the callback: awaiting `db`
+there waits for the transaction to finish, which waits for the callback.
+
+Drizzle's `tx.rollback` discards the transaction's work and rejects with
+`TransactionRollbackError`, as does any error the callback throws. A
+transaction cannot nest, since TinyJoin has no savepoints, and cannot take an
+isolation level or access mode.
+
+## JSON values
+
+Drizzle encodes a value for a `json` or `jsonb` column as JSON text, which
+PostgreSQL parses again. TinyJoin binds every parameter as the JavaScript value
+it is, so the driver parses that text back first, and the column stores the
+object rather than a string. Reading the column returns the object.
+
+Drizzle's raw `db.execute` resolves to the rows its statement returns, as
+objects.
+
 # Offline
 
 Source: https://tinyjoin.org/guides/offline/
@@ -2344,6 +2499,15 @@ and has no OPFS, filesystem persistence, or remote synchronization. See the
 Supported runtime values are booleans, JavaScript-safe integers, finite
 floating-point numbers, strings, JSON-compatible values, and `null`.
 
+## Drizzle
+
+To use the Drizzle ORM, call `drizzle(client, {schema})` from
+`tinyjoin/drizzle` with a Client from create(); the application installs
+`drizzle-orm` itself. Create tables with DDL through client.exec() rather than
+Drizzle Kit or Drizzle's migrators, use the column types TinyJoin has, and
+avoid relational queries with `with`, SQL functions, and nested transactions.
+See the [Drizzle guide](https://tinyjoin.org/guides/drizzle/).
+
 ## Transactions and changes
 
 Use db.transaction(callback) for related parameterized `INSERT`, `UPDATE`,
@@ -2515,6 +2679,16 @@ still return only columns and aggregates. See
 a `WHERE` clause. The subquery runs once, before the statement reads any row,
 must return one column and at most 1,024 rows, and cannot read the statement
 around it. See [subqueries](https://tinyjoin.org/guides/sql-compatibility/#subqueries).
+
+The new `tinyjoin/drizzle` entry point connects the
+[Drizzle ORM](https://orm.drizzle.team) to a TinyJoin Client:
+`drizzle(client, {schema})` returns a Drizzle database whose queries run in
+TinyJoin's dialect, whose transactions are TinyJoin's callback transactions,
+and whose JSON columns store JSON values rather than JSON text. The application
+installs `drizzle-orm` 0.45 or later itself; TinyJoin declares it as an
+optional peer dependency and never bundles it, so the download sizes are
+unchanged. Relational queries with `with`, Drizzle Kit, and Drizzle's
+migrators are not supported. See the [Drizzle guide](https://tinyjoin.org/guides/drizzle/).
 
 **Upgrading from v0.4.0 needs no action.** Install, rebuild, and redeploy. The
 Worker protocol stays at version 10 and the page format stays at format 3, so
@@ -2913,7 +3087,8 @@ storage, transactions, custom Workers, and compatibility details only when they
 become relevant.
 
 The [Node guide](https://tinyjoin.org/guides/node/) covers in-memory databases in Node.js with
-the same Client API.
+the same Client API, and the [Drizzle guide](https://tinyjoin.org/guides/drizzle/) covers querying
+TinyJoin with the Drizzle ORM.
 
 The [caveats](https://tinyjoin.org/guides/caveats/) collect what TinyJoin deliberately does not do,
 and which projects to reach for when that matters.
@@ -3953,4 +4128,86 @@ export interface TinyjoinOfflineOptions {
  * @since v0.1.0
  */
 export function tinyjoinOffline(options?: TinyjoinOfflineOptions): Plugin;
+````
+
+# Public API: tinyjoin/drizzle
+
+Source: https://tinyjoin.org/api/drizzle/
+
+````ts
+/**
+ * The drizzle module connects the Drizzle ORM query builder to a TinyJoin
+ * Client. It needs `drizzle-orm` 0.45 or later, which the application installs
+ * itself: TinyJoin declares it as an optional peer dependency and never bundles
+ * it.
+ *
+ * Drizzle writes PostgreSQL, so its queries run in TinyJoin's
+ * [SQL dialect](https://tinyjoin.org/guides/sql-compatibility/), and its schemas use the column
+ * types that dialect has. See the [Drizzle guide](https://tinyjoin.org/guides/drizzle/) for what
+ * works, and what does not.
+ * @packageDocumentation
+ * @module drizzle
+ * @since v0.5.0
+ */
+
+import type {DrizzleConfig} from 'drizzle-orm';
+import type {PgRemoteDatabase} from 'drizzle-orm/pg-proxy';
+import type {Client} from '../index.js';
+
+/**
+ * The TinyJoinDatabase type is the Drizzle database the drizzle function
+ * returns: Drizzle's PostgreSQL database with the TinyJoin Client it queries as
+ * its `$client`.
+ *
+ * Drizzle's raw `db.execute` resolves to the rows its statement returns, as
+ * objects.
+ * @category Drizzle
+ * @since v0.5.0
+ */
+export type TinyJoinDatabase<
+  TSchema extends Record<string, unknown> = Record<string, never>,
+> = PgRemoteDatabase<TSchema> & {$client: Client};
+
+/**
+ * The drizzle function creates a Drizzle database over a TinyJoin Client.
+ *
+ * Queries run on the Client as array rows, which Drizzle maps to its own
+ * result shapes. Drizzle's `db.transaction` runs on the Client's callback
+ * transaction, so it holds the database as any TinyJoin transaction does,
+ * `tx.rollback` discards its work, and a transaction cannot nest, since there
+ * are no savepoints, or take an isolation level.
+ *
+ * A value Drizzle encodes for a `json` or `jsonb` column is bound as the JSON
+ * value it is, rather than as the JSON text Drizzle makes of it, which TinyJoin
+ * would store as a string.
+ *
+ * Close the Client yourself when the database is no longer needed.
+ * @param client The TinyJoin Client to query, from create().
+ * @param config Drizzle's configuration: its schema, for relational queries,
+ * and its logger, casing, and cache.
+ * @returns A Drizzle database.
+ * @example
+ * ```ts
+ * import {create} from 'tinyjoin';
+ * import {drizzle} from 'tinyjoin/drizzle';
+ * import {eq} from 'drizzle-orm';
+ * import {boolean, pgTable, text} from 'drizzle-orm/pg-core';
+ *
+ * const tasks = pgTable('tasks', {
+ *   id: text('id').primaryKey(),
+ *   title: text('title').notNull(),
+ *   done: boolean('done').notNull().default(false),
+ * });
+ *
+ * const client = await create('opfs://my-app-v1');
+ * const db = drizzle(client, {schema: {tasks}});
+ * await db.insert(tasks).values({id: crypto.randomUUID(), title: 'Try Drizzle'});
+ * const open = await db.select().from(tasks).where(eq(tasks.done, false));
+ * ```
+ * @category Drizzle
+ * @since v0.5.0
+ */
+export function drizzle<
+  TSchema extends Record<string, unknown> = Record<string, never>,
+>(client: Client, config?: DrizzleConfig<TSchema>): TinyJoinDatabase<TSchema>;
 ````

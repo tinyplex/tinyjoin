@@ -1,4 +1,4 @@
-import {mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
+import {mkdtemp, readFile, rm, symlink, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join, relative, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -16,6 +16,13 @@ try {
   await writeFile(
     resolve(temporaryRoot, 'package.json'),
     '{"name":"tinyjoin","private":true,"type":"module"}\n',
+  );
+  // Declarations that import a peer dependency's types, as the Drizzle driver's
+  // do, resolve them as the documentation build beside the repository does.
+  await symlink(
+    resolve(root, 'node_modules'),
+    resolve(temporaryRoot, 'node_modules'),
+    'dir',
   );
   await buildDefinitions(root, temporaryDist);
   await withSiteBuild((buildDocs) =>

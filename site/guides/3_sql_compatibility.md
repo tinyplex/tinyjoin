@@ -324,6 +324,13 @@ SQL `NULL` and a JSON scalar `null` are the same runtime value, including in a
 JSON column. TinyJoin cannot distinguish them for `NOT NULL`, `IS NULL`,
 aggregates, or defaults.
 
+A parameter is the JavaScript value it is, so a string bound to a JSON column
+is stored as a JSON string. PostgreSQL and PGlite parse a string bound to a
+`json` or `jsonb` column as JSON text instead, so code that passes
+`JSON.stringify(value)` there stores an object in PGlite and a string in
+TinyJoin, without an error. Pass the value itself. The
+[Drizzle driver](/guides/drizzle/) does this for Drizzle's JSON columns.
+
 There are no implicit PostgreSQL casts. Notable unavailable types include
 `NUMERIC`/`DECIMAL`, date/time/interval types, UUID, `BYTEA`, arrays,
 serial/identity, enum/domain, and user-defined types. Type modifiers such as

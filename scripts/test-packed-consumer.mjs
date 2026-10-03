@@ -270,12 +270,14 @@ function run(command, args, cwd, options = {}) {
 }
 
 async function exerciseNodeConsumer() {
-  run(
-    process.execPath,
-    ['node_modules/typescript/bin/tsc', '--project', 'node/tsconfig.json'],
-    appDirectory,
-    {timeout: 30_000},
-  );
+  for (const project of ['node/tsconfig.json', 'node/tsconfig.drizzle.json']) {
+    run(
+      process.execPath,
+      ['node_modules/typescript/bin/tsc', '--project', project],
+      appDirectory,
+      {timeout: 30_000},
+    );
+  }
   for (const args of [
     ['node/main.mjs'],
     ['--input-type=module', '--eval', "await import('./node/main.mjs')"],
@@ -284,6 +286,13 @@ async function exerciseNodeConsumer() {
     if (!output.includes('NODE_MEMORY_CONSUMER_OK')) {
       throw new Error(`Node packed consumer did not complete:\n${output}`);
     }
+  }
+  // The Drizzle driver resolves the application's own drizzle-orm.
+  const drizzleOutput = run(process.execPath, ['node/drizzle.mjs'], appDirectory, {
+    timeout: 30_000,
+  });
+  if (!drizzleOutput.includes('NODE_DRIZZLE_CONSUMER_OK')) {
+    throw new Error(`Drizzle packed consumer did not complete:\n${drizzleOutput}`);
   }
 
   // A damaged install must reject create() and stop its Worker. Keep the
@@ -305,6 +314,7 @@ async function exerciseNodeConsumer() {
   }
   console.log('NODE_DECLARATIONS_OK');
   console.log('NODE_MEMORY_CONSUMER_OK');
+  console.log('NODE_DRIZZLE_CONSUMER_OK');
   console.log('NODE_MISSING_WASM_REJECTED');
 }
 
@@ -361,6 +371,7 @@ function assertPackedFiles(packed, documentationFiles) {
     '@types/node/index.d.ts',
     '@types/worker/index.d.ts',
     '@types/vite/index.d.ts',
+    '@types/drizzle/index.d.ts',
     'LICENSE',
     'README.md',
     'RUST_STANDARD_LIBRARY_NOTICES.html',
@@ -378,6 +389,7 @@ function assertPackedFiles(packed, documentationFiles) {
     'worker/default-entry.js',
     'worker/index.js',
     'vite/index.js',
+    'drizzle/index.js',
   ].sort();
   const missing = expected.filter((file) => !files.includes(file));
   const unexpected = files.filter((file) => !expected.includes(file));

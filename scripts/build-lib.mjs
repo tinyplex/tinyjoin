@@ -51,6 +51,9 @@ const RUNTIME_BUNDLES = [
   {entry: 'node/index.js', shared: {'index.js': '../index.js'}, platform: 'node'},
   {entry: 'node/worker-entry.js', shared: WORKER_SHARED, platform: 'node'},
   {entry: 'vite/index.js', shared: {}, platform: 'node'},
+  // The Drizzle driver extends the application's own drizzle-orm, an optional
+  // peer dependency that is never bundled.
+  {entry: 'drizzle/index.js', shared: {}, external: ['drizzle-orm', 'drizzle-orm/*']},
 ];
 
 // Published JavaScript, including the Node entry point and Vite plugin. tsc emits one
@@ -66,6 +69,7 @@ const RUNTIME_FILES = [
   'node/index.js',
   'node/worker-entry.js',
   'vite/index.js',
+  'drizzle/index.js',
 ];
 
 // Terser settings shared by every published file. Mangling top-level names is
@@ -158,6 +162,10 @@ manifest.exports = {
     types: './@types/vite/index.d.ts',
     import: './vite/index.js',
   },
+  './drizzle': {
+    types: './@types/drizzle/index.d.ts',
+    import: './drizzle/index.js',
+  },
 };
 
 await writeFile(
@@ -201,11 +209,12 @@ async function bundleRuntime() {
   // they all are: two of them share an entry, so writing as we went would build
   // the second from the first one's output rather than from the source.
   const bundled = [];
-  for (const {entry, shared, platform} of RUNTIME_BUNDLES) {
+  for (const {entry, shared, platform, external} of RUNTIME_BUNDLES) {
     const {outputFiles} = await esbuildBuild({
       bundle: true,
       define: {__TINYJOIN_VERSION__: JSON.stringify(version)},
       entryPoints: [resolve(dist, entry)],
+      external,
       format: 'esm',
       platform: platform ?? 'browser',
       plugins: [shareModules(shared)],
