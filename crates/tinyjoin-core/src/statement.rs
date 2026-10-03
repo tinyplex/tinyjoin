@@ -874,6 +874,17 @@ pub(crate) fn plan_add_column(
         return Err(EngineError::column_already_exists(&column.name, table));
     }
     schema_with_added_column(&schema, column)?;
+    // Rows already stored take the column's default, without being written again, so a NOT NULL
+    // column needs one that is not NULL.
+    if !column.nullable
+        && column.default.as_ref().is_none_or(Value::is_null)
+        && storage.table_row_count(table)? > 0
+    {
+        return Err(EngineError::constraint_violation(format!(
+            "Column `{}` cannot be added to `{table}`, which has rows, as NOT NULL without a default",
+            column.name
+        )));
+    }
     Ok(WriteOutcome {
         command: "ALTER TABLE",
         row_count: 0,

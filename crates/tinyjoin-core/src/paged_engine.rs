@@ -1099,7 +1099,30 @@ mod tests {
                 .execute_sql("ALTER TABLE accounts ADD COLUMN score BOOLEAN", &[])
                 .unwrap_err()
         );
+        // Stored rows take an added column's default, so a NOT NULL one needs a default that is
+        // not NULL, unless the table has no rows.
+        for (sql, code) in [
+            (
+                "ALTER TABLE accounts ADD COLUMN rank INTEGER NOT NULL",
+                "CONSTRAINT_VIOLATION",
+            ),
+            (
+                "ALTER TABLE accounts ADD COLUMN rank INTEGER NOT NULL DEFAULT NULL",
+                "INVALID_SCHEMA",
+            ),
+        ] {
+            let error = actual.execute_sql(sql, &[]).unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(error, expected.execute_sql(sql, &[]).unwrap_err());
+        }
         assert_eq!(actual.revision(), revision);
+        let mut empty = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        empty
+            .exec_sql(
+                "CREATE TABLE empty (id INTEGER PRIMARY KEY);\
+                 ALTER TABLE empty ADD COLUMN rank INTEGER NOT NULL;",
+            )
+            .unwrap();
 
         let reopened = PagedEngine::open(actual.into_device()).unwrap();
         reopened.check().unwrap();

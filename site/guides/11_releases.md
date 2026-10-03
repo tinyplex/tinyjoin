@@ -18,6 +18,16 @@ v0.5.0 reads the default as it was written, so an affected v0.4.0 database
 opens with its data intact. In-memory databases, which are never reopened, were
 not affected.
 
+**Adding a `NOT NULL` column without a default to a table with rows fails
+again.** v0.4.0 stopped writing every row again when `ALTER TABLE ... ADD
+COLUMN` adds a column, and with that stopped checking that the rows could hold
+it, so a `NOT NULL` column without a default could be added to a table with
+rows, which then held `NULL` in it: queries returned the `NULL`, and check()
+reported the table as corrupt. v0.5.0 refuses the statement with
+`CONSTRAINT_VIOLATION`, as v0.3.0 and PostgreSQL do. To repair a table that
+v0.4.0 left this way, give the column a value in every row, as in
+`UPDATE t SET c = 0 WHERE c IS NULL`, or drop its `NOT NULL`.
+
 A statement over one table can qualify its columns with the table's name, as a
 join already could: `SELECT tasks.id FROM tasks WHERE tasks.done = false ORDER
 BY tasks.title`, or `tasks.*` for every column. `UPDATE` and `DELETE` accept
