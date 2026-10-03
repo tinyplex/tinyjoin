@@ -928,10 +928,7 @@ impl BtreeCursor {
         if current != self.view {
             return Err(EngineError::new(
                 "CURSOR_INVALIDATED",
-                format!(
-                    "The cursor was opened for {:?}, but the current reader is {:?}",
-                    self.view, current
-                ),
+                "The cursor was opened for another view of its tree than the current reader's",
             ));
         }
         Ok(())

@@ -1230,7 +1230,7 @@ fn group_key_part_ref(data_type: ColumnType, value: &ValueRef<'_>, column: &str)
         (ColumnType::Text, ValueRef::Text(value)) => {
             format!(
                 "s:{}",
-                serde_json::to_string(value.as_ref()).expect("strings encode")
+                serde_json::to_string(value.as_ref()).unwrap_or_default()
             )
         }
         _ => {
@@ -1256,10 +1256,7 @@ pub(crate) fn group_key_part(data_type: ColumnType, value: &Value, column: &str)
             format!("f:{:016x}", number.to_bits())
         }
         (ColumnType::Text, Value::String(value)) => {
-            format!(
-                "s:{}",
-                serde_json::to_string(value).expect("strings encode")
-            )
+            format!("s:{}", serde_json::to_string(value).unwrap_or_default())
         }
         _ => {
             return Err(EngineError::type_mismatch(format!(
