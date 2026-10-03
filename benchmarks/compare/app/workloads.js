@@ -4,8 +4,9 @@
 //
 // Several workloads are adapted from the classic SQLite "speed comparison"
 // suite that PGlite and wa-sqlite also publish results for. The adaptations
-// give every table a primary key, replace SQL that TinyJoin does not support
-// (arithmetic in SET, INSERT ... SELECT), and use smaller counts.
+// give every table a primary key, replace SQL that TinyJoin did not support
+// when they were written (arithmetic in SET) or still does not (INSERT ...
+// SELECT), and use smaller counts.
 
 export const ROWS = 10_000;
 export const TABLE =
