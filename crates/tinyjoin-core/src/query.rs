@@ -1495,16 +1495,12 @@ impl<'a> SqlParser<'a> {
         } else {
             (Vec::new(), false)
         };
-        let limit = if self.consume_keyword("limit") {
-            Some(self.parse_limit()?)
-        } else {
-            None
-        };
-        let offset = if self.consume_keyword("offset") {
-            self.parse_limit()?
-        } else {
-            0
-        };
+        let (limit, offset) = crate::query::parse_limit_offset(
+            &self.tokens,
+            &mut self.position,
+            self.params,
+            self.mode,
+        )?;
 
         self.consume(TokenMatcher::Semicolon);
         if !self.is_done() {
@@ -1687,37 +1683,6 @@ impl<'a> SqlParser<'a> {
             }
         }
         Ok((orders, by_outputs))
-    }
-
-    fn parse_limit(&mut self) -> Result<usize> {
-        let value = self.parse_value()?;
-        pagination_value(&value, self.mode)
-    }
-
-    fn parse_value(&mut self) -> Result<Value> {
-        let Some(token) = self.next() else {
-            return Err(EngineError::parse_error("Expected a SQL value"));
-        };
-        match token {
-            Token::String(value) => Ok(Value::String(value)),
-            Token::Number(value) => number_literal(&value).map(Value::Number).ok_or_else(|| {
-                EngineError::invalid_query(format!("Invalid number literal `{value}`"))
-            }),
-            Token::Placeholder(index) => bind_parameter(&index, self.params),
-            Token::Identifier {
-                value,
-                quoted: false,
-            } if value.eq_ignore_ascii_case("null") => Ok(Value::Null),
-            Token::Identifier {
-                value,
-                quoted: false,
-            } if value.eq_ignore_ascii_case("true") => Ok(Value::Bool(true)),
-            Token::Identifier {
-                value,
-                quoted: false,
-            } if value.eq_ignore_ascii_case("false") => Ok(Value::Bool(false)),
-            _ => Err(unsupported_shape()),
-        }
     }
 
     fn parse_identifier(&mut self) -> Result<String> {
@@ -2718,6 +2683,35 @@ pub(crate) fn bind_nonnegative_integer_parameter(index: usize, params: &[Value])
         EngineError::invalid_query("LIMIT and OFFSET must be non-negative integers")
     })?;
     pagination_value(value, ParseMode::Bound)
+}
+
+/// Reads a statement's `LIMIT` and `OFFSET`, if it has them, at `position`: each a number literal
+/// or a parameter.
+pub(crate) fn parse_limit_offset(
+    tokens: &[Token],
+    position: &mut usize,
+    params: &[Value],
+    mode: ParseMode,
+) -> Result<(Option<usize>, usize)> {
+    let mut read = |keyword: &str| -> Result<Option<usize>> {
+        if !is_keyword(tokens.get(*position), keyword) {
+            return Ok(None);
+        }
+        let value = match tokens.get(*position + 1) {
+            Some(Token::Number(value)) => {
+                number_literal(value).map(Value::Number).ok_or_else(|| {
+                    EngineError::invalid_query(format!("Invalid number literal `{value}`"))
+                })?
+            }
+            Some(Token::Placeholder(index)) => bind_parameter(index, params)?,
+            None => return Err(EngineError::parse_error("Expected a LIMIT or OFFSET value")),
+            Some(_) => Value::Null,
+        };
+        *position += 2;
+        pagination_value(&value, mode).map(Some)
+    };
+    let limit = read("limit")?;
+    Ok((limit, read("offset")?.unwrap_or(0)))
 }
 
 pub(crate) fn pagination_value(value: &Value, mode: ParseMode) -> Result<usize> {

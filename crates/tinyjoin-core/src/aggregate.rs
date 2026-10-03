@@ -6,9 +6,8 @@ use serde_json::{Map, Number, Value};
 
 use crate::hash::{KeyHasher, KeyMap, KeySet};
 use crate::query::{
-    Filter, ParseMode, Token, bind_parameter, column_definition, is_distinct_keyword_at,
-    is_reserved_keyword, number_literal, pagination_value, parse_predicate_at, sort_rows_by,
-    validate_predicate_columns, validate_predicate_types,
+    Filter, ParseMode, Token, column_definition, is_distinct_keyword_at, is_reserved_keyword,
+    parse_predicate_at, sort_rows_by, validate_predicate_columns, validate_predicate_types,
 };
 use crate::row::{RowRef, ValueRef};
 use crate::storage::{StorageReader, column_type_name};
@@ -1386,16 +1385,12 @@ impl<'a> Parser<'a> {
         } else {
             vec![]
         };
-        let limit = if self.consume_keyword("limit") {
-            Some(self.parse_limit()?)
-        } else {
-            None
-        };
-        let offset = if self.consume_keyword("offset") {
-            self.parse_limit()?
-        } else {
-            0
-        };
+        let (limit, offset) = crate::query::parse_limit_offset(
+            &self.tokens,
+            &mut self.position,
+            self.params,
+            self.mode,
+        )?;
         self.consume_semicolon();
         if self.position != self.tokens.len() {
             return Err(EngineError::unsupported_sql(
@@ -1559,26 +1554,6 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(orders)
-    }
-
-    fn parse_limit(&mut self) -> Result<usize> {
-        let value = self.parse_value()?;
-        pagination_value(&value, self.mode)
-    }
-
-    fn parse_value(&mut self) -> Result<Value> {
-        let Some(token) = self.next() else {
-            return Err(EngineError::parse_error("Expected a SQL value"));
-        };
-        match token {
-            Token::Number(value) => number_literal(&value).map(Value::Number).ok_or_else(|| {
-                EngineError::invalid_query(format!("Invalid number literal `{value}`"))
-            }),
-            Token::Placeholder(index) => bind_parameter(&index, self.params),
-            _ => Err(EngineError::invalid_query(
-                "LIMIT and OFFSET must be non-negative integers",
-            )),
-        }
     }
 
     fn parse_identifier(&mut self) -> Result<String> {
