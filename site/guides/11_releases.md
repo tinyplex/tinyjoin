@@ -40,7 +40,14 @@ columns, literals, and parameters with `+`, `-`, `*`, `/`, `%`, unary `-`, and
 floats must stay finite and take no `%`, and there are no implicit casts. In an upsert, the
 stored row's columns are named with the table's name and the proposed row's
 with `EXCLUDED`, as in `SET hits = counters.hits + EXCLUDED.hits`. Types are
-checked before any row is read. See [expressions](/guides/sql-compatibility/#expressions).
+checked before any row is read.
+
+Either side of a `WHERE` comparison can now be an expression too, so a query
+can compare two columns, as in `WHERE updated > created`, or a value worked out
+from the row, as in `WHERE price * quantity > $1`. A comparison of a column with
+a value worked out from literals and parameters, such as
+`created > $1 - 86400`, still reads only a range of an index or the primary
+key. See [expressions](/guides/sql-compatibility/#expressions).
 
 **Upgrading from v0.4.0 needs no action.** Install, rebuild, and redeploy. The
 Worker protocol stays at version 10 and the page format stays at format 3, so

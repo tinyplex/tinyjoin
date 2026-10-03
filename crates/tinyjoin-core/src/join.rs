@@ -544,6 +544,19 @@ fn single_source(predicate: &Predicate, relations: &[Relation]) -> Result<Option
                 }
             }
             Predicate::Not { predicate } => visit(predicate, relations, found)?,
+            Predicate::Expressions { left, right, .. } => {
+                let mut names = Vec::new();
+                left.column_names(&mut names);
+                right.column_names(&mut names);
+                for name in names {
+                    let (source, _, _) = resolve_column(&parse_column_ref_text(name), relations)?;
+                    *found = match *found {
+                        None => Some(Some(source)),
+                        Some(Some(existing)) if existing == source => Some(Some(source)),
+                        Some(_) => Some(None),
+                    };
+                }
+            }
         }
         Ok(())
     }
@@ -565,6 +578,11 @@ fn renamed_to_source(predicate: &Predicate) -> Predicate {
                 predicates.iter_mut().for_each(rename)
             }
             Predicate::Not { predicate } => rename(predicate),
+            Predicate::Expressions { left, right, .. } => {
+                let source = |name: &str| parse_column_ref_text(name).column;
+                left.rename_columns(&source);
+                right.rename_columns(&source);
+            }
         }
     }
     rename(&mut predicate);
@@ -1246,6 +1264,14 @@ fn validate_join_predicate(predicate: &Predicate, relations: &[Relation]) -> Res
             Ok(())
         }
         Predicate::Not { predicate } => validate_join_predicate(predicate, relations),
+        Predicate::Expressions {
+            left,
+            operator,
+            right,
+        } => crate::expression::check_comparison(left, *operator, right, &|name| {
+            let (_, _, definition) = resolve_column(&parse_column_ref_text(name), relations)?;
+            Ok(definition.data_type)
+        }),
     }
 }
 

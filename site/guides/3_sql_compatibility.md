@@ -206,24 +206,29 @@ each statement retains the ordinary parser limits below.
 | `IS NULL`, `IS NOT NULL` | Supported | Tests the single runtime null value. |
 | `IN (...)`, `NOT IN (...)` | Supported | One to 1,024 literals or parameters with SQL null behavior. |
 | `BETWEEN`, `NOT BETWEEN` | Narrow | `column BETWEEN low AND high` means exactly `column >= low AND column <= high`, and `NOT BETWEEN` means `column < low OR column > high`, with those comparisons' type and null rules. Each bound is a literal or parameter. There is no `SYMMETRIC` form, so a reversed range matches nothing. |
-| `+`, `-`, `*`, `/`, `%`, `\|\|` | Narrow | In the values `UPDATE` and `ON CONFLICT DO UPDATE` assign. See [expressions](#expressions). |
+| `+`, `-`, `*`, `/`, `%`, `\|\|` | Narrow | In the values `UPDATE` and `ON CONFLICT DO UPDATE` assign, and on either side of a comparison. See [expressions](#expressions). |
 | Casts, `CASE`, scalar functions | No | There are no casts, conditional expressions, or functions other than the aggregates. |
 | `LIKE`, `NOT LIKE`, `ILIKE`, `NOT ILIKE` | Narrow | Matches a whole text column value against a literal or parameter pattern, where `%` matches any run of characters and `_` exactly one character; a non-text column is rejected. Backslash makes the next pattern character literal unless `ESCAPE` names another single character, or `''` for none; a pattern ending in its escape character is rejected. `ILIKE` folds only ASCII letters, as PostgreSQL does under the C locale. A `NULL` operand is unknown. A `LIKE` pattern that begins with literal characters, such as `'abc%'`, reads only the part of an index or primary key that can match; other patterns scan. |
 | `IS DISTINCT FROM`, `SIMILAR TO`, `ANY`, `ALL` | No | These PostgreSQL predicate families are not implemented. |
 | JSON/path operators | No | JSON can be stored, returned, and compared for structural equality only. |
 
-The right side of an ordinary predicate is a literal or parameter, not another
-column or subquery. Column-to-column comparison exists only in a join's `ON`
-equality terms.
+Either side of a comparison may be an [expression](#expressions), including a
+plain column, so `WHERE updated > created` and `WHERE price * quantity > $1`
+compare values worked out from the row. `IN`, `BETWEEN`, `LIKE`, and `IS NULL`
+take a plain column and literal or parameter values, and no predicate takes a
+subquery. A join's `ON` clause still holds only column equalities.
 
 ## Expressions
 
 An `UPDATE` or `ON CONFLICT DO UPDATE` assignment can work its value out from
-the row it updates:
+the row it updates, and a `WHERE` comparison can compare values worked out from
+the rows it reads:
 
 ```sql
 UPDATE counters SET hits = hits + 1, label = label || ' (edited)'
 WHERE id = $1;
+
+SELECT id FROM counters WHERE hits * 2 > target - $1;
 
 INSERT INTO counters (id, hits) VALUES ($1, 1)
 ON CONFLICT (id) DO UPDATE SET hits = counters.hits + EXCLUDED.hits;
@@ -247,9 +252,10 @@ assignment reads the row as it was before the statement, so
   and `'1' + 1` is a `TYPE_MISMATCH`.
 - A `NULL` operand gives `NULL`.
 
-Operand types, and whether a result's type fits the column it is assigned to,
-are checked before any row is read. `SET hits = hits * 1.5` on an integer
-column fails with `TYPE_MISMATCH` even when no row matches. A value that fails
+Operand types, whether a result's type fits the column it is assigned to, and
+whether compared values can be compared, are checked before any row is read.
+`SET hits = hits * 1.5` on an integer column fails with `TYPE_MISMATCH` even
+when no row matches. A value that fails
 as a row is written, such as an overflow or a `NULL` for a `NOT NULL` column,
 fails the statement, which changes nothing. An expression that reads no column
 is worked out once for the statement.
@@ -456,6 +462,13 @@ the complete predicate on every row they read:
   most a quarter of the table's rows, or else a range of the primary key's first
   column. An index is used for a range only if its other columns are
   `NOT NULL`, since a row with a `NULL` indexed value is not indexed.
+
+A comparison narrows the rows read only when one side is a plain column and the
+other a value known without reading a row: a literal, a parameter, or an
+[expression](#expressions) of them, such as `created > $1 - 86400`. A value on
+the left is read as it would be on the right, so `5 < id` narrows as `id > 5`
+does. A comparison that reads the row on both sides, such as `a > b`, is
+checked on every row read.
 
 An aggregate that reads only an index's columns and the primary key, in its
 select list, `GROUP BY`, and `WHERE` clause, answers a range of that index from

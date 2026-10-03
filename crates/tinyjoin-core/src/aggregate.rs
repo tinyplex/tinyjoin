@@ -315,6 +315,10 @@ fn read_columns(plan: &AggregatePlan, schema: &TableDefinition) -> Result<Vec<us
                 }
             }
             Predicate::Not { predicate } => predicate_columns(predicate, names),
+            Predicate::Expressions { left, right, .. } => {
+                left.column_names(names);
+                right.column_names(names);
+            }
         }
     }
     let mut names: Vec<&str> = plan.group_by.iter().map(String::as_str).collect();

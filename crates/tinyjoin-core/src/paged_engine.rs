@@ -3403,6 +3403,268 @@ mod tests {
     }
 
     #[test]
+    fn a_where_clause_compares_expressions_of_the_row() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .exec_sql(
+                "CREATE TABLE scores (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, \
+                   price FLOAT, name TEXT, doc JSON);\
+                 CREATE INDEX scores_a ON scores (a);\
+                 INSERT INTO scores VALUES (1, 1, 5, 2.5, 'x', '1'), (2, 4, 3, 1.0, 'y', NULL), \
+                   (3, 6, 6, NULL, 'z', 'z'), (4, NULL, 2, 3.0, NULL, NULL);",
+            )
+            .unwrap();
+        let ids = |engine: &mut PagedEngine<MemoryPageDevice>, sql: &str, params: &[Value]| {
+            engine
+                .execute_sql(sql, params)
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|row| row["id"].as_i64().unwrap())
+                .collect::<Vec<_>>()
+        };
+        for (sql, params, expected) in [
+            (
+                "SELECT id FROM scores WHERE a > b ORDER BY id",
+                vec![],
+                vec![2],
+            ),
+            (
+                "SELECT id FROM scores WHERE a >= b ORDER BY id",
+                vec![],
+                vec![2, 3],
+            ),
+            (
+                "SELECT id FROM scores WHERE b = a ORDER BY id",
+                vec![],
+                vec![3],
+            ),
+            ("SELECT id FROM scores WHERE a + 1 = b - 3", vec![], vec![1]),
+            (
+                "SELECT id FROM scores WHERE a * 2 > b ORDER BY id",
+                vec![],
+                vec![2, 3],
+            ),
+            (
+                "SELECT id FROM scores WHERE price * b > $1 ORDER BY id",
+                vec![json!(5)],
+                vec![1, 4],
+            ),
+            (
+                "SELECT id FROM scores WHERE (a + 1) * 2 > 10 ORDER BY id",
+                vec![],
+                vec![3],
+            ),
+            (
+                "SELECT id FROM scores WHERE (a > 1) ORDER BY id",
+                vec![],
+                vec![2, 3],
+            ),
+            ("SELECT id FROM scores WHERE ((a)) - 1 = 0", vec![], vec![1]),
+            (
+                "SELECT id FROM scores WHERE (a > 5 AND b > 5) OR (b - a) * 2 = 8 ORDER BY id",
+                vec![],
+                vec![1, 3],
+            ),
+            (
+                "SELECT id FROM scores WHERE NOT a < b ORDER BY id",
+                vec![],
+                vec![2, 3],
+            ),
+            (
+                "SELECT id FROM scores WHERE name || name = 'yy'",
+                vec![],
+                vec![2],
+            ),
+            (
+                "SELECT id FROM scores WHERE doc = name ORDER BY id",
+                vec![],
+                vec![3],
+            ),
+            // NULL makes a comparison unknown, which no row matches either way.
+            ("SELECT id FROM scores WHERE a + NULL = 1", vec![], vec![]),
+            (
+                "SELECT id FROM scores WHERE NOT a + 0 = b",
+                vec![],
+                vec![1, 2],
+            ),
+            // A value on the left mirrors onto the column, and one worked out from literals and
+            // parameters is a value.
+            ("SELECT id FROM scores WHERE 4 < a", vec![], vec![3]),
+            (
+                "SELECT id FROM scores WHERE a = $1 - 2 * 1",
+                vec![json!(6)],
+                vec![2],
+            ),
+            (
+                "SELECT COUNT(*) AS id FROM scores WHERE a < b",
+                vec![],
+                vec![1],
+            ),
+            (
+                "SELECT COUNT(*) AS id FROM scores WHERE a > 0 AND a <> b",
+                vec![],
+                vec![2],
+            ),
+            (
+                "SELECT DISTINCT b AS id FROM scores WHERE b > a ORDER BY id",
+                vec![],
+                vec![5],
+            ),
+        ] {
+            assert_eq!(ids(&mut engine, sql, &params), expected, "{sql}");
+        }
+
+        // A known value compares as a plain comparison does, and so can narrow the rows read.
+        let plan = |sql| format!("{:?}", crate::statement::parse(sql, &[json!(6)]).unwrap());
+        assert_eq!(
+            plan("SELECT id FROM scores WHERE a = $1 - 2 * 1"),
+            plan("SELECT id FROM scores WHERE a = 4")
+        );
+        assert_eq!(
+            plan("SELECT id FROM scores WHERE 4 < a"),
+            plan("SELECT id FROM scores WHERE a > 4")
+        );
+        // A prepared statement's is known once it is bound.
+        let statement = engine
+            .prepare_sql("SELECT id FROM scores WHERE a = $1 - 2 ORDER BY id")
+            .unwrap();
+        for (a, expected) in [(3, vec![1]), (8, vec![3])] {
+            assert_eq!(
+                engine
+                    .execute_prepared(statement, &[json!(a)])
+                    .unwrap()
+                    .rows
+                    .into_iter()
+                    .map(|row| row["id"].as_i64().unwrap())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+
+        // Writes filter the same way, and the table's name may qualify either side.
+        assert_eq!(
+            ids(
+                &mut engine,
+                "UPDATE scores SET b = b + 1 WHERE scores.a > scores.b - 1 RETURNING id",
+                &[],
+            ),
+            [2, 3]
+        );
+        assert_eq!(
+            ids(
+                &mut engine,
+                "DELETE FROM scores s WHERE s.b * 2 > s.a + 10 RETURNING id",
+                &[]
+            ),
+            Vec::<i64>::new()
+        );
+        assert_eq!(
+            ids(
+                &mut engine,
+                "DELETE FROM scores WHERE b - a = 0 RETURNING id",
+                &[]
+            ),
+            [2]
+        );
+
+        // Types are checked before any row is read; a row that fails fails the statement.
+        for (sql, code) in [
+            (
+                "SELECT id FROM scores WHERE name > a LIMIT 0",
+                "TYPE_MISMATCH",
+            ),
+            (
+                "SELECT id FROM scores WHERE doc < 1 LIMIT 0",
+                "TYPE_MISMATCH",
+            ),
+            (
+                "SELECT id FROM scores WHERE a + name = 1 LIMIT 0",
+                "TYPE_MISMATCH",
+            ),
+            (
+                "SELECT id FROM scores WHERE a = missing",
+                "COLUMN_NOT_FOUND",
+            ),
+            (
+                "SELECT id FROM scores WHERE a / (b - 5) > 0",
+                "DIVISION_BY_ZERO",
+            ),
+            ("SELECT id FROM scores WHERE a + 1", "UNSUPPORTED_SQL"),
+            (
+                "SELECT id FROM scores WHERE a + 1 IS NULL",
+                "UNSUPPORTED_SQL",
+            ),
+            ("SELECT id FROM scores WHERE (a + 1", "UNSUPPORTED_SQL"),
+            ("UPDATE scores SET b = 0 WHERE a > name", "TYPE_MISMATCH"),
+        ] {
+            assert_eq!(
+                engine.execute_sql(sql, &[]).unwrap_err().code,
+                code,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_join_compares_expressions_of_its_tables() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .exec_sql(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, limit_score INTEGER);\
+                 CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, score INTEGER);\
+                 INSERT INTO users VALUES (1, 5), (2, 10);\
+                 INSERT INTO posts VALUES (10, 1, 7), (11, 1, 3), (12, 2, 12), (13, 2, 4);",
+            )
+            .unwrap();
+        let ids = |engine: &mut PagedEngine<MemoryPageDevice>, sql: &str| {
+            engine
+                .execute_sql(sql, &[])
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|row| row["id"].as_i64().unwrap())
+                .collect::<Vec<_>>()
+        };
+        // Across tables, and within one, which then narrows that table as it is read.
+        assert_eq!(
+            ids(
+                &mut engine,
+                "SELECT p.id AS id FROM users u JOIN posts p ON p.user_id = u.id \
+                 WHERE p.score > u.limit_score ORDER BY id",
+            ),
+            [10, 12]
+        );
+        assert_eq!(
+            ids(
+                &mut engine,
+                "SELECT p.id AS id FROM users u JOIN posts p ON p.user_id = u.id \
+                 WHERE p.score * 2 > p.id - 2 AND u.limit_score - 5 = 0 ORDER BY id",
+            ),
+            [10]
+        );
+        assert_eq!(
+            ids(
+                &mut engine,
+                "SELECT p.id AS id FROM users u LEFT JOIN posts p ON p.user_id = u.id \
+                 WHERE p.score + u.limit_score > 20",
+            ),
+            [12]
+        );
+        assert_eq!(
+            engine
+                .execute_sql(
+                    "SELECT p.id AS id FROM users u JOIN posts p ON p.user_id = u.id \
+                     WHERE p.score > u.missing",
+                    &[],
+                )
+                .unwrap_err()
+                .code,
+            "COLUMN_NOT_FOUND"
+        );
+    }
+
+    #[test]
     fn a_quoted_name_holding_a_dot_is_one_column_not_a_qualified_one() {
         let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
         engine

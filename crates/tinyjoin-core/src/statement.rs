@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 #[cfg(test)]
 use crate::StorageDriver;
 use crate::expression::{
-    Columns, Expression, check_assignment, constant, evaluate, parse_expression_at,
+    Expression, Names, check_assignment, constant, evaluate, parse_expression_at,
 };
 use crate::hash::KeySet;
 use crate::paged_codec::{
@@ -2609,7 +2609,7 @@ impl<'a> MutationParser<'a> {
                 TokenMatcher::Eq,
                 "Expected `=` in ON CONFLICT DO UPDATE assignment",
             )?;
-            assignments.push((column, self.parse_assigned(Columns::Conflict(qualifier))?));
+            assignments.push((column, self.parse_assigned(Names::Conflict(qualifier))?));
             if !self.consume(TokenMatcher::Comma) {
                 break;
             }
@@ -2625,7 +2625,7 @@ impl<'a> MutationParser<'a> {
         })
     }
 
-    fn parse_assigned(&mut self, columns: Columns<'_>) -> Result<Assigned> {
+    fn parse_assigned(&mut self, names: Names<'_>) -> Result<Assigned> {
         if matches!(
             self.tokens.get(self.position),
             Some(Token::Identifier { value, quoted: false }) if value.eq_ignore_ascii_case("default")
@@ -2633,7 +2633,7 @@ impl<'a> MutationParser<'a> {
             self.position += 1;
             return Ok(Assigned::Default);
         }
-        parse_expression_at(&self.tokens, &mut self.position, self.params, columns)
+        parse_expression_at(&self.tokens, &mut self.position, self.params, names)
             .map(Assigned::Expression)
     }
 
@@ -2649,7 +2649,7 @@ impl<'a> MutationParser<'a> {
             }
             let column = self.parse_identifier()?;
             self.expect(TokenMatcher::Eq, "Expected `=` in UPDATE assignment")?;
-            assignments.push((column, self.parse_assigned(Columns::Row)?));
+            assignments.push((column, self.parse_assigned(Names::Row)?));
             if !self.consume(TokenMatcher::Comma) {
                 break;
             }

@@ -2,6 +2,10 @@ use std::cmp::Ordering;
 
 use serde_json::{Map, Number, Value};
 
+use crate::expression::{
+    Expression, Names, bind_expression, check_comparison, comparison, evaluate, folded,
+    parse_expression_at,
+};
 use crate::hash::KeySet;
 use crate::paged_codec::{IndexEntryLayout, encode_key_bound, encode_text_prefix_bounds};
 use crate::row::{Columns, RowRef, ValueRef};
@@ -1651,13 +1655,20 @@ impl PredicateParser<'_> {
 
     fn parse_primary(&mut self, depth: usize) -> Result<Predicate> {
         self.assert_depth(depth)?;
-        if self.consume_token(TokenMatcher::LParen) {
+        if matches!(self.tokens.get(self.position), Some(Token::LParen)) && !self.opens_expression()
+        {
+            self.position += 1;
             let predicate = self.parse_or(depth + 1)?;
             self.expect_token(TokenMatcher::RParen, "Expected `)` after WHERE expression")?;
             return Ok(predicate);
         }
 
-        let column = self.parse_identifier()?;
+        // Only a comparison takes an expression that is not a lone column.
+        let column =
+            match parse_expression_at(self.tokens, &mut self.position, self.params, Names::Row)? {
+                Expression::Column(column) => column,
+                left => return self.parse_comparison(left),
+            };
         if self.consume_keyword("is") {
             let negated = self.consume_keyword("not");
             if !self.consume_keyword("null") {
@@ -1713,7 +1724,11 @@ impl PredicateParser<'_> {
         if negated {
             return Err(unsupported_shape());
         }
+        self.parse_comparison(Expression::Column(column))
+    }
 
+    /// A comparison of `left` with the expression after the operator that follows it.
+    fn parse_comparison(&mut self, left: Expression) -> Result<Predicate> {
         let operator = match self.next() {
             Some(Token::Eq) => ComparisonOperator::Eq,
             Some(Token::Neq) => ComparisonOperator::Neq,
@@ -1723,12 +1738,45 @@ impl PredicateParser<'_> {
             Some(Token::Gte) => ComparisonOperator::Gte,
             _ => return Err(unsupported_shape()),
         };
-        let value = self.parse_value()?;
-        self.node(Predicate::Comparison {
-            column,
-            operator,
-            value,
-        })
+        let right = parse_expression_at(self.tokens, &mut self.position, self.params, Names::Row)?;
+        self.node(comparison(left, operator, right))
+    }
+
+    /// Whether the parenthesis here opens an expression rather than a predicate: whether a
+    /// comparison or an operator follows its close.
+    fn opens_expression(&self) -> bool {
+        let mut depth = 0usize;
+        for (index, token) in self.tokens.iter().enumerate().skip(self.position) {
+            match token {
+                Token::LParen => depth += 1,
+                Token::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return match self.tokens.get(index + 1) {
+                            Some(Token::Number(number)) => number.starts_with('-'),
+                            Some(token) => matches!(
+                                token,
+                                Token::Eq
+                                    | Token::Neq
+                                    | Token::Lt
+                                    | Token::Lte
+                                    | Token::Gt
+                                    | Token::Gte
+                                    | Token::Plus
+                                    | Token::Minus
+                                    | Token::Star
+                                    | Token::Slash
+                                    | Token::Percent
+                                    | Token::Concat
+                            ),
+                            None => false,
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     fn parse_in(&mut self, column: String) -> Result<Predicate> {
@@ -1787,51 +1835,6 @@ impl PredicateParser<'_> {
         } else {
             Predicate::And { predicates }
         })
-    }
-
-    fn parse_identifier(&mut self) -> Result<String> {
-        let Some(Token::Identifier { value, quoted }) = self.next() else {
-            return Err(EngineError::parse_error("Expected a SQL identifier"));
-        };
-        if value.is_empty() {
-            return Err(EngineError::parse_error(
-                "A quoted SQL identifier cannot be empty",
-            ));
-        }
-        if !quoted && is_reserved_keyword(&value) {
-            return Err(EngineError::parse_error(format!(
-                "Reserved keyword `{value}` cannot be used as an unquoted SQL identifier"
-            )));
-        }
-        let first = if quoted {
-            value
-        } else {
-            value.to_ascii_lowercase()
-        };
-        if !self.consume_token(TokenMatcher::Dot) {
-            return Ok(first);
-        }
-        let Some(Token::Identifier { value, quoted }) = self.next() else {
-            return Err(EngineError::parse_error(
-                "Expected a column name after qualifier",
-            ));
-        };
-        if value.is_empty() || (!quoted && is_reserved_keyword(&value)) {
-            return Err(EngineError::parse_error(
-                "Expected a valid column name after qualifier",
-            ));
-        }
-        let second = if quoted {
-            value
-        } else {
-            value.to_ascii_lowercase()
-        };
-        if self.consume_token(TokenMatcher::Dot) {
-            return Err(EngineError::unsupported_sql(
-                "WHERE columns can contain at most one table qualifier",
-            ));
-        }
-        Ok(format!("{first}.{second}"))
     }
 
     fn parse_value(&mut self) -> Result<Value> {
@@ -2268,6 +2271,19 @@ pub(crate) fn bind_predicate_parameters(
         }
         Predicate::Not { predicate } => bind_predicate_parameters(Some(predicate), params),
         Predicate::IsNull { .. } => Ok(()),
+        Predicate::Expressions {
+            left,
+            operator,
+            right,
+        } => {
+            bind_expression(left, params)?;
+            bind_expression(right, params)?;
+            // A side whose value is now known lets the comparison narrow the rows read.
+            if let Some(folded) = folded(left, *operator, right) {
+                *predicate = folded;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -2347,6 +2363,16 @@ pub(crate) fn bound_predicate(predicate: &Predicate, params: &[Value]) -> Result
         Predicate::Not { predicate } => Predicate::Not {
             predicate: Box::new(bound_predicate(predicate, params)?),
         },
+        Predicate::Expressions {
+            left,
+            operator,
+            right,
+        } => {
+            let (mut left, mut right) = (left.clone(), right.clone());
+            bind_expression(&mut left, params)?;
+            bind_expression(&mut right, params)?;
+            comparison(left, *operator, right)
+        }
     })
 }
 
@@ -2491,6 +2517,19 @@ fn evaluate_predicate(row: &Row, predicate: &Predicate, table: &str) -> Result<T
             Truth::False => Truth::True,
             Truth::Unknown => Truth::Unknown,
         }),
+        Predicate::Expressions {
+            left,
+            operator,
+            right,
+        } => {
+            let mut read = |column: &str, _| {
+                row.get(column)
+                    .cloned()
+                    .ok_or_else(|| EngineError::column_not_found(column, table))
+            };
+            let left = evaluate(left, &mut read)?;
+            evaluate_comparison(&left, &evaluate(right, &mut read)?, *operator, table, "")
+        }
     }
 }
 
@@ -2603,6 +2642,13 @@ enum FilterNode<'a> {
     And(Vec<FilterNode<'a>>),
     Or(Vec<FilterNode<'a>>),
     Not(Box<FilterNode<'a>>),
+    /// A comparison of expressions, with the position of each column they read.
+    Expressions {
+        left: &'a Expression,
+        operator: ComparisonOperator,
+        right: &'a Expression,
+        columns: Vec<(&'a str, usize)>,
+    },
 }
 
 impl<'a> Filter<'a> {
@@ -2756,6 +2802,25 @@ impl<'a> FilterNode<'a> {
             }
             Predicate::Or { predicates } => Self::Or(children(predicates)?),
             Predicate::Not { predicate } => Self::Not(Box::new(Self::new(predicate, position)?)),
+            Predicate::Expressions {
+                left,
+                operator,
+                right,
+            } => {
+                let mut names = Vec::new();
+                left.column_names(&mut names);
+                right.column_names(&mut names);
+                let mut columns = Vec::with_capacity(names.len());
+                for name in names {
+                    columns.push((name, position(name)?));
+                }
+                Self::Expressions {
+                    left,
+                    operator: *operator,
+                    right,
+                    columns,
+                }
+            }
         })
     }
 
@@ -2889,6 +2954,22 @@ impl<'a> FilterNode<'a> {
                 Truth::False => Truth::True,
                 Truth::Unknown => Truth::Unknown,
             }),
+            Self::Expressions {
+                left,
+                operator,
+                right,
+                columns,
+            } => {
+                let mut read = |name: &str, _| {
+                    let (_, index) = columns
+                        .iter()
+                        .find(|(column, _)| *column == name)
+                        .ok_or_else(|| EngineError::column_not_found(name, table))?;
+                    Ok(row.column(*index)?.into_value())
+                };
+                let left = evaluate(left, &mut read)?;
+                evaluate_comparison(&left, &evaluate(right, &mut read)?, *operator, table, "")
+            }
         }
     }
 }
@@ -3143,6 +3224,15 @@ pub(crate) fn validate_predicate_columns(
             Ok(())
         }
         Predicate::Not { predicate } => validate_predicate_columns(predicate, schema, table),
+        Predicate::Expressions { left, right, .. } => {
+            let mut names = Vec::new();
+            left.column_names(&mut names);
+            right.column_names(&mut names);
+            for name in names {
+                column_definition(schema, name, table)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -3201,6 +3291,13 @@ pub(crate) fn validate_predicate_types(
             Ok(())
         }
         Predicate::Not { predicate } => validate_predicate_types(predicate, schema, table),
+        Predicate::Expressions {
+            left,
+            operator,
+            right,
+        } => check_comparison(left, *operator, right, &|column| {
+            Ok(column_definition(schema, column, table)?.data_type)
+        }),
     }
 }
 

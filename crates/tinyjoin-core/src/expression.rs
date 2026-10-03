@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::query::{Token, bind_parameter, bound_value, is_reserved_keyword, number_literal};
 use crate::storage::{MAX_LOGICAL_VALUE_BYTES, column_type_name};
-use crate::{ColumnDefinition, ColumnType, EngineError, Result};
+use crate::{ColumnDefinition, ColumnType, ComparisonOperator, EngineError, Predicate, Result};
 
 const MAX_EXPRESSION_NODES: usize = 256;
 const MAX_EXPRESSION_DEPTH: usize = 32;
@@ -50,7 +50,7 @@ impl Operator {
 
 /// How an expression names columns.
 #[derive(Clone, Copy)]
-pub(crate) enum Columns<'a> {
+pub(crate) enum Names<'a> {
     /// A plain name is a column of the row. A statement over one table has dropped its table's
     /// qualifier before it is parsed, so any other qualified name is left for the row to refuse.
     Row,
@@ -70,6 +70,111 @@ impl Expression {
             Self::Binary(_, left, right) => left.reads_row() || right.reads_row(),
         }
     }
+
+    /// Adds the name of each column the expression reads to `names`.
+    pub(crate) fn column_names<'a>(&'a self, names: &mut Vec<&'a str>) {
+        match self {
+            Self::Value(_) => {}
+            Self::Column(name) | Self::Excluded(name) => names.push(name),
+            Self::Negate(operand) => operand.column_names(names),
+            Self::Binary(_, left, right) => {
+                left.column_names(names);
+                right.column_names(names);
+            }
+        }
+    }
+
+    /// Renames each column the expression reads.
+    pub(crate) fn rename_columns(&mut self, rename: &dyn Fn(&str) -> String) {
+        match self {
+            Self::Value(_) => {}
+            Self::Column(name) | Self::Excluded(name) => *name = rename(name),
+            Self::Negate(operand) => operand.rename_columns(rename),
+            Self::Binary(_, left, right) => {
+                left.rename_columns(rename);
+                right.rename_columns(rename);
+            }
+        }
+    }
+}
+
+/// The predicate comparing two expressions: a `Comparison` where one is a column and the other's
+/// value is known without reading a row, which can narrow the rows read, and otherwise
+/// `Expressions`.
+pub(crate) fn comparison(
+    left: Expression,
+    operator: ComparisonOperator,
+    right: Expression,
+) -> Predicate {
+    folded(&left, operator, &right).unwrap_or(Predicate::Expressions {
+        left,
+        operator,
+        right,
+    })
+}
+
+/// A comparison of two expressions as a `Comparison`, if it can be one. A side that reads no row
+/// but holds a prepared statement's parameter is not known until it is bound.
+pub(crate) fn folded(
+    left: &Expression,
+    operator: ComparisonOperator,
+    right: &Expression,
+) -> Option<Predicate> {
+    let known = |expression: &Expression| match expression {
+        Expression::Value(value) => Some(value.clone()),
+        expression if !expression.reads_row() => constant(expression).ok(),
+        _ => None,
+    };
+    let (column, operator, value) = match (left, right) {
+        (Expression::Column(column), value) => (column, operator, known(value)?),
+        // `1 < id` is `id > 1`.
+        (value, Expression::Column(column)) => (
+            column,
+            match operator {
+                ComparisonOperator::Lt => ComparisonOperator::Gt,
+                ComparisonOperator::Lte => ComparisonOperator::Gte,
+                ComparisonOperator::Gt => ComparisonOperator::Lt,
+                ComparisonOperator::Gte => ComparisonOperator::Lte,
+                operator => operator,
+            },
+            known(value)?,
+        ),
+        _ => return None,
+    };
+    Some(Predicate::Comparison {
+        column: column.clone(),
+        operator,
+        value,
+    })
+}
+
+/// Refuses a comparison of values whose types cannot be compared, before any row is read: a
+/// number with a number, text with text, and a boolean with a boolean, while JSON compares for
+/// equality with anything.
+pub(crate) fn check_comparison(
+    left: &Expression,
+    operator: ComparisonOperator,
+    right: &Expression,
+    column_type: &dyn Fn(&str) -> Result<ColumnType>,
+) -> Result<()> {
+    let numeric = |data_type| matches!(data_type, ColumnType::Integer | ColumnType::Float);
+    let comparable = match (
+        value_type(left, column_type)?,
+        value_type(right, column_type)?,
+    ) {
+        (None, _) | (_, None) => true,
+        (Some(ColumnType::Json), _) | (_, Some(ColumnType::Json)) => {
+            matches!(operator, ComparisonOperator::Eq | ComparisonOperator::Neq)
+        }
+        (Some(left), Some(right)) => left == right || (numeric(left) && numeric(right)),
+    };
+    if comparable {
+        Ok(())
+    } else {
+        Err(EngineError::type_mismatch(
+            "Compared values must have compatible scalar types",
+        ))
+    }
 }
 
 /// Parses the expression at `position`, advancing past it. `+` and `-` bind more loosely than
@@ -78,13 +183,13 @@ pub(crate) fn parse_expression_at(
     tokens: &[Token],
     position: &mut usize,
     params: &[Value],
-    columns: Columns<'_>,
+    names: Names<'_>,
 ) -> Result<Expression> {
     let mut parser = Parser {
         tokens,
         position: *position,
         params,
-        columns,
+        names,
         nodes: 0,
     };
     let expression = parser.concatenation(0)?;
@@ -96,7 +201,7 @@ struct Parser<'a> {
     tokens: &'a [Token],
     position: usize,
     params: &'a [Value],
-    columns: Columns<'a>,
+    names: Names<'a>,
     nodes: usize,
 }
 
@@ -238,9 +343,9 @@ impl Parser<'_> {
             )));
         }
         if !self.consume(&Token::Dot) {
-            return match self.columns {
-                Columns::Row => Ok(Expression::Column(first)),
-                Columns::Conflict(_) => Err(EngineError::invalid_query(format!(
+            return match self.names {
+                Names::Row => Ok(Expression::Column(first)),
+                Names::Conflict(_) => Err(EngineError::invalid_query(format!(
                     "Column `{first}` is ambiguous in ON CONFLICT DO UPDATE; write \
                      `EXCLUDED.{first}` for the proposed row, or qualify it with the table's name \
                      for the stored row"
@@ -253,9 +358,9 @@ impl Parser<'_> {
                 "Columns can contain at most one table qualifier",
             ));
         }
-        Ok(match self.columns {
-            Columns::Conflict(_) if first == "excluded" => Expression::Excluded(second),
-            Columns::Conflict(table) if first == table => Expression::Column(second),
+        Ok(match self.names {
+            Names::Conflict(_) if first == "excluded" => Expression::Excluded(second),
+            Names::Conflict(table) if first == table => Expression::Column(second),
             _ => Expression::Column(format!("{first}.{second}")),
         })
     }
@@ -523,8 +628,7 @@ mod tests {
         let run = || {
             let tokens = tokenize(sql)?;
             let mut position = 0;
-            let expression =
-                parse_expression_at(&tokens, &mut position, &[json!(3)], Columns::Row)?;
+            let expression = parse_expression_at(&tokens, &mut position, &[json!(3)], Names::Row)?;
             assert_eq!(position, tokens.len(), "{sql} was not read to its end");
             value_type(&expression, &column_type)?;
             evaluate(&expression, &mut |column, _| Ok(row[column].clone()))
@@ -628,7 +732,7 @@ mod tests {
     fn a_conflict_assignment_names_the_stored_and_proposed_rows() {
         let parse = |sql: &str| {
             let tokens = tokenize(sql).unwrap();
-            parse_expression_at(&tokens, &mut 0, &[], Columns::Conflict("kv"))
+            parse_expression_at(&tokens, &mut 0, &[], Names::Conflict("kv"))
         };
         assert_eq!(
             parse("kv.n + EXCLUDED.n").unwrap(),

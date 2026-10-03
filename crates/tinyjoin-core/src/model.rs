@@ -1,6 +1,8 @@
 use serde::Serialize;
 use serde_json::{Map, Value};
 
+use crate::expression::Expression;
+
 pub type Row = Map<String, Value>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -224,6 +226,13 @@ pub(crate) enum Predicate {
     },
     Not {
         predicate: Box<Predicate>,
+    },
+    /// A comparison `Comparison` cannot hold: of two columns, or of a value worked out from
+    /// the row. It never narrows the rows read.
+    Expressions {
+        left: Expression,
+        operator: ComparisonOperator,
+        right: Expression,
     },
 }
 
