@@ -30,7 +30,7 @@ use crate::{
         storage_corrupt, unique_violation,
     },
     row::{HeldRow, RowRef},
-    statement::{PlannedDml, PreviousRow, Statement, WriteStatement, change_table},
+    statement::{PlannedDml, PreviousRow, Statement, TableChange, WriteStatement, change_table},
     storage::{
         KeyOrder, KeyRange, estimated_record_bytes, estimated_row_bytes, preflight_row_write_set,
         schema_with_added_column, validate_schema,
@@ -393,20 +393,12 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 }
                 outcome
             }
-            WriteStatement::DropConstraint {
-                table,
-                name,
-                if_exists,
-            } => {
-                let outcome =
-                    crate::statement::plan_drop_constraint(self, table, name, *if_exists)?;
+            WriteStatement::AlterTable { table, change } => {
+                let outcome = crate::statement::plan_alter_table(self, table, change)?;
                 if outcome.mutated {
-                    self.drop_index(name)?;
+                    self.alter_table(table, change)?;
                 }
                 outcome
-            }
-            WriteStatement::DisableRowSecurity { table } => {
-                crate::statement::plan_disable_row_security(self, table)?
             }
             WriteStatement::Insert { .. }
             | WriteStatement::Update { .. }
@@ -514,6 +506,134 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         if let Some(root) = index.root_page_id {
             Btree::reclaim(&mut self.transaction.borrow_mut(), root, index.tree_id)?;
         }
+        self.charge_operations(1)
+    }
+
+    fn alter_table(&mut self, name: &str, change: &TableChange) -> Result<()> {
+        let table = self
+            .tables
+            .get(name)
+            .cloned()
+            .ok_or_else(|| EngineError::table_not_found(name))?;
+        let schema = match change {
+            TableChange::DropConstraint { name, .. } => return self.drop_index(name),
+            TableChange::RenameTable(to) => {
+                let to = crate::statement::renamed_table(name, to);
+                let mut schema = (*table.schema).clone();
+                schema.name.clone_from(&to);
+                let tables = Rc::make_mut(&mut self.tables);
+                tables.remove(name);
+                tables.insert(to.clone(), table);
+                for index in Rc::make_mut(&mut self.indexes).values_mut() {
+                    if index.definition.table == name {
+                        index.definition.table.clone_from(&to);
+                    }
+                }
+                return self.replace_schema(&to, schema);
+            }
+            _ => crate::statement::altered_schema(&table.schema, change)?,
+        };
+        match change {
+            TableChange::RenameColumn { from, to } => {
+                for index in Rc::make_mut(&mut self.indexes).values_mut() {
+                    if index.definition.table == name {
+                        for column in &mut index.definition.columns {
+                            if column == from {
+                                column.clone_from(to);
+                            }
+                        }
+                    }
+                }
+            }
+            TableChange::DropColumn { column, .. } => {
+                // As in PostgreSQL, a column takes every index on it with it.
+                let indexes = self
+                    .indexes
+                    .iter()
+                    .filter(|(_, index)| {
+                        index.definition.table == name && index.definition.columns.contains(column)
+                    })
+                    .map(|(index, _)| index.clone())
+                    .collect::<Vec<_>>();
+                for index in indexes {
+                    self.drop_index(&index)?;
+                }
+                return self.rebuild_table(name, schema);
+            }
+            // A record leaves out trailing columns that hold their defaults, so rows that left out
+            // this column must now write the default they had. A rebuild also checks that no row
+            // holds NULL in a column now declared NOT NULL.
+            TableChange::SetDefault { column, .. }
+                if schema != *table.schema && !schema.primary_key.contains(column) =>
+            {
+                return self.rebuild_table(name, schema);
+            }
+            TableChange::SetNullable {
+                nullable: false, ..
+            } => return self.rebuild_table(name, schema),
+            _ => {}
+        }
+        self.replace_schema(name, schema)
+    }
+
+    fn replace_schema(&mut self, name: &str, schema: TableDefinition) -> Result<()> {
+        Rc::make_mut(&mut self.tables)
+            .get_mut(name)
+            .ok_or_else(|| EngineError::table_not_found(name))?
+            .set_schema(schema)?;
+        self.charge_operations(1)
+    }
+
+    /// Writes every row of a table again under `schema`, which reads each row as the table's
+    /// schema does but places or leaves out its columns differently, into a new tree that
+    /// replaces the table's, and refuses a row holding NULL where `schema` declares NOT NULL.
+    /// Rows are read in key order, so each chunk extends the new tree.
+    fn rebuild_table(&mut self, name: &str, schema: TableDefinition) -> Result<()> {
+        let old = self
+            .tables
+            .get(name)
+            .cloned()
+            .ok_or_else(|| EngineError::table_not_found(name))?;
+        let mut table = old.clone();
+        table.set_schema(schema)?;
+        if let Some(root) = old.root_page_id {
+            let mut rebuilt = TableBuild {
+                tree_id: self.allocate_tree_id()?,
+                root_page_id: None,
+                hash: EMPTY_HASH,
+            };
+            let mut transaction = self.transaction.borrow_mut();
+            let mut rows = Btree::cursor_in_transaction(&mut transaction, root, old.tree_id)?;
+            let mut entries = Vec::new();
+            let mut bytes = 0usize;
+            while let Some((key, value)) = rows.next_in_transaction(&mut transaction)? {
+                self.charge_operations(1)?;
+                let row = old.record(&key, &value)?.to_row()?;
+                for column in &table.schema.columns {
+                    if !column.nullable && row.get(&column.name).is_none_or(Value::is_null) {
+                        return Err(EngineError::constraint_violation(format!(
+                            "Column `{}` of `{name}` holds NULL",
+                            column.name
+                        )));
+                    }
+                }
+                let record = encode_row(&table.schema, &row)?;
+                bytes += key.len() + record.len() + 48;
+                entries.push((key, record));
+                if bytes >= INDEX_BUILD_CHUNK_BYTES {
+                    rebuilt.write(&mut transaction, &mut entries)?;
+                    bytes = 0;
+                }
+            }
+            rebuilt.write(&mut transaction, &mut entries)?;
+            Btree::reclaim(&mut transaction, root, old.tree_id)?;
+            table.tree_id = rebuilt.tree_id;
+            table.root_page_id = rebuilt.root_page_id;
+            table.hash = rebuilt.hash;
+        }
+        *Rc::make_mut(&mut self.tables)
+            .get_mut(name)
+            .expect("the rebuilt table was resolved above") = table;
         self.charge_operations(1)
     }
 
@@ -1087,6 +1207,36 @@ const INDEX_BUILD_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 /// Small enough that tests build indexes over a few hundred rows in several chunks.
 #[cfg(test)]
 const INDEX_BUILD_CHUNK_BYTES: usize = 16 * 1024;
+
+/// A table's rows written again into a new tree, a chunk at a time, in key order.
+struct TableBuild {
+    tree_id: TreeId,
+    root_page_id: Option<PageId>,
+    hash: u64,
+}
+
+impl TableBuild {
+    fn write<D: PageDevice>(
+        &mut self,
+        transaction: &mut PagerWriteTransaction<'_, D>,
+        entries: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<()> {
+        let batch = entries
+            .iter()
+            .map(|(key, value)| BatchChange {
+                key,
+                value: Some(value),
+            })
+            .collect::<Vec<_>>();
+        let applied = Btree::apply(transaction, self.root_page_id, self.tree_id, &batch)?;
+        self.root_page_id = applied.root_page_id;
+        if let Some(hash) = applied.hash {
+            self.hash = hash;
+        }
+        entries.clear();
+        Ok(())
+    }
+}
 
 /// A new index, built from its table's rows a sorted chunk of entries at a time.
 struct IndexBuild<'a> {

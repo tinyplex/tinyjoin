@@ -15,6 +15,13 @@
       "when": 1791004488280,
       "tag": "0001_add_visits",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1791005316331,
+      "tag": "0002_loosen_users",
+      "breakpoints": true
     }
   ]
 }

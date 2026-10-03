@@ -178,7 +178,12 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 | `CREATE [UNIQUE] INDEX [IF NOT EXISTS]` | Narrow | One or more boolean, integer, or text columns. `USING btree` is accepted, since every index is a B-tree; no other methods, expressions, predicates, `INCLUDE`, ordering, or concurrent build. |
 | `ALTER TABLE ... ADD [COLUMN] [IF NOT EXISTS]` | Narrow | Adds one non-primary-key column and atomically backfills its literal default or `NULL`. On a nonempty table, `NOT NULL` requires a non-null default. The column cannot declare `UNIQUE`; add the constraint after it. |
 | `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE`, `DROP CONSTRAINT [IF EXISTS]` | Narrow | Adds a unique constraint, as `CREATE UNIQUE INDEX` would, or drops one of the table's unique indexes by name. |
-| `ALTER TABLE ... DISABLE ROW LEVEL SECURITY` | Supported | Changes nothing, since no table has row security. `ALTER COLUMN`, `DROP COLUMN`, `RENAME`, and other `ALTER` forms are rejected. |
+| `ALTER TABLE ... ALTER [COLUMN] ... SET DEFAULT`, `DROP DEFAULT` | Narrow | A literal default, as `DEFAULT` takes. Existing rows keep their values, so the table's rows are rewritten. |
+| `ALTER TABLE ... ALTER [COLUMN] ... SET NOT NULL`, `DROP NOT NULL` | Narrow | `SET NOT NULL` rewrites the table's rows, and fails with `CONSTRAINT_VIOLATION`, changing nothing, if a row holds `NULL`. A primary-key column stays `NOT NULL`. |
+| `ALTER TABLE ... ALTER [COLUMN] ... [SET DATA] TYPE` | Narrow | Only to another spelling of the column's runtime type, as `bigint` for an `integer` column, which changes nothing. No conversion or `USING`. |
+| `ALTER TABLE ... DROP [COLUMN] [IF EXISTS]` | Narrow | Drops a column outside the primary key, with every index on it, and rewrites the table's rows. `CASCADE` and `RESTRICT` are accepted. |
+| `ALTER TABLE ... RENAME [COLUMN] ... TO`, `RENAME TO` | Supported | Renames a column, including a key column, or the table, which keeps any schema that qualifies its name. Indexes follow the new names; statements prepared with the old ones fail. |
+| `ALTER TABLE ... DISABLE ROW LEVEL SECURITY` | Supported | Changes nothing, since no table has row security. Several changes in one `ALTER TABLE`, and other `ALTER` forms, are rejected. |
 | `DROP TABLE [IF EXISTS]` | Narrow | Drops the table and its indexes. `CASCADE` and `RESTRICT` are accepted and drop the same, since nothing else can depend on a table. |
 | `DROP INDEX [IF EXISTS]` | Supported | Drops one globally named index. `CASCADE` and `RESTRICT` are accepted. |
 | `INSERT ... VALUES` | Narrow | Optional column list, up to 4,096 literal/parameter rows, per-cell `DEFAULT`, and optional `RETURNING`. |

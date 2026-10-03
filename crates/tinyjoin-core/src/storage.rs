@@ -1543,7 +1543,7 @@ pub(crate) fn ensure_storage_key_bytes(bytes: usize) -> Result<()> {
     }
 }
 
-fn validate_catalog_name_bound(name: &str) -> Result<()> {
+pub(crate) fn validate_catalog_name_bound(name: &str) -> Result<()> {
     if name.len().saturating_add(1) > MAX_STORAGE_KEY_BYTES {
         Err(row_write_limit_error(format!(
             "A catalog name cannot exceed {} UTF-8 bytes",

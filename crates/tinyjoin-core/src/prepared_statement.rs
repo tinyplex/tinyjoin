@@ -296,8 +296,7 @@ fn bind_write_statement(statement: &WriteStatement, params: &[Value]) -> Result<
         | WriteStatement::DropTable { .. }
         | WriteStatement::DropIndex { .. }
         | WriteStatement::AddColumn { .. }
-        | WriteStatement::DropConstraint { .. }
-        | WriteStatement::DisableRowSecurity { .. } => {
+        | WriteStatement::AlterTable { .. } => {
             return Err(EngineError::new(
                 "INTERNAL_ERROR",
                 "A prepared statement registry retained unsupported DDL",

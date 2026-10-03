@@ -494,7 +494,12 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 | `CREATE [UNIQUE] INDEX [IF NOT EXISTS]` | Narrow | One or more boolean, integer, or text columns. `USING btree` is accepted, since every index is a B-tree; no other methods, expressions, predicates, `INCLUDE`, ordering, or concurrent build. |
 | `ALTER TABLE ... ADD [COLUMN] [IF NOT EXISTS]` | Narrow | Adds one non-primary-key column and atomically backfills its literal default or `NULL`. On a nonempty table, `NOT NULL` requires a non-null default. The column cannot declare `UNIQUE`; add the constraint after it. |
 | `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE`, `DROP CONSTRAINT [IF EXISTS]` | Narrow | Adds a unique constraint, as `CREATE UNIQUE INDEX` would, or drops one of the table's unique indexes by name. |
-| `ALTER TABLE ... DISABLE ROW LEVEL SECURITY` | Supported | Changes nothing, since no table has row security. `ALTER COLUMN`, `DROP COLUMN`, `RENAME`, and other `ALTER` forms are rejected. |
+| `ALTER TABLE ... ALTER [COLUMN] ... SET DEFAULT`, `DROP DEFAULT` | Narrow | A literal default, as `DEFAULT` takes. Existing rows keep their values, so the table's rows are rewritten. |
+| `ALTER TABLE ... ALTER [COLUMN] ... SET NOT NULL`, `DROP NOT NULL` | Narrow | `SET NOT NULL` rewrites the table's rows, and fails with `CONSTRAINT_VIOLATION`, changing nothing, if a row holds `NULL`. A primary-key column stays `NOT NULL`. |
+| `ALTER TABLE ... ALTER [COLUMN] ... [SET DATA] TYPE` | Narrow | Only to another spelling of the column's runtime type, as `bigint` for an `integer` column, which changes nothing. No conversion or `USING`. |
+| `ALTER TABLE ... DROP [COLUMN] [IF EXISTS]` | Narrow | Drops a column outside the primary key, with every index on it, and rewrites the table's rows. `CASCADE` and `RESTRICT` are accepted. |
+| `ALTER TABLE ... RENAME [COLUMN] ... TO`, `RENAME TO` | Supported | Renames a column, including a key column, or the table, which keeps any schema that qualifies its name. Indexes follow the new names; statements prepared with the old ones fail. |
+| `ALTER TABLE ... DISABLE ROW LEVEL SECURITY` | Supported | Changes nothing, since no table has row security. Several changes in one `ALTER TABLE`, and other `ALTER` forms, are rejected. |
 | `DROP TABLE [IF EXISTS]` | Narrow | Drops the table and its indexes. `CASCADE` and `RESTRICT` are accepted and drop the same, since nothing else can depend on a table. |
 | `DROP INDEX [IF EXISTS]` | Supported | Drops one globally named index. `CASCADE` and `RESTRICT` are accepted. |
 | `INSERT ... VALUES` | Narrow | Optional column list, up to 4,096 literal/parameter rows, per-cell `DEFAULT`, and optional `RETURNING`. |
@@ -1957,12 +1962,14 @@ migration before it left it. Every tab can call migrate() as it starts, since
 a migration that another tab applied first is skipped. A migration must fit in
 one script, of at most 255 statements and 1 MiB of SQL.
 
-The SQL that `drizzle-kit generate` writes runs as it is for new tables, with
-their `UNIQUE` constraints, composite primary keys, `USING btree` indexes, and
-JSON defaults, and for added columns, indexes, and constraints, and dropped
-tables, indexes, and constraints. TinyJoin's `ALTER TABLE` cannot yet change,
-drop, or rename a column, or rename a table, so a migration that does is
-refused, and changes nothing.
+The SQL that `drizzle-kit generate` writes runs as it is: new tables with their
+`UNIQUE` constraints, composite primary keys, `USING btree` indexes, and JSON
+defaults; added, renamed, and dropped columns, tables, indexes, and
+constraints; and changed defaults and nullability. A column's type can change
+only between spellings of one runtime type, such as `integer` and `bigint`,
+since TinyJoin cannot convert stored values. Dropping a column, changing its
+default, or making it `NOT NULL` rewrites every row of its table, within the
+work limits of one script.
 
 ## Queries
 
@@ -2813,6 +2820,14 @@ that `drizzle-kit generate` writes for new tables, apart from foreign keys,
 which TinyJoin cannot enforce and still rejects, now with an error saying so.
 See [constraints and indexes](https://tinyjoin.org/guides/sql-compatibility/#constraints-and-indexes).
 
+`ALTER TABLE` can now also rename a table or a column, drop a column, set or
+drop a column's default, and set or drop `NOT NULL`, and accepts a column type
+that restates the runtime type it has, as `bigint` does for `integer`. Existing
+rows keep their values: dropping a column, changing a default, and setting
+`NOT NULL` rewrite the table's rows, and `SET NOT NULL` fails, changing nothing,
+while a row holds `NULL`. A dropped column takes every index on it with it, as
+in PostgreSQL, and indexes follow renamed columns and tables.
+
 The new getSchema() method on the Client reads the database's tables, with
 their columns, primary keys, and indexes, as typed objects rather than through
 SQL catalog tables, which TinyJoin does not have. Each column carries its
@@ -3011,7 +3026,7 @@ quicker than in either.
   longer wait for their code to compile. See
   [custom Workers](https://tinyjoin.org/guides/custom-workers/).
 
-The compressed download is now 319 KiB, up from 295 KiB in v0.3.0.
+The compressed download is now 322 KiB, up from 295 KiB in v0.3.0.
 
 ## v0.3.0
 

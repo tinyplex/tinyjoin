@@ -4249,6 +4249,206 @@ mod tests {
     }
 
     #[test]
+    fn altered_columns_keep_every_row_as_it_was() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let rows = |engine: &mut PagedEngine<MemoryPageDevice>, sql: &str| {
+            engine
+                .execute_sql(sql, &[])
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(Value::Object)
+                .collect::<Vec<_>>()
+        };
+        engine
+            .exec_sql(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER DEFAULT 5, c TEXT DEFAULT 'x');\
+                 INSERT INTO t (id, a) VALUES (1, 'a1');\
+                 INSERT INTO t VALUES (2, 'a2', 7, 'y'), (3, NULL, 5, 'z');\
+                 ALTER TABLE t ADD COLUMN d INTEGER NOT NULL DEFAULT 9;\
+                 CREATE INDEX t_b ON t (b);\
+                 CREATE UNIQUE INDEX t_bc ON t (b, c);",
+            )
+            .unwrap();
+
+        // Rows that left a column out as its default keep the default they had.
+        engine
+            .exec_sql(
+                "ALTER TABLE t ALTER COLUMN d SET DEFAULT 10;\
+                 ALTER TABLE t ALTER COLUMN c DROP DEFAULT;\
+                 INSERT INTO t (id, a) VALUES (4, 'a4');",
+            )
+            .unwrap();
+        assert_eq!(
+            rows(&mut engine, "SELECT id, b, c, d FROM t ORDER BY id"),
+            [
+                json!({"id": 1, "b": 5, "c": "x", "d": 9}),
+                json!({"id": 2, "b": 7, "c": "y", "d": 9}),
+                json!({"id": 3, "b": 5, "c": "z", "d": 9}),
+                json!({"id": 4, "b": 5, "c": null, "d": 10}),
+            ]
+        );
+
+        // NOT NULL is refused while a row holds NULL, and then holds.
+        assert_eq!(
+            engine
+                .execute_sql("ALTER TABLE t ALTER COLUMN a SET NOT NULL", &[])
+                .unwrap_err()
+                .code,
+            "CONSTRAINT_VIOLATION"
+        );
+        engine
+            .exec_sql(
+                "UPDATE t SET a = 'a3' WHERE id = 3;\
+                 ALTER TABLE t ALTER COLUMN a SET NOT NULL;",
+            )
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute_sql("INSERT INTO t (id) VALUES (5)", &[])
+                .unwrap_err()
+                .code,
+            "CONSTRAINT_VIOLATION"
+        );
+        engine
+            .exec_sql(
+                "ALTER TABLE t ALTER COLUMN a DROP NOT NULL;\
+                 INSERT INTO t (id) VALUES (5);",
+            )
+            .unwrap();
+
+        // A dropped column takes its indexes with it, and the others still find rows.
+        engine
+            .exec_sql(
+                r#"ALTER TABLE "t" DROP COLUMN "c";
+                ALTER TABLE t DROP COLUMN IF EXISTS c;
+                ALTER TABLE t RENAME COLUMN b TO beta;
+                ALTER TABLE t RENAME id TO ident;
+                ALTER TABLE t ALTER COLUMN beta SET DATA TYPE bigint;
+                ALTER TABLE t ALTER beta TYPE int4;
+                ALTER TABLE t RENAME TO tee;"#,
+            )
+            .unwrap();
+        let schema = engine.schema().unwrap();
+        assert_eq!(schema.len(), 1);
+        let (tee, indexes) = &schema[0];
+        assert_eq!(tee.name, "tee");
+        assert_eq!(tee.primary_key, ["ident"]);
+        assert_eq!(
+            tee.columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["ident", "a", "beta", "d"]
+        );
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].name, "t_b");
+        assert_eq!(indexes[0].table, "tee");
+        assert_eq!(indexes[0].columns, ["beta"]);
+        assert_eq!(
+            rows(&mut engine, "SELECT ident, a FROM tee WHERE beta = 7"),
+            [json!({"ident": 2, "a": "a2"})]
+        );
+        assert_eq!(
+            rows(&mut engine, "SELECT * FROM tee WHERE ident = 5"),
+            [json!({"ident": 5, "a": null, "beta": 5, "d": 10})]
+        );
+        assert_eq!(
+            engine.execute_sql("SELECT * FROM t", &[]).unwrap_err().code,
+            "TABLE_NOT_FOUND"
+        );
+        engine.check().unwrap();
+        let mut engine = PagedEngine::open(engine.into_device()).unwrap();
+        assert_eq!(engine.schema().unwrap(), schema);
+        assert_eq!(rows(&mut engine, "SELECT ident FROM tee ORDER BY ident").len(), 5);
+        engine.check().unwrap();
+    }
+
+    #[test]
+    fn a_table_too_large_for_one_chunk_is_rebuilt_whole() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .execute_sql(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, extra TEXT, n INTEGER)",
+                &[],
+            )
+            .unwrap();
+        for start in (0..600).step_by(100) {
+            let values = (start..start + 100)
+                .map(|id| format!("({id}, 'body {id} {}', 'extra', {id})", "x".repeat(100)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            engine
+                .execute_sql(&format!("INSERT INTO notes VALUES {values}"), &[])
+                .unwrap();
+        }
+        engine
+            .exec_sql("CREATE INDEX notes_n ON notes (n); ALTER TABLE notes DROP COLUMN extra;")
+            .unwrap();
+        let result = engine
+            .execute_sql("SELECT count(*) AS rows, sum(n) AS total FROM notes", &[])
+            .unwrap();
+        assert_eq!(
+            Value::Object(result.rows[0].clone()),
+            json!({"rows": 600, "total": 179_700})
+        );
+        assert_eq!(
+            Value::Object(
+                engine
+                    .execute_sql("SELECT * FROM notes WHERE n = 599", &[])
+                    .unwrap()
+                    .rows[0]
+                    .clone()
+            ),
+            json!({"id": 599, "body": format!("body 599 {}", "x".repeat(100)), "n": 599})
+        );
+        engine.check().unwrap();
+    }
+
+    #[test]
+    fn alterations_tinyjoin_cannot_make_are_refused() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .exec_sql(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER);\
+                 CREATE TABLE app.items (id INTEGER PRIMARY KEY);\
+                 CREATE TABLE u (id INTEGER PRIMARY KEY);",
+            )
+            .unwrap();
+        for (sql, code) in [
+            ("ALTER TABLE t DROP COLUMN id", "UNSUPPORTED_SQL"),
+            ("ALTER TABLE t DROP COLUMN missing", "COLUMN_NOT_FOUND"),
+            ("ALTER TABLE t RENAME COLUMN a TO b", "COLUMN_ALREADY_EXISTS"),
+            ("ALTER TABLE t RENAME COLUMN missing TO c", "COLUMN_NOT_FOUND"),
+            ("ALTER TABLE t RENAME TO u", "TABLE_ALREADY_EXISTS"),
+            ("ALTER TABLE t ALTER COLUMN b SET DEFAULT 'x'", "INVALID_SCHEMA"),
+            ("ALTER TABLE t ALTER COLUMN id DROP NOT NULL", "INVALID_SCHEMA"),
+            ("ALTER TABLE t ALTER COLUMN b TYPE text", "UNSUPPORTED_SQL"),
+            ("ALTER TABLE t ALTER COLUMN b TYPE text USING b::text", "UNSUPPORTED_SQL"),
+            ("ALTER TABLE t ALTER COLUMN b SET STATISTICS 100", "SQL_PARSE_ERROR"),
+            ("ALTER TABLE t OWNER TO someone", "UNSUPPORTED_SQL"),
+        ] {
+            let error = engine.exec_sql(sql).unwrap_err();
+            assert_eq!(error.code, code, "{sql}: {}", error.message);
+        }
+        // A table named with a schema keeps its schema when it is renamed.
+        engine
+            .exec_sql("ALTER TABLE app.items RENAME TO things")
+            .unwrap();
+        assert!(engine.execute_sql("SELECT * FROM app.things", &[]).is_ok());
+
+        engine.begin_transaction().unwrap();
+        assert_eq!(
+            engine
+                .exec_sql("ALTER TABLE t RENAME TO v")
+                .unwrap_err()
+                .code,
+            "UNSUPPORTED_SQL"
+        );
+        engine.rollback_transaction().unwrap();
+    }
+
+    #[test]
     fn constraints_and_index_methods_tinyjoin_cannot_enforce_are_refused() {
         let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
         engine
@@ -4323,11 +4523,6 @@ mod tests {
                 "ALTER TABLE missing DISABLE ROW LEVEL SECURITY",
                 "TABLE_NOT_FOUND",
                 "",
-            ),
-            (
-                "ALTER TABLE posts ALTER COLUMN user_id SET NOT NULL",
-                "UNSUPPORTED_SQL",
-                "ALTER TABLE supports",
             ),
         ] {
             let error = engine.exec_sql(sql).unwrap_err();

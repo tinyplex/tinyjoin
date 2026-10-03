@@ -94,6 +94,14 @@ that `drizzle-kit generate` writes for new tables, apart from foreign keys,
 which TinyJoin cannot enforce and still rejects, now with an error saying so.
 See [constraints and indexes](/guides/sql-compatibility/#constraints-and-indexes).
 
+`ALTER TABLE` can now also rename a table or a column, drop a column, set or
+drop a column's default, and set or drop `NOT NULL`, and accepts a column type
+that restates the runtime type it has, as `bigint` does for `integer`. Existing
+rows keep their values: dropping a column, changing a default, and setting
+`NOT NULL` rewrite the table's rows, and `SET NOT NULL` fails, changing nothing,
+while a row holds `NULL`. A dropped column takes every index on it with it, as
+in PostgreSQL, and indexes follow renamed columns and tables.
+
 The new getSchema() method on the Client reads the database's tables, with
 their columns, primary keys, and indexes, as typed objects rather than through
 SQL catalog tables, which TinyJoin does not have. Each column carries its

@@ -280,8 +280,9 @@ runIfBuilt('the Drizzle driver', () => {
   });
 });
 
-// Two migrations that `drizzle-kit generate` wrote: the first creates two tables,
-// and the second drops one and adds a column and an index to the other.
+// Three migrations that `drizzle-kit generate` wrote: the first creates two
+// tables, the second drops one and adds a column and an index to the other, and
+// the third changes that table's columns and drops one.
 const migrationsFolder = resolve(import.meta.dirname, 'migrations');
 const journal = JSON.parse(
   readFileSync(resolve(migrationsFolder, 'meta/_journal.json'), 'utf8'),
@@ -322,6 +323,7 @@ runIfBuilt('the Drizzle migrator', () => {
       'post_tags',
       'users',
     ]);
+    await client.query("INSERT INTO users (id, name) VALUES ('u1', 'Ann')");
 
     await migrate(db, {journal, migrations});
     const {tables} = await client.getSchema();
@@ -330,10 +332,9 @@ runIfBuilt('the Drizzle migrator', () => {
       name: 'users',
       columns: [
         {name: 'id', type: 'text', nullable: false},
-        {name: 'name', type: 'text', nullable: false},
+        {name: 'name', type: 'text', nullable: true},
         {name: 'email', type: 'text', nullable: true},
-        {name: 'active', type: 'boolean', nullable: false, default: true},
-        {name: 'meta', type: 'json', nullable: true, default: {tags: []}},
+        {name: 'active', type: 'boolean', nullable: false, default: false},
         {name: 'visits', type: 'integer', nullable: false, default: 0},
       ],
       primaryKey: ['id'],
@@ -346,6 +347,11 @@ runIfBuilt('the Drizzle migrator', () => {
     expect(await applied()).toEqual([
       {tag: '0000_create_users'},
       {tag: '0001_add_visits'},
+      {tag: '0002_loosen_users'},
+    ]);
+    // The row written before the migrations keeps the default it was written with.
+    expect((await client.query('SELECT * FROM users')).rows).toEqual([
+      {id: 'u1', name: 'Ann', email: null, active: true, visits: 0},
     ]);
 
     const revision = client.getRevision();
@@ -356,7 +362,7 @@ runIfBuilt('the Drizzle migrator', () => {
   it('records migrations in the table it is given', async () => {
     const migrationsTable = 'app "migrations"';
     await migrate(db, {journal, migrations, migrationsTable});
-    expect(await applied('app ""migrations""')).toHaveLength(2);
+    expect(await applied('app ""migrations""')).toHaveLength(3);
     expect(
       (await client.getSchema()).tables.some(
         ({name}) => name === '__drizzle_migrations',
@@ -377,7 +383,7 @@ runIfBuilt('the Drizzle migrator', () => {
       },
     }).catch((error: unknown) => error);
     expect(failure).toMatchObject({code: 'UNSUPPORTED_SQL'});
-    expect(await applied()).toHaveLength(2);
+    expect(await applied()).toHaveLength(3);
     expect(
       (await client.getSchema()).tables.some(({name}) => name === 'notes'),
     ).toBe(false);
@@ -404,7 +410,7 @@ runIfBuilt('the Drizzle migrator', () => {
     } as unknown as TinyJoinDatabase;
     await migrate(racing, {journal, migrations});
     expect(raced).toBe(true);
-    expect(await applied()).toHaveLength(2);
+    expect(await applied()).toHaveLength(3);
   });
 });
 

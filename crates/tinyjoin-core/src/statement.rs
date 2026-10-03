@@ -25,8 +25,9 @@ use crate::storage::{
     MAX_LOGICAL_ROW_BYTES, ensure_storage_key_bytes, estimated_checked_value_bytes,
     estimated_key_bytes, estimated_record_bytes, estimated_row_bytes, estimated_value_bytes,
     json_scalar_bound, normalize_row, primary_key_values_fit, row_json_overhead,
-    schema_with_added_column, unplanned_record, validate_index_columns_for_schema,
-    validate_index_definition_shape, validate_primary_storage_key_bound, validate_value,
+    schema_with_added_column, unplanned_record, validate_catalog_name_bound,
+    validate_index_columns_for_schema, validate_index_definition_shape,
+    validate_primary_storage_key_bound, validate_schema, validate_value,
 };
 use crate::{
     ChangedKeys, ColumnDefinition, ColumnType, EngineError, IndexDefinition,
@@ -100,15 +101,10 @@ pub(crate) enum WriteStatement {
         column: ColumnDefinition,
         if_not_exists: bool,
     },
-    /// `ALTER TABLE ... DROP CONSTRAINT`, which drops one of the table's unique indexes.
-    DropConstraint {
+    /// Every `ALTER TABLE` but `ADD COLUMN` and `ADD CONSTRAINT`, which are other statements.
+    AlterTable {
         table: String,
-        name: String,
-        if_exists: bool,
-    },
-    /// `ALTER TABLE ... DISABLE ROW LEVEL SECURITY`, which changes nothing: no table has any.
-    DisableRowSecurity {
-        table: String,
+        change: TableChange,
     },
     Insert {
         table: String,
@@ -308,19 +304,17 @@ pub(crate) fn execute<S: StorageDriver>(
             column,
             if_not_exists,
         } => add_column(storage, table, column, *if_not_exists).map(no_changed_keys),
-        WriteStatement::DropConstraint {
-            table,
-            name,
-            if_exists,
-        } => {
-            let outcome = plan_drop_constraint(storage, table, name, *if_exists)?;
+        WriteStatement::AlterTable { table, change } => {
+            let outcome = plan_alter_table(storage, table, change)?;
             if outcome.mutated {
+                let TableChange::DropConstraint { name, .. } = change else {
+                    return Err(EngineError::unsupported_sql(
+                        "The in-memory test storage cannot alter a table's columns",
+                    ));
+                };
                 storage.drop_index(name)?;
             }
             Ok(no_changed_keys(outcome))
-        }
-        WriteStatement::DisableRowSecurity { table } => {
-            plan_disable_row_security(storage, table).map(no_changed_keys)
         }
         WriteStatement::Insert { .. }
         | WriteStatement::Update { .. }
@@ -603,8 +597,7 @@ pub(crate) fn plan_dml(
         | WriteStatement::DropTable { .. }
         | WriteStatement::DropIndex { .. }
         | WriteStatement::AddColumn { .. }
-        | WriteStatement::DropConstraint { .. }
-        | WriteStatement::DisableRowSecurity { .. } => Err(EngineError::unsupported_sql(
+        | WriteStatement::AlterTable { .. } => Err(EngineError::unsupported_sql(
             "Page-native SQL currently supports SELECT, CREATE TABLE, INSERT, UPDATE, and DELETE",
         )),
     }
@@ -686,44 +679,119 @@ fn drop_index<S: StorageDriver>(
     Ok(outcome)
 }
 
-pub(crate) fn plan_drop_constraint(
+/// Checks an `ALTER TABLE` change against the table it changes, reporting whether it changes it.
+pub(crate) fn plan_alter_table(
     storage: &dyn StorageReader,
     table: &str,
-    name: &str,
-    if_exists: bool,
+    change: &TableChange,
 ) -> Result<WriteOutcome> {
-    storage.table_schema(table)?;
-    let mutated = match storage.index_definition(name) {
-        Some(definition) if definition.unique && definition.table == table => true,
-        _ if if_exists => false,
+    let schema = storage.table_schema(table)?;
+    let mut tables = vec![table.to_owned()];
+    let mutated = match change {
+        TableChange::DisableRowSecurity => false,
+        TableChange::DropConstraint { name, if_exists } => match storage.index_definition(name) {
+            Some(definition) if definition.unique && definition.table == table => true,
+            _ if *if_exists => false,
+            _ => {
+                return Err(EngineError::new(
+                    "INDEX_NOT_FOUND",
+                    format!("Table `{table}` has no unique constraint `{name}`"),
+                ));
+            }
+        },
+        TableChange::RenameTable(name) => {
+            let name = renamed_table(table, name);
+            validate_catalog_name_bound(&name)
+                .map_err(|error| EngineError::invalid_schema(error.message))?;
+            if storage.table_schema(&name).is_ok() {
+                return Err(EngineError::table_already_exists(&name));
+            }
+            tables.push(name);
+            true
+        }
+        TableChange::DropColumn { column, if_exists: true }
+            if !schema.columns.iter().any(|existing| &existing.name == column) =>
+        {
+            false
+        }
+        TableChange::RestateType { column, data_type } => {
+            if schema.columns[column_position(&schema, column)?].data_type != *data_type {
+                return Err(EngineError::unsupported_sql(
+                    "ALTER COLUMN ... TYPE cannot change a column's runtime type, since TinyJoin cannot convert stored values",
+                ));
+            }
+            false
+        }
         _ => {
-            return Err(EngineError::new(
-                "INDEX_NOT_FOUND",
-                format!("Table `{table}` has no unique constraint `{name}`"),
-            ));
+            altered_schema(&schema, change)?;
+            true
         }
     };
     Ok(WriteOutcome {
         command: "ALTER TABLE",
         row_count: 0,
         rows: vec![],
-        tables: if mutated { vec![table.to_owned()] } else { vec![] },
+        tables: if mutated { tables } else { vec![] },
         mutated,
     })
 }
 
-pub(crate) fn plan_disable_row_security(
-    storage: &dyn StorageReader,
-    table: &str,
-) -> Result<WriteOutcome> {
-    storage.table_schema(table)?;
-    Ok(WriteOutcome {
-        command: "ALTER TABLE",
-        row_count: 0,
-        rows: vec![],
-        tables: vec![],
-        mutated: false,
-    })
+/// The schema a table has after a change to its columns, which the change must leave valid.
+pub(crate) fn altered_schema(
+    schema: &TableDefinition,
+    change: &TableChange,
+) -> Result<TableDefinition> {
+    let mut altered = schema.clone();
+    match change {
+        TableChange::RenameColumn { from, to } => {
+            if schema.columns.iter().any(|column| &column.name == to) {
+                return Err(EngineError::column_already_exists(to, &schema.name));
+            }
+            let position = column_position(schema, from)?;
+            altered.columns[position].name.clone_from(to);
+            for key in &mut altered.primary_key {
+                if key == from {
+                    key.clone_from(to);
+                }
+            }
+        }
+        TableChange::SetDefault { column, default } => {
+            let position = column_position(schema, column)?;
+            altered.columns[position].default.clone_from(default);
+        }
+        TableChange::SetNullable { column, nullable } => {
+            let position = column_position(schema, column)?;
+            altered.columns[position].nullable = *nullable;
+        }
+        TableChange::DropColumn { column, .. } => {
+            let position = column_position(schema, column)?;
+            if schema.primary_key.contains(column) {
+                return Err(EngineError::unsupported_sql(format!(
+                    "Primary-key column `{column}` cannot be dropped"
+                )));
+            }
+            altered.columns.remove(position);
+        }
+        _ => {}
+    }
+    validate_schema(&altered)?;
+    Ok(altered)
+}
+
+fn column_position(schema: &TableDefinition, column: &str) -> Result<usize> {
+    schema
+        .columns
+        .iter()
+        .position(|existing| existing.name == column)
+        .ok_or_else(|| EngineError::column_not_found(column, &schema.name))
+}
+
+/// A table's new name, which keeps the schema that qualifies its old one, as in PostgreSQL.
+pub(crate) fn renamed_table(table: &str, name: &str) -> String {
+    match table.bytes().rposition(|byte| byte == b'.') {
+        Some(dot) => format!("{}.{name}", &table[..dot]),
+        None => name.to_owned(),
+    }
 }
 
 pub(crate) fn plan_drop_index(
@@ -2589,28 +2657,93 @@ impl<'a> MutationParser<'a> {
     fn parse_alter_table(&mut self) -> Result<WriteStatement> {
         self.expect_keyword("table")?;
         let table = self.parse_table_name()?;
-        if self.consume_keyword("disable") {
+        let change = if self.consume_keyword("disable") {
             self.expect_keyword("row")?;
             self.expect_keyword("level")?;
             self.expect_keyword("security")?;
-            return Ok(WriteStatement::DisableRowSecurity { table });
-        }
-        if self.consume_keyword("drop") {
-            if !self.consume_keyword("constraint") {
-                return Err(unsupported_alter());
+            TableChange::DisableRowSecurity
+        } else if self.consume_keyword("rename") {
+            if self.consume_keyword("to") {
+                TableChange::RenameTable(self.parse_identifier()?)
+            } else {
+                self.consume_keyword("column");
+                let from = self.parse_identifier()?;
+                self.expect_keyword("to")?;
+                TableChange::RenameColumn {
+                    from,
+                    to: self.parse_identifier()?,
+                }
+            }
+        } else if self.consume_keyword("alter") {
+            self.consume_keyword("column");
+            let column = self.parse_identifier()?;
+            if self.consume_keyword("set") {
+                if self.consume_keyword("default") {
+                    TableChange::SetDefault {
+                        column,
+                        default: Some(self.parse_default()?),
+                    }
+                } else if self.consume_keyword("not") {
+                    self.expect_keyword("null")?;
+                    TableChange::SetNullable {
+                        column,
+                        nullable: false,
+                    }
+                } else {
+                    self.expect_keyword("data")?;
+                    self.expect_keyword("type")?;
+                    TableChange::RestateType {
+                        column,
+                        data_type: self.parse_column_type()?,
+                    }
+                }
+            } else if self.consume_keyword("drop") {
+                if self.consume_keyword("default") {
+                    TableChange::SetDefault {
+                        column,
+                        default: None,
+                    }
+                } else {
+                    self.expect_keyword("not")?;
+                    self.expect_keyword("null")?;
+                    TableChange::SetNullable {
+                        column,
+                        nullable: true,
+                    }
+                }
+            } else {
+                self.expect_keyword("type")?;
+                TableChange::RestateType {
+                    column,
+                    data_type: self.parse_column_type()?,
+                }
+            }
+        } else if self.consume_keyword("drop") {
+            let constraint = self.consume_keyword("constraint");
+            if !constraint {
+                self.consume_keyword("column");
             }
             let if_exists = self.parse_if_exists(false)?;
             let name = self.parse_identifier()?;
             self.consume_drop_behavior();
-            return Ok(WriteStatement::DropConstraint {
-                table,
-                name,
-                if_exists,
-            });
-        }
-        if !self.consume_keyword("add") {
-            return Err(unsupported_alter());
-        }
+            if constraint {
+                TableChange::DropConstraint { name, if_exists }
+            } else {
+                TableChange::DropColumn {
+                    column: name,
+                    if_exists,
+                }
+            }
+        } else {
+            if !self.consume_keyword("add") {
+                return Err(unsupported_alter());
+            }
+            return self.parse_alter_table_add(table);
+        };
+        Ok(WriteStatement::AlterTable { table, change })
+    }
+
+    fn parse_alter_table_add(&mut self, table: String) -> Result<WriteStatement> {
         match self.parse_table_constraint()? {
             Some(TableConstraint::Unique(constraint, columns)) => {
                 return Ok(WriteStatement::CreateIndex {
@@ -2678,12 +2811,7 @@ impl<'a> MutationParser<'a> {
                         "Column `{name}` declares DEFAULT more than once"
                     )));
                 }
-                let value = self.parse_literal()?;
-                default = Some(if self.consume(TokenMatcher::Cast) {
-                    self.parse_default_cast(value)?
-                } else {
-                    value
-                });
+                default = Some(self.parse_default()?);
             } else if constraint.is_some() {
                 return Err(EngineError::parse_error(
                     "Expected a column constraint after its name",
@@ -2703,9 +2831,14 @@ impl<'a> MutationParser<'a> {
         ))
     }
 
-    /// Reads the cast of a string to `json` or `jsonb` with which PostgreSQL tools write a JSON
-    /// column's default, as in `DEFAULT '{}'::jsonb`, by parsing the string as JSON text.
-    fn parse_default_cast(&mut self, value: Value) -> Result<Value> {
+    /// Reads a column's default: a literal, or the cast of a string to `json` or `jsonb` with
+    /// which PostgreSQL tools write a JSON default, as in `'{}'::jsonb`, which parses the string
+    /// as JSON text.
+    fn parse_default(&mut self) -> Result<Value> {
+        let value = self.parse_literal()?;
+        if !self.consume(TokenMatcher::Cast) {
+            return Ok(value);
+        }
         match (self.parse_column_type()?, value) {
             (ColumnType::Json, Value::String(text)) => serde_json::from_slice(text.as_bytes())
                 .map_err(|_| EngineError::invalid_schema("A JSON default must be JSON text")),
@@ -3158,6 +3291,24 @@ fn token_matches(token: Option<&Token>, matcher: TokenMatcher) -> bool {
     )
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum TableChange {
+    /// `DISABLE ROW LEVEL SECURITY`, which changes nothing, since no table has any.
+    DisableRowSecurity,
+    /// `DROP CONSTRAINT`, which drops one of the table's unique indexes.
+    DropConstraint { name: String, if_exists: bool },
+    RenameTable(String),
+    RenameColumn { from: String, to: String },
+    /// `SET DEFAULT`, or `DROP DEFAULT` where the default is `None`.
+    SetDefault { column: String, default: Option<Value> },
+    /// `DROP NOT NULL`, or `SET NOT NULL`, which every row must already meet.
+    SetNullable { column: String, nullable: bool },
+    DropColumn { column: String, if_exists: bool },
+    /// `ALTER COLUMN ... TYPE` naming the type the column already has, which changes nothing:
+    /// `VARCHAR` and `TEXT`, or `INTEGER` and `BIGINT`, are one runtime type.
+    RestateType { column: String, data_type: ColumnType },
+}
+
 enum TableConstraint {
     PrimaryKey(Vec<String>),
     /// A unique constraint's name, if it has one, and its columns.
@@ -3203,7 +3354,7 @@ fn check_unsupported() -> EngineError {
 
 fn unsupported_alter() -> EngineError {
     EngineError::unsupported_sql(
-        "ALTER TABLE supports ADD COLUMN, ADD CONSTRAINT ... UNIQUE, DROP CONSTRAINT, and DISABLE ROW LEVEL SECURITY",
+        "ALTER TABLE supports ADD, DROP, ALTER COLUMN, RENAME, and DISABLE ROW LEVEL SECURITY",
     )
 }
 

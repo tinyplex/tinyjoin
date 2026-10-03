@@ -133,12 +133,14 @@ migration before it left it. Every tab can call migrate() as it starts, since
 a migration that another tab applied first is skipped. A migration must fit in
 one script, of at most 255 statements and 1 MiB of SQL.
 
-The SQL that `drizzle-kit generate` writes runs as it is for new tables, with
-their `UNIQUE` constraints, composite primary keys, `USING btree` indexes, and
-JSON defaults, and for added columns, indexes, and constraints, and dropped
-tables, indexes, and constraints. TinyJoin's `ALTER TABLE` cannot yet change,
-drop, or rename a column, or rename a table, so a migration that does is
-refused, and changes nothing.
+The SQL that `drizzle-kit generate` writes runs as it is: new tables with their
+`UNIQUE` constraints, composite primary keys, `USING btree` indexes, and JSON
+defaults; added, renamed, and dropped columns, tables, indexes, and
+constraints; and changed defaults and nullability. A column's type can change
+only between spellings of one runtime type, such as `integer` and `bigint`,
+since TinyJoin cannot convert stored values. Dropping a column, changing its
+default, or making it `NOT NULL` rewrites every row of its table, within the
+work limits of one script.
 
 ## Queries
 
