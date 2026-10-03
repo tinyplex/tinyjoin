@@ -995,6 +995,11 @@ pub(crate) enum Token {
     Star,
     Comma,
     Dot,
+    Plus,
+    Minus,
+    Slash,
+    Percent,
+    Concat,
     Eq,
     Neq,
     Lt,
@@ -1040,6 +1045,23 @@ impl<'a> Lexer<'a> {
                 '.' => {
                     self.advance();
                     Token::Dot
+                }
+                '+' => {
+                    self.advance();
+                    Token::Plus
+                }
+                '/' => {
+                    self.advance();
+                    Token::Slash
+                }
+                '%' => {
+                    self.advance();
+                    Token::Percent
+                }
+                '|' if self.peek_after_current() == Some('|') => {
+                    self.advance();
+                    self.advance();
+                    Token::Concat
                 }
                 '=' => {
                     self.advance();
@@ -1097,6 +1119,10 @@ impl<'a> Lexer<'a> {
                     .is_some_and(|next| next.is_ascii_digit()) =>
                 {
                     self.number()
+                }
+                '-' => {
+                    self.advance();
+                    Token::Minus
                 }
                 character if is_identifier_start(character) => self.identifier(),
                 _ => {
@@ -2003,12 +2029,15 @@ fn is_identifier_named(token: Option<&Token>, name: &str) -> bool {
 ///
 /// A table named with a schema is qualified by the name after the dot, as it is in a join, and an
 /// alias replaces the table's name rather than joining it. A qualifier that names anything else
-/// is left for the parser to refuse, and so is a column behind two qualifiers. A write names only
-/// its own table's columns before its `WHERE` and `RETURNING` clauses, so it is read from the
-/// first of those, and an `INSERT` takes no alias.
+/// is left for the parser to refuse, and so is a column behind two qualifiers. Before its `WHERE`
+/// and `RETURNING` clauses, a write's only qualified names are in the values an `UPDATE` assigns,
+/// never the columns it assigns to. An `INSERT` keeps its own: `ON CONFLICT` names the stored row
+/// behind the table's name as it names the proposed row behind `EXCLUDED`. An `INSERT` takes no
+/// alias.
 pub(crate) fn drop_table_qualifiers(tokens: &mut Vec<Token>) {
     let select = is_keyword(tokens.first(), "select");
     let insert = is_keyword(tokens.first(), "insert");
+    let update = is_keyword(tokens.first(), "update");
     let start = if select {
         match tokens
             .iter()
@@ -2017,7 +2046,7 @@ pub(crate) fn drop_table_qualifiers(tokens: &mut Vec<Token>) {
             Some(from) => from + 1,
             None => return,
         }
-    } else if is_keyword(tokens.first(), "update") {
+    } else if update {
         1
     } else if insert || is_keyword(tokens.first(), "delete") {
         2
@@ -2045,20 +2074,18 @@ pub(crate) fn drop_table_qualifiers(tokens: &mut Vec<Token>) {
         }
     }
 
-    let first = if select {
-        0
-    } else {
-        tokens[end..]
-            .iter()
-            .position(|token| {
-                is_keyword(Some(token), "where") || is_keyword(Some(token), "returning")
-            })
-            .map_or(tokens.len(), |clause| end + clause)
-    };
+    let clauses = tokens[end..]
+        .iter()
+        .position(|token| is_keyword(Some(token), "where") || is_keyword(Some(token), "returning"))
+        .map_or(tokens.len(), |clause| end + clause);
+    let first = if select || update { 0 } else { clauses };
     let mut qualifiers = Vec::new();
     let mut ordering = false;
     for index in first..tokens.len() {
-        if (start..end).contains(&index) {
+        // A column an UPDATE assigns to is followed by `=`, which no value it assigns holds.
+        if (start..end).contains(&index)
+            || (update && index < clauses && matches!(tokens.get(index + 3), Some(Token::Eq)))
+        {
             continue;
         }
         ordering |= select && index > start && is_keyword(tokens.get(index), "order");
@@ -3119,7 +3146,7 @@ pub(crate) fn validate_predicate_columns(
     }
 }
 
-fn column_definition<'a>(
+pub(crate) fn column_definition<'a>(
     schema: &'a crate::TableDefinition,
     column: &str,
     table: &str,

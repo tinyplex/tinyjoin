@@ -1008,7 +1008,7 @@ mod tests {
             "CREATE TABLE generated (id SERIAL PRIMARY KEY)",
             "CREATE TABLE sized (id INTEGER PRIMARY KEY, name VARCHAR(100))",
             "INSERT INTO missing SELECT * FROM elsewhere",
-            "UPDATE missing SET value = value + 1",
+            "UPDATE missing SET value = upper(value)",
         ] {
             assert_eq!(
                 engine.execute_sql(sql, &[]).unwrap_err().code,

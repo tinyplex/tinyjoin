@@ -395,9 +395,10 @@ fn unsupported_on_conflict_forms_fail_explicitly() {
             "INSERT INTO kv VALUES (1, 'a', 0) ON CONFLICT (id) DO UPDATE SET v = 'b' WHERE n > 0",
             "UNSUPPORTED_SQL",
         ),
+        // A plain name could be the stored row's or the proposed row's.
         (
             "INSERT INTO kv VALUES (1, 'a', 0) ON CONFLICT (id) DO UPDATE SET n = n",
-            "UNSUPPORTED_SQL",
+            "INVALID_QUERY",
         ),
         (
             "INSERT INTO kv VALUES (1, 'a', 0) ON CONFLICT (id) DO",

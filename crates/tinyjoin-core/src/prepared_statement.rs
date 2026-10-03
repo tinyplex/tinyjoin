@@ -2,14 +2,13 @@ use std::mem::size_of;
 
 use serde_json::Value;
 
+use crate::expression::bind_expression;
 use crate::query::{
     MAX_SQL_PARAMETERS, ParseMode, Token, bound_predicate, bound_value, parameter_index,
     prepared_parameter_marker, tokenize, validate_bound_parameter_bytes, validate_sql_input,
     validate_sql_parameters,
 };
-use crate::statement::{
-    ConflictAction, ConflictValue, OnConflict, SqlValue, Statement, WriteStatement,
-};
+use crate::statement::{Assigned, ConflictAction, OnConflict, SqlValue, Statement, WriteStatement};
 use crate::{EngineError, Result};
 
 pub type PreparedStatementId = u32;
@@ -279,7 +278,7 @@ fn bind_write_statement(statement: &WriteStatement, params: &[Value]) -> Result<
             assignments: {
                 let mut bound = Vec::with_capacity(assignments.len());
                 for (column, value) in assignments {
-                    bound.push((column.clone(), bound_sql_value(value, params)?));
+                    bound.push((column.clone(), bound_assigned(value, params)?));
                 }
                 bound
             },
@@ -322,13 +321,7 @@ fn bound_on_conflict(clause: &OnConflict, params: &[Value]) -> Result<OnConflict
             ConflictAction::Update(assignments) => {
                 let mut bound = Vec::with_capacity(assignments.len());
                 for (column, value) in assignments {
-                    let value = match value {
-                        ConflictValue::Value(value) => {
-                            ConflictValue::Value(bound_sql_value(value, params)?)
-                        }
-                        ConflictValue::Excluded(source) => ConflictValue::Excluded(source.clone()),
-                    };
-                    bound.push((column.clone(), value));
+                    bound.push((column.clone(), bound_assigned(value, params)?));
                 }
                 ConflictAction::Update(bound)
             }
@@ -341,6 +334,14 @@ fn bound_sql_value(value: &SqlValue, params: &[Value]) -> Result<SqlValue> {
         SqlValue::Value(value) => SqlValue::Value(bound_value(value, params)?),
         SqlValue::Default => SqlValue::Default,
     })
+}
+
+fn bound_assigned(value: &Assigned, params: &[Value]) -> Result<Assigned> {
+    let mut value = value.clone();
+    if let Assigned::Expression(expression) = &mut value {
+        bind_expression(expression, params)?;
+    }
+    Ok(value)
 }
 
 fn retained_bytes(sql_bytes: usize, tokens: usize, parameter_count: usize) -> Result<usize> {

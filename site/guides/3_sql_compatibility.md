@@ -180,7 +180,7 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 | `INSERT ... DEFAULT VALUES` | Supported | Inserts one row using defaults and `NULL` values. |
 | `INSERT ... ON CONFLICT` | Narrow | `ON CONFLICT [(columns)] DO NOTHING` or `ON CONFLICT (columns) DO UPDATE SET column = value, ...`, before any `RETURNING`. See [upserts](#upserts). |
 | `INSERT ... SELECT`, `MERGE` | No | No query-sourced insert or merge statement. |
-| `UPDATE ... SET ... [WHERE ...]` | Narrow | Assigns literals, parameters, or `DEFAULT`; optional `RETURNING`. No expressions or `UPDATE ... FROM`. |
+| `UPDATE ... SET ... [WHERE ...]` | Narrow | Assigns `DEFAULT` or an [expression](#expressions) of the row's columns, literals, and parameters; optional `RETURNING`. No `UPDATE ... FROM`. |
 | `DELETE FROM ... [WHERE ...]` | Narrow | Optional `RETURNING`. No `DELETE ... USING`. |
 | `RETURNING` | Narrow | `*` or a list of distinct plain columns, which the table's name or alias may qualify; no expressions or output aliases. Duplicate names return `INVALID_QUERY` before any rows are changed, even when no rows match. |
 | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT` | No | Use the JavaScript callback transaction API. |
@@ -206,7 +206,8 @@ each statement retains the ordinary parser limits below.
 | `IS NULL`, `IS NOT NULL` | Supported | Tests the single runtime null value. |
 | `IN (...)`, `NOT IN (...)` | Supported | One to 1,024 literals or parameters with SQL null behavior. |
 | `BETWEEN`, `NOT BETWEEN` | Narrow | `column BETWEEN low AND high` means exactly `column >= low AND column <= high`, and `NOT BETWEEN` means `column < low OR column > high`, with those comparisons' type and null rules. Each bound is a literal or parameter. There is no `SYMMETRIC` form, so a reversed range matches nothing. |
-| Arithmetic, concatenation, casts, scalar functions | No | Values are not a general expression language. |
+| `+`, `-`, `*`, `/`, `%`, `\|\|` | Narrow | In the values `UPDATE` and `ON CONFLICT DO UPDATE` assign. See [expressions](#expressions). |
+| Casts, `CASE`, scalar functions | No | There are no casts, conditional expressions, or functions other than the aggregates. |
 | `LIKE`, `NOT LIKE`, `ILIKE`, `NOT ILIKE` | Narrow | Matches a whole text column value against a literal or parameter pattern, where `%` matches any run of characters and `_` exactly one character; a non-text column is rejected. Backslash makes the next pattern character literal unless `ESCAPE` names another single character, or `''` for none; a pattern ending in its escape character is rejected. `ILIKE` folds only ASCII letters, as PostgreSQL does under the C locale. A `NULL` operand is unknown. A `LIKE` pattern that begins with literal characters, such as `'abc%'`, reads only the part of an index or primary key that can match; other patterns scan. |
 | `IS DISTINCT FROM`, `SIMILAR TO`, `ANY`, `ALL` | No | These PostgreSQL predicate families are not implemented. |
 | JSON/path operators | No | JSON can be stored, returned, and compared for structural equality only. |
@@ -214,6 +215,52 @@ each statement retains the ordinary parser limits below.
 The right side of an ordinary predicate is a literal or parameter, not another
 column or subquery. Column-to-column comparison exists only in a join's `ON`
 equality terms.
+
+## Expressions
+
+An `UPDATE` or `ON CONFLICT DO UPDATE` assignment can work its value out from
+the row it updates:
+
+```sql
+UPDATE counters SET hits = hits + 1, label = label || ' (edited)'
+WHERE id = $1;
+
+INSERT INTO counters (id, hits) VALUES ($1, 1)
+ON CONFLICT (id) DO UPDATE SET hits = counters.hits + EXCLUDED.hits;
+```
+
+An expression combines columns, literals, and parameters with `+`, `-`, `*`,
+`/`, `%`, unary `-`, `||`, and parentheses. As in PostgreSQL, `*`, `/`, and `%`
+bind more tightly than `+` and `-`, and `||` more loosely than both. Every
+assignment reads the row as it was before the statement, so
+`SET a = b, b = a` swaps two columns of the same type.
+
+- Arithmetic takes integers and floats. Two integers give an integer, and
+  integer division truncates toward zero. A result outside the
+  JavaScript-safe range fails with `NUMERIC_OVERFLOW`.
+- A float operand makes the result a float, which must be finite or the
+  statement fails with `NUMERIC_OVERFLOW`. As with PostgreSQL's `double
+  precision`, `%` takes only integers.
+- Dividing by zero, or taking a remainder by zero, fails with
+  `DIVISION_BY_ZERO`.
+- `||` joins two texts. There are no implicit casts, so it takes no other type,
+  and `'1' + 1` is a `TYPE_MISMATCH`.
+- A `NULL` operand gives `NULL`.
+
+Operand types, and whether a result's type fits the column it is assigned to,
+are checked before any row is read. `SET hits = hits * 1.5` on an integer
+column fails with `TYPE_MISMATCH` even when no row matches. A value that fails
+as a row is written, such as an overflow or a `NULL` for a `NOT NULL` column,
+fails the statement, which changes nothing. An expression that reads no column
+is worked out once for the statement.
+
+In `ON CONFLICT DO UPDATE`, a column of the stored row is named with the
+table's name, such as `counters.hits`, and a column of the row proposed for
+insertion with `EXCLUDED`. A plain name could mean either, so, as in PostgreSQL,
+it is rejected.
+
+Casts, `CASE`, functions, and comparisons inside an expression are not
+supported.
 
 ## Runtime types
 
@@ -358,11 +405,12 @@ statement:
 - A conflict on a constraint that is not an arbiter fails the statement as an
   ordinary insert would.
 
-Each `SET` value is a literal, a parameter, `DEFAULT`, or `EXCLUDED.column`,
-which is the proposed row's value after column defaults. The existing row's
-columns cannot be read, so there is no `SET count = count + 1`, and `DO UPDATE`
-cannot change a row's primary key, although assigning it the same value is
-allowed. `NULL` never conflicts with a unique index.
+Each `SET` value is `DEFAULT` or an [expression](#expressions) of literals,
+parameters, and columns: the stored row's, named with the table's name as in
+`counters.hits`, and the proposed row's, named as in `EXCLUDED.hits`, which is
+its value after column defaults. `DO UPDATE` cannot change a row's primary key,
+although assigning it the same value is allowed. `NULL` never conflicts with a
+unique index.
 
 A primary-key arbiter uses direct key lookup. A unique-index arbiter reads the
 index postings, except inside a callback transaction that has staged changes to

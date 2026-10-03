@@ -6,15 +6,15 @@ use serde_json::{Map, Number, Value};
 
 use crate::hash::{KeyHasher, KeyMap, KeySet};
 use crate::query::{
-    Filter, ParseMode, Token, bind_parameter, is_distinct_keyword_at, is_reserved_keyword,
-    number_literal, pagination_value, parse_predicate_at, sort_rows_by, validate_predicate_columns,
-    validate_predicate_types,
+    Filter, ParseMode, Token, bind_parameter, column_definition, is_distinct_keyword_at,
+    is_reserved_keyword, number_literal, pagination_value, parse_predicate_at, sort_rows_by,
+    validate_predicate_columns, validate_predicate_types,
 };
 use crate::row::{RowRef, ValueRef};
-use crate::storage::StorageReader;
+use crate::storage::{StorageReader, column_type_name};
 use crate::{
-    ColumnDefinition, ColumnType, EngineError, NullOrder, OrderBy, OrderDirection, Predicate,
-    QueryResult, Result, ResultField, Row, TableDefinition, VisitControl,
+    ColumnType, EngineError, NullOrder, OrderBy, OrderDirection, Predicate, QueryResult, Result,
+    ResultField, Row, TableDefinition, VisitControl,
 };
 
 const MAX_SELECT_ITEMS: usize = 256;
@@ -1272,28 +1272,6 @@ fn compare_typed(data_type: ColumnType, left: &Value, right: &Value) -> Ordering
             .expect("typed text was validated")
             .cmp(right.as_str().expect("typed text was validated")),
         _ => Ordering::Equal,
-    }
-}
-
-fn column_definition<'a>(
-    schema: &'a TableDefinition,
-    column: &str,
-    table: &str,
-) -> Result<&'a ColumnDefinition> {
-    schema
-        .columns
-        .iter()
-        .find(|definition| definition.name == column)
-        .ok_or_else(|| EngineError::column_not_found(column, table))
-}
-
-fn column_type_name(data_type: ColumnType) -> &'static str {
-    match data_type {
-        ColumnType::Boolean => "boolean",
-        ColumnType::Integer => "integer",
-        ColumnType::Float => "float",
-        ColumnType::Text => "text",
-        ColumnType::Json => "json",
     }
 }
 

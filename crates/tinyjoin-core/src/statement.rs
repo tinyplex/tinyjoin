@@ -6,14 +6,17 @@ use serde_json::{Map, Value};
 
 #[cfg(test)]
 use crate::StorageDriver;
+use crate::expression::{
+    Columns, Expression, check_assignment, constant, evaluate, parse_expression_at,
+};
 use crate::hash::KeySet;
 use crate::paged_codec::{
     EMPTY_RECORD, RecordLayout, StoredRecord, encode_primary_key, encode_primary_key_values,
     encode_row_values, encode_updated_record,
 };
 use crate::query::{
-    Filter, ParseMode, Token, bind_parameter, exact_equalities, is_reserved_keyword,
-    number_literal, parse_predicate_at, tokenize, validate_named_columns,
+    Filter, ParseMode, Token, bind_parameter, column_definition, exact_equalities,
+    is_reserved_keyword, number_literal, parse_predicate_at, tokenize, validate_named_columns,
     validate_parameter_expansion, validate_predicate_columns, validate_predicate_types,
     validate_sql_input, visit_indexed_candidates,
 };
@@ -93,7 +96,7 @@ pub(crate) enum WriteStatement {
     },
     Update {
         table: String,
-        assignments: Vec<(String, SqlValue)>,
+        assignments: Vec<(String, Assigned)>,
         predicate: Option<Predicate>,
         returning: Option<Vec<String>>,
     },
@@ -110,6 +113,14 @@ pub(crate) enum SqlValue {
     Default,
 }
 
+/// A value `UPDATE ... SET` or `ON CONFLICT DO UPDATE SET` assigns: the column's `DEFAULT`, or an
+/// expression, which may read the row it updates and, in `ON CONFLICT`, the row proposed for it.
+#[derive(Clone, Debug)]
+pub(crate) enum Assigned {
+    Default,
+    Expression(Expression),
+}
+
 /// An `INSERT ... ON CONFLICT` clause.
 #[derive(Clone, Debug)]
 pub(crate) struct OnConflict {
@@ -122,15 +133,7 @@ pub(crate) struct OnConflict {
 #[derive(Clone, Debug)]
 pub(crate) enum ConflictAction {
     Nothing,
-    Update(Vec<(String, ConflictValue)>),
-}
-
-/// A `DO UPDATE SET` value: an ordinary literal, parameter, or `DEFAULT`, or a column of the row
-/// proposed for insertion, spelled `EXCLUDED.column`.
-#[derive(Clone, Debug)]
-pub(crate) enum ConflictValue {
-    Value(SqlValue),
-    Excluded(String),
+    Update(Vec<(String, Assigned)>),
 }
 
 #[derive(Debug)]
@@ -1110,6 +1113,8 @@ struct ConflictPlan {
 enum ResolvedConflictValue {
     Value(Value),
     Excluded(String),
+    /// An expression that reads a row, other than a lone `EXCLUDED.column`.
+    Computed(Expression),
 }
 
 impl ConflictPlan {
@@ -1161,22 +1166,24 @@ impl ConflictPlan {
                     }
                     // `column_default` also rejects an unknown column.
                     let default = column_default(schema, column)?;
+                    let definition = column_definition(schema, column, &schema.name)?;
                     let value = match value {
-                        ConflictValue::Value(SqlValue::Value(value)) => {
-                            let definition = schema
-                                .columns
-                                .iter()
-                                .find(|definition| definition.name == *column)
-                                .expect("column_default found the column");
-                            validate_value(definition, value, &schema.name)?;
-                            ResolvedConflictValue::Value(value.clone())
-                        }
-                        ConflictValue::Value(SqlValue::Default) => {
-                            ResolvedConflictValue::Value(default)
-                        }
-                        ConflictValue::Excluded(source) => {
+                        Assigned::Default => ResolvedConflictValue::Value(default),
+                        Assigned::Expression(Expression::Excluded(source)) => {
                             column_default(schema, source)?;
                             ResolvedConflictValue::Excluded(source.clone())
+                        }
+                        Assigned::Expression(expression) if expression.reads_row() => {
+                            let column_type = |column: &str| {
+                                Ok(column_definition(schema, column, &schema.name)?.data_type)
+                            };
+                            check_assignment(expression, definition, &schema.name, &column_type)?;
+                            ResolvedConflictValue::Computed(expression.clone())
+                        }
+                        Assigned::Expression(expression) => {
+                            let value = constant(expression)?;
+                            validate_value(definition, &value, &schema.name)?;
+                            ResolvedConflictValue::Value(value)
                         }
                     };
                     resolved.push((column.clone(), value));
@@ -1279,15 +1286,25 @@ fn updated_conflict_row(
     proposed: &Row,
 ) -> Result<Row> {
     let existing_key = primary_conflict_key(schema, &existing)?;
-    let mut row = existing;
-    for (column, value) in updates {
-        let value = match value {
+    // Every assignment reads the stored row as it was.
+    let mut values = Vec::with_capacity(updates.len());
+    for (_, value) in updates {
+        values.push(match value {
             ResolvedConflictValue::Value(value) => value.clone(),
-            ResolvedConflictValue::Excluded(source) => proposed
-                .get(source)
-                .cloned()
-                .ok_or_else(|| EngineError::column_not_found(source, &schema.name))?,
-        };
+            ResolvedConflictValue::Excluded(source) => row_column(proposed, source, &schema.name)?,
+            ResolvedConflictValue::Computed(expression) => {
+                evaluate(expression, &mut |column, excluded| {
+                    row_column(
+                        if excluded { proposed } else { &existing },
+                        column,
+                        &schema.name,
+                    )
+                })?
+            }
+        });
+    }
+    let mut row = existing;
+    for ((column, _), value) in updates.iter().zip(values) {
         row.insert(column.clone(), value);
     }
     let row = normalize_row(schema, row)?;
@@ -1383,7 +1400,7 @@ impl ConflictIndex {
 fn plan_update(
     storage: &dyn StorageReader,
     table: &str,
-    assignments: &[(String, SqlValue)],
+    assignments: &[(String, Assigned)],
     predicate: Option<&Predicate>,
     returning: Option<&[String]>,
 ) -> Result<PlannedDml> {
@@ -1401,41 +1418,40 @@ fn plan_update(
     }
     validate_projection(&schema, returning)?;
 
-    let assignment_bytes = assignments
-        .iter()
-        .try_fold(0usize, |bytes, (column, value)| {
-            let definition = schema
-                .columns
-                .iter()
-                .find(|definition| definition.name == *column)
-                .expect("assignment columns were validated above");
-            let value = match value {
-                SqlValue::Value(value) => value,
-                SqlValue::Default => definition.default.as_ref().unwrap_or(&Value::Null),
-            };
-            validate_value(definition, value, table)?;
-            let value_bytes = estimated_value_bytes(value)?;
-            checked_dml_add(
-                bytes,
+    // An assignment that reads no column gives every row one value, worked out here. One that
+    // reads the row is checked here, and worked out for each row from the row as it was.
+    let column_type = |column: &str| Ok(column_definition(&schema, column, table)?.data_type);
+    let mut resolved_assignments = Vec::with_capacity(assignments.len());
+    let mut computed = Vec::new();
+    for (column, assigned) in assignments {
+        let value = match assigned {
+            Assigned::Default => column_default(&schema, column)?,
+            Assigned::Expression(expression) if expression.reads_row() => {
+                let definition = column_definition(&schema, column, table)?;
+                check_assignment(expression, definition, table, &column_type)?;
+                computed.push((column, expression));
+                continue;
+            }
+            Assigned::Expression(expression) => constant(expression)?,
+        };
+        resolved_assignments.push((column.clone(), value));
+    }
+    let assignment_bytes =
+        resolved_assignments
+            .iter()
+            .try_fold(0usize, |bytes, (column, value)| {
+                let definition = column_definition(&schema, column, table)?;
+                validate_value(definition, value, table)?;
+                let value_bytes = estimated_value_bytes(value)?;
                 checked_dml_add(
-                    checked_dml_mul(column.len(), 2)?,
-                    checked_dml_add(checked_dml_mul(value_bytes, 2)?, 64)?,
-                )?,
-            )
-        })?;
+                    bytes,
+                    checked_dml_add(
+                        checked_dml_mul(column.len(), 2)?,
+                        checked_dml_add(checked_dml_mul(value_bytes, 2)?, 64)?,
+                    )?,
+                )
+            })?;
     ensure_dml_work_bytes(assignment_bytes)?;
-    let resolved_assignments = assignments
-        .iter()
-        .map(|(column, value)| {
-            Ok((
-                column.clone(),
-                match value {
-                    SqlValue::Value(value) => value.clone(),
-                    SqlValue::Default => column_default(&schema, column)?,
-                },
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
     struct PlannedUpdate {
         old_key: Vec<u8>,
         /// The row being updated, when it is kept for the writer.
@@ -1460,7 +1476,12 @@ fn plan_update(
             }
         }
     }
-    let records = RecordUpdate::new(storage, &schema, &resolved_assignments, returning)?;
+    // A row whose new values depend on its old ones is planned as a map.
+    let records = if computed.is_empty() {
+        RecordUpdate::new(storage, &schema, &resolved_assignments, returning)?
+    } else {
+        None
+    };
 
     let mut updates = Vec::new();
     let mut kept = KeptRows::default();
@@ -1529,8 +1550,17 @@ fn plan_update(
             (map, _) => {
                 let mut new_row = map.expect("a row not read as a record is a map");
                 let old_primary_key = primary_key_row(&schema, &new_row)?;
+                let mut values = Vec::with_capacity(computed.len());
+                for (_, expression) in &computed {
+                    values.push(evaluate(expression, &mut |column, _| {
+                        row_column(&new_row, column, table)
+                    })?);
+                }
                 for (column, value) in &resolved_assignments {
                     new_row.insert(column.clone(), value.clone());
+                }
+                for ((column, _), value) in computed.iter().zip(values) {
+                    new_row.insert((*column).clone(), value);
                 }
                 let new_row = normalize_row(&schema, new_row)?;
                 validate_primary_storage_key_bound(&schema, &new_row)?;
@@ -1818,6 +1848,13 @@ fn validate_projection(schema: &TableDefinition, returning: Option<&[String]>) -
     Ok(())
 }
 
+/// The value of `column` in `row`, which holds every column of its table.
+fn row_column(row: &Row, column: &str, table: &str) -> Result<Value> {
+    row.get(column)
+        .cloned()
+        .ok_or_else(|| EngineError::column_not_found(column, table))
+}
+
 fn column_default(schema: &TableDefinition, name: &str) -> Result<Value> {
     schema
         .columns
@@ -1985,10 +2022,9 @@ fn rewritten_record(
     for (column, value) in updates {
         let value = match value {
             ResolvedConflictValue::Value(value) => value.clone(),
-            ResolvedConflictValue::Excluded(source) => proposed
-                .get(source)
-                .cloned()
-                .ok_or_else(|| EngineError::column_not_found(source, &schema.name))?,
+            ResolvedConflictValue::Excluded(source) => row_column(proposed, source, &schema.name)?,
+            // Reading the stored row needs it as a map.
+            ResolvedConflictValue::Computed(_) => return Ok(None),
         };
         assignments.push((column.clone(), value));
     }
@@ -2506,7 +2542,12 @@ impl<'a> MutationParser<'a> {
             rows
         };
         let on_conflict = if self.consume_keyword("on") {
-            Some(self.parse_on_conflict()?)
+            // The stored row is qualified by the table's name, without any schema.
+            let name = table
+                .bytes()
+                .rposition(|byte| byte == b'.')
+                .map_or(0, |dot| dot + 1);
+            Some(self.parse_on_conflict(&table[name..])?)
         } else {
             None
         };
@@ -2520,7 +2561,7 @@ impl<'a> MutationParser<'a> {
         })
     }
 
-    fn parse_on_conflict(&mut self) -> Result<OnConflict> {
+    fn parse_on_conflict(&mut self, qualifier: &str) -> Result<OnConflict> {
         self.expect_keyword("conflict")?;
         if self.consume_keyword("on") {
             return Err(EngineError::unsupported_sql(
@@ -2568,12 +2609,7 @@ impl<'a> MutationParser<'a> {
                 TokenMatcher::Eq,
                 "Expected `=` in ON CONFLICT DO UPDATE assignment",
             )?;
-            let value = if self.consume_excluded_qualifier() {
-                ConflictValue::Excluded(self.parse_identifier()?)
-            } else {
-                ConflictValue::Value(self.parse_sql_value(true)?)
-            };
-            assignments.push((column, value));
+            assignments.push((column, self.parse_assigned(Columns::Conflict(qualifier))?));
             if !self.consume(TokenMatcher::Comma) {
                 break;
             }
@@ -2589,18 +2625,16 @@ impl<'a> MutationParser<'a> {
         })
     }
 
-    /// Consumes `EXCLUDED.`, the qualifier naming the row proposed for insertion.
-    fn consume_excluded_qualifier(&mut self) -> bool {
-        let excluded = matches!(
+    fn parse_assigned(&mut self, columns: Columns<'_>) -> Result<Assigned> {
+        if matches!(
             self.tokens.get(self.position),
-            Some(Token::Identifier { value, quoted })
-                if (*quoted && value == "excluded")
-                    || (!*quoted && value.eq_ignore_ascii_case("excluded"))
-        ) && matches!(self.tokens.get(self.position + 1), Some(Token::Dot));
-        if excluded {
-            self.position += 2;
+            Some(Token::Identifier { value, quoted: false }) if value.eq_ignore_ascii_case("default")
+        ) {
+            self.position += 1;
+            return Ok(Assigned::Default);
         }
-        excluded
+        parse_expression_at(&self.tokens, &mut self.position, self.params, columns)
+            .map(Assigned::Expression)
     }
 
     fn parse_update(&mut self) -> Result<WriteStatement> {
@@ -2615,7 +2649,7 @@ impl<'a> MutationParser<'a> {
             }
             let column = self.parse_identifier()?;
             self.expect(TokenMatcher::Eq, "Expected `=` in UPDATE assignment")?;
-            assignments.push((column, self.parse_sql_value(true)?));
+            assignments.push((column, self.parse_assigned(Columns::Row)?));
             if !self.consume(TokenMatcher::Comma) {
                 break;
             }

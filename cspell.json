@@ -97,6 +97,7 @@
     "rusage",
     "rustc",
     "RUSTFLAGS",
+    "rposition",
     "rustup",
     "sahpool",
     "savepoint",

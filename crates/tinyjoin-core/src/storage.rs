@@ -1146,7 +1146,7 @@ fn is_javascript_safe_integer(value: &Value) -> bool {
         })
 }
 
-fn column_type_name(data_type: ColumnType) -> &'static str {
+pub(crate) fn column_type_name(data_type: ColumnType) -> &'static str {
     match data_type {
         ColumnType::Boolean => "boolean",
         ColumnType::Integer => "integer",

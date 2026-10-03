@@ -3149,6 +3149,259 @@ mod tests {
         assert_eq!(engine.revision(), revision + 1);
     }
 
+    /// A table of counters for assignments that read the row they write.
+    fn counters_engine() -> PagedEngine<MemoryPageDevice> {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .exec_sql(
+                "CREATE TABLE counters (id INTEGER PRIMARY KEY, n INTEGER NOT NULL DEFAULT 0, \
+                   rate FLOAT, label TEXT, doc JSON);\
+                 INSERT INTO counters VALUES (1, 10, 1.5, 'one', NULL), (2, 20, NULL, 'two', \
+                   NULL);",
+            )
+            .unwrap();
+        engine
+    }
+
+    fn counters(engine: &PagedEngine<MemoryPageDevice>) -> Vec<Row> {
+        engine
+            .query_sql("SELECT id, n, rate, label FROM counters ORDER BY id", &[])
+            .unwrap()
+            .rows
+    }
+
+    #[test]
+    fn an_update_assigns_values_worked_out_from_the_row_it_updates() {
+        let mut engine = counters_engine();
+        // Every assignment reads the row as it was before the statement.
+        let updated = engine
+            .execute_sql(
+                "UPDATE counters SET n = n * 2 + $1, rate = n / 4.0, label = label || '!' \
+                 WHERE id = 1 RETURNING n, rate, label",
+                &[json!(1)],
+            )
+            .unwrap();
+        assert_eq!(
+            updated.rows,
+            vec![row(json!({"n": 21, "rate": 2.5, "label": "one!"}))]
+        );
+        // The table's name or alias may qualify what an assignment reads, though not what it
+        // assigns to; NULL gives NULL; a value that reads nothing is worked out once.
+        engine
+            .execute_sql("UPDATE counters c SET n = c.n - 1, rate = c.rate * 2", &[])
+            .unwrap();
+        engine
+            .execute_sql(
+                "UPDATE counters SET label = counters.label || '?' WHERE id = 2",
+                &[],
+            )
+            .unwrap();
+        engine
+            .execute_sql("UPDATE counters SET doc = 2 * 3 WHERE id = 1", &[])
+            .unwrap();
+        assert_eq!(
+            counters(&engine),
+            vec![
+                row(json!({"id": 1, "n": 20, "rate": 5.0, "label": "one!"})),
+                row(json!({"id": 2, "n": 19, "rate": null, "label": "two?"})),
+            ]
+        );
+        assert_eq!(
+            engine
+                .query_sql("SELECT doc FROM counters WHERE id = 1", &[])
+                .unwrap()
+                .rows,
+            vec![row(json!({"doc": 6}))]
+        );
+
+        // Two columns swap, since each assignment reads the row as it was.
+        for (id, swapped) in [
+            (2, json!({"id": 19, "n": 2})),
+            (19, json!({"id": 2, "n": 19})),
+        ] {
+            assert_eq!(
+                engine
+                    .execute_sql(
+                        "UPDATE counters SET n = id, id = n WHERE id = $1 RETURNING id, n",
+                        &[json!(id)],
+                    )
+                    .unwrap()
+                    .rows,
+                vec![row(swapped)]
+            );
+        }
+
+        // A key worked out from the row moves the row, and reports both keys.
+        let moved = engine
+            .execute_sql("UPDATE counters SET id = id + 10", &[])
+            .unwrap();
+        assert_eq!(moved.row_count, 2);
+        assert_eq!(keys_for_result(&moved, "counters"), [1, 2, 11, 12]);
+
+        // Prepared, the same statement reads each execution's parameters.
+        let statement = engine
+            .prepare_sql("UPDATE counters SET n = n + $1 WHERE id = $2 RETURNING n")
+            .unwrap();
+        for expected in [25, 30] {
+            assert_eq!(
+                engine
+                    .execute_prepared(statement, &[json!(5), json!(11)])
+                    .unwrap()
+                    .rows,
+                vec![row(json!({"n": expected}))]
+            );
+        }
+
+        // Inside a transaction, each statement reads the rows staged before it.
+        engine.begin_transaction().unwrap();
+        for _ in 0..3 {
+            engine
+                .execute_sql("UPDATE counters SET n = n + 1 WHERE id = 12", &[])
+                .unwrap();
+        }
+        engine.commit_transaction().unwrap();
+        assert_eq!(
+            engine
+                .query_sql("SELECT n FROM counters WHERE id = 12", &[])
+                .unwrap()
+                .rows,
+            vec![row(json!({"n": 22}))]
+        );
+
+        // Types are checked before any row is read; values as each row is written, and a
+        // statement that fails on one row changes none.
+        let revision = engine.revision();
+        for (sql, code) in [
+            (
+                "UPDATE counters SET n = n * 1.5 WHERE id = 99",
+                "TYPE_MISMATCH",
+            ),
+            (
+                "UPDATE counters SET n = label || 'x' WHERE id = 99",
+                "TYPE_MISMATCH",
+            ),
+            (
+                "UPDATE counters SET label = n + 1 WHERE id = 99",
+                "TYPE_MISMATCH",
+            ),
+            (
+                "UPDATE counters SET n = doc + 1 WHERE id = 99",
+                "TYPE_MISMATCH",
+            ),
+            (
+                "UPDATE counters SET n = missing + 1 WHERE id = 99",
+                "COLUMN_NOT_FOUND",
+            ),
+            (
+                "UPDATE counters SET n = 1 / 0 WHERE id = 99",
+                "DIVISION_BY_ZERO",
+            ),
+            ("UPDATE counters SET n = n / (id - 12)", "DIVISION_BY_ZERO"),
+            ("UPDATE counters SET n = n + rate", "TYPE_MISMATCH"),
+            ("UPDATE counters SET n = n + NULL", "CONSTRAINT_VIOLATION"),
+            (
+                "UPDATE counters SET n = n + 9007199254740991",
+                "NUMERIC_OVERFLOW",
+            ),
+            ("UPDATE counters SET id = id - id", "CONSTRAINT_VIOLATION"),
+            ("UPDATE counters SET counters.n = 1", "SQL_PARSE_ERROR"),
+            ("UPDATE counters SET n = abs(n)", "UNSUPPORTED_SQL"),
+        ] {
+            assert_eq!(
+                engine.execute_sql(sql, &[]).unwrap_err().code,
+                code,
+                "{sql}"
+            );
+        }
+        assert_eq!(engine.revision(), revision);
+    }
+
+    #[test]
+    fn an_upsert_assigns_values_worked_out_from_the_stored_and_proposed_rows() {
+        let mut engine = counters_engine();
+        // A lone upsert, and one among others, each read the stored row as it was.
+        let upsert = "INSERT INTO counters (id, n, label) VALUES ($1, $2, 'new') \
+                      ON CONFLICT (id) DO UPDATE SET n = counters.n + EXCLUDED.n, \
+                      label = counters.label || '+' || EXCLUDED.label RETURNING id, n, label";
+        assert_eq!(
+            engine
+                .execute_sql(upsert, &[json!(1), json!(5)])
+                .unwrap()
+                .rows,
+            vec![row(json!({"id": 1, "n": 15, "label": "one+new"}))]
+        );
+        assert_eq!(
+            engine
+                .execute_sql(
+                    "INSERT INTO counters (id, n) VALUES (2, 1), (3, 7) ON CONFLICT (id) \
+                     DO UPDATE SET n = counters.n * 10 + EXCLUDED.n",
+                    &[],
+                )
+                .unwrap()
+                .row_count,
+            2
+        );
+        let statement = engine.prepare_sql(upsert).unwrap();
+        assert_eq!(
+            engine
+                .execute_prepared(statement, &[json!(3), json!(-2)])
+                .unwrap()
+                .rows,
+            vec![row(json!({"id": 3, "n": 5, "label": null}))]
+        );
+        // An expression of the proposed row alone, and one of no row.
+        engine
+            .execute_sql(
+                "INSERT INTO counters (id, n) VALUES (2, 4) ON CONFLICT (id) \
+                 DO UPDATE SET n = EXCLUDED.n * EXCLUDED.n, rate = 1 / 4.0",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            counters(&engine),
+            vec![
+                row(json!({"id": 1, "n": 15, "rate": 1.5, "label": "one+new"})),
+                row(json!({"id": 2, "n": 16, "rate": 0.25, "label": "two"})),
+                row(json!({"id": 3, "n": 5, "rate": null, "label": null})),
+            ]
+        );
+
+        let revision = engine.revision();
+        for (sql, code) in [
+            (
+                "INSERT INTO counters (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET n = n + 1",
+                "INVALID_QUERY",
+            ),
+            (
+                "INSERT INTO counters (id) VALUES (9) ON CONFLICT (id) \
+                 DO UPDATE SET n = counters.label || 'x'",
+                "TYPE_MISMATCH",
+            ),
+            (
+                "INSERT INTO counters (id) VALUES (1) ON CONFLICT (id) \
+                 DO UPDATE SET n = other.n + 1",
+                "COLUMN_NOT_FOUND",
+            ),
+            (
+                "INSERT INTO counters (id) VALUES (1) ON CONFLICT (id) \
+                 DO UPDATE SET id = counters.id + 1",
+                "UNSUPPORTED_SQL",
+            ),
+            (
+                "INSERT INTO counters (id, n) VALUES (1, 0) ON CONFLICT (id) \
+                 DO UPDATE SET n = counters.n / EXCLUDED.n",
+                "DIVISION_BY_ZERO",
+            ),
+        ] {
+            assert_eq!(
+                engine.execute_sql(sql, &[]).unwrap_err().code,
+                code,
+                "{sql}"
+            );
+        }
+        assert_eq!(engine.revision(), revision);
+    }
+
     #[test]
     fn a_quoted_name_holding_a_dot_is_one_column_not_a_qualified_one() {
         let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();

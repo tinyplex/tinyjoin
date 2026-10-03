@@ -66,8 +66,12 @@ and has no OPFS, filesystem persistence, or remote synchronization. See the
 - Use client-generated text identifiers when automatic IDs are needed;
   sequences and generated identities are not implemented.
 - Write upserts as `INSERT ... ON CONFLICT (id) DO UPDATE SET column =
-  EXCLUDED.column` rather than reading before writing. `SET` cannot read the
-  existing row's values.
+  EXCLUDED.column` rather than reading before writing. Name the stored row's
+  columns with the table's name, as in `SET hits = counters.hits +
+  EXCLUDED.hits`.
+- Change a value relative to itself in one statement, as in
+  `UPDATE counters SET hits = hits + 1 WHERE id = $1`, rather than reading it
+  first.
 - Keep schema setup idempotent with `IF NOT EXISTS` where appropriate.
 - Treat a row generic as a TypeScript assertion, not runtime validation.
 - Consult the

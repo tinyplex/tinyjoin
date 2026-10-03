@@ -10,6 +10,7 @@ mod device;
 #[cfg(test)]
 mod engine;
 mod error;
+mod expression;
 mod hash;
 mod join;
 mod model;

@@ -32,6 +32,16 @@ the same statement with `INVALID_QUERY`, as before. Query builders that map
 rows by position, as Drizzle does, depend on this. See
 [repeated output names](/guides/sql-compatibility/#repeated-output-names).
 
+An `UPDATE` or `ON CONFLICT DO UPDATE` assignment can now work its value out
+from the row it updates, so a counter no longer needs a read before its write:
+`UPDATE counters SET hits = hits + 1 WHERE id = $1`. An expression combines
+columns, literals, and parameters with `+`, `-`, `*`, `/`, `%`, unary `-`, and
+`||`. Integers stay within the JavaScript-safe range and divide by truncating,
+floats must stay finite and take no `%`, and there are no implicit casts. In an upsert, the
+stored row's columns are named with the table's name and the proposed row's
+with `EXCLUDED`, as in `SET hits = counters.hits + EXCLUDED.hits`. Types are
+checked before any row is read. See [expressions](/guides/sql-compatibility/#expressions).
+
 **Upgrading from v0.4.0 needs no action.** Install, rebuild, and redeploy. The
 Worker protocol stays at version 10 and the page format stays at format 3, so
 an existing database opens with no migration and no OPFS namespace change. The
