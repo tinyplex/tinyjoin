@@ -22,6 +22,7 @@ use crate::storage::preflight_row_write_set;
 use crate::{
     ApplyOutcome, Btree, ColumnType, EngineError, ExecuteResult, IndexDefinition, PageDevice,
     PageId, Pager, Result, Row, StorageReader, TableDefinition, TreeId, VisitControl, VisitOutcome,
+    btree::{BtreeCursor, BtreeReadView, get_from, open_cursor},
     paged_codec::{
         CATALOG_TREE_ID, CatalogIndexRecord, CatalogKey, CatalogTableRecord, FIRST_USER_TREE_ID,
         IndexEntry, IndexEntryLayout, PrimaryKey, RecordLayout, StoredEntry, StoredRecord,
@@ -41,6 +42,358 @@ use crate::{
 };
 /// A callback for each key and value of a B-tree entry, which says whether to go on.
 pub(crate) type EntryVisitor<'a> = dyn FnMut(&[u8], &[u8]) -> Result<VisitControl> + 'a;
+
+/// Reads the rows and index entries of a catalog's tables through B-tree pages: those committed,
+/// or those a script's candidate sees, which charges each entry it reads to the script's `work`.
+pub(crate) struct TreeReader<'a> {
+    pub(crate) pages: &'a RefCell<dyn BtreeReadView + 'a>,
+    pub(crate) tables: &'a NameMap<PagedTable>,
+    pub(crate) indexes: &'a NameMap<PagedIndex>,
+    pub(crate) work: Option<&'a Cell<usize>>,
+}
+
+impl TreeReader<'_> {
+    fn charge(&self) -> Result<()> {
+        match self.work {
+            Some(work) => charge_operations(work, 1),
+            None => Ok(()),
+        }
+    }
+
+    fn table(&self, name: &str) -> Result<&PagedTable> {
+        self.tables
+            .get(name)
+            .ok_or_else(|| EngineError::table_not_found(name))
+    }
+
+    /// The table, and its index on exactly `columns`, if it has one.
+    fn index(&self, table: &str, columns: &[String]) -> Result<(&PagedTable, Option<&PagedIndex>)> {
+        let index = self
+            .indexes
+            .values()
+            .find(|index| index.definition.table == table && index.definition.columns == columns);
+        Ok((self.table(table)?, index))
+    }
+
+    /// The value the encoded key `key` holds in a tree, charged as one read.
+    pub(crate) fn get(&self, root: PageId, tree_id: TreeId, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.charge()?;
+        get_from(&mut *self.pages.borrow_mut(), root, tree_id, key)
+    }
+
+    /// A cursor over a tree from `bound`, or moving backward from before it.
+    fn cursor(
+        &self,
+        root: PageId,
+        tree_id: TreeId,
+        bound: Option<&[u8]>,
+        backward: bool,
+    ) -> Result<BtreeCursor> {
+        open_cursor(
+            &mut *self.pages.borrow_mut(),
+            root,
+            tree_id,
+            bound,
+            backward,
+            false,
+        )
+    }
+
+    pub(crate) fn visit_table(
+        &self,
+        table: &str,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        let table = self.table(table)?;
+        let Some(root) = table.root_page_id else {
+            return Ok(VisitOutcome::Complete);
+        };
+        let cursor = self.cursor(root, table.tree_id, Some(&[]), false)?;
+        self.visit_rows(table, cursor, None, visitor)
+    }
+
+    pub(crate) fn visit_table_range(
+        &self,
+        table: &str,
+        range: &KeyRange,
+        order: KeyOrder,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        let table = self.table(table)?;
+        let Some(root) = table.root_page_id else {
+            return Ok(VisitOutcome::Complete);
+        };
+        let cursor = match order {
+            KeyOrder::Ascending => self.cursor(root, table.tree_id, Some(range.start()), false)?,
+            KeyOrder::Descending => {
+                self.cursor(root, table.tree_id, range.end().as_deref(), true)?
+            }
+        };
+        self.visit_rows(table, cursor, Some(range), visitor)
+    }
+
+    /// Visits the rows of `table` that `cursor` reaches, while their keys lie within `range`.
+    fn visit_rows(
+        &self,
+        table: &PagedTable,
+        mut cursor: BtreeCursor,
+        range: Option<&KeyRange>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        let key_type = table.leading_key_type();
+        let work = self.work;
+        // Rows are read from the cursor's copy of each leaf, so the pages are borrowed only to move
+        // between leaves, or to read a value that overflows, and the visitor can read them too.
+        let mut read = |page_id: PageId| self.pages.borrow_mut().read_btree_page(page_id);
+        while cursor.next_leaf_from(&mut *self.pages.borrow_mut())? {
+            while let Some((key, value)) = cursor.next_in_leaf(&mut read)? {
+                if let Some(range) = range
+                    && !range.contains(leading_key_component(key, key_type)?)
+                {
+                    return Ok(VisitOutcome::Complete);
+                }
+                if let Some(work) = work {
+                    charge_operations(work, 1)?;
+                }
+                let value = match &value {
+                    Cow::Borrowed(value) => *value,
+                    Cow::Owned(value) => value.as_slice(),
+                };
+                if visitor(&RowRef::record(table.record(key, value)?))? == VisitControl::Stop {
+                    return Ok(VisitOutcome::Stopped);
+                }
+            }
+        }
+        Ok(VisitOutcome::Complete)
+    }
+
+    pub(crate) fn lookup_primary_key(&self, table: &str, key: &Row) -> Result<Option<Row>> {
+        let table = self.table(table)?;
+        let key = encode_primary_key(&table.schema, key)?;
+        let Some(root) = table.root_page_id else {
+            return Ok(None);
+        };
+        self.get(root, table.tree_id, &key)?
+            .map(|value| table.record(&key, &value)?.to_row())
+            .transpose()
+    }
+
+    /// Visits the row of the encoded primary key `key` in `table`, if it holds one.
+    pub(crate) fn visit_encoded_key(
+        &self,
+        table: &str,
+        key: &[u8],
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        let table = self.table(table)?;
+        let Some(root) = table.root_page_id else {
+            return Ok(VisitOutcome::Complete);
+        };
+        match self.get(root, table.tree_id, key)? {
+            Some(value)
+                if visitor(&RowRef::record(table.record(key, &value)?))? == VisitControl::Stop =>
+            {
+                Ok(VisitOutcome::Stopped)
+            }
+            _ => Ok(VisitOutcome::Complete),
+        }
+    }
+
+    pub(crate) fn visit_key(
+        &self,
+        table: &str,
+        key: PrimaryKey<'_>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        let key = key.encode(&self.table(table)?.schema)?;
+        self.visit_encoded_key(table, &key, visitor)
+    }
+
+    pub(crate) fn visit_index(
+        &self,
+        table: &str,
+        columns: &[String],
+        key: &Row,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<Option<VisitOutcome>> {
+        let (table_data, Some(index)) = self.index(table, columns)? else {
+            return Ok(None);
+        };
+        let Some(prefix) =
+            encode_secondary_index_prefix(&table_data.schema, &index.definition, key)?
+        else {
+            return Ok(Some(VisitOutcome::Complete));
+        };
+        let Some(index_root) = index.root_page_id else {
+            return Ok(Some(VisitOutcome::Complete));
+        };
+        let table_root = indexed_table_root(table_data, index)?;
+        let mut cursor = self.cursor(index_root, index.tree_id, Some(&prefix), false)?;
+        loop {
+            let next = cursor.next_from(&mut *self.pages.borrow_mut())?;
+            let Some((entry_key, value)) = next else {
+                break;
+            };
+            self.charge()?;
+            if !secondary_index_entry_matches_prefix(entry_key, &prefix) {
+                break;
+            }
+            if !value.is_empty() {
+                return Err(storage_corrupt(format!(
+                    "Secondary index `{}` contains a non-empty value",
+                    index.definition.name
+                )));
+            }
+            let primary_key = secondary_index_primary_key_for_definition(
+                &table_data.schema,
+                &index.definition,
+                entry_key,
+            )?;
+            if secondary_index_primary_key(entry_key, &prefix)? != primary_key {
+                return Err(storage_corrupt(format!(
+                    "Secondary index `{}` tuple boundary is inconsistent",
+                    index.definition.name
+                )));
+            }
+            let row_value = self
+                .get(table_root, table_data.tree_id, primary_key)?
+                .ok_or_else(|| {
+                    storage_corrupt(format!(
+                        "Secondary index `{}` contains a dangling primary key",
+                        index.definition.name
+                    ))
+                })?;
+            let row = RowRef::record(table_data.record(primary_key, &row_value)?);
+            if visitor(&row)? == VisitControl::Stop {
+                return Ok(Some(VisitOutcome::Stopped));
+            }
+        }
+        Ok(Some(VisitOutcome::Complete))
+    }
+
+    pub(crate) fn visit_index_range(
+        &self,
+        table: &str,
+        columns: &[String],
+        range: &KeyRange,
+        limit: usize,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<Option<VisitOutcome>> {
+        let (table_data, Some(index)) = self.index(table, columns)? else {
+            return Ok(None);
+        };
+        let Some(index_root) = index.root_page_id else {
+            return Ok(Some(VisitOutcome::Complete));
+        };
+        let table_root = indexed_table_root(table_data, index)?;
+        let types = table_data.column_types(columns)?;
+        // A range is read through the index only while it holds at most `limit` entries, which a
+        // first walk counts without copying any, charged as collecting them would be.
+        let mut entries = 0usize;
+        self.walk_index_range(index_root, index.tree_id, types[0], range, &mut |_, _| {
+            entries += 1;
+            if entries > limit {
+                return Ok(VisitControl::Stop);
+            }
+            self.charge()?;
+            Ok(VisitControl::Continue)
+        })?;
+        if entries > limit {
+            return Ok(None);
+        }
+        // Rows are visited in primary-key order, as a table visit would find them.
+        let mut primary_keys = BTreeSet::new();
+        self.walk_index_range(
+            index_root,
+            index.tree_id,
+            types[0],
+            range,
+            &mut |entry, value| {
+                primary_keys.insert(ranged_index_primary_key(
+                    &index.definition,
+                    entry,
+                    value,
+                    &types,
+                )?);
+                Ok(VisitControl::Continue)
+            },
+        )?;
+        for primary_key in &primary_keys {
+            let value = self
+                .get(table_root, table_data.tree_id, primary_key)?
+                .ok_or_else(|| dangling_index_entry(&index.definition))?;
+            if visitor(&RowRef::record(table_data.record(primary_key, &value)?))?
+                == VisitControl::Stop
+            {
+                return Ok(Some(VisitOutcome::Stopped));
+            }
+        }
+        Ok(Some(VisitOutcome::Complete))
+    }
+
+    pub(crate) fn visit_index_entries(
+        &self,
+        table: &str,
+        columns: &[String],
+        range: &KeyRange,
+        layout: &IndexEntryLayout,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<Option<VisitOutcome>> {
+        let (table_data, Some(index)) = self.index(table, columns)? else {
+            return Ok(None);
+        };
+        let Some(index_root) = index.root_page_id else {
+            return Ok(Some(VisitOutcome::Complete));
+        };
+        let leading = table_data.column_types(&columns[..1])?[0];
+        self.walk_index_range(
+            index_root,
+            index.tree_id,
+            leading,
+            range,
+            &mut |entry, _| {
+                self.charge()?;
+                visitor(&RowRef::index(IndexEntry::new(entry, layout)))
+            },
+        )
+        .map(Some)
+    }
+
+    /// Calls `each` with every entry of an index tree whose leading component, of type `leading`,
+    /// lies within `range`, in index order, until it stops.
+    fn walk_index_range(
+        &self,
+        root: PageId,
+        tree_id: TreeId,
+        leading: ColumnType,
+        range: &KeyRange,
+        each: &mut EntryVisitor<'_>,
+    ) -> Result<VisitOutcome> {
+        let mut cursor = self.cursor(root, tree_id, Some(range.start()), false)?;
+        let mut read = |page_id: PageId| self.pages.borrow_mut().read_btree_page(page_id);
+        while cursor.next_leaf_from(&mut *self.pages.borrow_mut())? {
+            while let Some((entry, value)) = cursor.next_in_leaf(&mut read)? {
+                if !range.contains(leading_key_component(entry, leading)?) {
+                    return Ok(VisitOutcome::Complete);
+                }
+                if each(entry, &value)? == VisitControl::Stop {
+                    return Ok(VisitOutcome::Stopped);
+                }
+            }
+        }
+        Ok(VisitOutcome::Complete)
+    }
+}
+
+/// The root of the table an index with entries indexes, which must have rows.
+fn indexed_table_root(table: &PagedTable, index: &PagedIndex) -> Result<PageId> {
+    table.root_page_id.ok_or_else(|| {
+        storage_corrupt(format!(
+            "Non-empty index `{}` references empty table `{}`",
+            index.definition.name, table.schema.name
+        ))
+    })
+}
 
 /// A relational view over the crash-safe paged B-tree store.
 ///
@@ -356,32 +709,6 @@ impl<D: PageDevice> PagedStorage<D> {
         check_catalog_contents(&mut pager, &records)
     }
 
-    /// Calls `each` with every entry of an index tree whose leading component, of type `leading`,
-    /// lies within `range`, in index order, until it stops.
-    fn walk_index_range(
-        &self,
-        root: PageId,
-        tree_id: TreeId,
-        leading: ColumnType,
-        range: &KeyRange,
-        each: &mut EntryVisitor<'_>,
-    ) -> Result<VisitOutcome> {
-        let mut cursor =
-            Btree::cursor_from(&mut self.pager.borrow_mut(), root, tree_id, range.start())?;
-        let mut read = |page_id: PageId| self.pager.borrow_mut().read_page(page_id);
-        while cursor.next_leaf(&mut self.pager.borrow_mut())? {
-            while let Some((entry, value)) = cursor.next_in_leaf(&mut read)? {
-                if !range.contains(leading_key_component(entry, leading)?) {
-                    return Ok(VisitOutcome::Complete);
-                }
-                if each(entry, &value)? == VisitControl::Stop {
-                    return Ok(VisitOutcome::Stopped);
-                }
-            }
-        }
-        Ok(VisitOutcome::Complete)
-    }
-
     /// The fingerprint of every row in this database, as published in the superblock.
     #[cfg(test)]
     pub(crate) fn database_hash(&self) -> u64 {
@@ -552,16 +879,14 @@ impl<D: PageDevice> PagedStorage<D> {
         Ok(VisitOutcome::Complete)
     }
 
-    /// [`StorageReader::visit_primary_key`] for a key already encoded as `table`'s B-tree key.
-    /// Visits the row of primary key `key` in `table`, if it holds one.
-    fn visit_key(
-        &self,
-        table: &str,
-        key: PrimaryKey<'_>,
-        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
-    ) -> Result<VisitOutcome> {
-        let encoded_key = key.encode(&self.table(table)?.schema)?;
-        self.visit_encoded_key(table, &encoded_key, visitor)
+    /// The reader of the committed catalog's B-trees.
+    pub(crate) fn reader(&self) -> TreeReader<'_> {
+        TreeReader {
+            pages: &self.pager,
+            tables: &self.tables,
+            indexes: &self.indexes,
+            work: None,
+        }
     }
 
     pub(crate) fn visit_encoded_key(
@@ -571,25 +896,7 @@ impl<D: PageDevice> PagedStorage<D> {
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
         self.ensure_ready()?;
-        let table = self.table(table)?;
-        let Some(root) = table.root_page_id else {
-            return Ok(VisitOutcome::Complete);
-        };
-        let value = Btree::get(
-            &mut self.pager.borrow_mut(),
-            root,
-            table.tree_id,
-            encoded_key,
-        )?;
-        match value {
-            Some(value)
-                if visitor(&RowRef::record(table.record(encoded_key, &value)?))?
-                    == VisitControl::Stop =>
-            {
-                Ok(VisitOutcome::Stopped)
-            }
-            _ => Ok(VisitOutcome::Complete),
-        }
+        self.reader().visit_encoded_key(table, encoded_key, visitor)
     }
 
     /// Validates one change of a transaction's write set, and measures what it adds to the write
@@ -1239,26 +1546,7 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
         self.ensure_ready()?;
-        let table = self.table(table)?;
-        let Some(root) = table.root_page_id else {
-            return Ok(VisitOutcome::Complete);
-        };
-        let mut cursor = Btree::cursor(&mut self.pager.borrow_mut(), root, table.tree_id)?;
-        // Rows are read from the cursor's copy of each leaf, so the pager is borrowed only to move
-        // between leaves, or to read a value that overflows, and the visitor can read it too.
-        let mut read = |page_id: PageId| self.pager.borrow_mut().read_page(page_id);
-        while cursor.next_leaf(&mut self.pager.borrow_mut())? {
-            while let Some((key, value)) = cursor.next_in_leaf(&mut read)? {
-                let value = match &value {
-                    Cow::Borrowed(value) => *value,
-                    Cow::Owned(value) => value.as_slice(),
-                };
-                if visitor(&RowRef::record(table.record(key, value)?))? == VisitControl::Stop {
-                    return Ok(VisitOutcome::Stopped);
-                }
-            }
-        }
-        Ok(VisitOutcome::Complete)
+        self.reader().visit_table(table, visitor)
     }
 
     fn visits_in_key_order(&self, _table: &str) -> bool {
@@ -1273,44 +1561,8 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
         self.ensure_ready()?;
-        let table = self
-            .tables
-            .get(table)
-            .ok_or_else(|| EngineError::table_not_found(table))?;
-        let Some(root) = table.root_page_id else {
-            return Ok(VisitOutcome::Complete);
-        };
-        let key_type = table.leading_key_type();
-        let mut cursor = match order {
-            KeyOrder::Ascending => Btree::cursor_from(
-                &mut self.pager.borrow_mut(),
-                root,
-                table.tree_id,
-                range.start(),
-            )?,
-            KeyOrder::Descending => Btree::cursor_before(
-                &mut self.pager.borrow_mut(),
-                root,
-                table.tree_id,
-                range.end().as_deref(),
-            )?,
-        };
-        let mut read = |page_id: PageId| self.pager.borrow_mut().read_page(page_id);
-        while cursor.next_leaf(&mut self.pager.borrow_mut())? {
-            while let Some((key, value)) = cursor.next_in_leaf(&mut read)? {
-                if !range.contains(leading_key_component(key, key_type)?) {
-                    return Ok(VisitOutcome::Complete);
-                }
-                let value = match &value {
-                    Cow::Borrowed(value) => *value,
-                    Cow::Owned(value) => value.as_slice(),
-                };
-                if visitor(&RowRef::record(table.record(key, value)?))? == VisitControl::Stop {
-                    return Ok(VisitOutcome::Stopped);
-                }
-            }
-        }
-        Ok(VisitOutcome::Complete)
+        self.reader()
+            .visit_table_range(table, range, order, visitor)
     }
 
     fn table_row_count(&self, table: &str) -> Result<usize> {
@@ -1323,22 +1575,7 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
 
     fn lookup_primary_key(&self, table: &str, key: &Row) -> Result<Option<Row>> {
         self.ensure_ready()?;
-        let table = self
-            .tables
-            .get(table)
-            .ok_or_else(|| EngineError::table_not_found(table))?;
-        let encoded_key = encode_primary_key(&table.schema, key)?;
-        let Some(root) = table.root_page_id else {
-            return Ok(None);
-        };
-        Btree::get(
-            &mut self.pager.borrow_mut(),
-            root,
-            table.tree_id,
-            &encoded_key,
-        )?
-        .map(|value| table.record(&encoded_key, &value)?.to_row())
-        .transpose()
+        self.reader().lookup_primary_key(table, key)
     }
 
     fn visit_primary_key(
@@ -1347,7 +1584,9 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
         key: &Row,
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
-        self.visit_key(table, PrimaryKey::Row(key), visitor)
+        self.ensure_ready()?;
+        self.reader()
+            .visit_key(table, PrimaryKey::Row(key), visitor)
     }
 
     fn visit_primary_key_values(
@@ -1357,7 +1596,9 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
         values: &[&Value],
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
-        self.visit_key(table, PrimaryKey::Values(values), visitor)
+        self.ensure_ready()?;
+        self.reader()
+            .visit_key(table, PrimaryKey::Values(values), visitor)
     }
 
     fn index_definition(&self, name: &str) -> Option<IndexDefinition> {
@@ -1388,81 +1629,7 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<Option<VisitOutcome>> {
         self.ensure_ready()?;
-        let table_data = self
-            .tables
-            .get(table)
-            .ok_or_else(|| EngineError::table_not_found(table))?;
-        let Some(index) = self
-            .indexes
-            .values()
-            .find(|index| index.definition.table == table && index.definition.columns == columns)
-        else {
-            return Ok(None);
-        };
-        let Some(prefix) =
-            encode_secondary_index_prefix(&table_data.schema, &index.definition, key)?
-        else {
-            return Ok(Some(VisitOutcome::Complete));
-        };
-        let Some(index_root) = index.root_page_id else {
-            return Ok(Some(VisitOutcome::Complete));
-        };
-        let table_root = table_data.root_page_id.ok_or_else(|| {
-            storage_corrupt(format!(
-                "Non-empty index `{}` references empty table `{table}`",
-                index.definition.name
-            ))
-        })?;
-
-        let mut cursor = Btree::cursor_from(
-            &mut self.pager.borrow_mut(),
-            index_root,
-            index.tree_id,
-            &prefix,
-        )?;
-        loop {
-            let next = cursor.next_entry(&mut self.pager.borrow_mut())?;
-            let Some((entry_key, value)) = next else {
-                break;
-            };
-            if !secondary_index_entry_matches_prefix(entry_key, &prefix) {
-                break;
-            }
-            if !value.is_empty() {
-                return Err(storage_corrupt(format!(
-                    "Secondary index `{}` contains a non-empty value",
-                    index.definition.name
-                )));
-            }
-            let primary_key = secondary_index_primary_key_for_definition(
-                &table_data.schema,
-                &index.definition,
-                entry_key,
-            )?;
-            if secondary_index_primary_key(entry_key, &prefix)? != primary_key {
-                return Err(storage_corrupt(format!(
-                    "Secondary index `{}` tuple boundary is inconsistent",
-                    index.definition.name
-                )));
-            }
-            let row_value = Btree::get(
-                &mut self.pager.borrow_mut(),
-                table_root,
-                table_data.tree_id,
-                primary_key,
-            )?
-            .ok_or_else(|| {
-                storage_corrupt(format!(
-                    "Secondary index `{}` contains a dangling primary key",
-                    index.definition.name
-                ))
-            })?;
-            let row = RowRef::record(table_data.record(primary_key, &row_value)?);
-            if visitor(&row)? == VisitControl::Stop {
-                return Ok(Some(VisitOutcome::Stopped));
-            }
-        }
-        Ok(Some(VisitOutcome::Complete))
+        self.reader().visit_index(table, columns, key, visitor)
     }
 
     fn visit_index_range(
@@ -1474,73 +1641,8 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<Option<VisitOutcome>> {
         self.ensure_ready()?;
-        let table_data = self
-            .tables
-            .get(table)
-            .ok_or_else(|| EngineError::table_not_found(table))?;
-        let Some(index) = self
-            .indexes
-            .values()
-            .find(|index| index.definition.table == table && index.definition.columns == columns)
-        else {
-            return Ok(None);
-        };
-        let Some(index_root) = index.root_page_id else {
-            return Ok(Some(VisitOutcome::Complete));
-        };
-        let table_root = table_data.root_page_id.ok_or_else(|| {
-            storage_corrupt(format!(
-                "Non-empty index `{}` references empty table `{table}`",
-                index.definition.name
-            ))
-        })?;
-        let types = table_data.column_types(columns)?;
-        // A range is read through the index only while it holds at most `limit` entries, which a
-        // first walk counts without copying any.
-        let mut entries = 0usize;
-        self.walk_index_range(index_root, index.tree_id, types[0], range, &mut |_, _| {
-            entries += 1;
-            Ok(if entries > limit {
-                VisitControl::Stop
-            } else {
-                VisitControl::Continue
-            })
-        })?;
-        if entries > limit {
-            return Ok(None);
-        }
-        // Rows are visited in primary-key order, as a table visit would find them.
-        let mut primary_keys = BTreeSet::new();
-        self.walk_index_range(
-            index_root,
-            index.tree_id,
-            types[0],
-            range,
-            &mut |entry, value| {
-                primary_keys.insert(ranged_index_primary_key(
-                    &index.definition,
-                    entry,
-                    value,
-                    &types,
-                )?);
-                Ok(VisitControl::Continue)
-            },
-        )?;
-        for primary_key in &primary_keys {
-            let value = Btree::get(
-                &mut self.pager.borrow_mut(),
-                table_root,
-                table_data.tree_id,
-                primary_key,
-            )?
-            .ok_or_else(|| dangling_index_entry(&index.definition))?;
-            if visitor(&RowRef::record(table_data.record(primary_key, &value)?))?
-                == VisitControl::Stop
-            {
-                return Ok(Some(VisitOutcome::Stopped));
-            }
-        }
-        Ok(Some(VisitOutcome::Complete))
+        self.reader()
+            .visit_index_range(table, columns, range, limit, visitor)
     }
 
     fn visit_index_entries(
@@ -1552,29 +1654,8 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<Option<VisitOutcome>> {
         self.ensure_ready()?;
-        let table_data = self
-            .tables
-            .get(table)
-            .ok_or_else(|| EngineError::table_not_found(table))?;
-        let Some(index) = self
-            .indexes
-            .values()
-            .find(|index| index.definition.table == table && index.definition.columns == columns)
-        else {
-            return Ok(None);
-        };
-        let Some(index_root) = index.root_page_id else {
-            return Ok(Some(VisitOutcome::Complete));
-        };
-        let leading = table_data.column_types(&columns[..1])?[0];
-        self.walk_index_range(
-            index_root,
-            index.tree_id,
-            leading,
-            range,
-            &mut |entry, _| visitor(&RowRef::index(IndexEntry::new(entry, layout))),
-        )
-        .map(Some)
+        self.reader()
+            .visit_index_entries(table, columns, range, layout, visitor)
     }
 
     fn table_schema(&self, table: &str) -> Result<Rc<TableDefinition>> {

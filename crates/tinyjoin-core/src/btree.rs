@@ -150,16 +150,6 @@ impl Btree {
         get_from(pager, root_page_id, tree_id, key)
     }
 
-    /// Looks up one exact key in a tree visible to an open pager transaction.
-    pub(crate) fn get_in_transaction<D: PageDevice>(
-        transaction: &mut PagerWriteTransaction<'_, D>,
-        root_page_id: PageId,
-        tree_id: TreeId,
-        key: &[u8],
-    ) -> Result<Option<Vec<u8>>> {
-        get_from(transaction, root_page_id, tree_id, key)
-    }
-
     /// Inserts or replaces an inline value and returns the candidate root and its fingerprint.
     /// Commits write through [`Self::apply`]; tests build trees one change at a time with this and
     /// [`Self::delete`], and check batches against them.
@@ -402,6 +392,7 @@ impl Btree {
         )
     }
 
+    #[cfg(test)]
     /// Opens a detached cursor which moves backward from the last key before `bound`, or from the
     /// last key of all.
     pub(crate) fn cursor_before<D: PageDevice>(
@@ -455,6 +446,7 @@ impl Btree {
         )
     }
 
+    #[cfg(test)]
     /// [`Self::cursor_before`] for a tree visible to an open pager transaction.
     pub(crate) fn cursor_before_in_transaction<D: PageDevice>(
         transaction: &mut PagerWriteTransaction<'_, D>,
@@ -487,7 +479,7 @@ impl Btree {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CursorView {
+pub(crate) enum CursorView {
     Committed {
         generation: u64,
     },
@@ -506,7 +498,8 @@ impl CursorView {
     }
 }
 
-trait BtreeReadView {
+/// The pages a B-tree is read from: those committed, or those a transaction sees.
+pub(crate) trait BtreeReadView {
     fn read_btree_page(&mut self, id: PageId) -> Result<Page>;
     fn read_btree_page_in_place(&mut self, id: PageId) -> Result<PageRef<'_>>;
     fn cursor_view(&self, tree_id: TreeId) -> Result<CursorView>;
@@ -558,8 +551,8 @@ impl<D: PageDevice> BtreeReadView for PagerWriteTransaction<'_, D> {
 ///
 /// Each step down must reach exactly the next lower level and a page's level is fixed, so a cycle
 /// is rejected without tracking visited pages.
-fn get_from(
-    reader: &mut impl BtreeReadView,
+pub(crate) fn get_from(
+    reader: &mut dyn BtreeReadView,
     root_page_id: PageId,
     tree_id: TreeId,
     key: &[u8],
@@ -610,8 +603,8 @@ fn get_from(
 
 /// Opens a cursor moving forward from the first key at or after `bound`, or backward from the last
 /// key before it. With no bound, it starts at the first or last key of all.
-fn open_cursor(
-    reader: &mut impl BtreeReadView,
+pub(crate) fn open_cursor(
+    reader: &mut dyn BtreeReadView,
     root_page_id: PageId,
     tree_id: TreeId,
     bound: Option<&[u8]>,
@@ -704,7 +697,10 @@ impl BtreeCursor {
         self.next_from(transaction)
     }
 
-    fn next_from(&mut self, reader: &mut impl BtreeReadView) -> Result<Option<CursorEntry<'_>>> {
+    pub(crate) fn next_from(
+        &mut self,
+        reader: &mut dyn BtreeReadView,
+    ) -> Result<Option<CursorEntry<'_>>> {
         if !self.next_leaf_from(reader)? {
             return Ok(None);
         }
@@ -719,15 +715,7 @@ impl BtreeCursor {
         self.next_leaf_from(pager)
     }
 
-    /// [`Self::next_leaf`] for a cursor opened in a transaction.
-    pub(crate) fn next_leaf_in_transaction<D: PageDevice>(
-        &mut self,
-        transaction: &mut PagerWriteTransaction<'_, D>,
-    ) -> Result<bool> {
-        self.next_leaf_from(transaction)
-    }
-
-    fn next_leaf_from(&mut self, reader: &mut impl BtreeReadView) -> Result<bool> {
+    pub(crate) fn next_leaf_from(&mut self, reader: &mut dyn BtreeReadView) -> Result<bool> {
         if self.finished {
             return Ok(false);
         }
@@ -824,7 +812,7 @@ impl BtreeCursor {
 
     fn load(
         &mut self,
-        reader: &mut impl BtreeReadView,
+        reader: &mut dyn BtreeReadView,
         page_id: PageId,
         expected_level: Option<u8>,
         parent_generation: Option<u64>,
@@ -847,7 +835,7 @@ impl BtreeCursor {
         Ok(node)
     }
 
-    fn seek(&mut self, reader: &mut impl BtreeReadView, bound: Option<&[u8]>) -> Result<()> {
+    fn seek(&mut self, reader: &mut dyn BtreeReadView, bound: Option<&[u8]>) -> Result<()> {
         self.ensure_view(reader)?;
         self.path.clear();
         self.visited_pages.clear();
@@ -885,7 +873,7 @@ impl BtreeCursor {
         )))
     }
 
-    fn advance_leaf(&mut self, reader: &mut impl BtreeReadView) -> Result<bool> {
+    fn advance_leaf(&mut self, reader: &mut dyn BtreeReadView) -> Result<bool> {
         while let Some((node, child_index)) = self.path.pop() {
             let sibling = if self.backward {
                 child_index.checked_sub(1)
@@ -906,7 +894,7 @@ impl BtreeCursor {
     /// Descends to the first leaf under a node moving forward, or its last moving backward.
     fn descend_edge(
         &mut self,
-        reader: &mut impl BtreeReadView,
+        reader: &mut dyn BtreeReadView,
         mut page_id: PageId,
         mut expected_level: u8,
         mut parent_generation: u64,
@@ -935,7 +923,7 @@ impl BtreeCursor {
         )))
     }
 
-    fn ensure_view(&self, reader: &impl BtreeReadView) -> Result<()> {
+    fn ensure_view(&self, reader: &dyn BtreeReadView) -> Result<()> {
         let current = reader.cursor_view(self.tree_id)?;
         if current != self.view {
             return Err(EngineError::new(
