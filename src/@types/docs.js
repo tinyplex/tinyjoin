@@ -77,6 +77,23 @@
 }
 
 /**
+ * The SetSchemaOptions interface configures the setSchema method.
+ * @category Schema
+ * @since v0.5.0
+ */
+/// SetSchemaOptions
+{
+  /**
+   * The drop property, when true, makes setSchema drop each table, and each
+   * column of a table the schema keeps, that the schema leaves out, and their
+   * data with them. Otherwise setSchema leaves them as they are.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// SetSchemaOptions.drop
+}
+
+/**
  * The ColumnType type names one of the five runtime types a column holds.
  *
  * Each SQL type name maps to one of them: `INTEGER` and `BIGINT` to `integer`,
@@ -134,6 +151,15 @@
    * @since v0.5.0
    */
   /// ColumnSchema.maxLength
+
+  /**
+   * The renamedFrom property names a column's former name, which setSchema
+   * renames the column from while the table still has a column of that name.
+   * getSchema never includes it.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// ColumnSchema.renamedFrom
 }
 
 /**
@@ -206,16 +232,35 @@
    * @since v0.5.0
    */
   /// TableSchema.indexes
+
+  /**
+   * The renamedFrom property names a table's former name, which setSchema
+   * renames the table from while the database still has a table of that name.
+   * getSchema never includes it.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// TableSchema.renamedFrom
 }
 
 /**
  * The Schema interface is returned by the getSchema method, and describes
- * every table in the database.
+ * every table in the database. The setSchema method takes one to make the
+ * database's.
  * @category Schema
  * @since v0.5.0
  */
 /// Schema
 {
+  /**
+   * The version property contains the version the application last gave the
+   * schema with setSchema, or zero. setSchema refuses a schema whose version is
+   * lower, as an older copy of the application would give it.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// Schema.version
+
   /**
    * The tables property describes the database's tables, in name order.
    * @category Schema
@@ -818,6 +863,57 @@
    * @since v0.5.0
    */
   /// Client.getSchema
+
+  /**
+   * The setSchema method makes the database's tables, columns, primary keys,
+   * and indexes match a Schema, as getSchema returns one, in one change that
+   * commits whole or not at all.
+   *
+   * It creates the tables and columns the schema has and the database lacks,
+   * renames a table or column from the name its renamedFrom gives while the
+   * database still has that name, and changes a column's default, nullability,
+   * or `VARCHAR` length to the schema's. Each table's indexes become exactly
+   * the schema's. Tables and columns the schema leaves out stay, unless the
+   * options' drop property is true. Rows keep their values, as `ALTER TABLE`
+   * keeps them: a change no statement could make, to a primary key or a
+   * column's runtime type, is refused, and so is one that a row prevents, such
+   * as `NOT NULL` where a row holds `NULL`.
+   *
+   * A schema the database already has changes nothing, so every tab of an
+   * application can call setSchema as it starts. A schema whose version is
+   * lower than the database's is refused with `SCHEMA_OUTDATED`, so that a tab
+   * still running an older copy of the application cannot undo a newer one's
+   * changes; a higher version is recorded. Call it outside a transaction.
+   * @param schema The schema to make the database's.
+   * @param options Whether to drop what the schema leaves out.
+   * @returns A Promise resolving to true if the database changed, or false if
+   * it already had the schema.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   *
+   * const db = await create();
+   * await db.setSchema({
+   *   version: 1,
+   *   tables: [
+   *     {
+   *       name: 'tasks',
+   *       columns: [
+   *         {name: 'id', type: 'text', nullable: false},
+   *         {name: 'title', type: 'text', nullable: false},
+   *         {name: 'done', type: 'boolean', nullable: false, default: false},
+   *       ],
+   *       primaryKey: ['id'],
+   *       indexes: [{name: 'tasks_done', columns: ['done'], unique: false}],
+   *     },
+   *   ],
+   * });
+   * await db.close();
+   * ```
+   * @category Lifecycle
+   * @since v0.5.0
+   */
+  /// Client.setSchema
 
   /**
    * The check method reads every row and index entry of the committed

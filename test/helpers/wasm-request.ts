@@ -95,6 +95,11 @@ export const decodeRequest = (
     case WASM_OPERATION.closePrepared:
       decoded = u32();
       break;
+    case WASM_OPERATION.setSchema: {
+      const drop = u8() === 1;
+      decoded = {schema: values()[0], drop};
+      break;
+    }
     default:
       decoded = undefined;
   }

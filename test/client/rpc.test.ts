@@ -280,15 +280,17 @@ describe('WorkerRpc', () => {
       indexes: [{name: 'notes_body', columns: ['body'], unique: true}],
     };
 
-    expect(isRpcResult('schema', {tables: []})).toBe(true);
-    expect(isRpcResult('schema', {tables: [table]})).toBe(true);
+    const schema = (tables: unknown[]) => ({version: 1, tables});
+    expect(isRpcResult('schema', schema([]))).toBe(true);
+    expect(isRpcResult('schema', schema([table]))).toBe(true);
     expect(
-      isRpcResult('schema', {
-        tables: [{...table, columns: [{...column, default: null}]}],
-      }),
+      isRpcResult(
+        'schema',
+        schema([{...table, columns: [{...column, default: null}]}]),
+      ),
     ).toBe(true);
     const text = {name: 'code', type: 'text', nullable: true, maxLength: 3};
-    expect(isRpcResult('schema', {tables: [{...table, columns: [text]}]})).toBe(
+    expect(isRpcResult('schema', schema([{...table, columns: [text]}]))).toBe(
       true,
     );
     expect(
@@ -302,22 +304,42 @@ describe('WorkerRpc', () => {
     expect(
       isWorkerRequest({v: PROTOCOL_VERSION, id: 1, method: 'schema', params: {}}),
     ).toBe(false);
+    // setSchema takes any JSON as its schema, whose shape the engine checks.
+    for (const [params, valid] of [
+      [{schema: schema([table]), drop: false}, true],
+      [{schema: 'anything', drop: true}, true],
+      [{schema: schema([]), drop: 'yes'}, false],
+      [{schema: schema([])}, false],
+    ] as const) {
+      expect(
+        isWorkerRequest({
+          v: PROTOCOL_VERSION,
+          id: 1,
+          method: 'setSchema',
+          params,
+        }),
+      ).toBe(valid);
+    }
+    expect(isRpcResult('setSchema', true)).toBe(true);
+    expect(isRpcResult('setSchema', 1)).toBe(false);
 
     for (const invalid of [
       undefined,
       {},
-      {tables: [], extra: true},
-      {tables: [{...table, extra: true}]},
-      {tables: [{...table, primaryKey: 'id'}]},
-      {tables: [{...table, columns: [{...column, type: 'bigint'}]}]},
-      {tables: [{...table, columns: [{...column, nullable: 0}]}]},
-      {tables: [{...table, columns: [{...column, default: undefined}]}]},
-      {tables: [{...table, columns: [{...column, extra: true}]}]},
-      {tables: [{...table, columns: [{...column, maxLength: 3}]}]},
-      {tables: [{...table, columns: [{...text, maxLength: 0}]}]},
-      {tables: [{...table, columns: [{...text, maxLength: 1.5}]}]},
-      {tables: [{...table, indexes: [{name: 'i', columns: ['id']}]}]},
-      {tables: [{...table, columns: new Array(1)}]},
+      {tables: []},
+      {version: -1, tables: []},
+      {version: 1, tables: [], extra: true},
+      {version: 1, tables: [{...table, extra: true}]},
+      {version: 1, tables: [{...table, primaryKey: 'id'}]},
+      {version: 1, tables: [{...table, columns: [{...column, type: 'bigint'}]}]},
+      {version: 1, tables: [{...table, columns: [{...column, nullable: 0}]}]},
+      {version: 1, tables: [{...table, columns: [{...column, default: undefined}]}]},
+      {version: 1, tables: [{...table, columns: [{...column, extra: true}]}]},
+      {version: 1, tables: [{...table, columns: [{...column, maxLength: 3}]}]},
+      {version: 1, tables: [{...table, columns: [{...text, maxLength: 0}]}]},
+      {version: 1, tables: [{...table, columns: [{...text, maxLength: 1.5}]}]},
+      {version: 1, tables: [{...table, indexes: [{name: 'i', columns: ['id']}]}]},
+      {version: 1, tables: [{...table, columns: new Array(1)}]},
     ]) {
       expect(isRpcResult('schema', invalid)).toBe(false);
     }

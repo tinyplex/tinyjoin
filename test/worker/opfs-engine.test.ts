@@ -45,7 +45,8 @@ function engine(): WorkerEngine {
     inTransaction: vi.fn(() => false),
     revision: vi.fn(() => 0),
     check: vi.fn(),
-    schema: vi.fn(() => ({tables: []})),
+    schema: vi.fn(() => ({version: 0, tables: []})),
+    setSchema: vi.fn(() => ({revision: 0, tables: [], keys: {}})),
     close: vi.fn(),
   };
 }

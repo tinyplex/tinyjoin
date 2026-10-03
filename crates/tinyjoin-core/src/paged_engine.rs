@@ -5,7 +5,8 @@ use serde_json::Value;
 
 use crate::{
     ApplyOutcome, ChangedKeys, EngineError, ExecuteResult, IndexDefinition, PageDevice,
-    PagedStorage, PreparedStatementId, QueryResult, Result, StorageReader, TableDefinition,
+    PagedStorage, PreparedStatementId, QueryResult, Result, SchemaDefinition, StorageReader,
+    TableDefinition,
     paged_transaction::{PagedReadView, PagedTransaction},
     prepared_statement::PreparedStatementRegistry,
     statement::{PlannedDml, Statement, WriteStatement},
@@ -229,6 +230,48 @@ impl<D: PageDevice> PagedEngine<D> {
     /// DDL cannot run inside a transaction, so a transaction sees the committed schema.
     pub fn schema(&self) -> Result<Vec<(Rc<TableDefinition>, Vec<IndexDefinition>)>> {
         self.storage.schema()
+    }
+
+    /// The version an application last gave the schema, or zero.
+    pub fn schema_version(&self) -> u64 {
+        self.storage.schema_version()
+    }
+
+    /// Makes the database's tables, columns, keys, and indexes match `target`, as one change that
+    /// publishes whole or not at all, and reports the tables it changed. A schema the database
+    /// already has changes nothing and advances no revision.
+    ///
+    /// Tables and columns are renamed from the names `target` says they had, while they still
+    /// have them; a table or column `target` leaves out is dropped only if `drop` is set. A
+    /// change no DDL statement could make, such as to a primary key or a column's runtime type,
+    /// is refused, as is a `target` older than the database's schema version.
+    pub fn set_schema(&mut self, target: &SchemaDefinition, drop: bool) -> Result<ApplyOutcome> {
+        self.storage.ensure_readiness()?;
+        if self.in_transaction() {
+            return Err(EngineError::transaction_active());
+        }
+        let statements = crate::schema::schema_statements(
+            &self.storage.schema()?,
+            self.storage.schema_version(),
+            target,
+            drop,
+        )?;
+        let mut tables = Vec::<String>::new();
+        for result in self
+            .storage
+            .execute_script(statements.into_iter().map(Statement::Write).collect())?
+        {
+            for table in result.tables {
+                if !tables.contains(&table) {
+                    tables.push(table);
+                }
+            }
+        }
+        Ok(ApplyOutcome {
+            revision: self.storage.revision(),
+            tables,
+            keys: ChangedKeys::default(),
+        })
     }
 
     /// Checks every row and index entry of the committed database, and every page holding them,
@@ -4651,6 +4694,242 @@ mod tests {
         engine
             .exec_sql("CREATE TABLE words (unique INTEGER PRIMARY KEY, constraint TEXT, check TEXT)")
             .unwrap();
+    }
+
+    fn schema_target(value: Value) -> crate::SchemaDefinition {
+        crate::SchemaDefinition::from_json(&value).unwrap()
+    }
+
+    /// The schema as getSchema() writes it, which set_schema reads back.
+    fn schema_json(engine: &PagedEngine<MemoryPageDevice>) -> Value {
+        let tables = engine
+            .schema()
+            .unwrap()
+            .iter()
+            .map(|(table, indexes)| {
+                json!({
+                    "name": table.name,
+                    "columns": table.columns.iter().map(|column| {
+                        let mut value = json!({
+                            "name": column.name,
+                            "type": match column.data_type {
+                                ColumnType::Boolean => "boolean",
+                                ColumnType::Integer => "integer",
+                                ColumnType::Float => "float",
+                                ColumnType::Text => "text",
+                                ColumnType::Json => "json",
+                            },
+                            "nullable": column.nullable,
+                        });
+                        if let Some(default) = &column.default {
+                            value["default"] = default.clone();
+                        }
+                        if let Some(length) = column.max_length {
+                            value["maxLength"] = json!(length);
+                        }
+                        value
+                    }).collect::<Vec<_>>(),
+                    "primaryKey": table.primary_key,
+                    "indexes": indexes.iter().map(|index| json!({
+                        "name": index.name, "columns": index.columns, "unique": index.unique,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({"version": engine.schema_version(), "tables": tables})
+    }
+
+    #[test]
+    fn set_schema_makes_the_database_match_and_keeps_its_rows() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let first = json!({"version": 1, "tables": [{
+            "name": "tasks",
+            "columns": [
+                {"name": "id", "type": "text", "nullable": false},
+                {"name": "title", "type": "text", "nullable": false, "maxLength": 200},
+                {"name": "done", "type": "boolean", "nullable": false, "default": false},
+            ],
+            "primaryKey": ["id"],
+            "indexes": [{"name": "tasks_done", "columns": ["done"], "unique": false}],
+        }]});
+        let outcome = engine.set_schema(&schema_target(first.clone()), false).unwrap();
+        assert_eq!(outcome.tables, ["tasks"]);
+        assert_eq!(schema_json(&engine), first);
+        // A schema the database already has changes nothing.
+        let revision = engine.revision();
+        let outcome = engine.set_schema(&schema_target(first.clone()), false).unwrap();
+        assert!(outcome.tables.is_empty());
+        assert_eq!(outcome.revision, revision);
+        engine
+            .execute_sql(
+                "INSERT INTO tasks (id, title) VALUES ('a', 'First'), ('b', 'Second')",
+                &[],
+            )
+            .unwrap();
+
+        // Renames, a new column, new defaults, a new index, and a new table, all at once.
+        let second = json!({"version": 2, "tables": [
+            {
+                "name": "todos",
+                "renamedFrom": "tasks",
+                "columns": [
+                    {"name": "id", "type": "text", "nullable": false},
+                    {"name": "name", "renamedFrom": "title", "type": "text", "nullable": false,
+                        "maxLength": 100},
+                    {"name": "done", "type": "boolean", "nullable": false, "default": true},
+                    {"name": "priority", "type": "integer", "nullable": false, "default": 0},
+                ],
+                "primaryKey": ["id"],
+                "indexes": [
+                    {"name": "todos_name", "columns": ["name"], "unique": true},
+                    {"name": "todos_priority", "columns": ["priority", "done"], "unique": false},
+                ],
+            },
+            {
+                "name": "notes",
+                "columns": [{"name": "id", "type": "integer", "nullable": false}],
+                "primaryKey": ["id"],
+                "indexes": [],
+            },
+        ]});
+        let outcome = engine.set_schema(&schema_target(second.clone()), false).unwrap();
+        assert_eq!(outcome.tables, ["tasks", "todos", "notes"]);
+        let mut expected = second.clone();
+        expected["tables"][0].as_object_mut().unwrap().remove("renamedFrom");
+        expected["tables"][0]["columns"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("renamedFrom");
+        let tables = expected["tables"].as_array_mut().unwrap();
+        tables.reverse();
+        assert_eq!(schema_json(&engine), expected);
+        assert_eq!(
+            engine
+                .execute_sql("SELECT id, name, done, priority FROM todos ORDER BY id", &[])
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(Value::Object)
+                .collect::<Vec<_>>(),
+            [
+                json!({"id": "a", "name": "First", "done": false, "priority": 0}),
+                json!({"id": "b", "name": "Second", "done": false, "priority": 0}),
+            ]
+        );
+
+        // An older schema is refused, and so is a change that fails partway: nothing changes.
+        assert_eq!(
+            engine
+                .set_schema(&schema_target(first.clone()), false)
+                .unwrap_err()
+                .code,
+            "SCHEMA_OUTDATED"
+        );
+        let mut failing = expected.clone();
+        failing["version"] = json!(3);
+        failing["tables"][1]["columns"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name": "owner", "type": "text", "nullable": false}));
+        failing["tables"][0]["columns"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name": "body", "type": "text", "nullable": true}));
+        assert_eq!(
+            engine
+                .set_schema(&schema_target(failing), false)
+                .unwrap_err()
+                .code,
+            "CONSTRAINT_VIOLATION"
+        );
+        assert_eq!(schema_json(&engine), expected);
+
+        // What the schema leaves out stays, unless it is dropped.
+        let third = json!({"version": 3, "tables": [{
+            "name": "todos",
+            "columns": [
+                {"name": "id", "type": "text", "nullable": false},
+                {"name": "name", "type": "text", "nullable": false, "maxLength": 100},
+            ],
+            "primaryKey": ["id"],
+            "indexes": [{"name": "todos_name", "columns": ["name"], "unique": true}],
+        }]});
+        engine.set_schema(&schema_target(third.clone()), false).unwrap();
+        assert_eq!(engine.schema().unwrap().len(), 2);
+        assert_eq!(engine.schema().unwrap()[1].0.columns.len(), 4);
+        engine.set_schema(&schema_target(third.clone()), true).unwrap();
+        assert_eq!(schema_json(&engine), third);
+        engine.check().unwrap();
+        let engine = PagedEngine::open(engine.into_device()).unwrap();
+        assert_eq!(schema_json(&engine), third);
+        assert_eq!(engine.schema_version(), 3);
+    }
+
+    #[test]
+    fn set_schema_refuses_what_no_statement_could_change() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .exec_sql("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER)")
+            .unwrap();
+        let table = |columns: Value, key: Value| {
+            schema_target(json!({"version": 0, "tables": [{
+                "name": "t", "columns": columns, "primaryKey": key, "indexes": [],
+            }]}))
+        };
+        for (target, code) in [
+            (
+                table(
+                    json!([{"name": "id", "type": "text", "nullable": false}]),
+                    json!(["id"]),
+                ),
+                "UNSUPPORTED_SQL",
+            ),
+            (
+                table(
+                    json!([
+                        {"name": "id", "type": "integer", "nullable": false},
+                        {"name": "a", "type": "text", "nullable": false},
+                    ]),
+                    json!(["id", "a"]),
+                ),
+                "UNSUPPORTED_SQL",
+            ),
+            (
+                table(
+                    json!([{"name": "id", "type": "integer", "nullable": false},
+                        {"name": "a", "type": "integer", "nullable": true}]),
+                    json!(["id"]),
+                ),
+                "UNSUPPORTED_SQL",
+            ),
+        ] {
+            assert_eq!(engine.set_schema(&target, false).unwrap_err().code, code);
+        }
+        for value in [
+            json!({"version": 0, "tables": [], "extra": 1}),
+            json!({"version": -1, "tables": []}),
+            json!({"version": 0, "tables": [{"name": "t", "columns": [
+                {"name": "id", "type": "bigint", "nullable": false}],
+                "primaryKey": ["id"], "indexes": []}]}),
+            json!({"version": 0, "tables": [{"name": "t", "columns": [
+                {"name": "id", "type": "integer", "nullable": false, "maxLength": 3}],
+                "primaryKey": ["id"], "indexes": []}]}),
+            json!({"version": 0, "tables": [{"name": "t", "columns": [
+                {"name": "id", "type": "integer"}], "primaryKey": ["id"], "indexes": []}]}),
+        ] {
+            assert_eq!(
+                crate::SchemaDefinition::from_json(&value).unwrap_err().code,
+                "INVALID_SCHEMA"
+            );
+        }
+        engine.begin_transaction().unwrap();
+        assert_eq!(
+            engine
+                .set_schema(&schema_target(json!({"version": 0, "tables": []})), true)
+                .unwrap_err()
+                .code,
+            "TRANSACTION_ACTIVE"
+        );
     }
 
     #[test]

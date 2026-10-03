@@ -31,6 +31,7 @@ export interface WorkerEngine {
   revision(): number;
   check(): void;
   schema(): Schema;
+  setSchema(schema: Schema, drop: boolean): ApplyOutcome;
   close(): void;
 }
 

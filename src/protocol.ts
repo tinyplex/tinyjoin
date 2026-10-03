@@ -62,6 +62,8 @@ export interface ColumnSchema {
   default?: JsonValue;
   /** The most characters a `VARCHAR(n)` column holds. */
   maxLength?: number;
+  /** A name the column had, which setSchema renames it from. */
+  renamedFrom?: string;
 }
 
 export interface IndexSchema {
@@ -75,11 +77,18 @@ export interface TableSchema {
   columns: ColumnSchema[];
   primaryKey: string[];
   indexes: IndexSchema[];
+  /** A name the table had, which setSchema renames it from. */
+  renamedFrom?: string;
 }
 
 /** The database's tables, in name order, as the engine's catalog holds them. */
 export interface Schema {
+  version: number;
   tables: TableSchema[];
+}
+
+export interface SetSchemaOptions {
+  drop?: boolean;
 }
 
 export type StorageOptions = {kind: 'memory'} | {kind: 'opfs'; name: string};
@@ -191,6 +200,10 @@ export interface RpcMethods {
   schema: {
     request: undefined;
     response: Schema;
+  };
+  setSchema: {
+    request: {schema: Schema; drop: boolean};
+    response: boolean;
   };
   close: {
     request: undefined;
@@ -309,6 +322,13 @@ export const isWorkerRequest = (value: unknown): value is WorkerRequest => {
     case 'schema':
     case 'close':
       return isUndefined(params);
+    // The engine reads the schema's shape, and says what is wrong with it.
+    case 'setSchema':
+      return (
+        hasParams(params, ['schema', 'drop']) &&
+        createJsonValidation().isJson(params.schema) &&
+        isBoolean(params.drop)
+      );
     default:
       return false;
   }
@@ -368,6 +388,8 @@ const isResult = (
       return isApplyOutcome(value);
     case 'schema':
       return isSchema(value);
+    case 'setSchema':
+      return isBoolean(value);
     case 'executeSql':
     case 'executePrepared':
       return isSqlResult(value, validation);
@@ -536,7 +558,8 @@ const isSchema = (value: unknown): value is Schema => {
     isDenseArray(table.indexes, isIndex);
   return (
     isRecord(value) &&
-    hasExactKeys(value, ['tables']) &&
+    hasExactKeys(value, ['version', 'tables']) &&
+    isCount(value.version) &&
     isDenseArray(value.tables, isTable)
   );
 };

@@ -28,6 +28,7 @@ mod query;
 mod recovery_property_tests;
 mod revision;
 mod row;
+mod schema;
 #[cfg(test)]
 mod semantic_property_tests;
 mod sql_script;
@@ -44,6 +45,7 @@ pub use device::PageDevice;
 #[cfg(test)]
 pub(crate) use engine::Engine;
 pub use error::{EngineError, Result};
+pub use schema::{SchemaDefinition, TableTarget};
 pub use model::{
     ApplyOutcome, ChangedKeys, ColumnDefinition, ColumnType, ExecuteResult, IndexDefinition,
     MAX_CHANGED_KEYS_PER_TABLE, ResultField, Row, TableDefinition, TableKeys,

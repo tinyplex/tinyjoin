@@ -21,6 +21,7 @@ export type {
   RowMode,
   Schema,
   SerializedError,
+  SetSchemaOptions,
   SubscriptionOptions,
   TableSchema,
   TablesChangedEvent,

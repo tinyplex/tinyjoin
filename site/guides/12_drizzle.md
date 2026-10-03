@@ -81,10 +81,50 @@ so it refuses the SQL that declares them. Drizzle's relations need no foreign
 keys.
 
 Create the tables with SQL through the Client, idempotently with
-`IF NOT EXISTS`, or apply the migrations that Drizzle Kit generates, as the next
-section describes. Drizzle Kit's `push`, `pull`, and Studio read PostgreSQL's
-system catalogs, which TinyJoin does not have; the Client reads the same facts
-with getSchema().
+`IF NOT EXISTS`; push the schema from the application, as the next section
+describes; or apply the migrations that Drizzle Kit generates. Drizzle Kit's
+own `push`, `pull`, and Studio read PostgreSQL's system catalogs, which TinyJoin
+does not have; the Client reads the same facts with getSchema().
+
+## Push
+
+push() from `tinyjoin/drizzle` makes the database hold the tables of a Drizzle
+schema, as Drizzle Kit's `push` would, but from the application itself and as
+one change that commits whole or not at all. There are no migration files to
+generate or bundle:
+
+```ts
+import {create} from 'tinyjoin';
+import {drizzle, push} from 'tinyjoin/drizzle';
+import * as schema from './schema';
+
+const db = drizzle(await create('opfs://my-app-v1'), {schema});
+await push(db, schema, {version: 2, renames: {'tasks.name': 'title'}});
+```
+
+push() reads each table's columns, primary key, unique constraints, and
+indexes from Drizzle, and passes them to the Client's
+[setSchema()](/guides/storage-and-lifecycle/#setting-the-schema). It creates
+the tables and columns the database lacks, changes defaults, nullability, and
+`varchar` lengths to the schema's, and makes each table's indexes the schema's,
+keeping every row. A schema the database already holds changes nothing, so
+every tab can call push() as it starts.
+
+A rename is not something a schema can show, so name each one in `renames`,
+from the new name, as `table` or `table.column`, to the old one; otherwise the
+new name is created empty. Tables and columns the schema leaves out stay unless
+push() is given `drop: true`. Give each change of schema a higher `version`:
+push() then refuses an older schema, from a tab still running an older copy of
+the application, with `SCHEMA_OUTDATED`, rather than undoing the change.
+
+A table that declares what TinyJoin cannot hold, such as a foreign key, a
+`timestamp` column, an `sql` default, or a descending index, is refused before
+anything changes. A default from `$defaultFn` is Drizzle's to fill in, so the
+database has none.
+
+Use push() when the schema in code is the record of truth, and
+[migrations](#migrations) when the history of changes, or data moved between
+them, matters too. Keep to one of the two for a database.
 
 ## Migrations
 

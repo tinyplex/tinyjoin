@@ -127,6 +127,16 @@ rows keep their values: dropping a column, changing a default, and setting
 while a row holds `NULL`. A dropped column takes every index on it with it, as
 in PostgreSQL, and indexes follow renamed columns and tables.
 
+The new setSchema() method makes the database's tables match a schema in the
+shape getSchema() returns, in one atomic change: it creates what is missing,
+renames tables and columns from the names they had, changes defaults,
+nullability, and `VARCHAR` lengths, and makes each table's indexes the
+schema's, keeping every row, and drops what the schema leaves out only when
+asked. A schema the database already has changes nothing, and a schema version
+keeps a tab running older code from undoing newer changes. `tinyjoin/drizzle`
+adds push(), which sets a Drizzle schema this way, in place of migrations. See
+[setting the schema](/guides/storage-and-lifecycle/#setting-the-schema).
+
 The new getSchema() method on the Client reads the database's tables, with
 their columns, primary keys, and indexes, as typed objects rather than through
 SQL catalog tables, which TinyJoin does not have. Each column carries its
@@ -135,9 +145,10 @@ runtime type, whether it is nullable, and any literal default. See
 
 **Upgrading from v0.4.0 needs no action.** Install, rebuild, and redeploy. The
 page format stays at format 3, so an existing database opens with no migration
-and no OPFS namespace change. A database that holds a `VARCHAR(n)` column
-cannot be opened by v0.4.0, which reports its catalog as corrupt, so do not
-roll back past v0.5.0 once a schema uses one. The Worker protocol moves from
+and no OPFS namespace change. A database that holds a `VARCHAR(n)` column, or
+a schema version from setSchema(), cannot be opened by v0.4.0, which reports
+its catalog as corrupt, so do not roll back past v0.5.0 once a database uses
+either. The Worker protocol moves from
 version 10 to 11
 for the schema request. Client and Worker ship together and are upgraded
 together by a normal install, so this affects only a deployment that pins or

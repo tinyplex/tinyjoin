@@ -30,7 +30,9 @@ use crate::{
         storage_corrupt, unique_violation,
     },
     row::{HeldRow, RowRef},
-    statement::{PlannedDml, PreviousRow, Statement, TableChange, WriteStatement, change_table},
+    statement::{
+        PlannedDml, PreviousRow, Statement, TableChange, WriteOutcome, WriteStatement, change_table,
+    },
     storage::{
         KeyOrder, KeyRange, estimated_record_bytes, estimated_row_bytes, preflight_row_write_set,
         schema_with_added_column, validate_schema, validate_value,
@@ -47,6 +49,7 @@ pub(crate) struct ScriptPublication {
     pub(crate) committed: bool,
     pub(crate) revision: u64,
     pub(crate) next_tree_id: TreeId,
+    pub(crate) schema_version: u64,
     pub(crate) tables: Rc<NameMap<PagedTable>>,
     pub(crate) indexes: Rc<NameMap<PagedIndex>>,
     pub(crate) results: Vec<ExecuteResult>,
@@ -187,6 +190,7 @@ struct PagedScriptCandidate<'a, D: PageDevice> {
     catalog_root: Option<PageId>,
     base_revision: u64,
     next_tree_id: TreeId,
+    schema_version: u64,
     // Shared with the storage until this candidate changes them.
     tables: Rc<NameMap<PagedTable>>,
     indexes: Rc<NameMap<PagedIndex>>,
@@ -202,6 +206,7 @@ pub(crate) fn execute<D: PageDevice>(
     pager: &mut Pager<D>,
     base_revision: u64,
     next_tree_id: TreeId,
+    schema_version: u64,
     tables: Rc<NameMap<PagedTable>>,
     indexes: Rc<NameMap<PagedIndex>>,
     statements: Vec<Statement>,
@@ -211,13 +216,21 @@ pub(crate) fn execute<D: PageDevice>(
             committed: false,
             revision: base_revision,
             next_tree_id,
+            schema_version,
             tables,
             indexes,
             results: vec![],
         });
     }
 
-    let mut candidate = begin_candidate(pager, base_revision, next_tree_id, tables, indexes)?;
+    let mut candidate = begin_candidate(
+        pager,
+        base_revision,
+        next_tree_id,
+        schema_version,
+        tables,
+        indexes,
+    )?;
     let execution = candidate.execute_all(statements);
     finish_candidate(candidate, execution)
 }
@@ -229,11 +242,19 @@ pub(crate) fn execute_changed_rows<D: PageDevice>(
     pager: &mut Pager<D>,
     base_revision: u64,
     next_tree_id: TreeId,
+    schema_version: u64,
     tables: Rc<NameMap<PagedTable>>,
     indexes: Rc<NameMap<PagedIndex>>,
     changes: &[TableChanges<'_>],
 ) -> Result<ScriptPublication> {
-    let mut candidate = begin_candidate(pager, base_revision, next_tree_id, tables, indexes)?;
+    let mut candidate = begin_candidate(
+        pager,
+        base_revision,
+        next_tree_id,
+        schema_version,
+        tables,
+        indexes,
+    )?;
     let execution = (|| {
         for (table, rows) in changes {
             let index_count = candidate
@@ -257,6 +278,7 @@ fn begin_candidate<'a, D: PageDevice>(
     pager: &'a mut Pager<D>,
     base_revision: u64,
     next_tree_id: TreeId,
+    schema_version: u64,
     tables: Rc<NameMap<PagedTable>>,
     indexes: Rc<NameMap<PagedIndex>>,
 ) -> Result<PagedScriptCandidate<'a, D>> {
@@ -267,6 +289,7 @@ fn begin_candidate<'a, D: PageDevice>(
         catalog_root,
         base_revision,
         next_tree_id,
+        schema_version,
         base_tables: Rc::clone(&tables),
         base_indexes: Rc::clone(&indexes),
         tables,
@@ -288,6 +311,7 @@ fn finish_candidate<D: PageDevice>(
         Ok(results) => {
             let revision = candidate.base_revision;
             let next_tree_id = candidate.next_tree_id;
+            let schema_version = candidate.schema_version;
             let tables = std::mem::take(&mut candidate.tables);
             let indexes = std::mem::take(&mut candidate.indexes);
             candidate.transaction.into_inner().abort();
@@ -295,6 +319,7 @@ fn finish_candidate<D: PageDevice>(
                 committed: false,
                 revision,
                 next_tree_id,
+                schema_version,
                 tables,
                 indexes,
                 results,
@@ -399,6 +424,17 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                     self.alter_table(table, change)?;
                 }
                 outcome
+            }
+            WriteStatement::SetSchemaVersion { version } => {
+                let mutated = *version != self.schema_version;
+                self.schema_version = *version;
+                WriteOutcome {
+                    command: "SET SCHEMA VERSION",
+                    row_count: 0,
+                    rows: vec![],
+                    tables: vec![],
+                    mutated,
+                }
             }
             WriteStatement::Insert { .. }
             | WriteStatement::Update { .. }
@@ -1093,6 +1129,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             committed: true,
             revision,
             next_tree_id: self.next_tree_id,
+            schema_version: self.schema_version,
             tables: self.tables,
             indexes: self.indexes,
             results,
@@ -1127,6 +1164,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 .map_err(|_| limit_error("The catalog contains too many tables"))?,
             index_count: u32::try_from(self.indexes.len())
                 .map_err(|_| limit_error("The catalog contains too many indexes"))?,
+            schema_version: self.schema_version,
         })?;
         changes.push((key, Some(value)));
         let mut database_hash = EMPTY_HASH;

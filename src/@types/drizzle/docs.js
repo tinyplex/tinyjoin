@@ -157,3 +157,77 @@
  * @since v0.5.0
  */
 /// drizzle.migrate
+
+/**
+ * The PushOptions interface configures the push function.
+ * @category Push
+ * @since v0.5.0
+ */
+/// PushOptions
+{
+  /**
+   * The version property gives the schema a version, zero unless it is
+   * given, which the database records. A schema whose version is lower than
+   * the database's is refused with `SCHEMA_OUTDATED`, so that a tab running an
+   * older copy of the application cannot undo a newer one's changes.
+   * @category Push
+   * @since v0.5.0
+   */
+  /// PushOptions.version
+
+  /**
+   * The drop property, when true, drops each table, and each column of a
+   * table the schema keeps, that the schema leaves out, with their data.
+   * Otherwise they stay as they are.
+   * @category Push
+   * @since v0.5.0
+   */
+  /// PushOptions.drop
+
+  /**
+   * The renames property maps the new name of each renamed table, as
+   * `table`, or column, as `table.column`, to the name it had, so that push
+   * renames it, keeping its data, rather than creating it empty. A rename
+   * that has already happened changes nothing.
+   * @category Push
+   * @since v0.5.0
+   */
+  /// PushOptions.renames
+}
+
+/**
+ * The push function makes the database hold the tables of a Drizzle schema,
+ * as Drizzle Kit's `push` would for PostgreSQL, but from the application and
+ * as one change that commits whole or not at all.
+ *
+ * It reads each table's columns, primary key, unique constraints, and indexes
+ * from Drizzle, and passes them to the Client's setSchema, which creates what
+ * the database lacks and changes what differs. A schema the database already
+ * holds changes nothing, so every tab of an application can call push as it
+ * starts, in place of migrations.
+ *
+ * A table that declares what TinyJoin does not have, such as a foreign key, a
+ * `timestamp` column, an SQL default, or an index on an expression, is
+ * refused before anything changes. A default Drizzle works out in JavaScript,
+ * with `$defaultFn`, is Drizzle's, not the database's.
+ * @param db The Drizzle database, from drizzle.
+ * @param schema The Drizzle schema, whose tables push reads, leaving out its
+ * relations.
+ * @param options The schema's version, whether to drop what it leaves out, and
+ * what it renames.
+ * @returns A Promise resolving to true if the database changed, or false if it
+ * already held the schema.
+ * @example
+ * ```ts
+ * import {create} from 'tinyjoin';
+ * import {drizzle, push} from 'tinyjoin/drizzle';
+ * import * as schema from './schema';
+ *
+ * const db = drizzle(await create('opfs://my-app-v1'), {schema});
+ * await push(db, schema, {version: 2, renames: {'tasks.name': 'title'}});
+ * ```
+ * @category Push
+ * @since v0.5.0
+ */
+/// drizzle.push
+

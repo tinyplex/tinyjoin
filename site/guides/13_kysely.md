@@ -90,6 +90,10 @@ their own, or that an `IF NOT EXISTS` makes safe to run again. A Web Lock keeps
 one tab of an application migrating at a time, so every tab can migrate as it
 starts.
 
+Instead of migrations, an application can declare its schema and pass it to
+the Client's [setSchema()](/guides/storage-and-lifecycle/#setting-the-schema)
+as it starts.
+
 `db.introspection.getTables` lists the tables, without the Migrator's own,
 from the Client's getSchema(), with each column's PostgreSQL type: `bool`,
 `int8`, `float8`, `text`, `varchar`, or `json`. TinyJoin has no schemas, so

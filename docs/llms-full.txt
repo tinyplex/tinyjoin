@@ -1158,7 +1158,7 @@ primary keys, and indexes, rather than through SQL catalog tables, which
 TinyJoin does not have:
 
 ```ts
-const {tables} = await db.getSchema();
+const {version, tables} = await db.getSchema();
 const tasks = tables.find(({name}) => name === 'tasks');
 // -> {
 //   name: 'tasks',
@@ -1177,12 +1177,68 @@ the table declares them, followed by any that `ALTER TABLE` added. A column's
 not the spelling it was declared with, so `VARCHAR` reads back as `text` and
 `BIGINT` as `integer`; a `VARCHAR(n)` column's `maxLength` is its `n`. `default` is present only for a column that declares
 one, and is `null` for `DEFAULT NULL`. The primary key is not listed among the
-indexes, and its columns are never nullable.
+indexes, and its columns are never nullable. `version` is the version the
+application last gave the schema with setSchema(), or zero.
 
 Use it to confirm that a database matches the schema the application expects,
 to decide which migration steps an older database still needs, or to generate
 code from the tables. It reads only the catalog, not rows, so it is cheap even
 for a large database. Call it outside a transaction.
+
+## Setting the schema
+
+setSchema() is the other way round: it takes a schema in the shape getSchema()
+returns, and makes the database's tables match it. An application can declare
+its schema in code and call setSchema() as it starts, rather than keeping a
+series of migrations:
+
+```ts
+await db.setSchema({
+  version: 2,
+  tables: [
+    {
+      name: 'tasks',
+      columns: [
+        {name: 'id', type: 'text', nullable: false},
+        {name: 'name', renamedFrom: 'title', type: 'text', nullable: false, maxLength: 200},
+        {name: 'done', type: 'boolean', nullable: false, default: false},
+        {name: 'priority', type: 'integer', nullable: false, default: 0},
+      ],
+      primaryKey: ['id'],
+      indexes: [{name: 'tasks_done', columns: ['done'], unique: false}],
+    },
+  ],
+});
+```
+
+It compares the schema with the database's and makes the difference in one
+change, which commits whole or not at all, with the statements TinyJoin's
+[DDL](https://tinyjoin.org/guides/sql-compatibility/#statements-and-clauses) would run:
+
+- a table or column the database lacks is created;
+- a table or column whose `renamedFrom` the database still has is renamed,
+  keeping its rows and values;
+- a column's default, nullability, and `VARCHAR` length become the schema's;
+- each table's indexes become exactly the schema's; and
+- a table or column the schema leaves out stays, unless setSchema() is given
+  `{drop: true}`.
+
+Rows keep their values, so a change that a row prevents fails, changing
+nothing: `NOT NULL` where a row holds `NULL`, a shorter `VARCHAR` than a value,
+or a `NOT NULL` column without a default added to a table with rows. A change
+no statement could make, to a primary key or a column's runtime type, is
+refused. Make one by creating a new table under a new name, copying the rows
+with the application's own code, and dropping the old table.
+
+A schema the database already has changes nothing and resolves to `false`, so
+every tab can call setSchema() as it starts. `version` guards against a tab
+that still runs an older copy of the application: setSchema() refuses a schema
+whose version is lower than the database's with `SCHEMA_OUTDATED`, and records
+a higher one. Give each schema change a higher version, and leave `renamedFrom`
+in place for as long as an older database may still have the old name.
+
+The [Drizzle guide](https://tinyjoin.org/guides/drizzle/#push) shows how to set a Drizzle schema
+this way.
 
 ## Application backups and restoration
 
@@ -1910,10 +1966,50 @@ so it refuses the SQL that declares them. Drizzle's relations need no foreign
 keys.
 
 Create the tables with SQL through the Client, idempotently with
-`IF NOT EXISTS`, or apply the migrations that Drizzle Kit generates, as the next
-section describes. Drizzle Kit's `push`, `pull`, and Studio read PostgreSQL's
-system catalogs, which TinyJoin does not have; the Client reads the same facts
-with getSchema().
+`IF NOT EXISTS`; push the schema from the application, as the next section
+describes; or apply the migrations that Drizzle Kit generates. Drizzle Kit's
+own `push`, `pull`, and Studio read PostgreSQL's system catalogs, which TinyJoin
+does not have; the Client reads the same facts with getSchema().
+
+## Push
+
+push() from `tinyjoin/drizzle` makes the database hold the tables of a Drizzle
+schema, as Drizzle Kit's `push` would, but from the application itself and as
+one change that commits whole or not at all. There are no migration files to
+generate or bundle:
+
+```ts
+import {create} from 'tinyjoin';
+import {drizzle, push} from 'tinyjoin/drizzle';
+import * as schema from './schema';
+
+const db = drizzle(await create('opfs://my-app-v1'), {schema});
+await push(db, schema, {version: 2, renames: {'tasks.name': 'title'}});
+```
+
+push() reads each table's columns, primary key, unique constraints, and
+indexes from Drizzle, and passes them to the Client's
+[setSchema()](https://tinyjoin.org/guides/storage-and-lifecycle/#setting-the-schema). It creates
+the tables and columns the database lacks, changes defaults, nullability, and
+`varchar` lengths to the schema's, and makes each table's indexes the schema's,
+keeping every row. A schema the database already holds changes nothing, so
+every tab can call push() as it starts.
+
+A rename is not something a schema can show, so name each one in `renames`,
+from the new name, as `table` or `table.column`, to the old one; otherwise the
+new name is created empty. Tables and columns the schema leaves out stay unless
+push() is given `drop: true`. Give each change of schema a higher `version`:
+push() then refuses an older schema, from a tab still running an older copy of
+the application, with `SCHEMA_OUTDATED`, rather than undoing the change.
+
+A table that declares what TinyJoin cannot hold, such as a foreign key, a
+`timestamp` column, an `sql` default, or a descending index, is refused before
+anything changes. A default from `$defaultFn` is Drizzle's to fill in, so the
+database has none.
+
+Use push() when the schema in code is the record of truth, and
+[migrations](https://tinyjoin.org/guides/drizzle/#migrations) when the history of changes, or data moved between
+them, matters too. Keep to one of the two for a database.
 
 ## Migrations
 
@@ -2123,6 +2219,10 @@ before the failure applied. Write migrations whose statements each stand on
 their own, or that an `IF NOT EXISTS` makes safe to run again. A Web Lock keeps
 one tab of an application migrating at a time, so every tab can migrate as it
 starts.
+
+Instead of migrations, an application can declare its schema and pass it to
+the Client's [setSchema()](https://tinyjoin.org/guides/storage-and-lifecycle/#setting-the-schema)
+as it starts.
 
 `db.introspection.getTables` lists the tables, without the Migrator's own,
 from the Client's getSchema(), with each column's PostgreSQL type: `bool`,
@@ -2747,6 +2847,10 @@ and has no OPFS, filesystem persistence, or remote synchronization. See the
 - Keep schema setup idempotent with `IF NOT EXISTS` where appropriate.
 - Read tables, columns, primary keys, and indexes with db.getSchema(). There is
   no `information_schema` or `pg_catalog` to query.
+- To declare the schema in code, pass the getSchema() shape to db.setSchema()
+  as the application starts. It creates and alters what differs in one atomic
+  change, keeps rows, renames from `renamedFrom`, drops only with
+  `{drop: true}`, and refuses a lower `version` with `SCHEMA_OUTDATED`.
 - Treat a row generic as a TypeScript assertion, not runtime validation.
 - Consult the
   [SQL compatibility contract](https://tinyjoin.org/guides/sql-compatibility/)
@@ -2761,9 +2865,10 @@ floating-point numbers, strings, JSON-compatible values, and `null`.
 
 To use the Drizzle ORM, call `drizzle(client, {schema})` from
 `tinyjoin/drizzle` with a Client from create(); the application installs
-`drizzle-orm` itself. Create tables with DDL through client.exec(), or apply
-`drizzle-kit generate` migrations, bundled into the application, with migrate()
-from `tinyjoin/drizzle`; Drizzle's own migrators and `push` do not work. Use the
+`drizzle-orm` itself. Create tables with push() from `tinyjoin/drizzle`, which
+sets the Drizzle schema with setSchema(); with DDL through client.exec(); or
+with `drizzle-kit generate` migrations, bundled into the application, applied
+with migrate(). Drizzle's own migrators and Drizzle Kit's `push` do not work. Use the
 column types TinyJoin has, leave out `.references()`, and avoid relational
 queries with `with`, SQL functions, and nested transactions.
 See the [Drizzle guide](https://tinyjoin.org/guides/drizzle/).
@@ -3015,6 +3120,16 @@ rows keep their values: dropping a column, changing a default, and setting
 while a row holds `NULL`. A dropped column takes every index on it with it, as
 in PostgreSQL, and indexes follow renamed columns and tables.
 
+The new setSchema() method makes the database's tables match a schema in the
+shape getSchema() returns, in one atomic change: it creates what is missing,
+renames tables and columns from the names they had, changes defaults,
+nullability, and `VARCHAR` lengths, and makes each table's indexes the
+schema's, keeping every row, and drops what the schema leaves out only when
+asked. A schema the database already has changes nothing, and a schema version
+keeps a tab running older code from undoing newer changes. `tinyjoin/drizzle`
+adds push(), which sets a Drizzle schema this way, in place of migrations. See
+[setting the schema](https://tinyjoin.org/guides/storage-and-lifecycle/#setting-the-schema).
+
 The new getSchema() method on the Client reads the database's tables, with
 their columns, primary keys, and indexes, as typed objects rather than through
 SQL catalog tables, which TinyJoin does not have. Each column carries its
@@ -3023,9 +3138,10 @@ runtime type, whether it is nullable, and any literal default. See
 
 **Upgrading from v0.4.0 needs no action.** Install, rebuild, and redeploy. The
 page format stays at format 3, so an existing database opens with no migration
-and no OPFS namespace change. A database that holds a `VARCHAR(n)` column
-cannot be opened by v0.4.0, which reports its catalog as corrupt, so do not
-roll back past v0.5.0 once a schema uses one. The Worker protocol moves from
+and no OPFS namespace change. A database that holds a `VARCHAR(n)` column, or
+a schema version from setSchema(), cannot be opened by v0.4.0, which reports
+its catalog as corrupt, so do not roll back past v0.5.0 once a database uses
+either. The Worker protocol moves from
 version 10 to 11
 for the schema request. Client and Worker ship together and are upgraded
 together by a normal install, so this affects only a deployment that pins or
@@ -3216,7 +3332,7 @@ quicker than in either.
   longer wait for their code to compile. See
   [custom Workers](https://tinyjoin.org/guides/custom-workers/).
 
-The compressed download is now 323 KiB, up from 295 KiB in v0.3.0.
+The compressed download is now 329 KiB, up from 295 KiB in v0.3.0.
 
 ## v0.3.0
 
@@ -3683,6 +3799,15 @@ export interface ColumnSchema {
    * @since v0.5.0
    */
   maxLength?: number;
+
+  /**
+   * The renamedFrom property names a column's former name, which setSchema
+   * renames the column from while the table still has a column of that name.
+   * getSchema never includes it.
+   * @category Schema
+   * @since v0.5.0
+   */
+  renamedFrom?: string;
 }
 
 /**
@@ -3753,21 +3878,56 @@ export interface TableSchema {
    * @since v0.5.0
    */
   indexes: IndexSchema[];
+
+  /**
+   * The renamedFrom property names a table's former name, which setSchema
+   * renames the table from while the database still has a table of that name.
+   * getSchema never includes it.
+   * @category Schema
+   * @since v0.5.0
+   */
+  renamedFrom?: string;
 }
 
 /**
  * The Schema interface is returned by the getSchema method, and describes
- * every table in the database.
+ * every table in the database. The setSchema method takes one to make the
+ * database's.
  * @category Schema
  * @since v0.5.0
  */
 export interface Schema {
+  /**
+   * The version property contains the version the application last gave the
+   * schema with setSchema, or zero. setSchema refuses a schema whose version is
+   * lower, as an older copy of the application would give it.
+   * @category Schema
+   * @since v0.5.0
+   */
+  version: number;
+
   /**
    * The tables property describes the database's tables, in name order.
    * @category Schema
    * @since v0.5.0
    */
   tables: TableSchema[];
+}
+
+/**
+ * The SetSchemaOptions interface configures the setSchema method.
+ * @category Schema
+ * @since v0.5.0
+ */
+export interface SetSchemaOptions {
+  /**
+   * The drop property, when true, makes setSchema drop each table, and each
+   * column of a table the schema keeps, that the schema leaves out, and their
+   * data with them. Otherwise setSchema leaves them as they are.
+   * @category Schema
+   * @since v0.5.0
+   */
+  drop?: boolean;
 }
 
 /**
@@ -4307,6 +4467,57 @@ export class Client {
   getSchema(): Promise<Schema>;
 
   /**
+   * The setSchema method makes the database's tables, columns, primary keys,
+   * and indexes match a Schema, as getSchema returns one, in one change that
+   * commits whole or not at all.
+   *
+   * It creates the tables and columns the schema has and the database lacks,
+   * renames a table or column from the name its renamedFrom gives while the
+   * database still has that name, and changes a column's default, nullability,
+   * or `VARCHAR` length to the schema's. Each table's indexes become exactly
+   * the schema's. Tables and columns the schema leaves out stay, unless the
+   * options' drop property is true. Rows keep their values, as `ALTER TABLE`
+   * keeps them: a change no statement could make, to a primary key or a
+   * column's runtime type, is refused, and so is one that a row prevents, such
+   * as `NOT NULL` where a row holds `NULL`.
+   *
+   * A schema the database already has changes nothing, so every tab of an
+   * application can call setSchema as it starts. A schema whose version is
+   * lower than the database's is refused with `SCHEMA_OUTDATED`, so that a tab
+   * still running an older copy of the application cannot undo a newer one's
+   * changes; a higher version is recorded. Call it outside a transaction.
+   * @param schema The schema to make the database's.
+   * @param options Whether to drop what the schema leaves out.
+   * @returns A Promise resolving to true if the database changed, or false if
+   * it already had the schema.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   *
+   * const db = await create();
+   * await db.setSchema({
+   *   version: 1,
+   *   tables: [
+   *     {
+   *       name: 'tasks',
+   *       columns: [
+   *         {name: 'id', type: 'text', nullable: false},
+   *         {name: 'title', type: 'text', nullable: false},
+   *         {name: 'done', type: 'boolean', nullable: false, default: false},
+   *       ],
+   *       primaryKey: ['id'],
+   *       indexes: [{name: 'tasks_done', columns: ['done'], unique: false}],
+   *     },
+   *   ],
+   * });
+   * await db.close();
+   * ```
+   * @category Lifecycle
+   * @since v0.5.0
+   */
+  setSchema(schema: Schema, options?: SetSchemaOptions): Promise<boolean>;
+
+  /**
    * The check method reads every row and index entry of the committed
    * database, and every page that holds them, and resolves when all of them
    * are sound.
@@ -4506,6 +4717,7 @@ export type {
   RowMode,
   Schema,
   SerializedError,
+  SetSchemaOptions,
   SubscriptionOptions,
   TableSchema,
   TablesChangedEvent,
@@ -4816,6 +5028,84 @@ export interface MigrationConfig {
 export function migrate<
   TSchema extends Record<string, unknown> = Record<string, never>,
 >(db: TinyJoinDatabase<TSchema>, config: MigrationConfig): Promise<void>;
+
+/**
+ * The PushOptions interface configures the push function.
+ * @category Push
+ * @since v0.5.0
+ */
+export interface PushOptions {
+  /**
+   * The version property gives the schema a version, zero unless it is
+   * given, which the database records. A schema whose version is lower than
+   * the database's is refused with `SCHEMA_OUTDATED`, so that a tab running an
+   * older copy of the application cannot undo a newer one's changes.
+   * @category Push
+   * @since v0.5.0
+   */
+  version?: number;
+
+  /**
+   * The drop property, when true, drops each table, and each column of a
+   * table the schema keeps, that the schema leaves out, with their data.
+   * Otherwise they stay as they are.
+   * @category Push
+   * @since v0.5.0
+   */
+  drop?: boolean;
+
+  /**
+   * The renames property maps the new name of each renamed table, as
+   * `table`, or column, as `table.column`, to the name it had, so that push
+   * renames it, keeping its data, rather than creating it empty. A rename
+   * that has already happened changes nothing.
+   * @category Push
+   * @since v0.5.0
+   */
+  renames?: Record<string, string>;
+}
+
+/**
+ * The push function makes the database hold the tables of a Drizzle schema,
+ * as Drizzle Kit's `push` would for PostgreSQL, but from the application and
+ * as one change that commits whole or not at all.
+ *
+ * It reads each table's columns, primary key, unique constraints, and indexes
+ * from Drizzle, and passes them to the Client's setSchema, which creates what
+ * the database lacks and changes what differs. A schema the database already
+ * holds changes nothing, so every tab of an application can call push as it
+ * starts, in place of migrations.
+ *
+ * A table that declares what TinyJoin does not have, such as a foreign key, a
+ * `timestamp` column, an SQL default, or an index on an expression, is
+ * refused before anything changes. A default Drizzle works out in JavaScript,
+ * with `$defaultFn`, is Drizzle's, not the database's.
+ * @param db The Drizzle database, from drizzle.
+ * @param schema The Drizzle schema, whose tables push reads, leaving out its
+ * relations.
+ * @param options The schema's version, whether to drop what it leaves out, and
+ * what it renames.
+ * @returns A Promise resolving to true if the database changed, or false if it
+ * already held the schema.
+ * @example
+ * ```ts
+ * import {create} from 'tinyjoin';
+ * import {drizzle, push} from 'tinyjoin/drizzle';
+ * import * as schema from './schema';
+ *
+ * const db = drizzle(await create('opfs://my-app-v1'), {schema});
+ * await push(db, schema, {version: 2, renames: {'tasks.name': 'title'}});
+ * ```
+ * @category Push
+ * @since v0.5.0
+ */
+export function push<
+  TSchema extends Record<string, unknown> = Record<string, never>,
+>(
+  db: TinyJoinDatabase<TSchema>,
+  schema: Record<string, unknown>,
+  options?: PushOptions,
+): Promise<boolean>;
 ````
 
 # Public API: tinyjoin/kysely

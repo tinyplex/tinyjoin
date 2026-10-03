@@ -22,6 +22,7 @@ pub(crate) const OP_REVISION: u32 = 10;
 pub(crate) const OP_CLOSE: u32 = 11;
 pub(crate) const OP_CHECK: u32 = 12;
 pub(crate) const OP_SCHEMA: u32 = 13;
+pub(crate) const OP_SET_SCHEMA: u32 = 14;
 
 const SUCCESS: u32 = 0;
 const FAILURE: u32 = 1;
@@ -176,9 +177,12 @@ pub(crate) fn prepared_statement_id(value: u32) -> Result<JsValue> {
 }
 
 /// Writes the schema as the payload.
-pub(crate) fn schema(tables: &[(Rc<TableDefinition>, Vec<IndexDefinition>)]) -> Result<JsValue> {
+pub(crate) fn schema(
+    version: u64,
+    tables: &[(Rc<TableDefinition>, Vec<IndexDefinition>)],
+) -> Result<JsValue> {
     let mut json = Json::success(false);
-    json.schema(tables)?;
+    json.schema(version, tables)?;
     json.raw("]");
     json.finish()
 }
@@ -447,8 +451,14 @@ impl Json {
 
     /// Writes the schema as an object of its tables, each with its columns, the columns of its
     /// primary key, and its indexes, all in the order the engine gives them.
-    fn schema(&mut self, tables: &[(Rc<TableDefinition>, Vec<IndexDefinition>)]) -> Result<()> {
-        self.raw("{\"tables\":[");
+    fn schema(
+        &mut self,
+        version: u64,
+        tables: &[(Rc<TableDefinition>, Vec<IndexDefinition>)],
+    ) -> Result<()> {
+        self.raw("{\"version\":");
+        self.unsigned(version)?;
+        self.raw(",\"tables\":[");
         for (position, (table, indexes)) in tables.iter().enumerate() {
             if position > 0 {
                 self.raw(",");
@@ -711,8 +721,9 @@ mod tests {
                 OP_CLOSE,
                 OP_CHECK,
                 OP_SCHEMA,
+                OP_SET_SCHEMA,
             ],
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
         );
     }
 
@@ -826,11 +837,11 @@ mod tests {
             unique: true,
         };
         let mut json = Json::default();
-        json.schema(&[(Rc::new(table), vec![index])]).unwrap();
+        json.schema(7, &[(Rc::new(table), vec![index])]).unwrap();
         assert_eq!(
             json.0,
             concat!(
-                r#"{"tables":[{"name":"t\"1","columns":["#,
+                r#"{"version":7,"tables":[{"name":"t\"1","columns":["#,
                 r#"{"name":"id","type":"integer","nullable":false},"#,
                 r#"{"name":"k","type":"text","nullable":false,"default":"x","maxLength":8},"#,
                 r#"{"name":"doc","type":"json","nullable":true,"default":null}],"#,
@@ -838,8 +849,8 @@ mod tests {
             )
         );
         let mut json = Json::default();
-        json.schema(&[]).unwrap();
-        assert_eq!(json.0, r#"{"tables":[]}"#);
+        json.schema(0, &[]).unwrap();
+        assert_eq!(json.0, r#"{"version":0,"tables":[]}"#);
     }
 
     #[test]

@@ -106,6 +106,10 @@ pub(crate) enum WriteStatement {
         table: String,
         change: TableChange,
     },
+    /// Records the version of the schema an application set, which no SQL statement can.
+    SetSchemaVersion {
+        version: u64,
+    },
     Insert {
         table: String,
         columns: Option<Vec<String>>,
@@ -304,6 +308,9 @@ pub(crate) fn execute<S: StorageDriver>(
             column,
             if_not_exists,
         } => add_column(storage, table, column, *if_not_exists).map(no_changed_keys),
+        WriteStatement::SetSchemaVersion { .. } => Err(EngineError::unsupported_sql(
+            "The in-memory test storage has no schema version",
+        )),
         WriteStatement::AlterTable { table, change } => {
             let outcome = plan_alter_table(storage, table, change)?;
             if outcome.mutated {
@@ -597,7 +604,8 @@ pub(crate) fn plan_dml(
         | WriteStatement::DropTable { .. }
         | WriteStatement::DropIndex { .. }
         | WriteStatement::AddColumn { .. }
-        | WriteStatement::AlterTable { .. } => Err(EngineError::unsupported_sql(
+        | WriteStatement::AlterTable { .. }
+        | WriteStatement::SetSchemaVersion { .. } => Err(EngineError::unsupported_sql(
             "Page-native SQL currently supports SELECT, CREATE TABLE, INSERT, UPDATE, and DELETE",
         )),
     }

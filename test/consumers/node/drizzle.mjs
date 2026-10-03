@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 
 import {eq, sql} from 'drizzle-orm';
 import {integer, jsonb, pgTable, text} from 'drizzle-orm/pg-core';
-import {drizzle, migrate} from 'tinyjoin/drizzle';
+import {drizzle, migrate, push} from 'tinyjoin/drizzle';
 import {create} from 'tinyjoin/node';
 
 const notes = pgTable('notes', {
@@ -23,6 +23,8 @@ try {
   };
   await migrate(db, migration);
   await migrate(db, migration);
+  // The database already holds the schema the migration made.
+  assert.equal(await push(db, {notes}), false);
   assert.equal(db.$client, client);
   await db.insert(notes).values({id: 1, body: 'Hello', meta: {from: 'drizzle'}});
   await db.transaction(async (tx) => {

@@ -3,7 +3,7 @@
 mod page_device;
 mod structured;
 
-use tinyjoin_core::{EngineError, PagedEngine};
+use tinyjoin_core::{EngineError, PagedEngine, SchemaDefinition};
 use wasm_bindgen::prelude::*;
 
 use page_device::WasmPageDevice;
@@ -168,7 +168,24 @@ impl WasmEngine {
             }
             structured::OP_SCHEMA => {
                 request.finish()?;
-                structured::schema(&self.engine()?.schema()?)
+                let engine = self.engine()?;
+                structured::schema(engine.schema_version(), &engine.schema()?)
+            }
+            structured::OP_SET_SCHEMA => {
+                let drop = request.flag()?;
+                let schema = request.values()?;
+                request.finish()?;
+                let [schema] = schema.as_slice() else {
+                    return Err(EngineError::new(
+                        "INVALID_BRIDGE_VALUE",
+                        "Invalid structured bridge request",
+                    ));
+                };
+                let target = SchemaDefinition::from_json(schema)?;
+                let previous_revision = self.engine()?.revision();
+                let outcome = self.engine_mut()?.set_schema(&target, drop)?;
+                let committed = outcome.revision != previous_revision;
+                self.encode_committed(structured::apply_outcome(&outcome, committed), committed)
             }
             _ => Err(EngineError::new(
                 "INVALID_BRIDGE_VALUE",

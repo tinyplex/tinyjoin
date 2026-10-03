@@ -32,6 +32,7 @@ import {
   encodeExecutePrepared,
   encodeExecuteSql,
   encodePrepareSql,
+  encodeSetSchema,
 } from './wasm-preflight.js';
 
 export {WasmBridgeError} from './wasm-preflight.js';
@@ -50,6 +51,7 @@ export const WASM_OPERATION = {
   close: 11,
   check: 12,
   schema: 13,
+  setSchema: 14,
 } as const;
 
 const BRIDGE_VERSION = 5;
@@ -326,6 +328,16 @@ export const adaptStructuredWasmEngine = (
     schema: (): Schema => {
       assertCallable();
       return invoke(WASM_OPERATION.schema, EMPTY_REQUEST, false, decodeSchema);
+    },
+
+    setSchema: (schema: Schema, drop: boolean): ApplyOutcome => {
+      assertCallable();
+      return invoke(
+        WASM_OPERATION.setSchema,
+        encodeSetSchema(schema as unknown as JsonValue, drop),
+        true,
+        decodeApplyOutcome,
+      );
     },
 
     close: (): void => {

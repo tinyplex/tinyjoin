@@ -16,12 +16,25 @@ import {
   relations,
   sql,
 } from 'drizzle-orm';
-import {alias, boolean, integer, jsonb, pgTable, text} from 'drizzle-orm/pg-core';
+import {
+  alias,
+  boolean,
+  index,
+  integer,
+  jsonb,
+  pgTable,
+  primaryKey,
+  text,
+  timestamp,
+  uniqueIndex,
+  varchar,
+} from 'drizzle-orm/pg-core';
 import {afterEach, beforeEach, describe, expect, it} from 'vitest';
 
 import {
   drizzle,
   migrate,
+  push,
   type MigrationJournal,
   type TinyJoinDatabase,
 } from '../../src/drizzle/index.js';
@@ -411,6 +424,145 @@ runIfBuilt('the Drizzle migrator', () => {
     await migrate(racing, {journal, migrations});
     expect(raced).toBe(true);
     expect(await applied()).toHaveLength(3);
+  });
+});
+
+runIfBuilt('the Drizzle push', () => {
+  let client: Client;
+
+  beforeEach(async () => {
+    const {create} = (await import(pathToFileURL(nodeEntry).href)) as {
+      create: () => Promise<Client>;
+    };
+    client = await create();
+  });
+
+  afterEach(async () => {
+    await client.close();
+  });
+
+  const people = pgTable(
+    'people',
+    {
+      id: text('id').primaryKey().$defaultFn(() => 'generated'),
+      name: varchar('name', {length: 40}).notNull(),
+      email: text('email').unique(),
+      active: boolean('active').notNull().default(true),
+      meta: jsonb('meta').default({tags: []}),
+    },
+    (table) => [index('people_name_idx').on(table.name)],
+  );
+  const memberships = pgTable(
+    'memberships',
+    {
+      personId: text('person_id').notNull(),
+      team: integer('team').notNull(),
+    },
+    (table) => [
+      primaryKey({columns: [table.personId, table.team]}),
+      uniqueIndex().on(table.team, table.personId),
+    ],
+  );
+
+  it('makes the database hold a Drizzle schema, once', async () => {
+    const db = drizzle(client, {schema: {people, memberships}});
+    expect(await push(db, {people, memberships})).toBe(true);
+    expect(await push(db, {people, memberships})).toBe(false);
+    expect(await client.getSchema()).toEqual({
+      version: 0,
+      tables: [
+        {
+          name: 'memberships',
+          columns: [
+            {name: 'person_id', type: 'text', nullable: false},
+            {name: 'team', type: 'integer', nullable: false},
+          ],
+          primaryKey: ['person_id', 'team'],
+          indexes: [
+            {
+              name: 'memberships_team_person_id_index',
+              columns: ['team', 'person_id'],
+              unique: true,
+            },
+          ],
+        },
+        {
+          name: 'people',
+          columns: [
+            {name: 'id', type: 'text', nullable: false},
+            {name: 'name', type: 'text', nullable: false, maxLength: 40},
+            {name: 'email', type: 'text', nullable: true},
+            {name: 'active', type: 'boolean', nullable: false, default: true},
+            {name: 'meta', type: 'json', nullable: true, default: {tags: []}},
+          ],
+          primaryKey: ['id'],
+          indexes: [
+            {name: 'people_email_unique', columns: ['email'], unique: true},
+            {name: 'people_name_idx', columns: ['name'], unique: false},
+          ],
+        },
+      ],
+    });
+    await db.insert(people).values({name: 'Ann'});
+    expect(await db.select().from(people)).toEqual([
+      {id: 'generated', name: 'Ann', email: null, active: true, meta: {tags: []}},
+    ]);
+
+    // A rename keeps the column's values, and a later version is recorded.
+    const renamed = pgTable('people', {
+      id: text('id').primaryKey(),
+      fullName: varchar('full_name', {length: 60}).notNull(),
+      active: boolean('active').notNull().default(false),
+    });
+    const next = drizzle(client, {schema: {renamed}});
+    expect(
+      await push(
+        next,
+        {renamed},
+        {version: 2, drop: true, renames: {'people.full_name': 'name'}},
+      ),
+    ).toBe(true);
+    expect(await next.select().from(renamed)).toEqual([
+      {id: 'generated', fullName: 'Ann', active: true},
+    ]);
+    expect((await client.getSchema()).tables.map(({name}) => name)).toEqual([
+      'people',
+    ]);
+    await expect(push(db, {people, memberships})).rejects.toMatchObject({
+      code: 'SCHEMA_OUTDATED',
+    });
+  });
+
+  it('refuses what TinyJoin cannot hold, before changing anything', async () => {
+    const db = drizzle(client);
+    const owners = pgTable('owners', {id: text('id').primaryKey()});
+    for (const [table, message] of [
+      [
+        pgTable('pets', {
+          id: text('id').primaryKey(),
+          owner: text('owner').references(() => owners.id),
+        }),
+        'foreign keys',
+      ],
+      [
+        pgTable('events', {
+          id: text('id').primaryKey(),
+          at: timestamp('at'),
+        }),
+        'types at as timestamp',
+      ],
+      [
+        pgTable(
+          'scores',
+          {id: text('id').primaryKey(), score: integer('score')},
+          (table) => [index('scores_desc').on(table.score.desc())],
+        ),
+        'orders an index',
+      ],
+    ] as const) {
+      await expect(push(db, {owners, table})).rejects.toThrow(message);
+    }
+    expect((await client.getSchema()).tables).toEqual([]);
   });
 });
 

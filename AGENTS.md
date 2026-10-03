@@ -75,6 +75,10 @@ and has no OPFS, filesystem persistence, or remote synchronization. See the
 - Keep schema setup idempotent with `IF NOT EXISTS` where appropriate.
 - Read tables, columns, primary keys, and indexes with db.getSchema(). There is
   no `information_schema` or `pg_catalog` to query.
+- To declare the schema in code, pass the getSchema() shape to db.setSchema()
+  as the application starts. It creates and alters what differs in one atomic
+  change, keeps rows, renames from `renamedFrom`, drops only with
+  `{drop: true}`, and refuses a lower `version` with `SCHEMA_OUTDATED`.
 - Treat a row generic as a TypeScript assertion, not runtime validation.
 - Consult the
   [SQL compatibility contract](https://tinyjoin.org/guides/sql-compatibility/)
@@ -89,9 +93,10 @@ floating-point numbers, strings, JSON-compatible values, and `null`.
 
 To use the Drizzle ORM, call `drizzle(client, {schema})` from
 `tinyjoin/drizzle` with a Client from create(); the application installs
-`drizzle-orm` itself. Create tables with DDL through client.exec(), or apply
-`drizzle-kit generate` migrations, bundled into the application, with migrate()
-from `tinyjoin/drizzle`; Drizzle's own migrators and `push` do not work. Use the
+`drizzle-orm` itself. Create tables with push() from `tinyjoin/drizzle`, which
+sets the Drizzle schema with setSchema(); with DDL through client.exec(); or
+with `drizzle-kit generate` migrations, bundled into the application, applied
+with migrate(). Drizzle's own migrators and Drizzle Kit's `push` do not work. Use the
 column types TinyJoin has, leave out `.references()`, and avoid relational
 queries with `with`, SQL functions, and nested transactions.
 See the [Drizzle guide](/guides/drizzle/).

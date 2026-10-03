@@ -6,6 +6,7 @@ import {
   Placeholder,
   type QueryWithTypings,
   type RelationalSchemaConfig,
+  SQL,
   type TablesRelationalConfig,
   createTableRelationsHelpers,
   entityKind,
@@ -14,7 +15,14 @@ import {
 } from 'drizzle-orm';
 import type {Cache} from 'drizzle-orm/cache/core';
 import type {WithCacheConfig} from 'drizzle-orm/cache/core/types';
-import {PgDialect, PgJson, PgJsonb} from 'drizzle-orm/pg-core';
+import {
+  type PgColumn,
+  PgDialect,
+  PgJson,
+  PgJsonb,
+  PgTable,
+  getTableConfig,
+} from 'drizzle-orm/pg-core';
 import type {
   PgTransactionConfig,
   PreparedQueryConfig,
@@ -26,7 +34,15 @@ import {
   PgRemoteSession,
 } from 'drizzle-orm/pg-proxy';
 
-import type {Client, JsonValue, Transaction} from '../index.js';
+import type {
+  Client,
+  ColumnSchema,
+  ColumnType,
+  IndexSchema,
+  JsonValue,
+  TableSchema,
+  Transaction,
+} from '../index.js';
 
 export type TinyJoinDatabase<
   TSchema extends Record<string, unknown> = Record<string, never>,
@@ -266,5 +282,139 @@ export async function migrate<
       }
     }
   }
+}
+
+export interface PushOptions {
+  version?: number;
+  drop?: boolean;
+  renames?: Record<string, string>;
+}
+
+// Each PostgreSQL type a Drizzle column can declare that TinyJoin has.
+const COLUMN_TYPES: {[type: string]: ColumnType} = {
+  boolean: 'boolean',
+  smallint: 'integer',
+  integer: 'integer',
+  bigint: 'integer',
+  real: 'float',
+  'double precision': 'float',
+  text: 'text',
+  varchar: 'text',
+  json: 'json',
+  jsonb: 'json',
+};
+
+const tableSchema = (
+  table: PgTable,
+  renames: Record<string, string>,
+): TableSchema => {
+  const config = getTableConfig(table);
+  const name = config.schema ? `${config.schema}.${config.name}` : config.name;
+  const refuse = (what: string): never => {
+    throw new Error(`Table ${name} ${what}, which TinyJoin does not have`);
+  };
+  if (config.foreignKeys.length > 0) {
+    refuse('declares foreign keys');
+  }
+  if (config.checks.length > 0) {
+    refuse('declares check constraints');
+  }
+  const indexes: IndexSchema[] = [];
+  const unique = (
+    indexName: string,
+    columns: PgColumn[],
+    nullsNotDistinct: boolean,
+  ): void => {
+    if (nullsNotDistinct) {
+      refuse(`makes ${indexName} treat NULLs as equal`);
+    }
+    indexes.push({
+      name: indexName,
+      columns: columns.map((column) => column.name),
+      unique: true,
+    });
+  };
+  const columns = config.columns.map((column): ColumnSchema => {
+    const [, sqlType = '', length] =
+      /^([a-z ]+)(?:\((\d+)\))?$/.exec(column.getSQLType()) ?? [];
+    const type = COLUMN_TYPES[sqlType] ?? refuse(`types ${column.name} as ${column.getSQLType()}`);
+    if (column.isUnique) {
+      unique(column.uniqueName!, [column], column.uniqueType === 'not distinct');
+    }
+    // A default Drizzle works out in JavaScript, with $defaultFn, is not the
+    // database's.
+    if (is(column.default, SQL)) {
+      refuse(`defaults ${column.name} with SQL`);
+    }
+    const renamedFrom = renames[`${name}.${column.name}`];
+    return {
+      name: column.name,
+      type,
+      nullable: !column.notNull,
+      ...(column.default === undefined
+        ? {}
+        : {default: column.default as JsonValue}),
+      ...(length === undefined ? {} : {maxLength: Number(length)}),
+      ...(renamedFrom === undefined ? {} : {renamedFrom}),
+    };
+  });
+  for (const constraint of config.uniqueConstraints) {
+    unique(
+      constraint.getName() ??
+        `${config.name}_${constraint.columns.map(({name}) => name).join('_')}_unique`,
+      constraint.columns,
+      constraint.nullsNotDistinct,
+    );
+  }
+  for (const {config: index} of config.indexes) {
+    const columnNames = index.columns.map((column) => {
+      const {name: columnName, indexConfig} = (is(column, SQL) ? {} : column) as {
+        name?: string;
+        indexConfig?: {order?: string; nulls?: string; opClass?: string};
+      };
+      return columnName === undefined
+        ? refuse('indexes an expression')
+        : indexConfig?.order === 'desc' ||
+            indexConfig?.nulls === 'first' ||
+            indexConfig?.opClass !== undefined
+          ? refuse('orders an index or gives it an operator class')
+          : columnName;
+    });
+    if (index.where || (index.method ?? 'btree') !== 'btree') {
+      refuse(`makes ${index.name ?? 'an index'} partial or not a B-tree`);
+    }
+    indexes.push({
+      name: index.name ?? `${config.name}_${columnNames.join('_')}_index`,
+      columns: columnNames,
+      unique: index.unique,
+    });
+  }
+  const renamedFrom = renames[name];
+  return {
+    name,
+    columns,
+    primaryKey:
+      config.primaryKeys[0]?.columns.map((column) => column.name) ??
+      config.columns.filter((column) => column.primary).map(({name}) => name),
+    indexes,
+    ...(renamedFrom === undefined ? {} : {renamedFrom}),
+  };
+};
+
+/**
+ * Makes the Client's database hold the tables of a Drizzle schema, as Drizzle
+ * Kit's push would, but in the application and as one atomic change.
+ */
+export async function push<
+  TSchema extends Record<string, unknown> = Record<string, never>,
+>(
+  db: TinyJoinDatabase<TSchema>,
+  schema: Record<string, unknown>,
+  {version = 0, drop = false, renames = {}}: PushOptions = {},
+): Promise<boolean> {
+  const tables = Object.values(schema)
+    .filter((value): value is PgTable => is(value, PgTable))
+    .map((table) => tableSchema(table, renames));
+  return db.$client.setSchema({version, tables}, {drop});
 }
 

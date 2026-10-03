@@ -70,7 +70,7 @@ primary keys, and indexes, rather than through SQL catalog tables, which
 TinyJoin does not have:
 
 ```ts
-const {tables} = await db.getSchema();
+const {version, tables} = await db.getSchema();
 const tasks = tables.find(({name}) => name === 'tasks');
 // -> {
 //   name: 'tasks',
@@ -89,12 +89,68 @@ the table declares them, followed by any that `ALTER TABLE` added. A column's
 not the spelling it was declared with, so `VARCHAR` reads back as `text` and
 `BIGINT` as `integer`; a `VARCHAR(n)` column's `maxLength` is its `n`. `default` is present only for a column that declares
 one, and is `null` for `DEFAULT NULL`. The primary key is not listed among the
-indexes, and its columns are never nullable.
+indexes, and its columns are never nullable. `version` is the version the
+application last gave the schema with setSchema(), or zero.
 
 Use it to confirm that a database matches the schema the application expects,
 to decide which migration steps an older database still needs, or to generate
 code from the tables. It reads only the catalog, not rows, so it is cheap even
 for a large database. Call it outside a transaction.
+
+## Setting the schema
+
+setSchema() is the other way round: it takes a schema in the shape getSchema()
+returns, and makes the database's tables match it. An application can declare
+its schema in code and call setSchema() as it starts, rather than keeping a
+series of migrations:
+
+```ts
+await db.setSchema({
+  version: 2,
+  tables: [
+    {
+      name: 'tasks',
+      columns: [
+        {name: 'id', type: 'text', nullable: false},
+        {name: 'name', renamedFrom: 'title', type: 'text', nullable: false, maxLength: 200},
+        {name: 'done', type: 'boolean', nullable: false, default: false},
+        {name: 'priority', type: 'integer', nullable: false, default: 0},
+      ],
+      primaryKey: ['id'],
+      indexes: [{name: 'tasks_done', columns: ['done'], unique: false}],
+    },
+  ],
+});
+```
+
+It compares the schema with the database's and makes the difference in one
+change, which commits whole or not at all, with the statements TinyJoin's
+[DDL](/guides/sql-compatibility/#statements-and-clauses) would run:
+
+- a table or column the database lacks is created;
+- a table or column whose `renamedFrom` the database still has is renamed,
+  keeping its rows and values;
+- a column's default, nullability, and `VARCHAR` length become the schema's;
+- each table's indexes become exactly the schema's; and
+- a table or column the schema leaves out stays, unless setSchema() is given
+  `{drop: true}`.
+
+Rows keep their values, so a change that a row prevents fails, changing
+nothing: `NOT NULL` where a row holds `NULL`, a shorter `VARCHAR` than a value,
+or a `NOT NULL` column without a default added to a table with rows. A change
+no statement could make, to a primary key or a column's runtime type, is
+refused. Make one by creating a new table under a new name, copying the rows
+with the application's own code, and dropping the old table.
+
+A schema the database already has changes nothing and resolves to `false`, so
+every tab can call setSchema() as it starts. `version` guards against a tab
+that still runs an older copy of the application: setSchema() refuses a schema
+whose version is lower than the database's with `SCHEMA_OUTDATED`, and records
+a higher one. Give each schema change a higher version, and leave `renamedFrom`
+in place for as long as an older database may still have the old name.
+
+The [Drizzle guide](/guides/drizzle/#push) shows how to set a Drizzle schema
+this way.
 
 ## Application backups and restoration
 

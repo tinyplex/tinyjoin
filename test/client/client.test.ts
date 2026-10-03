@@ -1163,6 +1163,7 @@ describe('Client', () => {
     const worker = writableWorker();
     const answer = worker.onPost!;
     const schema = {
+      version: 2,
       tables: [
         {
           name: 'posts',
@@ -1184,6 +1185,32 @@ describe('Client', () => {
     await expect(client.getSchema()).resolves.toEqual(schema);
     await client.transaction(async () => {
       await expect(client.getSchema()).rejects.toMatchObject({
+        code: 'TRANSACTION_ACTIVE',
+      });
+    });
+    await client.close();
+  });
+
+  it('sets the schema, dropping nothing unless asked, outside a transaction', async () => {
+    const worker = writableWorker();
+    const answer = worker.onPost!;
+    const params: unknown[] = [];
+    worker.onPost = (message) => {
+      if (message.method !== 'setSchema') return answer(message);
+      params.push(message.params);
+      queueMicrotask(() => respondOk(worker, message, params.length === 1));
+    };
+    const client = await create({worker});
+    const schema = {version: 1, tables: []};
+
+    await expect(client.setSchema(schema)).resolves.toBe(true);
+    await expect(client.setSchema(schema, {drop: true})).resolves.toBe(false);
+    expect(params).toEqual([
+      {schema, drop: false},
+      {schema, drop: true},
+    ]);
+    await client.transaction(async () => {
+      await expect(client.setSchema(schema)).rejects.toMatchObject({
         code: 'TRANSACTION_ACTIVE',
       });
     });

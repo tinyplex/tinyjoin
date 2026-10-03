@@ -5,6 +5,7 @@ import {
   isSqlResultText,
   readSqlResult,
   type Row,
+  type Schema,
   type SqlResult,
   type SqlResultText,
 } from '../../src/protocol.ts';
@@ -137,6 +138,7 @@ describe('WASM engine bridge', () => {
       close: 11,
       check: 12,
       schema: 13,
+      setSchema: 14,
     });
   });
 
@@ -373,6 +375,7 @@ describe('WASM engine bridge', () => {
   it('reads a schema, and keeps a malformed one nonfatal', () => {
     const raw = new FakeRawEngine();
     const schema = {
+      version: 0,
       tables: [
         {
           name: 'notes',
@@ -399,6 +402,18 @@ describe('WASM engine bridge', () => {
     raw.response = success({tables: [{name: 'notes'}]});
     expect(() => engine.schema()).toThrow(WasmStructuredDecodeError);
     expect(raw.closeCalls).toBe(0);
+
+    raw.response = success({revision: 4, tables: ['notes'], keys: {}}, DURABLE);
+    expect(engine.setSchema(schema as Schema, true)).toEqual({
+      revision: 4,
+      tables: ['notes'],
+      keys: {},
+    });
+    expect(raw.calls.at(-1)).toEqual({
+      bridgeVersion: VERSION,
+      operation: WASM_OPERATION.setSchema,
+      payload: {schema, drop: true},
+    });
   });
 
   it('keeps malformed nonmutating control results nonfatal', () => {

@@ -82,6 +82,9 @@ export interface ColumnSchema {
 
   /// ColumnSchema.maxLength
   maxLength?: number;
+
+  /// ColumnSchema.renamedFrom
+  renamedFrom?: string;
 }
 
 /// IndexSchema
@@ -109,12 +112,24 @@ export interface TableSchema {
 
   /// TableSchema.indexes
   indexes: IndexSchema[];
+
+  /// TableSchema.renamedFrom
+  renamedFrom?: string;
 }
 
 /// Schema
 export interface Schema {
+  /// Schema.version
+  version: number;
+
   /// Schema.tables
   tables: TableSchema[];
+}
+
+/// SetSchemaOptions
+export interface SetSchemaOptions {
+  /// SetSchemaOptions.drop
+  drop?: boolean;
 }
 
 /// SerializedError
@@ -325,6 +340,9 @@ export class Client {
 
   /// Client.getSchema
   getSchema(): Promise<Schema>;
+
+  /// Client.setSchema
+  setSchema(schema: Schema, options?: SetSchemaOptions): Promise<boolean>;
 
   /// Client.check
   check(): Promise<void>;

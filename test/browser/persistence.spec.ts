@@ -28,6 +28,7 @@ test('persists complete state across dedicated Worker restarts', async ({
   expect(report.revision).toBe(3);
   expect(report.updatedTitle).toBe('Persisted after forced termination');
   expect(report.schema).toEqual({
+    version: 0,
     tables: [
       {
         name: 'empty_table',

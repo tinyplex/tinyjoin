@@ -287,7 +287,7 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
     const wasm = await loadStructuredModule();
     const {engine} = createRecordingEngine(wasm, new MemoryPageDevice());
     try {
-      expect(engine.schema()).toEqual({tables: []});
+      expect(engine.schema()).toEqual({version: 0, tables: []});
       engine.execSql(
         `CREATE TABLE notes (owner TEXT, id INTEGER, body TEXT DEFAULT 'x',
            meta JSONB DEFAULT NULL, rating REAL NOT NULL, PRIMARY KEY (owner, id));
@@ -299,6 +299,7 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
       const schema = engine.schema();
       expect(isRpcResult('schema', schema)).toBe(true);
       expect(schema).toEqual({
+        version: 0,
         tables: [
           {
             name: 'Tags',
@@ -331,6 +332,50 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
       engine.beginTransaction();
       expect(engine.schema()).toEqual(schema);
       engine.rollbackTransaction();
+    } finally {
+      engine.close();
+    }
+  });
+
+  it('sets the schema the real engine holds, and refuses an older one', async () => {
+    const wasm = await loadStructuredModule();
+    const {engine} = createRecordingEngine(wasm, new MemoryPageDevice());
+    try {
+      const schema = {
+        version: 2,
+        tables: [
+          {
+            name: 'tasks',
+            columns: [
+              {name: 'id', type: 'text' as const, nullable: false},
+              {name: 'title', type: 'text' as const, nullable: false, maxLength: 80},
+              {name: 'done', type: 'boolean' as const, nullable: false, default: false},
+            ],
+            primaryKey: ['id'],
+            indexes: [{name: 'tasks_done', columns: ['done'], unique: false}],
+          },
+        ],
+      };
+      expect(engine.setSchema(schema, false)).toEqual({
+        revision: 1,
+        tables: ['tasks'],
+        keys: {},
+      });
+      expect(engine.schema()).toEqual(schema);
+      expect(engine.setSchema(schema, false)).toEqual({
+        revision: 1,
+        tables: [],
+        keys: {},
+      });
+      expect(
+        captureError(() => engine.setSchema({...schema, version: 1}, false)),
+      ).toMatchObject({code: 'SCHEMA_OUTDATED'});
+      expect(
+        captureError(() =>
+          engine.setSchema({version: 3, tables: [{name: 'x'}]} as never, false),
+        ),
+      ).toMatchObject({code: 'INVALID_SCHEMA'});
+      expect(engine.revision()).toBe(1);
     } finally {
       engine.close();
     }

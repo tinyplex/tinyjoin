@@ -36,3 +36,24 @@ export interface MigrationConfig {
 export function migrate<
   TSchema extends Record<string, unknown> = Record<string, never>,
 >(db: TinyJoinDatabase<TSchema>, config: MigrationConfig): Promise<void>;
+
+/// PushOptions
+export interface PushOptions {
+  /// PushOptions.version
+  version?: number;
+
+  /// PushOptions.drop
+  drop?: boolean;
+
+  /// PushOptions.renames
+  renames?: Record<string, string>;
+}
+
+/// drizzle.push
+export function push<
+  TSchema extends Record<string, unknown> = Record<string, never>,
+>(
+  db: TinyJoinDatabase<TSchema>,
+  schema: Record<string, unknown>,
+  options?: PushOptions,
+): Promise<boolean>;

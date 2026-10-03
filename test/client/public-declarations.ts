@@ -17,6 +17,7 @@ import {
   type RowMode as RowModeImplementation,
   type Schema as SchemaImplementation,
   type SerializedError as SerializedErrorImplementation,
+  type SetSchemaOptions as SetSchemaOptionsImplementation,
   type SubscriptionOptions as SubscriptionOptionsImplementation,
   type TableSchema as TableSchemaImplementation,
   type TablesChangedEvent as TablesChangedEventImplementation,
@@ -42,6 +43,7 @@ import type {
   RowMode as RowModeDeclaration,
   Schema as SchemaDeclaration,
   SerializedError as SerializedErrorDeclaration,
+  SetSchemaOptions as SetSchemaOptionsDeclaration,
   SubscriptionOptions as SubscriptionOptionsDeclaration,
   TableSchema as TableSchemaDeclaration,
   TablesChangedEvent as TablesChangedEventDeclaration,
@@ -128,6 +130,9 @@ type PublicTypeParity = [
   Assert<Equivalent<RowImplementation, RowDeclaration>>,
   Assert<Equivalent<RowModeImplementation, RowModeDeclaration>>,
   Assert<Equivalent<SchemaImplementation, SchemaDeclaration>>,
+  Assert<
+    Equivalent<SetSchemaOptionsImplementation, SetSchemaOptionsDeclaration>
+  >,
   Assert<Equivalent<SerializedErrorImplementation, SerializedErrorDeclaration>>,
   Assert<
     Equivalent<

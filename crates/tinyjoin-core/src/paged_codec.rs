@@ -46,6 +46,9 @@ pub(crate) const EMPTY_RECORD: &[u8] = &[0, 0];
 const RECORD_VERSION: u8 = 1;
 const RECORD_FLAGS: u8 = 0;
 const CATALOG_HEADER_BYTES: usize = 20;
+/// A header that records a schema version, which v0.4.0 and earlier never wrote, carries it in
+/// eight more bytes. One whose version is zero leaves them out, as those releases wrote it.
+const VERSIONED_CATALOG_HEADER_BYTES: usize = CATALOG_HEADER_BYTES + 8;
 const CATALOG_ITEM_HEADER_BYTES: usize = 40;
 const NO_PAGE_ID: PageId = u64::MAX;
 pub(crate) const MAX_TREE_ID: TreeId = u64::MAX - 1;
@@ -59,6 +62,8 @@ pub(crate) struct CatalogHeader {
     pub next_tree_id: TreeId,
     pub table_count: u32,
     pub index_count: u32,
+    /// The version an application last gave its schema, or zero.
+    pub schema_version: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1222,6 +1227,9 @@ pub(crate) fn encode_catalog_header_record(header: &CatalogHeader) -> Result<(Ve
     value.extend_from_slice(&header.next_tree_id.to_le_bytes());
     value.extend_from_slice(&header.table_count.to_le_bytes());
     value.extend_from_slice(&header.index_count.to_le_bytes());
+    if header.schema_version > 0 {
+        value.extend_from_slice(&header.schema_version.to_le_bytes());
+    }
     Ok((vec![CATALOG_HEADER_KEY], value))
 }
 
@@ -1231,16 +1239,22 @@ pub(crate) fn decode_catalog_header_record(key: &[u8], value: &[u8]) -> Result<C
             "A catalog header value must use the catalog header key",
         ));
     }
-    if value.len() != CATALOG_HEADER_BYTES {
-        return Err(storage_corrupt(format!(
-            "A catalog header value must contain exactly {CATALOG_HEADER_BYTES} bytes"
-        )));
-    }
+    let schema_version = match value.len() {
+        CATALOG_HEADER_BYTES => 0,
+        VERSIONED_CATALOG_HEADER_BYTES if read_u64(value, 20) > 0 => read_u64(value, 20),
+        _ => {
+            return Err(storage_corrupt(format!(
+                "A catalog header value must contain {CATALOG_HEADER_BYTES} bytes, or \
+                 {VERSIONED_CATALOG_HEADER_BYTES} with a schema version"
+            )));
+        }
+    };
     validate_record_prefix(value, "catalog header")?;
     let header = CatalogHeader {
         next_tree_id: read_u64(value, 4),
         table_count: read_u32(value, 12),
         index_count: read_u32(value, 16),
+        schema_version,
     };
     validate_catalog_header(&header).map_err(as_storage_corruption)?;
     Ok(header)
@@ -1884,6 +1898,11 @@ fn validate_catalog_header(header: &CatalogHeader) -> Result<()> {
         return Err(value_too_large(format!(
             "A catalog cannot contain more than {MAX_CATALOG_INDEXES} indexes"
         )));
+    }
+    if header.schema_version > MAX_SAFE_INTEGER {
+        return Err(value_too_large(
+            "A schema version must be a JavaScript-safe integer",
+        ));
     }
     let tree_count = u64::from(header.table_count) + u64::from(header.index_count);
     let minimum_next_tree_id = FIRST_USER_TREE_ID
@@ -2894,10 +2913,25 @@ mod tests {
             next_tree_id: 4,
             table_count: 1,
             index_count: 1,
+            schema_version: 0,
         };
         let (key, value) = encode_catalog_header_record(&header).unwrap();
         assert_eq!(key, [CATALOG_HEADER_KEY]);
+        assert_eq!(value.len(), CATALOG_HEADER_BYTES);
         assert_eq!(decode_catalog_header_record(&key, &value).unwrap(), header);
+        // A schema version takes eight more bytes, which a version of zero leaves out.
+        let versioned = CatalogHeader {
+            schema_version: 3,
+            ..header.clone()
+        };
+        let (key, mut value) = encode_catalog_header_record(&versioned).unwrap();
+        assert_eq!(value.len(), VERSIONED_CATALOG_HEADER_BYTES);
+        assert_eq!(decode_catalog_header_record(&key, &value).unwrap(), versioned);
+        value[20..].fill(0);
+        assert_eq!(
+            decode_catalog_header_record(&key, &value).unwrap_err().code,
+            "PAGED_STORAGE_CORRUPT"
+        );
 
         let table = table_record();
         let (key, value) = encode_catalog_table_record(&table).unwrap();
@@ -2959,6 +2993,7 @@ mod tests {
             next_tree_id: 2,
             table_count: MAX_CATALOG_TABLES + 1,
             index_count: 0,
+            schema_version: 0,
         };
         assert_eq!(
             encode_catalog_header_record(&oversized).unwrap_err().code,
@@ -2968,6 +3003,7 @@ mod tests {
             next_tree_id: 3,
             table_count: 1,
             index_count: 1,
+            schema_version: 0,
         };
         assert_eq!(
             encode_catalog_header_record(&insufficient_tree_range)

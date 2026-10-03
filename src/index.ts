@@ -23,5 +23,6 @@ export type {
   RowMode,
   Schema,
   SerializedError,
+  SetSchemaOptions,
   TableSchema,
 } from './protocol.js';

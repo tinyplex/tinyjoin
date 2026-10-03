@@ -136,7 +136,8 @@ function mockEngine() {
     inTransaction: vi.fn(() => transactionActive),
     revision: vi.fn(() => revision),
     check: vi.fn(),
-    schema: vi.fn(() => ({tables: []})),
+    schema: vi.fn(() => ({version: 0, tables: []})),
+    setSchema: vi.fn(() => ({revision: 0, tables: [], keys: {}})),
     close: vi.fn(),
   };
   return engine;
@@ -776,6 +777,7 @@ describe('startWorker', () => {
     const scope = new FakeScope();
     const engine = mockEngine();
     const schema = {
+      version: 0,
       tables: [
         {
           name: 'posts',
@@ -811,6 +813,64 @@ describe('startWorker', () => {
       });
     }
     expect(engine.schema).toHaveBeenCalledTimes(2);
+  });
+
+  it('sets the schema outside a transaction and announces the tables it changed', async () => {
+    const scope = new FakeScope();
+    const engine = mockEngine();
+    const schema = {version: 1, tables: []};
+    vi.mocked(engine.setSchema)
+      .mockReturnValueOnce({revision: 1, tables: ['tasks'], keys: {}})
+      .mockReturnValueOnce({revision: 0, tables: [], keys: {}});
+    startWorker({scope, durableEngineFactory: async () => engine});
+    const requests = [
+      {id: 1, method: 'init', params: {storage: {kind: 'memory'}}},
+      {id: 2, method: 'setSchema', params: {schema, drop: true}},
+      {id: 3, method: 'setSchema', params: {schema, drop: false}},
+      {id: 4, method: 'beginTransaction', params: undefined},
+      {id: 5, method: 'setSchema', params: {schema, drop: false}},
+    ];
+    for (const request of requests) {
+      scope.send({v: PROTOCOL_VERSION, ...request} as WorkerRequest);
+    }
+    await waitForPosted(scope, 6);
+
+    expect(scope.posted).toContainEqual({
+      v: PROTOCOL_VERSION,
+      id: 2,
+      ok: true,
+      result: true,
+    });
+    expect(scope.posted).toContainEqual({
+      v: PROTOCOL_VERSION,
+      id: 3,
+      ok: true,
+      result: false,
+    });
+    expect(scope.posted).toContainEqual({
+      v: PROTOCOL_VERSION,
+      id: 5,
+      ok: false,
+      error: {
+        code: 'TRANSACTION_ACTIVE',
+        message: 'A TinyJoin transaction is already active',
+      },
+    });
+    expect(vi.mocked(engine.setSchema).mock.calls).toEqual([
+      [schema, true],
+      [schema, false],
+    ]);
+    expect(
+      scope.posted.filter(
+        (message): message is WorkerEvent => 'event' in message,
+      ),
+    ).toEqual([
+      {
+        v: PROTOCOL_VERSION,
+        event: 'tablesChanged',
+        payload: {revision: 1, tables: ['tasks'], keys: {}},
+      },
+    ]);
   });
 
   it('keeps the transaction token active when rollback fails so cleanup can retry', async () => {

@@ -51,6 +51,7 @@ pub(crate) struct PagedStorage<D: PageDevice> {
     pager: RefCell<Pager<D>>,
     revision: u64,
     next_tree_id: TreeId,
+    schema_version: u64,
     // Shared with each script candidate, which copies them only if it changes the catalog.
     tables: Rc<NameMap<PagedTable>>,
     indexes: Rc<NameMap<PagedIndex>>,
@@ -282,11 +283,12 @@ pub(crate) struct ValidatedRowWrites {
 
 const MAX_PAGED_BATCH_OPERATIONS: usize = 1_000_000;
 const MAX_PAGED_BATCH_BYTES: usize = 16 * 1024 * 1024;
-type LoadedCatalog = (TreeId, NameMap<PagedTable>, NameMap<PagedIndex>);
+type LoadedCatalog = (TreeId, u64, NameMap<PagedTable>, NameMap<PagedIndex>);
 
 /// A catalog's table and index records, each list in name order, as the catalog holds them.
 struct CatalogRecords {
     next_tree_id: TreeId,
+    schema_version: u64,
     tables: Vec<(String, CatalogTableRecord)>,
     indexes: Vec<(String, CatalogIndexRecord)>,
 }
@@ -311,6 +313,7 @@ impl<D: PageDevice> PagedStorage<D> {
                 pager: RefCell::new(pager),
                 revision,
                 next_tree_id: FIRST_USER_TREE_ID,
+                schema_version: 0,
                 tables: Rc::default(),
                 indexes: Rc::default(),
                 recovery_required: false,
@@ -319,11 +322,13 @@ impl<D: PageDevice> PagedStorage<D> {
             });
         };
 
-        let (next_tree_id, tables, indexes) = load_catalog(&mut pager, catalog_root_page_id)?;
+        let (next_tree_id, schema_version, tables, indexes) =
+            load_catalog(&mut pager, catalog_root_page_id)?;
         Ok(Self {
             pager: RefCell::new(pager),
             revision,
             next_tree_id,
+            schema_version,
             tables: Rc::new(tables),
             indexes: Rc::new(indexes),
             recovery_required: false,
@@ -398,6 +403,7 @@ impl<D: PageDevice> PagedStorage<D> {
                 &mut pager,
                 self.revision,
                 self.next_tree_id,
+                self.schema_version,
                 self.tables.clone(),
                 self.indexes.clone(),
                 statements,
@@ -424,6 +430,7 @@ impl<D: PageDevice> PagedStorage<D> {
             committed,
             revision,
             next_tree_id,
+            schema_version,
             tables,
             indexes,
             results,
@@ -431,6 +438,7 @@ impl<D: PageDevice> PagedStorage<D> {
         if committed {
             self.revision = revision;
             self.next_tree_id = next_tree_id;
+            self.schema_version = schema_version;
             self.tables = tables;
             self.indexes = indexes;
         }
@@ -767,6 +775,11 @@ impl<D: PageDevice> PagedStorage<D> {
 
     /// The operations a write set is charged once for each table it changes: the table's own
     /// catalog entry, and one for each of its indexes.
+    /// The version an application last gave the schema, or zero.
+    pub(crate) fn schema_version(&self) -> u64 {
+        self.schema_version
+    }
+
     /// Every table, in name order, with the indexes on it, also in name order.
     pub(crate) fn schema(&self) -> Result<Vec<(Rc<TableDefinition>, Vec<IndexDefinition>)>> {
         self.ensure_ready()?;
@@ -949,6 +962,7 @@ impl<D: PageDevice> PagedStorage<D> {
                 &mut pager,
                 self.revision,
                 self.next_tree_id,
+                self.schema_version,
                 self.tables.clone(),
                 self.indexes.clone(),
                 &changes,
@@ -1581,6 +1595,7 @@ fn load_catalog<D: PageDevice>(
 ) -> Result<LoadedCatalog> {
     let CatalogRecords {
         next_tree_id,
+        schema_version,
         tables: table_records,
         indexes: index_records,
     } = read_catalog_records(pager, catalog_root_page_id)?;
@@ -1609,7 +1624,7 @@ fn load_catalog<D: PageDevice>(
         };
         indexes.insert(name, index);
     }
-    Ok((next_tree_id, tables, indexes))
+    Ok((next_tree_id, schema_version, tables, indexes))
 }
 
 /// Reads every catalog record, and checks the records against each other: one header, whose
@@ -1682,6 +1697,7 @@ fn read_catalog_records<D: PageDevice>(
     }
     Ok(CatalogRecords {
         next_tree_id: header.next_tree_id,
+        schema_version: header.schema_version,
         tables: table_records,
         indexes: index_records,
     })
@@ -2389,6 +2405,7 @@ mod tests {
             next_tree_id: FIRST_USER_TREE_ID + 6,
             table_count: 3,
             index_count: 2,
+            schema_version: 0,
         })
         .unwrap();
         let root = Btree::upsert(&mut transaction, root, CATALOG_TREE_ID, &key, &value)
@@ -2426,6 +2443,7 @@ mod tests {
                     next_tree_id: tree_id + 1,
                     table_count: 1,
                     index_count: 1,
+                    schema_version: 0,
                 })
                 .unwrap(),
                 encode_catalog_index_record(&CatalogIndexRecord {

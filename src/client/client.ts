@@ -21,6 +21,7 @@ import {
   type Results,
   type Row,
   type Schema,
+  type SetSchemaOptions,
   type SqlResult,
   type StorageOptions,
 } from '../protocol.js';
@@ -123,6 +124,7 @@ export interface Client {
   ): () => void;
   getRevision(): number;
   getSchema(): Promise<Schema>;
+  setSchema(schema: Schema, options?: SetSchemaOptions): Promise<boolean>;
   check(): Promise<void>;
   close(): Promise<void>;
 }
@@ -510,6 +512,12 @@ const createClient = (options: ClientOptions): Client => {
 
     getSchema: (): Promise<Schema> =>
       direct(() => rpc.request('schema', undefined)),
+
+    setSchema: (
+      schema: Schema,
+      {drop = false}: SetSchemaOptions = {},
+    ): Promise<boolean> =>
+      direct(() => rpc.request('setSchema', {schema, drop})),
 
     check: (): Promise<void> => direct(() => rpc.request('check', undefined)),
 

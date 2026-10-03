@@ -229,6 +229,13 @@ export const encodeClosePrepared = (statementId: number): Uint8Array => {
   return request.bytes();
 };
 
+export const encodeSetSchema = (schema: JsonValue, drop: boolean): Uint8Array => {
+  const request = new RequestWriter();
+  request.u8(drop ? 1 : 0);
+  writeJsonValues(request, [schema], 0, 'schema');
+  return request.bytes();
+};
+
 export const encodeExecSql = (sql: string, arrayRows: boolean): Uint8Array => {
   const request = new RequestWriter();
   request.u8(arrayRows ? 1 : 0);
