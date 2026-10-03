@@ -107,8 +107,9 @@ To use Kysely, give the `Kysely` constructor a TinyJoinDialect from
 `tinyjoin/kysely`, constructed with `{client}`; the application installs
 `kysely` itself and closes the Client.
 Kysely's Migrator and introspector work. Use the column types TinyJoin has,
-leave out foreign keys, select a join's columns by name rather than with
-`selectAll`, and avoid `jsonArrayFrom`, SQL functions, and savepoints. See the
+leave out foreign keys, use `selectAll('table')` rather than `selectAll()`
+over a join whose tables share column names, and avoid `jsonArrayFrom`, SQL
+functions, and savepoints. See the
 [Kysely guide](/guides/kysely/).
 
 ## Transactions and changes

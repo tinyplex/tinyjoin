@@ -472,7 +472,7 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 
 | Keyword or form | Status | TinyJoin form and boundary |
 | --- | --- | --- |
-| `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or a left-deep join over two to eight typed table sources. A single-table projection is `*` or a list of columns and [expressions](https://tinyjoin.org/guides/sql-compatibility/#expressions), each optionally renamed with `AS`. A statement over one table may [qualify its columns](https://tinyjoin.org/guides/sql-compatibility/#qualified-columns) with that table's name or alias. Join projections list columns and expressions explicitly: neither `*` nor `table.*` is supported. Output names must be distinct unless the rows are [read as arrays](https://tinyjoin.org/guides/sql-compatibility/#repeated-output-names): otherwise duplicates return `INVALID_QUERY`, including for empty results and `LIMIT 0`. There is no `SELECT` without `FROM`. |
+| `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or a left-deep join over two to eight typed table sources. A single-table projection is `*` or a list of columns and [expressions](https://tinyjoin.org/guides/sql-compatibility/#expressions), each optionally renamed with `AS`. A statement over one table may [qualify its columns](https://tinyjoin.org/guides/sql-compatibility/#qualified-columns) with that table's name or alias. A join's projection lists columns, expressions, `*` for every column of every table, and `table.*` for every column of one; so may a single-table projection, beside `*`. Output names must be distinct unless the rows are [read as arrays](https://tinyjoin.org/guides/sql-compatibility/#repeated-output-names): otherwise duplicates return `INVALID_QUERY`, including for empty results and `LIMIT 0`. There is no `SELECT` without `FROM`. |
 | `WHERE` | Supported | Predicates described below, with SQL three-valued null logic. |
 | `ORDER BY` | Narrow | Up to 32 plain or [qualified](https://tinyjoin.org/guides/sql-compatibility/#qualified-columns) columns or projected output names for simple queries, projected output names for grouped/aggregate queries, and projected output names or qualified/unambiguous source columns for joins; `ASC`/`DESC` and `NULLS FIRST`/`LAST`. An output name takes precedence over a source column with the same name. JSON values cannot be ordered. |
 | `LIMIT`, `OFFSET` | Supported | Non-negative integer literal or `$n` parameter. `LIMIT` is at most 100,000; `OFFSET` and `OFFSET + LIMIT` are at most 4,294,967,295. `OFFSET` may appear alone; when both occur, `LIMIT` must precede `OFFSET`. |
@@ -871,10 +871,14 @@ name. Without `ORDER BY`, row order is not part of the contract.
 
 ### Join projection and identifier boundaries
 
-Join projections must name each output column explicitly. Wildcards `*` and
-`table.*` are rejected. A join also rejects any source table whose catalog
-contains a column name with a dot, even if the projection and `ON` clause do
-not use that column. Quoting does not remove this restriction.
+A join's projection can name columns and expressions, or use `*` for every
+column of every table, in the order the query joins them, and `table.*` for
+every column of one table, each in the order its table declares them. Output
+names must still be distinct when rows are read as objects, so a `*` over
+tables that share a column name, such as `id`, needs
+[array rows](https://tinyjoin.org/guides/sql-compatibility/#repeated-output-names). A join also rejects any source table
+whose catalog contains a column name with a dot, even if the projection and
+`ON` clause do not use that column. Quoting does not remove this restriction.
 
 This small schema reproduces both boundaries:
 
@@ -895,17 +899,18 @@ FROM left_items JOIN right_items ON left_items.id = right_items.id;
 ```
 
 ```sql
+SELECT left_items.* FROM left_items JOIN right_items ON left_items.id = right_items.id;
+```
+
+```sql
 SELECT id, "extra.value" FROM dotted_items;
 ```
 
-Each of the following statements is unsupported:
+Each of the following statements fails, the first only when its rows are
+read as objects, which cannot hold both tables' `id`:
 
 ```sql
 SELECT * FROM left_items JOIN right_items ON left_items.id = right_items.id;
-```
-
-```sql
-SELECT left_items.* FROM left_items JOIN right_items ON left_items.id = right_items.id;
 ```
 
 ```sql
@@ -2233,11 +2238,12 @@ from the Client's getSchema(), with each column's PostgreSQL type: `bool`,
 
 These work as Kysely documents them:
 
-- `selectFrom` with `select`, and `selectAll` on one table;
+- `selectFrom` with `select` and `selectAll`, including `selectAll('table')`
+  over a join;
 - `where` with comparisons, `and`, `or`, `not`, `in` with values or a
   subquery, `between`, `like`, `ilike`, and `is null`;
 - `orderBy`, `limit`, and `offset`;
-- inner and left joins of up to eight tables, selecting their columns by name;
+- inner and left joins of up to eight tables;
 - `groupBy` with `countAll`, `count`, `sum`, `avg`, `min`, and `max`;
 - `insertInto` with `values`, `defaultValues`, and `onConflict`, with
   `doNothing` or `doUpdateSet`;
@@ -2247,7 +2253,8 @@ These work as Kysely documents them:
 
 These are refused with an error rather than run:
 
-- `selectAll` over a join;
+- `selectAll()` over a join whose tables share a column name, such as `id`,
+  since Kysely reads rows as objects, which cannot hold both;
 - `jsonArrayFrom` and `jsonObjectFrom`, which Kysely writes as correlated JSON
   subqueries, `exists`, and other correlated subqueries;
 - SQL functions such as `coalesce`, `case`, and casts;
@@ -2879,8 +2886,9 @@ To use Kysely, give the `Kysely` constructor a TinyJoinDialect from
 `tinyjoin/kysely`, constructed with `{client}`; the application installs
 `kysely` itself and closes the Client.
 Kysely's Migrator and introspector work. Use the column types TinyJoin has,
-leave out foreign keys, select a join's columns by name rather than with
-`selectAll`, and avoid `jsonArrayFrom`, SQL functions, and savepoints. See the
+leave out foreign keys, use `selectAll('table')` rather than `selectAll()`
+over a join whose tables share column names, and avoid `jsonArrayFrom`, SQL
+functions, and savepoints. See the
 [Kysely guide](https://tinyjoin.org/guides/kysely/).
 
 ## Transactions and changes
@@ -3066,6 +3074,12 @@ A single-table or join query can also return expressions, as in
 named `?column?`, as in PostgreSQL. Aggregate and `SELECT DISTINCT` queries
 still return only columns and aggregates. See
 [expressions](https://tinyjoin.org/guides/sql-compatibility/#expressions).
+
+A join's select list can use `*` for every column of every table and `table.*`
+for every column of one, as in `SELECT p.*, u.name FROM posts p JOIN users u
+ON u.id = p.user_id`, and a single table's can put `*` beside other outputs, as
+in `SELECT *, price * quantity AS total FROM items`. Object rows still need
+distinct names, so a `*` over tables that share a column name needs array rows.
 
 `IN` and `NOT IN` can take the values of a subquery, as in
 `WHERE user_id IN (SELECT id FROM users WHERE team = $1)`, in any statement with
@@ -3332,7 +3346,7 @@ quicker than in either.
   longer wait for their code to compile. See
   [custom Workers](https://tinyjoin.org/guides/custom-workers/).
 
-The compressed download is now 329 KiB, up from 295 KiB in v0.3.0.
+The compressed download is now 330 KiB, up from 295 KiB in v0.3.0.
 
 ## v0.3.0
 

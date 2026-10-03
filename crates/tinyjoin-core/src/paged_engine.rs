@@ -3072,6 +3072,111 @@ mod tests {
     }
 
     #[test]
+    fn a_star_over_a_join_lists_every_table_or_one() {
+        let mut engine = users_engine();
+        engine
+            .exec_sql(
+                "CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, \
+                   title TEXT NOT NULL);\
+                 INSERT INTO posts VALUES (10, 1, 'first'), (11, 3, 'second');",
+            )
+            .unwrap();
+        let rows = |result: ExecuteResult| {
+            result
+                .rows
+                .into_iter()
+                .map(Value::Object)
+                .collect::<Vec<_>>()
+        };
+
+        // One table's columns, beside another's, read by name.
+        let posts = "SELECT p.*, u.name FROM posts p JOIN users u ON u.id = p.user_id \
+                     ORDER BY title DESC";
+        assert_eq!(
+            rows(engine.execute_sql(posts, &[]).unwrap()),
+            [
+                json!({"id": 11, "user_id": 3, "title": "second", "name": "bob"}),
+                json!({"id": 10, "user_id": 1, "title": "first", "name": "cy"}),
+            ]
+        );
+        // A table a left join extends with NULLs lists them.
+        assert_eq!(
+            rows(
+                engine
+                    .execute_sql(
+                        "SELECT users.name, posts.* FROM users \
+                         LEFT JOIN posts ON posts.user_id = users.id WHERE users.id = 2",
+                        &[],
+                    )
+                    .unwrap()
+            ),
+            [json!({"name": "ann", "id": null, "user_id": null, "title": null})]
+        );
+
+        // Every table's columns repeat `id`, which only array rows can hold.
+        let every = "SELECT * FROM posts JOIN users ON users.id = posts.user_id ORDER BY posts.id";
+        assert_eq!(
+            engine.execute_sql(every, &[]).unwrap_err().code,
+            "INVALID_QUERY"
+        );
+        let result = engine.execute_sql_rows(every, &[], true).unwrap();
+        assert_eq!(
+            result
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "user_id", "title", "id", "name", "email", "active"]
+        );
+        assert_eq!(
+            rows(result)[0],
+            json!({"000id": 10, "001user_id": 1, "002title": "first", "003id": 1,
+                "004name": "cy", "005email": "c@example.com", "006active": true})
+        );
+        let statement = engine.prepare_sql(every).unwrap();
+        assert_eq!(
+            engine
+                .execute_prepared_rows(statement, &[], true)
+                .unwrap()
+                .rows
+                .len(),
+            2
+        );
+
+        assert_eq!(
+            engine
+                .execute_sql(
+                    "SELECT x.* FROM posts p JOIN users u ON u.id = p.user_id",
+                    &[],
+                )
+                .unwrap_err()
+                .code,
+            "INVALID_QUERY"
+        );
+
+        // A star beside other outputs of one table lists its columns in its place.
+        assert_eq!(
+            rows(
+                engine
+                    .execute_sql("SELECT *, id * 2 AS double FROM users WHERE id = 1", &[])
+                    .unwrap()
+            ),
+            [json!({"id": 1, "name": "cy", "email": "c@example.com", "active": true,
+                "double": 2})]
+        );
+        let repeated = "SELECT u.id, u.* FROM users u WHERE u.id = 2";
+        assert_eq!(
+            engine.execute_sql(repeated, &[]).unwrap_err().code,
+            "INVALID_QUERY"
+        );
+        assert_eq!(
+            rows(engine.execute_sql_rows(repeated, &[], true).unwrap()),
+            [json!({"000id": 2, "001id": 2, "002name": "ann", "003email": null,
+                "004active": false})]
+        );
+    }
+
+    #[test]
     fn array_rows_hold_fields_of_one_name_under_their_positions() {
         let mut engine = users_engine();
         engine

@@ -289,6 +289,8 @@ pub(crate) struct SelectColumn {
     pub(crate) output: String,
     /// An output worked out from the row rather than read from `column`, which is then empty.
     pub(crate) expression: Option<Expression>,
+    /// A `*` beside other outputs, which execution lists as the table's columns.
+    pub(crate) star: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -297,6 +299,8 @@ pub(crate) struct SelectPlan {
     pub(crate) columns: Option<Vec<SelectColumn>>,
     /// Whether the outputs are keyed by position because their names repeat.
     pub(crate) positional: bool,
+    /// Whether rows are read as arrays, so that the outputs a `*` lists may repeat names.
+    pub(crate) array_rows: bool,
     /// Whether `order_by` names outputs rather than the table's columns, because an output it
     /// orders by is worked out from the row.
     pub(crate) ordered_by_outputs: bool,

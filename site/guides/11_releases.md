@@ -74,6 +74,12 @@ named `?column?`, as in PostgreSQL. Aggregate and `SELECT DISTINCT` queries
 still return only columns and aggregates. See
 [expressions](/guides/sql-compatibility/#expressions).
 
+A join's select list can use `*` for every column of every table and `table.*`
+for every column of one, as in `SELECT p.*, u.name FROM posts p JOIN users u
+ON u.id = p.user_id`, and a single table's can put `*` beside other outputs, as
+in `SELECT *, price * quantity AS total FROM items`. Object rows still need
+distinct names, so a `*` over tables that share a column name needs array rows.
+
 `IN` and `NOT IN` can take the values of a subquery, as in
 `WHERE user_id IN (SELECT id FROM users WHERE team = $1)`, in any statement with
 a `WHERE` clause. The subquery runs once, before the statement reads any row,

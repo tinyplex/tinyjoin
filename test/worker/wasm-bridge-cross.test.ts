@@ -138,11 +138,15 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
     try {
       engine.execSql(examples[0]!);
       expect(engine.executeSql(examples[1]!, []).rows).toEqual([{id: 1}]);
-      expect(engine.executeSql(examples[2]!, []).rows).toEqual([{id: 1, 'extra.value': 'kept'}]);
-      for (const [index, sql] of examples.slice(3).entries()) {
-        expect(captureError(() => engine.executeSql(sql, [])), sql)
-          .toMatchObject({code: index === 1 ? 'SQL_PARSE_ERROR' : 'UNSUPPORTED_SQL'});
-      }
+      expect(engine.executeSql(examples[2]!, []).rows).toEqual([{id: 1}]);
+      expect(engine.executeSql(examples[3]!, []).rows).toEqual([{id: 1, 'extra.value': 'kept'}]);
+      expect(captureError(() => engine.executeSql(examples[4]!, []))).toMatchObject({
+        code: 'INVALID_QUERY',
+      });
+      expect(engine.executeSql(examples[4]!, [], 'array').rows).toEqual([[1, 1]]);
+      expect(captureError(() => engine.executeSql(examples[5]!, []))).toMatchObject({
+        code: 'UNSUPPORTED_SQL',
+      });
     } finally {
       engine.close();
     }

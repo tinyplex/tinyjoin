@@ -156,7 +156,7 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 
 | Keyword or form | Status | TinyJoin form and boundary |
 | --- | --- | --- |
-| `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or a left-deep join over two to eight typed table sources. A single-table projection is `*` or a list of columns and [expressions](#expressions), each optionally renamed with `AS`. A statement over one table may [qualify its columns](#qualified-columns) with that table's name or alias. Join projections list columns and expressions explicitly: neither `*` nor `table.*` is supported. Output names must be distinct unless the rows are [read as arrays](#repeated-output-names): otherwise duplicates return `INVALID_QUERY`, including for empty results and `LIMIT 0`. There is no `SELECT` without `FROM`. |
+| `SELECT ... FROM` | Narrow | One table, an aggregate over one table, or a left-deep join over two to eight typed table sources. A single-table projection is `*` or a list of columns and [expressions](#expressions), each optionally renamed with `AS`. A statement over one table may [qualify its columns](#qualified-columns) with that table's name or alias. A join's projection lists columns, expressions, `*` for every column of every table, and `table.*` for every column of one; so may a single-table projection, beside `*`. Output names must be distinct unless the rows are [read as arrays](#repeated-output-names): otherwise duplicates return `INVALID_QUERY`, including for empty results and `LIMIT 0`. There is no `SELECT` without `FROM`. |
 | `WHERE` | Supported | Predicates described below, with SQL three-valued null logic. |
 | `ORDER BY` | Narrow | Up to 32 plain or [qualified](#qualified-columns) columns or projected output names for simple queries, projected output names for grouped/aggregate queries, and projected output names or qualified/unambiguous source columns for joins; `ASC`/`DESC` and `NULLS FIRST`/`LAST`. An output name takes precedence over a source column with the same name. JSON values cannot be ordered. |
 | `LIMIT`, `OFFSET` | Supported | Non-negative integer literal or `$n` parameter. `LIMIT` is at most 100,000; `OFFSET` and `OFFSET + LIMIT` are at most 4,294,967,295. `OFFSET` may appear alone; when both occur, `LIMIT` must precede `OFFSET`. |
@@ -555,10 +555,14 @@ name. Without `ORDER BY`, row order is not part of the contract.
 
 ### Join projection and identifier boundaries
 
-Join projections must name each output column explicitly. Wildcards `*` and
-`table.*` are rejected. A join also rejects any source table whose catalog
-contains a column name with a dot, even if the projection and `ON` clause do
-not use that column. Quoting does not remove this restriction.
+A join's projection can name columns and expressions, or use `*` for every
+column of every table, in the order the query joins them, and `table.*` for
+every column of one table, each in the order its table declares them. Output
+names must still be distinct when rows are read as objects, so a `*` over
+tables that share a column name, such as `id`, needs
+[array rows](#repeated-output-names). A join also rejects any source table
+whose catalog contains a column name with a dot, even if the projection and
+`ON` clause do not use that column. Quoting does not remove this restriction.
 
 This small schema reproduces both boundaries:
 
@@ -579,17 +583,18 @@ FROM left_items JOIN right_items ON left_items.id = right_items.id;
 ```
 
 ```sql
+SELECT left_items.* FROM left_items JOIN right_items ON left_items.id = right_items.id;
+```
+
+```sql
 SELECT id, "extra.value" FROM dotted_items;
 ```
 
-Each of the following statements is unsupported:
+Each of the following statements fails, the first only when its rows are
+read as objects, which cannot hold both tables' `id`:
 
 ```sql
 SELECT * FROM left_items JOIN right_items ON left_items.id = right_items.id;
-```
-
-```sql
-SELECT left_items.* FROM left_items JOIN right_items ON left_items.id = right_items.id;
 ```
 
 ```sql

@@ -76,6 +76,34 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &SelectPlan) -> Result<
     }
 
     let schema = storage.table_schema(&plan.table)?;
+    if let Some(columns) = plan
+        .columns
+        .as_ref()
+        .filter(|columns| columns.iter().any(|item| item.star))
+    {
+        // A `*` beside other outputs lists the table's columns in its place.
+        let mut listed = plan.clone();
+        listed.columns = Some(Vec::new());
+        let items = listed.columns.as_mut().expect("the columns were just set");
+        for item in columns {
+            if !item.star {
+                items.push(item.clone());
+                continue;
+            }
+            for column in &schema.columns {
+                items.push(SelectColumn {
+                    column: column.name.clone(),
+                    output: column.name.clone(),
+                    expression: None,
+                    star: false,
+                });
+            }
+        }
+        if plan.array_rows {
+            position_outputs(&mut listed);
+        }
+        return execute(storage, &listed);
+    }
     let fields = select_fields(&schema, plan.columns.as_deref(), plan.positional)?;
     if let Some(predicate) = &plan.predicate {
         validate_predicate_columns(predicate, &schema, &plan.table)?;
@@ -313,7 +341,10 @@ pub(crate) fn field_name(output: &str, positional: bool) -> &str {
 /// that names outputs takes the key of the first it names, which parsing found to return what any
 /// other of that name does.
 pub(crate) fn position_outputs(plan: &mut SelectPlan) {
-    let Some(columns) = &mut plan.columns else {
+    // The names a `*` lists are known only once the table is read, which positions them.
+    plan.array_rows = true;
+    let Some(columns) = plan.columns.as_mut().filter(|columns| !columns.iter().any(|item| item.star))
+    else {
         return;
     };
     plan.positional = names_repeat(columns.len(), &|index| &columns[index].output);
@@ -1481,6 +1512,7 @@ impl<'a> SqlParser<'a> {
             table,
             columns,
             positional: false,
+            array_rows: false,
             ordered_by_outputs,
             predicate,
             order_by,
@@ -1491,7 +1523,10 @@ impl<'a> SqlParser<'a> {
 
     fn parse_projection(&mut self) -> Result<Option<Vec<SelectColumn>>> {
         if self.consume(TokenMatcher::Star) {
-            return Ok(None);
+            if !self.peek_matches(TokenMatcher::Comma) {
+                return Ok(None);
+            }
+            self.position -= 1;
         }
 
         let mut columns = Vec::new();
@@ -1500,6 +1535,18 @@ impl<'a> SqlParser<'a> {
                 return Err(EngineError::invalid_query(format!(
                     "A projection cannot contain more than {MAX_PROJECTION_COLUMNS} columns"
                 )));
+            }
+            if self.consume(TokenMatcher::Star) {
+                columns.push(SelectColumn {
+                    column: String::new(),
+                    output: String::new(),
+                    expression: None,
+                    star: true,
+                });
+                if !self.consume(TokenMatcher::Comma) {
+                    break;
+                }
+                continue;
             }
             let (column, expression) = match parse_expression_at(
                 &self.tokens,
@@ -1522,6 +1569,7 @@ impl<'a> SqlParser<'a> {
                 column,
                 output,
                 expression,
+                star: false,
             });
             if !self.consume(TokenMatcher::Comma) {
                 break;
@@ -3942,6 +3990,7 @@ mod tests {
             column: column.to_owned(),
             output: column.to_owned(),
             expression: None,
+            star: false,
         }
     }
 
@@ -5315,6 +5364,7 @@ mod tests {
                 table: "posts".to_owned(),
                 columns: Some(vec![select_column("id")]),
                 positional: false,
+                array_rows: false,
                 ordered_by_outputs: false,
                 predicate: None,
                 order_by: vec![],
@@ -5328,6 +5378,7 @@ mod tests {
                 table: "Posts".to_owned(),
                 columns: Some(vec![select_column("ID")]),
                 positional: false,
+                array_rows: false,
                 ordered_by_outputs: false,
                 predicate: None,
                 order_by: vec![],
@@ -5351,6 +5402,7 @@ mod tests {
                 table: "public.posts".to_owned(),
                 columns: Some(vec![select_column("display\"name")]),
                 positional: false,
+                array_rows: false,
                 ordered_by_outputs: false,
                 predicate: Some(Predicate::And {
                     predicates: vec![
@@ -5498,7 +5550,6 @@ mod tests {
     #[test]
     fn rejects_every_unimplemented_query_shape() {
         for sql in [
-            "SELECT * FROM posts JOIN users ON posts.user_id = users.id",
             "SELECT upper(title) FROM posts",
             "SELECT * FROM posts AS p (id, title)",
             "SELECT * FROM posts p q",

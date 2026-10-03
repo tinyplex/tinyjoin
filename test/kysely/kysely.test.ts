@@ -114,6 +114,15 @@ runIfBuilt('the Kysely dialect', () => {
     expect(
       await db.selectFrom('users').select('meta').where('id', '=', 'a').execute(),
     ).toEqual([{meta: {tags: ['x']}}]);
+    expect(
+      await db
+        .selectFrom('posts')
+        .innerJoin('users', 'users.id', 'posts.user_id')
+        .selectAll('posts')
+        .select('users.name')
+        .where('posts.id', '=', 2)
+        .execute(),
+    ).toEqual([{id: 2, user_id: 'b', title: 'Second', name: 'Bob'}]);
   });
 
   it('writes, returns, counts, and upserts', async () => {

@@ -68,6 +68,9 @@ struct Projection {
     /// An output worked out from the joined row rather than read from `source`, which is then
     /// empty.
     expression: Option<Expression>,
+    /// `*`, or `alias.*` where `source` has a qualifier: every column of every table, or of one,
+    /// which execution lists once it reads the tables' schemas.
+    star: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -90,6 +93,8 @@ pub(crate) struct JoinPlan {
     projections: Vec<Projection>,
     /// Whether the outputs are keyed by position because their names repeat.
     positional: bool,
+    /// Whether rows are read as arrays, so that outputs `*` lists may repeat names.
+    array_rows: bool,
     first: Source,
     joins: Vec<JoinStage>,
     predicate: Option<Predicate>,
@@ -132,6 +137,11 @@ impl WorkBudget {
 /// Keys a join's outputs by position if their names repeat. An `ORDER BY` name that is an
 /// output's takes the key of that output.
 pub(crate) fn position_outputs(plan: &mut JoinPlan) -> Result<()> {
+    // The names a `*` lists are known only once the tables are read, which positions them.
+    plan.array_rows = true;
+    if plan.projections.iter().any(|projection| projection.star) {
+        return Ok(());
+    }
     let projections = &mut plan.projections;
     plan.positional =
         crate::query::names_repeat(projections.len(), &|index| &projections[index].output);
@@ -230,6 +240,9 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &JoinPlan) -> Result<Qu
             source: join.source.clone(),
         });
     }
+    if plan.projections.iter().any(|projection| projection.star) {
+        return execute(storage, &listed_stars(plan, &relations)?);
+    }
     let (conditions, fields) = validate_plan(plan, &relations)?;
 
     // LIMIT 0 remains a validation-only operation, matching the other SELECT
@@ -297,6 +310,57 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &JoinPlan) -> Result<Qu
         fields,
         rows,
     })
+}
+
+/// The plan with each `*` replaced by the columns it reads, every table's in the order the query
+/// joins them and each table's in the order it declares them, as in PostgreSQL.
+fn listed_stars(plan: &JoinPlan, relations: &[Relation]) -> Result<JoinPlan> {
+    let mut listed = plan.clone();
+    listed.projections.clear();
+    for projection in &plan.projections {
+        if !projection.star {
+            listed.projections.push(projection.clone());
+            continue;
+        }
+        let mut found = false;
+        for relation in relations {
+            if projection
+                .source
+                .qualifier
+                .as_ref()
+                .is_some_and(|qualifier| *qualifier != relation.source.alias)
+            {
+                continue;
+            }
+            found = true;
+            for column in &relation.schema.columns {
+                listed.projections.push(Projection {
+                    source: ColumnRef {
+                        qualifier: Some(relation.source.alias.clone()),
+                        column: column.name.clone(),
+                    },
+                    output: column.name.clone(),
+                    expression: None,
+                    star: false,
+                });
+            }
+        }
+        if !found {
+            return Err(EngineError::invalid_query(format!(
+                "No table of the query is named `{}`",
+                projection.source.qualifier.as_deref().unwrap_or_default()
+            )));
+        }
+    }
+    if listed.projections.len() > MAX_PROJECTIONS {
+        return Err(EngineError::invalid_query(format!(
+            "A JOIN projection cannot contain more than {MAX_PROJECTIONS} columns"
+        )));
+    }
+    if plan.array_rows {
+        position_outputs(&mut listed)?;
+    }
+    Ok(listed)
 }
 
 fn preflight_build_rows(counts: &[usize]) -> Result<()> {
@@ -1816,6 +1880,7 @@ impl<'a> Parser<'a> {
             distinct,
             projections,
             positional: false,
+            array_rows: false,
             first,
             joins,
             predicate,
@@ -1826,17 +1891,46 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_projections(&mut self) -> Result<Vec<Projection>> {
-        if self.consume_star() {
-            return Err(EngineError::unsupported_sql(
-                "JOIN requires an explicit projection because JSON rows cannot represent duplicate column names",
-            ));
-        }
         let mut projections = Vec::new();
         loop {
             if projections.len() >= MAX_PROJECTIONS {
                 return Err(EngineError::invalid_query(format!(
                     "A JOIN projection cannot contain more than {MAX_PROJECTIONS} columns"
                 )));
+            }
+            let qualified_star = matches!(
+                (
+                    self.tokens.get(self.position),
+                    self.tokens.get(self.position + 1),
+                    self.tokens.get(self.position + 2),
+                ),
+                (
+                    Some(Token::Identifier { .. }),
+                    Some(Token::Dot),
+                    Some(Token::Star)
+                )
+            );
+            if qualified_star || self.consume_star() {
+                let qualifier = if qualified_star {
+                    let qualifier = self.parse_identifier()?;
+                    self.position += 2;
+                    Some(qualifier)
+                } else {
+                    None
+                };
+                projections.push(Projection {
+                    source: ColumnRef {
+                        qualifier,
+                        column: String::new(),
+                    },
+                    output: String::new(),
+                    expression: None,
+                    star: true,
+                });
+                if !self.consume_comma() {
+                    break;
+                }
+                continue;
             }
             let (source, expression) = match parse_expression_at(
                 &self.tokens,
@@ -1859,6 +1953,7 @@ impl<'a> Parser<'a> {
                 source,
                 output,
                 expression,
+                star: false,
             });
             if !self.consume_comma() {
                 break;
@@ -2406,7 +2501,8 @@ mod tests {
                 format!("SELECT DISTINCT ON (l.k1) l.k1 AS k {from}"),
                 "UNSUPPORTED_SQL",
             ),
-            (format!("SELECT DISTINCT * {from}"), "UNSUPPORTED_SQL"),
+            // Both tables have an `id`, which object rows cannot hold twice.
+            (format!("SELECT DISTINCT * {from}"), "INVALID_QUERY"),
         ] {
             assert_eq!(engine.query_sql(&sql, &[]).unwrap_err().code, code, "{sql}");
         }
@@ -2863,9 +2959,10 @@ mod tests {
                 "SELECT l.label, r.label FROM left_items l JOIN right_items r ON l.k1 = r.k1",
                 "INVALID_QUERY",
             ),
+            // Object rows cannot hold the `id` both tables have.
             (
                 "SELECT * FROM left_items l JOIN right_items r ON l.k1 = r.k1",
-                "UNSUPPORTED_SQL",
+                "INVALID_QUERY",
             ),
             (
                 "SELECT l.id AS id FROM left_items l JOIN right_items r ON l.k1 > r.k1",

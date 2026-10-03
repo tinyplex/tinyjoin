@@ -103,11 +103,12 @@ from the Client's getSchema(), with each column's PostgreSQL type: `bool`,
 
 These work as Kysely documents them:
 
-- `selectFrom` with `select`, and `selectAll` on one table;
+- `selectFrom` with `select` and `selectAll`, including `selectAll('table')`
+  over a join;
 - `where` with comparisons, `and`, `or`, `not`, `in` with values or a
   subquery, `between`, `like`, `ilike`, and `is null`;
 - `orderBy`, `limit`, and `offset`;
-- inner and left joins of up to eight tables, selecting their columns by name;
+- inner and left joins of up to eight tables;
 - `groupBy` with `countAll`, `count`, `sum`, `avg`, `min`, and `max`;
 - `insertInto` with `values`, `defaultValues`, and `onConflict`, with
   `doNothing` or `doUpdateSet`;
@@ -117,7 +118,8 @@ These work as Kysely documents them:
 
 These are refused with an error rather than run:
 
-- `selectAll` over a join;
+- `selectAll()` over a join whose tables share a column name, such as `id`,
+  since Kysely reads rows as objects, which cannot hold both;
 - `jsonArrayFrom` and `jsonObjectFrom`, which Kysely writes as correlated JSON
   subqueries, `exists`, and other correlated subqueries;
 - SQL functions such as `coalesce`, `case`, and casts;
