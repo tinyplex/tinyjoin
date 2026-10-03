@@ -8,7 +8,8 @@ use std::{
 use serde_json::Value;
 
 use crate::{
-    Btree, ChangedKeys, ColumnType, EngineError, ExecuteResult, PageDevice, PageId, Pager,
+    Btree, ChangedKeys, ColumnType, EngineError, ExecuteResult, ForeignKeyDefinition, PageDevice,
+    PageId, Pager,
     PagerWriteTransaction, QueryResult, Result, Row, RowChange, StorageReader, TableDefinition,
     TreeId, VisitControl, VisitOutcome,
     btree::BatchChange,
@@ -366,15 +367,25 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 let outcome =
                     crate::statement::plan_create_table(self, schema, indexes, *if_not_exists)?;
                 if outcome.mutated {
-                    validate_schema(schema)?;
+                    let foreign_keys = schema
+                        .foreign_keys
+                        .iter()
+                        .map(|key| crate::foreign_key::resolve(self, schema, indexes, key))
+                        .collect::<Result<Vec<_>>>()?;
+                    let schema = TableDefinition {
+                        foreign_keys,
+                        ..schema.clone()
+                    };
+                    validate_schema(&schema)?;
                     if self.tables.len() == MAX_CATALOG_TABLES as usize {
                         return Err(limit_error(format!(
                             "A catalog cannot contain more than {MAX_CATALOG_TABLES} tables"
                         )));
                     }
                     let tree_id = self.allocate_tree_id()?;
-                    let table = PagedTable::new(schema.clone(), tree_id, None, 0, EMPTY_HASH)?;
-                    Rc::make_mut(&mut self.tables).insert(schema.name.clone(), table);
+                    let name = schema.name.clone();
+                    let table = PagedTable::new(schema, tree_id, None, 0, EMPTY_HASH)?;
+                    Rc::make_mut(&mut self.tables).insert(name, table);
                     for definition in indexes {
                         self.create_index(definition)?;
                     }
@@ -392,17 +403,31 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 }
                 outcome
             }
-            WriteStatement::DropTable { table, if_exists } => {
-                let outcome = crate::statement::plan_drop_table(self, table, *if_exists)?;
+            WriteStatement::DropTable {
+                table,
+                if_exists,
+                cascade,
+            } => {
+                let outcome =
+                    crate::statement::plan_drop_table(self, table, *if_exists, *cascade)?;
                 if outcome.mutated {
+                    // CASCADE drops the other tables' foreign keys that reference it.
+                    self.edit_foreign_keys(&mut |child, keys| {
+                        keys.retain(|key| key.references != *table || child == table);
+                    })?;
                     self.drop_table(table)?;
                 }
                 outcome
             }
-            WriteStatement::DropIndex { name, if_exists } => {
-                let outcome = crate::statement::plan_drop_index(self, name, *if_exists)?;
+            WriteStatement::DropIndex {
+                name,
+                if_exists,
+                cascade,
+            } => {
+                let outcome =
+                    crate::statement::plan_drop_index(self, name, *if_exists, *cascade)?;
                 if outcome.mutated {
-                    self.drop_index(name)?;
+                    self.drop_needed_index(name)?;
                 }
                 outcome
             }
@@ -443,10 +468,11 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                     outcome,
                     changes,
                     previous,
+                    ..
                 } = crate::statement::plan_dml(self, statement)?;
                 if outcome.mutated {
                     keys = crate::statement::changed_keys(self, &changes, &previous)?;
-                    self.apply_changes(changes, previous)?;
+                    self.apply_changes_by_table(changes, previous)?;
                 }
                 outcome
             }
@@ -552,7 +578,23 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             .cloned()
             .ok_or_else(|| EngineError::table_not_found(name))?;
         let schema = match change {
-            TableChange::DropConstraint { name, .. } => return self.drop_index(name),
+            TableChange::DropConstraint { name: constraint, .. }
+                if !table
+                    .schema
+                    .foreign_keys
+                    .iter()
+                    .any(|key| key.name == *constraint) =>
+            {
+                return self.drop_needed_index(constraint);
+            }
+            TableChange::AddForeignKey(key) => {
+                let indexes = self.indexes_for_table(name)?;
+                let key = crate::foreign_key::resolve(self, &table.schema, &indexes, key)?;
+                crate::foreign_key::check_rows(self, &table.schema, &key)?;
+                let mut schema = (*table.schema).clone();
+                schema.foreign_keys.push(key);
+                return self.replace_schema(name, schema);
+            }
             TableChange::RenameTable(to) => {
                 let to = crate::statement::renamed_table(name, to);
                 let mut schema = (*table.schema).clone();
@@ -565,7 +607,15 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                         index.definition.table.clone_from(&to);
                     }
                 }
-                return self.replace_schema(&to, schema);
+                self.replace_schema(&to, schema)?;
+                // Foreign keys follow the table they reference, its own included.
+                return self.edit_foreign_keys(&mut |_, keys| {
+                    for key in keys {
+                        if key.references == name {
+                            key.references.clone_from(&to);
+                        }
+                    }
+                });
             }
             _ => crate::statement::altered_schema(&table.schema, change)?,
         };
@@ -580,8 +630,28 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                         }
                     }
                 }
+                self.replace_schema(name, schema)?;
+                return self.edit_foreign_keys(&mut |child, keys| {
+                    for key in keys {
+                        if key.references == name && child != name {
+                            for column in &mut key.referenced_columns {
+                                if column == from {
+                                    column.clone_from(to);
+                                }
+                            }
+                        }
+                    }
+                });
             }
             TableChange::DropColumn { column, .. } => {
+                // CASCADE drops the other tables' foreign keys that reference the column.
+                self.edit_foreign_keys(&mut |child, keys| {
+                    keys.retain(|key| {
+                        child == name
+                            || key.references != name
+                            || !key.referenced_columns.contains(column)
+                    });
+                })?;
                 // As in PostgreSQL, a column takes every index on it with it.
                 let indexes = self
                     .indexes
@@ -621,6 +691,73 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             _ => {}
         }
         self.replace_schema(name, schema)
+    }
+
+    /// Drops an index, and with it any foreign key that needs it, which planning allowed only with
+    /// `CASCADE`.
+    fn drop_needed_index(&mut self, name: &str) -> Result<()> {
+        if let Some(definition) = self.index_definition(name) {
+            let needing = crate::foreign_key::needing(self, &definition)
+                .into_iter()
+                .map(|(child, key)| (child.name.clone(), key.name))
+                .collect::<Vec<_>>();
+            self.edit_foreign_keys(&mut |child, keys| {
+                keys.retain(|key| {
+                    !needing
+                        .iter()
+                        .any(|(table, name)| table == child && *name == key.name)
+                });
+            })?;
+        }
+        self.drop_index(name)
+    }
+
+    /// Changes the foreign keys of each table that has any, as `edit` changes them.
+    fn edit_foreign_keys(
+        &mut self,
+        edit: &mut dyn FnMut(&str, &mut Vec<ForeignKeyDefinition>),
+    ) -> Result<()> {
+        for schema in crate::paged_storage::tables_with_foreign_keys(&self.tables) {
+            let mut edited = (*schema).clone();
+            edit(&schema.name, &mut edited.foreign_keys);
+            if edited.foreign_keys != schema.foreign_keys {
+                self.replace_schema(&schema.name, edited)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies a statement's changes, which its foreign keys' actions may extend to other tables,
+    /// a table at a time.
+    fn apply_changes_by_table(
+        &mut self,
+        changes: Vec<RowChange>,
+        previous: Vec<PreviousRow>,
+    ) -> Result<()> {
+        let Some(first) = changes.first() else {
+            return Ok(());
+        };
+        let table = change_table(first).clone();
+        if changes.iter().all(|change| *change_table(change) == table) {
+            return self.apply_changes(changes, previous);
+        }
+        let mut previous = previous.into_iter();
+        let mut groups: Vec<(String, Vec<RowChange>, Vec<PreviousRow>)> = Vec::new();
+        for change in changes {
+            let held = previous.next().unwrap_or(PreviousRow::Unread);
+            let table = change_table(&change).clone();
+            match groups.iter_mut().find(|(name, ..)| *name == table) {
+                Some((_, changes, previous)) => {
+                    changes.push(change);
+                    previous.push(held);
+                }
+                None => groups.push((table, vec![change], vec![held])),
+            }
+        }
+        for (_, changes, previous) in groups {
+            self.apply_changes(changes, previous)?;
+        }
+        Ok(())
     }
 
     fn replace_schema(&mut self, name: &str, schema: TableDefinition) -> Result<()> {
@@ -1407,6 +1544,10 @@ fn execute_query_result(result: QueryResult) -> Result<ExecuteResult> {
 impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
     fn charge_work(&self, operations: usize) -> Result<()> {
         self.charge_operations(operations)
+    }
+
+    fn tables_with_foreign_keys(&self) -> Vec<Rc<TableDefinition>> {
+        crate::paged_storage::tables_with_foreign_keys(&self.tables)
     }
 
     fn visit_table(

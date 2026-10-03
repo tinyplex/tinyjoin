@@ -278,6 +278,7 @@ describe('WorkerRpc', () => {
       columns: [column, {name: 'body', type: 'json', nullable: true, default: {a: [1]}}],
       primaryKey: ['id'],
       indexes: [{name: 'notes_body', columns: ['body'], unique: true}],
+      foreignKeys: [],
     };
 
     const schema = (tables: unknown[]) => ({version: 1, tables});
@@ -340,6 +341,24 @@ describe('WorkerRpc', () => {
       {version: 1, tables: [{...table, columns: [{...text, maxLength: 1.5}]}]},
       {version: 1, tables: [{...table, indexes: [{name: 'i', columns: ['id']}]}]},
       {version: 1, tables: [{...table, columns: new Array(1)}]},
+      {
+        version: 1,
+        tables: [
+          {
+            ...table,
+            foreignKeys: [
+              {
+                name: 'k',
+                columns: ['id'],
+                references: 'other',
+                referencedColumns: ['id'],
+                onDelete: 'delete',
+                onUpdate: 'no action',
+              },
+            ],
+          },
+        ],
+      },
     ]) {
       expect(isRpcResult('schema', invalid)).toBe(false);
     }

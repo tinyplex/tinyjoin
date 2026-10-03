@@ -489,19 +489,20 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 | `CREATE TABLE [IF NOT EXISTS]` | Narrow | Typed columns, a required inline or table-level primary key, and `UNIQUE` constraints. Up to 256 columns. |
 | `PRIMARY KEY` | Narrow | One inline single-column declaration or one table-level column list (single or composite), which `CONSTRAINT name` may name. It implies `NOT NULL`; JSON keys are rejected. |
 | `UNIQUE` | Narrow | A column's `UNIQUE`, or a table's `[CONSTRAINT name] UNIQUE (columns)`, creates a unique index of that name. An unnamed one is named as PostgreSQL names it, for its table and columns, as in `users_email_key`. The columns follow the `CREATE UNIQUE INDEX` rules. |
-| `REFERENCES`, `FOREIGN KEY`, `CHECK` | No | Foreign keys and check constraints are rejected, inline or as table constraints, since TinyJoin enforces neither. |
+| `REFERENCES`, `FOREIGN KEY` | Narrow | A column's `REFERENCES table [(column)]`, or a table's `[CONSTRAINT name] FOREIGN KEY (columns) REFERENCES table [(columns)]`, with `ON DELETE` and `ON UPDATE` actions, checked as each statement ends. See [foreign keys](https://tinyjoin.org/guides/sql-compatibility/#foreign-keys). |
+| `CHECK` | No | Check constraints are rejected, inline or as table constraints. |
 | `NULL`, `NOT NULL`, `DEFAULT` | Narrow | String, number, boolean, or `NULL` literal defaults, and a string cast to JSON, as in `DEFAULT '{}'::jsonb`. No other casts, default expressions, functions, sequences, or parameters. |
 | `CREATE [UNIQUE] INDEX [IF NOT EXISTS]` | Narrow | One or more boolean, integer, or text columns. `USING btree` is accepted, since every index is a B-tree; no other methods, expressions, predicates, `INCLUDE`, ordering, or concurrent build. |
 | `ALTER TABLE ... ADD [COLUMN] [IF NOT EXISTS]` | Narrow | Adds one non-primary-key column and atomically backfills its literal default or `NULL`. On a nonempty table, `NOT NULL` requires a non-null default. The column cannot declare `UNIQUE`; add the constraint after it. |
-| `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE`, `DROP CONSTRAINT [IF EXISTS]` | Narrow | Adds a unique constraint, as `CREATE UNIQUE INDEX` would, or drops one of the table's unique indexes by name. |
+| `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE`, `ADD [CONSTRAINT ...] FOREIGN KEY`, `DROP CONSTRAINT [IF EXISTS]` | Narrow | Adds a unique constraint, as `CREATE UNIQUE INDEX` would, or a foreign key, which every stored row must already meet, or drops a foreign key or unique constraint by name. |
 | `ALTER TABLE ... ALTER [COLUMN] ... SET DEFAULT`, `DROP DEFAULT` | Narrow | A literal default, as `DEFAULT` takes. Existing rows keep their values, so the table's rows are rewritten. |
 | `ALTER TABLE ... ALTER [COLUMN] ... SET NOT NULL`, `DROP NOT NULL` | Narrow | `SET NOT NULL` rewrites the table's rows, and fails with `CONSTRAINT_VIOLATION`, changing nothing, if a row holds `NULL`. A primary-key column stays `NOT NULL`. |
 | `ALTER TABLE ... ALTER [COLUMN] ... [SET DATA] TYPE` | Narrow | Only to another spelling of the column's runtime type, as `bigint` for an `integer` column, which changes nothing, or to a `VARCHAR` of another length, which checks every row when it shortens. No conversion or `USING`. |
-| `ALTER TABLE ... DROP [COLUMN] [IF EXISTS]` | Narrow | Drops a column outside the primary key, with every index on it, and rewrites the table's rows. `CASCADE` and `RESTRICT` are accepted. |
-| `ALTER TABLE ... RENAME [COLUMN] ... TO`, `RENAME TO` | Supported | Renames a column, including a key column, or the table, which keeps any schema that qualifies its name. Indexes follow the new names; statements prepared with the old ones fail. |
+| `ALTER TABLE ... DROP [COLUMN] [IF EXISTS]` | Narrow | Drops a column outside the primary key, with every index and foreign key of its table on it, and rewrites the table's rows. A column another table's foreign key references needs `CASCADE`, which drops that key. |
+| `ALTER TABLE ... RENAME [COLUMN] ... TO`, `RENAME TO` | Supported | Renames a column, including a key column, or the table, which keeps any schema that qualifies its name. Indexes and foreign keys follow the new names; statements prepared with the old ones fail. |
 | `ALTER TABLE ... DISABLE ROW LEVEL SECURITY` | Supported | Changes nothing, since no table has row security. Several changes in one `ALTER TABLE`, and other `ALTER` forms, are rejected. |
-| `DROP TABLE [IF EXISTS]` | Narrow | Drops the table and its indexes. `CASCADE` and `RESTRICT` are accepted and drop the same, since nothing else can depend on a table. |
-| `DROP INDEX [IF EXISTS]` | Supported | Drops one globally named index. `CASCADE` and `RESTRICT` are accepted. |
+| `DROP TABLE [IF EXISTS]` | Narrow | Drops the table and its indexes. A table another table's foreign key references needs `CASCADE`, which drops that key, not the other table. `RESTRICT` is the default. |
+| `DROP INDEX [IF EXISTS]` | Supported | Drops one globally named index. A unique index a foreign key needs, because it references the index's columns, needs `CASCADE`, which drops the key. |
 | `INSERT ... VALUES` | Narrow | Optional column list, up to 4,096 literal/parameter rows, per-cell `DEFAULT`, and optional `RETURNING`. |
 | `INSERT ... DEFAULT VALUES` | Supported | Inserts one row using defaults and `NULL` values. |
 | `INSERT ... ON CONFLICT` | Narrow | `ON CONFLICT [(columns)] DO NOTHING` or `ON CONFLICT (columns) DO UPDATE SET column = value, ...`, before any `RETURNING`. See [upserts](https://tinyjoin.org/guides/sql-compatibility/#upserts). |
@@ -804,15 +805,17 @@ Every SQL-created table has a primary key. TinyJoin currently implements:
 
 - primary-key uniqueness and non-nullability;
 - column `NOT NULL`;
-- scalar literal column defaults; and
-- unique indexes, which `CREATE UNIQUE INDEX` or a `UNIQUE` constraint creates.
+- scalar literal column defaults;
+- unique indexes, which `CREATE UNIQUE INDEX` or a `UNIQUE` constraint creates;
+  and
+- foreign keys.
 
 A `UNIQUE` constraint is a unique index of the constraint's name, so getSchema()
 lists it among the table's indexes, and either `DROP CONSTRAINT` or `DROP INDEX`
 removes it.
 
-It does not implement foreign keys, `CHECK`, exclusion constraints, generated
-columns, sequences, triggers, or dependency cascades.
+It does not implement `CHECK`, exclusion constraints, generated columns,
+sequences, or triggers.
 
 A row is identified by its primary key: each table is stored keyed by that
 value, and an `UPDATE` which changes a primary key is applied as a removal at
@@ -822,6 +825,51 @@ primary keys as stable, opaque identifiers.
 Composite primary and secondary indexes are supported. A unique index omits a
 key containing `NULL`, so multiple null-containing keys are allowed, matching
 PostgreSQL's default `NULLS DISTINCT` behavior.
+
+### Foreign keys
+
+A foreign key holds that its columns' values, in every row of its table, are
+the values of a row of the table it references, unless one of them is `NULL`,
+as PostgreSQL's default `MATCH SIMPLE` says. It references that table's primary
+key, unless it names columns, which must be the primary key's or a unique
+index's, of the same runtime types. A table may reference itself. A reference
+to `public.table` names `table` when there is no table of the longer name, as
+PostgreSQL tools write it.
+
+```sql
+CREATE TABLE posts (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users ON DELETE CASCADE,
+  editor_id TEXT REFERENCES users (id) ON DELETE SET NULL
+);
+```
+
+Each key is checked as its statement ends, so rows that one statement inserts
+can reference each other, and a statement that would leave a reference without
+its row fails with `CONSTRAINT_VIOLATION`, changing nothing. Inside a
+transaction, each statement is checked against the rows the transaction has
+staged. Keys cannot be deferred to the end of a transaction.
+
+When a statement deletes a referenced row, or changes the values its
+references hold, each referencing row is changed as the key's `ON DELETE` or
+`ON UPDATE` action says, in the same statement:
+
+- `NO ACTION`, the default, refuses the statement, unless another row holds the
+  values once it ends;
+- `RESTRICT` refuses it;
+- `CASCADE` deletes the referencing rows, or changes their references to the
+  new values, and so on through the keys that reference them;
+- `SET NULL` and `SET DEFAULT` change the referencing columns to `NULL` or to
+  their defaults, which must themselves be allowed.
+
+Finding the rows that reference a deleted or changed row reads the
+referencing table like a `WHERE` on its columns, so index the referencing
+columns of a large table, as in PostgreSQL. The rows an action changes count
+toward the statement's limits, and are reported among its changed tables.
+
+`ALTER TABLE ... ADD FOREIGN KEY` checks every stored row before it adds a key.
+Renaming a table or column renames it in the keys that name it, and dropping
+what a key needs takes `CASCADE`, which drops the key.
 
 Single-table `SELECT`, aggregates, `UPDATE`, and `DELETE` read only the rows
 their `WHERE` clause can match when its `AND`-ed terms allow, and still check
@@ -969,8 +1017,9 @@ JOIN tags AS tag ON post_tag.tag_id = tag.id
 ORDER BY post_id, tag_name
 ```
 
-Foreign keys are not implemented, so TinyJoin does not enforce the bridge
-table's references.
+The bridge table can declare [foreign keys](https://tinyjoin.org/guides/sql-compatibility/#foreign-keys) on `post_id` and
+`tag_id`, with `ON DELETE CASCADE`, so that deleting a post or tag deletes its
+links.
 
 ## Transactions and concurrency
 
@@ -1173,6 +1222,7 @@ const tasks = tables.find(({name}) => name === 'tasks');
 //   ],
 //   primaryKey: ['id'],
 //   indexes: [{name: 'tasks_done', columns: ['done'], unique: false}],
+//   foreignKeys: [],
 // }
 ```
 
@@ -1211,6 +1261,7 @@ await db.setSchema({
       ],
       primaryKey: ['id'],
       indexes: [{name: 'tasks_done', columns: ['done'], unique: false}],
+      foreignKeys: [],
     },
   ],
 });
@@ -1224,7 +1275,8 @@ change, which commits whole or not at all, with the statements TinyJoin's
 - a table or column whose `renamedFrom` the database still has is renamed,
   keeping its rows and values;
 - a column's default, nullability, and `VARCHAR` length become the schema's;
-- each table's indexes become exactly the schema's; and
+- each table's indexes and foreign keys become exactly the schema's, with
+  keys added once every table they reference exists; and
 - a table or column the schema leaves out stays, unless setSchema() is given
   `{drop: true}`.
 
@@ -1966,9 +2018,9 @@ as `text('id').primaryKey().$defaultFn(() => crypto.randomUUID())` does, and
 store a time as an integer or text column, or as a Drizzle `customType` over
 one.
 
-Leave `.references()` out of the schema: TinyJoin cannot enforce foreign keys,
-so it refuses the SQL that declares them. Drizzle's relations need no foreign
-keys.
+Foreign keys work as `.references()` declares them, with their `onDelete` and
+`onUpdate` actions; see [foreign keys](https://tinyjoin.org/guides/sql-compatibility/#foreign-keys).
+Index a large table's referencing columns.
 
 Create the tables with SQL through the Client, idempotently with
 `IF NOT EXISTS`; push the schema from the application, as the next section
@@ -2007,7 +2059,8 @@ push() is given `drop: true`. Give each change of schema a higher `version`:
 push() then refuses an older schema, from a tab still running an older copy of
 the application, with `SCHEMA_OUTDATED`, rather than undoing the change.
 
-A table that declares what TinyJoin cannot hold, such as a foreign key, a
+Foreign keys are pushed with their actions, and added once every table they
+reference is there. A table that declares what TinyJoin cannot hold, such as a
 `timestamp` column, an `sql` default, or a descending index, is refused before
 anything changes. A default from `$defaultFn` is Drizzle's to fill in, so the
 database has none.
@@ -2207,8 +2260,9 @@ five runtime types:
 
 TinyJoin has no `serial`, `uuid`, `timestamp`, `date`, `numeric`, enum, or
 array types. Generate identifiers in the application, and store a time as an
-integer or text column. Leave out `references` and foreign-key constraints:
-TinyJoin cannot enforce them, so it refuses the SQL that declares them.
+integer or text column. Foreign keys work as `references` and
+`addForeignKeyConstraint` declare them; see
+[foreign keys](https://tinyjoin.org/guides/sql-compatibility/#foreign-keys).
 
 Kysely's schema builder works within TinyJoin's
 [DDL](https://tinyjoin.org/guides/sql-compatibility/#statements-and-clauses): creating and dropping
@@ -2842,6 +2896,9 @@ and has no OPFS, filesystem persistence, or remote synchronization. See the
 - Put application values in `$1`, `$2`, and later parameters.
 - Use query() for one statement and exec() for a parameter-free script.
 - Give every SQL-created table a primary key.
+- Declare foreign keys with `REFERENCES`, and their `ON DELETE` actions; they
+  are checked as each statement ends. Index a large table's referencing
+  columns.
 - Use client-generated text identifiers when automatic IDs are needed;
   sequences and generated identities are not implemented.
 - Write upserts as `INSERT ... ON CONFLICT (id) DO UPDATE SET column =
@@ -2876,7 +2933,7 @@ To use the Drizzle ORM, call `drizzle(client, {schema})` from
 sets the Drizzle schema with setSchema(); with DDL through client.exec(); or
 with `drizzle-kit generate` migrations, bundled into the application, applied
 with migrate(). Drizzle's own migrators and Drizzle Kit's `push` do not work. Use the
-column types TinyJoin has, leave out `.references()`, and avoid relational
+column types TinyJoin has, and avoid relational
 queries with `with`, SQL functions, and nested transactions.
 See the [Drizzle guide](https://tinyjoin.org/guides/drizzle/).
 
@@ -2886,7 +2943,7 @@ To use Kysely, give the `Kysely` constructor a TinyJoinDialect from
 `tinyjoin/kysely`, constructed with `{client}`; the application installs
 `kysely` itself and closes the Client.
 Kysely's Migrator and introspector work. Use the column types TinyJoin has,
-leave out foreign keys, use `selectAll('table')` rather than `selectAll()`
+use `selectAll('table')` rather than `selectAll()`
 over a join whose tables share column names, and avoid `jsonArrayFrom`, SQL
 functions, and savepoints. See the
 [Kysely guide](https://tinyjoin.org/guides/kysely/).
@@ -3115,9 +3172,21 @@ named as PostgreSQL would name it; a JSON default written as `'{}'::jsonb`; and
 `USING btree` on an index. `ALTER TABLE` can add and drop a unique constraint,
 and accepts `DISABLE ROW LEVEL SECURITY`, which changes nothing. `DROP TABLE`
 and `DROP INDEX` accept `CASCADE` and `RESTRICT`. Together these run the SQL
-that `drizzle-kit generate` writes for new tables, apart from foreign keys,
-which TinyJoin cannot enforce and still rejects, now with an error saying so.
+that `drizzle-kit generate` writes for new tables.
 See [constraints and indexes](https://tinyjoin.org/guides/sql-compatibility/#constraints-and-indexes).
+
+**Foreign keys are enforced.** A column's `REFERENCES`, or a table's
+`FOREIGN KEY ... REFERENCES`, names the table and columns its values must be
+found in, unless one is `NULL`, and each key is checked as its statement ends,
+inside transactions too. Deleting or updating a referenced row does what the
+key's `ON DELETE` and `ON UPDATE` actions say: `NO ACTION` and `RESTRICT`
+refuse it, `CASCADE` deletes or updates the referencing rows in the same
+statement, and `SET NULL` and `SET DEFAULT` change their references. `ALTER
+TABLE` adds a key, checking every stored row, and drops one; renames follow
+into the keys; and dropping a table, column, or unique index a key needs takes
+`CASCADE`, which drops the key. getSchema() and setSchema() include each
+table's keys, and Drizzle's `.references()` pushes as one. See
+[foreign keys](https://tinyjoin.org/guides/sql-compatibility/#foreign-keys).
 
 A `VARCHAR(n)` or `CHARACTER VARYING(n)` column holds at most `n` characters,
 and a longer value fails with `CONSTRAINT_VIOLATION`, as in PostgreSQL, except
@@ -3153,7 +3222,7 @@ runtime type, whether it is nullable, and any literal default. See
 **Upgrading from v0.4.0 needs no action.** Install, rebuild, and redeploy. The
 page format stays at format 3, so an existing database opens with no migration
 and no OPFS namespace change. A database that holds a `VARCHAR(n)` column, or
-a schema version from setSchema(), cannot be opened by v0.4.0, which reports
+a schema version from setSchema(), or a foreign key, cannot be opened by v0.4.0, which reports
 its catalog as corrupt, so do not roll back past v0.5.0 once a database uses
 either. The Worker protocol moves from
 version 10 to 11
@@ -3346,7 +3415,7 @@ quicker than in either.
   longer wait for their code to compile. See
   [custom Workers](https://tinyjoin.org/guides/custom-workers/).
 
-The compressed download is now 330 KiB, up from 295 KiB in v0.3.0.
+The compressed download is now 346 KiB, up from 295 KiB in v0.3.0.
 
 ## v0.3.0
 
@@ -3856,8 +3925,78 @@ export interface IndexSchema {
 }
 
 /**
+ * The ForeignKeyAction type names what deleting or updating a referenced row
+ * does to the rows that reference it: `no action` and `restrict` refuse it,
+ * `cascade` deletes or updates them too, and `set null` and `set default`
+ * change their referencing columns to NULL or to the columns' defaults.
+ * @category Schema
+ * @since v0.5.0
+ */
+export type ForeignKeyAction =
+  | 'no action'
+  | 'restrict'
+  | 'cascade'
+  | 'set null'
+  | 'set default';
+
+/**
+ * The ForeignKeySchema interface describes one foreign key of a table: columns
+ * whose values, unless one is NULL, must be those of a row of the table it
+ * references.
+ * @category Schema
+ * @since v0.5.0
+ */
+export interface ForeignKeySchema {
+  /**
+   * The name property contains the foreign key's name.
+   * @category Schema
+   * @since v0.5.0
+   */
+  name: string;
+
+  /**
+   * The columns property contains the referencing columns, in key order.
+   * @category Schema
+   * @since v0.5.0
+   */
+  columns: string[];
+
+  /**
+   * The references property names the table the key references, which may be
+   * the table's own.
+   * @category Schema
+   * @since v0.5.0
+   */
+  references: string;
+
+  /**
+   * The referencedColumns property contains the referenced table's columns, by
+   * position in columns: its primary key, or a unique index's columns.
+   * @category Schema
+   * @since v0.5.0
+   */
+  referencedColumns: string[];
+
+  /**
+   * The onDelete property says what deleting a referenced row does to the rows
+   * that reference it.
+   * @category Schema
+   * @since v0.5.0
+   */
+  onDelete: ForeignKeyAction;
+
+  /**
+   * The onUpdate property says what changing a referenced row's referenced
+   * values does to the rows that reference it.
+   * @category Schema
+   * @since v0.5.0
+   */
+  onUpdate: ForeignKeyAction;
+}
+
+/**
  * The TableSchema interface describes one table, its columns, its primary
- * key, and its indexes.
+ * key, its indexes, and its foreign keys.
  * @category Schema
  * @since v0.5.0
  */
@@ -3892,6 +4031,14 @@ export interface TableSchema {
    * @since v0.5.0
    */
   indexes: IndexSchema[];
+
+  /**
+   * The foreignKeys property describes the table's foreign keys, in the order
+   * they were declared.
+   * @category Schema
+   * @since v0.5.0
+   */
+  foreignKeys: ForeignKeySchema[];
 
   /**
    * The renamedFrom property names a table's former name, which setSchema
@@ -4488,8 +4635,9 @@ export class Client {
    * It creates the tables and columns the schema has and the database lacks,
    * renames a table or column from the name its renamedFrom gives while the
    * database still has that name, and changes a column's default, nullability,
-   * or `VARCHAR` length to the schema's. Each table's indexes become exactly
-   * the schema's. Tables and columns the schema leaves out stay, unless the
+   * or `VARCHAR` length to the schema's. Each table's indexes and foreign keys
+   * become exactly the schema's, with keys added once every table they
+   * reference exists. Tables and columns the schema leaves out stay, unless the
    * options' drop property is true. Rows keep their values, as `ALTER TABLE`
    * keeps them: a change no statement could make, to a primary key or a
    * column's runtime type, is refused, and so is one that a row prevents, such
@@ -4521,6 +4669,7 @@ export class Client {
    *       ],
    *       primaryKey: ['id'],
    *       indexes: [{name: 'tasks_done', columns: ['done'], unique: false}],
+   *       foreignKeys: [],
    *     },
    *   ],
    * });
@@ -4720,6 +4869,8 @@ export type {
   Client,
   ColumnSchema,
   ColumnType,
+  ForeignKeyAction,
+  ForeignKeySchema,
   IndexSchema,
   JsonPrimitive,
   JsonValue,

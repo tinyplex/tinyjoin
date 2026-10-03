@@ -195,8 +195,74 @@
 }
 
 /**
+ * The ForeignKeyAction type names what deleting or updating a referenced row
+ * does to the rows that reference it: `no action` and `restrict` refuse it,
+ * `cascade` deletes or updates them too, and `set null` and `set default`
+ * change their referencing columns to NULL or to the columns' defaults.
+ * @category Schema
+ * @since v0.5.0
+ */
+/// ForeignKeyAction
+
+/**
+ * The ForeignKeySchema interface describes one foreign key of a table: columns
+ * whose values, unless one is NULL, must be those of a row of the table it
+ * references.
+ * @category Schema
+ * @since v0.5.0
+ */
+/// ForeignKeySchema
+{
+  /**
+   * The name property contains the foreign key's name.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// ForeignKeySchema.name
+
+  /**
+   * The columns property contains the referencing columns, in key order.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// ForeignKeySchema.columns
+
+  /**
+   * The references property names the table the key references, which may be
+   * the table's own.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// ForeignKeySchema.references
+
+  /**
+   * The referencedColumns property contains the referenced table's columns, by
+   * position in columns: its primary key, or a unique index's columns.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// ForeignKeySchema.referencedColumns
+
+  /**
+   * The onDelete property says what deleting a referenced row does to the rows
+   * that reference it.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// ForeignKeySchema.onDelete
+
+  /**
+   * The onUpdate property says what changing a referenced row's referenced
+   * values does to the rows that reference it.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// ForeignKeySchema.onUpdate
+}
+
+/**
  * The TableSchema interface describes one table, its columns, its primary
- * key, and its indexes.
+ * key, its indexes, and its foreign keys.
  * @category Schema
  * @since v0.5.0
  */
@@ -232,6 +298,14 @@
    * @since v0.5.0
    */
   /// TableSchema.indexes
+
+  /**
+   * The foreignKeys property describes the table's foreign keys, in the order
+   * they were declared.
+   * @category Schema
+   * @since v0.5.0
+   */
+  /// TableSchema.foreignKeys
 
   /**
    * The renamedFrom property names a table's former name, which setSchema
@@ -872,8 +946,9 @@
    * It creates the tables and columns the schema has and the database lacks,
    * renames a table or column from the name its renamedFrom gives while the
    * database still has that name, and changes a column's default, nullability,
-   * or `VARCHAR` length to the schema's. Each table's indexes become exactly
-   * the schema's. Tables and columns the schema leaves out stay, unless the
+   * or `VARCHAR` length to the schema's. Each table's indexes and foreign keys
+   * become exactly the schema's, with keys added once every table they
+   * reference exists. Tables and columns the schema leaves out stay, unless the
    * options' drop property is true. Rows keep their values, as `ALTER TABLE`
    * keeps them: a change no statement could make, to a primary key or a
    * column's runtime type, is refused, and so is one that a row prevents, such
@@ -905,6 +980,7 @@
    *       ],
    *       primaryKey: ['id'],
    *       indexes: [{name: 'tasks_done', columns: ['done'], unique: false}],
+   *       foreignKeys: [],
    *     },
    *   ],
    * });

@@ -72,8 +72,9 @@ five runtime types:
 
 TinyJoin has no `serial`, `uuid`, `timestamp`, `date`, `numeric`, enum, or
 array types. Generate identifiers in the application, and store a time as an
-integer or text column. Leave out `references` and foreign-key constraints:
-TinyJoin cannot enforce them, so it refuses the SQL that declares them.
+integer or text column. Foreign keys work as `references` and
+`addForeignKeyConstraint` declare them; see
+[foreign keys](/guides/sql-compatibility/#foreign-keys).
 
 Kysely's schema builder works within TinyJoin's
 [DDL](/guides/sql-compatibility/#statements-and-clauses): creating and dropping

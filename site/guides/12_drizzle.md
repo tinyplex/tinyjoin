@@ -76,9 +76,9 @@ as `text('id').primaryKey().$defaultFn(() => crypto.randomUUID())` does, and
 store a time as an integer or text column, or as a Drizzle `customType` over
 one.
 
-Leave `.references()` out of the schema: TinyJoin cannot enforce foreign keys,
-so it refuses the SQL that declares them. Drizzle's relations need no foreign
-keys.
+Foreign keys work as `.references()` declares them, with their `onDelete` and
+`onUpdate` actions; see [foreign keys](/guides/sql-compatibility/#foreign-keys).
+Index a large table's referencing columns.
 
 Create the tables with SQL through the Client, idempotently with
 `IF NOT EXISTS`; push the schema from the application, as the next section
@@ -117,7 +117,8 @@ push() is given `drop: true`. Give each change of schema a higher `version`:
 push() then refuses an older schema, from a tab still running an older copy of
 the application, with `SCHEMA_OUTDATED`, rather than undoing the change.
 
-A table that declares what TinyJoin cannot hold, such as a foreign key, a
+Foreign keys are pushed with their actions, and added once every table they
+reference is there. A table that declares what TinyJoin cannot hold, such as a
 `timestamp` column, an `sql` default, or a descending index, is refused before
 anything changes. A default from `$defaultFn` is Drizzle's to fill in, so the
 database has none.

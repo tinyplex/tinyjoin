@@ -80,6 +80,7 @@ const tasks = tables.find(({name}) => name === 'tasks');
 //   ],
 //   primaryKey: ['id'],
 //   indexes: [{name: 'tasks_done', columns: ['done'], unique: false}],
+//   foreignKeys: [],
 // }
 ```
 
@@ -118,6 +119,7 @@ await db.setSchema({
       ],
       primaryKey: ['id'],
       indexes: [{name: 'tasks_done', columns: ['done'], unique: false}],
+      foreignKeys: [],
     },
   ],
 });
@@ -131,7 +133,8 @@ change, which commits whole or not at all, with the statements TinyJoin's
 - a table or column whose `renamedFrom` the database still has is renamed,
   keeping its rows and values;
 - a column's default, nullability, and `VARCHAR` length become the schema's;
-- each table's indexes become exactly the schema's; and
+- each table's indexes and foreign keys become exactly the schema's, with
+  keys added once every table they reference exists; and
 - a table or column the schema leaves out stays, unless setSchema() is given
   `{drop: true}`.
 

@@ -313,6 +313,7 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
             ],
             primaryKey: ['name'],
             indexes: [],
+            foreignKeys: [],
           },
           {
             name: 'notes',
@@ -329,6 +330,7 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
               {name: 'a_notes_id', columns: ['id'], unique: false},
               {name: 'notes_body', columns: ['body', 'owner'], unique: true},
             ],
+            foreignKeys: [],
           },
         ],
       });
@@ -357,6 +359,7 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
             ],
             primaryKey: ['id'],
             indexes: [{name: 'tasks_done', columns: ['done'], unique: false}],
+            foreignKeys: [],
           },
         ],
       };

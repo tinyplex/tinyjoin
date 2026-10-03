@@ -356,6 +356,7 @@ runIfBuilt('the Drizzle migrator', () => {
         {name: 'users_email_unique', columns: ['email'], unique: true},
         {name: 'users_name_idx', columns: ['name'], unique: false},
       ],
+      foreignKeys: [],
     });
     expect(await applied()).toEqual([
       {tag: '0000_create_users'},
@@ -392,7 +393,7 @@ runIfBuilt('the Drizzle migrator', () => {
       migrations: {
         ...migrations,
         '0002_bad.sql': `CREATE TABLE notes (id INTEGER PRIMARY KEY);
-          CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id TEXT REFERENCES users (id));`,
+          CREATE TABLE posts (id INTEGER PRIMARY KEY, at TIMESTAMP);`,
       },
     }).catch((error: unknown) => error);
     expect(failure).toMatchObject({code: 'UNSUPPORTED_SQL'});
@@ -485,6 +486,7 @@ runIfBuilt('the Drizzle push', () => {
               unique: true,
             },
           ],
+          foreignKeys: [],
         },
         {
           name: 'people',
@@ -500,6 +502,7 @@ runIfBuilt('the Drizzle push', () => {
             {name: 'people_email_unique', columns: ['email'], unique: true},
             {name: 'people_name_idx', columns: ['name'], unique: false},
           ],
+          foreignKeys: [],
         },
       ],
     });
@@ -533,17 +536,38 @@ runIfBuilt('the Drizzle push', () => {
     });
   });
 
+  it('holds foreign keys, with their actions', async () => {
+    const owners = pgTable('owners', {id: text('id').primaryKey()});
+    const pets = pgTable('pets', {
+      id: text('id').primaryKey(),
+      owner: text('owner').references(() => owners.id, {onDelete: 'cascade'}),
+    });
+    const db = drizzle(client, {schema: {owners, pets}});
+    expect(await push(db, {owners, pets})).toBe(true);
+    expect(await push(db, {owners, pets})).toBe(false);
+    expect((await client.getSchema()).tables[1]?.foreignKeys).toEqual([
+      {
+        name: 'pets_owner_owners_id_fk',
+        columns: ['owner'],
+        references: 'owners',
+        referencedColumns: ['id'],
+        onDelete: 'cascade',
+        onUpdate: 'no action',
+      },
+    ]);
+    await db.insert(owners).values({id: 'ann'});
+    await db.insert(pets).values({id: 'rex', owner: 'ann'});
+    await expect(
+      db.insert(pets).values({id: 'tom', owner: 'bob'}),
+    ).rejects.toMatchObject({cause: {code: 'CONSTRAINT_VIOLATION'}});
+    await db.delete(owners).where(eq(owners.id, 'ann'));
+    expect(await db.select().from(pets)).toEqual([]);
+  });
+
   it('refuses what TinyJoin cannot hold, before changing anything', async () => {
     const db = drizzle(client);
     const owners = pgTable('owners', {id: text('id').primaryKey()});
     for (const [table, message] of [
-      [
-        pgTable('pets', {
-          id: text('id').primaryKey(),
-          owner: text('owner').references(() => owners.id),
-        }),
-        'foreign keys',
-      ],
       [
         pgTable('events', {
           id: text('id').primaryKey(),

@@ -784,6 +784,11 @@ impl<'a, D: PageDevice> PagedReadView<'a, D> {
 }
 
 impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
+    // A transaction cannot change the catalog, so the storage's is the transaction's.
+    fn tables_with_foreign_keys(&self) -> Vec<Rc<TableDefinition>> {
+        self.storage.tables_with_foreign_keys()
+    }
+
     fn charge_work(&self, operations: usize) -> Result<()> {
         match self.work {
             Some(work) => crate::sql_script::charge_operations(work, operations),

@@ -1229,6 +1229,10 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
         self.ensure_ready()
     }
 
+    fn tables_with_foreign_keys(&self) -> Vec<Rc<TableDefinition>> {
+        tables_with_foreign_keys(&self.tables)
+    }
+
     fn visit_table(
         &self,
         table: &str,
@@ -2026,6 +2030,7 @@ mod tests {
                     max_length: None,
                 })
                 .collect(),
+            foreign_keys: vec![],
         }
     }
 
@@ -2733,4 +2738,13 @@ mod tests {
         let error = check_error(pager.into_device());
         assert_eq!(error.code, "STORAGE_CORRUPT");
     }
+}
+
+/// Every table of a catalog that has a foreign key.
+pub(crate) fn tables_with_foreign_keys(tables: &NameMap<PagedTable>) -> Vec<Rc<TableDefinition>> {
+    tables
+        .values()
+        .filter(|table| !table.schema.foreign_keys.is_empty())
+        .map(|table| Rc::clone(&table.schema))
+        .collect()
 }

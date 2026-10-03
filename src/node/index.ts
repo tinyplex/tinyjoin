@@ -6,6 +6,8 @@ export type {
   Client,
   ColumnSchema,
   ColumnType,
+  ForeignKeyAction,
+  ForeignKeySchema,
   IndexSchema,
   JsonPrimitive,
   JsonValue,

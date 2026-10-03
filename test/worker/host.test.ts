@@ -784,6 +784,7 @@ describe('startWorker', () => {
           columns: [{name: 'id', type: 'integer' as const, nullable: false}],
           primaryKey: ['id'],
           indexes: [],
+          foreignKeys: [],
         },
       ],
     };

@@ -2216,6 +2216,7 @@ mod tests {
                     max_length: None,
                 })
                 .collect(),
+            foreign_keys: vec![],
         }
     }
 

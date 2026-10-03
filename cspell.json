@@ -47,6 +47,7 @@
     "DuckDB",
     "equijoin",
     "esbuild",
+    "fkey",
     "fptoint",
     "fract",
     "gridline",

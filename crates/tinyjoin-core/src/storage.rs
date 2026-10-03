@@ -178,6 +178,11 @@ pub(crate) trait StorageReader {
     }
     /// Where `table`'s columns live in its stored records, from a reader whose rows are stored
     /// records, which lets a writer plan rows straight into records. Other readers plan maps.
+    /// Every table that has a foreign key, which a reader with no catalog of its own leaves out.
+    fn tables_with_foreign_keys(&self) -> Vec<Rc<TableDefinition>> {
+        Vec::new()
+    }
+
     fn record_layout(&self, _table: &str) -> Option<Rc<RecordLayout>> {
         None
     }
@@ -680,6 +685,14 @@ pub(crate) fn validate_added_column(
 
 #[cfg(test)]
 impl StorageReader for InMemoryStorage {
+    fn tables_with_foreign_keys(&self) -> Vec<Rc<TableDefinition>> {
+        self.tables
+            .values()
+            .filter(|table| !table.schema.foreign_keys.is_empty())
+            .map(|table| Rc::new(table.schema.clone()))
+            .collect()
+    }
+
     fn visit_table(
         &self,
         table: &str,
@@ -1037,6 +1050,31 @@ pub(crate) fn validate_schema(schema: &TableDefinition) -> Result<()> {
                 "Primary-key column `{column}` is not declared in table `{}`",
                 schema.name
             )));
+        }
+    }
+    for (position, key) in schema.foreign_keys.iter().enumerate() {
+        validate_catalog_name_bound(&key.name)
+            .map_err(|error| EngineError::invalid_schema(error.message))?;
+        if key.name.is_empty()
+            || schema.foreign_keys[..position]
+                .iter()
+                .any(|previous| previous.name == key.name)
+        {
+            return Err(EngineError::invalid_schema(format!(
+                "Table `{}` needs a distinct name for each foreign key",
+                schema.name
+            )));
+        }
+        if key.columns.is_empty() || key.columns.len() != key.referenced_columns.len() {
+            return Err(EngineError::invalid_schema(format!(
+                "Foreign key `{}` must reference as many columns as it has",
+                key.name
+            )));
+        }
+        for column in &key.columns {
+            if !catalog_columns.contains(column.as_str()) {
+                return Err(EngineError::column_not_found(column, &schema.name));
+            }
         }
     }
     Ok(())
@@ -1950,6 +1988,7 @@ mod tests {
                         max_length: None,
                     },
                 ],
+                foreign_keys: vec![],
             })
             .unwrap();
         storage
@@ -2000,6 +2039,7 @@ mod tests {
             name: "users".to_owned(),
             primary_key: vec!["id".to_owned()],
             columns: vec![],
+            foreign_keys: vec![],
         })
         .unwrap_err();
 

@@ -6,7 +6,8 @@ use std::rc::Rc;
 use serde_json::{Map, Value};
 
 use crate::{
-    ColumnDefinition, ColumnType, EngineError, IndexDefinition, Result, TableDefinition,
+    ColumnDefinition, ColumnType, EngineError, ForeignKeyDefinition, IndexDefinition, Result,
+    TableDefinition,
     statement::{TableChange, WriteStatement},
     storage::{validate_index_columns_for_schema, validate_index_definition_shape, validate_schema},
 };
@@ -55,7 +56,14 @@ fn table_target(value: &Value) -> Result<TableTarget> {
     let table = object(
         value,
         "A table",
-        &["name", "columns", "primaryKey", "indexes", "renamedFrom"],
+        &[
+            "name",
+            "columns",
+            "primaryKey",
+            "indexes",
+            "foreignKeys",
+            "renamedFrom",
+        ],
     )?;
     let name = text(table, "name", "A table")?;
     let primary_key = texts(table, "primaryKey", "A table")?;
@@ -118,12 +126,34 @@ fn table_target(value: &Value) -> Result<TableTarget> {
             unique: flag(index, "unique", "An index")?,
         });
     }
+    let mut foreign_keys = Vec::new();
+    for value in items(table, "foreignKeys", "A table")? {
+        object(
+            value,
+            "A foreign key",
+            &[
+                "name",
+                "columns",
+                "references",
+                "referencedColumns",
+                "onDelete",
+                "onUpdate",
+            ],
+        )?;
+        foreign_keys.push(ForeignKeyDefinition::from_json(value).ok_or_else(|| {
+            invalid(
+                "A foreign key needs a name, columns, references, referencedColumns, and an \
+                 onDelete and onUpdate of no action, restrict, cascade, set null, or set default",
+            )
+        })?);
+    }
     Ok(TableTarget {
         renamed_from: optional_text(table, "renamedFrom", "A table")?,
         definition: TableDefinition {
             name,
             primary_key,
             columns,
+            foreign_keys,
         },
         indexes,
         column_renames,
@@ -233,9 +263,14 @@ pub(crate) fn schema_statements(
         table: table.to_owned(),
         change,
     };
-    // The statements of each phase, in the order the phases run.
-    let mut phases: [Vec<WriteStatement>; 7] = Default::default();
+    // The statements of each phase, in the order the phases run: tables renamed, foreign keys
+    // and tables dropped, indexes dropped, columns renamed, then added, altered, and dropped,
+    // indexes created, tables created, and foreign keys added once every table they reference is.
+    let mut phases: [Vec<WriteStatement>; 9] = Default::default();
     let mut kept = Vec::new();
+    let mut table_renames = Vec::new();
+    let mut column_renames = Vec::new();
+    let mut kept_tables = Vec::new();
     for target in &target.tables {
         let name = &target.definition.name;
         let existing = match (find(name), &target.renamed_from) {
@@ -244,18 +279,26 @@ pub(crate) fn schema_statements(
                 // A rename keeps the schema that qualifies a name, so the new name must too.
                 let to = name.rsplit('.').next().unwrap_or(name);
                 phases[0].push(alter(old, TableChange::RenameTable(to.to_owned())));
+                table_renames.push((old.as_str(), name.as_str()));
                 existing
             }),
             _ => None,
         };
         let Some((table, indexes)) = existing else {
-            phases[6].push(WriteStatement::CreateTable {
-                schema: target.definition.clone(),
+            phases[7].push(WriteStatement::CreateTable {
+                schema: TableDefinition {
+                    foreign_keys: vec![],
+                    ..target.definition.clone()
+                },
                 indexes: target.indexes.clone(),
                 if_not_exists: false,
             });
+            for key in &target.definition.foreign_keys {
+                phases[8].push(alter(name, TableChange::AddForeignKey(key.clone())));
+            }
             continue;
         };
+        kept_tables.push((target, table));
         if crate::statement::renamed_table(&table.name, name.rsplit('.').next().unwrap_or(name))
             != *name
         {
@@ -289,7 +332,8 @@ pub(crate) fn schema_statements(
                     renamed.clone_from(&column.name);
                 }
             }
-            phases[3].push(alter(
+            column_renames.push((name.as_str(), old.as_str(), column.name.as_str()));
+            phases[4].push(alter(
                 name,
                 TableChange::RenameColumn {
                     from: old.clone(),
@@ -309,9 +353,10 @@ pub(crate) fn schema_statements(
                     && wanted.columns == renamed.columns
                     && wanted.unique == index.unique
             }) {
-                phases[2].push(WriteStatement::DropIndex {
+                phases[3].push(WriteStatement::DropIndex {
                     name: index.name.clone(),
                     if_exists: false,
+                    cascade: false,
                 });
             }
         }
@@ -321,7 +366,7 @@ pub(crate) fn schema_statements(
                     && index.columns == wanted.columns
                     && index.unique == wanted.unique
             }) {
-                phases[5].push(WriteStatement::CreateIndex {
+                phases[6].push(WriteStatement::CreateIndex {
                     definition: wanted.clone(),
                     if_not_exists: false,
                 });
@@ -331,7 +376,7 @@ pub(crate) fn schema_statements(
         for column in &target.definition.columns {
             let Some(existing) = columns.iter().find(|existing| existing.name == column.name)
             else {
-                phases[4].push(WriteStatement::AddColumn {
+                phases[5].push(WriteStatement::AddColumn {
                     table: name.clone(),
                     column: column.clone(),
                     if_not_exists: false,
@@ -364,7 +409,7 @@ pub(crate) fn schema_statements(
                     nullable: column.nullable,
                 });
             }
-            phases[4].extend(changes.into_iter().map(|change| alter(name, change)));
+            phases[5].extend(changes.into_iter().map(|change| alter(name, change)));
         }
         if drop {
             for existing in &columns {
@@ -374,23 +419,73 @@ pub(crate) fn schema_statements(
                     .iter()
                     .any(|column| column.name == existing.name)
                 {
-                    phases[4].push(alter(
+                    phases[5].push(alter(
                         name,
                         TableChange::DropColumn {
                             column: existing.name.clone(),
                             if_exists: false,
+                            cascade: false,
                         },
                     ));
                 }
             }
         }
     }
+    // A foreign key is the target's when, with the tables and columns it names renamed, it is
+    // one the target declares.
+    let renamed_table = |table: &str| {
+        table_renames
+            .iter()
+            .find(|(old, _)| *old == table)
+            .map_or(table.to_owned(), |(_, new)| (*new).to_owned())
+    };
+    let renamed_columns = |table: &str, columns: &[String]| {
+        columns
+            .iter()
+            .map(|column| {
+                column_renames
+                    .iter()
+                    .find(|(renamed, old, _)| *renamed == table && *old == column)
+                    .map_or(column.clone(), |(_, _, new)| (*new).to_owned())
+            })
+            .collect::<Vec<_>>()
+    };
+    for (target, table) in kept_tables {
+        let name = &target.definition.name;
+        let mut existing = Vec::new();
+        for key in &table.foreign_keys {
+            let references = renamed_table(&key.references);
+            let renamed = ForeignKeyDefinition {
+                columns: renamed_columns(name, &key.columns),
+                referenced_columns: renamed_columns(&references, &key.referenced_columns),
+                references,
+                ..key.clone()
+            };
+            if !target.definition.foreign_keys.contains(&renamed) {
+                phases[1].push(alter(
+                    name,
+                    TableChange::DropConstraint {
+                        name: key.name.clone(),
+                        if_exists: false,
+                        cascade: false,
+                    },
+                ));
+            }
+            existing.push(renamed);
+        }
+        for key in &target.definition.foreign_keys {
+            if !existing.contains(key) {
+                phases[8].push(alter(name, TableChange::AddForeignKey(key.clone())));
+            }
+        }
+    }
     if drop {
         for (table, _) in current {
             if !kept.contains(&&table.name) {
-                phases[1].push(WriteStatement::DropTable {
+                phases[2].push(WriteStatement::DropTable {
                     table: table.name.clone(),
                     if_exists: false,
+                    cascade: true,
                 });
             }
         }

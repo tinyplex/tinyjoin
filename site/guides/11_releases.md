@@ -114,9 +114,21 @@ named as PostgreSQL would name it; a JSON default written as `'{}'::jsonb`; and
 `USING btree` on an index. `ALTER TABLE` can add and drop a unique constraint,
 and accepts `DISABLE ROW LEVEL SECURITY`, which changes nothing. `DROP TABLE`
 and `DROP INDEX` accept `CASCADE` and `RESTRICT`. Together these run the SQL
-that `drizzle-kit generate` writes for new tables, apart from foreign keys,
-which TinyJoin cannot enforce and still rejects, now with an error saying so.
+that `drizzle-kit generate` writes for new tables.
 See [constraints and indexes](/guides/sql-compatibility/#constraints-and-indexes).
+
+**Foreign keys are enforced.** A column's `REFERENCES`, or a table's
+`FOREIGN KEY ... REFERENCES`, names the table and columns its values must be
+found in, unless one is `NULL`, and each key is checked as its statement ends,
+inside transactions too. Deleting or updating a referenced row does what the
+key's `ON DELETE` and `ON UPDATE` actions say: `NO ACTION` and `RESTRICT`
+refuse it, `CASCADE` deletes or updates the referencing rows in the same
+statement, and `SET NULL` and `SET DEFAULT` change their references. `ALTER
+TABLE` adds a key, checking every stored row, and drops one; renames follow
+into the keys; and dropping a table, column, or unique index a key needs takes
+`CASCADE`, which drops the key. getSchema() and setSchema() include each
+table's keys, and Drizzle's `.references()` pushes as one. See
+[foreign keys](/guides/sql-compatibility/#foreign-keys).
 
 A `VARCHAR(n)` or `CHARACTER VARYING(n)` column holds at most `n` characters,
 and a longer value fails with `CONSTRAINT_VIOLATION`, as in PostgreSQL, except
@@ -152,7 +164,7 @@ runtime type, whether it is nullable, and any literal default. See
 **Upgrading from v0.4.0 needs no action.** Install, rebuild, and redeploy. The
 page format stays at format 3, so an existing database opens with no migration
 and no OPFS namespace change. A database that holds a `VARCHAR(n)` column, or
-a schema version from setSchema(), cannot be opened by v0.4.0, which reports
+a schema version from setSchema(), or a foreign key, cannot be opened by v0.4.0, which reports
 its catalog as corrupt, so do not roll back past v0.5.0 once a database uses
 either. The Worker protocol moves from
 version 10 to 11

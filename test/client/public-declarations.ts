@@ -5,6 +5,8 @@ import {
   type ColumnSchema as ColumnSchemaImplementation,
   type ColumnType as ColumnTypeImplementation,
   create as createImplementation,
+  type ForeignKeyAction as ForeignKeyActionImplementation,
+  type ForeignKeySchema as ForeignKeySchemaImplementation,
   type DataDir as DataDirImplementation,
   type IndexSchema as IndexSchemaImplementation,
   type JsonPrimitive as JsonPrimitiveImplementation,
@@ -31,6 +33,8 @@ import type {
   ColumnSchema as ColumnSchemaDeclaration,
   ColumnType as ColumnTypeDeclaration,
   create as createDeclaration,
+  ForeignKeyAction as ForeignKeyActionDeclaration,
+  ForeignKeySchema as ForeignKeySchemaDeclaration,
   DataDir as DataDirDeclaration,
   IndexSchema as IndexSchemaDeclaration,
   JsonPrimitive as JsonPrimitiveDeclaration,
@@ -115,6 +119,12 @@ type PublicTypeParity = [
   Assert<Equivalent<ColumnSchemaImplementation, ColumnSchemaDeclaration>>,
   Assert<Equivalent<ColumnTypeImplementation, ColumnTypeDeclaration>>,
   Assert<Equivalent<DataDirImplementation, DataDirDeclaration>>,
+  Assert<
+    Equivalent<ForeignKeyActionImplementation, ForeignKeyActionDeclaration>
+  >,
+  Assert<
+    Equivalent<ForeignKeySchemaImplementation, ForeignKeySchemaDeclaration>
+  >,
   Assert<Equivalent<IndexSchemaImplementation, IndexSchemaDeclaration>>,
   Assert<Equivalent<JsonPrimitiveImplementation, JsonPrimitiveDeclaration>>,
   Assert<Equivalent<JsonValueImplementation, JsonValueDeclaration>>,

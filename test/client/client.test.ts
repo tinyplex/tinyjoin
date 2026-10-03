@@ -1173,6 +1173,7 @@ describe('Client', () => {
           ],
           primaryKey: ['id'],
           indexes: [{name: 'posts_done', columns: ['done'], unique: false}],
+          foreignKeys: [],
         },
       ],
     };

@@ -4060,6 +4060,7 @@ mod tests {
                             max_length: None,
                         },
                     ],
+                    foreign_keys: vec![],
                 },
                 repeated_row,
                 repetitions,
@@ -4972,6 +4973,7 @@ mod tests {
                 column("j", ColumnType::Json, None),
                 column("d", ColumnType::Integer, Some(json!(7))),
             ],
+            foreign_keys: vec![],
         };
         let values = [
             vec![json!(1), json!(-4), json!(9_007_199_254_740_991_i64)],

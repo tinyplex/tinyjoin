@@ -511,6 +511,25 @@ impl Json {
                     ",\"unique\":false}"
                 });
             }
+            self.raw("],\"foreignKeys\":[");
+            for (position, key) in table.foreign_keys.iter().enumerate() {
+                if position > 0 {
+                    self.raw(",");
+                }
+                self.raw("{\"name\":");
+                self.string(&key.name);
+                self.raw(",\"columns\":");
+                self.strings(&key.columns);
+                self.raw(",\"references\":");
+                self.string(&key.references);
+                self.raw(",\"referencedColumns\":");
+                self.strings(&key.referenced_columns);
+                self.raw(",\"onDelete\":");
+                self.string(key.on_delete.name());
+                self.raw(",\"onUpdate\":");
+                self.string(key.on_update.name());
+                self.raw("}");
+            }
             self.raw("]}");
             self.bounded()?;
         }
@@ -664,7 +683,9 @@ fn serialization() -> EngineError {
 mod tests {
     use super::*;
     use serde_json::json;
-    use tinyjoin_core::{ColumnDefinition, ResultField, TableKeys};
+    use tinyjoin_core::{
+        ColumnDefinition, ForeignKeyAction, ForeignKeyDefinition, ResultField, TableKeys,
+    };
 
     fn result(fields: &[(&str, u32)], rows: Vec<Value>) -> ExecuteResult {
         ExecuteResult {
@@ -829,6 +850,14 @@ mod tests {
                     max_length: None,
                 },
             ],
+            foreign_keys: vec![ForeignKeyDefinition {
+                name: "k_fkey".into(),
+                columns: vec!["k".into()],
+                references: "t\"1".into(),
+                referenced_columns: vec!["k".into()],
+                on_delete: ForeignKeyAction::Cascade,
+                on_update: ForeignKeyAction::NoAction,
+            }],
         };
         let index = IndexDefinition {
             name: "by_k".into(),
@@ -845,7 +874,9 @@ mod tests {
                 r#"{"name":"id","type":"integer","nullable":false},"#,
                 r#"{"name":"k","type":"text","nullable":false,"default":"x","maxLength":8},"#,
                 r#"{"name":"doc","type":"json","nullable":true,"default":null}],"#,
-                r#""primaryKey":["id","k"],"indexes":[{"name":"by_k","columns":["k"],"unique":true}]}]}"#,
+                r#""primaryKey":["id","k"],"indexes":[{"name":"by_k","columns":["k"],"unique":true}],"#,
+                r#""foreignKeys":[{"name":"k_fkey","columns":["k"],"references":"t\"1","#,
+                r#""referencedColumns":["k"],"onDelete":"cascade","onUpdate":"no action"}]}]}"#,
             )
         );
         let mut json = Json::default();

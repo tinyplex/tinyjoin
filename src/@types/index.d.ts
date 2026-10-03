@@ -99,6 +99,35 @@ export interface IndexSchema {
   unique: boolean;
 }
 
+/// ForeignKeyAction
+export type ForeignKeyAction =
+  | 'no action'
+  | 'restrict'
+  | 'cascade'
+  | 'set null'
+  | 'set default';
+
+/// ForeignKeySchema
+export interface ForeignKeySchema {
+  /// ForeignKeySchema.name
+  name: string;
+
+  /// ForeignKeySchema.columns
+  columns: string[];
+
+  /// ForeignKeySchema.references
+  references: string;
+
+  /// ForeignKeySchema.referencedColumns
+  referencedColumns: string[];
+
+  /// ForeignKeySchema.onDelete
+  onDelete: ForeignKeyAction;
+
+  /// ForeignKeySchema.onUpdate
+  onUpdate: ForeignKeyAction;
+}
+
 /// TableSchema
 export interface TableSchema {
   /// TableSchema.name
@@ -112,6 +141,9 @@ export interface TableSchema {
 
   /// TableSchema.indexes
   indexes: IndexSchema[];
+
+  /// TableSchema.foreignKeys
+  foreignKeys: ForeignKeySchema[];
 
   /// TableSchema.renamedFrom
   renamedFrom?: string;

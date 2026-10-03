@@ -38,6 +38,7 @@ import type {
   Client,
   ColumnSchema,
   ColumnType,
+  ForeignKeySchema,
   IndexSchema,
   JsonValue,
   TableSchema,
@@ -313,9 +314,6 @@ const tableSchema = (
   const refuse = (what: string): never => {
     throw new Error(`Table ${name} ${what}, which TinyJoin does not have`);
   };
-  if (config.foreignKeys.length > 0) {
-    refuse('declares foreign keys');
-  }
   if (config.checks.length > 0) {
     refuse('declares check constraints');
   }
@@ -389,6 +387,18 @@ const tableSchema = (
       unique: index.unique,
     });
   }
+  const foreignKeys = config.foreignKeys.map((key): ForeignKeySchema => {
+    const {columns, foreignColumns, foreignTable} = key.reference();
+    const parent = getTableConfig(foreignTable);
+    return {
+      name: key.getName(),
+      columns: columns.map((column) => column.name),
+      references: parent.schema ? `${parent.schema}.${parent.name}` : parent.name,
+      referencedColumns: foreignColumns.map((column) => column.name),
+      onDelete: key.onDelete ?? 'no action',
+      onUpdate: key.onUpdate ?? 'no action',
+    };
+  });
   const renamedFrom = renames[name];
   return {
     name,
@@ -397,6 +407,7 @@ const tableSchema = (
       config.primaryKeys[0]?.columns.map((column) => column.name) ??
       config.columns.filter((column) => column.primary).map(({name}) => name),
     indexes,
+    foreignKeys,
     ...(renamedFrom === undefined ? {} : {renamedFrom}),
   };
 };

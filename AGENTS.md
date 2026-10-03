@@ -63,6 +63,9 @@ and has no OPFS, filesystem persistence, or remote synchronization. See the
 - Put application values in `$1`, `$2`, and later parameters.
 - Use query() for one statement and exec() for a parameter-free script.
 - Give every SQL-created table a primary key.
+- Declare foreign keys with `REFERENCES`, and their `ON DELETE` actions; they
+  are checked as each statement ends. Index a large table's referencing
+  columns.
 - Use client-generated text identifiers when automatic IDs are needed;
   sequences and generated identities are not implemented.
 - Write upserts as `INSERT ... ON CONFLICT (id) DO UPDATE SET column =
@@ -97,7 +100,7 @@ To use the Drizzle ORM, call `drizzle(client, {schema})` from
 sets the Drizzle schema with setSchema(); with DDL through client.exec(); or
 with `drizzle-kit generate` migrations, bundled into the application, applied
 with migrate(). Drizzle's own migrators and Drizzle Kit's `push` do not work. Use the
-column types TinyJoin has, leave out `.references()`, and avoid relational
+column types TinyJoin has, and avoid relational
 queries with `with`, SQL functions, and nested transactions.
 See the [Drizzle guide](/guides/drizzle/).
 
@@ -107,7 +110,7 @@ To use Kysely, give the `Kysely` constructor a TinyJoinDialect from
 `tinyjoin/kysely`, constructed with `{client}`; the application installs
 `kysely` itself and closes the Client.
 Kysely's Migrator and introspector work. Use the column types TinyJoin has,
-leave out foreign keys, use `selectAll('table')` rather than `selectAll()`
+use `selectAll('table')` rather than `selectAll()`
 over a join whose tables share column names, and avoid `jsonArrayFrom`, SQL
 functions, and savepoints. See the
 [Kysely guide](/guides/kysely/).

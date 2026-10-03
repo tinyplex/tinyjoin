@@ -35,6 +35,7 @@ test('persists complete state across dedicated Worker restarts', async ({
         columns: [{name: 'id', type: 'integer', nullable: false}],
         primaryKey: ['id'],
         indexes: [],
+        foreignKeys: [],
       },
       {
         name: 'posts',
@@ -47,6 +48,7 @@ test('persists complete state across dedicated Worker restarts', async ({
         ],
         primaryKey: ['id'],
         indexes: [{name: 'posts_author', columns: ['author'], unique: false}],
+        foreignKeys: [],
       },
     ],
   });

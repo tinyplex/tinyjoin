@@ -72,11 +72,29 @@ export interface IndexSchema {
   unique: boolean;
 }
 
+/** What deleting or updating a referenced row does to the rows that reference it. */
+export type ForeignKeyAction =
+  | 'no action'
+  | 'restrict'
+  | 'cascade'
+  | 'set null'
+  | 'set default';
+
+export interface ForeignKeySchema {
+  name: string;
+  columns: string[];
+  references: string;
+  referencedColumns: string[];
+  onDelete: ForeignKeyAction;
+  onUpdate: ForeignKeyAction;
+}
+
 export interface TableSchema {
   name: string;
   columns: ColumnSchema[];
   primaryKey: string[];
   indexes: IndexSchema[];
+  foreignKeys: ForeignKeySchema[];
   /** A name the table had, which setSchema renames it from. */
   renamedFrom?: string;
 }
@@ -532,6 +550,14 @@ const COLUMN_TYPES: readonly unknown[] = [
   'json',
 ];
 
+const FOREIGN_KEY_ACTIONS: readonly unknown[] = [
+  'no action',
+  'restrict',
+  'cascade',
+  'set null',
+  'set default',
+];
+
 const isSchema = (value: unknown): value is Schema => {
   const validation = createJsonValidation();
   const isColumn = (column: unknown): boolean =>
@@ -549,13 +575,36 @@ const isSchema = (value: unknown): value is Schema => {
     isString(index.name) &&
     isStrings(index.columns) &&
     isBoolean(index.unique);
+  const isForeignKey = (key: unknown): boolean =>
+    isRecord(key) &&
+    hasExactKeys(key, [
+      'name',
+      'columns',
+      'references',
+      'referencedColumns',
+      'onDelete',
+      'onUpdate',
+    ]) &&
+    isString(key.name) &&
+    isStrings(key.columns) &&
+    isString(key.references) &&
+    isStrings(key.referencedColumns) &&
+    FOREIGN_KEY_ACTIONS.includes(key.onDelete) &&
+    FOREIGN_KEY_ACTIONS.includes(key.onUpdate);
   const isTable = (table: unknown): boolean =>
     isRecord(table) &&
-    hasExactKeys(table, ['name', 'columns', 'primaryKey', 'indexes']) &&
+    hasExactKeys(table, [
+      'name',
+      'columns',
+      'primaryKey',
+      'indexes',
+      'foreignKeys',
+    ]) &&
     isString(table.name) &&
     isDenseArray(table.columns, isColumn) &&
     isStrings(table.primaryKey) &&
-    isDenseArray(table.indexes, isIndex);
+    isDenseArray(table.indexes, isIndex) &&
+    isDenseArray(table.foreignKeys, isForeignKey);
   return (
     isRecord(value) &&
     hasExactKeys(value, ['version', 'tables']) &&

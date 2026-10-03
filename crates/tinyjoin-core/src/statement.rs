@@ -30,8 +30,8 @@ use crate::storage::{
     validate_primary_storage_key_bound, validate_schema, validate_value,
 };
 use crate::{
-    ChangedKeys, ColumnDefinition, ColumnType, EngineError, IndexDefinition,
-    MAX_CHANGED_KEYS_PER_TABLE, Predicate, Result, ResultField, Row, RowChange, SelectPlan,
+    ChangedKeys, ColumnDefinition, ColumnType, EngineError, ForeignKeyAction, ForeignKeyDefinition,
+    IndexDefinition, MAX_CHANGED_KEYS_PER_TABLE, Predicate, Result, ResultField, Row, RowChange, SelectPlan,
     StorageReader, Subquery, TableDefinition, TableKeys, VisitControl, VisitOutcome,
 };
 
@@ -91,10 +91,14 @@ pub(crate) enum WriteStatement {
     DropTable {
         table: String,
         if_exists: bool,
+        /// `CASCADE`: the foreign keys of other tables that reference it are dropped too.
+        cascade: bool,
     },
     DropIndex {
         name: String,
         if_exists: bool,
+        /// `CASCADE`: the foreign keys that need the unique index are dropped too.
+        cascade: bool,
     },
     AddColumn {
         table: String,
@@ -174,6 +178,9 @@ pub(crate) struct PlannedDml {
     /// For each change, what its key held before the statement, where planning read it. Writers
     /// use it in place of looking the row up again.
     pub previous: Vec<PreviousRow>,
+    /// Each row an UPDATE moved to a new primary key: the change deleting it from its old key,
+    /// and the change writing it at its new one, by position in `changes`.
+    pub moved: Vec<(usize, usize)>,
 }
 
 /// What a planned change's key held before its statement.
@@ -297,12 +304,12 @@ pub(crate) fn execute<S: StorageDriver>(
             definition,
             if_not_exists,
         } => create_index(storage, definition, *if_not_exists).map(no_changed_keys),
-        WriteStatement::DropTable { table, if_exists } => {
-            drop_table(storage, table, *if_exists).map(no_changed_keys)
-        }
-        WriteStatement::DropIndex { name, if_exists } => {
-            drop_index(storage, name, *if_exists).map(no_changed_keys)
-        }
+        WriteStatement::DropTable {
+            table, if_exists, ..
+        } => drop_table(storage, table, *if_exists).map(no_changed_keys),
+        WriteStatement::DropIndex {
+            name, if_exists, ..
+        } => drop_index(storage, name, *if_exists).map(no_changed_keys),
         WriteStatement::AddColumn {
             table,
             column,
@@ -330,6 +337,7 @@ pub(crate) fn execute<S: StorageDriver>(
                 outcome,
                 changes,
                 previous,
+                ..
             } = plan_dml(storage, statement)?;
             let keys = changed_keys(storage, &changes, &previous)?;
             storage.apply_row_changes_unrevisioned(changes)?;
@@ -567,7 +575,7 @@ pub(crate) fn plan_dml(
     storage: &dyn StorageReader,
     statement: &WriteStatement,
 ) -> Result<PlannedDml> {
-    match statement {
+    let mut planned = match statement {
         WriteStatement::Insert {
             table,
             columns,
@@ -608,7 +616,10 @@ pub(crate) fn plan_dml(
         | WriteStatement::SetSchemaVersion { .. } => Err(EngineError::unsupported_sql(
             "Page-native SQL currently supports SELECT, CREATE TABLE, INSERT, UPDATE, and DELETE",
         )),
-    }
+    }?;
+    // Foreign keys are checked as the statement ends, with the rows their actions change.
+    crate::foreign_key::enforce(storage, &mut planned)?;
+    Ok(planned)
 }
 
 pub(crate) fn write_result_fields(
@@ -640,7 +651,7 @@ fn drop_table<S: StorageDriver>(
     table: &str,
     if_exists: bool,
 ) -> Result<WriteOutcome> {
-    let outcome = plan_drop_table(storage, table, if_exists)?;
+    let outcome = plan_drop_table(storage, table, if_exists, false)?;
     if outcome.mutated {
         storage.drop_table(table)?;
     }
@@ -651,6 +662,7 @@ pub(crate) fn plan_drop_table(
     storage: &dyn StorageReader,
     table: &str,
     if_exists: bool,
+    cascade: bool,
 ) -> Result<WriteOutcome> {
     storage.ensure_readable()?;
     if let Err(error) = storage.table_schema(table) {
@@ -664,6 +676,13 @@ pub(crate) fn plan_drop_table(
             tables: vec![],
             mutated: false,
         });
+    }
+    if !cascade
+        && let Some((child, key)) = crate::foreign_key::referencing(storage, table)
+            .into_iter()
+            .find(|(child, _)| child.name != table)
+    {
+        return Err(depended_on(&format!("Table `{table}`"), &child.name, &key.name));
     }
     Ok(WriteOutcome {
         command: "DROP TABLE",
@@ -680,11 +699,19 @@ fn drop_index<S: StorageDriver>(
     name: &str,
     if_exists: bool,
 ) -> Result<WriteOutcome> {
-    let outcome = plan_drop_index(storage, name, if_exists)?;
+    let outcome = plan_drop_index(storage, name, if_exists, false)?;
     if outcome.mutated {
         storage.drop_index(name)?;
     }
     Ok(outcome)
+}
+
+/// The error for dropping what a foreign key needs without `CASCADE`.
+fn depended_on(what: &str, table: &str, key: &str) -> EngineError {
+    EngineError::invalid_schema(format!(
+        "{what} cannot be dropped while foreign key `{key}` of `{table}` needs it; drop the key, \
+         or drop with CASCADE"
+    ))
 }
 
 /// Checks an `ALTER TABLE` change against the table it changes, reporting whether it changes it.
@@ -697,16 +724,56 @@ pub(crate) fn plan_alter_table(
     let mut tables = vec![table.to_owned()];
     let mutated = match change {
         TableChange::DisableRowSecurity => false,
-        TableChange::DropConstraint { name, if_exists } => match storage.index_definition(name) {
-            Some(definition) if definition.unique && definition.table == table => true,
+        TableChange::DropConstraint { name, .. }
+            if schema.foreign_keys.iter().any(|key| key.name == *name) =>
+        {
+            true
+        }
+        TableChange::DropConstraint {
+            name,
+            if_exists,
+            cascade,
+        } => match storage.index_definition(name) {
+            Some(definition) if definition.unique && definition.table == table => {
+                if !cascade
+                    && let Some((child, key)) =
+                        crate::foreign_key::needing(storage, &definition).into_iter().next()
+                {
+                    return Err(depended_on(
+                        &format!("Constraint `{name}`"),
+                        &child.name,
+                        &key.name,
+                    ));
+                }
+                true
+            }
             _ if *if_exists => false,
             _ => {
                 return Err(EngineError::new(
                     "INDEX_NOT_FOUND",
-                    format!("Table `{table}` has no unique constraint `{name}`"),
+                    format!("Table `{table}` has no constraint `{name}`"),
                 ));
             }
         },
+        TableChange::AddForeignKey(key) => {
+            if schema
+                .foreign_keys
+                .iter()
+                .any(|existing| existing.name == key.name)
+            {
+                return Err(EngineError::invalid_schema(format!(
+                    "Table `{table}` already has foreign key `{}`",
+                    key.name
+                )));
+            }
+            crate::foreign_key::resolve(
+                storage,
+                &schema,
+                &storage.indexes_for_table(table)?,
+                key,
+            )?;
+            true
+        }
         TableChange::RenameTable(name) => {
             let name = renamed_table(table, name);
             validate_catalog_name_bound(&name)
@@ -717,10 +784,24 @@ pub(crate) fn plan_alter_table(
             tables.push(name);
             true
         }
-        TableChange::DropColumn { column, if_exists: true }
-            if !schema.columns.iter().any(|existing| &existing.name == column) =>
+        TableChange::DropColumn {
+            column,
+            if_exists: true,
+            ..
+        } if !schema.columns.iter().any(|existing| &existing.name == column) => false,
+        TableChange::DropColumn {
+            column,
+            cascade: false,
+            ..
+        } if let Some((child, key)) = crate::foreign_key::referencing(storage, table)
+            .into_iter()
+            .find(|(child, key)| child.name != table && key.referenced_columns.contains(column)) =>
         {
-            false
+            return Err(depended_on(
+                &format!("Column `{column}`"),
+                &child.name,
+                &key.name,
+            ));
         }
         TableChange::RestateType {
             column,
@@ -762,9 +843,18 @@ pub(crate) fn altered_schema(
             }
             let position = column_position(schema, from)?;
             altered.columns[position].name.clone_from(to);
+            let own = schema.name.clone();
             for key in &mut altered.primary_key {
                 if key == from {
                     key.clone_from(to);
+                }
+            }
+            for key in &mut altered.foreign_keys {
+                let referenced = (key.references == own).then_some(&mut key.referenced_columns);
+                for column in key.columns.iter_mut().chain(referenced.into_iter().flatten()) {
+                    if column == from {
+                        column.clone_from(to);
+                    }
                 }
             }
         }
@@ -790,6 +880,14 @@ pub(crate) fn altered_schema(
                 )));
             }
             altered.columns.remove(position);
+            // As in PostgreSQL, the table's foreign keys on the column go with it.
+            altered.foreign_keys.retain(|key| {
+                !key.columns.contains(column)
+                    && !(key.references == schema.name && key.referenced_columns.contains(column))
+            });
+        }
+        TableChange::DropConstraint { name, .. } => {
+            altered.foreign_keys.retain(|key| key.name != *name);
         }
         _ => {}
     }
@@ -817,6 +915,7 @@ pub(crate) fn plan_drop_index(
     storage: &dyn StorageReader,
     name: &str,
     if_exists: bool,
+    cascade: bool,
 ) -> Result<WriteOutcome> {
     storage.ensure_readable()?;
     let Some(definition) = storage.index_definition(name) else {
@@ -834,6 +933,13 @@ pub(crate) fn plan_drop_index(
             format!("Index `{name}` is not defined"),
         ));
     };
+    if !cascade
+        && let Some((child, key)) = crate::foreign_key::needing(storage, &definition)
+            .into_iter()
+            .next()
+    {
+        return Err(depended_on(&format!("Index `{name}`"), &child.name, &key.name));
+    }
     Ok(WriteOutcome {
         command: "DROP INDEX",
         row_count: 0,
@@ -994,6 +1100,18 @@ pub(crate) fn plan_create_table(
         }
         validate_index_definition_shape(definition)?;
         validate_index_columns_for_schema(definition, schema)?;
+    }
+    for (position, key) in schema.foreign_keys.iter().enumerate() {
+        if schema.foreign_keys[..position]
+            .iter()
+            .any(|previous| previous.name == key.name)
+        {
+            return Err(EngineError::invalid_schema(format!(
+                "Table `{}` declares foreign key `{}` more than once",
+                schema.name, key.name
+            )));
+        }
+        crate::foreign_key::resolve(storage, schema, indexes, key)?;
     }
 
     Ok(WriteOutcome {
@@ -1267,6 +1385,7 @@ fn plan_insert(
         },
         changes,
         previous,
+        moved: vec![],
     })
 }
 
@@ -1870,6 +1989,7 @@ fn plan_update(
 
     // A row keeping its key replaces the row planning read there. A row moving to a new key is
     // deleted from its old one, and what its new key holds is left for the writer to read.
+    let mut moved = Vec::new();
     let (changes, previous) = if row_count > 0 {
         let mut deletes = Vec::with_capacity(row_count);
         let mut deleted = Vec::with_capacity(row_count);
@@ -1896,6 +2016,7 @@ fn plan_update(
                 } => (old_primary_key, new_key, new_row),
             };
             if update.old_key != new_key {
+                moved.push((deletes.len(), upserts.len()));
                 deletes.push(RowChange::Delete {
                     table: table.to_owned(),
                     key: old_primary_key,
@@ -1909,6 +2030,9 @@ fn plan_update(
                 table: table.to_owned(),
                 row: new_row,
             });
+        }
+        for (_, upsert) in &mut moved {
+            *upsert += deletes.len();
         }
         deletes.extend(upserts);
         deleted.extend(replaced);
@@ -1929,6 +2053,7 @@ fn plan_update(
         },
         changes,
         previous,
+        moved,
     })
 }
 
@@ -2025,6 +2150,7 @@ fn plan_delete(
         },
         changes,
         previous,
+        moved: vec![],
     })
 }
 
@@ -2506,6 +2632,7 @@ impl<'a> MutationParser<'a> {
         let mut inline_primary_key = None;
         let mut table_primary_key = None;
         let mut indexes = Vec::new();
+        let mut foreign_keys = Vec::new();
         loop {
             if let Some(constraint) = self.parse_table_constraint()? {
                 match constraint {
@@ -2519,6 +2646,9 @@ impl<'a> MutationParser<'a> {
                     }
                     TableConstraint::Unique(constraint, key) => {
                         indexes.push(unique_index(&name, constraint, key));
+                    }
+                    TableConstraint::ForeignKey(key) => {
+                        foreign_keys.push(foreign_key_named(&name, key));
                     }
                 }
             } else {
@@ -2538,6 +2668,9 @@ impl<'a> MutationParser<'a> {
                 }
                 if let Some(constraint) = clauses.unique {
                     indexes.push(unique_index(&name, constraint, vec![column.name.clone()]));
+                }
+                if let Some(key) = clauses.references {
+                    foreign_keys.push(foreign_key_named(&name, key));
                 }
                 columns.push(column);
             }
@@ -2568,6 +2701,7 @@ impl<'a> MutationParser<'a> {
                 name,
                 primary_key,
                 columns,
+                foreign_keys,
             },
             indexes,
             if_not_exists,
@@ -2601,12 +2735,85 @@ impl<'a> MutationParser<'a> {
             )));
         }
         if self.keyword_at(0, "foreign") && (named || self.keyword_at(1, "key")) {
-            return Err(foreign_keys_unsupported());
+            self.position += 1;
+            self.expect_keyword("key")?;
+            let columns = self.parse_constraint_columns()?;
+            self.expect_keyword("references")?;
+            return Ok(Some(TableConstraint::ForeignKey(
+                self.parse_references(constraint.unwrap_or_default(), columns)?,
+            )));
         }
         if self.keyword_at(0, "check") && (named || self.token_at(1, TokenMatcher::LParen)) {
             return Err(check_unsupported());
         }
         Ok(None)
+    }
+
+    /// Reads what follows `REFERENCES`: the table, its columns if they are not its primary key,
+    /// and what deleting or updating a referenced row does. A key is checked as each statement
+    /// ends, and one NULL among its values satisfies it, as `MATCH SIMPLE` says.
+    fn parse_references(
+        &mut self,
+        name: String,
+        columns: Vec<String>,
+    ) -> Result<ForeignKeyDefinition> {
+        let references = self.parse_table_name()?;
+        let referenced_columns = if self.peek_matches(TokenMatcher::LParen) {
+            self.parse_constraint_columns()?
+        } else {
+            Vec::new()
+        };
+        let mut on_delete = ForeignKeyAction::NoAction;
+        let mut on_update = ForeignKeyAction::NoAction;
+        loop {
+            if self.consume_keyword("on") {
+                let delete = self.consume_keyword("delete");
+                if !delete {
+                    self.expect_keyword("update")?;
+                }
+                let action = if self.consume_keyword("cascade") {
+                    ForeignKeyAction::Cascade
+                } else if self.consume_keyword("restrict") {
+                    ForeignKeyAction::Restrict
+                } else if self.consume_keyword("no") {
+                    self.expect_keyword("action")?;
+                    ForeignKeyAction::NoAction
+                } else {
+                    self.expect_keyword("set")?;
+                    if self.consume_keyword("null") {
+                        ForeignKeyAction::SetNull
+                    } else {
+                        self.expect_keyword("default")?;
+                        ForeignKeyAction::SetDefault
+                    }
+                };
+                if delete {
+                    on_delete = action;
+                } else {
+                    on_update = action;
+                }
+            } else if self.consume_keyword("match") {
+                self.expect_keyword("simple")?;
+            } else if self.keyword_at(0, "not") && self.keyword_at(1, "deferrable") {
+                self.position += 2;
+            } else if self.consume_keyword("initially") {
+                self.expect_keyword("immediate")?;
+            } else if self.keyword_at(0, "deferrable") {
+                return Err(EngineError::unsupported_sql(
+                    "A foreign key cannot be deferred; each is checked as its statement ends",
+                ));
+            } else {
+                break;
+            }
+        }
+        Ok(ForeignKeyDefinition {
+            name,
+            columns,
+            references,
+            referenced_columns,
+            on_delete,
+            on_update,
+        })
     }
 
     fn parse_constraint_columns(&mut self) -> Result<Vec<String>> {
@@ -2651,19 +2858,25 @@ impl<'a> MutationParser<'a> {
             false
         };
         let if_exists = self.parse_if_exists(false)?;
-        let statement = if table {
+        let name = if table {
+            self.parse_table_name()?
+        } else {
+            self.parse_identifier()?
+        };
+        let cascade = self.parse_drop_behavior();
+        Ok(if table {
             WriteStatement::DropTable {
-                table: self.parse_table_name()?,
+                table: name,
                 if_exists,
+                cascade,
             }
         } else {
             WriteStatement::DropIndex {
-                name: self.parse_identifier()?,
+                name,
                 if_exists,
+                cascade,
             }
-        };
-        self.consume_drop_behavior();
-        Ok(statement)
+        })
     }
 
     /// Reads `IF EXISTS`, or `IF NOT EXISTS` where `not` is set, reporting whether it was there.
@@ -2678,10 +2891,14 @@ impl<'a> MutationParser<'a> {
         Ok(true)
     }
 
-    // Nothing in TinyJoin depends on a table but its own indexes, which go with it, and nothing
-    // depends on an index or a constraint, so `CASCADE` and `RESTRICT` drop the same objects.
-    fn consume_drop_behavior(&mut self) {
-        let _ = self.consume_keyword("cascade") || self.consume_keyword("restrict");
+    /// Reads `CASCADE`, which drops the foreign keys that depend on what is dropped, or
+    /// `RESTRICT`, the default, which refuses to drop what a foreign key depends on.
+    fn parse_drop_behavior(&mut self) -> bool {
+        if self.consume_keyword("cascade") {
+            return true;
+        }
+        self.consume_keyword("restrict");
+        false
     }
 
     fn parse_alter_table(&mut self) -> Result<WriteStatement> {
@@ -2759,13 +2976,18 @@ impl<'a> MutationParser<'a> {
             }
             let if_exists = self.parse_if_exists(false)?;
             let name = self.parse_identifier()?;
-            self.consume_drop_behavior();
+            let cascade = self.parse_drop_behavior();
             if constraint {
-                TableChange::DropConstraint { name, if_exists }
+                TableChange::DropConstraint {
+                    name,
+                    if_exists,
+                    cascade,
+                }
             } else {
                 TableChange::DropColumn {
                     column: name,
                     if_exists,
+                    cascade,
                 }
             }
         } else {
@@ -2790,14 +3012,18 @@ impl<'a> MutationParser<'a> {
                     "ALTER TABLE cannot change a table's primary key",
                 ));
             }
+            Some(TableConstraint::ForeignKey(key)) => {
+                let change = TableChange::AddForeignKey(foreign_key_named(&table, key));
+                return Ok(WriteStatement::AlterTable { table, change });
+            }
             None => {}
         }
         self.consume_keyword("column");
         let if_not_exists = self.parse_if_exists(true)?;
         let (column, clauses) = self.parse_column_definition()?;
-        if clauses.primary_key || clauses.unique.is_some() {
+        if clauses.primary_key || clauses.unique.is_some() || clauses.references.is_some() {
             return Err(EngineError::unsupported_sql(
-                "ALTER TABLE ADD COLUMN cannot add a primary key or UNIQUE constraint",
+                "ALTER TABLE ADD COLUMN cannot add a constraint; add the column, then the constraint",
             ));
         }
         Ok(WriteStatement::AddColumn {
@@ -2815,10 +3041,12 @@ impl<'a> MutationParser<'a> {
         let mut clauses = ColumnClauses {
             primary_key: false,
             unique: None,
+            references: None,
         };
 
         loop {
-            // A constraint's name matters only for a unique constraint, whose index it names.
+            // A constraint's name matters only to a unique constraint, whose index it names, and to
+            // a foreign key.
             let constraint = if self.consume_keyword("constraint") {
                 Some(self.parse_identifier()?)
             } else {
@@ -2831,7 +3059,9 @@ impl<'a> MutationParser<'a> {
             } else if self.consume_keyword("unique") {
                 clauses.unique = Some(constraint);
             } else if self.consume_keyword("references") {
-                return Err(foreign_keys_unsupported());
+                clauses.references = Some(
+                    self.parse_references(constraint.unwrap_or_default(), vec![name.clone()])?,
+                );
             } else if self.consume_keyword("check") {
                 return Err(check_unsupported());
             } else if self.consume_keyword("not") {
@@ -3347,14 +3577,23 @@ pub(crate) enum TableChange {
     /// `DISABLE ROW LEVEL SECURITY`, which changes nothing, since no table has any.
     DisableRowSecurity,
     /// `DROP CONSTRAINT`, which drops one of the table's unique indexes.
-    DropConstraint { name: String, if_exists: bool },
+    DropConstraint {
+        name: String,
+        if_exists: bool,
+        cascade: bool,
+    },
+    AddForeignKey(ForeignKeyDefinition),
     RenameTable(String),
     RenameColumn { from: String, to: String },
     /// `SET DEFAULT`, or `DROP DEFAULT` where the default is `None`.
     SetDefault { column: String, default: Option<Value> },
     /// `DROP NOT NULL`, or `SET NOT NULL`, which every row must already meet.
     SetNullable { column: String, nullable: bool },
-    DropColumn { column: String, if_exists: bool },
+    DropColumn {
+        column: String,
+        if_exists: bool,
+        cascade: bool,
+    },
     /// `ALTER COLUMN ... TYPE` naming the runtime type the column already has, as `BIGINT` does
     /// for `INTEGER`, which can change only the length a `VARCHAR` holds.
     RestateType {
@@ -3368,29 +3607,31 @@ enum TableConstraint {
     PrimaryKey(Vec<String>),
     /// A unique constraint's name, if it has one, and its columns.
     Unique(Option<String>, Vec<String>),
+    /// A foreign key, whose name is empty if it has none.
+    ForeignKey(ForeignKeyDefinition),
 }
 
 struct ColumnClauses {
     primary_key: bool,
     /// The name of the column's unique constraint, if it has one and that constraint is named.
     unique: Option<Option<String>>,
+    /// The column's foreign key, whose name is empty if it has none.
+    references: Option<ForeignKeyDefinition>,
+}
+
+/// A foreign key's name, as PostgreSQL names one without a name, for its table and columns, as
+/// in `posts_user_id_fkey`.
+fn foreign_key_named(table: &str, mut key: ForeignKeyDefinition) -> ForeignKeyDefinition {
+    if key.name.is_empty() {
+        key.name = constraint_name(table, &key.columns, "_fkey");
+    }
+    key
 }
 
 /// The unique index a unique constraint creates. As in PostgreSQL, one without a name is named
 /// for its table and columns, as in `users_email_key`.
 fn unique_index(table: &str, name: Option<String>, columns: Vec<String>) -> IndexDefinition {
-    let name = name.unwrap_or_else(|| {
-        let mut name = table
-            .bytes()
-            .rposition(|byte| byte == b'.')
-            .map_or(table, |dot| &table[dot + 1..])
-            .to_owned();
-        for column in &columns {
-            name.push('_');
-            name.push_str(column);
-        }
-        name + "_key"
-    });
+    let name = name.unwrap_or_else(|| constraint_name(table, &columns, "_key"));
     IndexDefinition {
         name,
         table: table.to_owned(),
@@ -3399,8 +3640,18 @@ fn unique_index(table: &str, name: Option<String>, columns: Vec<String>) -> Inde
     }
 }
 
-fn foreign_keys_unsupported() -> EngineError {
-    EngineError::unsupported_sql("Foreign keys are not supported; TinyJoin cannot enforce them")
+/// A constraint's name for its table, without any schema, and its columns, as in `t_a_b_key`.
+fn constraint_name(table: &str, columns: &[String], suffix: &str) -> String {
+    let mut name = table
+        .bytes()
+        .rposition(|byte| byte == b'.')
+        .map_or(table, |dot| &table[dot + 1..])
+        .to_owned();
+    for column in columns {
+        name.push('_');
+        name.push_str(column);
+    }
+    name + suffix
 }
 
 fn check_unsupported() -> EngineError {
@@ -3563,6 +3814,7 @@ mod tests {
                         max_length: None,
                     },
                 ],
+                foreign_keys: vec![],
             })
             .unwrap();
         storage
@@ -3958,6 +4210,7 @@ mod tests {
                         max_length: None,
                     },
                 ],
+                foreign_keys: vec![],
             })
             .unwrap();
         let revision = storage.revision();

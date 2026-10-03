@@ -79,6 +79,63 @@ pub struct TableDefinition {
     pub name: String,
     pub primary_key: Vec<String>,
     pub columns: Vec<ColumnDefinition>,
+    /// The table's foreign keys, in the order they were declared.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub foreign_keys: Vec<ForeignKeyDefinition>,
+}
+
+/// A foreign key: columns of a table whose values, unless one is NULL, must be the values of the
+/// primary key or a unique index of the table they reference.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForeignKeyDefinition {
+    pub name: String,
+    pub columns: Vec<String>,
+    /// The table the key references, which may be its own.
+    pub references: String,
+    /// The referenced table's columns, by position in `columns`.
+    pub referenced_columns: Vec<String>,
+    pub on_delete: ForeignKeyAction,
+    pub on_update: ForeignKeyAction,
+}
+
+/// What deleting or updating a referenced row does to the rows that reference it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum ForeignKeyAction {
+    #[serde(rename = "no action")]
+    NoAction,
+    #[serde(rename = "restrict")]
+    Restrict,
+    #[serde(rename = "cascade")]
+    Cascade,
+    #[serde(rename = "set null")]
+    SetNull,
+    #[serde(rename = "set default")]
+    SetDefault,
+}
+
+impl ForeignKeyAction {
+    /// The action as SQL names it, in lower case.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::NoAction => "no action",
+            Self::Restrict => "restrict",
+            Self::Cascade => "cascade",
+            Self::SetNull => "set null",
+            Self::SetDefault => "set default",
+        }
+    }
+
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "no action" => Self::NoAction,
+            "restrict" => Self::Restrict,
+            "cascade" => Self::Cascade,
+            "set null" => Self::SetNull,
+            "set default" => Self::SetDefault,
+            _ => return None,
+        })
+    }
 }
 
 /// An index on a table, as its catalog holds it, with its columns in index order.
@@ -107,10 +164,33 @@ impl CatalogModel for TableDefinition {
         for column in object.get("columns")?.as_array()? {
             columns.push(ColumnDefinition::from_catalog_json(column)?);
         }
+        let mut foreign_keys = Vec::new();
+        if let Some(keys) = object.get("foreignKeys") {
+            for key in keys.as_array()? {
+                foreign_keys.push(ForeignKeyDefinition::from_json(key)?);
+            }
+        }
         Some(Self {
             name: catalog_string(object.get("name")?)?,
             primary_key: catalog_strings(object.get("primaryKey")?)?,
             columns,
+            foreign_keys,
+        })
+    }
+}
+
+impl ForeignKeyDefinition {
+    /// Reads a foreign key as its catalog, and the JavaScript API, write it.
+    pub(crate) fn from_json(value: &Value) -> Option<Self> {
+        let object = value.as_object()?;
+        let action = |key| ForeignKeyAction::from_name(object.get(key)?.as_str()?);
+        Some(Self {
+            name: catalog_string(object.get("name")?)?,
+            columns: catalog_strings(object.get("columns")?)?,
+            references: catalog_string(object.get("references")?)?,
+            referenced_columns: catalog_strings(object.get("referencedColumns")?)?,
+            on_delete: action("onDelete")?,
+            on_update: action("onUpdate")?,
         })
     }
 }

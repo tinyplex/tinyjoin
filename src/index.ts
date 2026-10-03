@@ -13,6 +13,8 @@ export type {
   ChangedKeys,
   ColumnSchema,
   ColumnType,
+  ForeignKeyAction,
+  ForeignKeySchema,
   IndexSchema,
   JsonPrimitive,
   JsonValue,

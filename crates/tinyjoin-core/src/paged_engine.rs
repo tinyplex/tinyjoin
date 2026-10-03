@@ -378,6 +378,7 @@ impl<D: PageDevice> PagedEngine<D> {
                 outcome,
                 changes,
                 previous,
+                ..
             },
             keys,
         ) = {
@@ -4654,6 +4655,285 @@ mod tests {
         engine.check().unwrap();
     }
 
+    fn query_values(engine: &PagedEngine<MemoryPageDevice>, sql: &str) -> Vec<Value> {
+        engine
+            .query_sql(sql, &[])
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(Value::Object)
+            .collect()
+    }
+
+    #[test]
+    fn foreign_keys_hold_references_to_rows_that_exist() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .exec_sql(
+                r#"CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT UNIQUE);
+                CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users,
+                    author TEXT, CONSTRAINT posts_author_fk FOREIGN KEY (author)
+                    REFERENCES "public"."users" (email));
+                INSERT INTO users VALUES (1, 'a@x'), (2, 'b@x');
+                INSERT INTO posts VALUES (10, 1, 'a@x'), (11, NULL, NULL);"#,
+            )
+            .unwrap();
+        let schema = engine.schema().unwrap();
+        let keys = &schema[0].0.foreign_keys;
+        assert_eq!(
+            keys.iter()
+                .map(|key| (
+                    key.name.as_str(),
+                    key.columns.clone(),
+                    key.references.as_str(),
+                    key.referenced_columns.clone()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("posts_user_id_fkey", vec!["user_id".to_owned()], "users", vec!["id".to_owned()]),
+                ("posts_author_fk", vec!["author".to_owned()], "users", vec!["email".to_owned()]),
+            ]
+        );
+
+        // A reference to a row that does not exist, or that a statement leaves without one, fails
+        // and changes nothing.
+        let revision = engine.revision();
+        for sql in [
+            "INSERT INTO posts VALUES (12, 3, NULL)",
+            "INSERT INTO posts VALUES (12, NULL, 'c@x')",
+            "UPDATE posts SET user_id = 9 WHERE id = 10",
+            "DELETE FROM users WHERE id = 1",
+            "UPDATE users SET id = 5 WHERE id = 1",
+            "UPDATE users SET email = 'z@x' WHERE id = 1",
+            "INSERT INTO users VALUES (1, 'q@x') ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email",
+        ] {
+            let error = engine.execute_sql(sql, &[]).unwrap_err();
+            assert_eq!(error.code, "CONSTRAINT_VIOLATION", "{sql}: {}", error.message);
+        }
+        assert_eq!(engine.revision(), revision);
+        // A row no reference names can go, and a reference can name a row its own statement
+        // writes, as one statement's rows are checked as it ends.
+        engine
+            .exec_sql(
+                "DELETE FROM users WHERE id = 2;\
+                 INSERT INTO users (id) VALUES (3);\
+                 INSERT INTO posts VALUES (12, 3, NULL);",
+            )
+            .unwrap();
+        // A referenced value cannot change while a row references it.
+        assert_eq!(
+            engine
+                .execute_sql("UPDATE users SET email = 'b@x' WHERE id = 1", &[])
+                .unwrap_err()
+                .code,
+            "CONSTRAINT_VIOLATION"
+        );
+        engine.check().unwrap();
+
+        // A transaction checks each statement against the rows it has staged.
+        engine.begin_transaction().unwrap();
+        engine
+            .execute_sql("INSERT INTO users (id) VALUES (4)", &[])
+            .unwrap();
+        engine
+            .execute_sql("INSERT INTO posts VALUES (13, 4, NULL)", &[])
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute_sql("DELETE FROM users WHERE id = 4", &[])
+                .unwrap_err()
+                .code,
+            "CONSTRAINT_VIOLATION"
+        );
+        engine.commit_transaction().unwrap();
+        assert_eq!(
+            query_values(&engine, "SELECT id FROM posts ORDER BY id"),
+            [json!({"id": 10}), json!({"id": 11}), json!({"id": 12}), json!({"id": 13})]
+        );
+        let reopened = PagedEngine::open(engine.into_device()).unwrap();
+        assert_eq!(reopened.schema().unwrap(), schema);
+    }
+
+    #[test]
+    fn foreign_key_actions_change_the_rows_that_reference_a_changed_row() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .exec_sql(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY);\
+                 CREATE TABLE posts (id INTEGER PRIMARY KEY, \
+                     user_id INTEGER REFERENCES users ON DELETE CASCADE ON UPDATE CASCADE, \
+                     editor_id INTEGER REFERENCES users ON DELETE SET NULL, \
+                     reviewer_id INTEGER DEFAULT 1 REFERENCES users ON DELETE SET DEFAULT);\
+                 CREATE TABLE comments (id INTEGER PRIMARY KEY, \
+                     post_id INTEGER NOT NULL REFERENCES posts ON DELETE CASCADE);\
+                 CREATE TABLE nodes (id INTEGER PRIMARY KEY, \
+                     parent_id INTEGER REFERENCES nodes ON DELETE CASCADE);\
+                 INSERT INTO users VALUES (1), (2), (3);\
+                 INSERT INTO posts VALUES (10, 2, 3, 3), (11, 3, 2, 2), (12, 1, 2, NULL);\
+                 INSERT INTO comments VALUES (100, 10), (101, 10), (102, 11);\
+                 INSERT INTO nodes VALUES (1, NULL), (2, 1), (3, 2), (4, NULL), (5, 4);",
+            )
+            .unwrap();
+
+        // Deleting user 2 deletes post 10 and its comments, and empties or resets the others'
+        // references.
+        let result = engine
+            .execute_sql("DELETE FROM users WHERE id = 2", &[])
+            .unwrap();
+        assert_eq!(result.row_count, 1);
+        assert_eq!(result.tables, ["users", "posts", "comments"]);
+        assert_eq!(
+            query_values(&engine, "SELECT * FROM posts ORDER BY id"),
+            [
+                json!({"id": 11, "user_id": 3, "editor_id": null, "reviewer_id": 1}),
+                json!({"id": 12, "user_id": 1, "editor_id": null, "reviewer_id": null}),
+            ]
+        );
+        assert_eq!(
+            query_values(&engine, "SELECT id FROM comments"),
+            [json!({"id": 102})]
+        );
+
+        // An update of a referenced key carries to the rows that reference it.
+        engine
+            .execute_sql("UPDATE users SET id = 30 WHERE id = 3", &[])
+            .unwrap();
+        assert_eq!(
+            query_values(&engine, "SELECT id, user_id FROM posts ORDER BY id"),
+            [json!({"id": 11, "user_id": 30}), json!({"id": 12, "user_id": 1})]
+        );
+
+        // A table can reference itself, and a cascade follows it down.
+        engine
+            .execute_sql("DELETE FROM nodes WHERE id = 1", &[])
+            .unwrap();
+        assert_eq!(
+            query_values(&engine, "SELECT id FROM nodes ORDER BY id"),
+            [json!({"id": 4}), json!({"id": 5})]
+        );
+
+        // An action the rows refuse refuses the statement: SET NULL into a NOT NULL column.
+        engine
+            .exec_sql(
+                "CREATE TABLE tags (id INTEGER PRIMARY KEY, \
+                     post_id INTEGER NOT NULL REFERENCES posts ON DELETE SET NULL);\
+                 INSERT INTO tags VALUES (1, 11);",
+            )
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute_sql("DELETE FROM users WHERE id = 30", &[])
+                .unwrap_err()
+                .code,
+            "CONSTRAINT_VIOLATION"
+        );
+
+        // A transaction stages what the actions change, and a rollback undoes it.
+        engine.begin_transaction().unwrap();
+        engine
+            .execute_sql("DELETE FROM nodes WHERE id = 4", &[])
+            .unwrap();
+        assert!(query_values(&engine, "SELECT id FROM nodes").is_empty());
+        engine.rollback_transaction().unwrap();
+        assert_eq!(query_values(&engine, "SELECT id FROM nodes").len(), 2);
+        engine.check().unwrap();
+    }
+
+    #[test]
+    fn foreign_keys_follow_the_schema_they_belong_to() {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .exec_sql(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT);\
+                 CREATE UNIQUE INDEX users_email ON users (email);\
+                 CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, email TEXT);\
+                 INSERT INTO users VALUES (1, 'a@x');\
+                 INSERT INTO posts VALUES (10, 1, 'a@x'), (11, 2, NULL);",
+            )
+            .unwrap();
+        for (sql, code) in [
+            (
+                "ALTER TABLE posts ADD CONSTRAINT posts_user FOREIGN KEY (user_id) REFERENCES users",
+                "CONSTRAINT_VIOLATION",
+            ),
+            (
+                "ALTER TABLE posts ADD FOREIGN KEY (user_id) REFERENCES missing",
+                "TABLE_NOT_FOUND",
+            ),
+            (
+                "ALTER TABLE posts ADD FOREIGN KEY (email) REFERENCES users (id)",
+                "TYPE_MISMATCH",
+            ),
+            (
+                "ALTER TABLE posts ADD FOREIGN KEY (user_id) REFERENCES posts (user_id)",
+                "INVALID_SCHEMA",
+            ),
+            (
+                "CREATE TABLE a (id INTEGER PRIMARY KEY REFERENCES users DEFERRABLE)",
+                "UNSUPPORTED_SQL",
+            ),
+        ] {
+            let error = engine.execute_sql(sql, &[]).unwrap_err();
+            assert_eq!(error.code, code, "{sql}: {}", error.message);
+        }
+        // The SQL Drizzle Kit writes for a foreign key.
+        engine
+            .exec_sql(
+                r#"DELETE FROM posts WHERE id = 11;
+                ALTER TABLE "posts" ADD CONSTRAINT "posts_user_id_users_id_fk" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE cascade ON UPDATE no action;
+                ALTER TABLE posts ADD CONSTRAINT posts_email FOREIGN KEY (email) REFERENCES users (email);"#,
+            )
+            .unwrap();
+
+        // What a foreign key needs cannot be dropped without CASCADE, which drops the key.
+        for sql in [
+            "DROP TABLE users",
+            "DROP INDEX users_email",
+            "ALTER TABLE users DROP COLUMN email",
+        ] {
+            assert_eq!(
+                engine.execute_sql(sql, &[]).unwrap_err().code,
+                "INVALID_SCHEMA",
+                "{sql}"
+            );
+        }
+        engine
+            .exec_sql(
+                "ALTER TABLE users RENAME COLUMN id TO user_key;\
+                 ALTER TABLE users RENAME TO people;\
+                 ALTER TABLE posts RENAME COLUMN user_id TO person;",
+            )
+            .unwrap();
+        let schema = engine.schema().unwrap();
+        let posts = &schema[1].0;
+        assert_eq!(posts.name, "posts");
+        assert_eq!(posts.foreign_keys[0].columns, ["person"]);
+        assert_eq!(posts.foreign_keys[0].references, "people");
+        assert_eq!(posts.foreign_keys[0].referenced_columns, ["user_key"]);
+        engine
+            .execute_sql("DELETE FROM people WHERE user_key = 1", &[])
+            .unwrap();
+        assert!(query_values(&engine, "SELECT id FROM posts").is_empty());
+
+        engine
+            .exec_sql(
+                "DROP INDEX users_email CASCADE;\
+                 ALTER TABLE posts DROP CONSTRAINT posts_user_id_users_id_fk;",
+            )
+            .unwrap();
+        assert!(engine.schema().unwrap()[1].0.foreign_keys.is_empty());
+        engine
+            .exec_sql(
+                "ALTER TABLE posts ADD FOREIGN KEY (person) REFERENCES people;\
+                 DROP TABLE people CASCADE;",
+            )
+            .unwrap();
+        let schema = engine.schema().unwrap();
+        assert_eq!(schema.len(), 1);
+        assert!(schema[0].0.foreign_keys.is_empty());
+        engine.check().unwrap();
+    }
+
     #[test]
     fn alterations_tinyjoin_cannot_make_are_refused() {
         let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
@@ -4698,7 +4978,7 @@ mod tests {
     }
 
     #[test]
-    fn constraints_and_index_methods_tinyjoin_cannot_enforce_are_refused() {
+    fn constraints_and_index_methods_tinyjoin_cannot_hold_are_refused() {
         let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
         engine
             .exec_sql(
@@ -4707,22 +4987,6 @@ mod tests {
             )
             .unwrap();
         for (sql, code, message) in [
-            (
-                "CREATE TABLE a (id INTEGER PRIMARY KEY, user_id TEXT REFERENCES users (id))",
-                "UNSUPPORTED_SQL",
-                "Foreign keys are not supported",
-            ),
-            (
-                "CREATE TABLE a (id INTEGER PRIMARY KEY, user_id TEXT, \
-                 FOREIGN KEY (user_id) REFERENCES users (id))",
-                "UNSUPPORTED_SQL",
-                "Foreign keys are not supported",
-            ),
-            (
-                r#"ALTER TABLE "posts" ADD CONSTRAINT "posts_user_id_users_id_fk" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE no action ON UPDATE no action"#,
-                "UNSUPPORTED_SQL",
-                "Foreign keys are not supported",
-            ),
             (
                 "CREATE TABLE a (id INTEGER PRIMARY KEY CHECK (id > 0))",
                 "UNSUPPORTED_SQL",
@@ -4756,7 +5020,7 @@ mod tests {
             (
                 "ALTER TABLE posts ADD COLUMN code TEXT UNIQUE",
                 "UNSUPPORTED_SQL",
-                "cannot add a primary key or UNIQUE constraint",
+                "cannot add a constraint",
             ),
             (
                 "ALTER TABLE posts ADD CONSTRAINT posts_pk PRIMARY KEY (user_id)",
@@ -4766,7 +5030,7 @@ mod tests {
             (
                 "ALTER TABLE posts DROP CONSTRAINT posts_missing",
                 "INDEX_NOT_FOUND",
-                "no unique constraint `posts_missing`",
+                "no constraint `posts_missing`",
             ),
             (
                 "ALTER TABLE missing DISABLE ROW LEVEL SECURITY",
@@ -4838,6 +5102,11 @@ mod tests {
                     "indexes": indexes.iter().map(|index| json!({
                         "name": index.name, "columns": index.columns, "unique": index.unique,
                     })).collect::<Vec<_>>(),
+                    "foreignKeys": table.foreign_keys.iter().map(|key| json!({
+                        "name": key.name, "columns": key.columns, "references": key.references,
+                        "referencedColumns": key.referenced_columns,
+                        "onDelete": key.on_delete, "onUpdate": key.on_update,
+                    })).collect::<Vec<_>>(),
                 })
             })
             .collect::<Vec<_>>();
@@ -4856,6 +5125,7 @@ mod tests {
             ],
             "primaryKey": ["id"],
             "indexes": [{"name": "tasks_done", "columns": ["done"], "unique": false}],
+            "foreignKeys": [],
         }]});
         let outcome = engine.set_schema(&schema_target(first.clone()), false).unwrap();
         assert_eq!(outcome.tables, ["tasks"]);
@@ -4889,12 +5159,14 @@ mod tests {
                     {"name": "todos_name", "columns": ["name"], "unique": true},
                     {"name": "todos_priority", "columns": ["priority", "done"], "unique": false},
                 ],
+                "foreignKeys": [],
             },
             {
                 "name": "notes",
                 "columns": [{"name": "id", "type": "integer", "nullable": false}],
                 "primaryKey": ["id"],
                 "indexes": [],
+                "foreignKeys": [],
             },
         ]});
         let outcome = engine.set_schema(&schema_target(second.clone()), false).unwrap();
@@ -4958,6 +5230,7 @@ mod tests {
             ],
             "primaryKey": ["id"],
             "indexes": [{"name": "todos_name", "columns": ["name"], "unique": true}],
+            "foreignKeys": [],
         }]});
         engine.set_schema(&schema_target(third.clone()), false).unwrap();
         assert_eq!(engine.schema().unwrap().len(), 2);
@@ -4979,6 +5252,7 @@ mod tests {
         let table = |columns: Value, key: Value| {
             schema_target(json!({"version": 0, "tables": [{
                 "name": "t", "columns": columns, "primaryKey": key, "indexes": [],
+                "foreignKeys": [],
             }]}))
         };
         for (target, code) in [
@@ -5015,12 +5289,13 @@ mod tests {
             json!({"version": -1, "tables": []}),
             json!({"version": 0, "tables": [{"name": "t", "columns": [
                 {"name": "id", "type": "bigint", "nullable": false}],
-                "primaryKey": ["id"], "indexes": []}]}),
+                "primaryKey": ["id"], "indexes": [], "foreignKeys": []}]}),
             json!({"version": 0, "tables": [{"name": "t", "columns": [
                 {"name": "id", "type": "integer", "nullable": false, "maxLength": 3}],
-                "primaryKey": ["id"], "indexes": []}]}),
+                "primaryKey": ["id"], "indexes": [], "foreignKeys": []}]}),
             json!({"version": 0, "tables": [{"name": "t", "columns": [
-                {"name": "id", "type": "integer"}], "primaryKey": ["id"], "indexes": []}]}),
+                {"name": "id", "type": "integer"}], "primaryKey": ["id"], "indexes": [],
+                "foreignKeys": []}]}),
         ] {
             assert_eq!(
                 crate::SchemaDefinition::from_json(&value).unwrap_err().code,

@@ -11,6 +11,7 @@ mod device;
 mod engine;
 mod error;
 mod expression;
+mod foreign_key;
 mod hash;
 mod join;
 mod model;
@@ -47,8 +48,9 @@ pub(crate) use engine::Engine;
 pub use error::{EngineError, Result};
 pub use schema::{SchemaDefinition, TableTarget};
 pub use model::{
-    ApplyOutcome, ChangedKeys, ColumnDefinition, ColumnType, ExecuteResult, IndexDefinition,
-    MAX_CHANGED_KEYS_PER_TABLE, ResultField, Row, TableDefinition, TableKeys,
+    ApplyOutcome, ChangedKeys, ColumnDefinition, ColumnType, ExecuteResult, ForeignKeyAction,
+    ForeignKeyDefinition, IndexDefinition, MAX_CHANGED_KEYS_PER_TABLE, ResultField, Row,
+    TableDefinition, TableKeys,
 };
 pub(crate) use model::{
     ComparisonOperator, NullOrder, OrderBy, OrderDirection, Predicate, QueryResult, RowChange,

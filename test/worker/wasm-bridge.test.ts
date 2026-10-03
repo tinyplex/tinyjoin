@@ -385,6 +385,7 @@ describe('WASM engine bridge', () => {
           ],
           primaryKey: ['id'],
           indexes: [{name: 'notes_body', columns: ['body'], unique: false}],
+          foreignKeys: [],
         },
       ],
     };

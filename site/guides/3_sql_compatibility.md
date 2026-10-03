@@ -173,19 +173,20 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 | `CREATE TABLE [IF NOT EXISTS]` | Narrow | Typed columns, a required inline or table-level primary key, and `UNIQUE` constraints. Up to 256 columns. |
 | `PRIMARY KEY` | Narrow | One inline single-column declaration or one table-level column list (single or composite), which `CONSTRAINT name` may name. It implies `NOT NULL`; JSON keys are rejected. |
 | `UNIQUE` | Narrow | A column's `UNIQUE`, or a table's `[CONSTRAINT name] UNIQUE (columns)`, creates a unique index of that name. An unnamed one is named as PostgreSQL names it, for its table and columns, as in `users_email_key`. The columns follow the `CREATE UNIQUE INDEX` rules. |
-| `REFERENCES`, `FOREIGN KEY`, `CHECK` | No | Foreign keys and check constraints are rejected, inline or as table constraints, since TinyJoin enforces neither. |
+| `REFERENCES`, `FOREIGN KEY` | Narrow | A column's `REFERENCES table [(column)]`, or a table's `[CONSTRAINT name] FOREIGN KEY (columns) REFERENCES table [(columns)]`, with `ON DELETE` and `ON UPDATE` actions, checked as each statement ends. See [foreign keys](#foreign-keys). |
+| `CHECK` | No | Check constraints are rejected, inline or as table constraints. |
 | `NULL`, `NOT NULL`, `DEFAULT` | Narrow | String, number, boolean, or `NULL` literal defaults, and a string cast to JSON, as in `DEFAULT '{}'::jsonb`. No other casts, default expressions, functions, sequences, or parameters. |
 | `CREATE [UNIQUE] INDEX [IF NOT EXISTS]` | Narrow | One or more boolean, integer, or text columns. `USING btree` is accepted, since every index is a B-tree; no other methods, expressions, predicates, `INCLUDE`, ordering, or concurrent build. |
 | `ALTER TABLE ... ADD [COLUMN] [IF NOT EXISTS]` | Narrow | Adds one non-primary-key column and atomically backfills its literal default or `NULL`. On a nonempty table, `NOT NULL` requires a non-null default. The column cannot declare `UNIQUE`; add the constraint after it. |
-| `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE`, `DROP CONSTRAINT [IF EXISTS]` | Narrow | Adds a unique constraint, as `CREATE UNIQUE INDEX` would, or drops one of the table's unique indexes by name. |
+| `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE`, `ADD [CONSTRAINT ...] FOREIGN KEY`, `DROP CONSTRAINT [IF EXISTS]` | Narrow | Adds a unique constraint, as `CREATE UNIQUE INDEX` would, or a foreign key, which every stored row must already meet, or drops a foreign key or unique constraint by name. |
 | `ALTER TABLE ... ALTER [COLUMN] ... SET DEFAULT`, `DROP DEFAULT` | Narrow | A literal default, as `DEFAULT` takes. Existing rows keep their values, so the table's rows are rewritten. |
 | `ALTER TABLE ... ALTER [COLUMN] ... SET NOT NULL`, `DROP NOT NULL` | Narrow | `SET NOT NULL` rewrites the table's rows, and fails with `CONSTRAINT_VIOLATION`, changing nothing, if a row holds `NULL`. A primary-key column stays `NOT NULL`. |
 | `ALTER TABLE ... ALTER [COLUMN] ... [SET DATA] TYPE` | Narrow | Only to another spelling of the column's runtime type, as `bigint` for an `integer` column, which changes nothing, or to a `VARCHAR` of another length, which checks every row when it shortens. No conversion or `USING`. |
-| `ALTER TABLE ... DROP [COLUMN] [IF EXISTS]` | Narrow | Drops a column outside the primary key, with every index on it, and rewrites the table's rows. `CASCADE` and `RESTRICT` are accepted. |
-| `ALTER TABLE ... RENAME [COLUMN] ... TO`, `RENAME TO` | Supported | Renames a column, including a key column, or the table, which keeps any schema that qualifies its name. Indexes follow the new names; statements prepared with the old ones fail. |
+| `ALTER TABLE ... DROP [COLUMN] [IF EXISTS]` | Narrow | Drops a column outside the primary key, with every index and foreign key of its table on it, and rewrites the table's rows. A column another table's foreign key references needs `CASCADE`, which drops that key. |
+| `ALTER TABLE ... RENAME [COLUMN] ... TO`, `RENAME TO` | Supported | Renames a column, including a key column, or the table, which keeps any schema that qualifies its name. Indexes and foreign keys follow the new names; statements prepared with the old ones fail. |
 | `ALTER TABLE ... DISABLE ROW LEVEL SECURITY` | Supported | Changes nothing, since no table has row security. Several changes in one `ALTER TABLE`, and other `ALTER` forms, are rejected. |
-| `DROP TABLE [IF EXISTS]` | Narrow | Drops the table and its indexes. `CASCADE` and `RESTRICT` are accepted and drop the same, since nothing else can depend on a table. |
-| `DROP INDEX [IF EXISTS]` | Supported | Drops one globally named index. `CASCADE` and `RESTRICT` are accepted. |
+| `DROP TABLE [IF EXISTS]` | Narrow | Drops the table and its indexes. A table another table's foreign key references needs `CASCADE`, which drops that key, not the other table. `RESTRICT` is the default. |
+| `DROP INDEX [IF EXISTS]` | Supported | Drops one globally named index. A unique index a foreign key needs, because it references the index's columns, needs `CASCADE`, which drops the key. |
 | `INSERT ... VALUES` | Narrow | Optional column list, up to 4,096 literal/parameter rows, per-cell `DEFAULT`, and optional `RETURNING`. |
 | `INSERT ... DEFAULT VALUES` | Supported | Inserts one row using defaults and `NULL` values. |
 | `INSERT ... ON CONFLICT` | Narrow | `ON CONFLICT [(columns)] DO NOTHING` or `ON CONFLICT (columns) DO UPDATE SET column = value, ...`, before any `RETURNING`. See [upserts](#upserts). |
@@ -488,15 +489,17 @@ Every SQL-created table has a primary key. TinyJoin currently implements:
 
 - primary-key uniqueness and non-nullability;
 - column `NOT NULL`;
-- scalar literal column defaults; and
-- unique indexes, which `CREATE UNIQUE INDEX` or a `UNIQUE` constraint creates.
+- scalar literal column defaults;
+- unique indexes, which `CREATE UNIQUE INDEX` or a `UNIQUE` constraint creates;
+  and
+- foreign keys.
 
 A `UNIQUE` constraint is a unique index of the constraint's name, so getSchema()
 lists it among the table's indexes, and either `DROP CONSTRAINT` or `DROP INDEX`
 removes it.
 
-It does not implement foreign keys, `CHECK`, exclusion constraints, generated
-columns, sequences, triggers, or dependency cascades.
+It does not implement `CHECK`, exclusion constraints, generated columns,
+sequences, or triggers.
 
 A row is identified by its primary key: each table is stored keyed by that
 value, and an `UPDATE` which changes a primary key is applied as a removal at
@@ -506,6 +509,51 @@ primary keys as stable, opaque identifiers.
 Composite primary and secondary indexes are supported. A unique index omits a
 key containing `NULL`, so multiple null-containing keys are allowed, matching
 PostgreSQL's default `NULLS DISTINCT` behavior.
+
+### Foreign keys
+
+A foreign key holds that its columns' values, in every row of its table, are
+the values of a row of the table it references, unless one of them is `NULL`,
+as PostgreSQL's default `MATCH SIMPLE` says. It references that table's primary
+key, unless it names columns, which must be the primary key's or a unique
+index's, of the same runtime types. A table may reference itself. A reference
+to `public.table` names `table` when there is no table of the longer name, as
+PostgreSQL tools write it.
+
+```sql
+CREATE TABLE posts (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users ON DELETE CASCADE,
+  editor_id TEXT REFERENCES users (id) ON DELETE SET NULL
+);
+```
+
+Each key is checked as its statement ends, so rows that one statement inserts
+can reference each other, and a statement that would leave a reference without
+its row fails with `CONSTRAINT_VIOLATION`, changing nothing. Inside a
+transaction, each statement is checked against the rows the transaction has
+staged. Keys cannot be deferred to the end of a transaction.
+
+When a statement deletes a referenced row, or changes the values its
+references hold, each referencing row is changed as the key's `ON DELETE` or
+`ON UPDATE` action says, in the same statement:
+
+- `NO ACTION`, the default, refuses the statement, unless another row holds the
+  values once it ends;
+- `RESTRICT` refuses it;
+- `CASCADE` deletes the referencing rows, or changes their references to the
+  new values, and so on through the keys that reference them;
+- `SET NULL` and `SET DEFAULT` change the referencing columns to `NULL` or to
+  their defaults, which must themselves be allowed.
+
+Finding the rows that reference a deleted or changed row reads the
+referencing table like a `WHERE` on its columns, so index the referencing
+columns of a large table, as in PostgreSQL. The rows an action changes count
+toward the statement's limits, and are reported among its changed tables.
+
+`ALTER TABLE ... ADD FOREIGN KEY` checks every stored row before it adds a key.
+Renaming a table or column renames it in the keys that name it, and dropping
+what a key needs takes `CASCADE`, which drops the key.
 
 Single-table `SELECT`, aggregates, `UPDATE`, and `DELETE` read only the rows
 their `WHERE` clause can match when its `AND`-ed terms allow, and still check
@@ -653,8 +701,9 @@ JOIN tags AS tag ON post_tag.tag_id = tag.id
 ORDER BY post_id, tag_name
 ```
 
-Foreign keys are not implemented, so TinyJoin does not enforce the bridge
-table's references.
+The bridge table can declare [foreign keys](#foreign-keys) on `post_id` and
+`tag_id`, with `ON DELETE CASCADE`, so that deleting a post or tag deletes its
+links.
 
 ## Transactions and concurrency
 
