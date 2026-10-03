@@ -2228,7 +2228,7 @@ pub(crate) fn is_keyword(token: Option<&Token>, keyword: &str) -> bool {
 
 /// The name an identifier token gives, as every parser reads it: an unquoted name is not a
 /// reserved word, and is folded to lower case.
-fn identifier_name(token: Option<&Token>) -> Option<String> {
+pub(crate) fn identifier_name(token: Option<&Token>) -> Option<String> {
     match token {
         Some(Token::Identifier { value, quoted }) if !value.is_empty() => {
             if *quoted {

@@ -345,12 +345,8 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
 
     fn execute_statement(&mut self, statement: Statement) -> Result<ExecuteResult> {
         match statement {
-            Statement::Select(plan) => execute_query_result(crate::query::execute(self, &plan)?),
-            Statement::Aggregate(plan) => {
-                execute_query_result(crate::aggregate::execute(self, &plan)?)
-            }
-            Statement::Join(plan) => execute_query_result(crate::join::execute(self, &plan)?),
             Statement::Write(statement) => self.execute_write(&statement),
+            statement => execute_query_result(crate::statement::run_query(self, statement)?),
         }
     }
 

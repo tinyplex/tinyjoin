@@ -31,8 +31,9 @@ use crate::storage::{
 };
 use crate::{
     ChangedKeys, ColumnDefinition, ColumnType, EngineError, ForeignKeyAction, ForeignKeyDefinition,
-    IndexDefinition, MAX_CHANGED_KEYS_PER_TABLE, Predicate, Result, ResultField, Row, RowChange,
-    SelectPlan, StorageReader, Subquery, TableDefinition, TableKeys, VisitControl, VisitOutcome,
+    IndexDefinition, MAX_CHANGED_KEYS_PER_TABLE, Predicate, QueryResult, Result, ResultField, Row,
+    RowChange, SelectPlan, StorageReader, Subquery, TableDefinition, TableKeys, VisitControl,
+    VisitOutcome,
 };
 
 const MAX_COLUMNS: usize = 256;
@@ -49,6 +50,8 @@ pub(crate) enum Statement {
     Select(SelectPlan),
     Aggregate(crate::aggregate::AggregatePlan),
     Join(crate::join::JoinPlan),
+    /// A `SELECT` with queries nested in it, which read its rows.
+    Nested(crate::nested::NestedPlan),
     Write(WriteStatement),
 }
 
@@ -60,9 +63,23 @@ impl Statement {
             Self::Select(plan) => crate::query::position_outputs(plan),
             Self::Aggregate(plan) => crate::aggregate::position_outputs(plan)?,
             Self::Join(plan) => crate::join::position_outputs(plan)?,
+            Self::Nested(plan) => plan.array_rows = true,
             Self::Write(_) => {}
         }
         Ok(())
+    }
+}
+
+/// Runs a `SELECT`.
+pub(crate) fn run_query(storage: &dyn StorageReader, statement: Statement) -> Result<QueryResult> {
+    match statement {
+        Statement::Select(plan) => crate::query::execute(storage, &plan),
+        Statement::Aggregate(plan) => crate::aggregate::execute(storage, &plan),
+        Statement::Join(plan) => crate::join::execute(storage, &plan),
+        Statement::Nested(plan) => crate::nested::execute(storage, &plan),
+        Statement::Write(_) => Err(EngineError::unsupported_sql(
+            "query_sql accepts only SELECT statements",
+        )),
     }
 }
 
@@ -229,6 +246,9 @@ pub(crate) fn parse_subquery(tokens: Vec<Token>, params: &[Value]) -> Result<Sub
         Statement::Select(plan) => Ok(Subquery::Select(plan)),
         Statement::Aggregate(plan) => Ok(Subquery::Aggregate(plan)),
         Statement::Join(plan) => Ok(Subquery::Join(plan)),
+        Statement::Nested(_) => Err(EngineError::unsupported_sql(
+            "A subquery in IN cannot nest another query",
+        )),
         Statement::Write(_) => Err(EngineError::invalid_query(
             "A subquery in IN must be a SELECT",
         )),
@@ -264,6 +284,13 @@ pub(crate) fn parse_tokens(
             quoted: false,
         }) if value.eq_ignore_ascii_case("select")
     );
+    if select && crate::nested::is_nested(&tokens) {
+        return Ok(Statement::Nested(crate::nested::NestedPlan {
+            tokens,
+            params: params.to_vec(),
+            array_rows: false,
+        }));
+    }
     if select && crate::join::is_join_select(&tokens) {
         return crate::join::parse_tokens(tokens, params, mode).map(Statement::Join);
     }

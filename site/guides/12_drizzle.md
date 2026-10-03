@@ -200,15 +200,19 @@ These work as Drizzle documents them:
 - `onConflictDoNothing` and `onConflictDoUpdate`, assigning `excluded.column`
   in an `sql` template, or an expression of the stored row's columns;
 - prepared statements and placeholders;
-- relational queries, `db.query.table.findMany()` and `findFirst()`, without
-  `with`.
+- relational queries, `db.query.table.findMany()` and `findFirst()`, including
+  `with`, and its `columns`, `where`, `orderBy`, `limit`, `offset`, and
+  `with` of its own.
+
+Drizzle loads each relation of `with` with a
+[nested query](/guides/sql-compatibility/#nested-queries) for every row it
+relates to, so index the columns that relations join on, such as a foreign
+key's.
 
 These are refused with an error rather than run:
 
-- relational queries with `with`, which Drizzle writes as lateral joins of
-  JSON aggregates;
-- SQL functions such as `lower()`, `coalesce()`, and `now()`, casts, and
-  `CASE`;
+- `extras` and other SQL functions, such as `lower()`, `coalesce()`, and
+  `now()`, casts, and `CASE`;
 - `having`, window functions, `$with` CTEs, `union`, correlated subqueries,
   and `exists`;
 - right, full, and cross joins, `insert ... select`, and `update ... from`;

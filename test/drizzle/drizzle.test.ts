@@ -201,6 +201,68 @@ runIfBuilt('the Drizzle driver', () => {
     ).toEqual({name: 'Cy'});
   });
 
+  it('loads relations with `with`', async () => {
+    await db.insert(posts).values({id: 13, userId: 3, title: 'Fourth', score: 1});
+    expect(
+      await db.query.users.findMany({
+        columns: {id: true, name: true},
+        with: {posts: {columns: {id: true, title: true}}},
+        orderBy: [users.id],
+      }),
+    ).toEqual([
+      {
+        id: 1,
+        name: 'Ann',
+        posts: [
+          {id: 10, title: 'First'},
+          {id: 12, title: 'Third'},
+        ],
+      },
+      {id: 2, name: 'Bob', posts: [{id: 11, title: 'Second'}]},
+      {id: 3, name: 'Cy', posts: [{id: 13, title: 'Fourth'}]},
+    ]);
+    expect(
+      await db.query.posts.findFirst({
+        where: eq(posts.id, 12),
+        with: {user: true},
+      }),
+    ).toEqual({
+      id: 12,
+      userId: 1,
+      title: 'Third',
+      score: 9,
+      user: {
+        id: 1,
+        name: 'Ann',
+        email: 'ann@example.com',
+        active: true,
+        visits: 0,
+        meta: {tags: ['a']},
+      },
+    });
+    // Relations within relations, filtered, ordered, and limited.
+    expect(
+      await db.query.users.findMany({
+        columns: {name: true},
+        where: eq(users.active, true),
+        with: {
+          posts: {
+            columns: {title: true},
+            where: gt(posts.score, 5),
+            orderBy: [desc(posts.score)],
+            limit: 1,
+            with: {user: {columns: {visits: true}}},
+          },
+        },
+        orderBy: [desc(users.id)],
+        limit: 2,
+      }),
+    ).toEqual([
+      {name: 'Bob', posts: []},
+      {name: 'Ann', posts: [{title: 'Third', user: {visits: 0}}]},
+    ]);
+  });
+
   it('writes, returns, increments, and upserts', async () => {
     expect(
       await db

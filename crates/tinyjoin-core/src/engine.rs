@@ -39,20 +39,7 @@ impl<S> Engine<S> {
 
 impl<S: StorageReader> Engine<S> {
     pub(crate) fn query_sql(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
-        match crate::statement::parse(sql, params)? {
-            crate::statement::Statement::Select(plan) => {
-                crate::query::execute(self.read_storage(), &plan)
-            }
-            crate::statement::Statement::Aggregate(plan) => {
-                crate::aggregate::execute(self.read_storage(), &plan)
-            }
-            crate::statement::Statement::Join(plan) => {
-                crate::join::execute(self.read_storage(), &plan)
-            }
-            crate::statement::Statement::Write(_) => Err(EngineError::unsupported_sql(
-                "query_sql accepts only SELECT statements",
-            )),
-        }
+        crate::statement::run_query(self.read_storage(), crate::statement::parse(sql, params)?)
     }
 
     pub(crate) fn revision(&self) -> u64 {
@@ -127,42 +114,6 @@ impl<S: StorageDriver + Clone> Engine<S> {
 
     pub(crate) fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<ExecuteResult> {
         match crate::statement::parse(sql, params)? {
-            crate::statement::Statement::Select(plan) => {
-                let result = crate::query::execute(self.read_storage(), &plan)?;
-                Ok(ExecuteResult {
-                    command: "SELECT".to_owned(),
-                    revision: result.revision,
-                    row_count: result.rows.len(),
-                    fields: result.fields,
-                    rows: result.rows,
-                    tables: vec![],
-                    keys: ChangedKeys::default(),
-                })
-            }
-            crate::statement::Statement::Aggregate(plan) => {
-                let result = crate::aggregate::execute(self.read_storage(), &plan)?;
-                Ok(ExecuteResult {
-                    command: "SELECT".to_owned(),
-                    revision: result.revision,
-                    row_count: result.rows.len(),
-                    fields: result.fields,
-                    rows: result.rows,
-                    tables: vec![],
-                    keys: ChangedKeys::default(),
-                })
-            }
-            crate::statement::Statement::Join(plan) => {
-                let result = crate::join::execute(self.read_storage(), &plan)?;
-                Ok(ExecuteResult {
-                    command: "SELECT".to_owned(),
-                    revision: result.revision,
-                    row_count: result.rows.len(),
-                    fields: result.fields,
-                    rows: result.rows,
-                    tables: vec![],
-                    keys: ChangedKeys::default(),
-                })
-            }
             crate::statement::Statement::Write(statement) => {
                 if let Some(transaction) = &mut self.transaction {
                     let mut candidate = transaction.storage.clone();
@@ -207,6 +158,18 @@ impl<S: StorageDriver + Clone> Engine<S> {
                         keys,
                     })
                 }
+            }
+            statement => {
+                let result = crate::statement::run_query(self.read_storage(), statement)?;
+                Ok(ExecuteResult {
+                    command: "SELECT".to_owned(),
+                    revision: result.revision,
+                    row_count: result.rows.len(),
+                    fields: result.fields,
+                    rows: result.rows,
+                    tables: vec![],
+                    keys: ChangedKeys::default(),
+                })
             }
         }
     }

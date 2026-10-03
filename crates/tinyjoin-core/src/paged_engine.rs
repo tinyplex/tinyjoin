@@ -41,14 +41,7 @@ impl<D: PageDevice> PagedEngine<D> {
 
     #[cfg(test)]
     pub(crate) fn query_sql(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
-        match crate::statement::parse(sql, params)? {
-            Statement::Select(plan) => crate::query::execute(&self.read_view(), &plan),
-            Statement::Aggregate(plan) => crate::aggregate::execute(&self.read_view(), &plan),
-            Statement::Join(plan) => crate::join::execute(&self.read_view(), &plan),
-            Statement::Write(_) => Err(EngineError::unsupported_sql(
-                "query_sql accepts only SELECT statements",
-            )),
-        }
+        crate::statement::run_query(&self.read_view(), crate::statement::parse(sql, params)?)
     }
 
     /// Executes one read or standalone row-mutation statement.
@@ -205,19 +198,11 @@ impl<D: PageDevice> PagedEngine<D> {
         work: Option<&Cell<usize>>,
     ) -> Result<ExecuteResult> {
         match statement {
-            Statement::Select(plan) => execute_query_result(crate::query::execute(
-                &self.read_view_with_work(work),
-                &plan,
-            )?),
-            Statement::Aggregate(plan) => execute_query_result(crate::aggregate::execute(
-                &self.read_view_with_work(work),
-                &plan,
-            )?),
-            Statement::Join(plan) => execute_query_result(crate::join::execute(
-                &self.read_view_with_work(work),
-                &plan,
-            )?),
             Statement::Write(statement) => self.execute_transaction_write(&statement, work),
+            statement => execute_query_result(crate::statement::run_query(
+                &self.read_view_with_work(work),
+                statement,
+            )?),
         }
     }
 
@@ -5434,5 +5419,192 @@ mod tests {
             rows,
             vec![row(json!({"value": "plain", "extra.value": "dotted"}))]
         );
+    }
+
+    fn nested_engine() -> PagedEngine<MemoryPageDevice> {
+        let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        engine
+            .exec_sql(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+                CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT);
+                CREATE INDEX posts_user_id ON posts (user_id);
+                CREATE TABLE comments (id INTEGER PRIMARY KEY, post_id INTEGER, body TEXT);
+                INSERT INTO users VALUES (1, 'Ann'), (2, 'Bo'), (3, 'Cy');
+                INSERT INTO posts VALUES (10, 1, 'First'), (11, 1, 'Second'), (12, 2, 'Third');
+                INSERT INTO comments VALUES (100, 11, 'Nice'), (101, 11, 'Agreed');",
+            )
+            .unwrap();
+        engine
+    }
+
+    #[test]
+    fn lateral_joins_gather_related_rows_as_drizzle_writes_them() {
+        let mut engine = nested_engine();
+        // Drizzle's `with: {posts: true}`.
+        assert_eq!(
+            query_values(
+                &engine,
+                r#"select "users"."id", "users"."name", "users_posts"."data" as "posts"
+                from "users" "users" left join lateral (select coalesce(json_agg(json_build_array(
+                "users_posts"."id", "users_posts"."user_id", "users_posts"."title")), '[]'::json)
+                as "data" from "posts" "users_posts" where "users_posts"."user_id" = "users"."id")
+                "users_posts" on true"#
+            ),
+            [
+                json!({"id": 1, "name": "Ann", "posts": [[10, 1, "First"], [11, 1, "Second"]]}),
+                json!({"id": 2, "name": "Bo", "posts": [[12, 2, "Third"]]}),
+                json!({"id": 3, "name": "Cy", "posts": []}),
+            ]
+        );
+
+        // A relation to one row, which is NULL where there is none, from a query with no other
+        // outputs.
+        let one = r#"select "posts_user"."data" as "user" from "posts" "posts" left join lateral
+            (select json_build_array("posts_user"."id", "posts_user"."name") as "data" from
+            (select * from "users" "posts_user" where "posts_user"."id" = "posts"."user_id"
+            limit $1) "posts_user") "posts_user" on true"#;
+        engine
+            .exec_sql("INSERT INTO posts VALUES (13, NULL, 'Orphan')")
+            .unwrap();
+        let rows = engine.query_sql(one, &[json!(1)]).unwrap().rows;
+        assert_eq!(
+            rows.into_iter().map(Value::Object).collect::<Vec<_>>(),
+            [
+                json!({"user": [1, "Ann"]}),
+                json!({"user": [1, "Ann"]}),
+                json!({"user": [2, "Bo"]}),
+                json!({"user": null}),
+            ]
+        );
+
+        // Ordered and limited relations, nested in each other, under an ordered and limited query.
+        let nested = r#"select "users"."id", "users_posts"."data" as "posts" from "users" "users"
+            left join lateral (select coalesce(json_agg(json_build_array("users_posts"."title",
+            "users_posts_comments"."data") order by "users_posts"."id" desc), '[]'::json) as "data"
+            from (select * from "posts" "users_posts" where ("users_posts"."user_id" = "users"."id"
+            and "users_posts"."id" > $1) order by "users_posts"."id" desc limit $2) "users_posts"
+            left join lateral (select coalesce(json_agg(json_build_array(
+            "users_posts_comments"."body") order by "users_posts_comments"."id" desc nulls last),
+            '[]'::json) as "data" from "comments" "users_posts_comments" where
+            "users_posts_comments"."post_id" = "users_posts"."id") "users_posts_comments" on true)
+            "users_posts" on true order by "users"."id" limit $3 offset $4"#;
+        let rows = engine
+            .execute_sql_rows(nested, &[json!(0), json!(1), json!(2), json!(0)], true)
+            .unwrap();
+        assert_eq!(
+            rows.fields
+                .iter()
+                .map(|field| (field.name.as_str(), field.data_type_id))
+                .collect::<Vec<_>>(),
+            [
+                ("id", ColumnType::Integer.postgres_oid()),
+                ("posts", ColumnType::Json.postgres_oid())
+            ]
+        );
+        assert_eq!(
+            rows.rows.into_iter().map(Value::Object).collect::<Vec<_>>(),
+            [
+                json!({"id": 1, "posts": [["Second", [["Agreed"], ["Nice"]]]]}),
+                json!({"id": 2, "posts": [["Third", []]]}),
+            ]
+        );
+    }
+
+    #[test]
+    fn subqueries_in_a_select_list_read_its_rows_as_kysely_writes_them() {
+        let mut engine = nested_engine();
+        // Kysely's `jsonArrayFrom`.
+        assert_eq!(
+            query_values(
+                &engine,
+                r#"select "id", (select coalesce(json_agg(agg), '[]') from (select "posts"."id",
+                "posts"."title" from "posts" where "posts"."user_id" = "users"."id" order by
+                "posts"."id" desc) as agg) as "posts" from "users" where "id" < 3"#
+            ),
+            [
+                json!({"id": 1, "posts": [{"id": 11, "title": "Second"}, {"id": 10, "title": "First"}]}),
+                json!({"id": 2, "posts": [{"id": 12, "title": "Third"}]}),
+            ]
+        );
+        // Kysely's `jsonObjectFrom`, with a value each row reads.
+        assert_eq!(
+            query_values(
+                &engine,
+                r#"select "id", (select to_json(obj) from (select "users"."name" from "users"
+                where "users"."id" = "posts"."user_id") as obj) as "user", (select count(*) from
+                comments where comments.post_id = posts.id) as "comments" from "posts" order by
+                "id" desc limit 2"#
+            ),
+            [
+                json!({"id": 12, "user": {"name": "Bo"}, "comments": 0}),
+                json!({"id": 11, "user": {"name": "Ann"}, "comments": 2}),
+            ]
+        );
+
+        // A query that joins tables can nest one that reads any of them.
+        assert_eq!(
+            query_values(
+                &engine,
+                "SELECT p.id, u.name, (SELECT count(*) FROM comments c WHERE c.post_id = p.id \
+                 AND c.body <> u.name) AS n FROM posts p JOIN users u ON u.id = p.user_id \
+                 WHERE u.id = 1 ORDER BY p.id DESC"
+            ),
+            [
+                json!({"id": 11, "name": "Ann", "n": 2}),
+                json!({"id": 10, "name": "Ann", "n": 0}),
+            ]
+        );
+
+        // A prepared statement binds its values each time it runs.
+        let prepared = engine
+            .prepare_sql(
+                r#"select "name", (select coalesce(json_agg(p.title), '[]')
+                from posts p where p.user_id = users.id and p.id > $1) as titles from users
+                where id = $2"#,
+            )
+            .unwrap();
+        for (after, titles) in [(0, json!(["First", "Second"])), (10, json!(["Second"]))] {
+            let rows = engine
+                .execute_prepared(prepared, &[json!(after), json!(1)])
+                .unwrap()
+                .rows;
+            assert_eq!(rows, [row(json!({"name": "Ann", "titles": titles}))]);
+        }
+
+        // A subquery giving more than one value for a row fails, as do what is not gathered.
+        for (sql, code) in [
+            (
+                "SELECT id, (SELECT title FROM posts WHERE posts.user_id = users.id) FROM users",
+                "INVALID_QUERY",
+            ),
+            (
+                "SELECT id, (SELECT id, title FROM posts WHERE posts.id = users.id) FROM users",
+                "INVALID_QUERY",
+            ),
+            (
+                "SELECT id, (SELECT json_agg(posts.title || '!') FROM posts) AS t FROM users",
+                "UNSUPPORTED_SQL",
+            ),
+            (
+                "SELECT u.id, l.n FROM users u CROSS JOIN LATERAL (SELECT 1 AS n FROM posts) l",
+                "UNSUPPORTED_SQL",
+            ),
+            (
+                "SELECT id, (SELECT json_agg(p.nope) FROM posts p WHERE p.user_id = users.id) \
+                 AS t FROM users",
+                "COLUMN_NOT_FOUND",
+            ),
+            (
+                "SELECT id, (SELECT count(*) FROM posts p WHERE p.user_id = users.nope) AS t \
+                 FROM users",
+                "COLUMN_NOT_FOUND",
+            ),
+            (
+                "SELECT id FROM users WHERE id IN (SELECT (SELECT 1 FROM posts) FROM posts)",
+                "UNSUPPORTED_SQL",
+            ),
+        ] {
+            assert_eq!(engine.query_sql(sql, &[]).unwrap_err().code, code, "{sql}");
+        }
     }
 }

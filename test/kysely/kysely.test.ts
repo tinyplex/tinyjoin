@@ -3,6 +3,7 @@ import {resolve} from 'node:path';
 import {pathToFileURL} from 'node:url';
 
 import {type ColumnType, type Generated, Kysely, sql} from 'kysely';
+import {jsonArrayFrom, jsonObjectFrom} from 'kysely/helpers/postgres';
 import {type Migration, Migrator} from 'kysely/migration';
 import {afterEach, beforeEach, describe, expect, it} from 'vitest';
 
@@ -123,6 +124,58 @@ runIfBuilt('the Kysely dialect', () => {
         .where('posts.id', '=', 2)
         .execute(),
     ).toEqual([{id: 2, user_id: 'b', title: 'Second', name: 'Bob'}]);
+  });
+
+  it('nests related rows with jsonArrayFrom and jsonObjectFrom', async () => {
+    expect(
+      await db
+        .selectFrom('users')
+        .select((eb) => [
+          'id',
+          jsonArrayFrom(
+            eb
+              .selectFrom('posts')
+              .select(['posts.id', 'posts.title'])
+              .whereRef('posts.user_id', '=', 'users.id')
+              .orderBy('posts.id', 'desc'),
+          ).as('posts'),
+        ])
+        .orderBy('id')
+        .execute(),
+    ).toEqual([
+      {
+        id: 'a',
+        posts: [
+          {id: 3, title: 'Third'},
+          {id: 1, title: 'First'},
+        ],
+      },
+      {id: 'b', posts: [{id: 2, title: 'Second'}]},
+    ]);
+    expect(
+      await db
+        .selectFrom('posts')
+        .select((eb) => [
+          'id',
+          jsonObjectFrom(
+            eb
+              .selectFrom('users')
+              .select(['users.name', 'users.meta'])
+              .whereRef('users.id', '=', 'posts.user_id'),
+          ).as('user'),
+          eb
+            .selectFrom('posts as others')
+            .select((eb) => eb.fn.countAll<number>().as('n'))
+            .whereRef('others.user_id', '=', 'posts.user_id')
+            .as('siblings'),
+        ])
+        .where('id', '<', 3)
+        .orderBy('id')
+        .execute(),
+    ).toEqual([
+      {id: 1, user: {name: 'Ann', meta: {tags: ['x']}}, siblings: 2},
+      {id: 2, user: {name: 'Bob', meta: null}, siblings: 1},
+    ]);
   });
 
   it('writes, returns, counts, and upserts', async () => {

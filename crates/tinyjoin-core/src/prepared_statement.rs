@@ -93,6 +93,10 @@ impl PreparedStatement {
                 self.limit_parameter,
                 self.offset_parameter,
             )?)),
+            Statement::Nested(plan) => Ok(Statement::Nested(crate::nested::NestedPlan {
+                params: params.to_vec(),
+                ..plan.clone()
+            })),
             Statement::Write(statement) => {
                 bind_write_statement(statement, params).map(Statement::Write)
             }

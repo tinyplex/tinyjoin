@@ -100,8 +100,9 @@ To use the Drizzle ORM, call `drizzle(client, {schema})` from
 sets the Drizzle schema with setSchema(); with DDL through client.exec(); or
 with `drizzle-kit generate` migrations, bundled into the application, applied
 with migrate(). Drizzle's own migrators and Drizzle Kit's `push` do not work. Use the
-column types TinyJoin has, and avoid relational
-queries with `with`, SQL functions, and nested transactions.
+column types TinyJoin has, and avoid SQL functions, `extras`, and nested
+transactions. Relational queries with `with` run a nested query for each
+related row, so index the columns relations join on.
 See the [Drizzle guide](/guides/drizzle/).
 
 ## Kysely
@@ -111,8 +112,9 @@ To use Kysely, give the `Kysely` constructor a TinyJoinDialect from
 `kysely` itself and closes the Client.
 Kysely's Migrator and introspector work. Use the column types TinyJoin has,
 use `selectAll('table')` rather than `selectAll()`
-over a join whose tables share column names, and avoid `jsonArrayFrom`, SQL
-functions, and savepoints. See the
+over a join whose tables share column names, and avoid `exists`, SQL
+functions, and savepoints. `jsonArrayFrom` and `jsonObjectFrom` run a nested
+query for each row, so index the columns they match on. See the
 [Kysely guide](/guides/kysely/).
 
 ## Transactions and changes

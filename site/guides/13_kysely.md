@@ -111,6 +111,10 @@ These work as Kysely documents them:
 - `orderBy`, `limit`, and `offset`;
 - inner and left joins of up to eight tables;
 - `groupBy` with `countAll`, `count`, `sum`, `avg`, `min`, and `max`;
+- `jsonArrayFrom` and `jsonObjectFrom` from `kysely/helpers/postgres`, and
+  subqueries in `select` that return one value, which may read the query
+  around them, as [nested queries](/guides/sql-compatibility/#nested-queries)
+  that run once for each row;
 - `insertInto` with `values`, `defaultValues`, and `onConflict`, with
   `doNothing` or `doUpdateSet`;
 - `updateTable` and `deleteFrom`, with `returning` and `returningAll`, and
@@ -121,9 +125,9 @@ These are refused with an error rather than run:
 
 - `selectAll()` over a join whose tables share a column name, such as `id`,
   since Kysely reads rows as objects, which cannot hold both;
-- `jsonArrayFrom` and `jsonObjectFrom`, which Kysely writes as correlated JSON
-  subqueries, `exists`, and other correlated subqueries;
-- SQL functions such as `coalesce`, `case`, and casts;
+- `exists`, and subqueries in `where` that read the query around them;
+- SQL functions such as `coalesce`, `case`, and casts, outside the JSON
+  helpers;
 - `distinctOn`, `having`, a distinct `count`, `with`, and `union`;
 - `updateTable(...).from` and `deleteFrom(...).using`;
 - streaming with `stream`.

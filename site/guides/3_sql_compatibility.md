@@ -165,11 +165,13 @@ These labels do not claim compatibility with a particular PostgreSQL release.
 | `HAVING`, aggregate `DISTINCT`, `FILTER`, windows | No | No post-group predicate, distinct aggregate, filter clause, or window form. |
 | `JOIN`, `INNER JOIN` | Narrow | Adds one typed table to a left-deep chain of at most eight sources. Each `ON` has one or more column equalities joined by `AND`, with at most 32 across the query; every equality connects the incoming source to an earlier source. |
 | `LEFT [OUTER] JOIN` | Narrow | The same bounded chain; an unmatched incoming source is represented by `NULL` columns. A later inner join can remove that null-extended row. |
-| `RIGHT`, `FULL`, `CROSS`, `NATURAL`, `USING`, `LATERAL` | No | No additional join families, parenthesized/derived relations, or join reordering. |
+| `LEFT JOIN LATERAL (SELECT ...) alias ON true` | Narrow | A query that runs for each row, as a [nested query](#nested-queries), and gives it at most one row of columns to return. |
+| `RIGHT`, `FULL`, `CROSS`, `NATURAL`, `USING`, other `LATERAL` joins | No | No additional join families, parenthesized relations, or join reordering. |
 | `AS` | Narrow | Output aliases on `SELECT` items in single-table, grouped/aggregate, and join queries, plus a table alias on every table a `SELECT` reads and on the table of an `UPDATE` or `DELETE`. A projection alias requires the `AS` keyword, and one column may be returned under several aliases. A table alias may omit `AS`. `INSERT` does not accept a table alias, and no alias takes a column list. |
 | `SELECT DISTINCT` | Narrow | Removes duplicate rows from an explicit single-table or join projection. `NULL`s compare as equal to each other, and other values compare by SQL equality; JSON columns are rejected. `ORDER BY` must name projected columns: by output name in a single-table query, and by output name or projected source column in a join. A single-table `DISTINCT` compares at most 32 distinct source columns and shares the aggregate group limits. `DISTINCT *`, `DISTINCT ON`, and `DISTINCT` combined with `GROUP BY` or aggregate functions are rejected. |
 | `IN (SELECT ...)` | Narrow | An uncorrelated [subquery](#subqueries) returning one column of at most 1,024 rows. |
-| `WITH`, other subqueries, `UNION`/`INTERSECT`/`EXCEPT` | No | No CTEs, correlated, scalar, `EXISTS`, or `FROM` subqueries, or set operations. |
+| `(SELECT ...)` in a select list, `FROM (SELECT ...) alias` | Narrow | A [nested query](#nested-queries), which may read the row around it: one value for each row, or the rows of a query, gathered into JSON. |
+| `WITH`, other subqueries, `UNION`/`INTERSECT`/`EXCEPT` | No | No CTEs, `EXISTS`, subqueries in `WHERE` that read the statement around them, or set operations. |
 | `CREATE TABLE [IF NOT EXISTS]` | Narrow | Typed columns, a required inline or table-level primary key, and `UNIQUE` constraints. Up to 256 columns. |
 | `PRIMARY KEY` | Narrow | One inline single-column declaration or one table-level column list (single or composite), which `CONSTRAINT name` may name. It implies `NOT NULL`; JSON keys are rejected. |
 | `UNIQUE` | Narrow | A column's `UNIQUE`, or a table's `[CONSTRAINT name] UNIQUE (columns)`, creates a unique index of that name. An unnamed one is named as PostgreSQL names it, for its table and columns, as in `users_email_key`. The columns follow the `CREATE UNIQUE INDEX` rules. |
@@ -218,7 +220,7 @@ each statement retains the ordinary parser limits below.
 | `IN (...)`, `NOT IN (...)` | Supported | One to 1,024 literals or parameters, or a [subquery](#subqueries), with SQL null behavior. |
 | `BETWEEN`, `NOT BETWEEN` | Narrow | `column BETWEEN low AND high` means exactly `column >= low AND column <= high`, and `NOT BETWEEN` means `column < low OR column > high`, with those comparisons' type and null rules. Each bound is a literal or parameter. There is no `SYMMETRIC` form, so a reversed range matches nothing. |
 | `+`, `-`, `*`, `/`, `%`, `\|\|` | Narrow | In the values `UPDATE` and `ON CONFLICT DO UPDATE` assign, on either side of a comparison, and in the select list of a query that does not aggregate. See [expressions](#expressions). |
-| Casts, `CASE`, scalar functions | No | There are no casts, apart from a JSON column's `DEFAULT '...'::jsonb`, and no conditional expressions or functions other than the aggregates. |
+| Casts, `CASE`, scalar functions | No | There are no casts, apart from a JSON column's `DEFAULT '...'::jsonb`, and no conditional expressions or functions other than the aggregates and the JSON functions of [nested queries](#nested-queries). |
 | `LIKE`, `NOT LIKE`, `ILIKE`, `NOT ILIKE` | Narrow | Matches a whole text column value against a literal or parameter pattern, where `%` matches any run of characters and `_` exactly one character; a non-text column is rejected. Backslash makes the next pattern character literal unless `ESCAPE` names another single character, or `''` for none; a pattern ending in its escape character is rejected. `ILIKE` folds only ASCII letters, as PostgreSQL does under the C locale. A `NULL` operand is unknown. A `LIKE` pattern that begins with literal characters, such as `'abc%'`, reads only the part of an index or primary key that can match; other patterns scan. |
 | `IS DISTINCT FROM`, `SIMILAR TO`, `ANY`, `ALL` | No | These PostgreSQL predicate families are not implemented. |
 | JSON/path operators | No | JSON can be stored, returned, and compared for structural equality only. |
@@ -250,11 +252,65 @@ list takes, or the statement fails with `QUERY_WORK_LIMIT_EXCEEDED`. As in
 PostgreSQL, a `NULL` among its values leaves `NOT IN` unknown for every row it
 does not match, so `NOT IN` returns no rows then.
 
-A subquery cannot read the statement around it, so a correlated reference such
-as `WHERE posts.user_id = users.id` names an unknown column. It cannot have
-`ORDER BY`, `LIMIT`, or `OFFSET`, and the values it returns are compared as an
-`IN` list's are, so they never narrow the rows the statement reads. A larger or
-correlated set is better written as a join.
+A subquery in `IN` cannot read the statement around it, so a correlated
+reference such as `WHERE posts.user_id = users.id` names an unknown column. It
+cannot have `ORDER BY`, `LIMIT`, or `OFFSET`, and the values it returns are
+compared as an `IN` list's are, so they never narrow the rows the statement
+reads. A larger or correlated set is better written as a join. A query in a
+select list can read the row around it, as a
+[nested query](#nested-queries).
+
+### Nested queries
+
+A `SELECT` can nest a query that runs once for each of its rows and reads that
+row's columns, by the name or alias of the table they come from. The nested
+query either returns one value, or gathers its rows into one JSON value. This
+is how ORMs load related rows, as Drizzle's relational queries and Kysely's
+`jsonArrayFrom` and `jsonObjectFrom` write them, and it works in hand-written
+SQL too:
+
+```sql
+SELECT u.id, u.name,
+  (SELECT count(*) FROM posts p WHERE p.user_id = u.id) AS post_count,
+  (SELECT coalesce(json_agg(json_build_array(p.id, p.title) ORDER BY p.id DESC), '[]')
+    FROM posts p WHERE p.user_id = u.id) AS posts
+FROM users u;
+
+SELECT p.id, author.data AS author
+FROM posts p
+LEFT JOIN LATERAL (
+  SELECT to_json(a) AS data
+  FROM (SELECT name, email FROM users WHERE users.id = p.user_id) a
+) author ON true;
+```
+
+A nested query is one of these forms:
+
+- `(SELECT ...)` as an item of a select list, which must return one column
+  and at most one row, or the statement fails with `INVALID_QUERY`. No row
+  gives `NULL`.
+- `LEFT JOIN LATERAL (SELECT ...) alias ON true`, whose columns the select list
+  reads as `alias.column`. No row gives `NULL` in each of them.
+- A select list of JSON values made from each row of a table, or of a query in
+  `FROM (SELECT ...) alias`: `json_build_array(t.a, t.b)`, an array of
+  qualified columns; `to_json(alias)` or `row_to_json(alias)`, the row as an
+  object; and `json_agg(...)` of any of these, a qualified column, or a row's
+  alias, which gathers every row into one array, or `NULL` where there are
+  none. `json_agg` takes `ORDER BY` qualified columns, and `coalesce(json_agg(...),
+  '[]')` gives an empty array where there are no rows.
+
+Any other query, inside one of these or around them, is a `SELECT` the dialect
+already runs, which may read the columns of every query around it. A query in
+`FROM (SELECT ...)` gives only JSON values, and a select list that uses
+`json_agg` has only `json_agg` items. A JSON value's field has the JSON type;
+a nested query's other values keep their types.
+
+Each nested query runs as a separate query for every row around it, so loading
+the posts of 1,000 users runs 1,001 queries. Index the columns that nested
+queries match on, such as `posts.user_id`, so that each reads only its own
+rows. A statement runs at most 100,000 nested queries, which together return at
+most 64 MiB, or fails with `QUERY_WORK_LIMIT_EXCEEDED`. Each nested query keeps
+the ordinary limits of its kind.
 
 ## Expressions
 
@@ -785,6 +841,7 @@ rather than growing without bound.
 | Predicate nodes / nesting / `IN` values | 256 / 32 / 1,024 |
 | Expression terms / nesting | 256 / 32 |
 | Subqueries in a statement / rows a subquery returns | 16 / 1,024 |
+| Nested queries a statement runs / data they return | 100,000 / 64 MiB |
 | Rows in one `INSERT ... VALUES` | 4,096 |
 | Explicit `LIMIT` / `OFFSET` / `OFFSET + LIMIT` | 100,000 / 4,294,967,295 / 4,294,967,295 |
 | Rows scanned / returned by a query | 1,000,000 / 100,000 |

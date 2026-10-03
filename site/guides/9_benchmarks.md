@@ -123,7 +123,7 @@ boundaries in full.
 | | TinyJoin | SQLite | PGlite |
 | --- | --- | --- | --- |
 | SQL dialect | A bounded, PostgreSQL-shaped subset | SQLite | PostgreSQL |
-| Subqueries, CTEs, set operations | Uncorrelated `IN (SELECT ...)` only | Yes | Yes |
+| Subqueries, CTEs, set operations | Uncorrelated `IN (SELECT ...)`, and nested queries that gather rows into JSON | Yes | Yes |
 | Expressions, casts, scalar functions | Arithmetic and `\|\|`, without casts or functions | Yes | Yes |
 | `HAVING`, window functions | No | Yes | Yes |
 | Views, triggers | No | Yes | Yes |

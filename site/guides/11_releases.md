@@ -86,6 +86,17 @@ a `WHERE` clause. The subquery runs once, before the statement reads any row,
 must return one column and at most 1,024 rows, and cannot read the statement
 around it. See [subqueries](/guides/sql-compatibility/#subqueries).
 
+A query can nest queries that read each of its rows, as ORMs write them to
+load related rows: a `(SELECT ...)` in the select list that returns one value,
+as in `(SELECT count(*) FROM posts p WHERE p.user_id = u.id)`, and a
+`LEFT JOIN LATERAL (SELECT ...) alias ON true`. Their rows can be gathered into
+JSON with `json_agg`, `json_build_array`, `to_json`, and `coalesce(..., '[]')`,
+including from a query in `FROM (SELECT ...) alias`. Each nested query runs
+once for every row around it, up to 100,000 in a statement. Drizzle's
+relational queries with `with`, and Kysely's `jsonArrayFrom` and
+`jsonObjectFrom`, run this way. See
+[nested queries](/guides/sql-compatibility/#nested-queries).
+
 The new `tinyjoin/drizzle` entry point connects the
 [Drizzle ORM](https://orm.drizzle.team) to a TinyJoin Client:
 `drizzle(client, {schema})` returns a Drizzle database whose queries run in
@@ -96,8 +107,7 @@ optional peer dependency and never bundles it, so the download sizes are
 unchanged. Its migrate() function applies the migrations that
 `drizzle-kit generate` writes, from SQL the application bundles, each
 atomically with the row that records it, so every tab can call it as it
-starts. Relational queries with `with`, Drizzle Kit's `push`, and Drizzle's
-own migrators are not supported. See the [Drizzle guide](/guides/drizzle/).
+starts. Drizzle Kit's `push` and Drizzle's own migrators are not supported. See the [Drizzle guide](/guides/drizzle/).
 
 The new `tinyjoin/kysely` entry point connects the [Kysely](https://kysely.dev)
 query builder to a TinyJoin Client. Its TinyJoinDialect, constructed with
