@@ -462,11 +462,18 @@ const cardTiles = (report: Report): string =>
       : cardTile(report, timeChart(report, [measure]).measures[0], 'ms', title),
   ).join('');
 
+// About how wide a lead is on the card, in pixels: its 20px text, its padding
+// and border, and the gap after it. The leads share the 1,424px row with their
+// label.
+const leadWidth = (text: string): number => text.length * 10.5 + 42;
+const LEADS_WIDTH = 1424 - 170;
+
 // Every other workload in which TinyJoin is the fastest, by how far ahead it
-// is. Ties, and leads that round to 1.0×, count as fastest in the headline,
-// but are not leads to list.
-const cardWins = (report: Report): string =>
-  report.results
+// is, as many as fit on one row. Ties, and leads that round to 1.0×, count as
+// fastest in the headline, but are not leads to list.
+const cardWins = (report: Report): string => {
+  let width = 0;
+  return report.results
     .filter(({id}) => !CARD_TILES.some(([measure]) => measure == id))
     .map(({id, label}) => ({
       name: CARD_NAMES[id] ?? label,
@@ -474,11 +481,16 @@ const cardWins = (report: Report): string =>
     }))
     .filter(({leads, ratio}) => leads && ratio >= 1.05)
     .sort((a, b) => b.ratio - a.ratio)
+    .filter(({name, ratio}) => {
+      width += leadWidth(`${name} ${formatRatio(ratio)}`);
+      return width <= LEADS_WIDTH;
+    })
     .map(
       ({name, ratio}) =>
         `<li>${escapeHtml(name)} <b>${formatRatio(ratio)}</b></li>`,
     )
     .join('');
+};
 
 const cardHeadline = (report: Report): string => {
   const [fastest, second, slowest] = placingCounts(report)[0];
