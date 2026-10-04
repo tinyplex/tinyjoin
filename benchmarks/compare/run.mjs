@@ -268,15 +268,53 @@ const save = async () => {
   if (options.out) await writeFile(resolve(options.out), text);
 };
 
+// A fixed computation, timed to tell whether the CPU still runs at the speed it started at. A
+// fanless laptop slows as it heats over a long run, and background work takes its cores; either
+// would weigh on whichever samples ran then.
+// Each result is stored, so that the computation cannot be optimized away.
+const probeSink = new Int32Array(1);
+const probe = () => {
+  let best = Infinity;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const start = performance.now();
+    let x = 0x9e3779b9 | 0;
+    let sum = 0;
+    for (let i = 0; i < 10_000_000; i++) {
+      x ^= x << 13;
+      x ^= x >>> 17;
+      x ^= x << 5;
+      sum = (sum + (x & 0xff)) | 0;
+    }
+    best = Math.min(best, performance.now() - start);
+    probeSink[0] ^= sum;
+  }
+  return Math.round(best * 10) / 10;
+};
+const cpu = {baselineMs: probe(), slowestMs: 0, waitedSeconds: 0};
+report.environment.cpuProbe = cpu;
+// Waits, for at most a minute, until the probe runs within 5% of its first time.
+const coolDown = async () => {
+  for (let waited = 0; ; waited += 5) {
+    const ms = probe();
+    cpu.slowestMs = Math.max(cpu.slowestMs, ms);
+    if (ms <= cpu.baselineMs * 1.05 || waited >= 60) return;
+    cpu.waitedSeconds += 5;
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+  }
+};
+
 try {
   for (const workload of ALL.filter(({id}) => selected.includes(id))) {
     const entry = {...workload, engines: {}};
     report.results.push(entry);
     const abandoned = new Set();
     for (const engine of engines) entry.engines[engine] = {samples: []};
-    // Engines alternate within each round, so drift affects them equally.
+    // Engines alternate within each round, each round starting with the next engine, so drift
+    // affects them equally, and no engine always follows the same one.
     for (let round = 0; round < samples; round++) {
-      for (const engine of engines.filter((engine) => !abandoned.has(engine))) {
+      await coolDown();
+      const order = engines.map((_, index) => engines[(index + round) % engines.length]);
+      for (const engine of order.filter((engine) => !abandoned.has(engine))) {
         const result = entry.engines[engine];
         try {
           const {ms, info, check, download} = await sample(engine, workload.id);
@@ -307,6 +345,7 @@ try {
   for (const server of servers) server.close();
 }
 
+console.log(`\nCPU probe: ${cpu.baselineMs} ms at the start, ${cpu.slowestMs} ms at its slowest, ${cpu.waitedSeconds} s spent cooling down`);
 const kib = (bytes) => `${(bytes / 1024).toLocaleString('en-US', {maximumFractionDigits: 0})} KiB`;
 console.log('\nDownload (gzip):', engines.filter((engine) => report.download[engine]).map((engine) => `${engine} ${kib(report.download[engine].gzip)}`).join(', ') || 'not measured');
 console.log('\nMedians, and TinyJoin relative to the fastest engine:\n');
