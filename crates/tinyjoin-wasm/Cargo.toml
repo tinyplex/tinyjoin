@@ -22,6 +22,8 @@ zmij = "1"
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = [
   "-Oz",
+  # Repeats the passes until the module stops shrinking: about 0.9 KB gzip for a few seconds.
+  "--converge",
   "--enable-bulk-memory",
   "--enable-nontrapping-float-to-int",
   "--enable-sign-ext",
