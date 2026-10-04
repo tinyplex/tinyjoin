@@ -57,6 +57,13 @@ pub(crate) enum Statement {
 }
 
 impl Statement {
+    /// Has a single-table query return [`crate::ValueRows`] where its rows stream in key order.
+    pub(crate) fn set_value_rows(&mut self, enabled: bool) {
+        if let Self::Select(plan) = self {
+            plan.value_rows = enabled;
+        }
+    }
+
     /// Keys a `SELECT`'s outputs by position if their names repeat, for a caller that reads each
     /// row's values in field order rather than by name.
     pub(crate) fn position_outputs(&mut self) -> Result<()> {

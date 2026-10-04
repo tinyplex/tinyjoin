@@ -50,7 +50,7 @@ pub use error::{EngineError, Result};
 pub use model::{
     ApplyOutcome, ChangedKeys, ColumnDefinition, ColumnType, ExecuteResult, ForeignKeyAction,
     ForeignKeyDefinition, IndexDefinition, MAX_CHANGED_KEYS_PER_TABLE, ResultField, Row,
-    TableDefinition, TableKeys,
+    TableDefinition, TableKeys, ValueRows,
 };
 pub(crate) use model::{
     ComparisonOperator, NullOrder, OrderBy, OrderDirection, Predicate, QueryResult, RowChange,

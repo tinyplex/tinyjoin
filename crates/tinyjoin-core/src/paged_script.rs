@@ -476,6 +476,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             row_count: outcome.row_count,
             fields,
             rows: outcome.rows,
+            values: None,
             tables: outcome.tables,
             keys,
         })
@@ -1451,6 +1452,15 @@ pub(crate) fn retain_result(result_bytes: &mut usize, result: &ExecuteResult) ->
             .and_then(|bytes| bytes.checked_add(64))
             .ok_or_else(batch_too_large)?;
     }
+    if let Some(values) = &result.values {
+        bytes = values
+            .rows
+            .len()
+            .checked_mul(64)
+            .and_then(|overhead| overhead.checked_add(values.estimated_bytes))
+            .and_then(|rows| rows.checked_add(bytes))
+            .ok_or_else(batch_too_large)?;
+    }
     for table in &result.tables {
         bytes = bytes
             .checked_add(table.len())
@@ -1467,9 +1477,10 @@ fn execute_query_result(result: QueryResult) -> Result<ExecuteResult> {
     Ok(ExecuteResult {
         command: "SELECT".to_owned(),
         revision: result.revision,
-        row_count: result.rows.len(),
+        row_count: result.row_count(),
         fields: result.fields,
         rows: result.rows,
+        values: result.values,
         tables: vec![],
         keys: ChangedKeys::default(),
     })

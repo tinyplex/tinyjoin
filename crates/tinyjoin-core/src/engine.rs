@@ -134,6 +134,7 @@ impl<S: StorageDriver + Clone> Engine<S> {
                         row_count: outcome.row_count,
                         fields,
                         rows: outcome.rows,
+                        values: None,
                         tables: outcome.tables,
                         // Staged work publishes at commit; subscribers ignore these until then.
                         keys,
@@ -154,6 +155,7 @@ impl<S: StorageDriver + Clone> Engine<S> {
                         row_count: outcome.row_count,
                         fields,
                         rows: outcome.rows,
+                        values: None,
                         tables: outcome.tables,
                         keys,
                     })
@@ -164,9 +166,10 @@ impl<S: StorageDriver + Clone> Engine<S> {
                 Ok(ExecuteResult {
                     command: "SELECT".to_owned(),
                     revision: result.revision,
-                    row_count: result.rows.len(),
+                    row_count: result.row_count(),
                     fields: result.fields,
                     rows: result.rows,
+                    values: result.values,
                     tables: vec![],
                     keys: ChangedKeys::default(),
                 })

@@ -250,6 +250,7 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &JoinPlan) -> Result<Qu
             revision: storage.revision(),
             fields,
             rows: Vec::new(),
+            values: None,
         });
     }
 
@@ -306,6 +307,7 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &JoinPlan) -> Result<Qu
         revision: storage.revision(),
         fields,
         rows,
+        values: None,
     })
 }
 

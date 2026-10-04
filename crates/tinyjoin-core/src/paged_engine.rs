@@ -21,6 +21,7 @@ pub struct PagedEngine<D: PageDevice> {
     storage: PagedStorage<D>,
     transaction: Option<PagedTransaction>,
     prepared_statements: PreparedStatementRegistry,
+    value_rows: bool,
 }
 
 impl<D: PageDevice> PagedEngine<D> {
@@ -30,7 +31,16 @@ impl<D: PageDevice> PagedEngine<D> {
             storage,
             transaction: None,
             prepared_statements: PreparedStatementRegistry::default(),
+            value_rows: false,
         })
+    }
+
+    /// Has statements return a single-table query's rows that stream in key order as
+    /// [`crate::ValueRows`], in [`ExecuteResult::values`], leaving [`ExecuteResult::rows`] empty:
+    /// quicker for a caller that writes each row's values out in field order, as the
+    /// WebAssembly bridge does.
+    pub fn set_value_rows(&mut self, enabled: bool) {
+        self.value_rows = enabled;
     }
 
     /// The fingerprint of every row in this database.
@@ -69,6 +79,7 @@ impl<D: PageDevice> PagedEngine<D> {
         if array_rows {
             statement.position_outputs()?;
         }
+        statement.set_value_rows(self.value_rows);
         self.execute_parsed_statement(statement)
     }
 
@@ -99,6 +110,7 @@ impl<D: PageDevice> PagedEngine<D> {
         if array_rows {
             statement.position_outputs()?;
         }
+        statement.set_value_rows(self.value_rows);
         self.execute_parsed_statement(statement)
     }
 
@@ -150,10 +162,11 @@ impl<D: PageDevice> PagedEngine<D> {
         for sql in script {
             statements.push(crate::statement::parse(sql, &[])?);
         }
-        if array_rows {
-            for statement in &mut statements {
+        for statement in &mut statements {
+            if array_rows {
                 statement.position_outputs()?;
             }
+            statement.set_value_rows(self.value_rows);
         }
         if self.transaction.is_none() {
             return self.storage.execute_script(statements);
@@ -386,6 +399,7 @@ impl<D: PageDevice> PagedEngine<D> {
             row_count: outcome.row_count,
             fields,
             rows: outcome.rows,
+            values: None,
             tables: outcome.tables,
             // Staged work publishes at commit, so these are reported for symmetry with `tables`
             // and ignored by subscribers until the transaction commits.
@@ -398,9 +412,10 @@ fn execute_query_result(result: QueryResult) -> Result<ExecuteResult> {
     Ok(ExecuteResult {
         command: "SELECT".to_owned(),
         revision: result.revision,
-        row_count: result.rows.len(),
+        row_count: result.row_count(),
         fields: result.fields,
         rows: result.rows,
+        values: result.values,
         tables: vec![],
         keys: ChangedKeys::default(),
     })
@@ -540,6 +555,120 @@ mod tests {
     }
 
     const LEDGER: &str = "CREATE TABLE ledger (id INTEGER PRIMARY KEY, note TEXT)";
+
+    /// A result's rows as objects, built from its value rows where it has them.
+    fn objects(result: &ExecuteResult) -> Vec<Row> {
+        let Some(values) = &result.values else {
+            return result.rows.clone();
+        };
+        assert!(result.rows.is_empty());
+        values
+            .rows
+            .iter()
+            .map(|row| {
+                assert_eq!(row.len(), result.fields.len());
+                result
+                    .fields
+                    .iter()
+                    .map(|field| field.name.clone())
+                    .zip(row.iter().cloned())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn value_rows_hold_what_object_rows_hold() {
+        let setup = [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, f FLOAT, s TEXT, b BOOLEAN, j JSON)",
+            "CREATE INDEX t_n ON t (n)",
+            r#"INSERT INTO t (id, n, f, s, b, j) VALUES (1, 10, 1.5, 'one', true, '{"a":[1,2]}'),
+                (2, NULL, -0.0, 'tw"o', false, 'null'), (3, 30, NULL, NULL, NULL, '["x"]'),
+                (4, 10, 2.25, 'four
+lines', true, '7')"#,
+            "ALTER TABLE t ADD COLUMN d TEXT DEFAULT 'later'",
+            "INSERT INTO t (id, n, s) VALUES (5, 50, 'five')",
+            "CREATE TABLE k (a TEXT, b INTEGER, v TEXT, PRIMARY KEY (a, b))",
+            "INSERT INTO k (a, b, v) VALUES ('x', 2, 'x2'), ('x', 1, 'x1'), ('y', 1, 'y1')",
+        ];
+        // Each query, and whether its rows stream in key order, which only then are value rows,
+        // where that does not depend on how the rows are stored.
+        let queries = [
+            ("SELECT * FROM t", Some(true)),
+            ("SELECT * FROM t WHERE id = 2", Some(true)),
+            ("SELECT * FROM t WHERE id = 99", Some(true)),
+            ("SELECT * FROM t ORDER BY id DESC", None),
+            ("SELECT * FROM t WHERE n = 10", Some(true)),
+            ("SELECT * FROM t WHERE n >= 10 AND n < 40 ORDER BY id", None),
+            ("SELECT id, s FROM t WHERE s IS NOT NULL", Some(true)),
+            ("SELECT s AS label, id FROM t LIMIT 2 OFFSET 1", Some(true)),
+            (
+                "SELECT id, n * 2 + 1 AS twice, s || '!' AS loud FROM t",
+                Some(true),
+            ),
+            ("SELECT t.id, t.d FROM t", Some(true)),
+            ("SELECT *, id AS again FROM t WHERE id > 3", Some(true)),
+            ("SELECT * FROM t LIMIT 0", Some(true)),
+            ("SELECT * FROM t ORDER BY s, id", Some(false)),
+            ("SELECT * FROM k", Some(true)),
+            ("SELECT * FROM k WHERE a = 'x'", Some(true)),
+            ("SELECT v FROM k WHERE a = 'x' AND b = 2", Some(true)),
+            ("SELECT count(*) AS n FROM t", Some(false)),
+        ];
+        for in_transaction in [false, true] {
+            let mut objects_engine = database_with(&setup);
+            let mut values_engine = database_with(&setup);
+            values_engine.set_value_rows(true);
+            if in_transaction {
+                for engine in [&mut objects_engine, &mut values_engine] {
+                    engine.begin_transaction().unwrap();
+                    for sql in [
+                        "UPDATE t SET s = 'staged' WHERE id = 1",
+                        "INSERT INTO t (id, n) VALUES (6, 60)",
+                        "DELETE FROM t WHERE id = 3",
+                    ] {
+                        engine.execute_sql(sql, &[]).unwrap();
+                    }
+                }
+            }
+            for (sql, streams) in queries {
+                for array_rows in [false, true] {
+                    let expected = objects_engine
+                        .execute_sql_rows(sql, &[], array_rows)
+                        .unwrap();
+                    let actual = values_engine
+                        .execute_sql_rows(sql, &[], array_rows)
+                        .unwrap();
+                    assert!(expected.values.is_none(), "{sql}");
+                    if let Some(streams) = streams {
+                        assert_eq!(actual.values.is_some(), streams, "{sql}");
+                    }
+                    assert_eq!(actual.fields, expected.fields, "{sql}");
+                    assert_eq!(actual.row_count, expected.row_count, "{sql}");
+                    assert_eq!(objects(&actual), expected.rows, "{sql}");
+                }
+            }
+            // Prepared statements and scripts return value rows too.
+            let point = values_engine
+                .prepare_sql("SELECT * FROM t WHERE id = $1")
+                .unwrap();
+            let prepared = values_engine
+                .execute_prepared_rows(point, &[json!(4)], false)
+                .unwrap();
+            assert_eq!(
+                objects(&prepared),
+                objects_engine
+                    .execute_sql("SELECT * FROM t WHERE id = 4", &[])
+                    .unwrap()
+                    .rows
+            );
+            let script = values_engine
+                .exec_sql_rows("SELECT id FROM t WHERE id < 3; SELECT * FROM k", false)
+                .unwrap();
+            assert!(script.iter().all(|result| result.values.is_some()));
+            assert_eq!(objects(&script[1]).len(), 3);
+        }
+    }
 
     #[test]
     fn a_key_too_long_to_store_fails_a_lookup_and_a_write_scans_for_it() {
@@ -983,6 +1112,7 @@ mod tests {
                 revision: revision + 1,
                 fields: rows.fields,
                 rows: rows.rows,
+                values: None,
             }
         );
         assert!(

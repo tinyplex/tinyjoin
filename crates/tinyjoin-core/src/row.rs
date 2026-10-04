@@ -156,6 +156,15 @@ impl<'a> RowRef<'a> {
         }
     }
 
+    /// The whole row's values, in the order of `schema`'s columns.
+    pub(crate) fn values(&self, schema: &TableDefinition) -> Result<Vec<Value>> {
+        let mut values = Vec::with_capacity(schema.columns.len());
+        for index in 0..schema.columns.len() {
+            values.push(self.get(index)?.into_value());
+        }
+        Ok(values)
+    }
+
     /// The row as a writer keeps it: a copy of a record's stored entry, or of a map.
     pub(crate) fn hold(&self) -> Result<HeldRow> {
         match &self.0 {

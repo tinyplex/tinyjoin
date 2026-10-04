@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::rc::Rc;
 
 use serde_json::{Map, Number, Value};
@@ -572,37 +573,18 @@ impl Json {
     /// objects whose keys follow the fields.
     fn rows(&mut self, result: &ExecuteResult, array_rows: bool) -> Result<()> {
         let fields = &result.fields;
-        // A row's values come in key order. Each field's position in that order is where its
-        // value sits, and the key there must be the field's name.
-        let mut positions: Vec<usize> = fields
-            .iter()
-            .map(|field| {
-                fields
-                    .iter()
-                    .filter(|other| other.name < field.name)
-                    .count()
-            })
-            .collect();
-        // Fields of one name, which only array rows are returned, instead leave each row's
-        // values keyed by field position, and so already in field order.
+        // Fields of one name, which only array rows are returned, leave object rows' values keyed
+        // by field position, and so already in field order.
         let positional = (1..fields.len()).any(|index| {
             fields[..index]
                 .iter()
                 .any(|field| field.name == fields[index].name)
         });
-        if positional {
-            if !array_rows {
-                return Err(serialization());
-            }
-            for (index, position) in positions.iter_mut().enumerate() {
-                *position = index;
-            }
+        if positional && !array_rows {
+            return Err(serialization());
         }
-        let mut names = vec![""; fields.len()];
-        for (field, position) in fields.iter().zip(&positions) {
-            names[*position] = &field.name;
-        }
-        // Each field's escaped name and colon, as an object row writes it.
+        // Where each field's escaped name sits in the fields list, from which object rows copy
+        // their keys.
         let mut keys = Vec::with_capacity(if array_rows { 0 } else { fields.len() });
         self.raw("{\"fields\":[");
         for (index, field) in fields.iter().enumerate() {
@@ -613,21 +595,45 @@ impl Json {
             let start = self.0.len();
             self.string(&field.name);
             if !array_rows {
-                let mut key = String::with_capacity(self.0.len() - start + 1);
-                key.push_str(&self.0[start..]);
-                key.push(':');
-                keys.push(key);
+                keys.push(start..self.0.len());
             }
             self.raw(",\"dataTypeID\":");
             self.unsigned(field.data_type_id.into())?;
             self.raw("}");
         }
         self.raw("],\"rows\":[");
+        if let Some(values) = &result.values {
+            for (index, row) in values.rows.iter().enumerate() {
+                if row.len() != fields.len() {
+                    return Err(serialization());
+                }
+                self.row(index, &mut row.iter(), &keys, array_rows)?;
+            }
+            self.raw("]}");
+            return Ok(());
+        }
+        // An object's values come in key order. Each field's position in that order is where its
+        // value sits, and the key there must be the field's name.
+        let mut positions: Vec<usize> = fields
+            .iter()
+            .map(|field| {
+                fields
+                    .iter()
+                    .filter(|other| other.name < field.name)
+                    .count()
+            })
+            .collect();
+        if positional {
+            for (index, position) in positions.iter_mut().enumerate() {
+                *position = index;
+            }
+        }
+        let mut names = vec![""; fields.len()];
+        for (field, position) in fields.iter().zip(&positions) {
+            names[*position] = &field.name;
+        }
         let mut values = Vec::with_capacity(fields.len());
         for (index, row) in result.rows.iter().enumerate() {
-            if index > 0 {
-                self.raw(",");
-            }
             values.clear();
             for ((key, value), name) in row.iter().zip(&names) {
                 // A positional key is three digits and then the field's name.
@@ -644,21 +650,42 @@ impl Json {
             if row.len() != fields.len() || values.len() != fields.len() {
                 return Err(serialization());
             }
-            self.raw(if array_rows { "[" } else { "{" });
-            for (index, position) in positions.iter().enumerate() {
-                if index > 0 {
-                    self.raw(",");
-                }
-                if !array_rows {
-                    self.raw(&keys[index]);
-                }
-                self.value(values[*position], 1)?;
-            }
-            self.raw(if array_rows { "]" } else { "}" });
-            self.bounded()?;
+            self.row(
+                index,
+                &mut positions.iter().map(|position| values[*position]),
+                &keys,
+                array_rows,
+            )?;
         }
         self.raw("]}");
         Ok(())
+    }
+
+    /// Writes the row at `index` of a result, from its values in field order: as an array, or as
+    /// an object whose keys are copied from the fields list at `keys`.
+    fn row(
+        &mut self,
+        index: usize,
+        values: &mut dyn Iterator<Item = &Value>,
+        keys: &[Range<usize>],
+        array: bool,
+    ) -> Result<()> {
+        if index > 0 {
+            self.raw(",");
+        }
+        self.raw(if array { "[" } else { "{" });
+        for (position, value) in values.enumerate() {
+            if position > 0 {
+                self.raw(",");
+            }
+            if let Some(key) = keys.get(position) {
+                self.0.extend_from_within(key.clone());
+                self.raw(":");
+            }
+            self.value(value, 1)?;
+        }
+        self.raw(if array { "]" } else { "}" });
+        self.bounded()
     }
 }
 
@@ -685,7 +712,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tinyjoin_core::{
-        ColumnDefinition, ForeignKeyAction, ForeignKeyDefinition, ResultField, TableKeys,
+        ColumnDefinition, ForeignKeyAction, ForeignKeyDefinition, ResultField, TableKeys, ValueRows,
     };
 
     fn result(fields: &[(&str, u32)], rows: Vec<Value>) -> ExecuteResult {
@@ -704,6 +731,7 @@ mod tests {
                 .into_iter()
                 .map(|row| row.as_object().unwrap().clone())
                 .collect(),
+            values: None,
             tables: vec!["items".into()],
             keys: changed_keys("items", &["id"], vec![json!(1)]),
         }
@@ -723,6 +751,66 @@ mod tests {
         let mut json = Json::success(true);
         json.results(results, array_rows, list)?;
         Ok(json.0)
+    }
+
+    /// `result` with its rows as value rows, in field order.
+    fn as_value_rows(mut result: ExecuteResult) -> ExecuteResult {
+        let rows = std::mem::take(&mut result.rows)
+            .iter()
+            .map(|row| {
+                result
+                    .fields
+                    .iter()
+                    .map(|field| row[&field.name].clone())
+                    .collect()
+            })
+            .collect();
+        result.values = Some(ValueRows {
+            rows,
+            ..ValueRows::default()
+        });
+        result
+    }
+
+    #[test]
+    fn value_rows_are_written_as_object_rows_are() {
+        let fields = [
+            ("id", 20),
+            ("say \"hi\"\n", 25),
+            ("é", 114),
+            ("b", 16),
+            ("f", 701),
+        ];
+        let rows = vec![
+            json!({"id": 1, "say \"hi\"\n": "tab\tquote\"", "é": {"a": [1, null, "x"]}, "b": true, "f": 1.5}),
+            json!({"id": 2, "say \"hi\"\n": null, "é": [], "b": false, "f": -0.0}),
+            json!({"id": 3, "say \"hi\"\n": "\u{1f600}", "é": "text", "b": null, "f": 1e300}),
+        ];
+        for array_rows in [false, true] {
+            for list in [false, true] {
+                let objects = [result(&fields, rows.clone()), result(&fields, vec![])];
+                let values = objects.clone().map(as_value_rows);
+                assert_eq!(
+                    written(&values, array_rows, list).unwrap(),
+                    written(&objects, array_rows, list).unwrap()
+                );
+            }
+        }
+        // Object rows cannot hold two fields of one name, which array rows can.
+        let mut repeated = as_value_rows(result(&[("id", 20)], vec![json!({"id": 1})]));
+        repeated.fields.push(repeated.fields[0].clone());
+        repeated.values.as_mut().unwrap().rows[0].push(json!(1));
+        assert_eq!(
+            written(std::slice::from_ref(&repeated), false, false)
+                .unwrap_err()
+                .code,
+            "BRIDGE_SERIALIZATION_ERROR"
+        );
+        assert!(
+            written(&[repeated], true, false)
+                .unwrap()
+                .ends_with(r#""rows":[[1,1]]}"#)
+        );
     }
 
     #[test]
@@ -778,6 +866,7 @@ mod tests {
             row_count: 3,
             fields: vec![],
             rows: vec![],
+            values: None,
             tables: vec![],
             keys: ChangedKeys::default(),
         };

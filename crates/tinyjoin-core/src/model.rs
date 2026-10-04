@@ -388,6 +388,8 @@ pub(crate) struct SelectPlan {
     pub(crate) order_by: Vec<OrderBy>,
     pub(crate) limit: Option<usize>,
     pub(crate) offset: usize,
+    /// Whether rows that stream in key order are returned as [`ValueRows`].
+    pub(crate) value_rows: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -512,6 +514,26 @@ pub(crate) struct QueryResult {
     pub(crate) revision: u64,
     pub(crate) fields: Vec<ResultField>,
     pub(crate) rows: Vec<Row>,
+    pub(crate) values: Option<ValueRows>,
+}
+
+impl QueryResult {
+    pub(crate) fn row_count(&self) -> usize {
+        self.values
+            .as_ref()
+            .map_or(self.rows.len(), |values| values.rows.len())
+    }
+}
+
+/// A result's rows as their values in field order, which a single-table query returns in place of
+/// [`ExecuteResult::rows`] once its engine is asked to. A row built as an object of its values
+/// under their names costs far more than its values alone, and is written out in field order in
+/// any case.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ValueRows {
+    pub rows: Vec<Vec<Value>>,
+    /// What the rows are estimated to take, as the objects they stand for would be.
+    pub estimated_bytes: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -524,6 +546,9 @@ pub struct ExecuteResult {
     /// execution for array rows returns, each value is instead under its field's position as
     /// three digits and then its name, so that a row's values come in field order.
     pub rows: Vec<Row>,
+    /// The rows, as their values in field order, of a single-table query whose engine was asked
+    /// for them, which leaves `rows` empty.
+    pub values: Option<ValueRows>,
     pub tables: Vec<String>,
     /// Changed primary keys per table, under the same bounded contract as [`ApplyOutcome::keys`].
     pub keys: ChangedKeys,

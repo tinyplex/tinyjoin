@@ -77,6 +77,7 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &NestedPlan) -> Result<
         revision: storage.revision(),
         fields,
         rows: result,
+        values: None,
     })
 }
 

@@ -11,12 +11,13 @@ use crate::paged_codec::{IndexEntryLayout, encode_key_bound, encode_text_prefix_
 use crate::row::{Columns, RowRef, ValueRef};
 use crate::storage::{
     KeyOrder, KeyRange, MAX_LOGICAL_VALUE_BYTES, StorageReader, estimated_checked_value_bytes,
-    estimated_row_bytes, estimated_value_bytes, json_scalar_bound, validate_json_value,
+    estimated_entry_bytes, estimated_row_bytes, estimated_value_bytes, json_scalar_bound,
+    validate_json_value,
 };
 use crate::{
     ColumnDefinition, ColumnType, ComparisonOperator, EngineError, NullOrder, OrderBy,
     OrderDirection, Predicate, QueryResult, Result, ResultField, Row, SelectColumn, SelectPlan,
-    Subquery, TableDefinition, VisitControl, VisitOutcome,
+    Subquery, TableDefinition, ValueRows, VisitControl, VisitOutcome,
 };
 
 const MAX_SQL_BYTES: usize = 64 * 1024;
@@ -133,10 +134,11 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &SelectPlan) -> Result<
             revision: storage.revision(),
             fields,
             rows: Vec::new(),
+            values: plan.value_rows.then(ValueRows::default),
         });
     }
 
-    let rows = match row_order(plan, &schema) {
+    let (rows, values) = match row_order(plan, &schema) {
         RowOrder::Any => execute_unordered(storage, plan, &schema, KeyOrder::Ascending)?,
         // Rows ordered by a prefix of the primary key arrive in that order, so they stream and
         // stop at the limit, unless a descending query would read them through an index.
@@ -152,13 +154,14 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &SelectPlan) -> Result<
         {
             execute_unordered(storage, plan, &schema, order)?
         }
-        RowOrder::Key(_) | RowOrder::Sorted => execute_ordered(storage, plan, &schema)?,
+        RowOrder::Key(_) | RowOrder::Sorted => (execute_ordered(storage, plan, &schema)?, None),
     };
 
     Ok(QueryResult {
         revision: storage.revision(),
         fields,
         rows,
+        values,
     })
 }
 
@@ -308,6 +311,15 @@ impl<'a> Projection<'a> {
         Ok(projected)
     }
 
+    /// The projected row's values, in output order.
+    fn values(&self, row: &RowRef<'_>) -> Result<Vec<Value>> {
+        let mut values = Vec::with_capacity(self.items.len());
+        for (_, value) in &self.items {
+            values.push(self.value(value, row)?);
+        }
+        Ok(values)
+    }
+
     fn project_owned(&self, row: &Row, schema: &TableDefinition) -> Result<Row> {
         self.project(&RowRef::map(row, schema))
     }
@@ -430,17 +442,18 @@ fn row_order(plan: &SelectPlan, schema: &TableDefinition) -> RowOrder {
 
 /// Reads the rows a query returns in the order candidates arrive, stopping at `LIMIT`. Without
 /// `ORDER BY` any order will do, and with it [`row_order`] has confirmed that `order` is the one
-/// asked for.
+/// asked for. The rows are objects, or [`ValueRows`] where the plan asks for them.
 fn execute_unordered(
     storage: &dyn StorageReader,
     plan: &SelectPlan,
     schema: &crate::TableDefinition,
     order: KeyOrder,
-) -> Result<Vec<Row>> {
+) -> Result<(Vec<Row>, Option<ValueRows>)> {
     let mut scanned = 0_usize;
     let mut skipped_matches = 0_usize;
     let mut result_bytes = 0_usize;
     let mut rows = Vec::new();
+    let mut values = Vec::new();
     let filter = Filter::new(plan.predicate.as_ref(), schema, &plan.table)?;
     let projection = Projection::new(plan.columns.as_deref(), schema, &plan.table)?;
     visit_candidate_rows(storage, plan, schema, order, &mut |row| {
@@ -452,31 +465,45 @@ fn execute_unordered(
             skipped_matches += 1;
             return Ok(VisitControl::Continue);
         }
-        if rows.len() == MAX_RESULT_ROWS {
+        let kept = rows.len() + values.len();
+        if kept == MAX_RESULT_ROWS {
             return Err(result_limit_exceeded());
         }
-        // An explicit projection is charged before it is built, from the columns it reads.
-        let projected = match &projection {
+        match &projection {
+            // An explicit projection is charged before it is built, from the columns it reads.
             Some(projection) => {
                 result_bytes = checked_result_add(result_bytes, projection.estimated_bytes(row)?)?;
                 ensure_result_budget(result_bytes)?;
-                projection.project(row)?
+                if plan.value_rows {
+                    values.push(projection.values(row)?);
+                } else {
+                    rows.push(projection.project(row)?);
+                }
+            }
+            None if plan.value_rows => {
+                let row = row.values(schema)?;
+                result_bytes = checked_result_add(result_bytes, owned_values_bytes(schema, &row)?)?;
+                ensure_result_budget(result_bytes)?;
+                values.push(row);
             }
             None => {
                 let row = row.to_row()?;
                 result_bytes = checked_result_add(result_bytes, owned_row_bytes(&row)?)?;
                 ensure_result_budget(result_bytes)?;
-                row
+                rows.push(row);
             }
-        };
-        rows.push(projected);
-        if plan.limit.is_some_and(|limit| rows.len() == limit) {
+        }
+        if plan.limit.is_some_and(|limit| kept + 1 == limit) {
             Ok(VisitControl::Stop)
         } else {
             Ok(VisitControl::Continue)
         }
     })?;
-    Ok(rows)
+    let values = plan.value_rows.then_some(ValueRows {
+        rows: values,
+        estimated_bytes: result_bytes,
+    });
+    Ok((rows, values))
 }
 
 fn execute_ordered(
@@ -965,6 +992,16 @@ fn result_limit_exceeded() -> EngineError {
 
 fn owned_row_bytes(row: &Row) -> Result<usize> {
     estimated_row_bytes(row).map_err(|_| result_bytes_limit_exceeded())
+}
+
+/// [`owned_row_bytes`] of the object a row's values in schema order stand for.
+fn owned_values_bytes(schema: &TableDefinition, values: &[Value]) -> Result<usize> {
+    let mut bytes = 32;
+    for (column, value) in schema.columns.iter().zip(values) {
+        bytes = estimated_entry_bytes(bytes, &column.name, value)
+            .map_err(|_| result_bytes_limit_exceeded())?;
+    }
+    Ok(bytes)
 }
 
 fn owned_value_bytes(value: &Value) -> Result<usize> {
@@ -1515,6 +1552,7 @@ impl<'a> SqlParser<'a> {
             order_by,
             limit,
             offset,
+            value_rows: false,
         })
     }
 
@@ -5406,6 +5444,7 @@ mod tests {
                 order_by: vec![],
                 limit: None,
                 offset: 0,
+                value_rows: false,
             }
         );
         assert_eq!(
@@ -5420,6 +5459,7 @@ mod tests {
                 order_by: vec![],
                 limit: None,
                 offset: 0,
+                value_rows: false,
             }
         );
     }
@@ -5467,6 +5507,7 @@ mod tests {
                 order_by: vec![],
                 limit: Some(10),
                 offset: 0,
+                value_rows: false,
             }
         );
     }

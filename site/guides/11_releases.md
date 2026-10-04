@@ -177,6 +177,13 @@ statements, and slowed them: in the comparative benchmark, timed workloads now
 run about 5% faster overall, point reads about 8% faster, and indexed range
 aggregates about a fifth faster.
 
+A single-table `SELECT` whose rows arrive in key order now hands them to the
+Worker as their values in field order, rather than first building each row as
+an object of values under their names, which the Worker then wrote out in
+field order anyway. Reading all 10,000 rows of the comparative benchmark takes
+two-fifths less time, and a point read by key about 3% less, for 1.2 KiB more
+of compressed engine.
+
 **Upgrading from v0.4.0 needs no action.** Install, rebuild, and redeploy. The
 page format stays at format 3, so an existing database opens with no migration
 and no OPFS namespace change. A database that holds a `VARCHAR(n)` column, or

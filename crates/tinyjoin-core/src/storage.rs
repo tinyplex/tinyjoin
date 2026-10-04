@@ -1250,14 +1250,19 @@ fn validate_primary_key_values(schema: &TableDefinition, row: &Row) -> Result<()
 pub(crate) fn estimated_row_bytes(row: &Row) -> Result<usize> {
     let mut bytes = 32usize;
     for (key, value) in row {
-        bytes = checked_row_write_add(bytes, 64)?;
-        bytes = checked_row_write_add(bytes, checked_row_write_mul(key.len(), 2)?)?;
-        bytes = checked_row_write_add(
-            bytes,
-            checked_row_write_mul(estimated_value_bytes_at_depth(value, 1)?, 2)?,
-        )?;
+        bytes = estimated_entry_bytes(bytes, key, value)?;
     }
     Ok(bytes)
+}
+
+/// Adds a row's value under `name` to the row's estimated `bytes`.
+pub(crate) fn estimated_entry_bytes(bytes: usize, name: &str, value: &Value) -> Result<usize> {
+    let bytes = checked_row_write_add(bytes, 64)?;
+    let bytes = checked_row_write_add(bytes, checked_row_write_mul(name.len(), 2)?)?;
+    checked_row_write_add(
+        bytes,
+        checked_row_write_mul(estimated_value_bytes_at_depth(value, 1)?, 2)?,
+    )
 }
 
 /// The most JSON text a row of `schema` can take, apart from its values: braces, commas, and each

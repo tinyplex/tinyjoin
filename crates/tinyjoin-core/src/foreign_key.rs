@@ -450,6 +450,7 @@ fn rows_where(
         order_by: Vec::new(),
         limit,
         offset: 0,
+        value_rows: false,
     };
     Ok(crate::query::execute(storage, &plan)?.rows)
 }

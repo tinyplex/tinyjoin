@@ -19,7 +19,9 @@ impl WasmEngine {
     #[wasm_bindgen(constructor)]
     pub fn new(device: JsValue) -> std::result::Result<WasmEngine, JsValue> {
         let device = WasmPageDevice::new(device).map_err(structured::constructor_error)?;
-        let engine = PagedEngine::open(device).map_err(structured::constructor_error)?;
+        let mut engine = PagedEngine::open(device).map_err(structured::constructor_error)?;
+        // Rows are written out in field order, so they need not be built as objects first.
+        engine.set_value_rows(true);
         Ok(Self {
             engine: Some(engine),
             poisoned: false,
