@@ -11,8 +11,8 @@ import {brotliCompressSync, constants, gzipSync} from 'node:zlib';
 
 // Compares TinyJoin with SQLite (opfs-sahpool) and PGlite (opfs-ahp), each
 // running in a Worker and storing to OPFS in a real Chromium profile. Every
-// sample gets a fresh browser profile on disk, so storage is never shared or
-// in-memory, and a hung sample can be killed without affecting the next.
+// sample gets a fresh browser profile on disk, so storage is never shared, and
+// a hung sample can be killed without affecting the next.
 // Diagnostic distributions, never a CI timing threshold. Turso can be added
 // with --engines for local comparison; it is never published.
 
@@ -27,15 +27,12 @@ const PACKAGES = {
   pglite: '@electric-sql/pglite',
   turso: '@tursodatabase/database-wasm',
 };
-const STORAGE = {
-  opfs: {tinyjoin: 'opfs://', sqlite: 'opfs-sahpool', pglite: 'opfs-ahp://', turso: 'OPFS sync access handles'},
-  memory: {tinyjoin: 'memory://', sqlite: ':memory:', pglite: 'memory://', turso: ':memory:'},
-};
+// How each engine stores to OPFS, as the report names it.
+const STORAGE = {tinyjoin: 'opfs://', sqlite: 'opfs-sahpool', pglite: 'opfs-ahp://', turso: 'OPFS sync access handles'};
 // Turso's threaded WebAssembly needs SharedArrayBuffer, so its page is served
 // cross-origin isolated, from a second origin that only it uses.
 const ISOLATED = new Set(['turso']);
-// The OPFS results are published for the benchmarks guide to chart. The
-// in-memory suite runs for comparison, with its report written by --out.
+// The results are published for the benchmarks guide to chart.
 const PUBLISHED = resolve(root, 'site/data/benchmarks.json');
 
 const {values: options} = parseArgs({
@@ -43,7 +40,6 @@ const {values: options} = parseArgs({
     engines: {type: 'string', default: ENGINES.join(',')},
     workloads: {type: 'string'},
     samples: {type: 'string', default: '5'},
-    storage: {type: 'string', default: 'opfs'},
     timeout: {type: 'string', default: '60'},
     out: {type: 'string'},
     publish: {type: 'boolean', default: false},
@@ -56,10 +52,9 @@ if (options.help) {
   --engines a,b      ${KNOWN_ENGINES.join(', ')} (default: ${ENGINES.join(',')})
   --workloads a,b    workload ids, including cold-open and reopen (default: all)
   --samples n        samples per engine and workload (default: 5)
-  --storage kind     opfs or memory (default: opfs)
   --timeout s        seconds before a sample is abandoned (default: 60)
   --out file         write the full JSON report
-  --publish          full default OPFS run, written to
+  --publish          full default run, written to
                      site/data/benchmarks.json`);
   process.exit(0);
 }
@@ -74,14 +69,12 @@ const ALL = [...STARTUP, ...workloads.map(({id, group, label, derivedFrom}) => (
 const engines = options.engines.split(',');
 const selected = options.workloads ? options.workloads.split(',') : ALL.map(({id}) => id);
 const samples = Number(options.samples);
-const storage = options.storage;
 const timeoutMs = Number(options.timeout) * 1000;
 for (const engine of engines) if (!KNOWN_ENGINES.includes(engine)) throw new Error(`Unknown engine: ${engine}`);
 for (const id of selected) if (!ALL.some((workload) => workload.id === id)) throw new Error(`Unknown workload: ${id}`);
-if (!STORAGE[storage]) throw new Error(`Unknown storage: ${storage}`);
 if (!(samples >= 1) || !(timeoutMs > 0)) throw new Error('--samples and --timeout must be positive');
-if (options.publish && (options.workloads || options.engines !== ENGINES.join(',') || samples < 5 || options.out || storage !== 'opfs')) {
-  throw new Error('--publish takes the full default OPFS suite: all engines and workloads, at least 5 samples, and no --out');
+if (options.publish && (options.workloads || options.engines !== ENGINES.join(',') || samples < 5 || options.out)) {
+  throw new Error('--publish takes the full default suite: all engines and workloads, at least 5 samples, and no --out');
 }
 
 // Byte sizes depend on the zlib bundled with Node, so published sizes use the
@@ -161,7 +154,7 @@ const [origin, isolatedOrigin] = servers.map((server) => `http://127.0.0.1:${ser
 const {chromium} = await import('@playwright/test');
 const report = {
   measuredAt: new Date().toISOString(),
-  storage,
+  storage: 'opfs',
   samples,
   timeoutMs,
   environment: {
@@ -180,7 +173,7 @@ const report = {
   results: [],
 };
 for (const engine of engines) {
-  report.engines[engine] = {package: PACKAGES[engine], version: await version(engine), storage: STORAGE[storage][engine]};
+  report.engines[engine] = {package: PACKAGES[engine], version: await version(engine), storage: STORAGE[engine]};
 }
 if (report.engines.tinyjoin) {
   report.engines.tinyjoin.commit = git('rev-parse', '--short', 'HEAD');
@@ -243,15 +236,15 @@ async function sample(engine, id) {
   try {
     if (id === 'cold-open') {
       return await session(engine, profile, async (page, fetched) => {
-        const result = await page.evaluate(({engine, storage}) => window.bench.coldOpen(engine, storage), {engine, storage});
+        const result = await page.evaluate((engine) => window.bench.coldOpen(engine), engine);
         return {...result, download: await measureDownload(fetched)};
       });
     }
     if (id === 'reopen') {
-      await session(engine, profile, (page) => page.evaluate(({engine, storage}) => window.bench.seedReopen(engine, storage), {engine, storage}));
-      return await session(engine, profile, (page) => page.evaluate(({engine, storage}) => window.bench.reopen(engine, storage), {engine, storage}));
+      await session(engine, profile, (page) => page.evaluate((engine) => window.bench.seedReopen(engine), engine));
+      return await session(engine, profile, (page) => page.evaluate((engine) => window.bench.reopen(engine), engine));
     }
-    return await session(engine, profile, (page) => page.evaluate(({engine, id, storage}) => window.bench.run(engine, id, storage), {engine, id, storage}));
+    return await session(engine, profile, (page) => page.evaluate(({engine, id}) => window.bench.run(engine, id), {engine, id}));
   } finally {
     await rm(profile, {recursive: true, force: true});
   }
@@ -277,7 +270,6 @@ const save = async () => {
 
 try {
   for (const workload of ALL.filter(({id}) => selected.includes(id))) {
-    if (workload.id === 'reopen' && storage === 'memory') continue;
     const entry = {...workload, engines: {}};
     report.results.push(entry);
     const abandoned = new Set();

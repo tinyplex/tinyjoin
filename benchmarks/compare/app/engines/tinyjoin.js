@@ -7,8 +7,8 @@ const rows = async (results) => (await results).rows;
 
 export default {
   name: 'tinyjoin',
-  async open(storage, database) {
-    db = await create(storage === 'opfs' ? `opfs://${database}` : 'memory://');
+  async open(database) {
+    db = await create(`opfs://${database}`);
     return {engineVersion: null};
   },
   exec: async (sql) => {

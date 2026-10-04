@@ -2,10 +2,7 @@
 
 Measures TinyJoin against SQLite (`@sqlite.org/sqlite-wasm`, `opfs-sahpool`)
 and PGlite (`@electric-sql/pglite`, `opfs-ahp://`), each in a Worker storing
-to OPFS, in a fresh on-disk Chromium profile per sample. With
-`--storage memory`, each engine keeps its database in memory instead
-(`memory://`, `:memory:`, and `memory://`), which separates the engines from
-the storage beneath them.
+to OPFS, in a fresh on-disk Chromium profile per sample.
 
 Turso (`@tursodatabase/database-wasm`) is an optional fourth engine for local
 comparison: add it with `--engines tinyjoin,sqlite,pglite,turso`. It is not in
@@ -22,8 +19,8 @@ npm run bench:compare -- --help
   and a check that must agree across engines.
 - `app/engines/` holds one adapter per engine, behind the same five calls.
 - `run.mjs` builds the page with Vite, serves it, drives Chromium, and prints
-  medians. `--publish` writes the OPFS results to `site/data/benchmarks.json`
-  for the website; `--out` saves any run's report, in memory or not.
+  medians. `--publish` writes the results to `site/data/benchmarks.json` for
+  the website; `--out` saves any run's report.
 
 The docs build also summarizes the published results in
 `docs/benchmark-card.html`, a 1600x900 card to share, from the template in

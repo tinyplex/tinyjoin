@@ -6,8 +6,8 @@ import {serve} from './rpc.js';
 let db;
 
 serve({
-  async open({storage, database}) {
-    db = await PGlite.create(storage === 'opfs' ? `opfs-ahp://${database}` : 'memory://');
+  async open({database}) {
+    db = await PGlite.create(`opfs-ahp://${database}`);
     const {rows} = await db.query('SHOW server_version');
     return {engineVersion: `PostgreSQL ${rows[0].server_version}`};
   },

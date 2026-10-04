@@ -40,10 +40,10 @@ export const createRemoteAdapter = (name, createWorker) => {
   const run = (handle, params) => call('query', {sql: handle.sql, params});
   return {
     name,
-    async open(storage, database) {
+    async open(database) {
       worker = createWorker();
       call = connect(worker);
-      return call('open', {storage, database});
+      return call('open', {database});
     },
     exec: (sql) => call('exec', {sql}),
     query: (sql, params) => call('query', {sql, params}),

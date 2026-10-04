@@ -261,6 +261,5 @@ npm run build
 npm run bench:compare -- --engines tinyjoin,sqlite --workloads update-pk,delete-pk --samples 3
 ```
 
-`--storage memory` runs the same workloads without OPFS, which separates the
-engine's own cost from storage. `--out` saves a report to compare against a
-later build, and `--help` lists every option.
+`--out` saves a report to compare against a later build, and `--help` lists
+every option.

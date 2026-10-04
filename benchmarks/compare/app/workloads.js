@@ -359,26 +359,26 @@ export const workloads = [
 // Startup is measured separately: from starting to fetch the engine to the
 // first query result, on an empty new database and on a populated one.
 export const startup = {
-  async coldOpen(load, storage) {
+  async coldOpen(load) {
     const start = performance.now();
     const db = await load();
-    const info = await db.open(storage, 'cold');
+    const info = await db.open('cold');
     await db.exec(TABLE);
     const rows = await db.query('SELECT count(*) AS n FROM t');
     const ms = performance.now() - start;
     await db.close();
     return {ms, info, check: {rows: Number(rows[0].n)}};
   },
-  async seedReopen(load, storage) {
+  async seedReopen(load) {
     const db = await load();
-    await db.open(storage, 'reopen');
+    await db.open('reopen');
     await table(db);
     await db.close();
   },
-  async reopen(load, storage) {
+  async reopen(load) {
     const start = performance.now();
     const db = await load();
-    const info = await db.open(storage, 'reopen');
+    const info = await db.open('reopen');
     const rows = await db.query('SELECT count(*) AS n, sum(b) AS b FROM t');
     const ms = performance.now() - start;
     await db.close();

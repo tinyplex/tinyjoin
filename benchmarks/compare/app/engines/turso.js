@@ -24,8 +24,8 @@ const run = (handle, params) => query(handle.sql, params);
 
 export default {
   name: 'turso',
-  async open(storage, database) {
-    db = await connect(storage === 'opfs' ? `${database}.db` : ':memory:');
+  async open(database) {
+    db = await connect(`${database}.db`);
     const [{version}] = await db.prepare('SELECT sqlite_version() AS version').all();
     return {engineVersion: `SQLite ${version} compatible`};
   },

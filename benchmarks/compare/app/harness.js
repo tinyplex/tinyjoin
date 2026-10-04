@@ -11,13 +11,13 @@ const engines = {
 const loader = (engine) => async () => (await engines[engine]()).default;
 
 window.bench = {
-  coldOpen: (engine, storage) => startup.coldOpen(loader(engine), storage),
-  seedReopen: (engine, storage) => startup.seedReopen(loader(engine), storage),
-  reopen: (engine, storage) => startup.reopen(loader(engine), storage),
-  async run(engine, id, storage) {
+  coldOpen: (engine) => startup.coldOpen(loader(engine)),
+  seedReopen: (engine) => startup.seedReopen(loader(engine)),
+  reopen: (engine) => startup.reopen(loader(engine)),
+  async run(engine, id) {
     const workload = workloads.find((candidate) => candidate.id === id);
     const db = await loader(engine)();
-    const info = await db.open(storage, `bench-${id}`);
+    const info = await db.open(`bench-${id}`);
     try {
       await workload.setup(db);
       const start = performance.now();

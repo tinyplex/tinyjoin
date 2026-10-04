@@ -7,14 +7,10 @@ let db;
 const statements = new Map();
 
 serve({
-  async open({storage, database}) {
+  async open({database}) {
     const sqlite3 = await sqlite3InitModule();
-    if (storage === 'opfs') {
-      const pool = await sqlite3.installOpfsSAHPoolVfs({name: 'bench-sahpool'});
-      db = new pool.OpfsSAHPoolDb(`/${database}.sqlite3`);
-    } else {
-      db = new sqlite3.oo1.DB(':memory:', 'c');
-    }
+    const pool = await sqlite3.installOpfsSAHPoolVfs({name: 'bench-sahpool'});
+    db = new pool.OpfsSAHPoolDb(`/${database}.sqlite3`);
     return {engineVersion: sqlite3.version.libVersion};
   },
   exec({sql}) {
