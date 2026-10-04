@@ -121,7 +121,7 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
       // Each result gets the full check, so a statement the engine rejects fails here.
       warmUp(engine as unknown as WorkerEngine);
       expect(engine.inTransaction()).toBe(false);
-      expect(engine.executeSql('SELECT count(*) AS n FROM w', []).rows).toEqual([{n: 537}]);
+      expect(engine.executeSql('SELECT count(*) AS n FROM w', []).rows).toEqual([{n: 404}]);
     } finally {
       engine.close();
     }

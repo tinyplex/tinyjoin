@@ -53,7 +53,9 @@ export const warmUp = (engine: WorkerEngine): void => {
   );
   const remove = engine.prepareSql('DELETE FROM w WHERE id = $1');
   let next = 1;
-  const passes = [5, 400];
+  // The second pass runs each loop just long enough to have it optimized. A longer one finished
+  // later, while a database's first statements were running, and left those statements slower.
+  const passes = [5, 300];
   for (const [pass, count] of passes.entries()) {
     engine.beginTransaction();
     for (let i = 0; i < count; i += 5) {

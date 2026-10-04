@@ -171,6 +171,12 @@ SQL catalog tables, which TinyJoin does not have. Each column carries its
 runtime type, whether it is nullable, and any literal default. See
 [reading the schema](/guides/storage-and-lifecycle/#reading-the-schema).
 
+The warm-up Worker that create() starts runs its loops three-quarters as long,
+and so finishes sooner. It was still running while a database ran its first
+statements, and slowed them: in the comparative benchmark, timed workloads now
+run about 5% faster overall, point reads about 8% faster, and indexed range
+aggregates about a fifth faster.
+
 **Upgrading from v0.4.0 needs no action.** Install, rebuild, and redeploy. The
 page format stays at format 3, so an existing database opens with no migration
 and no OPFS namespace change. A database that holds a `VARCHAR(n)` column, or

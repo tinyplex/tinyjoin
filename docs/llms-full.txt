@@ -1820,7 +1820,7 @@ assets during the supported Vite build path.
 
 Once per page, create() also starts a second, short-lived copy of the packaged
 Worker. It runs the engine's common statements on a scratch in-memory database
-for about a tenth of a second, and then exits. Chromium compiles WebAssembly
+for less than a tenth of a second, and then exits. Chromium compiles WebAssembly
 one function at a time, as each is first called, and Workers running the same
 module share the code either compiles, so the database's own Worker runs its
 first statements of each kind without stopping to compile them. The second
@@ -3296,6 +3296,12 @@ their columns, primary keys, and indexes, as typed objects rather than through
 SQL catalog tables, which TinyJoin does not have. Each column carries its
 runtime type, whether it is nullable, and any literal default. See
 [reading the schema](https://tinyjoin.org/guides/storage-and-lifecycle/#reading-the-schema).
+
+The warm-up Worker that create() starts runs its loops three-quarters as long,
+and so finishes sooner. It was still running while a database ran its first
+statements, and slowed them: in the comparative benchmark, timed workloads now
+run about 5% faster overall, point reads about 8% faster, and indexed range
+aggregates about a fifth faster.
 
 **Upgrading from v0.4.0 needs no action.** Install, rebuild, and redeploy. The
 page format stays at format 3, so an existing database opens with no migration

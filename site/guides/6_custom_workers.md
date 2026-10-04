@@ -6,7 +6,7 @@ assets during the supported Vite build path.
 
 Once per page, create() also starts a second, short-lived copy of the packaged
 Worker. It runs the engine's common statements on a scratch in-memory database
-for about a tenth of a second, and then exits. Chromium compiles WebAssembly
+for less than a tenth of a second, and then exits. Chromium compiles WebAssembly
 one function at a time, as each is first called, and Workers running the same
 module share the code either compiles, so the database's own Worker runs its
 first statements of each kind without stopping to compile them. The second
