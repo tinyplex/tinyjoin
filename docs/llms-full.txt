@@ -2580,12 +2580,12 @@ These numbers are published to track progress, not to win an argument.
 TinyJoin's engine is young. It is the smallest download and the quickest to
 open or reopen a database, and it reads every row, runs `LIKE` scans, groups,
 joins, builds indexes, and commits single inserts more quickly than either
-alternative. With OPFS storage, it is the fastest of the three in half of the
-workloads, and second in the other half, taking one to 1.5 times as long as the
-faster engine: it is never the slowest. Closing the remaining gaps is ongoing
+alternative. With OPFS storage, it is the fastest of the three in eight of the
+20 workloads, and second in the other 12, taking one to 1.6 times as long as
+the faster engine: it is never the slowest. Closing the remaining gaps is ongoing
 work, and the suite is designed to be rerun after every optimization.
 
-Measured on 2026-09-29 with headless Chromium 153.0.8010.12 on macOS (25.5.0), Apple M2, 8 logical CPUs, 16 GiB RAM. Each time is the median of 9 samples.
+Measured on 2026-10-04 with headless Chromium 153.0.8010.12 on macOS (25.5.0), Apple M2, 8 logical CPUs, 16 GiB RAM. Each time is the median of 9 samples.
 
 Each workload lists the engines fastest first, and is drawn to its own linear
 scale from zero, on which its slowest run reaches the full width, so a quick
@@ -2597,9 +2597,9 @@ engine's fastest run to its slowest.
 
 | Size | TinyJoin | SQLite | PGlite |
 | --- | ---: | ---: | ---: |
-| Download (uncompressed) | **736 KiB** | 1.0 MiB | 16.6 MiB |
-| Download (gzip) | **302 KiB** | 457 KiB | 5.6 MiB |
-| Download (Brotli) | **245 KiB** | 395 KiB | 3.8 MiB |
+| Download (uncompressed) | **822 KiB** | 1.0 MiB | 16.6 MiB |
+| Download (gzip) | **338 KiB** | 457 KiB | 5.6 MiB |
+| Download (Brotli) | **278 KiB** | 395 KiB | 3.8 MiB |
 
 Download size counts every file a page fetched to open a database: JavaScript
 for the page and the Worker, WebAssembly, and PGlite's file system image. It is
@@ -2610,8 +2610,8 @@ at quality 11, since servers send either.
 
 | Median time | TinyJoin | SQLite | PGlite |
 | --- | ---: | ---: | ---: |
-| Load, create an empty database, and read from it | **52.9 ms** | 89.7 ms | 1.12 s |
-| Reopen a 10,000-row database in a new session and count it | **22.3 ms** | 39.2 ms | 218 ms |
+| Load, create an empty database, and read from it | **49.4 ms** | 86.4 ms | 1.10 s |
+| Reopen a 10,000-row database in a new session and count it | **22.5 ms** | 38.4 ms | 215 ms |
 
 First open starts before the engine is fetched and ends when the first query on
 a new, empty database returns. Reopen runs in a new browser session with a warm
@@ -2629,44 +2629,44 @@ they go. See [custom Workers](https://tinyjoin.org/guides/custom-workers/).
 
 | Median time | TinyJoin | SQLite | PGlite |
 | --- | ---: | ---: | ---: |
-| 1,000 INSERTs, each committed alone | **436 ms** | 1.78 s | 498 ms |
-| One transaction of 10,000 INSERTs | 267 ms | **199 ms** | 1.05 s |
-| One transaction of 10,000 INSERTs, indexed text column | 275 ms | **212 ms** | 1.08 s |
-| One transaction of 50 INSERTs, 200 rows each | 46.7 ms | **45.5 ms** | 102 ms |
+| 1,000 INSERTs, each committed alone | **407 ms** | 1.58 s | 450 ms |
+| One transaction of 10,000 INSERTs | 268 ms | **196 ms** | 1.05 s |
+| One transaction of 10,000 INSERTs, indexed text column | 281 ms | **211 ms** | 1.08 s |
+| One transaction of 50 INSERTs, 200 rows each | 49.5 ms | **44.4 ms** | 101 ms |
 
 ## Read
 
 | Median time | TinyJoin | SQLite | PGlite |
 | --- | ---: | ---: | ---: |
-| 1,000 SELECTs by primary key | **29.6 ms** | 29.7 ms | 139 ms |
-| 100 range aggregates, no index | 46.9 ms | **44.2 ms** | 77.9 ms |
-| 100 LIKE aggregates on a text column | **114 ms** | 142 ms | 180 ms |
-| 100 range aggregates, indexed column | **3.50 ms** | **3.50 ms** | 19.4 ms |
-| Read all 10,000 rows in order | **10.4 ms** | 45.3 ms | 44.7 ms |
-| 10 GROUP BY aggregates over 10,000 rows | **15.9 ms** | 31.6 ms | 21.2 ms |
-| 100 joins: one customer’s orders from 5,000 | **16.3 ms** | 20.1 ms | 32.1 ms |
+| 1,000 SELECTs by primary key | 29.8 ms | **29.2 ms** | 137 ms |
+| 100 range aggregates, no index | 47.8 ms | **44.2 ms** | 78.0 ms |
+| 100 LIKE aggregates on a text column | **115 ms** | 142 ms | 180 ms |
+| 100 range aggregates, indexed column | 3.70 ms | **3.60 ms** | 19.7 ms |
+| Read all 10,000 rows in order | **11.2 ms** | 44.6 ms | 44.1 ms |
+| 10 GROUP BY aggregates over 10,000 rows | **15.9 ms** | 31.2 ms | 21.2 ms |
+| 100 joins: one customer’s orders from 5,000 | **16.7 ms** | 19.9 ms | 33.3 ms |
 
 ## Update
 
 | Median time | TinyJoin | SQLite | PGlite |
 | --- | ---: | ---: | ---: |
-| One transaction of 1,000 UPDATEs by primary key | 33.7 ms | **25.0 ms** | 127 ms |
-| One transaction of 100 range UPDATEs, no index | 62.8 ms | **49.4 ms** | 82.3 ms |
-| One transaction of 1,000 upserts, half of them new | 35.5 ms | **24.1 ms** | 128 ms |
+| One transaction of 1,000 UPDATEs by primary key | 35.4 ms | **23.8 ms** | 126 ms |
+| One transaction of 100 range UPDATEs, no index | 63.3 ms | **48.3 ms** | 81.0 ms |
+| One transaction of 1,000 upserts, half of them new | 36.4 ms | **22.6 ms** | 128 ms |
 
 ## Delete
 
 | Median time | TinyJoin | SQLite | PGlite |
 | --- | ---: | ---: | ---: |
-| One transaction of 1,000 DELETEs by primary key | 32.4 ms | **22.2 ms** | 122 ms |
-| One DELETE matching a LIKE pattern | 5.40 ms | 10.7 ms | **4.30 ms** |
-| One DELETE of 8,000 rows by indexed range | 7.50 ms | 11.5 ms | **6.10 ms** |
+| One transaction of 1,000 DELETEs by primary key | 33.3 ms | **21.5 ms** | 119 ms |
+| One DELETE matching a LIKE pattern | 5.70 ms | 10.0 ms | **4.20 ms** |
+| One DELETE of 8,000 rows by indexed range | 7.80 ms | 11.3 ms | **6.00 ms** |
 
 ## Schema
 
 | Median time | TinyJoin | SQLite | PGlite |
 | --- | ---: | ---: | ---: |
-| Create two indexes over 10,000 rows | **14.6 ms** | 21.7 ms | 15.6 ms |
+| Create two indexes over 10,000 rows | **13.7 ms** | 20.8 ms | 16.2 ms |
 
 ## What the results show
 
@@ -2675,24 +2675,24 @@ create a new database, where PGlite initializes a new PostgreSQL cluster, and
 to reopen one. It reads all 10,000 rows in order four times as fast as either
 engine, runs `LIKE` scans, `GROUP BY`, and joins faster than either, builds
 indexes and commits single inserts faster than either, and deletes rows in
-bulk faster than SQLite. Indexed range aggregates and point reads take as long
-as in the faster engine. Across the 20 timed workloads, it places like this,
-where engines that tie share a place:
+bulk faster than SQLite. Indexed range aggregates and point reads take at most
+3% longer than in the faster engine. Across the 20 timed workloads, it places
+like this, where engines that tie share a place:
 
 | Engine | Fastest | Second | Slowest |
 | --- | ---: | ---: | ---: |
-| TinyJoin | 10 | 10 | 0 |
-| SQLite | 9 | 5 | 6 |
+| TinyJoin | 8 | 12 | 0 |
+| SQLite | 10 | 4 | 6 |
 | PGlite | 2 | 4 | 14 |
 
-Where it comes second, it takes at most 1.5 times as long as the faster
+Where it comes second, it takes at most 1.6 times as long as the faster
 engine.
 
 - **Single statements** cost about 30 to 36 microseconds each, which is 1.0
-  to 1.5 times SQLite's cost for a point read, or an update, upsert, or delete
+  to 1.6 times SQLite's cost for a point read, or an update, upsert, or delete
   by primary key. About 14 microseconds of every round trip is the message
   between the page and the Worker, which every engine pays. A point read costs
-  as much as SQLite's, but a write in a transaction costs 9 to 11
+  about as much as SQLite's, but a write in a transaction costs 12 to 14
   microseconds more: in TinyJoin's Worker, in planning, checking, and staging
   the row, and in its share of the commit.
 - **Scans** take under a tenth longer than SQLite's. TinyJoin reads each
@@ -2701,15 +2701,16 @@ engine.
   range `UPDATE` inside a transaction also passes over the rows the
   transaction has already changed, finding them leaf by leaf, and takes about
   1.3 times as long as SQLite's.
-- **Inserts** one at a time take about 1.3 times as long as SQLite's, for
-  the same reasons as single statements, and 200 at a time about 3% longer.
-- **Bulk deletes** take about 1.2 to 1.3 times as long as PGlite's, which, like
+- **Inserts** one at a time take about 1.3 to 1.4 times as long as SQLite's,
+  for the same reasons as single statements, and 200 at a time about a tenth
+  longer.
+- **Bulk deletes** take about 1.3 to 1.4 times as long as PGlite's, which, like
   PostgreSQL, only marks deleted rows and leaves reclaiming their space to a
   later vacuum. TinyJoin removes each row and its index entries at once, and
   rewrites every page they occupied, and is still quicker than SQLite at both.
 - **Committing each insert alone** is dominated by the storage flush, one per
   commit, and writes only the pages the insert changed and the superblock. It
-  takes an eighth less time than PGlite's commits, and a quarter as long as
+  takes a tenth less time than PGlite's commits, and a quarter as long as
   SQLite's.
 - **Reopening** reads the database's catalog rather than every row, so a
   populated database reopens in under three-fifths of SQLite's time, and a
@@ -2752,7 +2753,7 @@ boundaries in full.
 
 | Engine | Package | Version | Storage |
 | --- | --- | --- | --- |
-| TinyJoin | `tinyjoin` | 0.3.0 | `opfs://` |
+| TinyJoin | `tinyjoin` | 0.4.0 | `opfs://` |
 | SQLite | `@sqlite.org/sqlite-wasm` | 3.53.4-build1 (3.53.4) | `opfs-sahpool` |
 | PGlite | `@electric-sql/pglite` | 0.5.8 (PostgreSQL 18.3) | `opfs-ahp://` |
 
