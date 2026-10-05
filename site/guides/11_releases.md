@@ -5,7 +5,7 @@ compatibility boundaries. Every entry states what upgrading to it requires, so
 check the entries between the version in use and the target before upgrading.
 A release that needs no action says so explicitly.
 
-## v0.5.0 (unreleased)
+## v0.5.0
 
 This release connects TinyJoin to the [Drizzle ORM](https://orm.drizzle.team)
 and the [Kysely](https://kysely.dev) query builder, and adds what they need: a
@@ -188,8 +188,8 @@ row out. Reading all 10,000 rows of the comparative benchmark takes two-fifths
 less time, and a point read by key about 3% less, for 1.2 KiB more of
 compressed engine.
 
-The compressed download is now {{sizes.total.gzip}}, up from 301 KiB in v0.4.0,
-for the engine's new SQL, foreign keys, and schema API. The Drizzle and Kysely
+The compressed download is now 339 KiB, up from 301 KiB in v0.4.0, for the
+engine's new SQL, foreign keys, and schema API. The Drizzle and Kysely
 entry points, and the libraries they connect, load only in an application that
 imports them.
 
