@@ -3146,8 +3146,11 @@ A release that needs no action says so explicitly.
 
 ## v0.5.0 (unreleased)
 
-This release accepts more of the ordinary SQL that hand-written statements and
-query builders use in the [SQL dialect](https://tinyjoin.org/guides/sql-compatibility/).
+This release connects TinyJoin to the [Drizzle ORM](https://orm.drizzle.team)
+and the [Kysely](https://kysely.dev) query builder, and adds what they need: a
+typed schema API, foreign keys, fuller `ALTER TABLE`, and more of the
+[SQL dialect](https://tinyjoin.org/guides/sql-compatibility/) that hand-written statements and
+query builders use. It also fixes two v0.4.0 bugs, and reads rows faster.
 
 **A database with a column declared `DEFAULT NULL` opens again.** v0.4.0 and
 earlier wrote such a column's default into a persistent database correctly, but
@@ -3166,6 +3169,82 @@ reported the table as corrupt. v0.5.0 refuses the statement with
 `CONSTRAINT_VIOLATION`, as v0.3.0 and PostgreSQL do. To repair a table that
 v0.4.0 left this way, give the column a value in every row, as in
 `UPDATE t SET c = 0 WHERE c IS NULL`, or drop its `NOT NULL`.
+
+The new `tinyjoin/drizzle` entry point connects the
+[Drizzle ORM](https://orm.drizzle.team) to a TinyJoin Client:
+`drizzle(client, {schema})` returns a Drizzle database whose queries run in
+TinyJoin's dialect, whose transactions are TinyJoin's callback transactions,
+and whose JSON columns store JSON values rather than JSON text. The application
+installs `drizzle-orm` 0.45 itself; TinyJoin declares it as an optional peer
+dependency and never bundles it, so the download sizes are unchanged. Its
+migrate() function applies the migrations that `drizzle-kit generate` writes,
+from SQL the application bundles, each atomically with the row that records
+it, so every tab can call it as it starts. Drizzle Kit's `push` and Drizzle's
+own migrators are not supported. See the [Drizzle guide](https://tinyjoin.org/guides/drizzle/).
+
+The new `tinyjoin/kysely` entry point connects the [Kysely](https://kysely.dev)
+query builder to a TinyJoin Client. Its TinyJoinDialect, constructed with
+`{client}`, is a Kysely dialect whose queries run in TinyJoin's dialect, whose
+transactions are TinyJoin's callback transactions, whose introspector reads
+getSchema(), and under which Kysely's Migrator runs, one tab at a time. The
+application installs `kysely` 0.28 or later itself; TinyJoin declares it as an
+optional peer dependency and never bundles it. See the
+[Kysely guide](https://tinyjoin.org/guides/kysely/).
+
+The new getSchema() method on the Client reads the database's tables, with
+their columns, primary keys, indexes, and foreign keys, as typed objects rather
+than through SQL catalog tables, which TinyJoin does not have. Each column
+carries its runtime type, whether it is nullable, any literal default, and any
+`VARCHAR` length. See
+[reading the schema](https://tinyjoin.org/guides/storage-and-lifecycle/#reading-the-schema).
+
+The new setSchema() method makes the database's tables match a schema in the
+shape getSchema() returns, in one atomic change: it creates what is missing,
+renames tables and columns from the names they had, changes defaults,
+nullability, and `VARCHAR` lengths, and makes each table's indexes the
+schema's, keeping every row, and drops what the schema leaves out only when
+asked. A schema the database already has changes nothing, and a schema version
+keeps a tab running older code from undoing newer changes. `tinyjoin/drizzle`
+adds push(), which sets a Drizzle schema this way, in place of migrations. See
+[setting the schema](https://tinyjoin.org/guides/storage-and-lifecycle/#setting-the-schema).
+
+**Foreign keys are enforced.** A column's `REFERENCES`, or a table's
+`FOREIGN KEY ... REFERENCES`, names the table and columns its values must be
+found in, unless one is `NULL`, and each key is checked as its statement ends,
+inside transactions too. Deleting or updating a referenced row does what the
+key's `ON DELETE` and `ON UPDATE` actions say: `NO ACTION` and `RESTRICT`
+refuse it, `CASCADE` deletes or updates the referencing rows in the same
+statement, and `SET NULL` and `SET DEFAULT` change their references. `ALTER
+TABLE` adds a key, checking every stored row, and drops one; renames follow
+into the keys; and dropping a table, column, or unique index a key needs takes
+`CASCADE`, which drops the key. getSchema() and setSchema() include each
+table's keys, and Drizzle's `.references()` pushes as one. See
+[foreign keys](https://tinyjoin.org/guides/sql-compatibility/#foreign-keys).
+
+`CREATE TABLE` accepts the constraints and spellings that schema tools write:
+a named primary key, as in `CONSTRAINT tags_pk PRIMARY KEY (post_id, tag)`;
+`UNIQUE` on a column or as a table constraint, which creates a unique index
+named as PostgreSQL would name it; a JSON default written as `'{}'::jsonb`; and
+`USING btree` on an index. `ALTER TABLE` can add and drop a unique constraint,
+and accepts `DISABLE ROW LEVEL SECURITY`, which changes nothing. `DROP TABLE`
+and `DROP INDEX` accept `CASCADE` and `RESTRICT`. Together these run the SQL
+that `drizzle-kit generate` writes for new tables.
+See [constraints and indexes](https://tinyjoin.org/guides/sql-compatibility/#constraints-and-indexes).
+
+`ALTER TABLE` can now also rename a table or a column, drop a column, set or
+drop a column's default, and set or drop `NOT NULL`, and accepts a column type
+that restates the runtime type it has, as `bigint` does for `integer`. Existing
+rows keep their values: dropping a column, changing a default, and setting
+`NOT NULL` rewrite the table's rows, and `SET NOT NULL` fails, changing nothing,
+while a row holds `NULL`. A dropped column takes every index on it with it, as
+in PostgreSQL, and indexes follow renamed columns and tables.
+
+A `VARCHAR(n)` or `CHARACTER VARYING(n)` column holds at most `n` characters,
+and a longer value fails with `CONSTRAINT_VIOLATION`, as in PostgreSQL, except
+that TinyJoin also refuses a value whose excess is spaces, which PostgreSQL
+would trim. `n` was previously rejected, so schemas that ORMs and migration
+tools write with lengths, such as Drizzle's `varchar({length})` and Kysely's
+migration tables, now run. getSchema() reports the length as `maxLength`.
 
 A statement over one table can qualify its columns with the table's name, as a
 join already could: `SELECT tasks.id FROM tasks WHERE tasks.done = false ORDER
@@ -3194,10 +3273,10 @@ from the row it updates, so a counter no longer needs a read before its write:
 `UPDATE counters SET hits = hits + 1 WHERE id = $1`. An expression combines
 columns, literals, and parameters with `+`, `-`, `*`, `/`, `%`, unary `-`, and
 `||`. Integers stay within the JavaScript-safe range and divide by truncating,
-floats must stay finite and take no `%`, and there are no implicit casts. In an upsert, the
-stored row's columns are named with the table's name and the proposed row's
-with `EXCLUDED`, as in `SET hits = counters.hits + EXCLUDED.hits`. Types are
-checked before any row is read.
+floats must stay finite and take no `%`, and there are no implicit casts. In an
+upsert, the stored row's columns are named with the table's name and the
+proposed row's with `EXCLUDED`, as in `SET hits = counters.hits +
+EXCLUDED.hits`. Types are checked before any row is read.
 
 Either side of a `WHERE` comparison can now be an expression too, so a query
 can compare two columns, as in `WHERE updated > created`, or a value worked out
@@ -3236,109 +3315,38 @@ relational queries with `with`, and Kysely's `jsonArrayFrom` and
 `jsonObjectFrom`, run this way. See
 [nested queries](https://tinyjoin.org/guides/sql-compatibility/#nested-queries).
 
-The new `tinyjoin/drizzle` entry point connects the
-[Drizzle ORM](https://orm.drizzle.team) to a TinyJoin Client:
-`drizzle(client, {schema})` returns a Drizzle database whose queries run in
-TinyJoin's dialect, whose transactions are TinyJoin's callback transactions,
-and whose JSON columns store JSON values rather than JSON text. The application
-installs `drizzle-orm` 0.45 or later itself; TinyJoin declares it as an
-optional peer dependency and never bundles it, so the download sizes are
-unchanged. Its migrate() function applies the migrations that
-`drizzle-kit generate` writes, from SQL the application bundles, each
-atomically with the row that records it, so every tab can call it as it
-starts. Drizzle Kit's `push` and Drizzle's own migrators are not supported. See the [Drizzle guide](https://tinyjoin.org/guides/drizzle/).
-
-The new `tinyjoin/kysely` entry point connects the [Kysely](https://kysely.dev)
-query builder to a TinyJoin Client. Its TinyJoinDialect, constructed with
-`{client}`, is a Kysely dialect whose queries run in TinyJoin's dialect, whose transactions are
-TinyJoin's callback transactions, whose introspector reads getSchema(), and
-under which Kysely's Migrator runs, one tab at a time. The application installs
-`kysely` 0.28 or later itself; TinyJoin declares it as an optional peer
-dependency and never bundles it. See the [Kysely guide](https://tinyjoin.org/guides/kysely/).
-
-`CREATE TABLE` accepts the constraints and spellings that schema tools write:
-a named primary key, as in `CONSTRAINT tags_pk PRIMARY KEY (post_id, tag)`;
-`UNIQUE` on a column or as a table constraint, which creates a unique index
-named as PostgreSQL would name it; a JSON default written as `'{}'::jsonb`; and
-`USING btree` on an index. `ALTER TABLE` can add and drop a unique constraint,
-and accepts `DISABLE ROW LEVEL SECURITY`, which changes nothing. `DROP TABLE`
-and `DROP INDEX` accept `CASCADE` and `RESTRICT`. Together these run the SQL
-that `drizzle-kit generate` writes for new tables.
-See [constraints and indexes](https://tinyjoin.org/guides/sql-compatibility/#constraints-and-indexes).
-
-**Foreign keys are enforced.** A column's `REFERENCES`, or a table's
-`FOREIGN KEY ... REFERENCES`, names the table and columns its values must be
-found in, unless one is `NULL`, and each key is checked as its statement ends,
-inside transactions too. Deleting or updating a referenced row does what the
-key's `ON DELETE` and `ON UPDATE` actions say: `NO ACTION` and `RESTRICT`
-refuse it, `CASCADE` deletes or updates the referencing rows in the same
-statement, and `SET NULL` and `SET DEFAULT` change their references. `ALTER
-TABLE` adds a key, checking every stored row, and drops one; renames follow
-into the keys; and dropping a table, column, or unique index a key needs takes
-`CASCADE`, which drops the key. getSchema() and setSchema() include each
-table's keys, and Drizzle's `.references()` pushes as one. See
-[foreign keys](https://tinyjoin.org/guides/sql-compatibility/#foreign-keys).
-
-A `VARCHAR(n)` or `CHARACTER VARYING(n)` column holds at most `n` characters,
-and a longer value fails with `CONSTRAINT_VIOLATION`, as in PostgreSQL, except
-that TinyJoin also refuses a value whose excess is spaces, which PostgreSQL
-would trim. `n` was previously rejected, so schemas that ORMs and migration
-tools write with lengths, such as Drizzle's `varchar({length})` and Kysely's
-migration tables, now run. getSchema() reports the length as `maxLength`.
-
-`ALTER TABLE` can now also rename a table or a column, drop a column, set or
-drop a column's default, and set or drop `NOT NULL`, and accepts a column type
-that restates the runtime type it has, as `bigint` does for `integer`. Existing
-rows keep their values: dropping a column, changing a default, and setting
-`NOT NULL` rewrite the table's rows, and `SET NOT NULL` fails, changing nothing,
-while a row holds `NULL`. A dropped column takes every index on it with it, as
-in PostgreSQL, and indexes follow renamed columns and tables.
-
-The new setSchema() method makes the database's tables match a schema in the
-shape getSchema() returns, in one atomic change: it creates what is missing,
-renames tables and columns from the names they had, changes defaults,
-nullability, and `VARCHAR` lengths, and makes each table's indexes the
-schema's, keeping every row, and drops what the schema leaves out only when
-asked. A schema the database already has changes nothing, and a schema version
-keeps a tab running older code from undoing newer changes. `tinyjoin/drizzle`
-adds push(), which sets a Drizzle schema this way, in place of migrations. See
-[setting the schema](https://tinyjoin.org/guides/storage-and-lifecycle/#setting-the-schema).
-
-The new getSchema() method on the Client reads the database's tables, with
-their columns, primary keys, and indexes, as typed objects rather than through
-SQL catalog tables, which TinyJoin does not have. Each column carries its
-runtime type, whether it is nullable, and any literal default. See
-[reading the schema](https://tinyjoin.org/guides/storage-and-lifecycle/#reading-the-schema).
-
 The warm-up Worker that create() starts runs its loops three-quarters as long,
 and so finishes sooner. It was still running while a database ran its first
 statements, and slowed them: in the comparative benchmark, timed workloads now
 run about 5% faster overall, point reads about 8% faster, and indexed range
 aggregates about a fifth faster.
 
-A single-table `SELECT` whose rows arrive in key order now hands them to the
-Worker as their values in field order, rather than first building each row as
-an object of values under their names, which the Worker then wrote out in
-field order anyway. Reading all 10,000 rows of the comparative benchmark takes
-two-fifths less time, and a point read by key about 3% less, for 1.2 KiB more
-of compressed engine.
+A single-table `SELECT` whose rows arrive in key order no longer builds each
+row as an object of its values under their names before the Worker writes the
+row out. Reading all 10,000 rows of the comparative benchmark takes two-fifths
+less time, and a point read by key about 3% less, for 1.2 KiB more of
+compressed engine.
+
+The compressed download is now 339 KiB, up from 301 KiB in v0.4.0,
+for the engine's new SQL, foreign keys, and schema API. The Drizzle and Kysely
+entry points, and the libraries they connect, load only in an application that
+imports them.
 
 **Upgrading from v0.4.0 needs no action.** Install, rebuild, and redeploy. The
 page format stays at format 3, so an existing database opens with no migration
-and no OPFS namespace change. A database that holds a `VARCHAR(n)` column, or
-a schema version from setSchema(), or a foreign key, cannot be opened by v0.4.0, which reports
-its catalog as corrupt, so do not roll back past v0.5.0 once a database uses
-either. The Worker protocol moves from
-version 10 to 11
-for the schema request. Client and Worker ship together and are upgraded
-together by a normal install, so this affects only a deployment that pins or
-caches a Worker file independently of the client bundle, where a mismatched
-pair fails cleanly with `PROTOCOL_MISMATCH`. The
-new syntax was previously rejected, so statements that already worked keep
-their meaning, with one exception: where a table has a column whose quoted name
-begins with the table's own name and a dot, such as `"extra.value"` in a table
-named `extra`, an unquoted `extra.value` in `WHERE` used to read that column
-and now reads the table's `value` column. Quote the name to read it.
+and no OPFS namespace change. A database that holds a `VARCHAR(n)` column, a
+schema version from setSchema(), or a foreign key cannot be opened by v0.4.0,
+which reports its catalog as corrupt, so do not roll back past v0.5.0 once a
+database holds any of them. The Worker protocol moves from version 10 to 11 for
+the schema request. Client and Worker ship together and are upgraded together
+by a normal install, so this affects only a deployment that pins or caches a
+Worker file independently of the client bundle, where a mismatched pair fails
+cleanly with `PROTOCOL_MISMATCH`. The new syntax was previously rejected, so
+statements that already worked keep their meaning, with one exception: where a
+table has a column whose quoted name begins with the table's own name and a
+dot, such as `"extra.value"` in a table named `extra`, an unquoted
+`extra.value` in `WHERE` used to read that column and now reads the table's
+`value` column. Quote the name to read it.
 
 ## v0.4.0
 
@@ -3519,7 +3527,7 @@ quicker than in either.
   longer wait for their code to compile. See
   [custom Workers](https://tinyjoin.org/guides/custom-workers/).
 
-The compressed download is now 339 KiB, up from 295 KiB in v0.3.0.
+The compressed download is now 301 KiB, up from 295 KiB in v0.3.0.
 
 ## v0.3.0
 
