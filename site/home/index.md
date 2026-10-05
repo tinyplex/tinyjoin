@@ -158,6 +158,26 @@ const openTasks = await db.prepare<{
 const {rows} = await openTasks.execute([false]);
 ```
 
+> ## Or bring a query builder
+>
+> The Drizzle ORM and the Kysely query builder run on the same Client. push()
+> makes the database hold a Drizzle schema as the app starts, in one atomic
+> change that keeps every row.
+
+```ts
+import {drizzle, push} from 'tinyjoin/drizzle';
+import {eq} from 'drizzle-orm';
+import * as schema from './schema';
+
+const orm = drizzle(db, {schema});
+await push(orm, schema);
+
+const open = await orm
+  .select()
+  .from(schema.tasks)
+  .where(eq(schema.tasks.done, false));
+```
+
 > ## Let the view follow the data
 >
 > subscribe() reports which tables changed, so a UI can re-query instead of

@@ -92,6 +92,22 @@ const openTasks = await db.prepare<{
 const {rows} = await openTasks.execute([false]);
 ```
 
+<section><h2 id="or-bring-a-query-builder">Or bring a query builder</h2><p>The <a href="https://tinyjoin.org/guides/drizzle/">Drizzle</a> ORM and the <a href="https://tinyjoin.org/guides/kysely/">Kysely</a> query builder run on the same <a href="https://tinyjoin.org/api/tinyjoin/classes/lifecycle/client/"><code>Client</code></a>. <a href="https://tinyjoin.org/api/drizzle/functions/push/push/"><code>push</code></a>() makes the database hold a <a href="https://tinyjoin.org/guides/drizzle/">Drizzle</a> schema as the app starts, in one atomic change that keeps every row.</p></section>
+
+```ts
+import {drizzle, push} from 'tinyjoin/drizzle';
+import {eq} from 'drizzle-orm';
+import * as schema from './schema';
+
+const orm = drizzle(db, {schema});
+await push(orm, schema);
+
+const open = await orm
+  .select()
+  .from(schema.tasks)
+  .where(eq(schema.tasks.done, false));
+```
+
 <section><h2 id="let-the-view-follow-the-data">Let the view follow the data</h2><p><a href="https://tinyjoin.org/api/tinyjoin/classes/lifecycle/client/methods/subscriptions/subscribe/"><code>subscribe</code></a>() reports which tables changed, so a UI can re-query instead of being told what to redraw by every writer. <a href="https://tinyjoin.org/api/tinyjoin/classes/lifecycle/client/methods/lifecycle/close/"><code>close</code></a>() then releases statements, storage, and the Worker.</p></section>
 
 ```ts
