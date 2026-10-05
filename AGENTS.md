@@ -48,7 +48,9 @@ Do not add a Worker entry, WASM plugin, or runtime copying step unless the
 application has an explicit custom-Worker requirement.
 
 Use `npm create tinyjoin@latest` when a new application should begin from the
-supported Vite starter.
+supported Vite starter. In a `--non-interactive` run, `--queries drizzle` or
+`--queries kysely` starts it with Drizzle or Kysely rather than SQL, and
+`--list-options` prints every option.
 
 For an in-memory database in Node.js 22 or later, import create from
 `tinyjoin/node`. It returns the same Client API and owns its Worker thread and

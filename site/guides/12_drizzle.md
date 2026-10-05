@@ -11,9 +11,14 @@ Drizzle's query builder works, and some of it does not. This guide says which.
 
 ## Get started
 
-Install TinyJoin and Drizzle. TinyJoin declares `drizzle-orm` 0.45 or later as
-an optional peer dependency, so an application that does not use Drizzle never
-installs it.
+To begin a new application with Drizzle, run `npm create tinyjoin@latest` and
+choose the Drizzle ORM for its queries. Its todo starter declares its table as
+a Drizzle schema, pushes the schema as each tab starts, and reads and writes
+the table through Drizzle.
+
+Otherwise, install TinyJoin and Drizzle. TinyJoin declares `drizzle-orm` 0.45
+or later as an optional peer dependency, so an application that does not use
+Drizzle never installs it.
 
 ```sh
 npm install tinyjoin drizzle-orm

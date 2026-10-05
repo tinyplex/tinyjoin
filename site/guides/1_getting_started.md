@@ -23,7 +23,9 @@ starter. Its production build includes [offline loading](/guides/offline/).
 npm create tinyjoin@latest
 ```
 
-Follow the prompts to choose JavaScript or TypeScript and how to store your data.
+Follow the prompts to choose JavaScript or TypeScript; SQL, the
+[Drizzle](/guides/drizzle/) ORM, or the [Kysely](/guides/kysely/) query builder
+for its queries; and how to store your data.
 
 ## Open a database
 
