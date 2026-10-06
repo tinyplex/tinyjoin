@@ -363,6 +363,7 @@ impl Btree {
     }
 
     /// Opens a detached cursor at the first key in a committed tree.
+    #[cfg(test)]
     pub(crate) fn cursor<D: PageDevice>(
         pager: &mut Pager<D>,
         root_page_id: PageId,
@@ -709,12 +710,9 @@ impl BtreeCursor {
 
     /// Moves on to the next leaf holding entries the cursor has not returned, unless the current
     /// one still holds some, and reports whether there is one. Its entries are then taken with
-    /// [`Self::next_in_leaf`]. The cursor's view is checked here, once for a leaf's entries, so
-    /// whoever takes them must not change the tree in between, as a visitor of rows cannot.
-    pub(crate) fn next_leaf<D: PageDevice>(&mut self, pager: &mut Pager<D>) -> Result<bool> {
-        self.next_leaf_from(pager)
-    }
-
+    /// [`Self::next_in_leaf`], or read in place from [`Self::leaf`]. The cursor's view is checked
+    /// here, once for a leaf's entries, so whoever takes them must not change the tree in between,
+    /// as a visitor of rows cannot.
     pub(crate) fn next_leaf_from(&mut self, reader: &mut dyn BtreeReadView) -> Result<bool> {
         if self.finished {
             return Ok(false);
@@ -736,7 +734,7 @@ impl BtreeCursor {
         }
     }
 
-    /// The next entry of the leaf [`Self::next_leaf`] moved to, or `None` once it holds no more.
+    /// The next entry of the leaf [`Self::next_leaf_from`] moved to, or `None` once it holds no more.
     /// The key and an inline value are slices of the cursor's copy of the leaf, so only a value
     /// held in an overflow chain needs pages read, which `read` reads.
     pub(crate) fn next_in_leaf(
@@ -757,7 +755,7 @@ impl BtreeCursor {
         Ok(Some(entry))
     }
 
-    /// The leaf [`Self::next_leaf`] moved to, and the index of the first entry the cursor has not
+    /// The leaf [`Self::next_leaf_from`] moved to, and the index of the first entry the cursor has not
     /// returned, for a loop that reads the leaf's entries in place, moving forward, and then
     /// [passes them](Self::skip_to). `None` before the first leaf or after the last.
     pub(crate) fn leaf(&self) -> Option<(&NodeView<'static>, usize)> {
@@ -765,7 +763,7 @@ impl BtreeCursor {
         self.leaf.as_ref().map(|leaf| (leaf, self.leaf_index))
     }
 
-    /// Marks the current leaf's entries before `index` as returned, so that [`Self::next_leaf`]
+    /// Marks the current leaf's entries before `index` as returned, so that [`Self::next_leaf_from`]
     /// moves on once `index` is the leaf's length.
     pub(crate) fn skip_to(&mut self, index: usize) {
         debug_assert!(!self.backward);
@@ -788,13 +786,7 @@ impl BtreeCursor {
         read_cell(leaf, self.tree_id, self.view.generation(), index, read)
     }
 
-    /// The index, in the leaf [`Self::next_leaf`] moved to, of the entry [`Self::next_in_leaf`]
-    /// returns next, moving forward.
-    pub(crate) fn leaf_position(&self) -> usize {
-        self.leaf_index
-    }
-
-    /// Finds which of `keys`, in ascending order, the leaf [`Self::next_leaf`] moved to holds at or
+    /// Finds which of `keys`, in ascending order, the leaf [`Self::next_leaf_from`] moved to holds at or
     /// after the cursor, moving forward, and puts their indexes in `positions`. Each key at or
     /// below the leaf's last is taken from `keys`, since no later leaf can hold it.
     pub(crate) fn leaf_positions(
@@ -1219,15 +1211,23 @@ impl<'a> NodeView<'a> {
     #[inline(always)]
     pub(crate) fn inline_leaf_cell(&self, index: usize) -> Option<(&[u8], &[u8])> {
         let bytes = &*self.bytes;
-        let offset = self.cell_offset(index).ok()?;
+        if index >= self.item_count {
+            return None;
+        }
+        let offset = read_u16(bytes, NODE_HEADER_SIZE + index * SLOT_SIZE) as usize;
         let header_end = offset + LEAF_CELL_HEADER_SIZE;
-        if header_end > bytes.len() || read_u16(bytes, offset + 2) != INLINE_CELL_FLAGS {
+        if offset < self.free_end
+            || header_end > bytes.len()
+            || read_u16(bytes, offset + 2) != INLINE_CELL_FLAGS
+        {
             return None;
         }
         let key_end = header_end + read_u16(bytes, offset) as usize;
-        let value_end = key_end.checked_add(read_u32(bytes, offset + 4) as usize)?;
-        (value_end <= bytes.len())
-            .then(|| (&bytes[header_end..key_end], &bytes[key_end..value_end]))
+        let value_end = key_end + read_u32(bytes, offset + 4) as usize;
+        if value_end > bytes.len() || value_end < key_end {
+            return None;
+        }
+        Some((&bytes[header_end..key_end], &bytes[key_end..value_end]))
     }
 
     /// The key of leaf cell `index`, reading only the key: binary searches read many keys and
@@ -3664,8 +3664,11 @@ fn validate_child_generation(
     Ok(())
 }
 
+/// Reads a little-endian number byte by byte, compiled into its caller: a scan reads several for
+/// every row, and a copy of a slice into an array would be a call.
+#[inline(always)]
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes(bytes[offset..offset + 2].try_into().expect("bounded u16"))
+    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
 }
 
 /// Writes `value` at `offset` as one store of its size, where copying it from a slice would call
@@ -3675,8 +3678,14 @@ fn put<const N: usize>(bytes: &mut [u8], offset: usize, value: [u8; N]) {
     *<&mut [u8; N]>::try_from(&mut bytes[offset..offset + N]).expect("bounded write") = value;
 }
 
+#[inline(always)]
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("bounded u32"))
+    u32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
 }
 
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {

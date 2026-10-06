@@ -31,6 +31,7 @@ use crate::{
         encode_record_index_prefix, encode_secondary_index_prefix, index_column_positions,
         index_entry_primary_key, leading_key_component, secondary_index_entry_matches_prefix,
         secondary_index_primary_key, secondary_index_primary_key_for_definition,
+        stored_record_passes,
     },
     query::Filter,
     row::{HeldRow, RowRef, ValueRef},
@@ -150,56 +151,57 @@ impl TreeReader<'_> {
         };
         let key_type = table.leading_key_type();
         let work = self.work;
-        let tests = filter.map_or(&[][..], Filter::record_tests);
-        let decided = filter.is_none_or(Filter::decided_by_tests);
         // Rows are read from the cursor's copy of each leaf, so the pages are borrowed only to move
         // between leaves, or to read a value that overflows, and the visitor can read them too.
         let mut read = |page_id: PageId| self.pages.borrow_mut().read_btree_page(page_id);
-        // One row's visit: whether the scan is over, or `None` to go on. A row past the range ends
-        // the scan without being charged; any other is charged, tested, and presented if accepted.
-        let mut visit = |key: &[u8], value: &[u8], examined: &mut usize| {
-            if let Some(range) = range
-                && !range.contains(leading_key_component(key, key_type)?)
-            {
-                return Ok(Some(VisitOutcome::Complete));
-            }
-            if let Some(work) = work {
-                charge_operations(work, 1)?;
-            }
-            *examined += 1;
-            let record = table.record(key, value)?;
-            match record.passes(tests) {
-                Some(false) => return Ok(None),
-                Some(true) if decided => {}
-                _ => {
-                    if let Some(filter) = filter
-                        && !filter.matches(&RowRef::record(record))?
-                    {
-                        return Ok(None);
-                    }
-                }
-            }
-            Ok((visitor(&RowRef::record(record))? == VisitControl::Stop)
-                .then_some(VisitOutcome::Stopped))
-        };
         if order == KeyOrder::Descending {
-            // Backward, a row at a time: no scan reads a table backward and passes rows over.
+            // Backward, a row at a time, each judged by the filter: no scan reads a table backward
+            // and passes rows over, and few read one backward at all.
             debug_assert!(except.is_empty());
             while cursor.next_leaf_from(&mut *self.pages.borrow_mut())? {
                 while let Some((key, value)) = cursor.next_in_leaf(&mut read)? {
-                    let mut examined = 0;
-                    let outcome = visit(key, &value, &mut examined)?;
-                    scanned(examined)?;
-                    if let Some(outcome) = outcome {
-                        return Ok(outcome);
+                    if let Some(range) = range
+                        && !range.contains(leading_key_component(key, key_type)?)
+                    {
+                        return Ok(VisitOutcome::Complete);
+                    }
+                    if let Some(work) = work {
+                        charge_operations(work, 1)?;
+                    }
+                    scanned(1)?;
+                    let row = RowRef::record(table.record(key, &value)?);
+                    if let Some(filter) = filter
+                        && !filter.matches(&row)?
+                    {
+                        continue;
+                    }
+                    if visitor(&row)? == VisitControl::Stop {
+                        return Ok(VisitOutcome::Stopped);
                     }
                 }
             }
             return Ok(VisitOutcome::Complete);
         }
+        // The filter's tests of stored columns, which each leaf's cells are tested with in one pass
+        // that reads their bytes and calls nothing. A test of a primary-key column, and a filter
+        // its tests do not decide, leave the filter to judge each row the pass accepts.
+        let tests = filter.map_or(&[][..], Filter::record_tests);
+        let mut stored_tests = Vec::with_capacity(tests.len());
+        let mut judged = !filter.is_none_or(Filter::decided_by_tests);
+        for test in tests {
+            match table.layout().stored_test(&table.schema, test) {
+                Some(test) => stored_tests.push(test),
+                None => judged = true,
+            }
+        }
+        // The entries of a leaf the pass accepts, each flagged when the filter must still judge it:
+        // one whose value overflows the leaf, or whose record the pass could not read, which
+        // presenting the row reports.
+        const JUDGE: u32 = 1 << 31;
+        let mut accepted: Vec<u32> = Vec::new();
         let mut positions = Vec::new();
         while cursor.next_leaf_from(&mut *self.pages.borrow_mut())? {
-            let Some((leaf, mut index)) = cursor.leaf() else {
+            let Some((leaf, start)) = cursor.leaf() else {
                 break;
             };
             let count = leaf.len();
@@ -208,30 +210,69 @@ impl TreeReader<'_> {
             } else {
                 cursor.leaf_positions(&mut except, &mut positions)?;
             }
-            let (mut skipped, mut examined, mut outcome) = (0, 0, None);
-            while index < count && outcome.is_none() {
-                let position = index;
-                index += 1;
-                if positions.get(skipped) == Some(&position) {
-                    // A row passed over is charged to the work, which bounds the rows read.
-                    if let Some(work) = work {
-                        charge_operations(work, 1)?;
-                    }
+            accepted.clear();
+            accepted.reserve(count - start);
+            let (mut skipped, mut examined, mut ended) = (0, 0, false);
+            let mut skip = positions.first().copied().unwrap_or(usize::MAX);
+            for position in start..count {
+                if position == skip {
                     skipped += 1;
+                    skip = positions.get(skipped).copied().unwrap_or(usize::MAX);
                     continue;
                 }
-                // Nearly every cell holds its value inline; any other is read through the pager.
-                outcome = match leaf.inline_leaf_cell(position) {
-                    Some((key, value)) => visit(key, value, &mut examined)?,
-                    None => {
-                        let (key, value) = cursor.cell_at(position, &mut read)?;
-                        visit(key, &value, &mut examined)?
+                let passes = match leaf.inline_leaf_cell(position) {
+                    Some((key, value)) => {
+                        if let Some(range) = range
+                            && !range.contains(leading_key_component(key, key_type)?)
+                        {
+                            ended = true;
+                            break;
+                        }
+                        stored_record_passes(value, &stored_tests)
                     }
+                    None => None,
                 };
+                examined += 1;
+                match passes {
+                    Some(false) => {}
+                    Some(true) => accepted.push(position as u32),
+                    None => accepted.push(position as u32 | JUDGE),
+                }
+            }
+            // Every row read is charged, passed over or not, before any of the leaf's rows is
+            // presented, so that a scan over its budget presents none past it.
+            if let Some(work) = work {
+                charge_operations(work, examined + skipped)?;
             }
             scanned(examined)?;
-            if let Some(outcome) = outcome {
-                return Ok(outcome);
+            for &entry in &accepted {
+                let position = (entry & !JUDGE) as usize;
+                let cell;
+                let (key, value): (&[u8], &[u8]) = match leaf.inline_leaf_cell(position) {
+                    Some(cell) => cell,
+                    None => {
+                        cell = cursor.cell_at(position, &mut read)?;
+                        if let Some(range) = range
+                            && !range.contains(leading_key_component(cell.0, key_type)?)
+                        {
+                            return Ok(VisitOutcome::Complete);
+                        }
+                        (cell.0, &cell.1)
+                    }
+                };
+                let row = RowRef::record(table.record(key, value)?);
+                if (judged || entry & JUDGE != 0)
+                    && let Some(filter) = filter
+                    && !filter.matches(&row)?
+                {
+                    continue;
+                }
+                if visitor(&row)? == VisitControl::Stop {
+                    return Ok(VisitOutcome::Stopped);
+                }
+            }
+            if ended {
+                return Ok(VisitOutcome::Complete);
             }
             cursor.skip_to(count);
         }

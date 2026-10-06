@@ -4,7 +4,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::model::CatalogModel;
-use crate::query::RecordTest;
+use crate::query::{LikePattern, RecordTest};
 use crate::row::ValueRef;
 use crate::{
     ColumnType, EngineError, FIRST_DATA_PAGE_ID, IndexDefinition, MAX_PAGE_COUNT, PageId, Result,
@@ -645,10 +645,237 @@ enum ColumnSlot {
     Stored(usize),
 }
 
+/// A [`RecordTest`] resolved to the position of its column in a table's stored records, which a
+/// scan applies to each record's bytes. A test of a primary-key column, which the record does
+/// not hold, is left to the filter.
+pub(crate) enum StoredTest<'a> {
+    IntegerRange {
+        position: usize,
+        low: i64,
+        high: i64,
+        default: bool,
+    },
+    Like {
+        position: usize,
+        pattern: &'a LikePattern,
+        default: bool,
+    },
+    TextEquals {
+        position: usize,
+        text: &'a [u8],
+        default: bool,
+    },
+    IsNull {
+        position: usize,
+        negated: bool,
+        /// Whether a record that omits the column, holding its default, passes.
+        default: bool,
+    },
+}
+
+impl StoredTest<'_> {
+    /// The tested column's position in the record, and whether a record that omits the column
+    /// passes.
+    fn position(&self) -> (usize, bool) {
+        match *self {
+            Self::IntegerRange {
+                position, default, ..
+            }
+            | Self::Like {
+                position, default, ..
+            }
+            | Self::TextEquals {
+                position, default, ..
+            }
+            | Self::IsNull {
+                position, default, ..
+            } => (position, default),
+        }
+    }
+}
+
+/// Whether the record `value` passes every one of `tests`, read from its bytes alone, or `None`
+/// when the record or a tested value cannot be read, which reading the row reports. A `NULL`
+/// passes only `IS NULL`, and a record that omits a column holds the column's default.
+///
+/// Compiled into the scan that calls it for every row, with every step in the open: the record's
+/// header is read once, and each test reads its column's bounds and bytes from it.
+#[inline(always)]
+pub(crate) fn stored_record_passes(value: &[u8], tests: &[StoredTest<'_>]) -> Option<bool> {
+    let [flags, count, ..] = *value else {
+        return None;
+    };
+    if flags & RECORD_RESERVED != 0 || flags & RECORD_OFFSET_WIDTH == 3 {
+        return None;
+    }
+    let count = count as usize;
+    let width = 1_usize << (flags & RECORD_OFFSET_WIDTH);
+    let has_nulls = flags & RECORD_HAS_NULLS != 0;
+    let bitmap_bytes = if has_nulls { count.div_ceil(8) } else { 0 };
+    let offsets_start = RECORD_HEADER_BYTES + bitmap_bytes;
+    let data_start = offsets_start + count.saturating_sub(1) * width;
+    if data_start > value.len() {
+        return None;
+    }
+    let data_len = value.len() - data_start;
+    for test in tests {
+        let (position, default) = test.position();
+        if position >= count {
+            if default {
+                continue;
+            }
+            return Some(false);
+        }
+        let null = has_nulls
+            && value[RECORD_HEADER_BYTES + position / 8] & (1 << (position % 8)) != 0;
+        if let StoredTest::IsNull { negated, .. } = test {
+            if null ^ negated {
+                continue;
+            }
+            return Some(false);
+        }
+        // Where the column's bytes start and stop within the data: nearly every record's offsets
+        // are single bytes, read here; wider ones are read apart.
+        let (start, stop) = if width == 1 {
+            let at = offsets_start + position;
+            (
+                if position == 0 {
+                    0
+                } else {
+                    usize::from(value[at - 1])
+                },
+                if position + 1 == count {
+                    data_len
+                } else {
+                    usize::from(value[at])
+                },
+            )
+        } else {
+            wide_column_bounds(value, offsets_start, width, count, data_len, position)
+        };
+        if stop < start || stop > data_len {
+            return None;
+        }
+        let bytes = &value[data_start + start..data_start + stop];
+        if null {
+            // A NULL holds no bytes; one that does is corrupt, which reading the row reports.
+            return if bytes.is_empty() { Some(false) } else { None };
+        }
+        let passes = match *test {
+            StoredTest::IntegerRange { low, high, .. } => {
+                let value = short_integer_value(bytes)?;
+                low <= value && value <= high
+            }
+            StoredTest::Like { pattern, .. } => match pattern.matches_bytes(bytes) {
+                Some(matched) => matched,
+                None => pattern.matches(std::str::from_utf8(bytes).ok()?),
+            },
+            StoredTest::TextEquals { text, .. } => bytes == text,
+            StoredTest::IsNull { .. } => unreachable!("IS NULL was decided above"),
+        };
+        if !passes {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+/// Where the stored column at `position` starts and stops within a record's data, for a record
+/// whose offsets are `width` bytes wide, as [`stored_record_passes`] reads them.
+#[inline(never)]
+fn wide_column_bounds(
+    value: &[u8],
+    offsets_start: usize,
+    width: usize,
+    count: usize,
+    data_len: usize,
+    position: usize,
+) -> (usize, usize) {
+    let end = |position: usize| -> usize {
+        if position + 1 == count {
+            return data_len;
+        }
+        let at = offsets_start + position * width;
+        match width {
+            2 => usize::from(u16::from_le_bytes([value[at], value[at + 1]])),
+            _ => u32::from_le_bytes([value[at], value[at + 1], value[at + 2], value[at + 3]])
+                as usize,
+        }
+    };
+    (if position == 0 { 0 } else { end(position - 1) }, end(position))
+}
+
+/// [`integer_value`] with the shortest encodings, which hold nearly every stored integer, decoded
+/// in one step each, for the scan that tests every row's integers.
+#[inline(always)]
+fn short_integer_value(bytes: &[u8]) -> Option<i64> {
+    Some(match *bytes {
+        [] => 0,
+        [a] => i64::from(a as i8),
+        [a, b] => i64::from(i16::from_le_bytes([a, b])),
+        [a, b, c] => i64::from(i32::from_le_bytes([a, b, c, 0]) << 8 >> 8),
+        [a, b, c, d] => i64::from(i32::from_le_bytes([a, b, c, d])),
+        _ => return integer_value(bytes),
+    })
+}
+
 impl RecordLayout {
     /// The type of each primary-key column, in key order.
     pub(crate) fn key_types(&self) -> &[ColumnType] {
         &self.key_types
+    }
+
+    /// `test` resolved to its column's position in stored records, or `None` for a primary-key
+    /// column, which the record does not hold.
+    pub(crate) fn stored_test<'a>(
+        &self,
+        schema: &TableDefinition,
+        test: &'a RecordTest,
+    ) -> Option<StoredTest<'a>> {
+        let stored = |column: usize| match self.slots[column] {
+            ColumnSlot::Stored(position) => Some(position),
+            ColumnSlot::Key(_) => None,
+        };
+        Some(match test {
+            RecordTest::IntegerRange {
+                column,
+                low,
+                high,
+                default,
+            } => StoredTest::IntegerRange {
+                position: stored(*column)?,
+                low: *low,
+                high: *high,
+                default: *default,
+            },
+            RecordTest::Like {
+                column,
+                pattern,
+                default,
+            } => StoredTest::Like {
+                position: stored(*column)?,
+                pattern,
+                default: *default,
+            },
+            RecordTest::TextEquals {
+                column,
+                text,
+                default,
+            } => StoredTest::TextEquals {
+                position: stored(*column)?,
+                text: text.as_bytes(),
+                default: *default,
+            },
+            RecordTest::IsNull { column, negated } => StoredTest::IsNull {
+                position: stored(*column)?,
+                negated: *negated,
+                default: schema.columns[*column]
+                    .default
+                    .as_ref()
+                    .is_none_or(Value::is_null)
+                    ^ negated,
+            },
+        })
     }
 
     pub(crate) fn new(schema: &TableDefinition) -> Result<Self> {
@@ -829,102 +1056,6 @@ impl<'a> StoredRecord<'a> {
     /// A copy of the entry, its key and record, to read in place again later.
     pub(crate) fn to_entry(self) -> StoredEntry {
         StoredEntry::new(self.key, self.value)
-    }
-
-    /// Whether the row passes every one of `tests`, read from the record's bytes without decoding
-    /// the row, or `None` when a tested value cannot be read, which reading the column reports.
-    #[inline(always)]
-    pub(crate) fn passes(&self, tests: &[RecordTest]) -> Option<bool> {
-        for test in tests {
-            if !self.passes_test(test)? {
-                return Some(false);
-            }
-        }
-        Some(true)
-    }
-
-    /// Whether the row passes `test`, as [`Self::passes`] decides it. A key column's value is
-    /// decoded from the key; a stored column's is read in place, or is its default when the record
-    /// omits it.
-    #[inline(always)]
-    fn passes_test(&self, test: &RecordTest) -> Option<bool> {
-        match *test {
-            RecordTest::IntegerRange {
-                column,
-                low,
-                high,
-                default,
-            } => {
-                let value = match self.layout.slots[column] {
-                    ColumnSlot::Stored(position) => {
-                        if position >= self.count {
-                            return Some(default);
-                        }
-                        match self.stored_bytes(position).ok()? {
-                            None => return Some(false),
-                            Some(bytes) => integer_value(bytes)?,
-                        }
-                    }
-                    ColumnSlot::Key(position) => match self.key_component(position).ok()? {
-                        ValueRef::Integer(value) => value,
-                        _ => return None,
-                    },
-                };
-                Some(low <= value && value <= high)
-            }
-            RecordTest::TextEquals {
-                column,
-                ref text,
-                default,
-            } => match self.layout.slots[column] {
-                ColumnSlot::Stored(position) => {
-                    if position >= self.count {
-                        return Some(default);
-                    }
-                    Some(self.stored_bytes(position).ok()? == Some(text.as_bytes()))
-                }
-                ColumnSlot::Key(position) => match self.key_component(position).ok()? {
-                    ValueRef::Text(value) => Some(*value == **text),
-                    _ => None,
-                },
-            },
-            RecordTest::Like {
-                column,
-                ref pattern,
-                default,
-            } => match self.layout.slots[column] {
-                ColumnSlot::Stored(position) => {
-                    if position >= self.count {
-                        return Some(default);
-                    }
-                    match self.stored_bytes(position).ok()? {
-                        None => Some(false),
-                        Some(bytes) => {
-                            Some(pattern.matches(std::str::from_utf8(bytes).ok()?))
-                        }
-                    }
-                }
-                ColumnSlot::Key(position) => match self.key_component(position).ok()? {
-                    ValueRef::Text(value) => Some(pattern.matches(&value)),
-                    _ => None,
-                },
-            },
-            RecordTest::IsNull { column, negated } => match self.layout.slots[column] {
-                ColumnSlot::Stored(position) => {
-                    let null = if position >= self.count {
-                        self.schema.columns[column]
-                            .default
-                            .as_ref()
-                            .is_none_or(Value::is_null)
-                    } else {
-                        self.is_null(position)
-                    };
-                    Some(null ^ negated)
-                }
-                // A key column never holds NULL.
-                ColumnSlot::Key(_) => Some(negated),
-            },
-        }
     }
 
     /// The value of the column at `index`, in schema order.

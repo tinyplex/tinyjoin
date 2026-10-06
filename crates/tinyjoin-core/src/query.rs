@@ -4078,7 +4078,53 @@ impl LikePattern {
             .collect()
     }
 
+    /// Whether `text` matches, judged from its bytes alone, which a pattern whose segments are all
+    /// literal can do: each literal is matched as bytes, and UTF-8 bytes equal to a whole string
+    /// of characters can only begin at a character boundary. `None` when a segment holds `_`,
+    /// which matches one character of any length.
+    pub(crate) fn matches_bytes(&self, text: &[u8]) -> Option<bool> {
+        if self.literals.iter().any(Option::is_none) {
+            return None;
+        }
+        let case_insensitive = self.case_insensitive;
+        let same = |bytes: &[u8], literal: &str| {
+            if case_insensitive {
+                bytes.eq_ignore_ascii_case(literal.as_bytes())
+            } else {
+                bytes == literal.as_bytes()
+            }
+        };
+        let literal = |index: usize| self.literals[index].as_deref().unwrap_or_default();
+        let last = self.segments.len() - 1;
+        let first = literal(0);
+        if last == 0 {
+            return Some(text.len() == first.len() && same(text, first));
+        }
+        if text.len() < first.len() || !same(&text[..first.len()], first) {
+            return Some(false);
+        }
+        let mut cursor = first.len();
+        for index in 1..last {
+            let literal = literal(index);
+            if literal.is_empty() {
+                continue;
+            }
+            match find_literal(&text[cursor..], literal, case_insensitive) {
+                Some(offset) => cursor += offset + literal.len(),
+                None => return Some(false),
+            }
+        }
+        let literal = literal(last);
+        let Some(start) = text.len().checked_sub(literal.len()) else {
+            return Some(false);
+        };
+        Some(start >= cursor && same(&text[start..], literal))
+    }
+
     pub(crate) fn matches(&self, text: &str) -> bool {
+        if let Some(matched) = self.matches_bytes(text.as_bytes()) {
+            return matched;
+        }
         let case_insensitive = self.case_insensitive;
         let same = |bytes: &[u8], literal: &str| {
             if case_insensitive {
