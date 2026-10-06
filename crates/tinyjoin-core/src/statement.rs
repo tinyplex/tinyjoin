@@ -653,18 +653,19 @@ pub(crate) fn plan_dml(
     Ok(planned)
 }
 
-/// A prepared statement that changes one row found by its primary key, as its template: a lone
-/// `INSERT`, with or without `ON CONFLICT (key) DO UPDATE SET`, or an `UPDATE` or `DELETE` of
-/// the row a primary-key equality names, all without `RETURNING`. [`plan_point`] plans one from
-/// the template and the parameters bound to it, rather than binding the statement and planning it
-/// as any statement is planned, which costs several times the planning itself. A template holds
-/// each value as the template's parser left it: a literal, or a parameter's marker.
+/// A prepared statement that changes rows it names by their primary keys, as its template: an
+/// `INSERT` of listed rows, a lone one with `ON CONFLICT (key) DO UPDATE SET`, or an `UPDATE` or
+/// `DELETE` of the row a primary-key equality names, all without `RETURNING`. [`plan_point`]
+/// plans one from the template and the parameters bound to it, rather than binding the statement
+/// and planning it as any statement is planned, which costs several times the planning itself. A
+/// template holds each value as the template's parser left it: a literal, or a parameter's marker.
 #[derive(Clone, Debug)]
 pub(crate) enum PointTemplate {
     Insert {
         table: String,
         columns: Option<Vec<String>>,
-        values: Vec<SqlValue>,
+        /// The listed rows: one, when there is a conflict clause.
+        rows: Vec<Vec<SqlValue>>,
         /// `ON CONFLICT (target) DO UPDATE SET`: the target's columns, and each assignment.
         conflict: Option<(Vec<String>, Vec<(String, PointAssigned)>)>,
     },
@@ -698,7 +699,7 @@ pub(crate) fn point_template(statement: &WriteStatement) -> Option<PointTemplate
             values,
             on_conflict,
             returning: None,
-        } if values.len() == 1 => {
+        } if values.len() == 1 || on_conflict.is_none() => {
             let conflict = match on_conflict {
                 None => None,
                 Some(OnConflict {
@@ -727,7 +728,7 @@ pub(crate) fn point_template(statement: &WriteStatement) -> Option<PointTemplate
             Some(PointTemplate::Insert {
                 table: table.clone(),
                 columns: columns.clone(),
-                values: values[0].clone(),
+                rows: values.clone(),
                 conflict,
             })
         }
@@ -808,13 +809,13 @@ pub(crate) fn plan_point(
         PointTemplate::Insert {
             table,
             columns,
-            values,
+            rows,
             conflict,
         } => plan_point_insert(
             storage,
             table,
             columns.as_deref(),
-            values,
+            rows,
             conflict.as_ref(),
             params,
         ),
@@ -1075,11 +1076,47 @@ fn plan_point_delete(
     )))
 }
 
+/// The most JSON text the rows of one point `INSERT` may take in all: a larger statement is left
+/// to the general planner, whose working budget bounds it.
+const MAX_POINT_INSERT_BYTES: usize = 1024 * 1024;
+
+/// Puts the values of a listed row into `row` in schema order, each named or its column's
+/// default, and returns the most JSON text the row can take, when every value is a scalar and
+/// that text cannot pass the row limit, as a record plans them; `None` leaves the row to the
+/// general planner.
+fn point_row_values<'a>(
+    schema: &'a TableDefinition,
+    positions: &[Option<usize>],
+    values: &'a [SqlValue],
+    params: &'a [Value],
+    default_values: bool,
+    overhead: usize,
+    row: &mut Vec<&'a Value>,
+) -> Result<Option<usize>> {
+    row.clear();
+    let mut bound = overhead;
+    for (column, position) in schema.columns.iter().zip(positions) {
+        let explicit = (!default_values)
+            .then(|| position.and_then(|index| values.get(index)))
+            .flatten();
+        let value = match explicit {
+            Some(SqlValue::Value(value)) => point_value(value, params)?,
+            Some(SqlValue::Default) | None => column.default.as_ref().unwrap_or(&Value::Null),
+        };
+        let Some(value_bound) = json_scalar_bound(value) else {
+            return Ok(None);
+        };
+        bound = bound.saturating_add(value_bound);
+        row.push(value);
+    }
+    Ok((bound <= MAX_LOGICAL_ROW_BYTES).then_some(bound))
+}
+
 fn plan_point_insert(
     storage: &dyn StorageReader,
     table: &str,
     columns: Option<&[String]>,
-    values: &[SqlValue],
+    rows: &[Vec<SqlValue>],
     conflict: Option<&(Vec<String>, Vec<(String, PointAssigned)>)>,
     params: &[Value],
 ) -> Result<Option<PlannedDml>> {
@@ -1087,7 +1124,8 @@ fn plan_point_insert(
     let Some(layout) = storage.record_layout(table) else {
         return Ok(None);
     };
-    let default_values = columns.is_none() && values.is_empty();
+    let default_values =
+        columns.is_none() && rows.len() == 1 && rows.first().is_some_and(Vec::is_empty);
     let all_columns;
     let columns = match columns {
         Some(columns) => columns,
@@ -1101,10 +1139,87 @@ fn plan_point_insert(
         }
     };
     let positions = named_column_positions(&schema, columns)?;
+    let overhead = row_json_overhead(&schema)?;
+    let schema = &*schema;
+    let Some((target, assignments)) = conflict else {
+        // Rows listed without a conflict clause, each planned straight into its record, in the
+        // order listed, with each key checked against the rows before it and the stored rows.
+        let mut changes = Vec::with_capacity(rows.len());
+        let mut previous = Vec::with_capacity(rows.len());
+        // The changes so far, ordered by their keys: rows usually arrive in key order, so a key
+        // is usually appended.
+        let mut by_key: Vec<usize> = Vec::with_capacity(rows.len());
+        let mut row = Vec::with_capacity(schema.columns.len());
+        let mut total = 0usize;
+        for values in rows {
+            if !default_values && values.len() != columns.len() {
+                return Ok(None);
+            }
+            let Some(bound) = point_row_values(
+                schema,
+                &positions,
+                values,
+                params,
+                default_values,
+                overhead,
+                &mut row,
+            )?
+            else {
+                return Ok(None);
+            };
+            total = total.saturating_add(bound);
+            if total > MAX_POINT_INSERT_BYTES {
+                return Ok(None);
+            }
+            for (column, value) in schema.columns.iter().zip(&row) {
+                validate_value(column, value, table)?;
+            }
+            let key = encode_primary_key_values(&schema, &layout, &row)?;
+            ensure_storage_key_bytes(key.len())?;
+            let key_of = |index: &usize| match &changes[*index] {
+                RowChange::Put { key, .. } => key.as_slice(),
+                _ => unreachable!("every change is a record"),
+            };
+            let position = match by_key.binary_search_by(|index| key_of(index).cmp(&key)) {
+                Ok(_) => return Err(duplicate_primary_key("INSERT into", table)),
+                Err(position) => position,
+            };
+            if storage.holds_encoded_key(table, &key)? {
+                return Err(duplicate_primary_key("INSERT into", table));
+            }
+            let record = encode_row_values(&schema, &layout, &row)?;
+            by_key.insert(position, changes.len());
+            changes.push(RowChange::Put {
+                table: table.to_owned(),
+                key,
+                record,
+            });
+            previous.push(PreviousRow::Read(None));
+        }
+        let row_count = changes.len();
+        return Ok(Some(PlannedDml {
+            outcome: WriteOutcome {
+                command: "INSERT",
+                row_count,
+                rows: vec![],
+                tables: (row_count > 0)
+                    .then(|| table.to_owned())
+                    .into_iter()
+                    .collect(),
+                mutated: row_count > 0,
+            },
+            changes,
+            previous,
+            moved: vec![],
+        }));
+    };
+    let [values] = rows else {
+        return Ok(None);
+    };
     if !default_values && values.len() != columns.len() {
         return Ok(None);
     }
-    let updates = match conflict {
+    let updates = match Some((target, assignments)) {
         None => None,
         Some((target, assignments)) => {
             if target.len() != schema.primary_key.len()
@@ -1130,25 +1245,18 @@ fn plan_point_insert(
             Some(assignments)
         }
     };
-    // The row's values in schema order, each named or its column's default, when every one is a
-    // scalar and the row's JSON text cannot pass the row limit, as a record plans them.
     let mut row = Vec::with_capacity(schema.columns.len());
-    let mut bound = row_json_overhead(&schema)?;
-    for (column, position) in schema.columns.iter().zip(&positions) {
-        let explicit = (!default_values)
-            .then(|| position.and_then(|index| values.get(index)))
-            .flatten();
-        let value = match explicit {
-            Some(SqlValue::Value(value)) => point_value(value, params)?,
-            Some(SqlValue::Default) | None => column.default.as_ref().unwrap_or(&Value::Null),
-        };
-        let Some(value_bound) = json_scalar_bound(value) else {
-            return Ok(None);
-        };
-        bound = bound.saturating_add(value_bound);
-        row.push(value);
-    }
-    if bound > MAX_LOGICAL_ROW_BYTES {
+    if point_row_values(
+        schema,
+        &positions,
+        values,
+        params,
+        default_values,
+        overhead,
+        &mut row,
+    )?
+    .is_none()
+    {
         return Ok(None);
     }
     for (column, value) in schema.columns.iter().zip(&row) {
@@ -1157,20 +1265,7 @@ fn plan_point_insert(
     let key = encode_primary_key_values(&schema, &layout, &row)?;
     ensure_storage_key_bytes(key.len())?;
     let Some(assignments) = updates else {
-        if storage.holds_encoded_key(table, &key)? {
-            return Err(duplicate_primary_key("INSERT into", table));
-        }
-        let record = encode_row_values(&schema, &layout, &row)?;
-        return Ok(Some(point_change(
-            "INSERT",
-            table,
-            RowChange::Put {
-                table: table.to_owned(),
-                key,
-                record,
-            },
-            PreviousRow::Read(None),
-        )));
+        unreachable!("a lone row without a conflict clause was planned above")
     };
     let position_of = |name: &str| {
         schema

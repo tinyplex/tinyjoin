@@ -744,6 +744,26 @@ lines', true, '7')"#,
                 vec![json!(7), json!("seven"), json!("many")],
             ),
             ("INSERT INTO items VALUES ($1, $2, $3, $4, $5)", vec![json!(9), json!("nine"), json!(9), json!("ninth"), json!(9.5)]),
+            (
+                "INSERT INTO items (id, name, qty) VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9)",
+                vec![json!(30), json!("thirty"), json!(3), json!(31), json!("thirty-one"), json!(1), json!(29), json!("twenty-nine"), json!(2)],
+            ),
+            (
+                "INSERT INTO items (id, name) VALUES ($1, $2), ($3, $4)",
+                vec![json!(40), json!("forty"), json!(40), json!("forty again")],
+            ),
+            (
+                "INSERT INTO items (id, name) VALUES ($1, $2), ($3, $4)",
+                vec![json!(41), json!("forty-one"), json!(30), json!("thirty again")],
+            ),
+            (
+                "INSERT INTO items (id, name, qty) VALUES ($1, $2, $3), ($4, $5, $6)",
+                vec![json!(42), json!("forty-two"), json!(1), json!(43), json!("forty-three"), json!("lots")],
+            ),
+            (
+                "INSERT INTO items (id, name) VALUES ($1, $2), ($3, $4)",
+                vec![json!(44), json!("one"), json!(45), json!("forty-five")],
+            ),
             ("UPDATE items SET note = $1 WHERE id = $2", vec![json!("noted"), json!(2)]),
             ("UPDATE items SET note = $1 WHERE id = $2", vec![json!("missing"), json!(99)]),
             ("UPDATE items SET qty = DEFAULT, note = $1 WHERE $2 = id", vec![json!(null), json!(3)]),
@@ -815,10 +835,11 @@ lines', true, '7')"#,
         let full = plain.commit_transaction().unwrap();
         assert_eq!(format!("{fast:?}"), format!("{full:?}"));
         assert_eq!(prepared.database_hash(), plain.database_hash());
-        // Rows 4, 8, 9, and 20 remain: 2 moved to 20, 3 and 5 were deleted, and 1 last of all.
+        // Rows 4, 8, 9, 20, 29, 30, and 31 remain: 2 moved to 20, 3 and 5 were deleted, 1 last of
+        // all, and every later listed insert failed as a whole.
         assert_eq!(
             objects(&prepared.execute_sql("SELECT * FROM items ORDER BY id", &[]).unwrap()).len(),
-            4
+            7
         );
     }
 
