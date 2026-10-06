@@ -911,7 +911,7 @@ fn point_row(
     storage.visit_primary_key_values(&schema.name, schema, values, &mut |row| {
         found = match row.hold()? {
             HeldRow::Stored(entry) => PointRow::Stored(entry),
-            HeldRow::Map(_) => PointRow::Other,
+            HeldRow::Map(_) | HeldRow::Measured(_) => PointRow::Other,
         };
         Ok(VisitControl::Stop)
     })?;
@@ -2841,6 +2841,23 @@ fn plan_delete(
     let filter = Filter::new(predicate, &schema, table)?;
     // A script's writer lets a delete plan each stored row by its key, without a map.
     let by_key = storage.plans_removals();
+    // That writer reads nothing of a deleted row but that it exists and what it is charged as
+    // when the table has no index to take the row's entries from and no foreign key reads the
+    // row, so planning then measures each row in place rather than copying its entry. The
+    // estimate parses the row's JSON columns, the same work the writer's held_row_bytes did
+    // with the copy, so a corrupt record's error now surfaces while planning on this path.
+    let measured = by_key
+        && !storage.table_has_indexes(table)?
+        && !crate::foreign_key::involves(storage, table);
+    // What planning retains for each change, and for a stored row's key when no key column holds
+    // text or JSON, which the layout measured once for every row.
+    let change_charge = checked_dml_add(table.len(), DML_CHANGE_RETAINED_BYTES)?;
+    let key_charge = by_key
+        .then(|| storage.record_layout(table))
+        .flatten()
+        .and_then(|layout| layout.scalar_key_estimate())
+        .map(|bytes| checked_dml_add(bytes, 96))
+        .transpose()?;
     let visit_outcome = visit_dml_candidates(
         storage,
         &schema,
@@ -2854,14 +2871,18 @@ fn plan_delete(
                 )));
             }
             // A delete needs only the row's key; the writer reads the rest from the row it keeps.
-            let (change, charge) = match row.stored().filter(|_| by_key) {
+            let record = row.stored().filter(|_| by_key);
+            let (change, charge) = match record {
                 // Charged as the map of its key columns, which is what its key's estimate is.
                 Some(record) => (
                     RowChange::Remove {
                         table: Rc::clone(&table_name),
                         key: record.key().to_vec(),
                     },
-                    checked_dml_add(estimated_key_bytes(record)?, 96)?,
+                    match key_charge {
+                        Some(charge) => charge,
+                        None => checked_dml_add(estimated_key_bytes(record)?, 96)?,
+                    },
                 ),
                 None => {
                     let key = row.primary_key()?;
@@ -2876,7 +2897,8 @@ fn plan_delete(
                 }
             };
             ensure_dml_work_bytes(checked_dml_add(work_bytes, charge)?)?;
-            work_bytes = retain_dml_change(work_bytes, table)?;
+            work_bytes = checked_dml_add(work_bytes, change_charge)?;
+            ensure_dml_work_bytes(work_bytes)?;
             if let Some(columns) = returning {
                 let row = row.to_row()?;
                 result_bytes = retain_returned_row(result_bytes, &row, columns)?;
@@ -2884,10 +2906,14 @@ fn plan_delete(
             }
             work_bytes = checked_dml_add(work_bytes, charge)?;
             changes.push(change);
-            previous.push(if kept.fits(row.held_bytes()?) {
-                PreviousRow::Read(Some(row.hold()?))
-            } else {
-                PreviousRow::Unread
+            // Only a row removed by its key is measured, and a measured row is not kept, so it
+            // takes nothing of what planning may keep.
+            previous.push(match record.filter(|_| measured) {
+                Some(record) => {
+                    PreviousRow::Read(Some(HeldRow::Measured(estimated_record_bytes(record)?)))
+                }
+                None if kept.fits(row.held_bytes()?) => PreviousRow::Read(Some(row.hold()?)),
+                None => PreviousRow::Unread,
             });
             Ok(VisitControl::Continue)
         },
@@ -3202,6 +3228,9 @@ fn held_row(schema: &TableDefinition, storage: &dyn StorageReader, held: &HeldRo
                 .ok_or_else(unplanned_record)?;
             StoredRecord::new(schema, &layout, entry.key(), entry.value())?.to_row()
         }
+        // Planning measures a row in place of holding it only for a writer that reads nothing
+        // of it.
+        HeldRow::Measured(_) => Err(unplanned_record()),
     }
 }
 

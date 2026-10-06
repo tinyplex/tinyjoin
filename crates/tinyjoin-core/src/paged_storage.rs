@@ -34,7 +34,7 @@ use crate::{
         stored_record_passes,
     },
     query::Filter,
-    row::{HeldRow, RowRef, ValueRef},
+    row::{HeldRow, RowRef, ValueRef, unkept_row},
     sql_script::charge_operations,
     storage::{
         KeyOrder, KeyRange, RowWriteUsage, normalize_row, preflight_record_write,
@@ -844,6 +844,24 @@ impl<D: PageDevice> PagedStorage<D> {
         self.ensure_ready()
     }
 
+    /// What a script's candidate plans for `statement`, without applying it.
+    #[cfg(test)]
+    pub(crate) fn plan_script_dml(
+        &self,
+        statement: &crate::statement::WriteStatement,
+    ) -> Result<crate::statement::PlannedDml> {
+        self.ensure_ready()?;
+        crate::paged_script::plan_candidate_dml(
+            &mut self.pager.borrow_mut(),
+            self.revision,
+            self.next_tree_id,
+            self.schema_version,
+            self.tables.clone(),
+            self.indexes.clone(),
+            statement,
+        )
+    }
+
     pub(crate) fn execute_script(
         &mut self,
         statements: Vec<crate::statement::Statement>,
@@ -1100,6 +1118,8 @@ impl<D: PageDevice> PagedStorage<D> {
             Some(HeldRow::Stored(base)) => {
                 estimated_record_batch_bytes(&table.record(base.key(), base.value())?)?
             }
+            // A transaction's reader keeps every row it reads, since the overlay reads them.
+            Some(HeldRow::Measured(_)) => return Err(unkept_row()),
         };
         let next_bytes = if is_delete { 0 } else { row_bytes };
         let mut prepared_bytes = key
@@ -1178,6 +1198,7 @@ impl<D: PageDevice> PagedStorage<D> {
                     &index_column_positions(&table.schema, &index.definition)?,
                     &table.record(entry.key(), entry.value())?,
                 )?,
+                HeldRow::Measured(_) => return Err(unkept_row()),
             };
             values.extend(prefix.map(|prefix| (index.tree_id, prefix)));
         }
@@ -1792,6 +1813,11 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
             .collect())
     }
 
+    fn table_has_indexes(&self, table: &str) -> Result<bool> {
+        self.ensure_ready()?;
+        table_has_indexes(&self.tables, &self.indexes, table)
+    }
+
     fn visit_index(
         &self,
         table: &str,
@@ -2260,6 +2286,21 @@ pub(crate) fn tables_with_foreign_keys(tables: &NameMap<PagedTable>) -> Vec<Rc<T
         .filter(|table| !table.schema.foreign_keys.is_empty())
         .map(|table| Rc::clone(&table.schema))
         .collect()
+}
+
+/// Whether a catalog's `table` has an index, answered without copying a definition, for every
+/// reader with a catalog.
+pub(crate) fn table_has_indexes(
+    tables: &NameMap<PagedTable>,
+    indexes: &NameMap<PagedIndex>,
+    table: &str,
+) -> Result<bool> {
+    if !tables.contains_key(table) {
+        return Err(EngineError::table_not_found(table));
+    }
+    Ok(indexes
+        .values()
+        .any(|index| index.definition.table == table))
 }
 
 #[cfg(test)]

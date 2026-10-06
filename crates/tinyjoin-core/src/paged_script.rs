@@ -27,7 +27,7 @@ use crate::{
         limit_error, storage_corrupt, unique_violation,
     },
     query::Filter,
-    row::{HeldRow, RowRef},
+    row::{HeldRow, RowRef, unkept_row},
     statement::{
         PlannedDml, PreviousRow, Statement, TableChange, WriteOutcome, WriteStatement, change_table,
     },
@@ -173,13 +173,14 @@ enum PlannedRow {
 pub(crate) type TableChanges<'a> = (&'a str, Vec<(&'a [u8], &'a ChangedRow)>);
 
 /// The estimated bytes of a row a writer holds, which [`estimated_row_bytes`] finds for it as a
-/// map, reading a stored entry in place.
+/// map, reading a stored entry in place, or which planning measured in place of holding it.
 pub(crate) fn held_row_bytes(table: &PagedTable, row: &HeldRow) -> Result<usize> {
     match row {
         HeldRow::Map(row) => estimated_row_bytes(row),
         HeldRow::Stored(entry) => {
             estimated_record_bytes(&table.record(entry.key(), entry.value())?)
         }
+        HeldRow::Measured(bytes) => Ok(*bytes),
     }
 }
 
@@ -270,6 +271,31 @@ pub(crate) fn execute_changed_rows<D: PageDevice>(
         Ok(vec![])
     })();
     finish_candidate(candidate, execution)
+}
+
+/// What a script's candidate plans for `statement`, without applying it, for tests of what a
+/// script's planning keeps for its writer.
+#[cfg(test)]
+pub(crate) fn plan_candidate_dml<D: PageDevice>(
+    pager: &mut Pager<D>,
+    base_revision: u64,
+    next_tree_id: TreeId,
+    schema_version: u64,
+    tables: Rc<NameMap<PagedTable>>,
+    indexes: Rc<NameMap<PagedIndex>>,
+    statement: &WriteStatement,
+) -> Result<PlannedDml> {
+    let candidate = begin_candidate(
+        pager,
+        base_revision,
+        next_tree_id,
+        schema_version,
+        tables,
+        indexes,
+    )?;
+    let planned = crate::statement::plan_dml(&candidate, statement);
+    candidate.transaction.into_inner().abort();
+    planned
 }
 
 fn begin_candidate<'a, D: PageDevice>(
@@ -1103,6 +1129,9 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                             &table.record(entry.key(), entry.value())?,
                         )?
                         .then_some(start..keys.len()),
+                        // Planning measures a row in place of holding it only when its table
+                        // has no index to take the row's entries from.
+                        Some(HeldRow::Measured(_)) => return Err(unkept_row()),
                     };
                     let middle = keys.len();
                     let next_key = match &change.next {
@@ -1644,6 +1673,10 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
             .filter(|index| index.definition.table == table)
             .map(|index| index.definition.clone())
             .collect())
+    }
+
+    fn table_has_indexes(&self, table: &str) -> Result<bool> {
+        crate::paged_storage::table_has_indexes(&self.tables, &self.indexes, table)
     }
 
     fn visit_index(

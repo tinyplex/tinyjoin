@@ -64,6 +64,12 @@ deleting 8,000 rows by an indexed range takes 12% less time optimized and
 18% less before optimization, a `LIKE` delete 6% less, and 10,000 inserts in
 a transaction 6% less before optimization.
 
+A `DELETE` outside a transaction, over a table with no index and no foreign
+key, measures each row it removes rather than copying it, since nothing would
+read the copy, and charges per statement what it charged per row. Engine-only,
+the `LIKE` delete takes a further 6% less time before optimization and 15%
+less after.
+
 ### Comparing memory
 
 The WebAssembly build compares memory eight bytes at a time, in place of the

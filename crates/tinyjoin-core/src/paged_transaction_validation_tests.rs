@@ -57,6 +57,7 @@ fn decoded_retained_bytes(
         None => 0,
         Some(HeldRow::Map(row)) => estimated_row_bytes(row).unwrap(),
         Some(HeldRow::Stored(stored)) => decoded(stored.value()),
+        Some(HeldRow::Measured(_)) => unreachable!("a transaction keeps every row it reads"),
     };
     let next_bytes = entry.row.next.as_deref().map_or(0, decoded);
     retained_bytes(table, key, base_bytes, next_bytes).unwrap()

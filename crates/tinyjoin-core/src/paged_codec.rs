@@ -963,6 +963,13 @@ impl RecordLayout {
     pub(crate) fn json_overhead(&self) -> usize {
         self.json_overhead
     }
+
+    /// The estimated bytes of the map of a primary key's columns when no key column holds text or
+    /// JSON, which is then what [`StoredRecord::key_estimate`] reports for every record of this
+    /// layout, so a writer charging many of a table's keys reads it once.
+    pub(crate) fn scalar_key_estimate(&self) -> Option<usize> {
+        self.key_estimate
+    }
 }
 
 /// A stored table entry read in place. Each column is decoded only when it is read, straight from

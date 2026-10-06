@@ -173,15 +173,8 @@ pub(crate) fn enforce(storage: &dyn StorageReader, planned: &mut PlannedDml) -> 
     let Some(first) = planned.changes.first() else {
         return Ok(());
     };
-    let keyed = storage.tables_with_foreign_keys();
     let name = change_table(first);
-    if !keyed.iter().any(|child| {
-        *child.name == **name
-            || child
-                .foreign_keys
-                .iter()
-                .any(|key| *key.references == **name)
-    }) {
+    if !involves(storage, name) {
         return Ok(());
     }
 
@@ -378,6 +371,15 @@ pub(crate) fn enforce(storage: &dyn StorageReader, planned: &mut PlannedDml) -> 
         planned.previous.push(PreviousRow::Unread);
     }
     Ok(())
+}
+
+/// Whether a foreign key involves `table`: one of its own, or one of another table's that
+/// references it. [`enforce`] checks a statement's rows only then, so a writer may plan a change
+/// to any other table without the rows it would read.
+pub(crate) fn involves(storage: &dyn StorageReader, table: &str) -> bool {
+    storage.tables_with_foreign_keys().iter().any(|child| {
+        child.name == table || child.foreign_keys.iter().any(|key| key.references == table)
+    })
 }
 
 /// Keeps the keys that `keep` keeps, after it changes them as it needs to. Every caller shares

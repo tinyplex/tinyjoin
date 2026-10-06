@@ -470,6 +470,17 @@ Found along the way:
   reads and for statements inside a transaction; a test pins the three paths.
   Engine-only, the `LIKE` delete takes 21% less time under baseline
   compilation and 11% less optimized, the range delete 7% and 5%.
+- A script's DELETE over a table with no index of any kind and no foreign key
+  involving it keeps `HeldRow::Measured`, the row's estimated bytes, instead
+  of a copy of its entry: the writer needs only that the row exists and what
+  it is charged as. The per-row change charge and a scalar key's estimate are
+  hoisted to the statement, and the write-set preflight takes a scalar key's
+  estimate from the layout instead of opening an empty record. Per deleted
+  row of the `LIKE` delete, 33 fewer WebAssembly calls and one allocation
+  fewer; engine-only, 6% less time under baseline compilation and 15% less
+  optimized, the range delete 2% and 4%, for 0.4 KiB more compressed code.
+  The one observable change: a corrupt text or JSON column in such a row
+  fails the statement while planning rather than while applying.
 
 Found along the way, 6 and 7 October:
 

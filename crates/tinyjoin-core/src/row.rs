@@ -87,11 +87,25 @@ pub(crate) trait Columns {
 pub(crate) struct RowRef<'a>(Source<'a>);
 
 /// A row a writer keeps from reading it: a map, or the stored entry a record was read from, which
-/// the writer reads in place rather than decoding whole.
+/// the writer reads in place rather than decoding whole, or only what a stored row is charged as,
+/// when the writer needs nothing else of it.
 #[derive(Clone, Debug)]
 pub(crate) enum HeldRow {
     Map(Row),
     Stored(StoredEntry),
+    /// A stored row planning read and measured as [`crate::storage::estimated_record_bytes`] but
+    /// did not copy, because its writer needs nothing of it but that it exists and what it is
+    /// charged as: a row a script deletes from a table with no index and no foreign key.
+    Measured(usize),
+}
+
+/// The error for a row planning measured without keeping it reaching a reader of it, which
+/// planning avoids by measuring only the rows no writer reads.
+pub(crate) fn unkept_row() -> EngineError {
+    EngineError::new(
+        "INTERNAL_ERROR",
+        "A row planning measured without keeping it was read",
+    )
 }
 
 enum Source<'a> {

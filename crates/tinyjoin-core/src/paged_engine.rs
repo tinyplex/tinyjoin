@@ -375,6 +375,15 @@ impl<D: PageDevice> PagedEngine<D> {
         self.transaction.as_ref().map(PagedTransaction::fingerprint)
     }
 
+    /// What a script's candidate plans for the row-changing statement `sql`, without applying it.
+    #[cfg(test)]
+    pub(crate) fn plan_script_dml(&self, sql: &str) -> Result<PlannedDml> {
+        match crate::statement::parse(sql, &[])? {
+            Statement::Write(statement) => self.storage.plan_script_dml(&statement),
+            _ => Err(EngineError::invalid_query("A read changes no rows")),
+        }
+    }
+
     pub fn into_device(self) -> D {
         self.storage.into_device()
     }
@@ -926,6 +935,20 @@ lines', true, '7')"#,
     /// them in batches within the SQL token limit. Every seventh note is `NULL`; the rest name
     /// the row's number in words, as "entry fifty three of the ledger", in at least 27 bytes.
     fn entries_seed(count: usize) -> Vec<String> {
+        let mut statements = vec![
+            "CREATE TABLE entries (id INTEGER PRIMARY KEY, amount INTEGER NOT NULL, \
+             note TEXT, flag BOOLEAN NOT NULL DEFAULT false)"
+                .to_owned(),
+        ];
+        statements.extend(worded_rows("entries", count, false));
+        statements
+    }
+
+    /// The statements that insert the rows [`entries_seed`] describes into `table`, whose
+    /// columns are `id`, `amount` and `note`, and with `json` a column `meta` as well, which
+    /// holds the row's number and its note's words in every third row and NULL in the rest, so
+    /// that measuring a row parses JSON.
+    fn worded_rows(table: &str, count: usize, json: bool) -> Vec<String> {
         const TENS: [&str; 10] = [
             "zero", "ten", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty",
             "ninety",
@@ -933,31 +956,38 @@ lines', true, '7')"#,
         const ONES: [&str; 10] = [
             "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
         ];
-        let mut statements = vec![
-            "CREATE TABLE entries (id INTEGER PRIMARY KEY, amount INTEGER NOT NULL, \
-             note TEXT, flag BOOLEAN NOT NULL DEFAULT false)"
-                .to_owned(),
-        ];
-        statements.extend((0..count).collect::<Vec<_>>().chunks(200).map(|batch| {
-            let rows = batch
-                .iter()
-                .map(|id| {
-                    let note = if id % 7 == 0 {
-                        "NULL".to_owned()
-                    } else {
-                        format!(
-                            "'entry {} {} of the ledger'",
-                            TENS[(id / 10) % 10],
-                            ONES[id % 10]
-                        )
-                    };
-                    format!("({id}, {}, {note})", (id * 37) % 10_000)
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("INSERT INTO entries (id, amount, note) VALUES {rows}")
-        }));
-        statements
+        let columns = if json {
+            "id, amount, note, meta"
+        } else {
+            "id, amount, note"
+        };
+        (0..count)
+            .collect::<Vec<_>>()
+            .chunks(200)
+            .map(|batch| {
+                let rows = batch
+                    .iter()
+                    .map(|id| {
+                        let (tens, ones) = (TENS[(id / 10) % 10], ONES[id % 10]);
+                        let note = if id % 7 == 0 {
+                            "NULL".to_owned()
+                        } else {
+                            format!("'entry {tens} {ones} of the ledger'")
+                        };
+                        let meta = match json {
+                            true if id % 3 == 0 => {
+                                format!(r#", '{{"n": {id}, "words": ["{tens}", "{ones}"]}}'"#)
+                            }
+                            true => ", NULL".to_owned(),
+                            false => String::new(),
+                        };
+                        format!("({id}, {}, {note}{meta})", (id * 37) % 10_000)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("INSERT INTO {table} ({columns}) VALUES {rows}")
+            })
+            .collect()
     }
 
     #[test]
@@ -1141,6 +1171,225 @@ lines', true, '7')"#,
                 .rows,
             vec![row(json!({"n": 343}))]
         );
+    }
+
+    /// The statements that create a `ledger` table of `count` rows, with the columns
+    /// [`worded_rows`] fills and `columns` more, shaped as `shape` says: `bare`, with an
+    /// `indexed` or a `unique` index on its amounts, `referenced` by a table of tags that cascade
+    /// its deletes, or `referencing` a table of books from its first hundred rows.
+    fn ledger_seed(count: usize, shape: &str) -> Vec<String> {
+        let ledger = |columns: &str| {
+            format!(
+                "CREATE TABLE ledger (id INTEGER PRIMARY KEY, amount INTEGER NOT NULL, \
+                 note TEXT, meta JSON{columns})"
+            )
+        };
+        let (before, after): (Vec<String>, Vec<String>) = match shape {
+            "bare" => (vec![ledger("")], vec![]),
+            "indexed" => (
+                vec![
+                    ledger(""),
+                    "CREATE INDEX ledger_amount ON ledger (amount)".to_owned(),
+                ],
+                vec![],
+            ),
+            "unique" => (
+                vec![
+                    ledger(""),
+                    "CREATE UNIQUE INDEX ledger_amount ON ledger (amount)".to_owned(),
+                ],
+                vec![],
+            ),
+            "referenced" => {
+                // A tag for every fiftieth row, and for the row the tests delete by its key.
+                let tags = (0..count)
+                    .step_by(50)
+                    .chain((count > 1234).then_some(1234))
+                    .map(|id| format!("({id}, {id}, 'tag {id}')"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (
+                    vec![ledger("")],
+                    vec![
+                        "CREATE TABLE tags (id INTEGER PRIMARY KEY, entry INTEGER NOT NULL \
+                         REFERENCES ledger (id) ON DELETE CASCADE, tag TEXT NOT NULL)"
+                            .to_owned(),
+                        format!("INSERT INTO tags (id, entry, tag) VALUES {tags}"),
+                    ],
+                )
+            }
+            "referencing" => (
+                vec![
+                    "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT)".to_owned(),
+                    "INSERT INTO books (id, title) VALUES (1, 'the ledger')".to_owned(),
+                    ledger(", book INTEGER REFERENCES books (id)"),
+                ],
+                vec!["UPDATE ledger SET book = 1 WHERE id < 100".to_owned()],
+            ),
+            _ => unreachable!("an unknown shape"),
+        };
+        let mut statements = before;
+        statements.extend(worded_rows("ledger", count, true));
+        statements.extend(after);
+        statements
+    }
+
+    #[test]
+    fn script_delete_measures_rows_it_does_not_hold() {
+        // A standalone DELETE from a table with no index and no foreign key keeps nothing of the
+        // rows it deletes but what each is charged as, measured as it is planned, where a table
+        // with an index, or one a foreign key involves, has every deleted row held for its
+        // writer. Each DELETE here runs standalone in one database and in a transaction of its
+        // own in another, both seeded with enough rows, with text and JSON columns, to fill many
+        // leaves, for each shape of table: the two must report the same result and leave the
+        // same rows. The delete of one row by its key runs standalone as any delete is planned,
+        // not from a prepared statement's point template.
+        const ROWS: usize = 3_000;
+        // The notes alone, of at least 27 bytes in six rows of seven, fill more pages than this.
+        const NOTE_PAGES: u64 = (ROWS * 6 / 7 * 27 / PAGE_SIZE) as u64;
+        let fifties = (0..ROWS)
+            .filter(|id| (id / 10) % 10 == 5 && id % 7 != 0)
+            .count();
+        let statements = [
+            (
+                "DELETE FROM ledger WHERE id = 1234 RETURNING id, note, meta",
+                Some(1),
+            ),
+            ("DELETE FROM ledger WHERE id = 1234", Some(0)),
+            (
+                "DELETE FROM ledger WHERE note LIKE '%fifty%' RETURNING id, note, meta",
+                Some(fifties),
+            ),
+            (
+                "DELETE FROM ledger WHERE amount >= 1000 AND amount < 3000",
+                None,
+            ),
+            (
+                "DELETE FROM ledger WHERE id >= 2000 AND id < 2400 RETURNING id",
+                None,
+            ),
+            ("DELETE FROM ledger WHERE meta IS NULL AND id < 600", None),
+            ("DELETE FROM ledger", None),
+        ];
+        let describe = |result: &Result<ExecuteResult>| match result {
+            Ok(result) => format!(
+                "ok {} {} {:?} {:?} {:?}",
+                result.command, result.row_count, result.tables, result.keys, result.rows
+            ),
+            Err(error) => format!("err {} {}", error.code, error.message),
+        };
+        for shape in ["bare", "indexed", "unique", "referenced", "referencing"] {
+            let seed = ledger_seed(ROWS, shape);
+            let seed: Vec<&str> = seed.iter().map(String::as_str).collect();
+            let device = database_with(&seed).into_device();
+            assert!(
+                device.page_count() > NOTE_PAGES,
+                "{shape}: {} pages hold the rows",
+                device.page_count()
+            );
+            let mut script = PagedEngine::open(device).unwrap();
+            let mut transaction = database_with(&seed);
+            for (sql, matched) in statements {
+                let standalone = script.execute_sql(sql, &[]);
+                transaction.begin_transaction().unwrap();
+                let staged = transaction.execute_sql(sql, &[]);
+                transaction.commit_transaction().unwrap();
+                assert_eq!(describe(&standalone), describe(&staged), "{shape}: {sql}");
+                assert_eq!(
+                    script.database_hash(),
+                    transaction.database_hash(),
+                    "{shape}: {sql}"
+                );
+                let row_count = standalone.unwrap().row_count;
+                match matched {
+                    Some(matched) => assert_eq!(row_count, matched, "{shape}: {sql}"),
+                    None => assert!(row_count > 0, "{shape}: {sql}"),
+                }
+            }
+            script.check().unwrap();
+            transaction.check().unwrap();
+            let remaining = "SELECT count(*) AS n FROM ledger";
+            let rows = script.query_sql(remaining, &[]).unwrap().rows;
+            assert_eq!(rows, transaction.query_sql(remaining, &[]).unwrap().rows);
+            assert_eq!(rows, vec![row(json!({"n": 0}))], "{shape}");
+            if shape == "referenced" {
+                let tags = "SELECT id, entry, tag FROM tags ORDER BY id";
+                let rows = script.query_sql(tags, &[]).unwrap().rows;
+                assert_eq!(rows, transaction.query_sql(tags, &[]).unwrap().rows);
+                assert!(rows.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn plan_delete_measures_the_rows_a_script_does_not_hold() {
+        use crate::{row::HeldRow, statement::PreviousRow, storage::estimated_row_bytes};
+
+        // What a script's candidate plans for a DELETE from a table with no index and no foreign
+        // key keeps, for each deleted row, only the row's estimated bytes, which are those of the
+        // map the row decodes to; with an index, or a foreign key referencing the table, it keeps
+        // each row's stored entry.
+        const ROWS: usize = 700;
+        let seed = ledger_seed(ROWS, "bare");
+        let seed: Vec<&str> = seed.iter().map(String::as_str).collect();
+        let bare = database_with(&seed);
+        let rows = bare
+            .query_sql("SELECT * FROM ledger ORDER BY id", &[])
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), ROWS);
+        // Each DELETE, and the rows it deletes: a LIKE over the table, one row by its key, which
+        // a standalone statement plans as it plans any delete, and every row.
+        type DeletesRow = fn(&Row) -> bool;
+        let deletes: [(&str, DeletesRow); 3] = [
+            ("DELETE FROM ledger WHERE note LIKE '%fifty%'", |row| {
+                row["note"]
+                    .as_str()
+                    .is_some_and(|note| note.contains("fifty"))
+            }),
+            ("DELETE FROM ledger WHERE id = 123", |row| row["id"] == 123),
+            ("DELETE FROM ledger", |_| true),
+        ];
+        for (sql, deletes_row) in &deletes {
+            let planned = bare.plan_script_dml(sql).unwrap();
+            let expected: Vec<&Row> = rows.iter().filter(|row| deletes_row(row)).collect();
+            assert!(!expected.is_empty(), "{sql}");
+            assert_eq!(planned.changes.len(), expected.len(), "{sql}");
+            assert_eq!(planned.previous.len(), expected.len(), "{sql}");
+            for (previous, row) in planned.previous.iter().zip(expected) {
+                match previous {
+                    PreviousRow::Read(Some(HeldRow::Measured(bytes))) => {
+                        assert_eq!(*bytes, estimated_row_bytes(row).unwrap(), "{sql}");
+                    }
+                    other => panic!("{sql} keeps {other:?}"),
+                }
+            }
+        }
+        for shape in ["indexed", "unique", "referenced", "referencing"] {
+            let seed = ledger_seed(ROWS, shape);
+            let seed: Vec<&str> = seed.iter().map(String::as_str).collect();
+            let engine = database_with(&seed);
+            for (sql, _) in &deletes {
+                let planned = engine.plan_script_dml(sql).unwrap();
+                // The statement's own rows come first; the rows a foreign key's action deletes
+                // with them follow, which planning does not read.
+                let own = planned.outcome.row_count;
+                assert!(own > 0, "{shape}: {sql}");
+                assert_eq!(
+                    planned.previous.len(),
+                    planned.changes.len(),
+                    "{shape}: {sql}"
+                );
+                for (position, previous) in planned.previous.iter().enumerate() {
+                    let held = if position < own {
+                        matches!(previous, PreviousRow::Read(Some(HeldRow::Stored(_))))
+                    } else {
+                        matches!(previous, PreviousRow::Unread)
+                    };
+                    assert!(held, "{shape}: {sql} keeps {previous:?} at {position}");
+                }
+            }
+        }
     }
 
     #[test]

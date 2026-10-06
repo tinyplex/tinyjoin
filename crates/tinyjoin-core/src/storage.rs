@@ -239,6 +239,12 @@ pub(crate) trait StorageReader {
     }
     fn index_definition(&self, name: &str) -> Option<IndexDefinition>;
     fn indexes_for_table(&self, table: &str) -> Result<Vec<IndexDefinition>>;
+    /// Whether `table` has an index, which a writer asks once for each statement it plans. The
+    /// default copies the table's definitions through [`Self::indexes_for_table`]; a reader with
+    /// a catalog answers without the copies.
+    fn table_has_indexes(&self, table: &str) -> Result<bool> {
+        Ok(!self.indexes_for_table(table)?.is_empty())
+    }
     fn visit_index(
         &self,
         table: &str,
@@ -1785,10 +1791,17 @@ fn preflight_row_changes<'a>(
                 continue;
             }
             RowChange::Remove { key, .. } => {
-                // Charged as the map of its key columns a delete otherwise plans.
+                // Charged as the map of its key columns a delete otherwise plans, which the layout
+                // measured once for every row when no key column holds text or JSON; any other
+                // key is measured as the map it decodes to.
                 let layout = layout.ok_or_else(unplanned_record)?;
-                let key = StoredRecord::new(schema, layout, key, EMPTY_RECORD)?;
-                batch_bytes = charge_row_write(table, estimated_key_bytes(&key)?, batch_bytes)?;
+                let key_bytes = match layout.scalar_key_estimate() {
+                    Some(bytes) => bytes,
+                    None => {
+                        estimated_key_bytes(&StoredRecord::new(schema, layout, key, EMPTY_RECORD)?)?
+                    }
+                };
+                batch_bytes = charge_row_write(table, key_bytes, batch_bytes)?;
                 continue;
             }
         };

@@ -1165,6 +1165,11 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
         self.storage.indexes_for_table(table)
     }
 
+    fn table_has_indexes(&self, table: &str) -> Result<bool> {
+        self.ensure_base_revision()?;
+        self.storage.table_has_indexes(table)
+    }
+
     fn visit_index(
         &self,
         table: &str,
