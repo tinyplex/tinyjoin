@@ -10,10 +10,12 @@ A release that needs no action says so explicitly.
 This release makes the engine faster across the
 [comparative benchmarks](/guides/benchmarks/), with no change to the API or to
 the storage format. With OPFS storage, TinyJoin is the fastest of the three
-engines in 11 of the 20 timed workloads and second in the other nine, never
-the slowest. Range aggregates take about half the time they did, `LIKE` scans
-and a transaction's range `UPDATE`s a third less, the 8,000-row range delete
-a tenth less, and 200-row inserts about what SQLite's take.
+engines in 13 of the 20 timed workloads, up from 11, and second in the other
+seven, never the slowest, taking at most 1.4 times as long as the faster
+engine where it is second, down from 1.5. Range aggregates take about half
+the time they did, `LIKE` scans and a transaction's range `UPDATE`s a third
+less, 200-row inserts a seventh less, and the 8,000-row range delete a tenth
+less.
 
 ### Scanning rows
 

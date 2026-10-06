@@ -164,6 +164,18 @@ lowest sum of the logarithms of all three engines' medians, 231.1 against
 Spotlight's importers and Activity Monitor paused. The compressed download is
 352 KiB.
 
+The `cbab3dd6` run, published on 7 October after the point insert's resolved
+values and skipped staged search, with the same processes paused and a CPU
+probe never more than 2.6 ms slow, the quietest of the night: TinyJoin was the
+fastest engine in 13 of the 20 workloads and second in the rest, never the
+slowest, at most 1.35 times the faster engine. 200-row inserts fell from 1.00
+times SQLite's time to 0.94, inserts in a transaction from 1.28 to 1.23, and
+indexed range aggregates came out at 0.97 of SQLite's time and single
+committed inserts at 0.91 of PGlite's; updates, upserts and deletes by key
+stayed at 1.30 to 1.35, inserts into an indexed table at 1.23, the `LIKE`
+delete at 1.17 times PGlite's time and the range delete at 1.10. The
+compressed download is 353 KiB.
+
 Done:
 
 - Phase 0, the native benchmark.
