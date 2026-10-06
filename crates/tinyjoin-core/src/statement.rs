@@ -1126,19 +1126,14 @@ fn plan_point_insert(
     };
     let default_values =
         columns.is_none() && rows.len() == 1 && rows.first().is_some_and(Vec::is_empty);
-    let all_columns;
-    let columns = match columns {
-        Some(columns) => columns,
-        None => {
-            all_columns = schema
-                .columns
-                .iter()
-                .map(|column| column.name.clone())
-                .collect::<Vec<_>>();
-            &all_columns
-        }
+    // Without a column list, the values come in schema order.
+    let (positions, named) = match columns {
+        Some(columns) => (named_column_positions(&schema, columns)?, columns.len()),
+        None => (
+            (0..schema.columns.len()).map(Some).collect(),
+            schema.columns.len(),
+        ),
     };
-    let positions = named_column_positions(&schema, columns)?;
     let overhead = row_json_overhead(&schema)?;
     let schema = &*schema;
     let Some((target, assignments)) = conflict else {
@@ -1152,7 +1147,7 @@ fn plan_point_insert(
         let mut row = Vec::with_capacity(schema.columns.len());
         let mut total = 0usize;
         for values in rows {
-            if !default_values && values.len() != columns.len() {
+            if !default_values && values.len() != named {
                 return Ok(None);
             }
             let Some(bound) = point_row_values(
@@ -1216,7 +1211,7 @@ fn plan_point_insert(
     let [values] = rows else {
         return Ok(None);
     };
-    if !default_values && values.len() != columns.len() {
+    if !default_values && values.len() != named {
         return Ok(None);
     }
     let updates = match Some((target, assignments)) {

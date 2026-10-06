@@ -151,37 +151,12 @@ impl TreeReader<'_> {
         };
         let key_type = table.leading_key_type();
         let work = self.work;
+        // No scan reads a table backward and passes rows over.
+        let backward = order == KeyOrder::Descending;
+        debug_assert!(!backward || except.is_empty());
         // Rows are read from the cursor's copy of each leaf, so the pages are borrowed only to move
         // between leaves, or to read a value that overflows, and the visitor can read them too.
         let mut read = |page_id: PageId| self.pages.borrow_mut().read_btree_page(page_id);
-        if order == KeyOrder::Descending {
-            // Backward, a row at a time, each judged by the filter: no scan reads a table backward
-            // and passes rows over, and few read one backward at all.
-            debug_assert!(except.is_empty());
-            while cursor.next_leaf_from(&mut *self.pages.borrow_mut())? {
-                while let Some((key, value)) = cursor.next_in_leaf(&mut read)? {
-                    if let Some(range) = range
-                        && !range.contains(leading_key_component(key, key_type)?)
-                    {
-                        return Ok(VisitOutcome::Complete);
-                    }
-                    if let Some(work) = work {
-                        charge_operations(work, 1)?;
-                    }
-                    scanned(1)?;
-                    let row = RowRef::record(table.record(key, &value)?);
-                    if let Some(filter) = filter
-                        && !filter.matches(&row)?
-                    {
-                        continue;
-                    }
-                    if visitor(&row)? == VisitControl::Stop {
-                        return Ok(VisitOutcome::Stopped);
-                    }
-                }
-            }
-            return Ok(VisitOutcome::Complete);
-        }
         // The filter's tests of stored columns, which each leaf's cells are tested with in one pass
         // that reads their bytes and calls nothing. A test of a primary-key column, and a filter
         // its tests do not decide, leave the filter to judge each row the pass accepts.
@@ -210,11 +185,21 @@ impl TreeReader<'_> {
             } else {
                 cursor.leaf_positions(&mut except, &mut positions)?;
             }
+            // Forward, the entries from `start` on; backward, those before it, last first.
+            let remaining = if backward { start } else { count - start };
             accepted.clear();
-            accepted.reserve(count - start);
+            accepted.reserve(remaining);
             let (mut skipped, mut examined, mut ended) = (0, 0, false);
             let mut skip = positions.first().copied().unwrap_or(usize::MAX);
-            for position in start..count {
+            let mut next = start;
+            for _ in 0..remaining {
+                let position = if backward {
+                    next -= 1;
+                    next
+                } else {
+                    next += 1;
+                    next - 1
+                };
                 if position == skip {
                     skipped += 1;
                     skip = positions.get(skipped).copied().unwrap_or(usize::MAX);
@@ -274,7 +259,7 @@ impl TreeReader<'_> {
             if ended {
                 return Ok(VisitOutcome::Complete);
             }
-            cursor.skip_to(count);
+            cursor.skip_to(if backward { 0 } else { count });
         }
         Ok(VisitOutcome::Complete)
     }

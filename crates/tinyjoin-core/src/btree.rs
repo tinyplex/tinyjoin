@@ -755,18 +755,18 @@ impl BtreeCursor {
         Ok(Some(entry))
     }
 
-    /// The leaf [`Self::next_leaf_from`] moved to, and the index of the first entry the cursor has not
-    /// returned, for a loop that reads the leaf's entries in place, moving forward, and then
+    /// The leaf [`Self::next_leaf_from`] moved to, and how many of its entries lie before the
+    /// cursor: the first the cursor has not returned moving forward, or one past it moving
+    /// backward; for a loop that reads the leaf's entries in place and then
     /// [passes them](Self::skip_to). `None` before the first leaf or after the last.
     pub(crate) fn leaf(&self) -> Option<(&NodeView<'static>, usize)> {
-        debug_assert!(!self.backward);
         self.leaf.as_ref().map(|leaf| (leaf, self.leaf_index))
     }
 
-    /// Marks the current leaf's entries before `index` as returned, so that [`Self::next_leaf_from`]
-    /// moves on once `index` is the leaf's length.
+    /// Sets how many of the current leaf's entries lie before the cursor, so that
+    /// [`Self::next_leaf_from`] moves on once none remain: at the leaf's length moving forward,
+    /// or at zero moving backward.
     pub(crate) fn skip_to(&mut self, index: usize) {
-        debug_assert!(!self.backward);
         self.leaf_index = index;
     }
 
@@ -1214,16 +1214,16 @@ impl<'a> NodeView<'a> {
         if index >= self.item_count {
             return None;
         }
-        let offset = read_u16(bytes, NODE_HEADER_SIZE + index * SLOT_SIZE) as usize;
+        let offset = u16_at(bytes, NODE_HEADER_SIZE + index * SLOT_SIZE) as usize;
         let header_end = offset + LEAF_CELL_HEADER_SIZE;
         if offset < self.free_end
             || header_end > bytes.len()
-            || read_u16(bytes, offset + 2) != INLINE_CELL_FLAGS
+            || u16_at(bytes, offset + 2) != INLINE_CELL_FLAGS
         {
             return None;
         }
-        let key_end = header_end + read_u16(bytes, offset) as usize;
-        let value_end = key_end + read_u32(bytes, offset + 4) as usize;
+        let key_end = header_end + u16_at(bytes, offset) as usize;
+        let value_end = key_end + u32_at(bytes, offset + 4) as usize;
         if value_end > bytes.len() || value_end < key_end {
             return None;
         }
@@ -3664,11 +3664,26 @@ fn validate_child_generation(
     Ok(())
 }
 
-/// Reads a little-endian number byte by byte, compiled into its caller: a scan reads several for
-/// every row, and a copy of a slice into an array would be a call.
-#[inline(always)]
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16_at(bytes, offset)
+}
+
+/// Reads a little-endian number byte by byte, compiled into its caller: the cell reader a scan
+/// runs for every row reads several, and a copy of a slice into an array would be a call. The
+/// readers above stay calls, which the many places that read a number once are smaller as.
+#[inline(always)]
+fn u16_at(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+#[inline(always)]
+fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
 }
 
 /// Writes `value` at `offset` as one store of its size, where copying it from a slice would call
@@ -3678,14 +3693,8 @@ fn put<const N: usize>(bytes: &mut [u8], offset: usize, value: [u8; N]) {
     *<&mut [u8; N]>::try_from(&mut bytes[offset..offset + N]).expect("bounded write") = value;
 }
 
-#[inline(always)]
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-    ])
+    u32_at(bytes, offset)
 }
 
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
