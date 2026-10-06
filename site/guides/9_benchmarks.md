@@ -8,12 +8,13 @@ and are driven from the page by the same workloads in the same Chromium.
 These numbers are published to track progress, not to win an argument.
 TinyJoin's engine is young. It is the smallest download and the quickest to
 open or reopen a database, and it reads every row, reads rows by key, scans,
-runs `LIKE` scans, groups, joins, updates rows by range, and builds indexes
-more quickly than either alternative, and runs indexed range aggregates as
-quickly as SQLite. With OPFS storage, it is the fastest of the three in 11 of
-the 20 workloads, and second in the other nine, taking at most 1.4 times as
-long as the faster engine: it is never the slowest. Closing the remaining gaps is
-ongoing work, and the suite is designed to be rerun after every optimization.
+runs `LIKE` scans, groups, joins, updates rows by range, builds indexes, and
+commits single inserts more quickly than either alternative, and runs indexed
+range aggregates and 200-row inserts about as quickly as SQLite. With OPFS
+storage, it is the fastest of the three in 11 of the 20 workloads, and second
+in the other nine, taking at most about one and a half times as long as the
+faster engine: it is never the slowest. Closing the remaining gaps is ongoing
+work, and the suite is designed to be rerun after every optimization.
 
 {{benchmarks.environment}}
 

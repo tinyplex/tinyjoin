@@ -2591,12 +2591,13 @@ and are driven from the page by the same workloads in the same Chromium.
 These numbers are published to track progress, not to win an argument.
 TinyJoin's engine is young. It is the smallest download and the quickest to
 open or reopen a database, and it reads every row, reads rows by key, scans,
-runs `LIKE` scans, groups, joins, updates rows by range, and builds indexes
-more quickly than either alternative, and runs indexed range aggregates as
-quickly as SQLite. With OPFS storage, it is the fastest of the three in 11 of
-the 20 workloads, and second in the other nine, taking at most 1.4 times as
-long as the faster engine: it is never the slowest. Closing the remaining gaps is
-ongoing work, and the suite is designed to be rerun after every optimization.
+runs `LIKE` scans, groups, joins, updates rows by range, builds indexes, and
+commits single inserts more quickly than either alternative, and runs indexed
+range aggregates and 200-row inserts about as quickly as SQLite. With OPFS
+storage, it is the fastest of the three in 11 of the 20 workloads, and second
+in the other nine, taking at most about one and a half times as long as the
+faster engine: it is never the slowest. Closing the remaining gaps is ongoing
+work, and the suite is designed to be rerun after every optimization.
 
 Measured on 2026-10-06 with headless Chromium 153.0.8010.12 on macOS (25.5.0), Apple M2, 8 logical CPUs, 16 GiB RAM. Each time is the median of 9 samples.
 
@@ -2610,9 +2611,9 @@ engine's fastest run to its slowest.
 
 | Size | TinyJoin | SQLite | PGlite |
 | --- | ---: | ---: | ---: |
-| Download (uncompressed) | **847 KiB** | 1.0 MiB | 16.6 MiB |
-| Download (gzip) | **349 KiB** | 457 KiB | 5.6 MiB |
-| Download (Brotli) | **286 KiB** | 395 KiB | 3.8 MiB |
+| Download (uncompressed) | **855 KiB** | 1.0 MiB | 16.6 MiB |
+| Download (gzip) | **353 KiB** | 457 KiB | 5.6 MiB |
+| Download (Brotli) | **289 KiB** | 395 KiB | 3.8 MiB |
 
 Download size counts every file a page fetched to open a database: JavaScript
 for the page and the Worker, WebAssembly, and PGlite's file system image. It is
@@ -2623,8 +2624,8 @@ at quality 11, since servers send either.
 
 | Median time | TinyJoin | SQLite | PGlite |
 | --- | ---: | ---: | ---: |
-| Load, create an empty database, and read from it | **54.4 ms** | 88.0 ms | 1.15 s |
-| Reopen a 10,000-row database in a new session and count it | **22.7 ms** | 39.3 ms | 218 ms |
+| Load, create an empty database, and read from it | **51.1 ms** | 86.7 ms | 1.12 s |
+| Reopen a 10,000-row database in a new session and count it | **22.6 ms** | 39.0 ms | 217 ms |
 
 First open starts before the engine is fetched and ends when the first query on
 a new, empty database returns. Reopen runs in a new browser session with a warm
@@ -2648,44 +2649,44 @@ fifth run in one page, against 27 and 29 the first time. See [custom Workers](ht
 
 | Median time | TinyJoin | SQLite | PGlite |
 | --- | ---: | ---: | ---: |
-| 1,000 INSERTs, each committed alone | 431 ms | 1.60 s | **415 ms** |
-| One transaction of 10,000 INSERTs | 254 ms | **197 ms** | 1.06 s |
-| One transaction of 10,000 INSERTs, indexed text column | 265 ms | **213 ms** | 1.08 s |
-| One transaction of 50 INSERTs, 200 rows each | 46.1 ms | **43.3 ms** | 101 ms |
+| 1,000 INSERTs, each committed alone | **383 ms** | 1.59 s | 449 ms |
+| One transaction of 10,000 INSERTs | 252 ms | **197 ms** | 1.05 s |
+| One transaction of 10,000 INSERTs, indexed text column | 260 ms | **212 ms** | 1.08 s |
+| One transaction of 50 INSERTs, 200 rows each | 44.8 ms | **44.7 ms** | 101 ms |
 
 ## Read
 
 | Median time | TinyJoin | SQLite | PGlite |
 | --- | ---: | ---: | ---: |
-| 1,000 SELECTs by primary key | **27.0 ms** | 29.9 ms | 138 ms |
-| 100 range aggregates, no index | **26.1 ms** | 45.0 ms | 79.6 ms |
-| 100 LIKE aggregates on a text column | **70.4 ms** | 140 ms | 179 ms |
-| 100 range aggregates, indexed column | **3.50 ms** | **3.50 ms** | 19.4 ms |
-| Read all 10,000 rows in order | **6.30 ms** | 44.8 ms | 44.4 ms |
-| 10 GROUP BY aggregates over 10,000 rows | **15.5 ms** | 31.3 ms | 21.2 ms |
-| 100 joins: one customer’s orders from 5,000 | **17.5 ms** | 20.1 ms | 32.2 ms |
+| 1,000 SELECTs by primary key | **26.9 ms** | 28.9 ms | 136 ms |
+| 100 range aggregates, no index | **25.5 ms** | 44.2 ms | 77.2 ms |
+| 100 LIKE aggregates on a text column | **69.8 ms** | 141 ms | 181 ms |
+| 100 range aggregates, indexed column | 3.80 ms | **3.50 ms** | 19.1 ms |
+| Read all 10,000 rows in order | **6.00 ms** | 44.7 ms | 44.4 ms |
+| 10 GROUP BY aggregates over 10,000 rows | **15.6 ms** | 31.3 ms | 21.0 ms |
+| 100 joins: one customer’s orders from 5,000 | **17.4 ms** | 19.9 ms | 32.5 ms |
 
 ## Update
 
 | Median time | TinyJoin | SQLite | PGlite |
 | --- | ---: | ---: | ---: |
-| One transaction of 1,000 UPDATEs by primary key | 31.4 ms | **24.4 ms** | 126 ms |
-| One transaction of 100 range UPDATEs, no index | **39.7 ms** | 48.4 ms | 81.2 ms |
-| One transaction of 1,000 upserts, half of them new | 30.0 ms | **23.0 ms** | 127 ms |
+| One transaction of 1,000 UPDATEs by primary key | 30.8 ms | **24.7 ms** | 126 ms |
+| One transaction of 100 range UPDATEs, no index | **39.6 ms** | 48.8 ms | 81.2 ms |
+| One transaction of 1,000 upserts, half of them new | 30.4 ms | **22.9 ms** | 128 ms |
 
 ## Delete
 
 | Median time | TinyJoin | SQLite | PGlite |
 | --- | ---: | ---: | ---: |
-| One transaction of 1,000 DELETEs by primary key | 30.1 ms | **21.3 ms** | 119 ms |
-| One DELETE matching a LIKE pattern | 5.00 ms | 10.0 ms | **4.20 ms** |
-| One DELETE of 8,000 rows by indexed range | 7.10 ms | 11.1 ms | **5.90 ms** |
+| One transaction of 1,000 DELETEs by primary key | 29.4 ms | **19.1 ms** | 118 ms |
+| One DELETE matching a LIKE pattern | 4.90 ms | 9.00 ms | **3.70 ms** |
+| One DELETE of 8,000 rows by indexed range | 6.40 ms | 10.9 ms | **5.90 ms** |
 
 ## Schema
 
 | Median time | TinyJoin | SQLite | PGlite |
 | --- | ---: | ---: | ---: |
-| Create two indexes over 10,000 rows | **12.4 ms** | 19.8 ms | 16.4 ms |
+| Create two indexes over 10,000 rows | **12.8 ms** | 21.5 ms | 15.7 ms |
 
 ## What the results show
 
@@ -2702,7 +2703,7 @@ places like this, where engines that tie share a place:
 | --- | ---: | ---: | ---: |
 | TinyJoin | 11 | 9 | 0 |
 | SQLite | 7 | 7 | 6 |
-| PGlite | 3 | 3 | 14 |
+| PGlite | 2 | 4 | 14 |
 
 Where it comes second, it takes at most 1.4 times as long as the faster
 engine.
@@ -3166,10 +3167,9 @@ This release makes the engine faster across the
 [comparative benchmarks](https://tinyjoin.org/guides/benchmarks/), with no change to the API or to
 the storage format. With OPFS storage, TinyJoin is the fastest of the three
 engines in 11 of the 20 timed workloads and second in the other nine, never
-the slowest, and where it is second it takes at most 1.4 times as long as the
-faster engine, down from 1.5. Range aggregates and `LIKE` scans take about
-half the time they did, a transaction's range `UPDATE`s a third less, and
-200-row inserts about what SQLite's take.
+the slowest. Range aggregates take about half the time they did, `LIKE` scans
+and a transaction's range `UPDATE`s a third less, the 8,000-row range delete
+a tenth less, and 200-row inserts about what SQLite's take.
 
 ### Scanning rows
 

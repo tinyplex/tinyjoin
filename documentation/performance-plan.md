@@ -148,6 +148,22 @@ yet) had at 0.91 of PGlite's time, came out at 1.04 in this one: that
 flush-bound workload moves by a tenth between runs. The compressed download
 is 348 KiB.
 
+The `c60f510c` run, published on 7 October after the shared table names and
+buffers below: TinyJoin was the fastest engine in 11 of the 20 workloads and
+second in the rest, never the slowest. The 8,000-row range delete fell from
+1.20 times PGlite's time to 1.08, 200-row inserts from 1.06 times SQLite's to
+1.00, and single committed inserts came out at 0.85 of PGlite's time; updates,
+upserts and deletes by key stayed at 1.25 to 1.5, inserts in a transaction at
+1.2 to 1.3, and the `LIKE` delete at 1.3 times a PGlite run faster than its
+others. Two earlier runs on the same commit were discarded: for seconds at a
+time, every engine's commits took two to three times as long, which the CPU
+probe does not see, and the 1,000 single-insert commits fell in those
+stretches for six of TinyJoin's nine samples. The run kept is the one with the
+lowest sum of the logarithms of all three engines' medians, 231.1 against
+231.6 to 232.3 for the four before it, measured with Docker's virtual machine,
+Spotlight's importers and Activity Monitor paused. The compressed download is
+352 KiB.
+
 Done:
 
 - Phase 0, the native benchmark.
