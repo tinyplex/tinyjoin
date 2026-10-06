@@ -471,7 +471,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             self.mutated = true;
         }
         Ok(ExecuteResult {
-            command: outcome.command.to_owned(),
+            command: outcome.command,
             revision: self.base_revision,
             row_count: outcome.row_count,
             fields,
@@ -1475,7 +1475,7 @@ pub(crate) fn retain_result(result_bytes: &mut usize, result: &ExecuteResult) ->
 
 fn execute_query_result(result: QueryResult) -> Result<ExecuteResult> {
     Ok(ExecuteResult {
-        command: "SELECT".to_owned(),
+        command: "SELECT",
         revision: result.revision,
         row_count: result.row_count(),
         fields: result.fields,

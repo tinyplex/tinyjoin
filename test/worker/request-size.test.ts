@@ -2,6 +2,7 @@ import {describe, expect, it} from 'vitest';
 import {
   checkedRequestBytes,
   requestBytes,
+  statementRequestBytes,
 } from '../../src/worker/request-size.js';
 
 describe('retained request accounting', () => {
@@ -112,6 +113,27 @@ describe('checked request accounting', () => {
       for (const limit of [64, 512, 4_096, 1_000_000]) {
         expect(checkedRequestBytes(value, limit)).toBe(
           requestBytes(value, limit),
+        );
+      }
+    }
+  });
+
+  it('estimates a statement with scalar parameters exactly as the walk does', () => {
+    const requests = [
+      {v: 9, id: 1, method: 'executePrepared', params: {statementId: 3, params: [1, 'updated']}},
+      {v: 9, id: 2, method: 'executePrepared', params: {statementId: 3, params: [], transactionId: 'tx-1'}},
+      {v: 9, id: 3, method: 'executePrepared', params: {statementId: 3, params: [null, true, 2.5, 'é'.repeat(40)], transactionId: 'tx-1', rowMode: 'array'}},
+      {v: 9, id: 4, method: 'executeSql', params: {sql: 'SELECT * FROM t WHERE id = $1', params: [7]}},
+      {v: 9, id: 5, method: 'executeSql', params: {sql: 'INSERT INTO t VALUES ($1)', params: [{nested: [1]}]}},
+      {v: 9, id: 6, method: 'executePrepared', params: {statementId: 3, params: new Array(40).fill(1)}},
+      {v: 9, id: 7, method: 'prepareSql', params: {sql: 'SELECT 1'}},
+      {v: 9, id: 8, method: 'close', params: undefined},
+      {v: 9, id: 9, method: 'executeSql', params: undefined},
+    ];
+    for (const request of requests.map((request) => structuredClone(request))) {
+      for (const limit of [64, 512, 4_096, 1_000_000]) {
+        expect(statementRequestBytes(request, limit)).toBe(
+          checkedRequestBytes(request, limit),
         );
       }
     }

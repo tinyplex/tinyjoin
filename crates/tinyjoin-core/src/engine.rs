@@ -129,7 +129,7 @@ impl<S: StorageDriver + Clone> Engine<S> {
                         );
                     }
                     Ok(ExecuteResult {
-                        command: outcome.command.to_owned(),
+                        command: outcome.command,
                         revision: self.storage.revision(),
                         row_count: outcome.row_count,
                         fields,
@@ -150,7 +150,7 @@ impl<S: StorageDriver + Clone> Engine<S> {
                     };
                     self.storage = candidate;
                     Ok(ExecuteResult {
-                        command: outcome.command.to_owned(),
+                        command: outcome.command,
                         revision,
                         row_count: outcome.row_count,
                         fields,
@@ -164,7 +164,7 @@ impl<S: StorageDriver + Clone> Engine<S> {
             statement => {
                 let result = crate::statement::run_query(self.read_storage(), statement)?;
                 Ok(ExecuteResult {
-                    command: "SELECT".to_owned(),
+                    command: "SELECT",
                     revision: result.revision,
                     row_count: result.row_count(),
                     fields: result.fields,

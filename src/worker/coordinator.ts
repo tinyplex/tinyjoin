@@ -26,7 +26,7 @@ import {
 } from './coordination-protocol.js';
 import {startWorker, type WorkerScope} from './host.js';
 import {createLocalRpc, type LocalRpc} from './local-rpc.js';
-import {checkedRequestBytes} from './request-size.js';
+import {statementRequestBytes} from './request-size.js';
 import {warmUp} from './warm-up.js';
 
 type Pending = {request: WorkerRequest; bytes: number; epoch?: string};
@@ -400,7 +400,7 @@ const startCoordinator = (
       request.method === 'commitTransaction' ||
       request.method === 'rollbackTransaction';
     // The request was checked above, as plain data from a structured clone.
-    const bytes = checkedRequestBytes(request, MAX_QUEUED_BYTES);
+    const bytes = statementRequestBytes(request, MAX_QUEUED_BYTES);
     if (
       bytes > MAX_QUEUED_BYTES ||
       pending.size >= MAX_PENDING_REQUESTS + (cleanup ? 8 : 0) ||

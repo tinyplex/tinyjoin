@@ -538,7 +538,8 @@ pub struct ValueRows {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ExecuteResult {
-    pub command: String,
+    /// The statement's command tag, one of a few fixed words.
+    pub command: &'static str,
     pub revision: u64,
     pub row_count: usize,
     pub fields: Vec<ResultField>,

@@ -439,7 +439,7 @@ impl<D: PageDevice> PagedEngine<D> {
                 .stage(&self.storage, changes, previous)?;
         }
         Ok(ExecuteResult {
-            command: outcome.command.to_owned(),
+            command: outcome.command,
             revision: self.storage.revision(),
             row_count: outcome.row_count,
             fields,
@@ -455,7 +455,7 @@ impl<D: PageDevice> PagedEngine<D> {
 
 fn execute_query_result(result: QueryResult) -> Result<ExecuteResult> {
     Ok(ExecuteResult {
-        command: "SELECT".to_owned(),
+        command: "SELECT",
         revision: result.revision,
         row_count: result.row_count(),
         fields: result.fields,
@@ -2328,7 +2328,7 @@ lines', true, '7')"#,
         assert_eq!(
             results
                 .iter()
-                .map(|result| result.command.as_str())
+                .map(|result| result.command)
                 .collect::<Vec<_>>(),
             ["CREATE TABLE", "INSERT", "CREATE INDEX", "SELECT"]
         );

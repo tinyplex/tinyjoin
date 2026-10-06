@@ -24,6 +24,7 @@ import {
   type SetSchemaOptions,
   type SqlResult,
   type StorageOptions,
+  type RpcMethods,
 } from '../protocol.js';
 import {clientError} from './error.js';
 import {createWorkerRpc, type ResultValidation, type WorkerRpc} from './rpc.js';
@@ -164,8 +165,13 @@ const SUPPORTED_OPTIONS = ['dataDir', 'worker', 'workerFactory', 'workerUrl'];
 const TRANSACTION_ACTIVE = 'TRANSACTION_ACTIVE';
 const OPFS_PREFIX = 'opfs://';
 const DATABASE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-const ROW_COUNT_COMMANDS = /^(?:DELETE|INSERT|SELECT|UPDATE)$/;
-const AFFECTED_ROW_COMMANDS = /^(?:DELETE|INSERT|UPDATE)$/;
+// The commands whose results carry a row count, and those whose count is the
+// rows they changed. A statement's command is one of a few short words, which
+// comparing costs less than a regular expression's test.
+const countsRows = (command: string): boolean =>
+  command === 'SELECT' || changesRows(command);
+const changesRows = (command: string): boolean =>
+  command === 'INSERT' || command === 'UPDATE' || command === 'DELETE';
 
 // A prepared statement's state lives here rather than on the statement itself,
 // so that a transaction can recognize a statement belonging to its own client
@@ -279,7 +285,7 @@ const createClient = (options: ClientOptions): Client => {
     direct(() =>
       rpc.request(
         'executePrepared',
-        {statementId, params, ...rowModeParam(options)},
+        preparedParams(statementId, params, undefined, options),
         readResults<RowType>,
       ),
     );
@@ -699,12 +705,7 @@ const createTransactionSession = (
       return track(
         rpc.request(
           'executePrepared',
-          {
-            statementId: state.statementId,
-            params,
-            transactionId,
-            ...rowModeParam(options),
-          },
+          preparedParams(state.statementId, params, transactionId, options),
           readResults<RowType>,
         ),
         state,
@@ -907,6 +908,24 @@ const rowModeParam = (
   options: QueryOptions | undefined,
 ): {rowMode?: 'array'} => (options?.rowMode === 'array' ? {rowMode: 'array'} : {});
 
+// The parameters of a prepared statement's execution: its array rows only when
+// asked for, so that the usual request is built without spreading anything.
+const preparedParams = (
+  statementId: number,
+  params: JsonValue[],
+  transactionId: string | undefined,
+  options: QueryOptions | undefined,
+): RpcMethods['executePrepared']['request'] => {
+  if (isUndefined(transactionId)) {
+    return options?.rowMode === 'array'
+      ? {statementId, params, rowMode: 'array'}
+      : {statementId, params};
+  }
+  return options?.rowMode === 'array'
+    ? {statementId, params, transactionId, rowMode: 'array'}
+    : {statementId, params, transactionId};
+};
+
 // The rows of a statement that returns none, such as an INSERT's.
 const NO_ROWS = '{"fields":[],"rows":[]}';
 
@@ -924,20 +943,28 @@ const toResults = <RowType>(result: SqlResult): Results<RowType> => {
       'The TinyJoin worker returned an invalid result for the requested operation',
     );
   }
-  return {
-    rows: data.rows as RowType[],
-    fields: data.fields as ResultField[],
-    affectedRows: AFFECTED_ROW_COMMANDS.test(result.command)
-      ? result.rowCount
-      : 0,
-    command: result.command,
-    ...(ROW_COUNT_COMMANDS.test(result.command)
-      ? {rowCount: result.rowCount}
-      : {}),
-    revision: result.revision,
-    tables: result.tables,
-    keys: result.keys,
-  };
+  const command = result.command;
+  const affectedRows = changesRows(command) ? result.rowCount : 0;
+  return countsRows(command)
+    ? {
+        rows: data.rows as RowType[],
+        fields: data.fields as ResultField[],
+        affectedRows,
+        command,
+        rowCount: result.rowCount,
+        revision: result.revision,
+        tables: result.tables,
+        keys: result.keys,
+      }
+    : {
+        rows: data.rows as RowType[],
+        fields: data.fields as ResultField[],
+        affectedRows,
+        command,
+        revision: result.revision,
+        tables: result.tables,
+        keys: result.keys,
+      };
 };
 
 const assertQueryOptions = (options: QueryOptions | undefined): void => {

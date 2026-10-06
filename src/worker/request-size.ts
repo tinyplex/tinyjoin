@@ -86,6 +86,60 @@ export const requestBytes = (value: unknown, limit: number): number => {
  * container's own properties are exactly its enumerable ones, which
  * Object.keys lists far faster than a for-in loop visits them.
  */
+/**
+ * {@link checkedRequestBytes} for a statement request whose parameters are a
+ * few scalars, as nearly every statement's are: charged exactly as the walk
+ * would charge them, without the walk. Any other request is walked.
+ */
+export const statementRequestBytes = (
+  request: {method: string; params: unknown},
+  limit: number,
+): number => {
+  const params = request.params as Record<string, unknown> | undefined;
+  const values = params?.params;
+  if (
+    (request.method === 'executePrepared' || request.method === 'executeSql') &&
+    params !== undefined &&
+    Array.isArray(values) &&
+    values.length <= 32
+  ) {
+    // The request object with its keys `v`, `id`, `method` and `params`, the
+    // numbers and the method's name; then the parameters object with its keys,
+    // each scalar value, and the array of parameters.
+    let bytes = 222 + request.method.length * 2;
+    for (const key of Object.keys(params)) {
+      const value = params[key];
+      bytes += 24 + key.length * 2;
+      if (key === 'params') {
+        bytes += 32;
+        continue;
+      }
+      if (typeof value === 'string') bytes += 16 + value.length * 2;
+      else if (
+        value === undefined ||
+        value === null ||
+        typeof value === 'boolean' ||
+        typeof value === 'number'
+      )
+        bytes += 8;
+      else return checkedRequestBytes(request, limit);
+    }
+    bytes += values.length * 8;
+    for (const value of values) {
+      if (typeof value === 'string') bytes += 16 + value.length * 2;
+      else if (
+        value === null ||
+        typeof value === 'boolean' ||
+        typeof value === 'number'
+      )
+        bytes += 8;
+      else return checkedRequestBytes(request, limit);
+    }
+    return bytes > limit ? limit + 1 : bytes;
+  }
+  return checkedRequestBytes(request, limit);
+};
+
 export const checkedRequestBytes = (value: unknown, limit: number): number => {
   if (
     !Number.isSafeInteger(limit) ||
