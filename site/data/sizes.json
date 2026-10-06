@@ -5,8 +5,8 @@
     "gzipLabel": "327 KiB"
   },
   "client": {
-    "raw": 17141,
-    "gzip": 6734,
+    "raw": 17128,
+    "gzip": 6745,
     "gzipLabel": "7 KiB"
   },
   "worker": {
@@ -15,8 +15,8 @@
     "gzipLabel": "16 KiB"
   },
   "total": {
-    "raw": 865487,
-    "gzip": 357206,
+    "raw": 865474,
+    "gzip": 357217,
     "gzipLabel": "349 KiB"
   }
 }

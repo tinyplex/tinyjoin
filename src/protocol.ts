@@ -271,14 +271,15 @@ const SQL_RESULT_KEYS = [
   'data',
 ] as const;
 
+// A response has exactly its four keys: each is checked by name, so counting
+// the keys is what confirms there is no other, without walking them.
 export const isWorkerResponse = (value: unknown): value is WorkerResponse =>
   isEnvelope(value) &&
   isRequestId(value.id) &&
+  objKeys(value).length === 4 &&
   (value.ok === true
-    ? hasExactKeys(value, ['v', 'id', 'ok', 'result'])
-    : value.ok === false &&
-      hasExactKeys(value, ['v', 'id', 'ok', 'error']) &&
-      isSerializedError(value.error));
+    ? objHasOwn(value, 'result')
+    : value.ok === false && isSerializedError(value.error));
 
 export const isWorkerEvent = (value: unknown): value is WorkerEvent =>
   isEnvelope(value) &&
@@ -646,13 +647,15 @@ const isResultField = (value: unknown): value is ResultField =>
 
 // A validation context also parses the rows' JSON text and walks every field
 // and row. The header-only pass leaves the text to whoever produced it.
+// Each of a result's keys is checked by name below, so counting them is what
+// confirms there is no other, without walking them.
 const isSqlResult = (
   value: unknown,
   validation?: JsonValidation,
 ): value is SqlResult =>
   (!validation || validation.step()) &&
   isRecord(value) &&
-  hasExactKeys(value, SQL_RESULT_KEYS) &&
+  objKeys(value).length === SQL_RESULT_KEYS.length &&
   isString(value.command) &&
   isCount(value.revision) &&
   isCount(value.rowCount) &&
