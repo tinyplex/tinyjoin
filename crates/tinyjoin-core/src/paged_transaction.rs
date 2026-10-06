@@ -337,6 +337,10 @@ impl PagedTransaction {
         let mut replaces = false;
         let count = changes.len();
         let mut previous = previous.into_iter();
+        // The table the last change named, with its place in `patched` and the entries the
+        // transaction already stages for it: a statement's changes name one table, which is
+        // looked up once rather than for every row.
+        let mut last: Option<(String, usize, Option<&BTreeMap<Vec<u8>, OverlayEntry>>)> = None;
         for change in changes {
             let held = previous.next().unwrap_or(PreviousRow::Unread);
             let (table, row, encoded) = match change {
@@ -361,8 +365,9 @@ impl PagedTransaction {
             };
             // A statement's only change needs nothing merged with it.
             if count == 1 {
+                let staged = self.entries.get(&table);
                 let (change, replaces) =
-                    self.first_change(storage, &table, &key, held, row, is_delete)?;
+                    self.first_change(storage, staged, &table, &key, held, row, is_delete)?;
                 let paged = storage.table(&table)?;
                 let indexes = storage.table_indexes(&table);
                 let entry = overlay_entry(storage, paged, &indexes, &key, change)?;
@@ -371,10 +376,18 @@ impl PagedTransaction {
                     replaces,
                 });
             }
-            let position = patched.partition_point(|(name, _)| *name < table);
-            if patched.get(position).is_none_or(|(name, _)| *name != table) {
-                patched.insert(position, (table.clone(), KeyedRows::default()));
-            }
+            let (position, staged) = match &last {
+                Some((name, position, staged)) if *name == table => (*position, *staged),
+                _ => {
+                    let position = patched.partition_point(|(name, _)| *name < table);
+                    if patched.get(position).is_none_or(|(name, _)| *name != table) {
+                        patched.insert(position, (table.clone(), KeyedRows::default()));
+                    }
+                    let staged = self.entries.get(&table);
+                    last = Some((table.clone(), position, staged));
+                    (position, staged)
+                }
+            };
             let entries = &mut patched[position].1;
             match entries.get_mut(&key) {
                 Some(slot) => {
@@ -390,7 +403,7 @@ impl PagedTransaction {
                 }
                 None => {
                     let (change, replaced) =
-                        self.first_change(storage, &table, &key, held, row, is_delete)?;
+                        self.first_change(storage, staged, &table, &key, held, row, is_delete)?;
                     replaces |= replaced;
                     entries.insert(key, change);
                 }
@@ -415,18 +428,21 @@ impl PagedTransaction {
     }
 
     /// A statement's first change to `key`, starting from the committed row of the entry it
-    /// replaces, or else the row planning read, or else the row the key holds; and whether it
-    /// replaces an entry the transaction staged before.
+    /// replaces, among those the transaction stages for the table, `staged`, or else the row
+    /// planning read, or else the row the key holds; and whether it replaces an entry the
+    /// transaction staged before.
+    #[allow(clippy::too_many_arguments)]
     fn first_change<D: PageDevice>(
         &self,
         storage: &PagedStorage<D>,
+        staged: Option<&BTreeMap<Vec<u8>, OverlayEntry>>,
         table: &str,
         key: &[u8],
         held: PreviousRow,
         row: PatchRow,
         is_delete: bool,
     ) -> Result<(PatchChange, bool)> {
-        let staged = self.entries.get(table).and_then(|entries| entries.get(key));
+        let staged = staged.and_then(|entries| entries.get(key));
         let base = match (staged, held) {
             (Some(entry), _) => entry.row.old.clone(),
             (None, PreviousRow::Read(row)) => row,
