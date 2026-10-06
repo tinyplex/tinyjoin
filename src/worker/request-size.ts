@@ -101,7 +101,7 @@ export const statementRequestBytes = (
     (request.method === 'executePrepared' || request.method === 'executeSql') &&
     params !== undefined &&
     Array.isArray(values) &&
-    values.length <= 32
+    values.length <= 4096
   ) {
     // The request object with its keys `v`, `id`, `method` and `params`, the
     // numbers and the method's name; then the parameters object with its keys,

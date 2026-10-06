@@ -160,11 +160,11 @@ impl KeyedRows<PlannedChange> {
     }
 }
 
-/// A planned change's row: a map, or a key a delete names, or the encoded key and record of a
-/// row planned straight into its stored entry.
+/// A planned change's row: a map, or a key a delete names, or the record of a row planned
+/// straight into its stored entry, whose encoded key comes with the change.
 enum PlannedRow {
     Map(Row),
-    Record(Vec<u8>, Vec<u8>),
+    Record(Vec<u8>),
 }
 
 /// The rows a write changes in one table, each with its encoded primary key, in key order.
@@ -883,21 +883,24 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         let mut previous = previous.into_iter();
         for change in input_changes {
             let held = previous.next().unwrap_or(PreviousRow::Unread);
-            let (row, is_delete) = match change {
-                RowChange::Upsert { row, .. } => (PlannedRow::Map(row), false),
-                RowChange::Delete { key, .. } => (PlannedRow::Map(key), true),
-                RowChange::Put { key, record, .. } => (PlannedRow::Record(key, record), false),
-                RowChange::Remove { key, .. } => (PlannedRow::Record(key, Vec::new()), true),
+            let (encoded, row, is_delete) = match change {
+                RowChange::Upsert { row, .. } => (None, PlannedRow::Map(row), false),
+                RowChange::Delete { key, .. } => (None, PlannedRow::Map(key), true),
+                RowChange::Put { key, record, .. } => {
+                    (Some(key), PlannedRow::Record(record), false)
+                }
+                RowChange::Remove { key, .. } => (Some(key), PlannedRow::Record(Vec::new()), true),
             };
             // A stored row planning held is the row the change's key holds, so its entry's key is
             // the change's encoded key.
-            let key = match (&row, &held) {
-                (PlannedRow::Record(key, _), _) => key.clone(),
-                (PlannedRow::Map(row), PreviousRow::Read(Some(HeldRow::Stored(entry)))) => {
+            let key = match (encoded, &row, &held) {
+                (Some(key), ..) => key,
+                (None, PlannedRow::Map(row), PreviousRow::Read(Some(HeldRow::Stored(entry)))) => {
                     debug_assert_eq!(entry.key(), encode_primary_key(&table.schema, row)?);
                     entry.key().to_vec()
                 }
-                (PlannedRow::Map(row), _) => encode_primary_key(&table.schema, row)?,
+                (None, PlannedRow::Map(row), _) => encode_primary_key(&table.schema, row)?,
+                (None, PlannedRow::Record(_), _) => unreachable!("a record comes with its key"),
             };
             let existing = changes.get_mut(&key);
             if !is_delete && existing.as_ref().is_some_and(|existing| existing.written) {
@@ -912,7 +915,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                     Some(encode_row(&table.schema, &row)?),
                     estimated_row_bytes(&row)?,
                 ),
-                PlannedRow::Record(_, record) => {
+                PlannedRow::Record(record) => {
                     let bytes = estimated_record_bytes(&table.record(&key, &record)?)?;
                     (Some(record), bytes)
                 }

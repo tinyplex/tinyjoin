@@ -175,6 +175,22 @@ class RequestWriter {
     this.#operations = checkedIncrement(this.#operations, MAX_OPERATIONS);
   }
 
+  /** Counts `count` scalar values at the top level, as a node and an operation each. */
+  scalars(count: number): void {
+    const nodes = this.#nodes + count;
+    const operations = this.#operations + count;
+    if (
+      !isCount(nodes) ||
+      nodes > MAX_NODES ||
+      !isCount(operations) ||
+      operations > MAX_OPERATIONS
+    ) {
+      throw resourceLimit();
+    }
+    this.#nodes = nodes;
+    this.#operations = operations;
+  }
+
   /**
    * The request written, which stays valid only until the next is begun. A
    * buffer grown for an unusually large request is let go afterwards.
@@ -258,6 +274,11 @@ const writeJsonValues = (
   }
   request.vector(length, RUST_VALUE_BYTES);
   writeCount(request, length);
+  // A statement's parameters are nearly always scalars, which are written in one pass that
+  // counts them once; any other array takes each value as it comes.
+  if (depth === 0 && writeScalars(request, input)) {
+    return;
+  }
   for (let index = 0; index < length; index += 1) {
     const item: unknown = input[index];
     if (isUndefined(item)) {
@@ -265,6 +286,43 @@ const writeJsonValues = (
     }
     writeJsonValue(request, item, depth);
   }
+};
+
+/** Writes an array of scalars, exactly as {@link writeJsonValue} writes each, or writes nothing and
+ * reports `false` when a value is not a scalar. */
+const writeScalars = (request: RequestWriter, values: unknown[]): boolean => {
+  const length = values.length;
+  for (let index = 0; index < length; index += 1) {
+    const item: unknown = values[index];
+    if (
+      !(
+        item === null ||
+        typeof item === 'boolean' ||
+        typeof item === 'string' ||
+        (isNumber(item) && isFiniteNumber(item))
+      )
+    ) {
+      return false;
+    }
+  }
+  request.scalars(length);
+  for (let index = 0; index < length; index += 1) {
+    const item = values[index] as null | boolean | number | string;
+    if (item === null) {
+      request.u8(JSON_NULL);
+    } else if (item === false) {
+      request.u8(JSON_FALSE);
+    } else if (item === true) {
+      request.u8(JSON_TRUE);
+    } else if (typeof item === 'number') {
+      request.u8(isSafeInteger(item) ? JSON_I64 : JSON_F64);
+      request.number(item);
+    } else {
+      request.u8(JSON_STRING);
+      request.string(item);
+    }
+  }
+  return true;
 };
 
 const writeJsonValue = (

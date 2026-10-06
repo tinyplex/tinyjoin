@@ -1011,9 +1011,36 @@ impl<D: PageDevice> PagedStorage<D> {
     /// `base` the committed row the change replaces. The catalog operations charged once per
     /// changed table are left to [`Self::write_set_usage`], and conflicts between claims to the
     /// caller.
+    #[cfg(test)]
     pub(crate) fn change_cost(
         &self,
         table_name: &str,
+        row: ChangeRow<'_>,
+        is_delete: bool,
+        key: &[u8],
+        base: Option<&HeldRow>,
+    ) -> Result<ChangeCost> {
+        let table = self
+            .tables
+            .get(table_name)
+            .ok_or_else(|| EngineError::table_not_found(table_name))?;
+        let indexes = self.table_indexes(table_name);
+        self.change_cost_in(table, &indexes, row, is_delete, key, base)
+    }
+
+    /// The indexes on `table`, which a statement changing many rows finds once for all of them.
+    pub(crate) fn table_indexes(&self, table: &str) -> Vec<&PagedIndex> {
+        self.indexes
+            .values()
+            .filter(|index| index.definition.table == table)
+            .collect()
+    }
+
+    /// [`Self::change_cost`] for a change to `table`, whose indexes are `indexes`.
+    pub(crate) fn change_cost_in(
+        &self,
+        table: &PagedTable,
+        indexes: &[&PagedIndex],
         row: ChangeRow<'_>,
         is_delete: bool,
         key: &[u8],
@@ -1023,15 +1050,8 @@ impl<D: PageDevice> PagedStorage<D> {
         #[cfg(test)]
         self.validated_row_count
             .set(self.validated_row_count.get() + 1);
-        let table = self
-            .tables
-            .get(table_name)
-            .ok_or_else(|| EngineError::table_not_found(table_name))?;
-        let indexes = self
-            .indexes
-            .values()
-            .filter(|index| index.definition.table == table_name)
-            .collect::<Vec<_>>();
+        let table_name = table.schema.name.as_str();
+        // A table without indexes, as most are, borrows an empty list.
         let definitions = indexes
             .iter()
             .map(|index| &index.definition)

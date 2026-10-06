@@ -14,7 +14,9 @@ use crate::{
         EMPTY_RECORD, IndexEntryLayout, PrimaryKey, RecordLayout, encode_primary_key, encode_row,
     },
     paged_script::{ChangedRow, KeyedRows, TableChanges, held_row_bytes},
-    paged_storage::{ChangeCost, ChangeRow, PagedTable, PagedWriteUsage, batch_too_large},
+    paged_storage::{
+        ChangeCost, ChangeRow, PagedIndex, PagedTable, PagedWriteUsage, batch_too_large,
+    },
     query::Filter,
     row::{HeldRow, RowRef},
     statement::PreviousRow,
@@ -361,7 +363,9 @@ impl PagedTransaction {
             if count == 1 {
                 let (change, replaces) =
                     self.first_change(storage, &table, &key, held, row, is_delete)?;
-                let entry = overlay_entry(storage, storage.table(&table)?, &table, &key, change)?;
+                let paged = storage.table(&table)?;
+                let indexes = storage.table_indexes(&table);
+                let entry = overlay_entry(storage, paged, &indexes, &key, change)?;
                 return Ok(OverlayPatch {
                     entries: vec![(table, vec![(key, entry)])],
                     replaces,
@@ -398,10 +402,11 @@ impl PagedTransaction {
         };
         for (table, changes) in patched {
             let paged = storage.table(&table)?;
+            let indexes = storage.table_indexes(&table);
             let changes = changes.into_sorted();
             let mut entries = Vec::with_capacity(changes.len());
             for (key, change) in changes {
-                let entry = overlay_entry(storage, paged, &table, &key, change)?;
+                let entry = overlay_entry(storage, paged, &indexes, &key, change)?;
                 entries.push((key, entry));
             }
             patch.entries.push((table, entries));
@@ -591,12 +596,13 @@ impl PagedTransaction {
 fn overlay_entry<D: PageDevice>(
     storage: &PagedStorage<D>,
     table: &PagedTable,
-    table_name: &str,
+    indexes: &[&PagedIndex],
     key: &[u8],
     change: PatchChange,
 ) -> Result<OverlayEntry> {
     let PatchChange { base, row, .. } = change;
     let schema = &table.schema;
+    let table_name = schema.name.as_str();
     let is_delete = matches!(row, PatchRow::Delete(_));
     // A planned map is encoded here; a planned record already was, and is measured in place.
     let (next, map) = match row {
@@ -628,7 +634,7 @@ fn overlay_entry<D: PageDevice>(
                 (None, Some(record)) => ChangeRow::Record(record, row_bytes),
                 (None, None) => unreachable!("a change without a map is a record"),
             };
-            storage.change_cost(table_name, row, is_delete, key, base.as_ref())
+            storage.change_cost_in(table, indexes, row, is_delete, key, base.as_ref())
         })
         .transpose()?;
     Ok(OverlayEntry {
