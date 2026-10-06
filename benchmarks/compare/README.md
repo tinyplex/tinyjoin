@@ -21,6 +21,11 @@ npm run bench:compare -- --help
 - `run.mjs` builds the page with Vite, serves it, drives Chromium, and prints
   medians. `--publish` writes the results to `site/data/benchmarks.json` for
   the website; `--out` saves any run's report.
+- `probes.mjs` holds the CPU probe the runner waits on before each round and
+  the flush probe it waits on before each sample, which on macOS issues the
+  flush Chromium's OPFS flush issues, through `flush-probe.py`; `orders.mjs`
+  gives each round its engine order. `--probe 60` times the probes alone for a
+  minute, to see whether the machine is quiet before a long run.
 
 The docs build also summarizes the published results in
 `docs/benchmark-card.html`, a 1600x900 card to share, from the template in

@@ -13,6 +13,7 @@ import {readFileSync} from 'node:fs';
 
 type Result = {
   samples: number[];
+  flushMs?: (number | null)[];
   median?: number;
   min?: number;
   max?: number;
@@ -333,6 +334,47 @@ const environment = (report: Report): string => {
   );
 };
 
+const count = (n: number, noun: string): string =>
+  `${n} ${noun}${n == 1 ? '' : 's'}`;
+
+// What the runner's probes read in the run shown, from whichever fields the
+// report holds: one made before the flush probe existed has only the CPU
+// probe's first three figures, and one whose flush probe failed before the
+// run started has no baseline for it.
+const probes = (report: Report): string => {
+  const {cpuProbe, flushProbe} = report.environment;
+  if (cpuProbe == null) {
+    return '';
+  }
+  const sentences = [
+    `In the run shown, the CPU probe took ${formatMs(cpuProbe.baselineMs)} ` +
+      `at the start and ${formatMs(cpuProbe.slowestMs)} at its slowest, ` +
+      `and the runner waited ${cpuProbe.waitedSeconds} s in all for the CPU` +
+      (cpuProbe.unrecoveredRounds
+        ? `, and ${count(cpuProbe.unrecoveredRounds, 'round')} began ` +
+          'before it had recovered.'
+        : '.'),
+  ];
+  if (flushProbe?.baselineMs != null) {
+    sentences.push(
+      'A write and flush usually took ' +
+        `${formatMs(flushProbe.referenceMs ?? flushProbe.baselineMs)}, and ` +
+        `${formatMs(flushProbe.slowestMs)} at its slowest, and the runner ` +
+        `waited ${flushProbe.waitedSeconds} s in all for the disk` +
+        (flushProbe.unrecoveredSamples
+          ? `, and ${count(flushProbe.unrecoveredSamples, 'sample')} began ` +
+            'before it had recovered'
+          : '') +
+        (flushProbe.gaveUp ? ', and the runner gave up waiting on it' : '') +
+        (flushProbe.approximate
+          ? '; the flush timed was a full flush of the drive rather than ' +
+            'the barrier the engines issue.'
+          : '.'),
+    );
+  }
+  return sentences.join(' ');
+};
+
 const renderText = (report: Report, name: string): string => {
   switch (name) {
     case 'versions':
@@ -343,6 +385,8 @@ const renderText = (report: Report, name: string): string => {
       return environment(report);
     case 'placings':
       return placings(report);
+    case 'probes':
+      return probes(report);
     default:
       throw new Error(`Unknown benchmark placeholder: ${name}`);
   }

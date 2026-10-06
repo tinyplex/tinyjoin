@@ -117,7 +117,8 @@ engine.
   commit, and writes only the pages the insert changed and the superblock. It
   takes about a tenth less time than PGlite's commits, and about a quarter as
   long as SQLite's. Its time is mostly the flushes, so it varies most of any
-  workload with the state of the disk.
+  workload with the state of the disk, which is why the runner waits for a
+  flush to run at its usual latency before each sample.
 - **Reopening** reads the database's catalog rather than every row, so a
   populated database reopens in under three-fifths of SQLite's time, and a
   large one as quickly as a small one. The full check of every row and index
@@ -192,12 +193,27 @@ Every sample launches Chromium with a fresh profile in a new temporary
 directory. The profile is on disk, not an incognito context, whose storage would
 be held in memory. No engine ever sees another's files or warm caches, and a
 sample that exceeds the time limit can be killed without affecting the next.
-Engines take turns within each round of samples, and each round starts with
-the next engine, so gradual changes in machine load affect them equally. Before
+Engines take turns within each round of samples, in an order that changes every
+round through every arrangement of the three, so that no engine always follows
+the same one and gradual changes in machine load affect them equally. Before
 each round, the runner times a short computation, and waits until it runs
 within 5% of its time at the start: a laptop slows as it heats over a long run,
 and background work takes its cores, and either would otherwise weigh on
 whichever workloads ran then.
+
+Before each sample, once the previous sample's profile has been deleted, the
+runner also times a small write and flush to the disk that holds the browser
+profiles, and waits until it runs at its usual latency. A flush takes its turn
+in the drive's queue behind whatever else is being written to the volume, so
+deleting a profile, which for PGlite holds a pool of many files, or other work
+on the disk can slow every engine's commits for seconds at a time, which the
+computation would not show. The flush it times is the one the engines pay for:
+on macOS, Chromium's OPFS flush is a barrier that orders the drive's queue, not
+a full flush of its cache. The wait is capped, and the report records how many
+samples began regardless, whether the runner gave up waiting, and the reading
+taken before each sample.
+
+{{benchmarks.probes}}
 
 In each sample, the harness opens a new database, runs the workload's untimed
 setup, and then times only the workload itself with performance.now(). Setup
@@ -263,8 +279,10 @@ its zlib. A full run of nine samples takes about ten minutes on the machine
 above. Close other applications, pause background work such as photo library
 analysis, and avoid concurrent builds or tests while it runs: a busy machine
 slows every engine, and a burst of load can land on some workloads and not
-others. The runner prints how long its CPU probe took at the start and at its
-slowest, and how long it waited for the CPU to recover.
+others. The runner prints how long its CPU and flush probes took at the start
+and at their slowest, and how long it waited for each to recover. `--probe 60`
+times both once a second for a minute without running anything else, which
+shows whether the machine is quiet before a long run.
 
 `--publish` requires the full suite and writes every sample, the environment,
 and the list of downloaded files to `site/data/benchmarks.json`, from which the

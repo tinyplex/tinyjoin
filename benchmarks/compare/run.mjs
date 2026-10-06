@@ -9,6 +9,9 @@ import {fileURLToPath} from 'node:url';
 import {parseArgs} from 'node:util';
 import {brotliCompressSync, constants, gzipSync} from 'node:zlib';
 
+import {roundOrders} from './orders.mjs';
+import {createCpuProbe, createFlushProbe, createNodeFlushProbe, createSettler} from './probes.mjs';
+
 // Compares TinyJoin with SQLite (opfs-sahpool) and PGlite (opfs-ahp), each
 // running in a Worker and storing to OPFS in a real Chromium profile. Every
 // sample gets a fresh browser profile on disk, so storage is never shared, and
@@ -43,6 +46,7 @@ const {values: options} = parseArgs({
     timeout: {type: 'string', default: '60'},
     out: {type: 'string'},
     publish: {type: 'boolean', default: false},
+    probe: {type: 'string'},
     help: {type: 'boolean', default: false},
   },
 });
@@ -55,7 +59,45 @@ if (options.help) {
   --timeout s        seconds before a sample is abandoned (default: 60)
   --out file         write the full JSON report
   --publish          full default run, written to
-                     site/data/benchmarks.json`);
+                     site/data/benchmarks.json
+  --probe s          time the CPU and flush probes once a second for s
+                     seconds, and exit`);
+  process.exit(0);
+}
+
+// Times the probes alone, once a second, with no build, servers, or browser: whether the machine
+// is quiet before a long run, and what each probe reads on it, which is what the flush gate's
+// tolerance is set from. The flush probe should read near what an engine's commit flush costs,
+// which documentation/performance-plan.md records; Node's fsync, a full flush of the drive's
+// cache on macOS, is timed beside it for reference only.
+if (options.probe) {
+  if (options.publish) throw new Error('--probe times the probes alone, and cannot be combined with --publish');
+  const seconds = Number(options.probe);
+  if (!(seconds >= 1)) throw new Error('--probe takes a number of seconds');
+  const probes = [createCpuProbe(), await createFlushProbe(tmpdir()), await createNodeFlushProbe(tmpdir())];
+  const [, flush, fsync] = probes;
+  const quietest = probes.map(() => Infinity);
+  const slowest = probes.map(() => 0);
+  try {
+    console.log(`Flush probe: ${flush.primitive}${flush.approximate ? ' (approximate)' : ''}. Node's fsync: ${fsync.primitive}.`);
+    for (let second = 1; second <= seconds; second++) {
+      const readings = [];
+      for (const [index, probe] of probes.entries()) {
+        const ms = await probe.probe();
+        readings.push(ms);
+        quietest[index] = Math.min(quietest[index], ms);
+        slowest[index] = Math.max(slowest[index], ms);
+      }
+      console.log(`${String(second).padStart(4)} s  cpu ${readings[0].toFixed(1)} ms  flush ${readings[1].toFixed(3)} ms  fsync ${readings[2].toFixed(3)} ms`);
+      if (second < seconds) await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    for (const [index, probe] of probes.entries()) {
+      console.log(`${probe.name[0].toUpperCase()}${probe.name.slice(1)}: ${quietest[index]} ms at its quietest, ${slowest[index]} ms at its slowest`);
+    }
+  } finally {
+    await flush.close();
+    await fsync.close();
+  }
   process.exit(0);
 }
 
@@ -268,57 +310,56 @@ const save = async () => {
   if (options.out) await writeFile(resolve(options.out), text);
 };
 
-// A fixed computation, timed to tell whether the CPU still runs at the speed it started at. A
-// fanless laptop slows as it heats over a long run, and background work takes its cores; either
-// would weigh on whichever samples ran then.
-// Each result is stored, so that the computation cannot be optimized away.
-const probeSink = new Int32Array(1);
-const probe = () => {
-  let best = Infinity;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const start = performance.now();
-    let x = 0x9e3779b9 | 0;
-    let sum = 0;
-    for (let i = 0; i < 10_000_000; i++) {
-      x ^= x << 13;
-      x ^= x >>> 17;
-      x ^= x << 5;
-      sum = (sum + (x & 0xff)) | 0;
-    }
-    best = Math.min(best, performance.now() - start);
-    probeSink[0] ^= sum;
-  }
-  return Math.round(best * 10) / 10;
-};
-const cpu = {baselineMs: probe(), slowestMs: 0, waitedSeconds: 0};
-report.environment.cpuProbe = cpu;
-// Waits, for at most a minute, until the probe runs within 5% of its first time.
-const coolDown = async () => {
-  for (let waited = 0; ; waited += 5) {
-    const ms = probe();
-    cpu.slowestMs = Math.max(cpu.slowestMs, ms);
-    if (ms <= cpu.baselineMs * 1.05 || waited >= 60) return;
-    cpu.waitedSeconds += 5;
-    await new Promise((resolve) => setTimeout(resolve, 5000));
-  }
-};
+// The runner waits on two probes from probes.mjs. The CPU probe runs before each round, within
+// 5% of its time at the start, stepping every 5 s for at most a minute, as before, and is never
+// given up on, since its minute of waiting cools the laptop whether or not the probe comes back
+// within tolerance. The flush probe runs before each sample, within half again of its reference
+// or a tenth of a millisecond more, whichever is the larger, since its readings are small and
+// noisier than a computation's; it steps every second and gives up after 15 s, as the stretches
+// it waits out last a few seconds. Its baseline is the median of five windows a second apart, so
+// that a stretch under way as the run starts does not become the reference, and its reference
+// may fall to a quieter reading that a later reading repeats, but not below two-thirds of the
+// baseline, so that no sample is held to less than the baseline itself. Once five samples in a
+// row have begun before it recovered, the runner stops waiting on it, reads it once before each
+// sample, and says so in the report.
+const cpu = await createSettler(createCpuProbe(), {tolerance: (ms) => ms * 1.05, stepSeconds: 5, maxSeconds: 60, counter: 'unrecoveredRounds'});
+const flushProbe = await createFlushProbe(tmpdir());
+const flush = await createSettler(flushProbe, {
+  tolerance: (ms) => Math.max(ms * 1.5, ms + 0.1),
+  floor: (baselineMs) => baselineMs / 1.5,
+  stepSeconds: 1,
+  maxSeconds: 15,
+  giveUpAfter: 5,
+  reference: 'repeated',
+  counter: 'unrecoveredSamples',
+  baselineWindows: 5,
+  baselineGapSeconds: 1,
+});
+// The settlers' live state, so that each save() writes the current figures.
+report.environment.cpuProbe = cpu.report();
+report.environment.flushProbe = flush.report();
+const orders = roundOrders(engines, samples);
 
 try {
   for (const workload of ALL.filter(({id}) => selected.includes(id))) {
     const entry = {...workload, engines: {}};
     report.results.push(entry);
     const abandoned = new Set();
-    for (const engine of engines) entry.engines[engine] = {samples: []};
-    // Engines alternate within each round, each round starting with the next engine, so drift
-    // affects them equally, and no engine always follows the same one.
+    for (const engine of engines) entry.engines[engine] = {samples: [], flushMs: []};
+    // The engines' order changes every round, through every arrangement of them, so that no
+    // engine always follows the same one and drift affects them equally; see orders.mjs. The CPU
+    // gate runs before each round, and the flush gate before each sample, once the previous
+    // sample's profile has been removed; its first reading is kept beside the sample it preceded.
     for (let round = 0; round < samples; round++) {
-      await coolDown();
-      const order = engines.map((_, index) => engines[(index + round) % engines.length]);
-      for (const engine of order.filter((engine) => !abandoned.has(engine))) {
+      const label = `${workload.id} round ${round + 1}`;
+      await cpu.settle(label);
+      for (const engine of orders[round].filter((engine) => !abandoned.has(engine))) {
         const result = entry.engines[engine];
+        const {ms: flushMs} = await flush.settle(`${engine} ${label}`);
         try {
           const {ms, info, check, download} = await sample(engine, workload.id);
           result.samples.push(Math.round(ms * 100) / 100);
+          result.flushMs.push(flushMs);
           result.check = check;
           if (info?.engineVersion) report.engines[engine].engineVersion = info.engineVersion;
           if (download) report.download[engine] = download;
@@ -343,9 +384,21 @@ try {
   }
 } finally {
   for (const server of servers) server.close();
+  await flushProbe.close();
 }
 
-console.log(`\nCPU probe: ${cpu.baselineMs} ms at the start, ${cpu.slowestMs} ms at its slowest, ${cpu.waitedSeconds} s spent cooling down`);
+const cpuState = cpu.report();
+console.log(`\nCPU probe: ${cpuState.baselineMs} ms at the start, ${cpuState.slowestMs} ms at its slowest, ${cpuState.waitedSeconds} s spent cooling down, ${cpuState.unrecoveredRounds} rounds started slow`);
+const flushState = flush.report();
+console.log(
+  `Flush probe (${flushState.primitive}${flushState.approximate ? ', approximate' : ''}): ` +
+    (flushState.baselineMs == null
+      ? `failed before the run started: ${flushState.fault}`
+      : `${flushState.baselineMs} ms a flush at the start, ${flushState.referenceMs} ms its reference at the end, ${flushState.slowestMs} ms at its slowest, ` +
+        `${flushState.waitedSeconds} s spent waiting for the disk, ${flushState.unrecoveredSamples} samples started slow` +
+        (flushState.gaveUp ? ', and the runner stopped waiting on it' : '') +
+        (flushState.fault ? `; the probe failed: ${flushState.fault}` : '')),
+);
 const kib = (bytes) => `${(bytes / 1024).toLocaleString('en-US', {maximumFractionDigits: 0})} KiB`;
 console.log('\nDownload (gzip):', engines.filter((engine) => report.download[engine]).map((engine) => `${engine} ${kib(report.download[engine].gzip)}`).join(', ') || 'not measured');
 console.log('\nMedians, and TinyJoin relative to the fastest engine:\n');

@@ -512,6 +512,49 @@ Found along the way, 6 and 7 October:
   whole leaves and writes 10 pages; committing one insert writes about four
   pages and flushes, and an OPFS flush costs 0.35-0.4 ms, which is nearly all
   of that workload's 431 µs per statement.
+- The slow `insert-autocommit` samples in the two runs discarded on 7
+  October were the ones that followed the deletion of a PGlite profile. Within
+  a round the engines ran in a fixed rotation of TinyJoin, SQLite, PGlite, so
+  TinyJoin followed PGlite in six rounds of nine, and in both runs those
+  twelve samples took 909-1,150 ms, bar one in each run at about 500, against
+  372-414 ms for the four that followed SQLite across a round boundary within
+  the workload; the first sample of each run, which followed the previous
+  workload's last SQLite sample, was slow too (798 and 1,026 ms), so the
+  deletion explains the pattern within the workload but not the workload's
+  first sample. SQLite's two slow samples in each run (2,705 and 1,824 ms,
+  then 2,360 and 1,698) were among the three that followed PGlite across a
+  boundary, and PGlite, which never followed itself, kept its medians (464
+  and 459 ms), though it had slow samples of its own. A two-engine run fitted
+  the same rule in eleven samples of twelve. PGlite's `opfs-ahp` creates a
+  pool of 1,000 OPFS files when it initializes, so removing its profile is by
+  far the heaviest deletion in the suite, and the next sample's flushes pay
+  for it for a few seconds. Those two runs were not quiet otherwise either:
+  their CPU probe reached 96 and 85.6 ms against a baseline of 18, where the
+  kept runs reached 22-26. The runner now waits on a flush probe before each
+  sample and uses every arrangement of the engines across rounds, as the
+  benchmarks guide describes. The flush it times is the one the engines pay
+  for, read in Chromium's source on 7 October (its main branch, not the
+  harness's version; the change dates from 2019, https://crrev.com/c/1400159,
+  so Chromium 153 has it):
+  `FileSystemSyncAccessHandle::flush()` calls `file_delegate()->Flush()`,
+  `FileSystemAccessRegularFileDelegate::Flush()` is `backing_file_.Flush()`,
+  and `base::File::Flush()` is `fcntl(F_BARRIERFSYNC)` with `fsync` as the
+  fallback on Apple platforms, and `fdatasync` on Linux. Node's `fs.fsync`
+  cannot be asked for the barrier: `uv__fs_fsync` in `src/unix/fs.c` of
+  libuv 1.52.1, the libuv Node 24.21.0 bundles, tries `F_FULLFSYNC`, then the
+  barrier, then `fsync`; the macOS SDK's `sys/fcntl.h` defines `F_FULLFSYNC`
+  as 51 and `F_BARRIERFSYNC` as 85, and python's `fcntl` module names only the
+  first, so the probe's helper passes 85. Timed here with a 16 KiB write, a
+  barrier takes about 0.3-0.6 ms, a full flush and Node's `fsync` alike about
+  3 ms, and a plain `fsync` 0.03 ms. PGlite's `opfs-ahp` flushes by calling
+  flush() on each of its access handles, read in its `dist/fs/opfs-ahp.js`;
+  SQLite's `opfs-sahpool` xSync was not read. Creating 1,000 files of 40 KiB
+  on the same volume and deleting them, whether unflushed within a tenth of a
+  second or each flushed with the barrier and deleted three seconds later, did
+  not move the barrier probe from its 0.35-0.5 ms, so file churn alone does
+  not reproduce what a PGlite profile's deletion did to the sample after it;
+  the readings the runner keeps beside each sample will show whether the
+  probe sees it.
 
 Remaining, in order of expected value:
 
