@@ -1,5 +1,6 @@
 #![deny(unreachable_pub)]
 
+mod mem;
 mod page_device;
 mod structured;
 
