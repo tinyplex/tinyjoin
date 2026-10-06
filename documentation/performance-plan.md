@@ -135,6 +135,19 @@ the fastest engine in 10 of the 20 workloads and second in the rest. In
 memory, committing each insert alone fell from 90 microseconds to 83, creating
 indexes by 12%, and the `LIKE` delete by 10%.
 
+The `f91bee22` run, published on 6 October after the night's work below,
+with SQLite's log-sum at 74.55, among the lowest yet: TinyJoin was the
+fastest engine in 11 of the 20 workloads and second in the rest, never the
+slowest, at most 1.41 times the faster engine. Range aggregates without an
+index fell from 1.06 times SQLite's time to 0.58, `LIKE` aggregates from 0.80
+to 0.50, a transaction's range `UPDATE`s from 1.28 to 0.82, and 200-row
+inserts from 1.10 to 1.06; updates, upserts and deletes by key stayed at 1.3
+to 1.4, and inserts in a transaction at 1.25 to 1.3. Single committed inserts,
+which a run on `6cb477fe` an hour earlier (SQLite's log-sum 74.43, the lowest
+yet) had at 0.91 of PGlite's time, came out at 1.04 in this one: that
+flush-bound workload moves by a tenth between runs. The compressed download
+is 348 KiB.
+
 Done:
 
 - Phase 0, the native benchmark.
@@ -374,6 +387,51 @@ Found along the way:
   8,000-row range delete takes 10 ms the first time and 5.6 once warm, and 7.3
   after the warm-up Worker's statements, which touch its paths too lightly to
   optimize them.
+
+- A filter's simple terms, comparisons of an INTEGER or TEXT column with
+  constants, `LIKE` patterns, and `IS NULL` tests, compile into record tests,
+  which a table scan applies to each leaf's cells in one pass over the leaf's
+  bytes, with the record's offsets, null bits and short integers read in
+  place and literal `LIKE` segments matched as bytes, and only the accepted
+  rows are decoded and presented. The scan charges the caller's row bound a
+  leaf at a time. Engine-only, 100 range aggregates fell from 46 ms to 20, 100
+  `LIKE` aggregates from 111 to 71, and 100 range `UPDATE`s from 58 to 31.
+- A prepared statement of one of four shapes, a lone INSERT, an upsert on the
+  primary key, an UPDATE or a DELETE of the row a primary-key equality names,
+  or an INSERT of listed rows, keeps a point template, and inside a transaction
+  is planned from the template and its parameters directly, without binding
+  the syntax tree or the general planner's validation and scanning; a test
+  stages the same statements both ways and compares the transactions.
+  Engine-only, inserts in a transaction took a fifth less time, updates by key
+  a fifth less, upserts a third less, and 200-row inserts a quarter less.
+- The WebAssembly build provides `memcmp` and `bcmp` that compare eight bytes
+  at a time; the builtins' byte loops had been 19% of a 200-row insert's time
+  under baseline compilation.
+- The client shapes results and requests without regular expressions or
+  spreads, the Worker sizes scalar parameters by shape and writes them in one
+  pass, and the validators count keys rather than walking them: warm in
+  Chromium, an update by key spent 1.7 µs less in the Worker and 1.1 µs less
+  on the page.
+
+Found along the way, 6 and 7 October:
+
+- Warm in Chromium (measured with a page-and-Worker profiler harness), an
+  update by key in a transaction costs TinyJoin about 22 µs against SQLite's
+  17.5, of which about 12 µs in each is the message exchange itself: one
+  `postMessage` each way, their serialization and dispatch, and 4-6 µs in
+  which neither thread runs. TinyJoin's WebAssembly takes 5.3 µs against
+  SQLite's 1.4, and its page-side JavaScript 3.5 against 1.2; SQLite pays
+  1.6 µs per statement writing its rollback journal, which TinyJoin defers to
+  the commit. Only sending fewer messages per statement can remove the floor:
+  a shared-memory channel measured 13.6 → 8.7 µs per round trip, but needs
+  cross-origin isolation.
+- The benchmark's 1,000-statement phases run mostly baseline-compiled
+  WebAssembly: V8 optimizes a function only once about 13 MB of its code has
+  executed, so TinyJoin's many small functions stay in Liftoff for the whole
+  phase, where they run 1.7-1.9 times slower than optimized, while SQLite's
+  few large functions cross the budget almost at once. Running thousands of
+  point statements in the warm-up Worker first did not change the browser
+  numbers.
 
 Remaining, in order of expected value:
 

@@ -5,6 +5,71 @@ compatibility boundaries. Every entry states what upgrading to it requires, so
 check the entries between the version in use and the target before upgrading.
 A release that needs no action says so explicitly.
 
+## v0.6.0 (unreleased)
+
+This release makes the engine faster across the
+[comparative benchmarks](/guides/benchmarks/), with no change to the API or to
+the storage format. With OPFS storage, TinyJoin is the fastest of the three
+engines in 11 of the 20 timed workloads and second in the other nine, never
+the slowest, and where it is second it takes at most 1.4 times as long as the
+faster engine, down from 1.5. Range aggregates and `LIKE` scans take about
+half the time they did, a transaction's range `UPDATE`s a third less, and
+200-row inserts about what SQLite's take.
+
+### Scanning rows
+
+A `WHERE` clause's simple terms, those that compare an `INTEGER` or `TEXT`
+column with constants, match a `LIKE` pattern, or test for `NULL`, are
+compiled into tests of the stored record, and a table scan applies them to
+each leaf's rows in one pass over the leaf's bytes, decoding and presenting
+only the rows they accept. A `LIKE` pattern of literal segments is matched as
+bytes. In the benchmark, 100 range aggregates without an index fell from 48 ms
+to 25, 100 `LIKE` aggregates from 113 ms to 70, and a transaction's 100 range
+`UPDATE`s from 62 ms to 41.
+
+### Writing rows by key
+
+A prepared `INSERT`, including one of many listed rows, a lone upsert on the
+primary key, and an `UPDATE` or `DELETE` of the row a primary-key equality
+names, run inside a transaction, is planned straight from its template and
+parameters: its key is encoded from them, the row looked up once, and the
+change built as the record a commit writes, rather than binding the
+statement's syntax tree and planning it as any statement is. A test stages
+the same statements both ways and checks that the transactions, the results,
+and the committed databases agree. Staging then looks a statement's table up
+once rather than for every row. Engine-only, 10,000 inserts in a transaction
+take a fifth less time, updates by key a fifth less, upserts a third less, and
+200-row inserts a quarter less.
+
+### Comparing memory
+
+The WebAssembly build compares memory eight bytes at a time, in place of the
+byte loops the compiler provides, which nearly every comparison of keys in a
+B-tree search, a sort, or a transaction's staged rows ran. It matters most
+before V8 has optimized the code, when a statement over many rows runs the
+loop for every one of them: under baseline compilation, 10,000 inserts in a
+transaction take 14% less time, and creating two indexes 18% less.
+
+### The client and the Worker
+
+A result's command is one of a few fixed words, kept as a static string and
+compared rather than tested against regular expressions; the client builds a
+prepared execution's request in its exact shape; the Worker sizes a
+statement's scalar parameters by their shape and writes them into its request
+in one pass; and a response's keys are counted rather than walked where each
+is checked by name. Warm in Chromium, an update by key in a transaction spends
+about 2 µs less in the Worker's JavaScript and 1 µs less in the page's.
+
+### Download size
+
+The compressed download is now {{sizes.total.gzip}}, up from 339 KiB in
+v0.5.0, for the record tests, the point planner, and the word-wise
+comparison.
+
+### Upgrading from v0.5.0
+
+Nothing is required: the API and the storage format are unchanged.
+
 ## v0.5.0
 
 This release connects TinyJoin to the [Drizzle ORM](https://orm.drizzle.team)

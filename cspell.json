@@ -61,6 +61,8 @@
     "linejoin",
     "llms",
     "lparen",
+    "bcmp",
+    "memcmp",
     "memcpy",
     "menustate",
     "microbatches",

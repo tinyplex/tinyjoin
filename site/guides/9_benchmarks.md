@@ -7,13 +7,13 @@ and are driven from the page by the same workloads in the same Chromium.
 
 These numbers are published to track progress, not to win an argument.
 TinyJoin's engine is young. It is the smallest download and the quickest to
-open or reopen a database, and it reads every row, reads rows by key, runs
-`LIKE` scans and indexed range aggregates, groups, joins, builds indexes, and
-commits single inserts more quickly than either alternative. With OPFS storage,
-it is the fastest of the three in half of the workloads, and second in the
-other half, taking one to 1.5 times as long as the faster engine: it is never
-the slowest. Closing the remaining gaps is ongoing
-work, and the suite is designed to be rerun after every optimization.
+open or reopen a database, and it reads every row, reads rows by key, scans,
+runs `LIKE` scans, groups, joins, updates rows by range, and builds indexes
+more quickly than either alternative, and runs indexed range aggregates as
+quickly as SQLite. With OPFS storage, it is the fastest of the three in 11 of
+the 20 workloads, and second in the other nine, taking at most 1.4 times as
+long as the faster engine: it is never the slowest. Closing the remaining gaps is
+ongoing work, and the suite is designed to be rerun after every optimization.
 
 {{benchmarks.environment}}
 
@@ -87,33 +87,35 @@ places like this, where engines that tie share a place:
 
 {{benchmarks.placings}}
 
-Where it comes second, it takes at most 1.5 times as long as the faster
+Where it comes second, it takes at most 1.4 times as long as the faster
 engine.
 
-- **Single statements** cost about 27 to 35 microseconds each. About 14
+- **Single statements** cost about 27 to 31 microseconds each. About 12
   microseconds of every round trip is the message between the page and the
-  Worker, which every engine pays. A point read by primary key takes about 6%
+  Worker, which every engine pays. A point read by primary key takes about 8%
   less time than SQLite's, but an update, upsert, or delete by primary key
-  takes 1.4 to 1.5 times as long: a write in a transaction costs 10 to 12
-  microseconds more, in TinyJoin's Worker, in planning, checking, and staging
-  the row, and in its share of the commit.
-- **Scans** take under a tenth longer than SQLite's. TinyJoin reads each
-  column in place from the stored row, and each leaf's rows from its own copy
-  of the leaf, and compares an integer column with integer bounds directly. A
-  range `UPDATE` inside a transaction also passes over the rows the
-  transaction has already changed, finding them leaf by leaf, and takes about
-  1.3 times as long as SQLite's.
-- **Inserts** one at a time take about 1.3 to 1.4 times as long as SQLite's,
-  for the same reasons as single statements, and 200 at a time about a tenth
-  longer.
+  takes 1.3 to 1.4 times as long: a write in a transaction costs about 7
+  microseconds more. Warm, the difference is about 5 microseconds, in the
+  engine's planning, staging, and result, and in the page's reading of the
+  result. The benchmark's 1,000 statements run mostly WebAssembly that V8 has
+  not yet optimized, which runs TinyJoin's many small functions almost twice
+  as slowly as optimized code, where SQLite's few large functions are
+  optimized almost at once.
+- **Scans** take about three-fifths of SQLite's time. A predicate's simple
+  terms are tested against each leaf's rows in one pass over the leaf's bytes,
+  and only the rows they accept are decoded. A range `UPDATE` inside a
+  transaction also passes over the rows the transaction has already changed,
+  finding them leaf by leaf, and takes about five-sixths of SQLite's time.
+- **Inserts** one at a time take about 1.2 to 1.3 times as long as SQLite's,
+  for the same reasons as single statements, and 200 at a time about as long.
 - **Bulk deletes** take about 1.2 times as long as PGlite's, which, like
   PostgreSQL, only marks deleted rows and leaves reclaiming their space to a
   later vacuum. TinyJoin removes each row and its index entries at once, and
   rewrites every page they occupied, and is still quicker than SQLite at both.
 - **Committing each insert alone** is dominated by the storage flush, one per
   commit, and writes only the pages the insert changed and the superblock. It
-  takes about 7% less time than PGlite's commits, and about a quarter as long
-  as SQLite's. Its time is mostly the flushes, so it varies most of any
+  takes about a tenth less time than PGlite's commits, and about a quarter as
+  long as SQLite's. Its time is mostly the flushes, so it varies most of any
   workload with the state of the disk.
 - **Reopening** reads the database's catalog rather than every row, so a
   populated database reopens in under three-fifths of SQLite's time, and a
