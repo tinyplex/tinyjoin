@@ -4,4 +4,5 @@ These small examples focus on application behavior. TinyJoin keeps its Worker,
 WebAssembly, and storage implementation behind the ordinary create() call.
 
 The [create-tinyjoin](https://github.com/tinyplex/create-tinyjoin) package can
-generate a complete Vite starter using the same patterns.
+generate a complete Vite starter using the same patterns, with its queries in
+SQL, or written with the Drizzle ORM or the Kysely query builder.

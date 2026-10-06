@@ -36,12 +36,19 @@
 > ## Your first _TinyJoin_ app
 >
 > Scaffold a complete local todo app in JS or TS - and with its relational data
-> saved in TinyJoin across reloads - in less than 60s.
+> saved in TinyJoin across reloads - in less than 60s. Write its queries in SQL,
+> or with the Drizzle ORM or the Kysely query builder.
 
 ```bash
 > npm create tinyjoin@latest
 
 🎉 Welcome to TinyJoin!
+
+✔ Project name: … my-tinyjoin-app
+✔ Language: › TypeScript
+✔ Queries: › Drizzle ORM
+✔ Todo data: › Save data across reloads (recommended)
+✔ Install dependencies and start the app? … yes
 
 📦 Creating your project...
 ```
@@ -162,7 +169,8 @@ const {rows} = await openTasks.execute([false]);
 >
 > The Drizzle ORM and the Kysely query builder run on the same Client. push()
 > makes the database hold a Drizzle schema as the app starts, in one atomic
-> change that keeps every row.
+> change that keeps every row. And `npm create tinyjoin@latest` can start a new
+> app with either.
 
 ```ts
 import {drizzle, push} from 'tinyjoin/drizzle';
