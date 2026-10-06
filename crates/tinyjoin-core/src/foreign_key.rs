@@ -176,7 +176,11 @@ pub(crate) fn enforce(storage: &dyn StorageReader, planned: &mut PlannedDml) -> 
     let keyed = storage.tables_with_foreign_keys();
     let name = change_table(first);
     if !keyed.iter().any(|child| {
-        child.name == *name || child.foreign_keys.iter().any(|key| key.references == *name)
+        *child.name == **name
+            || child
+                .foreign_keys
+                .iter()
+                .any(|key| *key.references == **name)
     }) {
         return Ok(());
     }
@@ -360,6 +364,7 @@ pub(crate) fn enforce(storage: &dyn StorageReader, planned: &mut PlannedDml) -> 
         if !planned.outcome.tables.contains(&table) {
             planned.outcome.tables.push(table.clone());
         }
+        let table = Rc::from(table);
         planned.changes.push(match item.new {
             Some(row) => RowChange::Upsert { table, row },
             None => RowChange::Delete {

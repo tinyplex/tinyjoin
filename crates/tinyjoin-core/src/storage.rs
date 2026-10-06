@@ -477,7 +477,7 @@ impl StorageDriver for InMemoryStorage {
                 RowChange::Upsert { table, row } => {
                     let schema = &self
                         .tables
-                        .get(&table)
+                        .get(&*table)
                         .ok_or_else(|| EngineError::table_not_found(&table))?
                         .schema;
                     let row = normalize_row(schema, row)?;
@@ -487,7 +487,7 @@ impl StorageDriver for InMemoryStorage {
                 RowChange::Delete { table, key } => {
                     let schema = &self
                         .tables
-                        .get(&table)
+                        .get(&*table)
                         .ok_or_else(|| EngineError::table_not_found(&table))?
                         .schema;
                     validate_primary_key_values(schema, &key)?;
@@ -506,7 +506,7 @@ impl StorageDriver for InMemoryStorage {
                 .and_then(|bytes| bytes.checked_add(next_bytes))
                 .and_then(|bytes| bytes.checked_add(96))
                 .ok_or_else(row_write_overflow_error)?;
-            let table_changes = tables.entry(table).or_default();
+            let table_changes = tables.entry(table.to_string()).or_default();
             if let Some(previous) = table_changes.insert(key.clone(), next) {
                 let previous_bytes = previous.as_ref().map_or(Ok(0), estimated_row_bytes)?;
                 let previous_charge = key
@@ -1319,6 +1319,7 @@ pub(crate) fn row_json_overhead(schema: &TableDefinition) -> Result<usize> {
 /// An upper bound on a scalar's JSON text, or `None` for an array or object, which only its
 /// encoding measures. A number takes at most 25 bytes however it is spelled, and a string at most
 /// six per byte, when every byte is escaped, and its quotes.
+#[inline]
 pub(crate) fn json_scalar_bound(value: &Value) -> Option<usize> {
     match value {
         Value::Null | Value::Bool(_) => Some(5),
@@ -1648,12 +1649,23 @@ pub(crate) fn validate_catalog_name_bound(name: &str) -> Result<()> {
     }
 }
 
+// Each is an addition and a branch in its caller, which estimating a row's bytes runs dozens of
+// times: as a call, with the error's closure a second, those were a tenth of the calls a statement
+// by key made.
+#[inline(always)]
 fn checked_row_write_add(left: usize, right: usize) -> Result<usize> {
-    left.checked_add(right).ok_or_else(row_write_overflow_error)
+    match left.checked_add(right) {
+        Some(bytes) => Ok(bytes),
+        None => Err(row_write_overflow_error()),
+    }
 }
 
+#[inline(always)]
 fn checked_row_write_mul(left: usize, right: usize) -> Result<usize> {
-    left.checked_mul(right).ok_or_else(row_write_overflow_error)
+    match left.checked_mul(right) {
+        Some(bytes) => Ok(bytes),
+        None => Err(row_write_overflow_error()),
+    }
 }
 
 #[cfg(test)]
@@ -1667,6 +1679,8 @@ fn ensure_row_write_bytes(bytes: usize) -> Result<()> {
     }
 }
 
+#[cold]
+#[inline(never)]
 fn row_write_overflow_error() -> EngineError {
     row_write_limit_error("A row write-set size overflowed".to_owned())
 }
@@ -1741,14 +1755,24 @@ fn preflight_row_changes<'a>(
     indexes: &[&IndexDefinition],
     mut batch_bytes: usize,
 ) -> Result<usize> {
+    // The table the last change named, with its shape: a statement's changes name one table, which
+    // is checked and resolved once rather than for every row.
+    let mut last: Option<(&str, TableShape<'a>)> = None;
     for change in changes {
         let (RowChange::Upsert { table, .. }
         | RowChange::Delete { table, .. }
         | RowChange::Put { table, .. }
         | RowChange::Remove { table, .. }) = change;
-        validate_catalog_name_bound(table)
-            .map_err(|error| EngineError::invalid_change(error.message))?;
-        let (schema, layout) = tables(table).ok_or_else(|| EngineError::table_not_found(table))?;
+        let (schema, layout) = match last {
+            Some((name, shape)) if name == &**table => shape,
+            _ => {
+                validate_catalog_name_bound(table)
+                    .map_err(|error| EngineError::invalid_change(error.message))?;
+                let shape = tables(table).ok_or_else(|| EngineError::table_not_found(table))?;
+                last = Some((table, shape));
+                shape
+            }
+        };
         let (input, is_delete) = match change {
             RowChange::Upsert { row, .. } => (row, false),
             RowChange::Delete { key, .. } => (key, true),
@@ -2044,7 +2068,7 @@ mod tests {
         let schema = users_storage().table_schema("users").unwrap();
         let tables = |name: &str| (name == "users").then_some((&*schema, None));
         let changes = vec![RowChange::Upsert {
-            table: "users".to_owned(),
+            table: "users".into(),
             row: row(json!({"id": 1, "email": "one"})),
         }];
         let addition =
@@ -2098,7 +2122,7 @@ mod tests {
         storage
             .define_index(IndexDefinition {
                 name: "users_email".to_owned(),
-                table: "users".to_owned(),
+                table: "users".into(),
                 columns: vec!["email".to_owned()],
                 unique: true,
             })
@@ -2106,11 +2130,11 @@ mod tests {
         storage
             .apply_row_changes_unrevisioned(vec![
                 RowChange::Upsert {
-                    table: "users".to_owned(),
+                    table: "users".into(),
                     row: row(json!({"id": 1, "email": "one@example.com"})),
                 },
                 RowChange::Upsert {
-                    table: "users".to_owned(),
+                    table: "users".into(),
                     row: row(json!({"id": 2, "email": "two@example.com"})),
                 },
             ])
@@ -2119,19 +2143,19 @@ mod tests {
         storage
             .apply_row_changes_unrevisioned(vec![
                 RowChange::Delete {
-                    table: "users".to_owned(),
+                    table: "users".into(),
                     key: row(json!({"id": 1})),
                 },
                 RowChange::Delete {
-                    table: "users".to_owned(),
+                    table: "users".into(),
                     key: row(json!({"id": 2})),
                 },
                 RowChange::Upsert {
-                    table: "users".to_owned(),
+                    table: "users".into(),
                     row: row(json!({"id": 1, "email": "two@example.com"})),
                 },
                 RowChange::Upsert {
-                    table: "users".to_owned(),
+                    table: "users".into(),
                     row: row(json!({"id": 2, "email": "one@example.com"})),
                 },
             ])
@@ -2162,7 +2186,7 @@ mod tests {
         let mut storage = users_storage();
         storage
             .apply_row_changes_unrevisioned(vec![RowChange::Upsert {
-                table: "users".to_owned(),
+                table: "users".into(),
                 row: row(json!({"id": 1, "email": "kept@example.com"})),
             }])
             .unwrap();
@@ -2171,11 +2195,11 @@ mod tests {
         let error = storage
             .apply_row_changes_unrevisioned(vec![
                 RowChange::Upsert {
-                    table: "users".to_owned(),
+                    table: "users".into(),
                     row: row(json!({"id": 1, "email": "changed@example.com"})),
                 },
                 RowChange::Upsert {
-                    table: "missing".to_owned(),
+                    table: "missing".into(),
                     row: row(json!({"id": 2})),
                 },
             ])
@@ -2191,11 +2215,11 @@ mod tests {
         storage
             .apply_row_changes_unrevisioned(vec![
                 RowChange::Upsert {
-                    table: "users".to_owned(),
+                    table: "users".into(),
                     row: row(json!({"id": 1, "email": null})),
                 },
                 RowChange::Upsert {
-                    table: "users".to_owned(),
+                    table: "users".into(),
                     row: row(json!({"id": 2, "email": null})),
                 },
             ])

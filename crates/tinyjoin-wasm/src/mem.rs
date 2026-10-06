@@ -75,7 +75,11 @@ mod overrides {
     /// # Safety
     /// `left` and `right` must each point to `length` readable bytes.
     #[unsafe(no_mangle)]
-    pub(crate) unsafe extern "C" fn memcmp(left: *const u8, right: *const u8, length: usize) -> i32 {
+    pub(crate) unsafe extern "C" fn memcmp(
+        left: *const u8,
+        right: *const u8,
+        length: usize,
+    ) -> i32 {
         // SAFETY: the caller promises both pointers address `length` readable bytes.
         let (left, right) = unsafe {
             (
@@ -123,11 +127,12 @@ mod tests {
                     right[at] = (next() % 256) as u8;
                 }
                 // Both at an odd offset too, since keys sit anywhere in a page.
-                let (padded_left, padded_right) = (
-                    [&[1][..], &left].concat(),
-                    [&[1][..], &right].concat(),
-                );
-                for (left, right) in [(&left[..], &right[..]), (&padded_left[1..], &padded_right[1..])] {
+                let (padded_left, padded_right) =
+                    ([&[1][..], &left].concat(), [&[1][..], &right].concat());
+                for (left, right) in [
+                    (&left[..], &right[..]),
+                    (&padded_left[1..], &padded_right[1..]),
+                ] {
                     assert_eq!(compare(left, right), left.cmp(right), "{left:?} {right:?}");
                     assert_eq!(differ(left, right), left != right, "{left:?} {right:?}");
                 }

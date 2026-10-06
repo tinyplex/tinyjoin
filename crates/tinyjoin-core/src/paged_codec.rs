@@ -353,24 +353,47 @@ fn encode_record_index_tuple(
     record: &StoredRecord<'_>,
     spare: usize,
 ) -> Result<Option<Vec<u8>>> {
-    let schema = record.schema;
     let mut key = Vec::with_capacity(16 * positions.len() + spare);
+    Ok(append_record_index_tuple(&mut key, positions, record)?.then_some(key))
+}
+
+/// Appends a stored row's secondary-index entry to `into`, as [`encode_record_index_entry`]
+/// encodes it, and says so; a row whose indexed tuple holds a NULL has no entry, and appends
+/// nothing. Entries of many rows share one buffer rather than a vector each.
+pub(crate) fn append_record_index_entry(
+    into: &mut Vec<u8>,
+    positions: &[usize],
+    record: &StoredRecord<'_>,
+) -> Result<bool> {
+    let start = into.len();
+    if !append_record_index_tuple(into, positions, record)? {
+        return Ok(false);
+    }
+    into.extend_from_slice(record.key);
+    validate_key_size(&into[start..])?;
+    Ok(true)
+}
+
+/// Appends the indexed tuple of a stored row to `into`, and says so; a tuple holding a NULL is not
+/// appended.
+fn append_record_index_tuple(
+    into: &mut Vec<u8>,
+    positions: &[usize],
+    record: &StoredRecord<'_>,
+) -> Result<bool> {
+    let schema = record.schema;
+    let start = into.len();
     for position in positions {
         let value = record.column(*position)?;
         if value.is_null() {
-            return Ok(None);
+            into.truncate(start);
+            return Ok(false);
         }
         let column = &schema.columns[*position];
-        encode_component_ref(
-            &mut key,
-            column.data_type,
-            &value,
-            &schema.name,
-            &column.name,
-        )?;
-        validate_key_size(&key)?;
+        encode_component_ref(into, column.data_type, &value, &schema.name, &column.name)?;
+        validate_key_size(&into[start..])?;
     }
-    Ok(Some(key))
+    Ok(true)
 }
 
 /// Encodes one value as a key component of `data_type`, to bound a range of keys. Components compare
@@ -637,6 +660,9 @@ pub(crate) struct RecordLayout {
     /// [`crate::storage::estimated_key_bytes`] finds them, when no key column holds text, whose
     /// values take more than a scalar's 16.
     key_estimate: Option<usize>,
+    /// The most JSON text a row takes apart from its values, as
+    /// [`crate::storage::row_json_overhead`] finds it.
+    json_overhead: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -726,8 +752,8 @@ pub(crate) fn stored_record_passes(value: &[u8], tests: &[StoredTest<'_>]) -> Op
             }
             return Some(false);
         }
-        let null = has_nulls
-            && value[RECORD_HEADER_BYTES + position / 8] & (1 << (position % 8)) != 0;
+        let null =
+            has_nulls && value[RECORD_HEADER_BYTES + position / 8] & (1 << (position % 8)) != 0;
         if let StoredTest::IsNull { negated, .. } = test {
             if null ^ negated {
                 continue;
@@ -802,7 +828,10 @@ fn wide_column_bounds(
                 as usize,
         }
     };
-    (if position == 0 { 0 } else { end(position - 1) }, end(position))
+    (
+        if position == 0 { 0 } else { end(position - 1) },
+        end(position),
+    )
 }
 
 /// [`integer_value`] with the shortest encodings, which hold nearly every stored integer, decoded
@@ -925,7 +954,14 @@ impl RecordLayout {
             estimate,
             sized,
             key_estimate,
+            json_overhead: crate::storage::row_json_overhead(schema)?,
         })
+    }
+
+    /// The most JSON text a row takes apart from its values: braces, commas, and each column's
+    /// name and colon.
+    pub(crate) fn json_overhead(&self) -> usize {
+        self.json_overhead
     }
 }
 
@@ -1198,6 +1234,7 @@ impl<'a> StoredRecord<'a> {
     }
 
     /// Where the stored column at `position` ends within the data.
+    #[inline(always)]
     fn end(&self, position: usize) -> usize {
         if position + 1 == self.count {
             return self.data.len();
@@ -1213,6 +1250,7 @@ impl<'a> StoredRecord<'a> {
         }
     }
 
+    #[inline(always)]
     fn is_null(&self, position: usize) -> bool {
         self.bitmap
             .get(position / 8)
@@ -2461,7 +2499,7 @@ mod tests {
         CatalogIndexRecord {
             definition: IndexDefinition {
                 name: "items_name".to_owned(),
-                table: "items".to_owned(),
+                table: "items".into(),
                 columns: vec!["name".to_owned()],
                 unique: false,
             },
@@ -2602,7 +2640,7 @@ mod tests {
         );
         let definition = IndexDefinition {
             name: "items_tenant".to_owned(),
-            table: "items".to_owned(),
+            table: "items".into(),
             columns: vec!["tenant".to_owned()],
             unique: false,
         };
@@ -2655,7 +2693,7 @@ mod tests {
         );
         let definition = IndexDefinition {
             name: "items_value".to_owned(),
-            table: "items".to_owned(),
+            table: "items".into(),
             columns: vec!["value".to_owned()],
             unique: true,
         };
@@ -2924,7 +2962,7 @@ mod tests {
         ]
         .map(|columns| IndexDefinition {
             name: columns.join("_"),
-            table: "items".to_owned(),
+            table: "items".into(),
             columns: columns.into_iter().map(str::to_owned).collect(),
             unique: false,
         });

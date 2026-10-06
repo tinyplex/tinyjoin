@@ -1,6 +1,7 @@
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeSet,
+    ops::Range,
     rc::Rc,
 };
 
@@ -15,11 +16,11 @@ use crate::{
     name_map::NameMap,
     paged_codec::{
         CATALOG_TREE_ID, CatalogHeader, CatalogIndexRecord, IndexEntryLayout, MAX_CATALOG_INDEXES,
-        MAX_CATALOG_TABLES, MAX_TREE_ID, PrimaryKey, RecordLayout, encode_catalog_header_record,
-        encode_catalog_index_key, encode_catalog_index_record, encode_catalog_table_key,
-        encode_primary_key, encode_record_index_entry, encode_record_index_prefix, encode_row,
-        encode_secondary_index_entry_key, index_column_positions,
-        secondary_index_entry_matches_prefix, secondary_index_primary_key,
+        MAX_CATALOG_TABLES, MAX_TREE_ID, PrimaryKey, RecordLayout, append_record_index_entry,
+        encode_catalog_header_record, encode_catalog_index_key, encode_catalog_index_record,
+        encode_catalog_table_key, encode_primary_key, encode_record_index_entry,
+        encode_record_index_prefix, encode_row, encode_secondary_index_entry_key,
+        index_column_positions, secondary_index_entry_matches_prefix, secondary_index_primary_key,
     },
     paged_storage::{
         PagedIndex, PagedTable, TreeReader, adjusted_count, batch_too_large, ensure_batch_bytes,
@@ -725,7 +726,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
             return self.apply_changes(changes, previous);
         }
         let mut previous = previous.into_iter();
-        let mut groups: Vec<(String, Vec<RowChange>, Vec<PreviousRow>)> = Vec::new();
+        let mut groups: Vec<(Rc<str>, Vec<RowChange>, Vec<PreviousRow>)> = Vec::new();
         for change in changes {
             let held = previous.next().unwrap_or(PreviousRow::Unread);
             let table = change_table(&change).clone();
@@ -862,7 +863,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
         )?;
         let index_count = definitions
             .iter()
-            .filter(|definition| definition.table == table_name)
+            .filter(|definition| *definition.table == *table_name)
             .count();
         for change in &input_changes {
             if *change_table(change) != table_name {
@@ -871,8 +872,13 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                     "A statement's changes name more than one table",
                 ));
             }
-            self.charge_operations(index_count.saturating_mul(2).saturating_add(1))?;
         }
+        self.charge_operations(
+            index_count
+                .saturating_mul(2)
+                .saturating_add(1)
+                .saturating_mul(input_changes.len()),
+        )?;
 
         let table = self
             .tables
@@ -964,7 +970,7 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 },
             );
         }
-        let changes = [(table_name.as_str(), changes.changes())];
+        let changes = [(&*table_name, changes.changes())];
         self.validate_changed_unique_indexes(&changes, retained_bytes)?;
         self.apply_row_changes(&changes)
     }
@@ -1073,41 +1079,56 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 .values_mut()
                 .filter(|index| index.definition.table == *table_name)
             {
-                // Entries end with their row's primary key, so no two changes share one.
+                // Entries end with their row's primary key, so no two changes share one. The
+                // entries the index loses and gains are spans of one buffer, each with whether it
+                // is gained: a vector for each would allocate once for every changed row.
                 let positions = index_column_positions(&table.schema, &index.definition)?;
-                let mut entries = Vec::new();
+                let mut keys = Vec::new();
+                let mut entries: Vec<(Range<usize>, bool)> = Vec::new();
                 for (key, change) in table_changes {
+                    let start = keys.len();
                     let old_key = match &change.old {
                         None => None,
                         Some(HeldRow::Map(row)) => {
                             encode_secondary_index_entry_key(&table.schema, &index.definition, row)?
+                                .map(|entry| {
+                                    keys.extend_from_slice(&entry);
+                                    start..keys.len()
+                                })
                         }
-                        Some(HeldRow::Stored(entry)) => encode_record_index_entry(
+                        Some(HeldRow::Stored(entry)) => append_record_index_entry(
+                            &mut keys,
                             &positions,
                             &table.record(entry.key(), entry.value())?,
                         )?
-                        .map(|(key, _)| key),
+                        .then_some(start..keys.len()),
                     };
+                    let middle = keys.len();
                     let next_key = match &change.next {
-                        Some(record) => {
-                            encode_record_index_entry(&positions, &table.record(key, record)?)?
-                                .map(|(key, _)| key)
-                        }
+                        Some(record) => append_record_index_entry(
+                            &mut keys,
+                            &positions,
+                            &table.record(key, record)?,
+                        )?
+                        .then_some(middle..keys.len()),
                         None => None,
                     };
-                    if old_key == next_key {
+                    let span =
+                        |range: &Option<Range<usize>>| range.clone().map(|range| &keys[range]);
+                    if span(&old_key) == span(&next_key) {
+                        keys.truncate(start);
                         continue;
                     }
-                    entries.extend(old_key.map(|key| (key, false)));
-                    entries.extend(next_key.map(|key| (key, true)));
+                    entries.extend(old_key.map(|range| (range, false)));
+                    entries.extend(next_key.map(|range| (range, true)));
                 }
                 if entries.is_empty() {
                     continue;
                 }
                 let mut batch = entries
                     .iter()
-                    .map(|(key, insert)| BatchChange {
-                        key,
+                    .map(|(range, insert)| BatchChange {
+                        key: &keys[range.clone()],
                         value: insert.then_some(&[][..]),
                     })
                     .collect::<Vec<_>>();

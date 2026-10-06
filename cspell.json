@@ -35,6 +35,8 @@
     "amcheck",
     "appendable",
     "atrule",
+    "bcmp",
+    "Binaryen",
     "bindgen",
     "BYTEA",
     "bytewise",
@@ -61,7 +63,7 @@
     "linejoin",
     "llms",
     "lparen",
-    "bcmp",
+    "malloc",
     "memcmp",
     "memcpy",
     "menustate",
@@ -177,7 +179,7 @@
     {
       "filename": "crates/tinyjoin-core/src/paged_codec.rs",
       "ignoreRegExpList": [
-        "/\"insideÿpayload\"/g"
+        "/\"inside\u00ffpayload\"/g"
       ]
     },
     {

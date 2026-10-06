@@ -26,10 +26,10 @@ use crate::row::{HeldRow, RowRef};
 use crate::storage::{
     MAX_LOGICAL_ROW_BYTES, ensure_storage_key_bytes, estimated_checked_value_bytes,
     estimated_key_bytes, estimated_record_bytes, estimated_row_bytes, estimated_value_bytes,
-    json_scalar_bound, normalize_row, primary_key_values_fit, row_json_overhead,
-    schema_with_added_column, unplanned_record, validate_catalog_name_bound,
-    validate_index_columns_for_schema, validate_index_definition_shape,
-    validate_primary_storage_key_bound, validate_schema, validate_value,
+    json_scalar_bound, normalize_row, primary_key_values_fit, schema_with_added_column,
+    unplanned_record, validate_catalog_name_bound, validate_index_columns_for_schema,
+    validate_index_definition_shape, validate_primary_storage_key_bound, validate_schema,
+    validate_value,
 };
 use crate::{
     ChangedKeys, ColumnDefinition, ColumnType, EngineError, ForeignKeyAction, ForeignKeyDefinition,
@@ -386,7 +386,7 @@ pub(crate) fn execute<S: StorageDriver>(
 /// the order of their encodings, which is its primary-key order, and two keys encode alike exactly
 /// when they are equal.
 struct EncodedKey<'a> {
-    table: &'a String,
+    table: &'a str,
     key: Cow<'a, [u8]>,
     change: &'a RowChange,
 }
@@ -433,7 +433,7 @@ pub(crate) fn changed_keys(
         let schema = storage.table_schema(table)?;
         let mut values = Vec::with_capacity(schema.primary_key.len());
         push_changed_key(storage, &schema, change, &mut values)?;
-        keys.insert(table_keys(table, &schema, values));
+        keys.insert(table_keys(schema, values));
         return Ok(keys);
     }
     if exceeds_changed_keys(changes, previous) {
@@ -442,9 +442,9 @@ pub(crate) fn changed_keys(
     // A statement changes one table's rows, so the last schema read is almost always the one
     // needed.
     let mut schema: Option<Rc<TableDefinition>> = None;
-    let mut schema_of = |table: &String| -> Result<Rc<TableDefinition>> {
+    let mut schema_of = |table: &str| -> Result<Rc<TableDefinition>> {
         match &schema {
-            Some(schema) if schema.name == *table => Ok(Rc::clone(schema)),
+            Some(schema) if schema.name == table => Ok(Rc::clone(schema)),
             _ => Ok(Rc::clone(schema.insert(storage.table_schema(table)?))),
         }
     };
@@ -468,22 +468,18 @@ pub(crate) fn changed_keys(
         for changed in changed {
             push_changed_key(storage, &schema, changed.change, &mut values)?;
         }
-        keys.insert(table_keys(table, &schema, values));
+        keys.insert(table_keys(schema, values));
     }
     Ok(keys)
 }
 
 /// A table's changed keys: its primary-key columns, in key order, and each key's values.
-fn table_keys(table: &str, schema: &TableDefinition, values: Vec<Value>) -> TableKeys {
-    TableKeys {
-        table: table.to_owned(),
-        columns: schema.primary_key.clone(),
-        values,
-    }
+fn table_keys(schema: Rc<TableDefinition>, values: Vec<Value>) -> TableKeys {
+    TableKeys { schema, values }
 }
 
 /// The table a change is to.
-pub(crate) fn change_table(change: &RowChange) -> &String {
+pub(crate) fn change_table(change: &RowChange) -> &Rc<str> {
     match change {
         RowChange::Upsert { table, .. }
         | RowChange::Delete { table, .. }
@@ -592,7 +588,7 @@ pub(crate) fn finish_changed_keys(
                     values.push(key.get(name).cloned().unwrap_or(Value::Null));
                 }
             }
-            finished.insert(table_keys(&table, &schema, values));
+            finished.insert(table_keys(schema, values));
         }
     }
     Ok(finished)
@@ -934,22 +930,20 @@ fn point_change(
 /// The most JSON text a row of `schema` can take with `assigned` values in place of its own, as
 /// [`RecordUpdate`] bounds it, or `None` where a column the row keeps could take any amount.
 fn point_assigned_bound(
+    overhead: usize,
     schema: &TableDefinition,
     assigned: &[Option<&Value>],
-) -> Result<Option<usize>> {
-    let mut bound = row_json_overhead(schema)?;
+) -> Option<usize> {
+    let mut bound = overhead;
     for (column, value) in schema.columns.iter().zip(assigned) {
         let value_bound = match value {
             Some(value) => json_scalar_bound(value),
             None if column.data_type == ColumnType::Json => None,
             None => json_scalar_bound(column.default.as_ref().unwrap_or(&Value::Null)),
         };
-        let Some(value_bound) = value_bound else {
-            return Ok(None);
-        };
-        bound = bound.saturating_add(value_bound);
+        bound = bound.saturating_add(value_bound?);
     }
-    Ok(Some(bound))
+    Some(bound)
 }
 
 /// Whether the stored row `record`, rewritten with values bounded by `bound`, cannot pass the row
@@ -970,6 +964,8 @@ fn plan_point_update(
     key: &[(String, Value)],
     params: &[Value],
 ) -> Result<Option<PlannedDml>> {
+    // One name, shared by every change the statement plans rather than copied for each.
+    let table_name: Rc<str> = Rc::from(table);
     let schema = storage.table_schema(table)?;
     let Some(layout) = storage.record_layout(table) else {
         return Ok(None);
@@ -1017,7 +1013,7 @@ fn plan_point_update(
             table,
         )?;
     }
-    let Some(bound) = point_assigned_bound(&schema, &assigned)? else {
+    let Some(bound) = point_assigned_bound(layout.json_overhead(), &schema, &assigned) else {
         return Ok(None);
     };
     let entry = match point_row(storage, &schema, &key_values)? {
@@ -1034,7 +1030,7 @@ fn plan_point_update(
         "UPDATE",
         table,
         RowChange::Put {
-            table: table.to_owned(),
+            table: Rc::clone(&table_name),
             key: entry.key().to_vec(),
             record: next,
         },
@@ -1048,6 +1044,8 @@ fn plan_point_delete(
     key: &[(String, Value)],
     params: &[Value],
 ) -> Result<Option<PlannedDml>> {
+    // One name, shared by every change the statement plans rather than copied for each.
+    let table_name: Rc<str> = Rc::from(table);
     let schema = storage.table_schema(table)?;
     let Some(layout) = storage.record_layout(table) else {
         return Ok(None);
@@ -1063,12 +1061,12 @@ fn plan_point_delete(
     // A script's writer applies a delete by its encoded key; a transaction's by the key as a map.
     let change = if storage.plans_removals() {
         RowChange::Remove {
-            table: table.to_owned(),
+            table: Rc::clone(&table_name),
             key: entry.key().to_vec(),
         }
     } else {
         RowChange::Delete {
-            table: table.to_owned(),
+            table: Rc::clone(&table_name),
             key: StoredRecord::new(&schema, &layout, entry.key(), entry.value())?.key_row()?,
         }
     };
@@ -1124,6 +1122,8 @@ fn plan_point_insert(
     conflict: Option<&PointConflict>,
     params: &[Value],
 ) -> Result<Option<PlannedDml>> {
+    // One name, shared by every change the statement plans rather than copied for each.
+    let table_name: Rc<str> = Rc::from(table);
     let schema = storage.table_schema(table)?;
     let Some(layout) = storage.record_layout(table) else {
         return Ok(None);
@@ -1138,7 +1138,7 @@ fn plan_point_insert(
             schema.columns.len(),
         ),
     };
-    let overhead = row_json_overhead(&schema)?;
+    let overhead = layout.json_overhead();
     let schema = &*schema;
     let Some((target, assignments)) = conflict else {
         // Rows listed without a conflict clause, each planned straight into its record, in the
@@ -1189,7 +1189,7 @@ fn plan_point_insert(
             let record = encode_row_values(schema, &layout, &row)?;
             by_key.insert(position, changes.len());
             changes.push(RowChange::Put {
-                table: table.to_owned(),
+                table: Rc::clone(&table_name),
                 key,
                 record,
             });
@@ -1233,9 +1233,11 @@ fn plan_point_insert(
             // conflicts, as the general planner checks it.
             for (column, value) in assignments {
                 if let PointAssigned::Value(value) = value {
-                    let Some(definition) = schema.columns.iter().find(|definition| {
-                        definition.name == *column
-                    }) else {
+                    let Some(definition) = schema
+                        .columns
+                        .iter()
+                        .find(|definition| definition.name == *column)
+                    else {
                         return Ok(None);
                     };
                     validate_value(definition, point_value(value, params)?, table)?;
@@ -1266,12 +1268,7 @@ fn plan_point_insert(
     let Some(assignments) = updates else {
         unreachable!("a lone row without a conflict clause was planned above")
     };
-    let position_of = |name: &str| {
-        schema
-            .columns
-            .iter()
-            .position(|column| column.name == name)
-    };
+    let position_of = |name: &str| schema.columns.iter().position(|column| column.name == name);
     let mut key_values = Vec::with_capacity(schema.primary_key.len());
     for column in &schema.primary_key {
         let value = row[position_of(column).expect("a key column is a column")];
@@ -1288,7 +1285,7 @@ fn plan_point_insert(
                 "INSERT",
                 table,
                 RowChange::Put {
-                    table: table.to_owned(),
+                    table: Rc::clone(&table_name),
                     key,
                     record,
                 },
@@ -1316,7 +1313,7 @@ fn plan_point_insert(
             PointAssigned::Value(value) => point_value(value, params)?,
         });
     }
-    let Some(bound) = point_assigned_bound(schema, &assigned)? else {
+    let Some(bound) = point_assigned_bound(overhead, schema, &assigned) else {
         return Ok(None);
     };
     let record = StoredRecord::new(schema, &layout, entry.key(), entry.value())?;
@@ -1334,7 +1331,7 @@ fn plan_point_insert(
         "INSERT",
         table,
         RowChange::Put {
-            table: table.to_owned(),
+            table: Rc::clone(&table_name),
             key: entry.key().to_vec(),
             record: next,
         },
@@ -1863,6 +1860,8 @@ fn plan_insert(
     on_conflict: Option<&OnConflict>,
     returning: Option<&[String]>,
 ) -> Result<PlannedDml> {
+    // One name, shared by every change the statement plans rather than copied for each.
+    let table_name: Rc<str> = Rc::from(table);
     let schema = storage.table_schema(table)?;
     let default_values =
         columns.is_none() && value_rows.len() == 1 && value_rows.first().is_some_and(Vec::is_empty);
@@ -1912,10 +1911,7 @@ fn plan_insert(
     // A reader that stores records lets a plain INSERT plan each row straight into the entry it
     // writes, without a map.
     let records = if conflicts.is_none() && returning.is_none() {
-        storage
-            .record_layout(table)
-            .map(|layout| RecordPlan::new(&schema, layout))
-            .transpose()?
+        storage.record_layout(table).map(RecordPlan::new)
     } else {
         None
     };
@@ -1967,7 +1963,7 @@ fn plan_insert(
             ensure_dml_work_bytes(work_bytes)?;
             work_bytes = retain_dml_change(work_bytes, table)?;
             changes.push(RowChange::Put {
-                table: table.to_owned(),
+                table: Rc::clone(&table_name),
                 key,
                 record,
             });
@@ -2015,7 +2011,7 @@ fn plan_insert(
                         ensure_dml_work_bytes(work_bytes)?;
                         work_bytes = retain_dml_change(work_bytes, table)?;
                         changes.push(RowChange::Put {
-                            table: table.to_owned(),
+                            table: Rc::clone(&table_name),
                             key,
                             record,
                         });
@@ -2097,7 +2093,7 @@ fn plan_insert(
             returned.push(project_returning_row(&row, columns, table)?);
         }
         changes.push(RowChange::Upsert {
-            table: table.to_owned(),
+            table: Rc::clone(&table_name),
             row,
         });
         previous.push(held);
@@ -2484,6 +2480,8 @@ fn plan_update(
     predicate: Option<&Predicate>,
     returning: Option<&[String]>,
 ) -> Result<PlannedDml> {
+    // One name, shared by every change the statement plans rather than copied for each.
+    let table_name: Rc<str> = Rc::from(table);
     let resolved = resolved_subqueries(storage, predicate)?;
     let predicate = resolved.as_ref().or(predicate);
     let schema = storage.table_schema(table)?;
@@ -2572,112 +2570,119 @@ fn plan_update(
     let mut work_bytes = 0usize;
     let mut result_bytes = 0usize;
     let filter = Filter::new(predicate, &schema, table)?;
-    let visit_outcome = visit_dml_candidates(storage, &schema, predicate, &filter, &mut scanned, &mut |row| {
-        if updates.len() == MAX_DML_CHANGED_ROWS {
-            return Err(dml_limit_error(format!(
-                "A data-modification statement cannot change more than {MAX_DML_CHANGED_ROWS} rows"
-            )));
-        }
-
-        // A stored row keeping its key is rewritten as its record, charged as the map it replaces.
-        let record = records
-            .as_ref()
-            .and_then(|plan| Some((plan, plan.record(row)?)));
-        let map = match record {
-            Some(_) => None,
-            None => Some(row.to_row()?),
-        };
-        // Check the retained candidate budget before copying assignment values into the row.
-        let old_row_bytes = match (&map, record) {
-            (Some(map), _) => estimated_row_bytes(map)?,
-            (None, Some((_, record))) => estimated_record_bytes(record)?,
-            (None, None) => unreachable!("a row is read as a map or a record"),
-        };
-        let conservative_row_bytes = checked_dml_add(
-            checked_dml_mul(old_row_bytes, 3)?,
-            checked_dml_add(assignment_bytes, 256)?,
-        )?;
-        ensure_dml_work_bytes(checked_dml_add(work_bytes, conservative_row_bytes)?)?;
-
-        let old_key = row.encoded_key()?.into_owned();
-        let old_row = if kept.fits(row.held_bytes()?) {
-            Some(row.hold()?)
-        } else {
-            None
-        };
-        let (next, next_bytes, key_bytes) = match (map, record) {
-            (None, Some((plan, record))) => {
-                let next = encode_updated_record(record, &plan.assigned)?;
-                let next_bytes = estimated_record_bytes(&StoredRecord::new(
-                    &schema,
-                    &plan.layout,
-                    &old_key,
-                    &next,
-                )?)?;
-                (
-                    UpdatedRow::Record(next),
-                    next_bytes,
-                    estimated_key_bytes(record)?,
-                )
+    let visit_outcome = visit_dml_candidates(
+        storage,
+        &schema,
+        predicate,
+        &filter,
+        &mut scanned,
+        &mut |row| {
+            if updates.len() == MAX_DML_CHANGED_ROWS {
+                return Err(dml_limit_error(format!(
+                    "A data-modification statement cannot change more than {MAX_DML_CHANGED_ROWS} rows"
+                )));
             }
-            (map, _) => {
-                let mut new_row = map.expect("a row not read as a record is a map");
-                let old_primary_key = primary_key_row(&schema, &new_row)?;
-                let mut values = Vec::with_capacity(computed.len());
-                for (_, expression) in &computed {
-                    values.push(evaluate(expression, &mut |column, _| {
-                        row_column(&new_row, column, table)
-                    })?);
+
+            // A stored row keeping its key is rewritten as its record, charged as the map it replaces.
+            let record = records
+                .as_ref()
+                .and_then(|plan| Some((plan, plan.record(row)?)));
+            let map = match record {
+                Some(_) => None,
+                None => Some(row.to_row()?),
+            };
+            // Check the retained candidate budget before copying assignment values into the row.
+            let old_row_bytes = match (&map, record) {
+                (Some(map), _) => estimated_row_bytes(map)?,
+                (None, Some((_, record))) => estimated_record_bytes(record)?,
+                (None, None) => unreachable!("a row is read as a map or a record"),
+            };
+            let conservative_row_bytes = checked_dml_add(
+                checked_dml_mul(old_row_bytes, 3)?,
+                checked_dml_add(assignment_bytes, 256)?,
+            )?;
+            ensure_dml_work_bytes(checked_dml_add(work_bytes, conservative_row_bytes)?)?;
+
+            let old_key = row.encoded_key()?.into_owned();
+            let old_row = if kept.fits(row.held_bytes()?) {
+                Some(row.hold()?)
+            } else {
+                None
+            };
+            let (next, next_bytes, key_bytes) = match (map, record) {
+                (None, Some((plan, record))) => {
+                    let next = encode_updated_record(record, &plan.assigned)?;
+                    let next_bytes = estimated_record_bytes(&StoredRecord::new(
+                        &schema,
+                        &plan.layout,
+                        &old_key,
+                        &next,
+                    )?)?;
+                    (
+                        UpdatedRow::Record(next),
+                        next_bytes,
+                        estimated_key_bytes(record)?,
+                    )
                 }
-                for (column, value) in &resolved_assignments {
-                    new_row.insert(column.clone(), value.clone());
+                (map, _) => {
+                    let mut new_row = map.expect("a row not read as a record is a map");
+                    let old_primary_key = primary_key_row(&schema, &new_row)?;
+                    let mut values = Vec::with_capacity(computed.len());
+                    for (_, expression) in &computed {
+                        values.push(evaluate(expression, &mut |column, _| {
+                            row_column(&new_row, column, table)
+                        })?);
+                    }
+                    for (column, value) in &resolved_assignments {
+                        new_row.insert(column.clone(), value.clone());
+                    }
+                    for ((column, _), value) in computed.iter().zip(values) {
+                        new_row.insert((*column).clone(), value);
+                    }
+                    let new_row = normalize_row(&schema, new_row)?;
+                    validate_primary_storage_key_bound(&schema, &new_row)?;
+                    let new_key = encode_primary_key(&schema, &new_row)?;
+                    let (next_bytes, key_bytes) = (
+                        estimated_row_bytes(&new_row)?,
+                        estimated_row_bytes(&old_primary_key)?,
+                    );
+                    (
+                        UpdatedRow::Map {
+                            old_primary_key,
+                            new_key,
+                            new_row,
+                        },
+                        next_bytes,
+                        key_bytes,
+                    )
                 }
-                for ((column, _), value) in computed.iter().zip(values) {
-                    new_row.insert((*column).clone(), value);
-                }
-                let new_row = normalize_row(&schema, new_row)?;
-                validate_primary_storage_key_bound(&schema, &new_row)?;
-                let new_key = encode_primary_key(&schema, &new_row)?;
-                let (next_bytes, key_bytes) = (
-                    estimated_row_bytes(&new_row)?,
-                    estimated_row_bytes(&old_primary_key)?,
-                );
-                (
-                    UpdatedRow::Map {
-                        old_primary_key,
-                        new_key,
-                        new_row,
-                    },
-                    next_bytes,
-                    key_bytes,
-                )
-            }
-        };
-        let update = PlannedUpdate {
-            old_key,
-            old_row,
-            next,
-        };
-        let new_key = update.new_key();
-        work_bytes = checked_dml_add(work_bytes, next_bytes)?;
-        work_bytes = checked_dml_add(work_bytes, key_bytes)?;
-        work_bytes = checked_dml_add(
-            work_bytes,
-            checked_dml_add(update.old_key.len(), checked_dml_add(new_key.len(), 192)?)?,
-        )?;
-        ensure_dml_work_bytes(work_bytes)?;
-        work_bytes = retain_dml_change(work_bytes, table)?;
-        if update.old_key != new_key {
+            };
+            let update = PlannedUpdate {
+                old_key,
+                old_row,
+                next,
+            };
+            let new_key = update.new_key();
+            work_bytes = checked_dml_add(work_bytes, next_bytes)?;
+            work_bytes = checked_dml_add(work_bytes, key_bytes)?;
+            work_bytes = checked_dml_add(
+                work_bytes,
+                checked_dml_add(update.old_key.len(), checked_dml_add(new_key.len(), 192)?)?,
+            )?;
+            ensure_dml_work_bytes(work_bytes)?;
             work_bytes = retain_dml_change(work_bytes, table)?;
-        }
+            if update.old_key != new_key {
+                work_bytes = retain_dml_change(work_bytes, table)?;
+            }
 
-        if let (Some(columns), UpdatedRow::Map { new_row, .. }) = (returning, &update.next) {
-            result_bytes = retain_returned_row(result_bytes, new_row, columns)?;
-            returned.push(project_returning_row(new_row, columns, table)?);
-        }
-        updates.push(update);
-        Ok(VisitControl::Continue)
-    })?;
+            if let (Some(columns), UpdatedRow::Map { new_row, .. }) = (returning, &update.next) {
+                result_bytes = retain_returned_row(result_bytes, new_row, columns)?;
+                returned.push(project_returning_row(new_row, columns, table)?);
+            }
+            updates.push(update);
+            Ok(VisitControl::Continue)
+        },
+    )?;
     require_complete_dml_scan(visit_outcome, table)?;
 
     let row_count = updates.len();
@@ -2726,7 +2731,7 @@ fn plan_update(
                 UpdatedRow::Record(record) => {
                     replaced.push(old_row);
                     upserts.push(RowChange::Put {
-                        table: table.to_owned(),
+                        table: Rc::clone(&table_name),
                         key: update.old_key,
                         record,
                     });
@@ -2741,7 +2746,7 @@ fn plan_update(
             if update.old_key != new_key {
                 moved.push((deletes.len(), upserts.len()));
                 deletes.push(RowChange::Delete {
-                    table: table.to_owned(),
+                    table: Rc::clone(&table_name),
                     key: old_primary_key,
                 });
                 deleted.push(old_row);
@@ -2750,7 +2755,7 @@ fn plan_update(
                 replaced.push(old_row);
             }
             upserts.push(RowChange::Upsert {
-                table: table.to_owned(),
+                table: Rc::clone(&table_name),
                 row: new_row,
             });
         }
@@ -2786,6 +2791,8 @@ fn plan_delete(
     predicate: Option<&Predicate>,
     returning: Option<&[String]>,
 ) -> Result<PlannedDml> {
+    // One name, shared by every change the statement plans rather than copied for each.
+    let table_name: Rc<str> = Rc::from(table);
     let resolved = resolved_subqueries(storage, predicate)?;
     let predicate = resolved.as_ref().or(predicate);
     let schema = storage.table_schema(table)?;
@@ -2805,50 +2812,57 @@ fn plan_delete(
     let filter = Filter::new(predicate, &schema, table)?;
     // A script's writer lets a delete plan each stored row by its key, without a map.
     let by_key = storage.plans_removals();
-    let visit_outcome = visit_dml_candidates(storage, &schema, predicate, &filter, &mut scanned, &mut |row| {
-        if changes.len() == MAX_DML_CHANGED_ROWS {
-            return Err(dml_limit_error(format!(
-                "A data-modification statement cannot change more than {MAX_DML_CHANGED_ROWS} rows"
-            )));
-        }
-        // A delete needs only the row's key; the writer reads the rest from the row it keeps.
-        let (change, charge) = match row.stored().filter(|_| by_key) {
-            // Charged as the map of its key columns, which is what its key's estimate is.
-            Some(record) => (
-                RowChange::Remove {
-                    table: table.to_owned(),
-                    key: record.key().to_vec(),
-                },
-                checked_dml_add(estimated_key_bytes(record)?, 96)?,
-            ),
-            None => {
-                let key = row.primary_key()?;
-                let charge = delete_charge(&schema, &key)?;
-                (
-                    RowChange::Delete {
-                        table: table.to_owned(),
-                        key,
-                    },
-                    charge,
-                )
+    let visit_outcome = visit_dml_candidates(
+        storage,
+        &schema,
+        predicate,
+        &filter,
+        &mut scanned,
+        &mut |row| {
+            if changes.len() == MAX_DML_CHANGED_ROWS {
+                return Err(dml_limit_error(format!(
+                    "A data-modification statement cannot change more than {MAX_DML_CHANGED_ROWS} rows"
+                )));
             }
-        };
-        ensure_dml_work_bytes(checked_dml_add(work_bytes, charge)?)?;
-        work_bytes = retain_dml_change(work_bytes, table)?;
-        if let Some(columns) = returning {
-            let row = row.to_row()?;
-            result_bytes = retain_returned_row(result_bytes, &row, columns)?;
-            returned.push(project_returning_row(&row, columns, table)?);
-        }
-        work_bytes = checked_dml_add(work_bytes, charge)?;
-        changes.push(change);
-        previous.push(if kept.fits(row.held_bytes()?) {
-            PreviousRow::Read(Some(row.hold()?))
-        } else {
-            PreviousRow::Unread
-        });
-        Ok(VisitControl::Continue)
-    })?;
+            // A delete needs only the row's key; the writer reads the rest from the row it keeps.
+            let (change, charge) = match row.stored().filter(|_| by_key) {
+                // Charged as the map of its key columns, which is what its key's estimate is.
+                Some(record) => (
+                    RowChange::Remove {
+                        table: Rc::clone(&table_name),
+                        key: record.key().to_vec(),
+                    },
+                    checked_dml_add(estimated_key_bytes(record)?, 96)?,
+                ),
+                None => {
+                    let key = row.primary_key()?;
+                    let charge = delete_charge(&schema, &key)?;
+                    (
+                        RowChange::Delete {
+                            table: Rc::clone(&table_name),
+                            key,
+                        },
+                        charge,
+                    )
+                }
+            };
+            ensure_dml_work_bytes(checked_dml_add(work_bytes, charge)?)?;
+            work_bytes = retain_dml_change(work_bytes, table)?;
+            if let Some(columns) = returning {
+                let row = row.to_row()?;
+                result_bytes = retain_returned_row(result_bytes, &row, columns)?;
+                returned.push(project_returning_row(&row, columns, table)?);
+            }
+            work_bytes = checked_dml_add(work_bytes, charge)?;
+            changes.push(change);
+            previous.push(if kept.fits(row.held_bytes()?) {
+                PreviousRow::Read(Some(row.hold()?))
+            } else {
+                PreviousRow::Unread
+            });
+            Ok(VisitControl::Continue)
+        },
+    )?;
     require_complete_dml_scan(visit_outcome, table)?;
     let row_count = changes.len();
     Ok(PlannedDml {
@@ -2979,11 +2993,11 @@ struct RecordPlan {
 }
 
 impl RecordPlan {
-    fn new(schema: &TableDefinition, layout: Rc<RecordLayout>) -> Result<Self> {
-        Ok(Self {
+    fn new(layout: Rc<RecordLayout>) -> Self {
+        Self {
+            json_overhead: layout.json_overhead(),
             layout,
-            json_overhead: row_json_overhead(schema)?,
-        })
+        }
     }
 
     /// A row's values in schema order, each named value or its column's default, when every one
@@ -3051,7 +3065,7 @@ impl<'a> RecordUpdate<'a> {
                 _ => return Ok(None),
             }
         }
-        let mut bound = row_json_overhead(schema)?;
+        let mut bound = layout.json_overhead();
         for (column, value) in schema.columns.iter().zip(&assigned) {
             // Only encoding a JSON value a row keeps measures it, which a map would do.
             let value_bound = match value {
@@ -3266,12 +3280,22 @@ fn retain_returned_row(current: usize, row: &Row, columns: &[String]) -> Result<
     Ok(next)
 }
 
+// Each is an addition and a branch in its caller, which planning runs several times for every row
+// a statement changes.
+#[inline(always)]
 fn checked_dml_add(left: usize, right: usize) -> Result<usize> {
-    left.checked_add(right).ok_or_else(dml_overflow_error)
+    match left.checked_add(right) {
+        Some(bytes) => Ok(bytes),
+        None => Err(dml_overflow_error()),
+    }
 }
 
+#[inline(always)]
 fn checked_dml_mul(left: usize, right: usize) -> Result<usize> {
-    left.checked_mul(right).ok_or_else(dml_overflow_error)
+    match left.checked_mul(right) {
+        Some(bytes) => Ok(bytes),
+        None => Err(dml_overflow_error()),
+    }
 }
 
 fn ensure_dml_work_bytes(bytes: usize) -> Result<()> {
@@ -4511,7 +4535,7 @@ mod tests {
         for row in rows {
             storage
                 .apply_row_changes_unrevisioned(vec![RowChange::Upsert {
-                    table: table.to_owned(),
+                    table: Rc::from(table),
                     row,
                 }])
                 .unwrap();

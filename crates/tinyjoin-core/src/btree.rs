@@ -3670,7 +3670,8 @@ fn read_u16(bytes: &[u8], offset: usize) -> u16 {
 
 /// Reads a little-endian number byte by byte, compiled into its caller: the cell reader a scan
 /// runs for every row reads several, and a copy of a slice into an array would be a call. The
-/// readers above stay calls, which the many places that read a number once are smaller as.
+/// readers above and below stay calls: compiled into the many places that read a number once,
+/// they cost 2.6 KiB of compressed code for a gain of about a percent.
 #[inline(always)]
 fn u16_at(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
@@ -3698,7 +3699,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 }
 
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("bounded u64"))
+    u64::from(u32_at(bytes, offset)) | (u64::from(u32_at(bytes, offset + 4)) << 32)
 }
 
 fn as_corruption(error: EngineError) -> EngineError {

@@ -513,31 +513,38 @@ fn execute_ordered(
     // Ordered by its outputs, a row is projected before rows are sorted, since an output worked
     // out from the row is in no row read.
     let projected_first = projection.as_ref().filter(|_| plan.ordered_by_outputs);
-    visit_candidate_rows(storage, plan, schema, KeyOrder::Ascending, &filter, &mut |row| {
-        if rows.len() == MAX_ORDERED_ROWS {
-            return Err(EngineError::new(
-                "QUERY_WORK_LIMIT_EXCEEDED",
-                format!(
-                    "An ordered query cannot collect more than {MAX_ORDERED_ROWS} matching rows"
-                ),
-            ));
-        }
-        let row = match projected_first {
-            Some(projection) => {
-                ensure_result_budget(checked_result_add(
-                    ordered_bytes,
-                    projection.estimated_bytes(row)?,
-                )?)?;
-                projection.project(row)?
+    visit_candidate_rows(
+        storage,
+        plan,
+        schema,
+        KeyOrder::Ascending,
+        &filter,
+        &mut |row| {
+            if rows.len() == MAX_ORDERED_ROWS {
+                return Err(EngineError::new(
+                    "QUERY_WORK_LIMIT_EXCEEDED",
+                    format!(
+                        "An ordered query cannot collect more than {MAX_ORDERED_ROWS} matching rows"
+                    ),
+                ));
             }
-            None => row.to_row()?,
-        };
-        let next_ordered_bytes = checked_result_add(ordered_bytes, owned_row_bytes(&row)?)?;
-        ensure_result_budget(next_ordered_bytes)?;
-        rows.push(row);
-        ordered_bytes = next_ordered_bytes;
-        Ok(VisitControl::Continue)
-    })?;
+            let row = match projected_first {
+                Some(projection) => {
+                    ensure_result_budget(checked_result_add(
+                        ordered_bytes,
+                        projection.estimated_bytes(row)?,
+                    )?)?;
+                    projection.project(row)?
+                }
+                None => row.to_row()?,
+            };
+            let next_ordered_bytes = checked_result_add(ordered_bytes, owned_row_bytes(&row)?)?;
+            ensure_result_budget(next_ordered_bytes)?;
+            rows.push(row);
+            ordered_bytes = next_ordered_bytes;
+            Ok(VisitControl::Continue)
+        },
+    )?;
     sort_rows(&mut rows, &plan.order_by, &plan.table)?;
     let take = plan.limit.unwrap_or(MAX_RESULT_ROWS + 1);
     let mut remaining_ordered_bytes = ordered_bytes;
@@ -5100,7 +5107,7 @@ mod tests {
     fn visitor_index_absence_falls_back_but_an_empty_posting_does_not() {
         let definition = IndexDefinition {
             name: "items_user".to_owned(),
-            table: "items".to_owned(),
+            table: "items".into(),
             columns: vec!["user_id".to_owned()],
             unique: false,
         };
@@ -5145,7 +5152,7 @@ mod tests {
         storage.index = Some((
             IndexDefinition {
                 name: "items_user".to_owned(),
-                table: "items".to_owned(),
+                table: "items".into(),
                 columns: vec!["user_id".to_owned()],
                 unique: false,
             },
@@ -5683,7 +5690,7 @@ mod tests {
         assert_eq!(
             parse_sql("SELECT ID FROM POSTS", &[]).unwrap(),
             SelectPlan {
-                table: "posts".to_owned(),
+                table: "posts".into(),
                 columns: Some(vec![select_column("id")]),
                 positional: false,
                 array_rows: false,
@@ -5698,7 +5705,7 @@ mod tests {
         assert_eq!(
             parse_sql("SELECT \"ID\" FROM \"Posts\"", &[]).unwrap(),
             SelectPlan {
-                table: "Posts".to_owned(),
+                table: "Posts".into(),
                 columns: Some(vec![select_column("ID")]),
                 positional: false,
                 array_rows: false,
@@ -5723,7 +5730,7 @@ mod tests {
             )
             .unwrap(),
             SelectPlan {
-                table: "public.posts".to_owned(),
+                table: "public.posts".into(),
                 columns: Some(vec![select_column("display\"name")]),
                 positional: false,
                 array_rows: false,

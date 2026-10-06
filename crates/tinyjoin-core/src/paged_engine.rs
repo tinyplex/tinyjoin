@@ -736,17 +736,45 @@ lines', true, '7')"#,
                 "INSERT INTO items (id, name, qty, note, price) VALUES ($1, $2, $3, $4, $5)",
                 vec![json!(4), json!("four"), json!(4), json!(null), json!(4.0)],
             ),
-            ("INSERT INTO items (id, name) VALUES ($1, $2)", vec![json!(5), json!("five")]),
-            ("INSERT INTO items (id, name) VALUES ($1, $2)", vec![json!(5), json!("again")]),
-            ("INSERT INTO items (id, name) VALUES ($1, $2)", vec![json!(6), json!("one")]),
+            (
+                "INSERT INTO items (id, name) VALUES ($1, $2)",
+                vec![json!(5), json!("five")],
+            ),
+            (
+                "INSERT INTO items (id, name) VALUES ($1, $2)",
+                vec![json!(5), json!("again")],
+            ),
+            (
+                "INSERT INTO items (id, name) VALUES ($1, $2)",
+                vec![json!(6), json!("one")],
+            ),
             (
                 "INSERT INTO items (id, name, qty) VALUES ($1, $2, $3)",
                 vec![json!(7), json!("seven"), json!("many")],
             ),
-            ("INSERT INTO items VALUES ($1, $2, $3, $4, $5)", vec![json!(9), json!("nine"), json!(9), json!("ninth"), json!(9.5)]),
+            (
+                "INSERT INTO items VALUES ($1, $2, $3, $4, $5)",
+                vec![
+                    json!(9),
+                    json!("nine"),
+                    json!(9),
+                    json!("ninth"),
+                    json!(9.5),
+                ],
+            ),
             (
                 "INSERT INTO items (id, name, qty) VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9)",
-                vec![json!(30), json!("thirty"), json!(3), json!(31), json!("thirty-one"), json!(1), json!(29), json!("twenty-nine"), json!(2)],
+                vec![
+                    json!(30),
+                    json!("thirty"),
+                    json!(3),
+                    json!(31),
+                    json!("thirty-one"),
+                    json!(1),
+                    json!(29),
+                    json!("twenty-nine"),
+                    json!(2),
+                ],
             ),
             (
                 "INSERT INTO items (id, name) VALUES ($1, $2), ($3, $4)",
@@ -754,24 +782,60 @@ lines', true, '7')"#,
             ),
             (
                 "INSERT INTO items (id, name) VALUES ($1, $2), ($3, $4)",
-                vec![json!(41), json!("forty-one"), json!(30), json!("thirty again")],
+                vec![
+                    json!(41),
+                    json!("forty-one"),
+                    json!(30),
+                    json!("thirty again"),
+                ],
             ),
             (
                 "INSERT INTO items (id, name, qty) VALUES ($1, $2, $3), ($4, $5, $6)",
-                vec![json!(42), json!("forty-two"), json!(1), json!(43), json!("forty-three"), json!("lots")],
+                vec![
+                    json!(42),
+                    json!("forty-two"),
+                    json!(1),
+                    json!(43),
+                    json!("forty-three"),
+                    json!("lots"),
+                ],
             ),
             (
                 "INSERT INTO items (id, name) VALUES ($1, $2), ($3, $4)",
                 vec![json!(44), json!("one"), json!(45), json!("forty-five")],
             ),
-            ("UPDATE items SET note = $1 WHERE id = $2", vec![json!("noted"), json!(2)]),
-            ("UPDATE items SET note = $1 WHERE id = $2", vec![json!("missing"), json!(99)]),
-            ("UPDATE items SET qty = DEFAULT, note = $1 WHERE $2 = id", vec![json!(null), json!(3)]),
-            ("UPDATE items SET name = $1 WHERE id = $2", vec![json!(null), json!(1)]),
-            ("UPDATE items SET name = $1 WHERE id = $2", vec![json!("two"), json!(1)]),
-            ("UPDATE items SET price = $1 WHERE id = $2", vec![json!(2), json!(2)]),
-            ("UPDATE items SET id = $1 WHERE id = $2", vec![json!(20), json!(2)]),
-            ("UPDATE items SET qty = $1 WHERE id = $2", vec![json!(3.5), json!(1)]),
+            (
+                "UPDATE items SET note = $1 WHERE id = $2",
+                vec![json!("noted"), json!(2)],
+            ),
+            (
+                "UPDATE items SET note = $1 WHERE id = $2",
+                vec![json!("missing"), json!(99)],
+            ),
+            (
+                "UPDATE items SET qty = DEFAULT, note = $1 WHERE $2 = id",
+                vec![json!(null), json!(3)],
+            ),
+            (
+                "UPDATE items SET name = $1 WHERE id = $2",
+                vec![json!(null), json!(1)],
+            ),
+            (
+                "UPDATE items SET name = $1 WHERE id = $2",
+                vec![json!("two"), json!(1)],
+            ),
+            (
+                "UPDATE items SET price = $1 WHERE id = $2",
+                vec![json!(2), json!(2)],
+            ),
+            (
+                "UPDATE items SET id = $1 WHERE id = $2",
+                vec![json!(20), json!(2)],
+            ),
+            (
+                "UPDATE items SET qty = $1 WHERE id = $2",
+                vec![json!(3.5), json!(1)],
+            ),
             ("DELETE FROM items WHERE id = $1", vec![json!(5)]),
             ("DELETE FROM items WHERE id = $1", vec![json!(5)]),
             ("DELETE FROM items WHERE id = $1", vec![json!(3)]),
@@ -795,13 +859,22 @@ lines', true, '7')"#,
                  ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
                 vec![json!(8), json!("eighth")],
             ),
-            ("INSERT INTO tags (id, item, tag) VALUES ($1, $2, $3)", vec![json!(12), json!(2), json!("c")]),
-            ("INSERT INTO tags (id, item, tag) VALUES ($1, $2, $3)", vec![json!(13), json!(99), json!("d")]),
+            (
+                "INSERT INTO tags (id, item, tag) VALUES ($1, $2, $3)",
+                vec![json!(12), json!(2), json!("c")],
+            ),
+            (
+                "INSERT INTO tags (id, item, tag) VALUES ($1, $2, $3)",
+                vec![json!(13), json!(99), json!("d")],
+            ),
             (
                 "UPDATE items SET note = $1 WHERE id = $2 AND name = $3",
                 vec![json!("x"), json!(1), json!("uno")],
             ),
-            ("SELECT id, qty, note FROM items WHERE id = $1", vec![json!(1)]),
+            (
+                "SELECT id, qty, note FROM items WHERE id = $1",
+                vec![json!(1)],
+            ),
             ("DELETE FROM items WHERE id = $1", vec![json!(1)]),
         ];
         let open = || {
@@ -838,7 +911,12 @@ lines', true, '7')"#,
         // Rows 4, 8, 9, 20, 29, 30, and 31 remain: 2 moved to 20, 3 and 5 were deleted, 1 last of
         // all, and every later listed insert failed as a whole.
         assert_eq!(
-            objects(&prepared.execute_sql("SELECT * FROM items ORDER BY id", &[]).unwrap()).len(),
+            objects(
+                &prepared
+                    .execute_sql("SELECT * FROM items ORDER BY id", &[])
+                    .unwrap()
+            )
+            .len(),
             7
         );
     }
@@ -3016,7 +3094,7 @@ lines', true, '7')"#,
             )
             .unwrap();
         let keys = inserted.keys.get("members").unwrap();
-        assert_eq!(keys.columns, ["team", "id"]);
+        assert_eq!(keys.columns(), ["team", "id"]);
         assert_eq!(keys.values, [json!("a"), json!(2), json!("b"), json!(1)]);
 
         // A transaction's statements and its commit list them the same way.
@@ -3024,10 +3102,13 @@ lines', true, '7')"#,
         let updated = engine
             .execute_sql("UPDATE members SET role = 'z' WHERE team = 'b'", &[])
             .unwrap();
-        assert_eq!(updated.keys.get("members").unwrap().columns, ["team", "id"]);
+        assert_eq!(
+            updated.keys.get("members").unwrap().columns(),
+            ["team", "id"]
+        );
         let outcome = engine.commit_transaction().unwrap();
         let keys = outcome.keys.get("members").unwrap();
-        assert_eq!(keys.columns, ["team", "id"]);
+        assert_eq!(keys.columns(), ["team", "id"]);
         assert_eq!(keys.values, [json!("b"), json!(1)]);
     }
 

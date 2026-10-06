@@ -96,6 +96,10 @@ enum PatchRow {
 /// A table's entries in a patch, in key order.
 type PatchEntries = Vec<(Vec<u8>, OverlayEntry)>;
 
+/// The table a patch's last change named: its name, its place in the patch, and the entries the
+/// transaction already stages for it.
+type LastTable<'a> = (Rc<str>, usize, Option<&'a BTreeMap<Vec<u8>, OverlayEntry>>);
+
 /// A statement's overlay entries: each table it changes, with its entries in key order. A
 /// statement changes a table or two, and most change a row or two, so vectors hold them without
 /// the nodes a map would allocate.
@@ -250,8 +254,7 @@ impl PagedTransaction {
             }
             if !values.is_empty() {
                 keys.insert(TableKeys {
-                    table: table.clone(),
-                    columns: paged.schema.primary_key.clone(),
+                    schema: Rc::clone(&paged.schema),
                     values,
                 });
             }
@@ -340,7 +343,7 @@ impl PagedTransaction {
         // The table the last change named, with its place in `patched` and the entries the
         // transaction already stages for it: a statement's changes name one table, which is
         // looked up once rather than for every row.
-        let mut last: Option<(String, usize, Option<&BTreeMap<Vec<u8>, OverlayEntry>>)> = None;
+        let mut last: Option<LastTable<'_>> = None;
         for change in changes {
             let held = previous.next().unwrap_or(PreviousRow::Unread);
             let (table, row, encoded) = match change {
@@ -365,25 +368,28 @@ impl PagedTransaction {
             };
             // A statement's only change needs nothing merged with it.
             if count == 1 {
-                let staged = self.entries.get(&table);
+                let staged = self.entries.get(&*table);
                 let (change, replaces) =
                     self.first_change(storage, staged, &table, &key, held, row, is_delete)?;
                 let paged = storage.table(&table)?;
                 let indexes = storage.table_indexes(&table);
                 let entry = overlay_entry(storage, paged, &indexes, &key, change)?;
                 return Ok(OverlayPatch {
-                    entries: vec![(table, vec![(key, entry)])],
+                    entries: vec![(table.to_string(), vec![(key, entry)])],
                     replaces,
                 });
             }
             let (position, staged) = match &last {
                 Some((name, position, staged)) if *name == table => (*position, *staged),
                 _ => {
-                    let position = patched.partition_point(|(name, _)| *name < table);
-                    if patched.get(position).is_none_or(|(name, _)| *name != table) {
-                        patched.insert(position, (table.clone(), KeyedRows::default()));
+                    let position = patched.partition_point(|(name, _)| name.as_str() < &*table);
+                    if patched
+                        .get(position)
+                        .is_none_or(|(name, _)| *name != *table)
+                    {
+                        patched.insert(position, (table.to_string(), KeyedRows::default()));
                     }
-                    let staged = self.entries.get(&table);
+                    let staged = self.entries.get(&*table);
                     last = Some((table.clone(), position, staged));
                     (position, staged)
                 }
@@ -682,11 +688,11 @@ fn changes_from_entries<'a, D: PageDevice>(
             let paged = storage.table(table).unwrap();
             match &entry.row.next {
                 Some(record) => RowChange::Upsert {
-                    table: table.to_owned(),
+                    table: std::rc::Rc::from(table),
                     row: paged.record(key, record).unwrap().to_row().unwrap(),
                 },
                 None => RowChange::Delete {
-                    table: table.to_owned(),
+                    table: std::rc::Rc::from(table),
                     key: key_row(paged, key).unwrap(),
                 },
             }
@@ -852,7 +858,14 @@ impl<'a, D: PageDevice> PagedReadView<'a, D> {
             .and_then(|transaction| transaction.table_entries(table))
         else {
             return self.storage.visit_rows_where(
-                table, range, order, &[], self.work, filter, scanned, visitor,
+                table,
+                range,
+                order,
+                &[],
+                self.work,
+                filter,
+                scanned,
+                visitor,
             );
         };
         // The committed rows that changed entries replace are passed over, and the entries' rows
@@ -924,7 +937,14 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
         table: &str,
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
-        self.visit_rows_where(table, None, KeyOrder::Ascending, None, &mut |_| Ok(()), visitor)
+        self.visit_rows_where(
+            table,
+            None,
+            KeyOrder::Ascending,
+            None,
+            &mut |_| Ok(()),
+            visitor,
+        )
     }
 
     fn visit_table_where(
@@ -1187,7 +1207,7 @@ mod tests {
                     .stage(
                         &storage,
                         vec![RowChange::Upsert {
-                            table: "items".to_owned(),
+                            table: "items".into(),
                             row: row(json!({"id": id, "name": format!("item-{id}")})),
                         }],
                         Vec::new(),
@@ -1227,15 +1247,15 @@ mod tests {
                 &storage,
                 vec![
                     RowChange::Delete {
-                        table: "items".to_owned(),
+                        table: "items".into(),
                         key: row(json!({"id": 1})),
                     },
                     RowChange::Upsert {
-                        table: "items".to_owned(),
+                        table: "items".into(),
                         row: row(json!({"id": 2, "name": "changed"})),
                     },
                     RowChange::Upsert {
-                        table: "items".to_owned(),
+                        table: "items".into(),
                         row: row(json!({"id": 3, "name": "three"})),
                     },
                 ],
@@ -1246,7 +1266,7 @@ mod tests {
             .stage(
                 &storage,
                 vec![RowChange::Delete {
-                    table: "items".to_owned(),
+                    table: "items".into(),
                     key: row(json!({"id": 3})),
                 }],
                 Vec::new(),
@@ -1313,11 +1333,11 @@ mod tests {
             };
             changes.push(match &name {
                 Some(name) => RowChange::Upsert {
-                    table: "items".to_owned(),
+                    table: "items".into(),
                     row: row(json!({"id": id, "name": name})),
                 },
                 None => RowChange::Delete {
-                    table: "items".to_owned(),
+                    table: "items".into(),
                     key: row(json!({"id": id})),
                 },
             });
@@ -1328,7 +1348,7 @@ mod tests {
         }
         for id in (1..3000).step_by(98) {
             changes.push(RowChange::Upsert {
-                table: "items".to_owned(),
+                table: "items".into(),
                 row: row(json!({"id": id, "name": format!("odd {id}")})),
             });
             expected.insert(id, format!("odd {id}"));
@@ -1366,7 +1386,7 @@ mod tests {
         let payload = "x".repeat(900_000);
         let changes = (10..20)
             .map(|id| RowChange::Upsert {
-                table: "items".to_owned(),
+                table: "items".into(),
                 row: row(json!({"id": id, "name": payload})),
             })
             .collect();

@@ -412,6 +412,18 @@ Found along the way:
   pass, and the validators count keys rather than walking them: warm in
   Chromium, an update by key spent 1.7 µs less in the Worker and 1.1 µs less
   on the page.
+- The rows a statement changes share one `Rc<str>` for their table, hoisted
+  once per planner, and the entries an index gains and loses for them are
+  encoded into one buffer; a result's changed keys hold their table's schema
+  rather than copies of its name and key columns; the write-set and DML size
+  checks are inline additions with cold error paths; a record layout keeps
+  its rows' JSON overhead; the write-set preflight resolves a statement's
+  table once and the script path charges its operations once; and the Worker
+  writes each response into the text kept from the last. An update by key
+  makes 1,513 WebAssembly calls rather than 1,876. Engine-only, the 8,000-row
+  range delete takes 12% less time optimized and 18% less under baseline
+  compilation, the `LIKE` delete 6% less, and 10,000 inserts in a transaction
+  6% less under baseline compilation, for 3.8 KiB more compressed code.
 
 Found along the way, 6 and 7 October:
 
@@ -432,6 +444,28 @@ Found along the way, 6 and 7 October:
   few large functions cross the budget almost at once. Running thousands of
   point statements in the warm-up Worker first did not change the browser
   numbers.
+- Binaryen's `--log-execution` pass, with the logging import answered from the
+  harness, counts every function's calls: an update by key made 1,876 calls,
+  122 of them to a two-byte reader, 102 to `memcmp`, 57 to `Vec::reserve`,
+  39 to `push_str`, 56 to `Option::ok_or_else`, and 28 `malloc`/`free`
+  pairs. Removing 19% of the calls took 5% off the time under baseline
+  compilation, so the calls themselves are a smaller part of the tax than
+  their count suggests. Compiling the two- and four-byte readers into their
+  callers cost 2.6 KiB compressed for about 1%, and was dropped.
+- Compiling the engine at opt-level `s` takes 23% off the baseline-compiled
+  time of statements by key and 8% off the optimized time, for 39 KiB more
+  compressed code; an explicit LLVM inline threshold of 30 at opt-level `z`
+  about 10% for 17 KiB, and a threshold of 15 nothing reliable for 3.8 KiB.
+  `wasm-opt -Os` makes no difference to `-Oz`. The first measurement after a
+  build runs 20-40% slow on this passively cooled machine, and once mistook the
+  threshold of 15 for a fifth off: compare builds interleaved, after a
+  warm-up block.
+- A commit's page writes: the 1,000 spread updates, the 200-row inserts and
+  the `LIKE` delete each rewrite all 178 of the table's pages in two or three
+  runs, since the rows they change lie in every leaf; the range delete frees
+  whole leaves and writes 10 pages; committing one insert writes about four
+  pages and flushes, and an OPFS flush costs 0.35-0.4 ms, which is nearly all
+  of that workload's 431 µs per statement.
 
 Remaining, in order of expected value:
 

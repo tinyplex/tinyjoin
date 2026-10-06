@@ -105,7 +105,15 @@ impl TreeReader<'_> {
         table: &str,
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
-        self.visit_rows_where(table, None, KeyOrder::Ascending, &[], None, &mut |_| Ok(()), visitor)
+        self.visit_rows_where(
+            table,
+            None,
+            KeyOrder::Ascending,
+            &[],
+            None,
+            &mut |_| Ok(()),
+            visitor,
+        )
     }
 
     pub(crate) fn visit_table_range(
@@ -115,7 +123,15 @@ impl TreeReader<'_> {
         order: KeyOrder,
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
-        self.visit_rows_where(table, Some(range), order, &[], None, &mut |_| Ok(()), visitor)
+        self.visit_rows_where(
+            table,
+            Some(range),
+            order,
+            &[],
+            None,
+            &mut |_| Ok(()),
+            visitor,
+        )
     }
 
     /// Visits the rows of `table` in `order`, those within `range` when one is given, except those
@@ -910,7 +926,12 @@ impl<D: PageDevice> PagedStorage<D> {
                 .get(table_name)
                 .ok_or_else(|| EngineError::table_not_found(table_name))?;
             let key = encode_primary_key(&table.schema, input)?;
-            if is_upsert && !upserts.entry(table_name.clone()).or_default().insert(key) {
+            if is_upsert
+                && !upserts
+                    .entry(table_name.to_string())
+                    .or_default()
+                    .insert(key)
+            {
                 return Err(EngineError::constraint_violation(format!(
                     "SQL statement would write canonical primary key in `{table_name}` more than once"
                 )));
@@ -1253,7 +1274,7 @@ impl<D: PageDevice> PagedStorage<D> {
                 normalize_row(&table.schema, input.clone())?
             };
             let key = encode_primary_key(&table.schema, &row)?;
-            let table_changes = tables.entry(table_name.clone()).or_default();
+            let table_changes = tables.entry(table_name.to_string()).or_default();
             if let Some(existing) = table_changes.get_mut(&key) {
                 let previous_bytes = existing.next.as_ref().map_or(Ok(0), estimated_row_bytes)?;
                 let next = (!is_delete).then_some(row);
@@ -1446,7 +1467,7 @@ fn preflight_batch(
         if !tables.contains_key(table) {
             return Err(EngineError::table_not_found(table));
         }
-        let index_count = index_counts.get(table.as_str()).copied().unwrap_or(0);
+        let index_count = index_counts.get(&**table).copied().unwrap_or(0);
         operations = operations
             .checked_add(1 + 2 * index_count)
             .ok_or_else(batch_too_large)?;
@@ -1460,7 +1481,7 @@ fn preflight_batch(
             .and_then(|bytes| bytes.checked_add(64))
             .ok_or_else(batch_too_large)?;
         ensure_batch_bytes(bytes)?;
-        changed_tables.insert(table.as_str());
+        changed_tables.insert(&**table);
     }
     let affected_index_count = changed_tables.iter().try_fold(0usize, |count, table| {
         count
@@ -2340,7 +2361,7 @@ mod tests {
             execute_sql(&mut storage, sql, &[]).unwrap();
         }
         let change = |table: &str, id: i64, value: &str| RowChange::Upsert {
-            table: table.to_owned(),
+            table: std::rc::Rc::from(table),
             row: row(json!({"id": id, "value": value})),
         };
         let changes = vec![
@@ -2365,7 +2386,7 @@ mod tests {
             // One row and two maintained indexes, or one row and one index.
             assert_eq!(
                 cost.usage.operations,
-                if table == "first_table" { 5 } else { 3 }
+                if &**table == "first_table" { 5 } else { 3 }
             );
             usage = usage.plus(cost.usage).unwrap();
             claims.extend(
@@ -2394,7 +2415,7 @@ mod tests {
             execute_sql(&mut storage, sql, &[]).unwrap();
         }
         let change = RowChange::Upsert {
-            table: "items".to_owned(),
+            table: "items".into(),
             row: row(json!({"id": 1, "value": "one"})),
         };
         let RowChange::Upsert { row, .. } = &change else {
@@ -2595,7 +2616,7 @@ mod tests {
         let index = CatalogIndexRecord {
             definition: IndexDefinition {
                 name: "missing_entries".to_owned(),
-                table: "missing_rows".to_owned(),
+                table: "missing_rows".into(),
                 columns: vec!["id".to_owned()],
                 unique: false,
             },
@@ -2694,7 +2715,7 @@ mod tests {
                 encode_catalog_index_record(&CatalogIndexRecord {
                     definition: IndexDefinition {
                         name: "items_lookup".to_owned(),
-                        table: "items".to_owned(),
+                        table: "items".into(),
                         columns: vec![column.to_owned()],
                         unique: false,
                     },

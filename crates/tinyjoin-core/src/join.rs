@@ -2217,7 +2217,7 @@ mod tests {
         for row in rows {
             storage
                 .apply_row_changes_unrevisioned(vec![RowChange::Upsert {
-                    table: table.to_owned(),
+                    table: std::rc::Rc::from(table),
                     row,
                 }])
                 .unwrap();

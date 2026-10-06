@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -254,24 +256,24 @@ fn catalog_strings(value: &Value) -> Option<Vec<String>> {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum RowChange {
     Upsert {
-        table: String,
+        table: Rc<str>,
         row: Row,
     },
     Delete {
-        table: String,
+        table: Rc<str>,
         key: Row,
     },
     /// An upsert planned straight into the stored entry it writes: its encoded primary key and
     /// its record. Only a reader with record layouts plans rows this way.
     Put {
-        table: String,
+        table: Rc<str>,
         key: Vec<u8>,
         record: Vec<u8>,
     },
     /// A delete planned straight from the stored entry it removes: its encoded primary key. Only a
     /// reader with record layouts plans deletes this way.
     Remove {
-        table: String,
+        table: Rc<str>,
         key: Vec<u8>,
     },
 }
@@ -415,10 +417,10 @@ pub struct ChangedKeys(Vec<TableKeys>);
 /// One table's changed primary keys.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TableKeys {
-    pub table: String,
-    /// The table's primary-key columns, in key order, as a key's object lists them.
-    pub columns: Vec<String>,
-    /// Each key's values in the order of `columns`, one key after another.
+    /// The table's schema, shared with the catalog rather than copied for every statement, whose
+    /// primary-key columns, in key order, a key's object lists.
+    pub schema: Rc<TableDefinition>,
+    /// Each key's values in the order of the key's columns, one key after another.
     pub values: Vec<Value>,
 }
 
@@ -434,7 +436,7 @@ impl ChangedKeys {
 
     pub fn get(&self, table: &str) -> Option<&TableKeys> {
         self.0
-            .binary_search_by(|keys| keys.table.as_str().cmp(table))
+            .binary_search_by(|keys| keys.table().cmp(table))
             .ok()
             .map(|at| &self.0[at])
     }
@@ -443,7 +445,7 @@ impl ChangedKeys {
     pub fn insert(&mut self, keys: TableKeys) {
         match self
             .0
-            .binary_search_by(|other| other.table.cmp(&keys.table))
+            .binary_search_by(|other| other.table().cmp(keys.table()))
         {
             Ok(at) => self.0[at] = keys,
             Err(at) => self.0.insert(at, keys),
@@ -463,9 +465,19 @@ impl ChangedKeys {
 }
 
 impl TableKeys {
+    /// The table's name.
+    pub fn table(&self) -> &str {
+        &self.schema.name
+    }
+
+    /// The table's primary-key columns, in key order, as a key's object lists them.
+    pub fn columns(&self) -> &[String] {
+        &self.schema.primary_key
+    }
+
     /// Each key's values, in the order of the columns.
     pub fn keys(&self) -> std::slice::Chunks<'_, Value> {
-        self.values.chunks(self.columns.len().max(1))
+        self.values.chunks(self.columns().len().max(1))
     }
 
     /// Each key as an object of its columns, as a result reports it.
@@ -473,7 +485,7 @@ impl TableKeys {
     pub(crate) fn rows(&self) -> Vec<Row> {
         self.keys()
             .map(|values| {
-                self.columns
+                self.columns()
                     .iter()
                     .cloned()
                     .zip(values.iter().cloned())

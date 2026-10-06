@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -58,6 +59,7 @@ impl<'a> Request<'a> {
         Self { bytes, at: 0 }
     }
 
+    #[inline(always)]
     fn take(&mut self, count: usize) -> Result<&'a [u8]> {
         let end = self
             .at
@@ -260,11 +262,23 @@ fn error_text(error: &EngineError) -> String {
 #[derive(Default)]
 struct Json(String);
 
+thread_local! {
+    /// The text of the last response, emptied, for the next to be written into, so that a
+    /// statement's response neither allocates nor frees its text. One far longer than a statement's
+    /// header is freed rather than kept.
+    static SPARE: Cell<String> = const { Cell::new(String::new()) };
+}
+
+const SPARE_BYTES: usize = 64 * 1024;
+
 impl Json {
     fn envelope(status: u32, disposition: u32) -> Self {
+        let mut text = SPARE.take();
+        text.clear();
         // Room for a statement's header and a few rows, so that most responses are written without
         // growing the text.
-        let mut json = Self(String::with_capacity(512));
+        text.reserve(512);
+        let mut json = Self(text);
         json.raw("[");
         for value in [VERSION, status, disposition] {
             // Written as a u64, which numbers are written as anyway.
@@ -287,7 +301,11 @@ impl Json {
 
     fn finish(self) -> Result<JsValue> {
         self.bounded()?;
-        Ok(JsValue::from_str(&self.0))
+        let value = JsValue::from_str(&self.0);
+        if self.0.capacity() <= SPARE_BYTES {
+            SPARE.set(self.0);
+        }
+        Ok(value)
     }
 
     fn bounded(&self) -> Result<()> {
@@ -416,11 +434,11 @@ impl Json {
             if index > 0 {
                 self.raw(",");
             }
-            self.string(&table.table);
+            self.string(table.table());
             self.raw(":[");
             for (index, values) in table.keys().enumerate() {
                 self.raw(if index > 0 { ",{" } else { "{" });
-                for (index, (column, value)) in table.columns.iter().zip(values).enumerate() {
+                for (index, (column, value)) in table.columns().iter().zip(values).enumerate() {
                     if index > 0 {
                         self.raw(",");
                     }
@@ -737,13 +755,21 @@ mod tests {
         }
     }
 
+    fn table_keys(table: &str, columns: &[&str], values: Vec<Value>) -> TableKeys {
+        TableKeys {
+            schema: Rc::new(TableDefinition {
+                name: table.into(),
+                primary_key: columns.iter().map(|column| (*column).into()).collect(),
+                columns: vec![],
+                foreign_keys: vec![],
+            }),
+            values,
+        }
+    }
+
     fn changed_keys(table: &str, columns: &[&str], values: Vec<Value>) -> ChangedKeys {
         let mut keys = ChangedKeys::default();
-        keys.insert(TableKeys {
-            table: table.into(),
-            columns: columns.iter().map(|column| (*column).into()).collect(),
-            values,
-        });
+        keys.insert(table_keys(table, columns, values));
         keys
     }
 
@@ -981,11 +1007,7 @@ mod tests {
             &["a", "b"],
             vec![json!(1), json!("x"), json!(2), json!("y")],
         );
-        keys.insert(TableKeys {
-            table: "empty".into(),
-            columns: vec!["id".into()],
-            values: vec![],
-        });
+        keys.insert(table_keys("empty", &["id"], vec![]));
         let mut json = Json::default();
         json.changed_keys(&keys).unwrap();
         assert_eq!(

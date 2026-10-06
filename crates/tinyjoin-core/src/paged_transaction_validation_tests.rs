@@ -29,14 +29,14 @@ fn upsert(table: &str, id: Value, email: Value, payload: &str) -> RowChange {
     // SQL planning normalizes a FLOAT key to binary64 before staging it.
     let id = crate::storage::float_value(&id);
     RowChange::Upsert {
-        table: table.to_owned(),
+        table: table.into(),
         row: row(json!({"id": id, "email": email, "group_id": 1, "payload": payload})),
     }
 }
 
 fn delete(id: i64) -> RowChange {
     RowChange::Delete {
-        table: "items".to_owned(),
+        table: "items".into(),
         key: row(json!({"id": id})),
     }
 }
@@ -414,7 +414,7 @@ fn generated_mixed_statements_stage_as_full_validation_does() {
                         let email = emails[random.below(emails.len())].clone();
                         let group = [json!(1), json!(2), Value::Null][random.below(3)].clone();
                         RowChange::Upsert {
-                            table: "items".to_owned(),
+                            table: "items".into(),
                             row: row(json!({
                                 "id": crate::storage::float_value(&json!(id)),
                                 "email": email,
