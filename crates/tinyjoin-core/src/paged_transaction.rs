@@ -34,6 +34,10 @@ pub(crate) struct PagedTransaction {
     entries: BTreeMap<String, BTreeMap<Vec<u8>, OverlayEntry>>,
     /// The tables a statement has changed, in name order.
     touched_tables: Vec<String>,
+    /// How many staged entries of each table delete their row. An insert of a key no row was read
+    /// for can replace a staged entry only in a table with one, so other tables' inserts skip the
+    /// search for one.
+    staged_deletes: Vec<(String, usize)>,
     totals: Totals,
 }
 
@@ -81,6 +85,8 @@ struct PatchChange {
     row: PatchRow,
     /// Whether the statement upserts the key, which it may do only once.
     upserted: bool,
+    /// Whether the change replaces a staged entry that deleted the key.
+    replaced_delete: bool,
 }
 
 /// A statement's change to one key, as planning made it.
@@ -96,9 +102,14 @@ enum PatchRow {
 /// A table's entries in a patch, in key order.
 type PatchEntries = Vec<(Vec<u8>, OverlayEntry)>;
 
-/// The table a patch's last change named: its name, its place in the patch, and the entries the
-/// transaction already stages for it.
-type LastTable<'a> = (Rc<str>, usize, Option<&'a BTreeMap<Vec<u8>, OverlayEntry>>);
+/// The table a patch's last change named: its name, its place in the patch, the entries the
+/// transaction already stages for it, and whether any of those delete their row.
+type LastTable<'a> = (
+    Rc<str>,
+    usize,
+    Option<&'a BTreeMap<Vec<u8>, OverlayEntry>>,
+    bool,
+);
 
 /// A statement's overlay entries: each table it changes, with its entries in key order. A
 /// statement changes a table or two, and most change a row or two, so vectors hold them without
@@ -106,6 +117,9 @@ type LastTable<'a> = (Rc<str>, usize, Option<&'a BTreeMap<Vec<u8>, OverlayEntry>
 #[derive(Default)]
 struct OverlayPatch {
     entries: Vec<(String, PatchEntries)>,
+    /// For each table in `entries`, how many more of its staged entries delete their row once the
+    /// patch is installed.
+    deletes: Vec<isize>,
     /// Whether any entry replaces one the transaction staged before.
     replaces: bool,
 }
@@ -140,12 +154,20 @@ impl PagedTransaction {
             base_revision,
             entries: BTreeMap::new(),
             touched_tables: Vec::new(),
+            staged_deletes: Vec::new(),
             totals: Totals::default(),
         }
     }
 
     pub(crate) fn base_revision(&self) -> u64 {
         self.base_revision
+    }
+
+    /// Whether any of `table`'s staged entries deletes its row.
+    fn has_staged_deletes(&self, table: &str) -> bool {
+        self.staged_deletes
+            .iter()
+            .any(|(name, count)| name == table && *count > 0)
     }
 
     pub(crate) fn is_dirty(&self) -> bool {
@@ -279,7 +301,24 @@ impl PagedTransaction {
 
         // No fallible validation remains: a failed statement changes neither the staged rows nor
         // the totals.
-        for ((table, entries), changed_rows) in patch.entries.into_iter().zip(change.changed_rows) {
+        for (((table, entries), deletes), changed_rows) in patch
+            .entries
+            .into_iter()
+            .zip(patch.deletes)
+            .zip(change.changed_rows)
+        {
+            if deletes != 0 {
+                match self
+                    .staged_deletes
+                    .iter_mut()
+                    .find(|(name, _)| *name == table)
+                {
+                    Some((_, count)) => *count = count.saturating_add_signed(deletes),
+                    None => self
+                        .staged_deletes
+                        .push((table.clone(), deletes.max(0).unsigned_abs())),
+                }
+            }
             let count = changed_count(&self.totals.changed_tables, &table, changed_rows);
             match self
                 .totals
@@ -369,18 +408,31 @@ impl PagedTransaction {
             // A statement's only change needs nothing merged with it.
             if count == 1 {
                 let staged = self.entries.get(&*table);
-                let (change, replaces) =
-                    self.first_change(storage, staged, &table, &key, held, row, is_delete)?;
+                let has_deletes = self.has_staged_deletes(&table);
+                let (change, replaces) = self.first_change(
+                    storage,
+                    staged,
+                    &table,
+                    &key,
+                    held,
+                    row,
+                    is_delete,
+                    has_deletes,
+                )?;
+                let deletes = isize::from(is_delete) - isize::from(change.replaced_delete);
                 let paged = storage.table(&table)?;
                 let indexes = storage.table_indexes(&table);
                 let entry = overlay_entry(storage, paged, &indexes, &key, change)?;
                 return Ok(OverlayPatch {
                     entries: vec![(table.to_string(), vec![(key, entry)])],
+                    deletes: vec![deletes],
                     replaces,
                 });
             }
-            let (position, staged) = match &last {
-                Some((name, position, staged)) if *name == table => (*position, *staged),
+            let (position, staged, has_deletes) = match &last {
+                Some((name, position, staged, has_deletes)) if *name == table => {
+                    (*position, *staged, *has_deletes)
+                }
                 _ => {
                     let position = patched.partition_point(|(name, _)| name.as_str() < &*table);
                     if patched
@@ -390,8 +442,9 @@ impl PagedTransaction {
                         patched.insert(position, (table.to_string(), KeyedRows::default()));
                     }
                     let staged = self.entries.get(&*table);
-                    last = Some((table.clone(), position, staged));
-                    (position, staged)
+                    let has_deletes = self.has_staged_deletes(&table);
+                    last = Some((table.clone(), position, staged, has_deletes));
+                    (position, staged, has_deletes)
                 }
             };
             let entries = &mut patched[position].1;
@@ -408,8 +461,16 @@ impl PagedTransaction {
                     slot.row = row;
                 }
                 None => {
-                    let (change, replaced) =
-                        self.first_change(storage, staged, &table, &key, held, row, is_delete)?;
+                    let (change, replaced) = self.first_change(
+                        storage,
+                        staged,
+                        &table,
+                        &key,
+                        held,
+                        row,
+                        is_delete,
+                        has_deletes,
+                    )?;
                     replaces |= replaced;
                     entries.insert(key, change);
                 }
@@ -424,11 +485,15 @@ impl PagedTransaction {
             let indexes = storage.table_indexes(&table);
             let changes = changes.into_sorted();
             let mut entries = Vec::with_capacity(changes.len());
+            let mut deletes = 0isize;
             for (key, change) in changes {
+                deletes += isize::from(matches!(change.row, PatchRow::Delete(_)))
+                    - isize::from(change.replaced_delete);
                 let entry = overlay_entry(storage, paged, &indexes, &key, change)?;
                 entries.push((key, entry));
             }
             patch.entries.push((table, entries));
+            patch.deletes.push(deletes);
         }
         Ok(patch)
     }
@@ -447,8 +512,16 @@ impl PagedTransaction {
         held: PreviousRow,
         row: PatchRow,
         is_delete: bool,
+        has_deletes: bool,
     ) -> Result<(PatchChange, bool)> {
-        let staged = staged.and_then(|entries| entries.get(key));
+        // A key planning read no row for has no live staged entry, which planning would have
+        // read, so only a table with staged deletes can hold an entry for it.
+        let staged = if !is_delete && !has_deletes && matches!(held, PreviousRow::Read(None)) {
+            None
+        } else {
+            staged.and_then(|entries| entries.get(key))
+        };
+        let replaced_delete = staged.is_some_and(|entry| entry.row.next.is_none());
         let base = match (staged, held) {
             (Some(entry), _) => entry.row.old.clone(),
             (None, PreviousRow::Read(row)) => row,
@@ -460,6 +533,7 @@ impl PagedTransaction {
             base,
             row,
             upserted: !is_delete,
+            replaced_delete,
         };
         Ok((change, staged.is_some()))
     }

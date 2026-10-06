@@ -661,7 +661,7 @@ pub(crate) enum PointTemplate {
         table: String,
         columns: Option<Vec<String>>,
         /// The listed rows: one, when there is a conflict clause.
-        rows: Vec<Vec<SqlValue>>,
+        rows: Vec<Vec<PointArg>>,
         /// `ON CONFLICT (target) DO UPDATE SET`: the target's columns, and each assignment.
         conflict: Option<PointConflict>,
     },
@@ -676,6 +676,15 @@ pub(crate) enum PointTemplate {
         table: String,
         key: Vec<(String, Value)>,
     },
+}
+
+/// A value a point template's listed row holds, resolved once when the template is made rather
+/// than for every row of every execution: a literal, the parameter at an index, or `DEFAULT`.
+#[derive(Clone, Debug)]
+pub(crate) enum PointArg {
+    Literal(Value),
+    Param(usize),
+    Default,
 }
 
 /// A point template's `ON CONFLICT (target) DO UPDATE SET`: the target's columns, and each
@@ -728,7 +737,10 @@ pub(crate) fn point_template(statement: &WriteStatement) -> Option<PointTemplate
             Some(PointTemplate::Insert {
                 table: table.clone(),
                 columns: columns.clone(),
-                rows: values.clone(),
+                rows: values
+                    .iter()
+                    .map(|row| row.iter().map(point_arg).collect())
+                    .collect(),
                 conflict,
             })
         }
@@ -832,12 +844,28 @@ pub(crate) fn plan_point(
 fn point_value<'a>(value: &'a Value, params: &'a [Value]) -> Result<&'a Value> {
     match prepared_parameter_index(value) {
         None => Ok(value),
-        Some(index) => params.get(index - 1).ok_or_else(|| {
-            EngineError::new(
-                "INTERNAL_ERROR",
-                "Prepared statement parameter metadata is inconsistent",
-            )
-        }),
+        Some(index) => point_param(params, index - 1),
+    }
+}
+
+/// The parameter at `index`, which the statement's parameter check made sure is bound.
+fn point_param(params: &[Value], index: usize) -> Result<&Value> {
+    params.get(index).ok_or_else(|| {
+        EngineError::new(
+            "INTERNAL_ERROR",
+            "Prepared statement parameter metadata is inconsistent",
+        )
+    })
+}
+
+/// A listed value as a point template keeps it.
+fn point_arg(value: &SqlValue) -> PointArg {
+    match value {
+        SqlValue::Default => PointArg::Default,
+        SqlValue::Value(value) => match prepared_parameter_index(value) {
+            Some(index) => PointArg::Param(index - 1),
+            None => PointArg::Literal(value.clone()),
+        },
     }
 }
 
@@ -1089,7 +1117,7 @@ const MAX_POINT_INSERT_BYTES: usize = 1024 * 1024;
 fn point_row_values<'a>(
     schema: &'a TableDefinition,
     positions: &[Option<usize>],
-    values: &'a [SqlValue],
+    values: &'a [PointArg],
     params: &'a [Value],
     default_values: bool,
     overhead: usize,
@@ -1102,8 +1130,9 @@ fn point_row_values<'a>(
             .then(|| position.and_then(|index| values.get(index)))
             .flatten();
         let value = match explicit {
-            Some(SqlValue::Value(value)) => point_value(value, params)?,
-            Some(SqlValue::Default) | None => column.default.as_ref().unwrap_or(&Value::Null),
+            Some(PointArg::Param(index)) => point_param(params, *index)?,
+            Some(PointArg::Literal(value)) => value,
+            Some(PointArg::Default) | None => column.default.as_ref().unwrap_or(&Value::Null),
         };
         let Some(value_bound) = json_scalar_bound(value) else {
             return Ok(None);
@@ -1118,7 +1147,7 @@ fn plan_point_insert(
     storage: &dyn StorageReader,
     table: &str,
     columns: Option<&[String]>,
-    rows: &[Vec<SqlValue>],
+    rows: &[Vec<PointArg>],
     conflict: Option<&PointConflict>,
     params: &[Value],
 ) -> Result<Option<PlannedDml>> {

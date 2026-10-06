@@ -440,6 +440,15 @@ Found along the way:
   range delete takes 12% less time optimized and 18% less under baseline
   compilation, the `LIKE` delete 6% less, and 10,000 inserts in a transaction
   6% less under baseline compilation, for 3.8 KiB more compressed code.
+- A point template keeps each listed value as a literal or a parameter
+  position, resolved when the statement is prepared rather than looked up in
+  the value's marker object for every row of every execution, and an insert of
+  a key planning read no row for, into a table none of whose staged entries is
+  a delete, skips the search of the staged entries for one it would replace:
+  the overlay's B-tree map searches had been a quarter of a 200-row insert's
+  time under baseline compilation. Engine-only, 200-row inserts take 14% less
+  time under baseline compilation and 9% less optimized, 10,000 inserts in a
+  transaction 8% and 3%, and upserts 4%.
 
 Found along the way, 6 and 7 October:
 

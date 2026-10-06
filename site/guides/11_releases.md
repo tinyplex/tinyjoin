@@ -36,9 +36,13 @@ change built as the record a commit writes, rather than binding the
 statement's syntax tree and planning it as any statement is. A test stages
 the same statements both ways and checks that the transactions, the results,
 and the committed databases agree. Staging then looks a statement's table up
-once rather than for every row. Engine-only, 10,000 inserts in a transaction
-take a fifth less time, updates by key a fifth less, upserts a third less, and
-200-row inserts a quarter less.
+once rather than for every row, a listed row's values are resolved to literals
+or parameter positions once, when the statement is prepared, rather than for
+every row of every execution, and an insert into a table none of whose staged
+rows is a delete skips the search of the staged rows for an entry it would
+replace, which planning would have read. Engine-only, 10,000 inserts in a
+transaction take a quarter less time, updates by key a fifth less, upserts a
+third less, and 200-row inserts a third less.
 
 ### Changing many rows
 
