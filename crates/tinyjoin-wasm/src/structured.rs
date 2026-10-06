@@ -550,7 +550,7 @@ impl Json {
                 self.raw(",");
             }
             self.raw("{\"command\":");
-            self.string(&result.command);
+            self.string(result.command);
             self.raw(",\"revision\":");
             self.unsigned(result.revision)?;
             self.raw(",\"rowCount\":");
@@ -717,7 +717,7 @@ mod tests {
 
     fn result(fields: &[(&str, u32)], rows: Vec<Value>) -> ExecuteResult {
         ExecuteResult {
-            command: "SELECT".into(),
+            command: "SELECT",
             revision: 7,
             row_count: rows.len(),
             fields: fields
@@ -861,7 +861,7 @@ mod tests {
         );
 
         let empty = ExecuteResult {
-            command: "UPDATE".into(),
+            command: "UPDATE",
             revision: 8,
             row_count: 3,
             fields: vec![],

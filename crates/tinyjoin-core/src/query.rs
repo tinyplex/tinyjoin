@@ -603,6 +603,7 @@ fn visit_candidate_rows(
 /// that filters one table. Narrowing is only ever a candidate-selection step: each caller still
 /// evaluates the full predicate per visited row, so an index that covers part of a predicate
 /// cannot change which rows the caller accepts.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn visit_predicate_candidates(
     storage: &dyn StorageReader,
     table: &str,

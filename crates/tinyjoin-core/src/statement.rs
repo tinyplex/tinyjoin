@@ -667,7 +667,7 @@ pub(crate) enum PointTemplate {
         /// The listed rows: one, when there is a conflict clause.
         rows: Vec<Vec<SqlValue>>,
         /// `ON CONFLICT (target) DO UPDATE SET`: the target's columns, and each assignment.
-        conflict: Option<(Vec<String>, Vec<(String, PointAssigned)>)>,
+        conflict: Option<PointConflict>,
     },
     Update {
         table: String,
@@ -681,6 +681,10 @@ pub(crate) enum PointTemplate {
         key: Vec<(String, Value)>,
     },
 }
+
+/// A point template's `ON CONFLICT (target) DO UPDATE SET`: the target's columns, and each
+/// assigned column with what it is assigned.
+type PointConflict = (Vec<String>, Vec<(String, PointAssigned)>);
 
 /// What `ON CONFLICT DO UPDATE SET` assigns in a point template: a column of `EXCLUDED`, the
 /// proposed row, or a constant.
@@ -1117,7 +1121,7 @@ fn plan_point_insert(
     table: &str,
     columns: Option<&[String]>,
     rows: &[Vec<SqlValue>],
-    conflict: Option<&(Vec<String>, Vec<(String, PointAssigned)>)>,
+    conflict: Option<&PointConflict>,
     params: &[Value],
 ) -> Result<Option<PlannedDml>> {
     let schema = storage.table_schema(table)?;
@@ -1169,7 +1173,7 @@ fn plan_point_insert(
             for (column, value) in schema.columns.iter().zip(&row) {
                 validate_value(column, value, table)?;
             }
-            let key = encode_primary_key_values(&schema, &layout, &row)?;
+            let key = encode_primary_key_values(schema, &layout, &row)?;
             ensure_storage_key_bytes(key.len())?;
             let key_of = |index: &usize| match &changes[*index] {
                 RowChange::Put { key, .. } => key.as_slice(),
@@ -1182,7 +1186,7 @@ fn plan_point_insert(
             if storage.holds_encoded_key(table, &key)? {
                 return Err(duplicate_primary_key("INSERT into", table));
             }
-            let record = encode_row_values(&schema, &layout, &row)?;
+            let record = encode_row_values(schema, &layout, &row)?;
             by_key.insert(position, changes.len());
             changes.push(RowChange::Put {
                 table: table.to_owned(),
@@ -1257,7 +1261,7 @@ fn plan_point_insert(
     for (column, value) in schema.columns.iter().zip(&row) {
         validate_value(column, value, table)?;
     }
-    let key = encode_primary_key_values(&schema, &layout, &row)?;
+    let key = encode_primary_key_values(schema, &layout, &row)?;
     ensure_storage_key_bytes(key.len())?;
     let Some(assignments) = updates else {
         unreachable!("a lone row without a conflict clause was planned above")
@@ -1271,15 +1275,15 @@ fn plan_point_insert(
     let mut key_values = Vec::with_capacity(schema.primary_key.len());
     for column in &schema.primary_key {
         let value = row[position_of(column).expect("a key column is a column")];
-        if !exact_primary_key_value(&schema, column, value) {
+        if !exact_primary_key_value(schema, column, value) {
             return Ok(None);
         }
         key_values.push(value);
     }
-    let entry = match point_row(storage, &schema, &key_values)? {
+    let entry = match point_row(storage, schema, &key_values)? {
         PointRow::Other => return Ok(None),
         PointRow::None => {
-            let record = encode_row_values(&schema, &layout, &row)?;
+            let record = encode_row_values(schema, &layout, &row)?;
             return Ok(Some(point_change(
                 "INSERT",
                 table,
@@ -1312,10 +1316,10 @@ fn plan_point_insert(
             PointAssigned::Value(value) => point_value(value, params)?,
         });
     }
-    let Some(bound) = point_assigned_bound(&schema, &assigned)? else {
+    let Some(bound) = point_assigned_bound(schema, &assigned)? else {
         return Ok(None);
     };
-    let record = StoredRecord::new(&schema, &layout, entry.key(), entry.value())?;
+    let record = StoredRecord::new(schema, &layout, entry.key(), entry.value())?;
     if !point_record_fits(&record, schema.columns.len(), bound) {
         return Ok(None);
     }
