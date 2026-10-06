@@ -26,6 +26,7 @@ use crate::{
         PagedIndex, PagedTable, TreeReader, adjusted_count, batch_too_large, ensure_batch_bytes,
         limit_error, storage_corrupt, unique_violation,
     },
+    query::Filter,
     row::{HeldRow, RowRef},
     statement::{
         PlannedDml, PreviousRow, Statement, TableChange, WriteOutcome, WriteStatement, change_table,
@@ -1540,6 +1541,47 @@ impl<D: PageDevice> StorageReader for PagedScriptCandidate<'_, D> {
     ) -> Result<VisitOutcome> {
         self.reader()
             .visit_table_range(table, range, order, visitor)
+    }
+
+    // A script's rows are stored records, so the tree reader tests each one against the filter
+    // from its bytes before presenting it, as a read's and a transaction's rows are tested; the
+    // trait's default, which decodes and judges every row, is for readers without records.
+    fn visit_table_where(
+        &self,
+        table: &str,
+        filter: &Filter<'_>,
+        scanned: &mut dyn FnMut(usize) -> Result<()>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        self.reader().visit_rows_where(
+            table,
+            None,
+            KeyOrder::Ascending,
+            &[],
+            Some(filter),
+            scanned,
+            visitor,
+        )
+    }
+
+    fn visit_table_range_where(
+        &self,
+        table: &str,
+        range: &KeyRange,
+        order: KeyOrder,
+        filter: &Filter<'_>,
+        scanned: &mut dyn FnMut(usize) -> Result<()>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        self.reader().visit_rows_where(
+            table,
+            Some(range),
+            order,
+            &[],
+            Some(filter),
+            scanned,
+            visitor,
+        )
     }
 
     fn table_row_count(&self, table: &str) -> Result<usize> {

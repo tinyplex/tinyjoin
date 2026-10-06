@@ -461,6 +461,15 @@ Found along the way:
   time under baseline compilation. Engine-only, 200-row inserts take 14% less
   time under baseline compilation and 9% less optimized, 10,000 inserts in a
   transaction 8% and 3%, and upserts 4%.
+- A script's DELETE and UPDATE scan through the record tests as reads and
+  transactions do: the script candidate had inherited the trait's default
+  visit, which decoded every row and judged it with the whole predicate. A
+  predicate term the record tests reject no longer has the row's other terms
+  evaluated, so an expression that would fail on a rejected row (a division
+  by zero, say) no longer fails the statement, as was already the case for
+  reads and for statements inside a transaction; a test pins the three paths.
+  Engine-only, the `LIKE` delete takes 21% less time under baseline
+  compilation and 11% less optimized, the range delete 7% and 5%.
 
 Found along the way, 6 and 7 October:
 

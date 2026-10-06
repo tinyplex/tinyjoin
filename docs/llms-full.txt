@@ -3180,9 +3180,12 @@ column with constants, match a `LIKE` pattern, or test for `NULL`, are
 compiled into tests of the stored record, and a table scan applies them to
 each leaf's rows in one pass over the leaf's bytes, decoding and presenting
 only the rows they accept. A `LIKE` pattern of literal segments is matched as
-bytes. In the benchmark, 100 range aggregates without an index fell from 48 ms
-to 25, 100 `LIKE` aggregates from 113 ms to 70, and a transaction's 100 range
-`UPDATE`s from 62 ms to 41.
+bytes. A `DELETE` or `UPDATE` run outside a transaction scans the same way,
+where before it decoded every row and judged each with the whole predicate.
+In the benchmark, 100 range aggregates without an index fell from 48 ms to 25,
+100 `LIKE` aggregates from 113 ms to 70, and a transaction's 100 range
+`UPDATE`s from 62 ms to 41; engine-only, the `LIKE` delete takes a fifth less
+time before V8 has optimized the code and a tenth less after.
 
 ### Writing rows by key
 

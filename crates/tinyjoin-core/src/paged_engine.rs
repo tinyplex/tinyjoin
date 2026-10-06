@@ -921,6 +921,228 @@ lines', true, '7')"#,
         );
     }
 
+    /// The statements that create a table of entries whose notes name their rows' numbers in
+    /// words, so that a `LIKE` pattern matches a known share of its rows, and insert `count` of
+    /// them in batches within the SQL token limit. Every seventh note is `NULL`; the rest name
+    /// the row's number in words, as "entry fifty three of the ledger", in at least 27 bytes.
+    fn entries_seed(count: usize) -> Vec<String> {
+        const TENS: [&str; 10] = [
+            "zero", "ten", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty",
+            "ninety",
+        ];
+        const ONES: [&str; 10] = [
+            "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+        ];
+        let mut statements = vec![
+            "CREATE TABLE entries (id INTEGER PRIMARY KEY, amount INTEGER NOT NULL, \
+             note TEXT, flag BOOLEAN NOT NULL DEFAULT false)"
+                .to_owned(),
+        ];
+        statements.extend((0..count).collect::<Vec<_>>().chunks(200).map(|batch| {
+            let rows = batch
+                .iter()
+                .map(|id| {
+                    let note = if id % 7 == 0 {
+                        "NULL".to_owned()
+                    } else {
+                        format!(
+                            "'entry {} {} of the ledger'",
+                            TENS[(id / 10) % 10],
+                            ONES[id % 10]
+                        )
+                    };
+                    format!("({id}, {}, {note})", (id * 37) % 10_000)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("INSERT INTO entries (id, amount, note) VALUES {rows}")
+        }));
+        statements
+    }
+
+    #[test]
+    fn script_dml_filters_rows_from_their_records() {
+        // A standalone DELETE or UPDATE runs as a one-statement script, whose candidate reads
+        // its table through the tree reader that tests each stored record against the filter
+        // before presenting a row, as a read and a transaction do. Each statement here runs
+        // standalone in one database and in a transaction of its own in another, both seeded
+        // with enough rows to fill many leaves, and in the in-memory engine, which decodes and
+        // judges every row; all three must report the same result, and the two databases must
+        // hold the same rows afterwards.
+        const ROWS: usize = 3_000;
+        // The notes alone, of at least 27 bytes in six rows of seven, fill more pages than this,
+        // so the rows span many leaves.
+        const NOTE_PAGES: u64 = (ROWS * 6 / 7 * 27 / PAGE_SIZE) as u64;
+        let statements = entries_seed(ROWS);
+        let seed: Vec<&str> = statements.iter().map(String::as_str).collect();
+        let (seeded, mut transaction) = (database_with(&seed), database_with(&seed));
+        let mut oracle = Engine::default();
+        for sql in &seed {
+            oracle.execute_sql(sql, &[]).unwrap();
+        }
+        let device = seeded.into_device();
+        assert!(
+            device.page_count() > NOTE_PAGES,
+            "{} pages hold the rows",
+            device.page_count()
+        );
+        let mut script = PagedEngine::open(device).unwrap();
+        // The in-memory engine holds rows under their keys' text, and returns them in that order,
+        // so its rows are compared sorted by id, which every RETURNING here lists; the two paged
+        // paths must agree on the order as well.
+        let describe = |result: &Result<ExecuteResult>, sorted: bool| match result {
+            Ok(result) => {
+                let mut rows = result.rows.clone();
+                if sorted {
+                    rows.sort_by_key(|row| row["id"].as_i64());
+                }
+                format!(
+                    "ok {} {} {:?} {:?} {:?}",
+                    result.command, result.row_count, result.tables, result.keys, rows
+                )
+            }
+            Err(error) => format!("err {} {}", error.code, error.message),
+        };
+        // The one predicate whose outcome the record tests change: an expression that divides
+        // by zero at the fifth row, beside a LIKE no note matches. The reader's test rejects
+        // every row from its record, so the expression judges none, and the script and the
+        // transaction delete nothing; the in-memory engine, which judges every row in source
+        // order, as the script did before its candidate tested records, fails at that row.
+        let dividing = "DELETE FROM entries WHERE amount / (id - 5) > 0 AND note LIKE '%nothing%'";
+        let standalone = script.execute_sql(dividing, &[]);
+        transaction.begin_transaction().unwrap();
+        let staged = transaction.execute_sql(dividing, &[]);
+        transaction.commit_transaction().unwrap();
+        assert_eq!(describe(&standalone, false), describe(&staged, false));
+        assert_eq!(standalone.unwrap().row_count, 0);
+        assert_eq!(
+            oracle.execute_sql(dividing, &[]).unwrap_err().code,
+            "DIVISION_BY_ZERO"
+        );
+        // Each predicate, and whether the reader's record tests decide it: a LIKE, a range of a
+        // stored integer column, and IS NULL they do; a range of the key column, which records
+        // do not hold, an OR, and a key term beside a LIKE leave the filter to judge the rows the
+        // pass presents. The notes of three hundred rows hold "fifty", bar every seventh, which
+        // is NULL.
+        let fifties = (0..ROWS)
+            .filter(|id| (id / 10) % 10 == 5 && id % 7 != 0)
+            .count();
+        let statements = [
+            (
+                "DELETE FROM entries WHERE note LIKE '%fifty%' RETURNING id, note",
+                Some(fifties),
+            ),
+            (
+                "UPDATE entries SET flag = true WHERE note LIKE 'entry twenty%' RETURNING id",
+                None,
+            ),
+            (
+                "UPDATE entries SET amount = amount + 1 WHERE amount >= 2000 AND amount < 4000",
+                None,
+            ),
+            (
+                "DELETE FROM entries WHERE id >= 1000 AND id < 1900 RETURNING id",
+                None,
+            ),
+            (
+                "UPDATE entries SET note = 'unnamed' WHERE note IS NULL RETURNING id",
+                None,
+            ),
+            (
+                "DELETE FROM entries WHERE note LIKE '%seven%' OR amount < 300 RETURNING id, amount",
+                None,
+            ),
+            (
+                "UPDATE entries SET flag = true WHERE id >= 2000 AND note LIKE '%three%' RETURNING id",
+                None,
+            ),
+            ("DELETE FROM entries WHERE note LIKE '%nothing%'", Some(0)),
+            (
+                "DELETE FROM entries WHERE amount >= 1000 AND amount < 9000",
+                None,
+            ),
+        ];
+        for (sql, matched) in statements {
+            let standalone = script.execute_sql(sql, &[]);
+            transaction.begin_transaction().unwrap();
+            let staged = transaction.execute_sql(sql, &[]);
+            let expected = oracle.execute_sql(sql, &[]);
+            assert_eq!(
+                describe(&standalone, false),
+                describe(&staged, false),
+                "{sql}"
+            );
+            assert_eq!(
+                describe(&standalone, true),
+                describe(&expected, true),
+                "{sql}"
+            );
+            transaction.commit_transaction().unwrap();
+            assert_eq!(script.database_hash(), transaction.database_hash(), "{sql}");
+            let row_count = standalone.unwrap().row_count;
+            match matched {
+                Some(matched) => assert_eq!(row_count, matched, "{sql}"),
+                None => assert!(row_count > 0, "{sql}"),
+            }
+        }
+        script.check().unwrap();
+        transaction.check().unwrap();
+        let remaining = "SELECT id, amount, note, flag FROM entries ORDER BY id";
+        let rows = script.query_sql(remaining, &[]).unwrap().rows;
+        assert_eq!(rows, transaction.query_sql(remaining, &[]).unwrap().rows);
+        assert_eq!(rows, oracle.query_sql(remaining, &[]).unwrap().rows);
+        assert!(!rows.is_empty());
+    }
+
+    #[test]
+    fn script_dml_scans_are_bounded_by_the_scripts_operations() {
+        // A script's DML scan is bounded by the operations the script may require, charged for
+        // every row the reader examines, whether or not the filter accepts it. Over 4,000 rows,
+        // 250 deletes that match nothing scan exactly the budget's 1,000,000 rows and succeed;
+        // one more fails the whole script, which publishes nothing. A script inside a
+        // transaction has the same budget, and fails the same way, staging nothing. The counts
+        // pin a rejected row's cost at exactly one operation; a charge per statement would move
+        // the boundary, and these counts with it.
+        let statements = entries_seed(4_000);
+        let seed: Vec<&str> = statements.iter().map(String::as_str).collect();
+        let mut engine = database_with(&seed);
+        let revision = engine.revision();
+        let hash = engine.database_hash();
+        let fruitless = "DELETE FROM entries WHERE note LIKE '%absent%';".repeat(250);
+        let results = engine.exec_sql(&fruitless).unwrap();
+        assert_eq!(results.len(), 250);
+        assert!(results.iter().all(|result| result.row_count == 0));
+        assert_eq!(engine.revision(), revision);
+        let over = format!("{fruitless}DELETE FROM entries WHERE note LIKE '%fifty%';");
+        let failure = |error: EngineError| (error.code, error.message);
+        let too_large = (
+            "TRANSACTION_TOO_LARGE".to_owned(),
+            "A SQL script cannot require more than 1000000 row, index, and join operations"
+                .to_owned(),
+        );
+        assert_eq!(failure(engine.exec_sql(&over).unwrap_err()), too_large);
+        assert_eq!(engine.revision(), revision);
+        assert_eq!(engine.database_hash(), hash);
+
+        engine.begin_transaction().unwrap();
+        let untouched = engine.transaction_fingerprint();
+        assert_eq!(engine.exec_sql(&fruitless).unwrap().len(), 250);
+        assert_eq!(failure(engine.exec_sql(&over).unwrap_err()), too_large);
+        assert_eq!(engine.transaction_fingerprint(), untouched);
+        engine.rollback_transaction().unwrap();
+        assert_eq!(engine.database_hash(), hash);
+        assert_eq!(
+            engine
+                .query_sql(
+                    "SELECT COUNT(*) AS n FROM entries WHERE note LIKE '%fifty%'",
+                    &[]
+                )
+                .unwrap()
+                .rows,
+            vec![row(json!({"n": 343}))]
+        );
+    }
+
     #[test]
     fn a_key_too_long_to_store_fails_a_lookup_and_a_write_scans_for_it() {
         let mut engine = database_with(&[
