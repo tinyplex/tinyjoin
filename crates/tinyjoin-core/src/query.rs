@@ -449,18 +449,13 @@ fn execute_unordered(
     schema: &crate::TableDefinition,
     order: KeyOrder,
 ) -> Result<(Vec<Row>, Option<ValueRows>)> {
-    let mut scanned = 0_usize;
     let mut skipped_matches = 0_usize;
     let mut result_bytes = 0_usize;
     let mut rows = Vec::new();
     let mut values = Vec::new();
     let filter = Filter::new(plan.predicate.as_ref(), schema, &plan.table)?;
     let projection = Projection::new(plan.columns.as_deref(), schema, &plan.table)?;
-    visit_candidate_rows(storage, plan, schema, order, &mut |row| {
-        count_scanned_row(&mut scanned)?;
-        if !filter.matches(row)? {
-            return Ok(VisitControl::Continue);
-        }
+    visit_candidate_rows(storage, plan, schema, order, &filter, &mut |row| {
         if skipped_matches < plan.offset {
             skipped_matches += 1;
             return Ok(VisitControl::Continue);
@@ -511,7 +506,6 @@ fn execute_ordered(
     plan: &SelectPlan,
     schema: &crate::TableDefinition,
 ) -> Result<Vec<Row>> {
-    let mut scanned = 0_usize;
     let mut ordered_bytes = 0_usize;
     let mut rows = Vec::new();
     let filter = Filter::new(plan.predicate.as_ref(), schema, &plan.table)?;
@@ -519,32 +513,29 @@ fn execute_ordered(
     // Ordered by its outputs, a row is projected before rows are sorted, since an output worked
     // out from the row is in no row read.
     let projected_first = projection.as_ref().filter(|_| plan.ordered_by_outputs);
-    visit_candidate_rows(storage, plan, schema, KeyOrder::Ascending, &mut |row| {
-        count_scanned_row(&mut scanned)?;
-        if filter.matches(row)? {
-            if rows.len() == MAX_ORDERED_ROWS {
-                return Err(EngineError::new(
-                    "QUERY_WORK_LIMIT_EXCEEDED",
-                    format!(
-                        "An ordered query cannot collect more than {MAX_ORDERED_ROWS} matching rows"
-                    ),
-                ));
-            }
-            let row = match projected_first {
-                Some(projection) => {
-                    ensure_result_budget(checked_result_add(
-                        ordered_bytes,
-                        projection.estimated_bytes(row)?,
-                    )?)?;
-                    projection.project(row)?
-                }
-                None => row.to_row()?,
-            };
-            let next_ordered_bytes = checked_result_add(ordered_bytes, owned_row_bytes(&row)?)?;
-            ensure_result_budget(next_ordered_bytes)?;
-            rows.push(row);
-            ordered_bytes = next_ordered_bytes;
+    visit_candidate_rows(storage, plan, schema, KeyOrder::Ascending, &filter, &mut |row| {
+        if rows.len() == MAX_ORDERED_ROWS {
+            return Err(EngineError::new(
+                "QUERY_WORK_LIMIT_EXCEEDED",
+                format!(
+                    "An ordered query cannot collect more than {MAX_ORDERED_ROWS} matching rows"
+                ),
+            ));
         }
+        let row = match projected_first {
+            Some(projection) => {
+                ensure_result_budget(checked_result_add(
+                    ordered_bytes,
+                    projection.estimated_bytes(row)?,
+                )?)?;
+                projection.project(row)?
+            }
+            None => row.to_row()?,
+        };
+        let next_ordered_bytes = checked_result_add(ordered_bytes, owned_row_bytes(&row)?)?;
+        ensure_result_budget(next_ordered_bytes)?;
+        rows.push(row);
+        ordered_bytes = next_ordered_bytes;
         Ok(VisitControl::Continue)
     })?;
     sort_rows(&mut rows, &plan.order_by, &plan.table)?;
@@ -586,19 +577,24 @@ fn execute_ordered(
     Ok(projected_rows)
 }
 
+/// Visits the rows a query's predicate accepts, bounding the rows scanned to find them.
 fn visit_candidate_rows(
     storage: &dyn StorageReader,
     plan: &SelectPlan,
     schema: &crate::TableDefinition,
     order: KeyOrder,
+    filter: &Filter<'_>,
     visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
 ) -> Result<VisitOutcome> {
+    let mut scanned = 0_usize;
     visit_predicate_candidates(
         storage,
         &plan.table,
         plan.predicate.as_ref(),
         schema,
         order,
+        filter,
+        &mut |rows| count_scanned_rows(&mut scanned, rows),
         visitor,
     )
 }
@@ -613,12 +609,38 @@ pub(crate) fn visit_predicate_candidates(
     predicate: Option<&Predicate>,
     schema: &crate::TableDefinition,
     order: KeyOrder,
+    filter: &Filter<'_>,
+    scanned: &mut dyn FnMut(usize) -> Result<()>,
     visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
 ) -> Result<VisitOutcome> {
     if let Some(values) = exact_equalities(predicate, schema, &schema.primary_key) {
-        return storage.visit_primary_key_values(table, schema, &values, visitor);
+        return storage.visit_primary_key_values(
+            table,
+            schema,
+            &values,
+            &mut filtered(filter, scanned, visitor),
+        );
     }
-    visit_indexed_candidates(storage, table, predicate, schema, order, visitor)
+    visit_indexed_candidates(
+        storage, table, predicate, schema, order, filter, scanned, visitor,
+    )
+}
+
+/// A visitor of candidate rows that charges each to `scanned` and passes those `filter` accepts
+/// on to `visitor`, for the candidate paths that present every row they find.
+fn filtered<'v>(
+    filter: &'v Filter<'_>,
+    scanned: &'v mut dyn FnMut(usize) -> Result<()>,
+    visitor: &'v mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+) -> impl FnMut(&RowRef<'_>) -> Result<VisitControl> + 'v {
+    move |row| {
+        scanned(1)?;
+        if filter.matches(row)? {
+            visitor(row)
+        } else {
+            Ok(VisitControl::Continue)
+        }
+    }
 }
 
 /// [`visit_predicate_candidates`] once no complete primary key applies. In ascending order it reads,
@@ -626,16 +648,25 @@ pub(crate) fn visit_predicate_candidates(
 /// column, a range of the leading primary-key column, and otherwise the whole table. Every one of
 /// these returns rows in primary-key order, the equality index because its rows' indexed values
 /// are equal. In descending order it reads only by primary key.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn visit_indexed_candidates(
     storage: &dyn StorageReader,
     table: &str,
     predicate: Option<&Predicate>,
     schema: &crate::TableDefinition,
     order: KeyOrder,
+    filter: &Filter<'_>,
+    scanned: &mut dyn FnMut(usize) -> Result<()>,
     visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
 ) -> Result<VisitOutcome> {
     if order == KeyOrder::Ascending
-        && let Some(outcome) = visit_secondary_index(storage, table, predicate, schema, visitor)?
+        && let Some(outcome) = visit_secondary_index(
+            storage,
+            table,
+            predicate,
+            schema,
+            &mut filtered(filter, scanned, visitor),
+        )?
     {
         return Ok(outcome);
     }
@@ -647,13 +678,20 @@ pub(crate) fn visit_indexed_candidates(
         None => ColumnRange::Unbounded,
     };
     match (range, order) {
-        (ColumnRange::Unbounded, KeyOrder::Ascending) => storage.visit_table(table, visitor),
-        (ColumnRange::Unbounded, KeyOrder::Descending) => {
-            storage.visit_table_range(table, &KeyRange::default(), order, visitor)
+        (ColumnRange::Unbounded, KeyOrder::Ascending) => {
+            storage.visit_table_where(table, filter, scanned, visitor)
         }
+        (ColumnRange::Unbounded, KeyOrder::Descending) => storage.visit_table_range_where(
+            table,
+            &KeyRange::default(),
+            order,
+            filter,
+            scanned,
+            visitor,
+        ),
         (ColumnRange::Empty, _) => Ok(VisitOutcome::Complete),
         (ColumnRange::Bounded(range), _) => {
-            storage.visit_table_range(table, &range, order, visitor)
+            storage.visit_table_range_where(table, &range, order, filter, scanned, visitor)
         }
     }
 }
@@ -723,15 +761,26 @@ fn visit_secondary_index(
 /// Visits a predicate's candidates in any order, as [`visit_predicate_candidates`] does, but from
 /// the entries of an index holding every column at `read`, the columns the caller reads, when one
 /// serves the predicate.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn visit_aggregate_candidates(
     storage: &dyn StorageReader,
     table: &str,
     predicate: Option<&Predicate>,
     schema: &crate::TableDefinition,
     read: &[usize],
+    filter: &Filter<'_>,
+    scanned: &mut dyn FnMut(usize) -> Result<()>,
     visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
 ) -> Result<VisitOutcome> {
-    match visit_covered_candidates(storage, table, predicate, schema, read, visitor)? {
+    let covered = visit_covered_candidates(
+        storage,
+        table,
+        predicate,
+        schema,
+        read,
+        &mut filtered(filter, scanned, visitor),
+    )?;
+    match covered {
         Some(outcome) => Ok(outcome),
         None => visit_predicate_candidates(
             storage,
@@ -739,6 +788,8 @@ pub(crate) fn visit_aggregate_candidates(
             predicate,
             schema,
             KeyOrder::Ascending,
+            filter,
+            scanned,
             visitor,
         ),
     }
@@ -971,8 +1022,9 @@ fn secondary_index_key(
     Ok(None)
 }
 
-fn count_scanned_row(scanned: &mut usize) -> Result<()> {
-    *scanned += 1;
+/// Charges `rows` more scanned rows to a query's count of them, within the bound.
+pub(crate) fn count_scanned_rows(scanned: &mut usize, rows: usize) -> Result<()> {
+    *scanned = scanned.saturating_add(rows);
     if *scanned > MAX_SCAN_ROWS {
         Err(EngineError::new(
             "QUERY_WORK_LIMIT_EXCEEDED",
@@ -2971,6 +3023,41 @@ fn comparison_error(table: &str, column: &str) -> EngineError {
 pub(crate) struct Filter<'a> {
     node: Option<FilterNode<'a>>,
     table: &'a str,
+    /// The terms a reader of stored records tests before presenting a row, and whether they decide
+    /// the whole predicate, so that the reader need not present a row they reject, nor evaluate
+    /// the predicate again for one they accept.
+    tests: Vec<RecordTest>,
+    decided: bool,
+}
+
+/// A test of one column of a stored record, compiled from a predicate's term that compares the
+/// column with constants, which a reader applies to the record's bytes without decoding the row.
+/// Each test accepts exactly the rows its term is true for: a `NULL` value satisfies none but
+/// `IS NULL`, as its term is unknown rather than true, and a stored row whose record omits the
+/// column holds the column's default.
+pub(crate) enum RecordTest {
+    /// An INTEGER column, at schema position `column`, holds a value from `low` to `high`.
+    IntegerRange {
+        column: usize,
+        low: i64,
+        high: i64,
+        /// Whether the column's default lies within the range.
+        default: bool,
+    },
+    /// A TEXT column matches a `LIKE` pattern.
+    Like {
+        column: usize,
+        pattern: LikePattern,
+        default: bool,
+    },
+    /// A TEXT column equals a string.
+    TextEquals {
+        column: usize,
+        text: String,
+        default: bool,
+    },
+    /// A column is `NULL`, or with `negated`, is not.
+    IsNull { column: usize, negated: bool },
 }
 
 enum FilterNode<'a> {
@@ -3026,13 +3113,29 @@ impl<'a> Filter<'a> {
         schema: &TableDefinition,
         table: &'a str,
     ) -> Result<Self> {
-        Self::resolved(predicate, table, &|column| {
+        let mut filter = Self::resolved(predicate, table, &|column| {
             schema
                 .columns
                 .iter()
                 .position(|definition| definition.name == column)
                 .ok_or_else(|| EngineError::column_not_found(column, table))
-        })
+        })?;
+        filter.decided = match &filter.node {
+            None => true,
+            Some(node) => node.compile_tests(schema, &mut filter.tests),
+        };
+        Ok(filter)
+    }
+
+    /// The tests of stored records compiled from the predicate, each of which a row must pass.
+    pub(crate) fn record_tests(&self) -> &[RecordTest] {
+        &self.tests
+    }
+
+    /// Whether the record tests decide the predicate: a row passing them all matches, and no other
+    /// row does. Otherwise a row passing them must still be [matched](Self::matches).
+    pub(crate) fn decided_by_tests(&self) -> bool {
+        self.decided
     }
 
     /// Resolves a validated predicate whose columns `position` places. `table` names the rows in
@@ -3047,6 +3150,8 @@ impl<'a> Filter<'a> {
                 .map(|predicate| FilterNode::new(predicate, position))
                 .transpose()?,
             table,
+            tests: Vec::new(),
+            decided: false,
         })
     }
 
@@ -3192,6 +3297,97 @@ impl<'a> FilterNode<'a> {
             }
             Predicate::Subquery { .. } => return Err(unresolved_subquery()),
         })
+    }
+
+    /// Adds to `tests` the record tests that evaluate this node's terms, and returns whether they
+    /// evaluate the node entirely. Under `AND`, a row must pass every term, so each term that
+    /// compiles is a test even when another does not.
+    fn compile_tests(&self, schema: &TableDefinition, tests: &mut Vec<RecordTest>) -> bool {
+        let data_type = |column: usize| schema.columns[column].data_type;
+        let default = |column: usize| schema.columns[column].default.as_ref();
+        match self {
+            Self::Comparison {
+                column,
+                operator,
+                value,
+                ..
+            } if data_type(*column) == ColumnType::Integer => {
+                let Some((low, high)) = integer_range(&[(*operator, *value)]) else {
+                    return false;
+                };
+                let default = default(*column)
+                    .and_then(Value::as_i64)
+                    .is_some_and(|value| low <= value && value <= high);
+                tests.push(RecordTest::IntegerRange {
+                    column: *column,
+                    low,
+                    high,
+                    default,
+                });
+                true
+            }
+            Self::Comparison {
+                column,
+                operator: ComparisonOperator::Eq,
+                value: Value::String(text),
+                ..
+            } if data_type(*column) == ColumnType::Text => {
+                let default = default(*column)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value == text);
+                tests.push(RecordTest::TextEquals {
+                    column: *column,
+                    text: text.clone(),
+                    default,
+                });
+                true
+            }
+            Self::Comparisons {
+                column,
+                integers: Some((low, high)),
+                ..
+            } if data_type(*column) == ColumnType::Integer => {
+                let default = default(*column)
+                    .and_then(Value::as_i64)
+                    .is_some_and(|value| *low <= value && value <= *high);
+                tests.push(RecordTest::IntegerRange {
+                    column: *column,
+                    low: *low,
+                    high: *high,
+                    default,
+                });
+                true
+            }
+            Self::Like {
+                column,
+                pattern: Some(pattern),
+            } if data_type(*column) == ColumnType::Text => {
+                let default = default(*column)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| pattern.matches(value));
+                tests.push(RecordTest::Like {
+                    column: *column,
+                    pattern: pattern.clone(),
+                    default,
+                });
+                true
+            }
+            Self::IsNull { column, negated } => {
+                tests.push(RecordTest::IsNull {
+                    column: *column,
+                    negated: *negated,
+                });
+                true
+            }
+            Self::And(nodes) => {
+                let mut decided = true;
+                for node in nodes {
+                    decided &= node.compile_tests(schema, tests);
+                }
+                decided
+            }
+            _ => false,
+        }
     }
 
     fn evaluate(&self, row: &dyn Columns, table: &str) -> Result<Truth> {
@@ -3824,7 +4020,8 @@ pub(crate) fn like_matches(
 /// Between unescaped `%` wildcards, each segment matches a fixed number of characters, so taking
 /// the leftmost match of every middle segment always leaves the most room for the rest. That keeps
 /// the work proportional to the text length times the longest segment, with no backtracking.
-struct LikePattern {
+#[derive(Clone)]
+pub(crate) struct LikePattern {
     segments: Vec<Vec<LikeElement>>,
     /// Each segment's text when it has no `_`, which is matched as bytes. Folding ASCII letters byte
     /// by byte is exactly `ILIKE`'s folding, and UTF-8 bytes equal to a whole string of characters
@@ -3881,7 +4078,7 @@ impl LikePattern {
             .collect()
     }
 
-    fn matches(&self, text: &str) -> bool {
+    pub(crate) fn matches(&self, text: &str) -> bool {
         let case_insensitive = self.case_insensitive;
         let same = |bytes: &[u8], literal: &str| {
             if case_insensitive {

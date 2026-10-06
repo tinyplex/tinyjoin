@@ -2,7 +2,6 @@ use serde_json::Value;
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::{
-    borrow::Cow,
     cell::{Cell, RefCell},
     collections::BTreeSet,
     rc::Rc,
@@ -33,6 +32,7 @@ use crate::{
         index_entry_primary_key, leading_key_component, secondary_index_entry_matches_prefix,
         secondary_index_primary_key, secondary_index_primary_key_for_definition,
     },
+    query::Filter,
     row::{HeldRow, RowRef, ValueRef},
     sql_script::charge_operations,
     storage::{
@@ -104,12 +104,7 @@ impl TreeReader<'_> {
         table: &str,
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
-        let table = self.table(table)?;
-        let Some(root) = table.root_page_id else {
-            return Ok(VisitOutcome::Complete);
-        };
-        let cursor = self.cursor(root, table.tree_id, Some(&[]), false)?;
-        self.visit_rows(table, cursor, None, visitor)
+        self.visit_rows_where(table, None, KeyOrder::Ascending, &[], None, &mut |_| Ok(()), visitor)
     }
 
     pub(crate) fn visit_table_range(
@@ -119,50 +114,126 @@ impl TreeReader<'_> {
         order: KeyOrder,
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
+        self.visit_rows_where(table, Some(range), order, &[], None, &mut |_| Ok(()), visitor)
+    }
+
+    /// Visits the rows of `table` in `order`, those within `range` when one is given, except those
+    /// whose encoded keys `except` holds, in ascending order; and of them, those `filter` accepts,
+    /// or all without one. Each row read is charged to the reader's work and to `scanned`. Only a
+    /// leaf that could hold one of `except` looks for it, once, so that a scan passing over the
+    /// rows a transaction replaced compares no row with their keys; and a filter's record tests
+    /// reject a row from its bytes, before anything is decoded or presented for it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn visit_rows_where(
+        &self,
+        table: &str,
+        range: Option<&KeyRange>,
+        order: KeyOrder,
+        mut except: &[&[u8]],
+        filter: Option<&Filter<'_>>,
+        scanned: &mut dyn FnMut(usize) -> Result<()>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
         let table = self.table(table)?;
         let Some(root) = table.root_page_id else {
             return Ok(VisitOutcome::Complete);
         };
-        let cursor = match order {
-            KeyOrder::Ascending => self.cursor(root, table.tree_id, Some(range.start()), false)?,
-            KeyOrder::Descending => {
-                self.cursor(root, table.tree_id, range.end().as_deref(), true)?
-            }
+        let start = range.map_or(&[][..], KeyRange::start);
+        let mut cursor = match order {
+            KeyOrder::Ascending => self.cursor(root, table.tree_id, Some(start), false)?,
+            KeyOrder::Descending => self.cursor(
+                root,
+                table.tree_id,
+                range.and_then(KeyRange::end).as_deref(),
+                true,
+            )?,
         };
-        self.visit_rows(table, cursor, Some(range), visitor)
-    }
-
-    /// Visits the rows of `table` that `cursor` reaches, while their keys lie within `range`.
-    fn visit_rows(
-        &self,
-        table: &PagedTable,
-        mut cursor: BtreeCursor,
-        range: Option<&KeyRange>,
-        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
-    ) -> Result<VisitOutcome> {
         let key_type = table.leading_key_type();
         let work = self.work;
+        let tests = filter.map_or(&[][..], Filter::record_tests);
+        let decided = filter.is_none_or(Filter::decided_by_tests);
         // Rows are read from the cursor's copy of each leaf, so the pages are borrowed only to move
         // between leaves, or to read a value that overflows, and the visitor can read them too.
         let mut read = |page_id: PageId| self.pages.borrow_mut().read_btree_page(page_id);
-        while cursor.next_leaf_from(&mut *self.pages.borrow_mut())? {
-            while let Some((key, value)) = cursor.next_in_leaf(&mut read)? {
-                if let Some(range) = range
-                    && !range.contains(leading_key_component(key, key_type)?)
-                {
-                    return Ok(VisitOutcome::Complete);
-                }
-                if let Some(work) = work {
-                    charge_operations(work, 1)?;
-                }
-                let value = match &value {
-                    Cow::Borrowed(value) => *value,
-                    Cow::Owned(value) => value.as_slice(),
-                };
-                if visitor(&RowRef::record(table.record(key, value)?))? == VisitControl::Stop {
-                    return Ok(VisitOutcome::Stopped);
+        // One row's visit: whether the scan is over, or `None` to go on. A row past the range ends
+        // the scan without being charged; any other is charged, tested, and presented if accepted.
+        let mut visit = |key: &[u8], value: &[u8], examined: &mut usize| {
+            if let Some(range) = range
+                && !range.contains(leading_key_component(key, key_type)?)
+            {
+                return Ok(Some(VisitOutcome::Complete));
+            }
+            if let Some(work) = work {
+                charge_operations(work, 1)?;
+            }
+            *examined += 1;
+            let record = table.record(key, value)?;
+            match record.passes(tests) {
+                Some(false) => return Ok(None),
+                Some(true) if decided => {}
+                _ => {
+                    if let Some(filter) = filter
+                        && !filter.matches(&RowRef::record(record))?
+                    {
+                        return Ok(None);
+                    }
                 }
             }
+            Ok((visitor(&RowRef::record(record))? == VisitControl::Stop)
+                .then_some(VisitOutcome::Stopped))
+        };
+        if order == KeyOrder::Descending {
+            // Backward, a row at a time: no scan reads a table backward and passes rows over.
+            debug_assert!(except.is_empty());
+            while cursor.next_leaf_from(&mut *self.pages.borrow_mut())? {
+                while let Some((key, value)) = cursor.next_in_leaf(&mut read)? {
+                    let mut examined = 0;
+                    let outcome = visit(key, &value, &mut examined)?;
+                    scanned(examined)?;
+                    if let Some(outcome) = outcome {
+                        return Ok(outcome);
+                    }
+                }
+            }
+            return Ok(VisitOutcome::Complete);
+        }
+        let mut positions = Vec::new();
+        while cursor.next_leaf_from(&mut *self.pages.borrow_mut())? {
+            let Some((leaf, mut index)) = cursor.leaf() else {
+                break;
+            };
+            let count = leaf.len();
+            if except.is_empty() {
+                positions.clear();
+            } else {
+                cursor.leaf_positions(&mut except, &mut positions)?;
+            }
+            let (mut skipped, mut examined, mut outcome) = (0, 0, None);
+            while index < count && outcome.is_none() {
+                let position = index;
+                index += 1;
+                if positions.get(skipped) == Some(&position) {
+                    // A row passed over is charged to the work, which bounds the rows read.
+                    if let Some(work) = work {
+                        charge_operations(work, 1)?;
+                    }
+                    skipped += 1;
+                    continue;
+                }
+                // Nearly every cell holds its value inline; any other is read through the pager.
+                outcome = match leaf.inline_leaf_cell(position) {
+                    Some((key, value)) => visit(key, value, &mut examined)?,
+                    None => {
+                        let (key, value) = cursor.cell_at(position, &mut read)?;
+                        visit(key, &value, &mut examined)?
+                    }
+                };
+            }
+            scanned(examined)?;
+            if let Some(outcome) = outcome {
+                return Ok(outcome);
+            }
+            cursor.skip_to(count);
         }
         Ok(VisitOutcome::Complete)
     }
@@ -850,54 +921,35 @@ impl<D: PageDevice> PagedStorage<D> {
     /// `work`, visited or not. Only a leaf that could hold one of `except` looks for it, once, so
     /// that a scan passing over the rows a transaction replaced compares no row with their keys.
     /// Plain scans keep to [`StorageReader::visit_table`], whose loop does nothing else.
-    pub(crate) fn visit_table_except(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn visit_rows_where(
         &self,
         table: &str,
-        mut except: &[&[u8]],
+        range: Option<&KeyRange>,
+        order: KeyOrder,
+        except: &[&[u8]],
         work: Option<&Cell<usize>>,
+        filter: Option<&Filter<'_>>,
+        scanned: &mut dyn FnMut(usize) -> Result<()>,
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
         self.ensure_ready()?;
-        let table = self.table(table)?;
-        let Some(root) = table.root_page_id else {
-            return Ok(VisitOutcome::Complete);
-        };
-        let mut cursor = Btree::cursor(&mut self.pager.borrow_mut(), root, table.tree_id)?;
-        // Rows are read from the cursor's copy of each leaf, so the pager is borrowed only to move
-        // between leaves, or to read a value that overflows, and the visitor can read it too.
-        let mut read = |page_id: PageId| self.pager.borrow_mut().read_page(page_id);
-        let mut positions = Vec::new();
-        while cursor.next_leaf(&mut self.pager.borrow_mut())? {
-            cursor.leaf_positions(&mut except, &mut positions)?;
-            let (mut position, mut skipped) = (cursor.leaf_position(), 0);
-            while let Some((key, value)) = cursor.next_in_leaf(&mut read)? {
-                if let Some(work) = work {
-                    charge_operations(work, 1)?;
-                }
-                position += 1;
-                if positions.get(skipped) == Some(&(position - 1)) {
-                    skipped += 1;
-                    continue;
-                }
-                let value = match &value {
-                    Cow::Borrowed(value) => *value,
-                    Cow::Owned(value) => value.as_slice(),
-                };
-                if visitor(&RowRef::record(table.record(key, value)?))? == VisitControl::Stop {
-                    return Ok(VisitOutcome::Stopped);
-                }
-            }
-        }
-        Ok(VisitOutcome::Complete)
+        self.reader_charging(work)
+            .visit_rows_where(table, range, order, except, filter, scanned, visitor)
     }
 
     /// The reader of the committed catalog's B-trees.
     pub(crate) fn reader(&self) -> TreeReader<'_> {
+        self.reader_charging(None)
+    }
+
+    /// The reader of the committed catalog's B-trees, charging each row it reads to `work`.
+    fn reader_charging<'a>(&'a self, work: Option<&'a Cell<usize>>) -> TreeReader<'a> {
         TreeReader {
             pages: &self.pager,
             tables: &self.tables,
             indexes: &self.indexes,
-            work: None,
+            work,
         }
     }
 
@@ -1575,6 +1627,46 @@ impl<D: PageDevice> StorageReader for PagedStorage<D> {
         self.ensure_ready()?;
         self.reader()
             .visit_table_range(table, range, order, visitor)
+    }
+
+    fn visit_table_where(
+        &self,
+        table: &str,
+        filter: &Filter<'_>,
+        scanned: &mut dyn FnMut(usize) -> Result<()>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        self.visit_rows_where(
+            table,
+            None,
+            KeyOrder::Ascending,
+            &[],
+            None,
+            Some(filter),
+            scanned,
+            visitor,
+        )
+    }
+
+    fn visit_table_range_where(
+        &self,
+        table: &str,
+        range: &KeyRange,
+        order: KeyOrder,
+        filter: &Filter<'_>,
+        scanned: &mut dyn FnMut(usize) -> Result<()>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        self.visit_rows_where(
+            table,
+            Some(range),
+            order,
+            &[],
+            None,
+            Some(filter),
+            scanned,
+            visitor,
+        )
     }
 
     fn table_row_count(&self, table: &str) -> Result<usize> {

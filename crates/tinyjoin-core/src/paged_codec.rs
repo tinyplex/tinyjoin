@@ -4,6 +4,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::model::CatalogModel;
+use crate::query::RecordTest;
 use crate::row::ValueRef;
 use crate::{
     ColumnType, EngineError, FIRST_DATA_PAGE_ID, IndexDefinition, MAX_PAGE_COUNT, PageId, Result,
@@ -828,6 +829,102 @@ impl<'a> StoredRecord<'a> {
     /// A copy of the entry, its key and record, to read in place again later.
     pub(crate) fn to_entry(self) -> StoredEntry {
         StoredEntry::new(self.key, self.value)
+    }
+
+    /// Whether the row passes every one of `tests`, read from the record's bytes without decoding
+    /// the row, or `None` when a tested value cannot be read, which reading the column reports.
+    #[inline(always)]
+    pub(crate) fn passes(&self, tests: &[RecordTest]) -> Option<bool> {
+        for test in tests {
+            if !self.passes_test(test)? {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
+    /// Whether the row passes `test`, as [`Self::passes`] decides it. A key column's value is
+    /// decoded from the key; a stored column's is read in place, or is its default when the record
+    /// omits it.
+    #[inline(always)]
+    fn passes_test(&self, test: &RecordTest) -> Option<bool> {
+        match *test {
+            RecordTest::IntegerRange {
+                column,
+                low,
+                high,
+                default,
+            } => {
+                let value = match self.layout.slots[column] {
+                    ColumnSlot::Stored(position) => {
+                        if position >= self.count {
+                            return Some(default);
+                        }
+                        match self.stored_bytes(position).ok()? {
+                            None => return Some(false),
+                            Some(bytes) => integer_value(bytes)?,
+                        }
+                    }
+                    ColumnSlot::Key(position) => match self.key_component(position).ok()? {
+                        ValueRef::Integer(value) => value,
+                        _ => return None,
+                    },
+                };
+                Some(low <= value && value <= high)
+            }
+            RecordTest::TextEquals {
+                column,
+                ref text,
+                default,
+            } => match self.layout.slots[column] {
+                ColumnSlot::Stored(position) => {
+                    if position >= self.count {
+                        return Some(default);
+                    }
+                    Some(self.stored_bytes(position).ok()? == Some(text.as_bytes()))
+                }
+                ColumnSlot::Key(position) => match self.key_component(position).ok()? {
+                    ValueRef::Text(value) => Some(*value == **text),
+                    _ => None,
+                },
+            },
+            RecordTest::Like {
+                column,
+                ref pattern,
+                default,
+            } => match self.layout.slots[column] {
+                ColumnSlot::Stored(position) => {
+                    if position >= self.count {
+                        return Some(default);
+                    }
+                    match self.stored_bytes(position).ok()? {
+                        None => Some(false),
+                        Some(bytes) => {
+                            Some(pattern.matches(std::str::from_utf8(bytes).ok()?))
+                        }
+                    }
+                }
+                ColumnSlot::Key(position) => match self.key_component(position).ok()? {
+                    ValueRef::Text(value) => Some(pattern.matches(&value)),
+                    _ => None,
+                },
+            },
+            RecordTest::IsNull { column, negated } => match self.layout.slots[column] {
+                ColumnSlot::Stored(position) => {
+                    let null = if position >= self.count {
+                        self.schema.columns[column]
+                            .default
+                            .as_ref()
+                            .is_none_or(Value::is_null)
+                    } else {
+                        self.is_null(position)
+                    };
+                    Some(null ^ negated)
+                }
+                // A key column never holds NULL.
+                ColumnSlot::Key(_) => Some(negated),
+            },
+        }
     }
 
     /// The value of the column at `index`, in schema order.

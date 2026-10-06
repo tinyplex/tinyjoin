@@ -15,6 +15,7 @@ use crate::{
     },
     paged_script::{ChangedRow, KeyedRows, TableChanges, held_row_bytes},
     paged_storage::{ChangeCost, ChangeRow, PagedTable, PagedWriteUsage, batch_too_large},
+    query::Filter,
     row::{HeldRow, RowRef},
     statement::PreviousRow,
     storage::{KeyOrder, KeyRange, estimated_record_bytes, estimated_row_bytes, unplanned_record},
@@ -776,6 +777,74 @@ impl<'a, D: PageDevice> PagedReadView<'a, D> {
 
     /// Whether the committed table is exactly what this view sees, so that its key order and
     /// indexes apply: no transaction has staged a change to it.
+    /// Visits the table's rows as the transaction sees them: the committed rows, except those the
+    /// transaction replaced, and then the rows it staged, all charged to the view's work and to
+    /// `scanned`, and each presented only if `filter` accepts it. Within `range` and in `order`
+    /// only while the transaction has not changed the table: staged rows follow the committed
+    /// ones rather than taking their places in key order, so a transaction which changed the
+    /// table visits every row, and the caller's filter still decides membership.
+    fn visit_rows_where(
+        &self,
+        table: &str,
+        range: Option<&KeyRange>,
+        order: KeyOrder,
+        filter: Option<&Filter<'_>>,
+        scanned: &mut dyn FnMut(usize) -> Result<()>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        self.ensure_base_revision()?;
+        let Some(entries) = self
+            .transaction
+            .and_then(|transaction| transaction.table_entries(table))
+        else {
+            return self.storage.visit_rows_where(
+                table, range, order, &[], self.work, filter, scanned, visitor,
+            );
+        };
+        // The committed rows that changed entries replace are passed over, and the entries' rows
+        // visited after the rest. Both are in key order, so the scan finds each replaced row once.
+        let mut replaced = Vec::new();
+        for (key, entry) in entries {
+            if entry.changed {
+                replaced.push(key.as_slice());
+            }
+        }
+        if self.storage.visit_rows_where(
+            table,
+            None,
+            KeyOrder::Ascending,
+            &replaced,
+            self.work,
+            filter,
+            scanned,
+            visitor,
+        )? == VisitOutcome::Stopped
+        {
+            return Ok(VisitOutcome::Stopped);
+        }
+        let paged = self.storage.table(table)?;
+        for (key, entry) in entries {
+            self.charge_work(1)?;
+            if !entry.changed {
+                continue;
+            }
+            let Some(record) = &entry.row.next else {
+                continue;
+            };
+            scanned(1)?;
+            let row = RowRef::record(paged.record(key, record)?);
+            if let Some(filter) = filter
+                && !filter.matches(&row)?
+            {
+                continue;
+            }
+            if visitor(&row)? == VisitControl::Stop {
+                return Ok(VisitOutcome::Stopped);
+            }
+        }
+        Ok(VisitOutcome::Complete)
+    }
+
     fn reads_committed(&self, table: &str) -> bool {
         self.transaction.is_none_or(|transaction| {
             table_count(&transaction.totals.changed_tables, table).is_none_or(|count| count == 0)
@@ -801,48 +870,36 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
         table: &str,
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
-        self.ensure_base_revision()?;
-        let Some(entries) = self
-            .transaction
-            .and_then(|transaction| transaction.table_entries(table))
-        else {
-            // Without a budget to charge, rows go straight to the visitor.
-            if self.work.is_none() {
-                return self.storage.visit_table(table, visitor);
-            }
-            return self.storage.visit_table(table, &mut |row| {
-                self.charge_work(1)?;
-                visitor(row)
-            });
-        };
-        // The committed rows that changed entries replace are passed over, and the entries' rows
-        // visited after the rest. Both are in key order, so the scan finds each replaced row once.
-        let mut replaced = Vec::new();
-        for (key, entry) in entries {
-            if entry.changed {
-                replaced.push(key.as_slice());
-            }
-        }
-        if self
-            .storage
-            .visit_table_except(table, &replaced, self.work, visitor)?
-            == VisitOutcome::Stopped
-        {
-            return Ok(VisitOutcome::Stopped);
-        }
-        let paged = self.storage.table(table)?;
-        for (key, entry) in entries {
-            self.charge_work(1)?;
-            if !entry.changed {
-                continue;
-            }
-            if let Some(record) = &entry.row.next
-                && visitor(&RowRef::record(paged.record(key, record)?))? == VisitControl::Stop
-            {
-                return Ok(VisitOutcome::Stopped);
-            }
-        }
-        Ok(VisitOutcome::Complete)
+        self.visit_rows_where(table, None, KeyOrder::Ascending, None, &mut |_| Ok(()), visitor)
+    }
+
+    fn visit_table_where(
+        &self,
+        table: &str,
+        filter: &Filter<'_>,
+        scanned: &mut dyn FnMut(usize) -> Result<()>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        self.visit_rows_where(
+            table,
+            None,
+            KeyOrder::Ascending,
+            Some(filter),
+            scanned,
+            visitor,
+        )
+    }
+
+    fn visit_table_range_where(
+        &self,
+        table: &str,
+        range: &KeyRange,
+        order: KeyOrder,
+        filter: &Filter<'_>,
+        scanned: &mut dyn FnMut(usize) -> Result<()>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        self.visit_rows_where(table, Some(range), order, Some(filter), scanned, visitor)
     }
 
     fn visits_indexes(&self, table: &str) -> bool {
@@ -860,20 +917,7 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
         order: KeyOrder,
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
-        self.ensure_base_revision()?;
-        if !self.reads_committed(table) {
-            // Staged rows follow the committed ones rather than taking their places in key order,
-            // so a transaction which changed the table visits every row.
-            return self.visit_table(table, visitor);
-        }
-        if self.work.is_none() {
-            return self.storage.visit_table_range(table, range, order, visitor);
-        }
-        self.storage
-            .visit_table_range(table, range, order, &mut |row| {
-                self.charge_work(1)?;
-                visitor(row)
-            })
+        self.visit_rows_where(table, Some(range), order, None, &mut |_| Ok(()), visitor)
     }
 
     fn table_row_count(&self, table: &str) -> Result<usize> {

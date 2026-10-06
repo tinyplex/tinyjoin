@@ -751,26 +751,41 @@ impl BtreeCursor {
             false if self.leaf_index < leaf.len() => self.leaf_index,
             _ => return Ok(None),
         };
-        let (key, value) = match leaf.inline_leaf_cell(index) {
-            Some((key, value)) => (key, CellValue::Inline(value)),
-            None => leaf.leaf_cell(index)?,
-        };
-        let value = match value {
-            CellValue::Inline(value) => Cow::Borrowed(value),
-            CellValue::Overflow(descriptor) => Cow::Owned(
-                read_overflow_chain(
-                    read,
-                    self.tree_id,
-                    self.view.generation(),
-                    leaf.generation,
-                    &descriptor,
-                )?
-                .0,
-            ),
-        };
         // An entry that fails to read is not passed over: reading on reports the same error.
+        let entry = read_cell(leaf, self.tree_id, self.view.generation(), index, read)?;
         self.leaf_index = if self.backward { index } else { index + 1 };
-        Ok(Some((key, value)))
+        Ok(Some(entry))
+    }
+
+    /// The leaf [`Self::next_leaf`] moved to, and the index of the first entry the cursor has not
+    /// returned, for a loop that reads the leaf's entries in place, moving forward, and then
+    /// [passes them](Self::skip_to). `None` before the first leaf or after the last.
+    pub(crate) fn leaf(&self) -> Option<(&NodeView<'static>, usize)> {
+        debug_assert!(!self.backward);
+        self.leaf.as_ref().map(|leaf| (leaf, self.leaf_index))
+    }
+
+    /// Marks the current leaf's entries before `index` as returned, so that [`Self::next_leaf`]
+    /// moves on once `index` is the leaf's length.
+    pub(crate) fn skip_to(&mut self, index: usize) {
+        debug_assert!(!self.backward);
+        self.leaf_index = index;
+    }
+
+    /// The entry at `index` of the current leaf, whose value `read` reads from its overflow pages
+    /// when it has them.
+    pub(crate) fn cell_at(
+        &self,
+        index: usize,
+        read: &mut dyn FnMut(PageId) -> Result<Page>,
+    ) -> Result<CursorEntry<'_>> {
+        let leaf = self.leaf.as_ref().ok_or_else(|| {
+            invalid_btree(storage_diagnostic!(
+                "Tree {} has no leaf to read cell {index} from",
+                self.tree_id
+            ))
+        })?;
+        read_cell(leaf, self.tree_id, self.view.generation(), index, read)
     }
 
     /// The index, in the leaf [`Self::next_leaf`] moved to, of the entry [`Self::next_in_leaf`]
@@ -936,6 +951,28 @@ impl BtreeCursor {
 }
 
 /// A value as a leaf cell holds it: inline bytes, or a descriptor of its overflow chain.
+/// The entry at `index` of `leaf`, in a tree read at `view_generation`, whose value `read` reads
+/// from its overflow pages when it has them.
+fn read_cell<'a>(
+    leaf: &'a NodeView<'static>,
+    tree_id: TreeId,
+    view_generation: u64,
+    index: usize,
+    read: &mut dyn FnMut(PageId) -> Result<Page>,
+) -> Result<CursorEntry<'a>> {
+    let (key, value) = match leaf.inline_leaf_cell(index) {
+        Some((key, value)) => (key, CellValue::Inline(value)),
+        None => leaf.leaf_cell(index)?,
+    };
+    let value = match value {
+        CellValue::Inline(value) => Cow::Borrowed(value),
+        CellValue::Overflow(descriptor) => Cow::Owned(
+            read_overflow_chain(read, tree_id, view_generation, leaf.generation, &descriptor)?.0,
+        ),
+    };
+    Ok((key, value))
+}
+
 enum CellValue<'a> {
     Inline(&'a [u8]),
     Overflow(OverflowDescriptor),
@@ -958,7 +995,7 @@ impl CellValue<'_> {
 /// with every check in [`Node::decode`]. A view owns a copy of its page's payload, which a cursor
 /// keeps between steps, or borrows it from the page cache for one lookup.
 #[derive(Debug)]
-struct NodeView<'a> {
+pub(crate) struct NodeView<'a> {
     page_id: PageId,
     level: u8,
     generation: u64,
@@ -1087,7 +1124,7 @@ impl<'a> NodeView<'a> {
     }
 
     /// The number of entries: leaf cells, or an internal node's keyed children.
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.item_count
     }
 
@@ -1180,7 +1217,7 @@ impl<'a> NodeView<'a> {
     /// as nearly every cell does. Compiled into the cursor's step, which reads every row a scan
     /// visits; [`Self::leaf_cell`] reads any other cell, and reports what is wrong with it.
     #[inline(always)]
-    fn inline_leaf_cell(&self, index: usize) -> Option<(&[u8], &[u8])> {
+    pub(crate) fn inline_leaf_cell(&self, index: usize) -> Option<(&[u8], &[u8])> {
         let bytes = &*self.bytes;
         let offset = self.cell_offset(index).ok()?;
         let header_end = offset + LEAF_CELL_HEADER_SIZE;

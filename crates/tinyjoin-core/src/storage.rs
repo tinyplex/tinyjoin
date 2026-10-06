@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use crate::hash::KeySet;
 use crate::paged_codec::{EMPTY_RECORD, IndexEntryLayout, RecordLayout, StoredRecord};
+use crate::query::Filter;
 use crate::row::{RowRef, ValueRef};
 use crate::{
     ColumnDefinition, ColumnType, EngineError, IndexDefinition, Result, Row, RowChange,
@@ -131,6 +132,45 @@ pub(crate) trait StorageReader {
     ) -> Result<VisitOutcome> {
         let _ = (range, order);
         self.visit_table(table, visitor)
+    }
+    /// Visits the rows of a table that `filter` accepts, as [`Self::visit_table`] visits them all,
+    /// charging each row it reads, accepted or not, to `scanned`. A reader of stored records tests
+    /// each record before presenting its row, so that a rejected row is never decoded.
+    fn visit_table_where(
+        &self,
+        table: &str,
+        filter: &Filter<'_>,
+        scanned: &mut dyn FnMut(usize) -> Result<()>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        self.visit_table(table, &mut |row| {
+            scanned(1)?;
+            if filter.matches(row)? {
+                visitor(row)
+            } else {
+                Ok(VisitControl::Continue)
+            }
+        })
+    }
+    /// Visits the rows within `range` that `filter` accepts, as [`Self::visit_table_range`] visits
+    /// them all, charging each row read to `scanned` as [`Self::visit_table_where`] does.
+    fn visit_table_range_where(
+        &self,
+        table: &str,
+        range: &KeyRange,
+        order: KeyOrder,
+        filter: &Filter<'_>,
+        scanned: &mut dyn FnMut(usize) -> Result<()>,
+        visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
+    ) -> Result<VisitOutcome> {
+        self.visit_table_range(table, range, order, &mut |row| {
+            scanned(1)?;
+            if filter.matches(row)? {
+                visitor(row)
+            } else {
+                Ok(VisitControl::Continue)
+            }
+        })
     }
     fn table_row_count(&self, table: &str) -> Result<usize>;
     /// Collecting helper for operators that require all table rows at once.

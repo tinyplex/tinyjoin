@@ -222,7 +222,7 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &AggregatePlan) -> Resu
         group_columns.push(SourceColumn::new(&schema, column, &plan.table)?);
     }
     // Grouping never stops early, so narrowing only removes rows the predicate would reject
-    // anyway; the per-row filter below remains the authority on membership.
+    // anyway; the filter remains the authority on membership.
     let read = read_columns(plan, &schema)?;
     crate::query::visit_aggregate_candidates(
         storage,
@@ -230,15 +230,19 @@ pub(crate) fn execute(storage: &dyn StorageReader, plan: &AggregatePlan) -> Resu
         plan.predicate.as_ref(),
         &schema,
         &read,
-        &mut |row| {
-            scanned = scanned.saturating_add(1);
+        &filter,
+        &mut |rows| {
+            scanned = scanned.saturating_add(rows);
             if scanned > MAX_SCAN_ROWS {
                 return Err(EngineError::new(
                     "QUERY_WORK_LIMIT_EXCEEDED",
                     format!("An aggregate query cannot scan more than {MAX_SCAN_ROWS} rows"),
                 ));
             }
-            if filter.matches(row)? {
+            Ok(())
+        },
+        &mut |row| {
+            {
                 if let Some(state) = &mut global {
                     working_bytes = state.update_within(row, working_bytes)?;
                     return Ok(VisitControl::Continue);

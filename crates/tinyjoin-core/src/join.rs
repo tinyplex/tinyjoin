@@ -762,11 +762,9 @@ fn build_hash_table(
         join.access.pushed[source].as_ref(),
         &relation.schema,
         KeyOrder::Ascending,
+        filter,
+        &mut |rows| count_scanned_rows(scanned, rows),
         &mut |row| {
-            count_scanned_row(scanned)?;
-            if !filter.matches(row)? {
-                return Ok(VisitControl::Continue);
-            }
             let row = row.to_row()?;
             // A row with a NULL key matches nothing, so it need not be kept.
             let mut key = Vec::with_capacity(sides.len());
@@ -856,13 +854,11 @@ fn visit_joined_rows(
         join.access.pushed[0].as_ref(),
         &probe.schema,
         KeyOrder::Ascending,
+        &filters[0],
+        &mut |rows| count_scanned_rows(&mut scanned, rows),
         &mut |row| {
             if stop_requested {
                 return Ok(VisitControl::Stop);
-            }
-            count_scanned_row(&mut scanned)?;
-            if !filters[0].matches(row)? {
-                return Ok(VisitControl::Continue);
             }
             let row = row.to_row()?;
             let mut bindings = [None; MAX_JOIN_SOURCES];
@@ -1623,8 +1619,8 @@ fn owned_value_bytes(value: &Value) -> Result<usize> {
     }
 }
 
-fn count_scanned_row(scanned: &mut usize) -> Result<()> {
-    *scanned = scanned.saturating_add(1);
+fn count_scanned_rows(scanned: &mut usize, rows: usize) -> Result<()> {
+    *scanned = scanned.saturating_add(rows);
     if *scanned > MAX_SCAN_ROWS {
         Err(scan_limit_error())
     } else {

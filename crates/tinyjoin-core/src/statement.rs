@@ -1882,16 +1882,7 @@ fn plan_update(
     let mut work_bytes = 0usize;
     let mut result_bytes = 0usize;
     let filter = Filter::new(predicate, &schema, table)?;
-    let visit_outcome = visit_dml_candidates(storage, &schema, predicate, &mut |row| {
-        scanned = scanned.saturating_add(1);
-        if scanned > MAX_DML_SCAN_ROWS {
-            return Err(dml_limit_error(format!(
-                "A data-modification statement cannot scan more than {MAX_DML_SCAN_ROWS} rows"
-            )));
-        }
-        if !filter.matches(row)? {
-            return Ok(VisitControl::Continue);
-        }
+    let visit_outcome = visit_dml_candidates(storage, &schema, predicate, &filter, &mut scanned, &mut |row| {
         if updates.len() == MAX_DML_CHANGED_ROWS {
             return Err(dml_limit_error(format!(
                 "A data-modification statement cannot change more than {MAX_DML_CHANGED_ROWS} rows"
@@ -2124,16 +2115,7 @@ fn plan_delete(
     let filter = Filter::new(predicate, &schema, table)?;
     // A script's writer lets a delete plan each stored row by its key, without a map.
     let by_key = storage.plans_removals();
-    let visit_outcome = visit_dml_candidates(storage, &schema, predicate, &mut |row| {
-        scanned = scanned.saturating_add(1);
-        if scanned > MAX_DML_SCAN_ROWS {
-            return Err(dml_limit_error(format!(
-                "A data-modification statement cannot scan more than {MAX_DML_SCAN_ROWS} rows"
-            )));
-        }
-        if !filter.matches(row)? {
-            return Ok(VisitControl::Continue);
-        }
+    let visit_outcome = visit_dml_candidates(storage, &schema, predicate, &filter, &mut scanned, &mut |row| {
         if changes.len() == MAX_DML_CHANGED_ROWS {
             return Err(dml_limit_error(format!(
                 "A data-modification statement cannot change more than {MAX_DML_CHANGED_ROWS} rows"
@@ -2224,13 +2206,31 @@ fn visit_dml_candidates(
     storage: &dyn StorageReader,
     schema: &TableDefinition,
     predicate: Option<&Predicate>,
+    filter: &Filter<'_>,
+    scanned: &mut usize,
     visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
 ) -> Result<VisitOutcome> {
+    let mut count = |rows: usize| {
+        *scanned = scanned.saturating_add(rows);
+        if *scanned > MAX_DML_SCAN_ROWS {
+            return Err(dml_limit_error(format!(
+                "A data-modification statement cannot scan more than {MAX_DML_SCAN_ROWS} rows"
+            )));
+        }
+        Ok(())
+    };
     // A valid predicate can name a key too large to store; keep its scan behavior.
     if let Some(values) = exact_equalities(predicate, schema, &schema.primary_key)
         && primary_key_values_fit(&values)
     {
-        return storage.visit_primary_key_values(&schema.name, schema, &values, visitor);
+        return storage.visit_primary_key_values(&schema.name, schema, &values, &mut |row| {
+            count(1)?;
+            if filter.matches(row)? {
+                visitor(row)
+            } else {
+                Ok(VisitControl::Continue)
+            }
+        });
     }
     visit_indexed_candidates(
         storage,
@@ -2238,6 +2238,8 @@ fn visit_dml_candidates(
         predicate,
         schema,
         crate::storage::KeyOrder::Ascending,
+        filter,
+        &mut count,
         visitor,
     )
 }
