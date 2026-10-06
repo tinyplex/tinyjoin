@@ -4258,7 +4258,11 @@ fn guaranteed_equality<'p>(predicate: &'p Predicate, column: &str) -> Option<&'p
 /// A direct B-tree lookup must be semantically indistinguishable from scanning
 /// and evaluating the predicate. Floats have multiple JSON encodings that
 /// compare numerically equal (`1`/`1.0`), so they cannot use this shortcut.
-fn exact_primary_key_value(schema: &crate::TableDefinition, column: &str, value: &Value) -> bool {
+pub(crate) fn exact_primary_key_value(
+    schema: &crate::TableDefinition,
+    column: &str,
+    value: &Value,
+) -> bool {
     let Some(definition) = schema.columns.iter().find(|item| item.name == column) else {
         return false;
     };

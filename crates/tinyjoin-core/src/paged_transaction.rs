@@ -146,6 +146,38 @@ impl PagedTransaction {
         !self.touched_tables.is_empty()
     }
 
+    /// Everything the transaction holds, written out for tests that compare two ways of staging
+    /// the same statements: each entry's rows, whether it changed the row, what it retains and
+    /// costs; the totals; and the tables touched.
+    #[cfg(test)]
+    pub(crate) fn fingerprint(&self) -> String {
+        use std::fmt::Write;
+        let mut text = String::new();
+        for (table, entries) in &self.entries {
+            for (key, entry) in entries {
+                writeln!(
+                    text,
+                    "{table} {key:?} old={:?} next={:?} changed={} retained={} cost={:?}",
+                    entry.row.old, entry.row.next, entry.changed, entry.retained, entry.cost
+                )
+                .unwrap();
+            }
+        }
+        writeln!(
+            text,
+            "keys={} bytes={} usage={:?} changed_tables={:?} claims={:?} released={} touched={:?}",
+            self.totals.overlay_keys,
+            self.totals.overlay_bytes,
+            self.totals.usage,
+            self.totals.changed_tables,
+            self.totals.claims,
+            self.totals.released,
+            self.touched_tables
+        )
+        .unwrap();
+        text
+    }
+
     pub(crate) fn touched_tables(&self) -> Vec<String> {
         self.touched_tables.clone()
     }

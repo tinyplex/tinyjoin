@@ -5,8 +5,8 @@ use serde_json::Value;
 
 use crate::{
     ApplyOutcome, ChangedKeys, EngineError, ExecuteResult, IndexDefinition, PageDevice,
-    PagedStorage, PreparedStatementId, QueryResult, Result, SchemaDefinition, StorageReader,
-    TableDefinition,
+    PagedStorage, PreparedStatementId, QueryResult, Result, ResultField, SchemaDefinition,
+    StorageReader, TableDefinition,
     paged_transaction::{PagedReadView, PagedTransaction},
     prepared_statement::PreparedStatementRegistry,
     statement::{PlannedDml, Statement, WriteStatement},
@@ -106,6 +106,11 @@ impl<D: PageDevice> PagedEngine<D> {
         params: &[Value],
         array_rows: bool,
     ) -> Result<ExecuteResult> {
+        if self.transaction.is_some()
+            && let Some(result) = self.execute_point(id, params)?
+        {
+            return Ok(result);
+        }
         let mut statement = self.prepared_statements.bind(id, params)?;
         if array_rows {
             statement.position_outputs()?;
@@ -117,6 +122,32 @@ impl<D: PageDevice> PagedEngine<D> {
     /// Releases a retained statement. Closing an already closed issued ID is idempotent.
     pub fn close_prepared(&mut self, id: PreparedStatementId) -> Result<()> {
         self.prepared_statements.close(id)
+    }
+
+    /// Executes a prepared statement of a point template's shape inside a transaction, from the
+    /// template and `params` directly, or returns `None`, having changed nothing, when the
+    /// statement must be bound and planned in full.
+    fn execute_point(
+        &mut self,
+        id: PreparedStatementId,
+        params: &[Value],
+    ) -> Result<Option<ExecuteResult>> {
+        let Some(template) = self.prepared_statements.point(id, params)? else {
+            return Ok(None);
+        };
+        self.storage.ensure_readiness()?;
+        let (planned, keys) = {
+            let view = self.read_view();
+            let Some(mut planned) = crate::statement::plan_point(&view, template, params)? else {
+                return Ok(None);
+            };
+            // Foreign keys are checked as the statement ends, with the rows their actions change.
+            crate::foreign_key::enforce(&view, &mut planned)?;
+            let keys = crate::statement::changed_keys(&view, &planned.changes, &planned.previous)?;
+            (planned, keys)
+        };
+        self.finish_transaction_write(planned, keys, Vec::new())
+            .map(Some)
     }
 
     fn execute_parsed_statement(&mut self, statement: Statement) -> Result<ExecuteResult> {
@@ -338,6 +369,12 @@ impl<D: PageDevice> PagedEngine<D> {
         self.transaction.is_some()
     }
 
+    /// What the active transaction holds, as [`PagedTransaction::fingerprint`] writes it.
+    #[cfg(test)]
+    pub(crate) fn transaction_fingerprint(&self) -> Option<String> {
+        self.transaction.as_ref().map(PagedTransaction::fingerprint)
+    }
+
     pub fn into_device(self) -> D {
         self.storage.into_device()
     }
@@ -371,15 +408,7 @@ impl<D: PageDevice> PagedEngine<D> {
                 "Page-native explicit transactions currently support only INSERT, UPDATE, and DELETE",
             ));
         }
-        let (
-            PlannedDml {
-                outcome,
-                changes,
-                previous,
-                ..
-            },
-            keys,
-        ) = {
+        let (planned, keys) = {
             let view = self.read_view_with_work(work);
             let planned = crate::statement::plan_dml(&view, statement)?;
             let keys = crate::statement::changed_keys(&view, &planned.changes, &planned.previous)?;
@@ -387,6 +416,22 @@ impl<D: PageDevice> PagedEngine<D> {
         };
         let fields =
             crate::statement::write_result_fields(&self.read_view_with_work(work), statement)?;
+        self.finish_transaction_write(planned, keys, fields)
+    }
+
+    /// Stages what a transaction's statement planned, and reports the statement's result.
+    fn finish_transaction_write(
+        &mut self,
+        planned: PlannedDml,
+        keys: ChangedKeys,
+        fields: Vec<ResultField>,
+    ) -> Result<ExecuteResult> {
+        let PlannedDml {
+            outcome,
+            changes,
+            previous,
+            ..
+        } = planned;
         if outcome.mutated {
             self.transaction
                 .as_mut()
@@ -668,6 +713,113 @@ lines', true, '7')"#,
             assert!(script.iter().all(|result| result.values.is_some()));
             assert_eq!(objects(&script[1]).len(), 3);
         }
+    }
+
+    #[test]
+    fn point_statements_stage_what_their_statements_stage() {
+        const SETUP: &[&str] = &[
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, \
+             qty INTEGER NOT NULL DEFAULT 1, note TEXT, price FLOAT)",
+            "CREATE UNIQUE INDEX items_name ON items (name)",
+            "CREATE INDEX items_qty ON items (qty)",
+            "CREATE TABLE tags (id INTEGER PRIMARY KEY, \
+             item INTEGER NOT NULL REFERENCES items (id) ON DELETE CASCADE, tag TEXT NOT NULL)",
+            "INSERT INTO items (id, name, qty, note, price) VALUES \
+             (1, 'one', 1, NULL, 1.5), (2, 'two', 2, 'second', NULL), (3, 'three', 3, NULL, NULL)",
+            "INSERT INTO tags (id, item, tag) VALUES (10, 1, 'a'), (11, 3, 'b')",
+        ];
+        // Each statement runs prepared in one engine, which plans it from its point template, and
+        // as SQL with the same parameters in another, which plans it in full. Several fail, in
+        // both; several are not point statements at all.
+        let statements: Vec<(&str, Vec<Value>)> = vec![
+            (
+                "INSERT INTO items (id, name, qty, note, price) VALUES ($1, $2, $3, $4, $5)",
+                vec![json!(4), json!("four"), json!(4), json!(null), json!(4.0)],
+            ),
+            ("INSERT INTO items (id, name) VALUES ($1, $2)", vec![json!(5), json!("five")]),
+            ("INSERT INTO items (id, name) VALUES ($1, $2)", vec![json!(5), json!("again")]),
+            ("INSERT INTO items (id, name) VALUES ($1, $2)", vec![json!(6), json!("one")]),
+            (
+                "INSERT INTO items (id, name, qty) VALUES ($1, $2, $3)",
+                vec![json!(7), json!("seven"), json!("many")],
+            ),
+            ("INSERT INTO items VALUES ($1, $2, $3, $4, $5)", vec![json!(9), json!("nine"), json!(9), json!("ninth"), json!(9.5)]),
+            ("UPDATE items SET note = $1 WHERE id = $2", vec![json!("noted"), json!(2)]),
+            ("UPDATE items SET note = $1 WHERE id = $2", vec![json!("missing"), json!(99)]),
+            ("UPDATE items SET qty = DEFAULT, note = $1 WHERE $2 = id", vec![json!(null), json!(3)]),
+            ("UPDATE items SET name = $1 WHERE id = $2", vec![json!(null), json!(1)]),
+            ("UPDATE items SET name = $1 WHERE id = $2", vec![json!("two"), json!(1)]),
+            ("UPDATE items SET price = $1 WHERE id = $2", vec![json!(2), json!(2)]),
+            ("UPDATE items SET id = $1 WHERE id = $2", vec![json!(20), json!(2)]),
+            ("UPDATE items SET qty = $1 WHERE id = $2", vec![json!(3.5), json!(1)]),
+            ("DELETE FROM items WHERE id = $1", vec![json!(5)]),
+            ("DELETE FROM items WHERE id = $1", vec![json!(5)]),
+            ("DELETE FROM items WHERE id = $1", vec![json!(3)]),
+            (
+                "INSERT INTO items (id, name, qty) VALUES ($1, $2, $3) \
+                 ON CONFLICT (id) DO UPDATE SET qty = EXCLUDED.qty, note = $4",
+                vec![json!(1), json!("uno"), json!(10), json!("upserted")],
+            ),
+            (
+                "INSERT INTO items (id, name, qty) VALUES ($1, $2, $3) \
+                 ON CONFLICT (id) DO UPDATE SET qty = EXCLUDED.qty",
+                vec![json!(8), json!("eight"), json!(8)],
+            ),
+            (
+                "INSERT INTO items (id, name) VALUES ($1, $2) \
+                 ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+                vec![json!(8), json!("two")],
+            ),
+            (
+                "INSERT INTO items (id, name) VALUES ($1, $2) \
+                 ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+                vec![json!(8), json!("eighth")],
+            ),
+            ("INSERT INTO tags (id, item, tag) VALUES ($1, $2, $3)", vec![json!(12), json!(2), json!("c")]),
+            ("INSERT INTO tags (id, item, tag) VALUES ($1, $2, $3)", vec![json!(13), json!(99), json!("d")]),
+            (
+                "UPDATE items SET note = $1 WHERE id = $2 AND name = $3",
+                vec![json!("x"), json!(1), json!("uno")],
+            ),
+            ("SELECT id, qty, note FROM items WHERE id = $1", vec![json!(1)]),
+            ("DELETE FROM items WHERE id = $1", vec![json!(1)]),
+        ];
+        let open = || {
+            let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+            for sql in SETUP {
+                engine.execute_sql(sql, &[]).unwrap();
+            }
+            engine.begin_transaction().unwrap();
+            engine
+        };
+        let (mut prepared, mut plain) = (open(), open());
+        let describe = |result: &Result<ExecuteResult>| match result {
+            Ok(result) => format!(
+                "ok {} {} {:?} {:?} {:?}",
+                result.command, result.row_count, result.tables, result.keys, result.rows
+            ),
+            Err(error) => format!("err {} {}", error.code, error.message),
+        };
+        for (sql, params) in &statements {
+            let id = prepared.prepare_sql(sql).unwrap();
+            let fast = prepared.execute_prepared(id, params);
+            let full = plain.execute_sql(sql, params);
+            assert_eq!(describe(&fast), describe(&full), "{sql}");
+            assert_eq!(
+                prepared.transaction_fingerprint(),
+                plain.transaction_fingerprint(),
+                "{sql}"
+            );
+        }
+        let fast = prepared.commit_transaction().unwrap();
+        let full = plain.commit_transaction().unwrap();
+        assert_eq!(format!("{fast:?}"), format!("{full:?}"));
+        assert_eq!(prepared.database_hash(), plain.database_hash());
+        // Rows 4, 8, 9, and 20 remain: 2 moved to 20, 3 and 5 were deleted, and 1 last of all.
+        assert_eq!(
+            objects(&prepared.execute_sql("SELECT * FROM items ORDER BY id", &[]).unwrap()).len(),
+            4
+        );
     }
 
     #[test]

@@ -8,7 +8,9 @@ use crate::query::{
     prepared_parameter_marker, tokenize, validate_bound_parameter_bytes, validate_sql_input,
     validate_sql_parameters,
 };
-use crate::statement::{Assigned, ConflictAction, OnConflict, SqlValue, Statement, WriteStatement};
+use crate::statement::{
+    Assigned, ConflictAction, OnConflict, PointTemplate, SqlValue, Statement, WriteStatement,
+};
 use crate::{EngineError, Result};
 
 pub type PreparedStatementId = u32;
@@ -22,6 +24,9 @@ const PREPARED_ENTRY_OVERHEAD: usize = 256;
 pub(crate) struct PreparedStatement {
     source: Box<str>,
     statement: Statement,
+    /// The statement as a point template, when it has the shape of one, which a transaction
+    /// plans from the template and its parameters directly.
+    point: Option<PointTemplate>,
     parameter_count: usize,
     parameter_occurrences: Box<[usize]>,
     limit_parameter: Option<usize>,
@@ -47,9 +52,14 @@ impl PreparedStatement {
             ));
         }
         let retained_bytes = retained_bytes(sql.len(), token_count, layout.parameter_count)?;
+        let point = match &statement {
+            Statement::Write(write) => crate::statement::point_template(write),
+            _ => None,
+        };
         Ok(Self {
             source: sql.into(),
             statement,
+            point,
             parameter_count: layout.parameter_count,
             parameter_occurrences: layout.parameter_occurrences.into_boxed_slice(),
             limit_parameter: layout.limit_parameter,
@@ -58,7 +68,9 @@ impl PreparedStatement {
         })
     }
 
-    pub(crate) fn bind(&self, params: &[Value]) -> Result<Statement> {
+    /// Checks `params` against the statement: their number, every slot, including gaps in
+    /// PostgreSQL-style numbering, and their sizes, before anything is cloned or planned.
+    fn check_params(&self, params: &[Value]) -> Result<()> {
         if params.len() != self.parameter_count {
             return Err(EngineError::bind_error(format!(
                 "Prepared statement expects {} parameters, but received {}",
@@ -66,10 +78,12 @@ impl PreparedStatement {
                 params.len()
             )));
         }
-        // Validate every slot, including gaps in PostgreSQL-style numbering, before cloning the
-        // parsed template or opening any mutation candidate.
         validate_sql_parameters(params)?;
-        validate_bound_parameter_bytes(&self.parameter_occurrences, params)?;
+        validate_bound_parameter_bytes(&self.parameter_occurrences, params)
+    }
+
+    pub(crate) fn bind(&self, params: &[Value]) -> Result<Statement> {
+        self.check_params(params)?;
         match &self.statement {
             Statement::Select(plan) => Ok(Statement::Select(
                 crate::query::bind_select_plan_parameters(
@@ -166,6 +180,22 @@ impl PreparedStatementRegistry {
     pub(crate) fn bind(&self, id: PreparedStatementId, params: &[Value]) -> Result<Statement> {
         let position = self.position(id).ok_or_else(|| prepared_not_found(id))?;
         self.statements[position].1.bind(params)
+    }
+
+    /// The point template of the statement registered as `id`, if it has one, with `params`
+    /// checked against the statement as binding would check them.
+    pub(crate) fn point(
+        &self,
+        id: PreparedStatementId,
+        params: &[Value],
+    ) -> Result<Option<&PointTemplate>> {
+        let position = self.position(id).ok_or_else(|| prepared_not_found(id))?;
+        let statement = &self.statements[position].1;
+        let Some(point) = &statement.point else {
+            return Ok(None);
+        };
+        statement.check_params(params)?;
+        Ok(Some(point))
     }
 
     pub(crate) fn close(&mut self, id: PreparedStatementId) -> Result<()> {

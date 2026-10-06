@@ -12,14 +12,15 @@ use crate::expression::{
 };
 use crate::hash::{KeyMap, KeySet};
 use crate::paged_codec::{
-    EMPTY_RECORD, RecordLayout, StoredRecord, encode_primary_key, encode_primary_key_values,
-    encode_row_values, encode_updated_record,
+    EMPTY_RECORD, RecordLayout, StoredEntry, StoredRecord, encode_primary_key,
+    encode_primary_key_values, encode_row_values, encode_updated_record,
 };
 use crate::query::{
-    Filter, ParseMode, Token, column_definition, exact_equalities, is_keyword, is_reserved_keyword,
-    next_outer, parse_predicate_at, resolved_subqueries, tokenize, validate_named_columns,
-    validate_parameter_expansion, validate_predicate_columns, validate_predicate_types,
-    validate_sql_input, visit_indexed_candidates,
+    Filter, ParseMode, Token, column_definition, exact_equalities, exact_primary_key_value,
+    is_keyword, is_reserved_keyword, next_outer, parse_predicate_at, prepared_parameter_index,
+    resolved_subqueries, tokenize, validate_named_columns, validate_parameter_expansion,
+    validate_predicate_columns, validate_predicate_types, validate_sql_input,
+    visit_indexed_candidates,
 };
 use crate::row::{HeldRow, RowRef};
 use crate::storage::{
@@ -650,6 +651,601 @@ pub(crate) fn plan_dml(
     // Foreign keys are checked as the statement ends, with the rows their actions change.
     crate::foreign_key::enforce(storage, &mut planned)?;
     Ok(planned)
+}
+
+/// A prepared statement that changes one row found by its primary key, as its template: a lone
+/// `INSERT`, with or without `ON CONFLICT (key) DO UPDATE SET`, or an `UPDATE` or `DELETE` of
+/// the row a primary-key equality names, all without `RETURNING`. [`plan_point`] plans one from
+/// the template and the parameters bound to it, rather than binding the statement and planning it
+/// as any statement is planned, which costs several times the planning itself. A template holds
+/// each value as the template's parser left it: a literal, or a parameter's marker.
+#[derive(Clone, Debug)]
+pub(crate) enum PointTemplate {
+    Insert {
+        table: String,
+        columns: Option<Vec<String>>,
+        values: Vec<SqlValue>,
+        /// `ON CONFLICT (target) DO UPDATE SET`: the target's columns, and each assignment.
+        conflict: Option<(Vec<String>, Vec<(String, PointAssigned)>)>,
+    },
+    Update {
+        table: String,
+        /// Each assigned column and its value, or `None` for the column's `DEFAULT`.
+        assignments: Vec<(String, Option<Value>)>,
+        /// Each column the predicate sets equal to a value, and the value.
+        key: Vec<(String, Value)>,
+    },
+    Delete {
+        table: String,
+        key: Vec<(String, Value)>,
+    },
+}
+
+/// What `ON CONFLICT DO UPDATE SET` assigns in a point template: a column of `EXCLUDED`, the
+/// proposed row, or a constant.
+#[derive(Clone, Debug)]
+pub(crate) enum PointAssigned {
+    Excluded(String),
+    Value(Value),
+}
+
+/// The point template of a prepared statement's parsed template, if it has the shape of one.
+pub(crate) fn point_template(statement: &WriteStatement) -> Option<PointTemplate> {
+    match statement {
+        WriteStatement::Insert {
+            table,
+            columns,
+            values,
+            on_conflict,
+            returning: None,
+        } if values.len() == 1 => {
+            let conflict = match on_conflict {
+                None => None,
+                Some(OnConflict {
+                    target: Some(target),
+                    action: ConflictAction::Update(assignments),
+                }) => {
+                    let mut assigned = Vec::with_capacity(assignments.len());
+                    for (column, value) in assignments {
+                        assigned.push((
+                            column.clone(),
+                            match value {
+                                Assigned::Expression(Expression::Excluded(source)) => {
+                                    PointAssigned::Excluded(source.clone())
+                                }
+                                Assigned::Expression(Expression::Value(value)) => {
+                                    PointAssigned::Value(value.clone())
+                                }
+                                _ => return None,
+                            },
+                        ));
+                    }
+                    Some((target.clone(), assigned))
+                }
+                Some(_) => return None,
+            };
+            Some(PointTemplate::Insert {
+                table: table.clone(),
+                columns: columns.clone(),
+                values: values[0].clone(),
+                conflict,
+            })
+        }
+        WriteStatement::Update {
+            table,
+            assignments,
+            predicate: Some(predicate),
+            returning: None,
+        } => {
+            let mut assigned = Vec::with_capacity(assignments.len());
+            for (column, value) in assignments {
+                assigned.push((
+                    column.clone(),
+                    match value {
+                        Assigned::Default => None,
+                        Assigned::Expression(Expression::Value(value)) => Some(value.clone()),
+                        Assigned::Expression(_) => return None,
+                    },
+                ));
+            }
+            Some(PointTemplate::Update {
+                table: table.clone(),
+                assignments: assigned,
+                key: key_equalities(predicate)?,
+            })
+        }
+        WriteStatement::Delete {
+            table,
+            predicate: Some(predicate),
+            returning: None,
+        } => Some(PointTemplate::Delete {
+            table: table.clone(),
+            key: key_equalities(predicate)?,
+        }),
+        _ => None,
+    }
+}
+
+/// The columns a predicate sets equal to values, when it is a conjunction of such equalities of
+/// distinct columns and nothing else.
+fn key_equalities(predicate: &Predicate) -> Option<Vec<(String, Value)>> {
+    let equality = |predicate: &Predicate| match predicate {
+        Predicate::Comparison {
+            column,
+            operator: crate::model::ComparisonOperator::Eq,
+            value,
+        } => Some((column.clone(), value.clone())),
+        _ => None,
+    };
+    let mut key = Vec::new();
+    match predicate {
+        Predicate::And { predicates } => {
+            for predicate in predicates {
+                key.push(equality(predicate)?);
+            }
+        }
+        predicate => key.push(equality(predicate)?),
+    }
+    for (index, (column, _)) in key.iter().enumerate() {
+        if key[..index].iter().any(|(other, _)| other == column) {
+            return None;
+        }
+    }
+    Some(key)
+}
+
+/// Plans a point template with `params` bound, as [`plan_dml`] would plan the statement, or
+/// `None` when the statement is not one the template's shape plans: a predicate that does not
+/// name exactly the primary key with values a lookup finds exactly, an assignment to a key
+/// column, a row too large to plan as a record, or anything else the general planner must judge
+/// or refuse. Planning stages nothing, so a statement declined here is planned again in full.
+pub(crate) fn plan_point(
+    storage: &dyn StorageReader,
+    template: &PointTemplate,
+    params: &[Value],
+) -> Result<Option<PlannedDml>> {
+    match template {
+        PointTemplate::Insert {
+            table,
+            columns,
+            values,
+            conflict,
+        } => plan_point_insert(
+            storage,
+            table,
+            columns.as_deref(),
+            values,
+            conflict.as_ref(),
+            params,
+        ),
+        PointTemplate::Update {
+            table,
+            assignments,
+            key,
+        } => plan_point_update(storage, table, assignments, key, params),
+        PointTemplate::Delete { table, key } => plan_point_delete(storage, table, key, params),
+    }
+}
+
+/// The value a template holds, with a parameter's marker replaced by the parameter.
+fn point_value<'a>(value: &'a Value, params: &'a [Value]) -> Result<&'a Value> {
+    match prepared_parameter_index(value) {
+        None => Ok(value),
+        Some(index) => params.get(index - 1).ok_or_else(|| {
+            EngineError::new(
+                "INTERNAL_ERROR",
+                "Prepared statement parameter metadata is inconsistent",
+            )
+        }),
+    }
+}
+
+/// The values of `key`, one for each of `schema`'s key columns in key order, when `key` names
+/// exactly those columns, with values a lookup finds exactly.
+fn point_key<'a>(
+    schema: &TableDefinition,
+    key: &'a [(String, Value)],
+    params: &'a [Value],
+) -> Result<Option<Vec<&'a Value>>> {
+    if key.len() != schema.primary_key.len() {
+        return Ok(None);
+    }
+    let mut values = Vec::with_capacity(key.len());
+    for column in &schema.primary_key {
+        let Some((_, value)) = key.iter().find(|(named, _)| named == column) else {
+            return Ok(None);
+        };
+        let value = point_value(value, params)?;
+        if value.is_null() || !exact_primary_key_value(schema, column, value) {
+            return Ok(None);
+        }
+        values.push(value);
+    }
+    Ok(primary_key_values_fit(&values).then_some(values))
+}
+
+/// What a table holds at a key: nothing, a stored row, or a row the reader does not store as a
+/// record, which only the general planner reads.
+enum PointRow {
+    None,
+    Stored(StoredEntry),
+    Other,
+}
+
+/// The row of `schema`'s table at the key `values`, as the reader sees it, held for the writer.
+fn point_row(
+    storage: &dyn StorageReader,
+    schema: &TableDefinition,
+    values: &[&Value],
+) -> Result<PointRow> {
+    let mut found = PointRow::None;
+    storage.visit_primary_key_values(&schema.name, schema, values, &mut |row| {
+        found = match row.hold()? {
+            HeldRow::Stored(entry) => PointRow::Stored(entry),
+            HeldRow::Map(_) => PointRow::Other,
+        };
+        Ok(VisitControl::Stop)
+    })?;
+    Ok(found)
+}
+
+/// What a point statement that matched no row plans.
+fn point_unchanged(command: &'static str) -> PlannedDml {
+    PlannedDml {
+        outcome: WriteOutcome {
+            command,
+            row_count: 0,
+            rows: vec![],
+            tables: vec![],
+            mutated: false,
+        },
+        changes: vec![],
+        previous: vec![],
+        moved: vec![],
+    }
+}
+
+/// What a point statement that changes one row of `table` plans.
+fn point_change(
+    command: &'static str,
+    table: &str,
+    change: RowChange,
+    previous: PreviousRow,
+) -> PlannedDml {
+    PlannedDml {
+        outcome: WriteOutcome {
+            command,
+            row_count: 1,
+            rows: vec![],
+            tables: vec![table.to_owned()],
+            mutated: true,
+        },
+        changes: vec![change],
+        previous: vec![previous],
+        moved: vec![],
+    }
+}
+
+/// The most JSON text a row of `schema` can take with `assigned` values in place of its own, as
+/// [`RecordUpdate`] bounds it, or `None` where a column the row keeps could take any amount.
+fn point_assigned_bound(
+    schema: &TableDefinition,
+    assigned: &[Option<&Value>],
+) -> Result<Option<usize>> {
+    let mut bound = row_json_overhead(schema)?;
+    for (column, value) in schema.columns.iter().zip(assigned) {
+        let value_bound = match value {
+            Some(value) => json_scalar_bound(value),
+            None if column.data_type == ColumnType::Json => None,
+            None => json_scalar_bound(column.default.as_ref().unwrap_or(&Value::Null)),
+        };
+        let Some(value_bound) = value_bound else {
+            return Ok(None);
+        };
+        bound = bound.saturating_add(value_bound);
+    }
+    Ok(Some(bound))
+}
+
+/// Whether the stored row `record`, rewritten with values bounded by `bound`, cannot pass the row
+/// limit, as [`RecordUpdate::fits`] decides.
+fn point_record_fits(record: &StoredRecord<'_>, columns: usize, bound: usize) -> bool {
+    record
+        .entry_len()
+        .saturating_mul(6)
+        .saturating_add(columns.saturating_mul(25))
+        .saturating_add(bound)
+        <= MAX_LOGICAL_ROW_BYTES
+}
+
+fn plan_point_update(
+    storage: &dyn StorageReader,
+    table: &str,
+    assignments: &[(String, Option<Value>)],
+    key: &[(String, Value)],
+    params: &[Value],
+) -> Result<Option<PlannedDml>> {
+    let schema = storage.table_schema(table)?;
+    let Some(layout) = storage.record_layout(table) else {
+        return Ok(None);
+    };
+    let Some(key_values) = point_key(&schema, key, params)? else {
+        return Ok(None);
+    };
+    // Each assignment's value, checked in assignment order, as the general planner checks them.
+    let mut defaults = Vec::new();
+    let mut assigned: Vec<Option<&Value>> = vec![None; schema.columns.len()];
+    for (column, value) in assignments {
+        let Some(position) = schema
+            .columns
+            .iter()
+            .position(|definition| definition.name == *column)
+        else {
+            return Ok(None);
+        };
+        if schema.primary_key.contains(column) || assigned[position].is_some() {
+            return Ok(None);
+        }
+        match value {
+            Some(value) => assigned[position] = Some(point_value(value, params)?),
+            None => defaults.push((
+                position,
+                schema.columns[position]
+                    .default
+                    .clone()
+                    .unwrap_or(Value::Null),
+            )),
+        }
+    }
+    for (position, value) in &defaults {
+        assigned[*position] = Some(value);
+    }
+    for (column, _) in assignments {
+        let position = schema
+            .columns
+            .iter()
+            .position(|definition| definition.name == *column)
+            .expect("the column was found above");
+        validate_value(
+            &schema.columns[position],
+            assigned[position].expect("the column was assigned above"),
+            table,
+        )?;
+    }
+    let Some(bound) = point_assigned_bound(&schema, &assigned)? else {
+        return Ok(None);
+    };
+    let entry = match point_row(storage, &schema, &key_values)? {
+        PointRow::None => return Ok(Some(point_unchanged("UPDATE"))),
+        PointRow::Stored(entry) => entry,
+        PointRow::Other => return Ok(None),
+    };
+    let record = StoredRecord::new(&schema, &layout, entry.key(), entry.value())?;
+    if !point_record_fits(&record, schema.columns.len(), bound) {
+        return Ok(None);
+    }
+    let next = encode_updated_record(&record, &assigned)?;
+    Ok(Some(point_change(
+        "UPDATE",
+        table,
+        RowChange::Put {
+            table: table.to_owned(),
+            key: entry.key().to_vec(),
+            record: next,
+        },
+        PreviousRow::Read(Some(HeldRow::Stored(entry))),
+    )))
+}
+
+fn plan_point_delete(
+    storage: &dyn StorageReader,
+    table: &str,
+    key: &[(String, Value)],
+    params: &[Value],
+) -> Result<Option<PlannedDml>> {
+    let schema = storage.table_schema(table)?;
+    let Some(layout) = storage.record_layout(table) else {
+        return Ok(None);
+    };
+    let Some(key_values) = point_key(&schema, key, params)? else {
+        return Ok(None);
+    };
+    let entry = match point_row(storage, &schema, &key_values)? {
+        PointRow::None => return Ok(Some(point_unchanged("DELETE"))),
+        PointRow::Stored(entry) => entry,
+        PointRow::Other => return Ok(None),
+    };
+    // A script's writer applies a delete by its encoded key; a transaction's by the key as a map.
+    let change = if storage.plans_removals() {
+        RowChange::Remove {
+            table: table.to_owned(),
+            key: entry.key().to_vec(),
+        }
+    } else {
+        RowChange::Delete {
+            table: table.to_owned(),
+            key: StoredRecord::new(&schema, &layout, entry.key(), entry.value())?.key_row()?,
+        }
+    };
+    Ok(Some(point_change(
+        "DELETE",
+        table,
+        change,
+        PreviousRow::Read(Some(HeldRow::Stored(entry))),
+    )))
+}
+
+fn plan_point_insert(
+    storage: &dyn StorageReader,
+    table: &str,
+    columns: Option<&[String]>,
+    values: &[SqlValue],
+    conflict: Option<&(Vec<String>, Vec<(String, PointAssigned)>)>,
+    params: &[Value],
+) -> Result<Option<PlannedDml>> {
+    let schema = storage.table_schema(table)?;
+    let Some(layout) = storage.record_layout(table) else {
+        return Ok(None);
+    };
+    let default_values = columns.is_none() && values.is_empty();
+    let all_columns;
+    let columns = match columns {
+        Some(columns) => columns,
+        None => {
+            all_columns = schema
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect::<Vec<_>>();
+            &all_columns
+        }
+    };
+    let positions = named_column_positions(&schema, columns)?;
+    if !default_values && values.len() != columns.len() {
+        return Ok(None);
+    }
+    let updates = match conflict {
+        None => None,
+        Some((target, assignments)) => {
+            if target.len() != schema.primary_key.len()
+                || !schema
+                    .primary_key
+                    .iter()
+                    .all(|column| target.contains(column))
+            {
+                return Ok(None);
+            }
+            // A constant the clause assigns is checked before any row, whether or not one
+            // conflicts, as the general planner checks it.
+            for (column, value) in assignments {
+                if let PointAssigned::Value(value) = value {
+                    let Some(definition) = schema.columns.iter().find(|definition| {
+                        definition.name == *column
+                    }) else {
+                        return Ok(None);
+                    };
+                    validate_value(definition, point_value(value, params)?, table)?;
+                }
+            }
+            Some(assignments)
+        }
+    };
+    // The row's values in schema order, each named or its column's default, when every one is a
+    // scalar and the row's JSON text cannot pass the row limit, as a record plans them.
+    let mut row = Vec::with_capacity(schema.columns.len());
+    let mut bound = row_json_overhead(&schema)?;
+    for (column, position) in schema.columns.iter().zip(&positions) {
+        let explicit = (!default_values)
+            .then(|| position.and_then(|index| values.get(index)))
+            .flatten();
+        let value = match explicit {
+            Some(SqlValue::Value(value)) => point_value(value, params)?,
+            Some(SqlValue::Default) | None => column.default.as_ref().unwrap_or(&Value::Null),
+        };
+        let Some(value_bound) = json_scalar_bound(value) else {
+            return Ok(None);
+        };
+        bound = bound.saturating_add(value_bound);
+        row.push(value);
+    }
+    if bound > MAX_LOGICAL_ROW_BYTES {
+        return Ok(None);
+    }
+    for (column, value) in schema.columns.iter().zip(&row) {
+        validate_value(column, value, table)?;
+    }
+    let key = encode_primary_key_values(&schema, &layout, &row)?;
+    ensure_storage_key_bytes(key.len())?;
+    let Some(assignments) = updates else {
+        if storage.holds_encoded_key(table, &key)? {
+            return Err(duplicate_primary_key("INSERT into", table));
+        }
+        let record = encode_row_values(&schema, &layout, &row)?;
+        return Ok(Some(point_change(
+            "INSERT",
+            table,
+            RowChange::Put {
+                table: table.to_owned(),
+                key,
+                record,
+            },
+            PreviousRow::Read(None),
+        )));
+    };
+    let position_of = |name: &str| {
+        schema
+            .columns
+            .iter()
+            .position(|column| column.name == name)
+    };
+    let mut key_values = Vec::with_capacity(schema.primary_key.len());
+    for column in &schema.primary_key {
+        let value = row[position_of(column).expect("a key column is a column")];
+        if !exact_primary_key_value(&schema, column, value) {
+            return Ok(None);
+        }
+        key_values.push(value);
+    }
+    let entry = match point_row(storage, &schema, &key_values)? {
+        PointRow::Other => return Ok(None),
+        PointRow::None => {
+            let record = encode_row_values(&schema, &layout, &row)?;
+            return Ok(Some(point_change(
+                "INSERT",
+                table,
+                RowChange::Put {
+                    table: table.to_owned(),
+                    key,
+                    record,
+                },
+                PreviousRow::Read(None),
+            )));
+        }
+        PointRow::Stored(entry) => entry,
+    };
+    // The stored row is rewritten with the assigned values, as a lone upsert rewrites it.
+    let mut assigned: Vec<Option<&Value>> = vec![None; schema.columns.len()];
+    for (column, value) in assignments {
+        let Some(position) = position_of(column) else {
+            return Ok(None);
+        };
+        if schema.primary_key.contains(column) || assigned[position].is_some() {
+            return Ok(None);
+        }
+        assigned[position] = Some(match value {
+            PointAssigned::Excluded(source) => {
+                let Some(source) = position_of(source) else {
+                    return Ok(None);
+                };
+                row[source]
+            }
+            PointAssigned::Value(value) => point_value(value, params)?,
+        });
+    }
+    let Some(bound) = point_assigned_bound(&schema, &assigned)? else {
+        return Ok(None);
+    };
+    let record = StoredRecord::new(&schema, &layout, entry.key(), entry.value())?;
+    if !point_record_fits(&record, schema.columns.len(), bound) {
+        return Ok(None);
+    }
+    // Checked in schema order, as normalizing a map of the row checks them.
+    for (column, value) in schema.columns.iter().zip(&assigned) {
+        if let Some(value) = value {
+            validate_value(column, value, table)?;
+        }
+    }
+    let next = encode_updated_record(&record, &assigned)?;
+    Ok(Some(point_change(
+        "INSERT",
+        table,
+        RowChange::Put {
+            table: table.to_owned(),
+            key: entry.key().to_vec(),
+            record: next,
+        },
+        PreviousRow::Read(Some(HeldRow::Stored(entry))),
+    )))
 }
 
 pub(crate) fn write_result_fields(
