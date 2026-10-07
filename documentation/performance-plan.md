@@ -553,6 +553,20 @@ Found along the way:
   insert-indexed -4.7%, with staging's calls a third fewer (an update's 299
   to 205, its allocations there 5 to none); whole stack, cold, -1.6% to
   -3.7% by median; 33 bytes smaller compressed.
+- A cached page is fetched with no call but the cache's lookup.
+  `Pager::read_page_in_place` tests in one place what a read of a cached page
+  needs (the pager is usable, the ID is a data page the active root
+  allocates, no page is reserved, the cache holds it), marks the entry
+  referenced and reads the envelope's type, length and ID at fixed offsets;
+  any other read goes whole to `read_page_checked`, which makes each check in
+  turn and reports the first that fails. The route had been 17 calls a page,
+  three pages for a lookup in the benchmark's table. Ten tests hold the new
+  route to the old one: every page ID against the old bitmap indexing, every
+  type byte, and `decode_whole` against `decode_verified` under every
+  single-bit flip of the envelope. Instructions under baseline compilation:
+  update-pk -2.0%, upsert -1.4%, delete-pk -1.9%, select-pk -2.3%,
+  select-scan -3.4%, update-scan -2.1%, and about half as much once
+  optimized; 15 bytes larger compressed.
 
 Found along the way, 6 and 7 October:
 

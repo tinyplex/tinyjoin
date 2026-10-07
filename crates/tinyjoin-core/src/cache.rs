@@ -149,6 +149,38 @@ impl<D: PageDevice> PageCache<D> {
         self.read_owned(Owner::Committed, id, verify)
     }
 
+    /// Where the cache holds committed page `id`, when [`Self::read_page_verified`] would do no
+    /// more than find the page there and return it: the page is cached, and no page is reserved,
+    /// so `id` cannot be. `None` leaves the read to that routine. So does an index past the
+    /// entries, which the lookup never holds and which that routine stops on. The index is the
+    /// entry's, for [`Self::cached_page`], and stands until the cache next changes.
+    ///
+    /// Both are compiled into the pager's reader, which reaches a cached page through them with
+    /// one call, the lookup. They are two so that the reader borrows a page from the cache only
+    /// once it has decided to return it: a borrow it might not return would last through the
+    /// read it falls back to.
+    #[inline(always)]
+    pub(crate) fn cached_index(&self, id: PageId) -> Option<usize> {
+        if !self.reservations.is_empty() {
+            return None;
+        }
+        let index = *self.lookup.get(&(Owner::Committed, id))?;
+        (index < self.entries.len()).then_some(index)
+    }
+
+    /// The page in the entry [`Self::cached_index`] found, marked as referenced as every read
+    /// marks the page it returns.
+    #[inline(always)]
+    pub(crate) fn cached_page(&mut self, index: usize) -> &[u8; PAGE_SIZE] {
+        // The index was tested against the entries when it was found, so the compiler drops this
+        // test and its panic, where indexing the vector would be a call.
+        let Some(entry) = self.entries.get_mut(index) else {
+            unreachable!("the index of a cached page names an entry")
+        };
+        entry.referenced = true;
+        &entry.bytes
+    }
+
     #[cfg(test)]
     pub(crate) fn read_candidate_page(
         &mut self,
@@ -675,6 +707,49 @@ fn cache_error(message: impl Into<String>) -> EngineError {
     EngineError::new("PAGE_CACHE_ERROR", message)
 }
 
+/// A memory device that counts the pages read from it, which a [`MemoryPageDevice`] does not
+/// record: what tells a page served from the cache from a page read again.
+///
+/// [`MemoryPageDevice`]: crate::MemoryPageDevice
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct CountingDevice {
+    inner: crate::MemoryPageDevice,
+    reads: usize,
+}
+
+#[cfg(test)]
+impl CountingDevice {
+    pub(crate) fn new(inner: crate::MemoryPageDevice) -> Self {
+        Self { inner, reads: 0 }
+    }
+
+    /// How many pages have been read from the device.
+    pub(crate) fn reads(&self) -> usize {
+        self.reads
+    }
+}
+
+#[cfg(test)]
+impl PageDevice for CountingDevice {
+    fn page_count(&self) -> PageId {
+        self.inner.page_count()
+    }
+
+    fn read_page(&mut self, id: PageId, destination: &mut [u8]) -> Result<()> {
+        self.reads += 1;
+        self.inner.read_page(id, destination)
+    }
+
+    fn write_page(&mut self, id: PageId, source: &[u8]) -> Result<()> {
+        self.inner.write_page(id, source)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.inner.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1093,5 +1168,162 @@ mod tests {
             "PAGE_CACHE_ERROR"
         );
         assert_eq!(cache.read_page(page_id).unwrap(), &[6; PAGE_SIZE]);
+    }
+
+    /// A cache of `capacity` pages over a device that counts its reads, whose first data pages
+    /// each hold their distance from the first of them.
+    fn counting_cache(capacity: usize, pages: PageId) -> PageCache<CountingDevice> {
+        let mut device = MemoryPageDevice::new(FIRST_DATA_PAGE_ID + pages).unwrap();
+        for page in 0..pages {
+            device
+                .write_page(FIRST_DATA_PAGE_ID + page, &[page as u8; PAGE_SIZE])
+                .unwrap();
+        }
+        PageCache::with_capacity(CountingDevice::new(device), capacity * PAGE_SIZE).unwrap()
+    }
+
+    #[test]
+    fn a_committed_page_is_found_once_cached_and_while_no_page_is_reserved() {
+        let mut cache = counting_cache(5, 5);
+        let active = active_bitmap();
+        let [cached, reserved, other, refused, abandoned] =
+            [0, 1, 2, 3, 4].map(|page| FIRST_DATA_PAGE_ID + page);
+
+        // A page is found only once a read has loaded it, and is then served without the device.
+        assert_eq!(cache.cached_index(cached), None);
+        assert_eq!(cache.read_page(cached).unwrap(), &[0; PAGE_SIZE]);
+        assert_eq!(cache.device().reads(), 1);
+        for _ in 0..3 {
+            let index = cache.cached_index(cached).unwrap();
+            assert_eq!(cache.cached_page(index), &[0; PAGE_SIZE]);
+            assert_eq!(cache.read_page(cached).unwrap(), &[0; PAGE_SIZE]);
+        }
+        assert_eq!(cache.cached_index(other), None);
+        assert_eq!(cache.device().reads(), 1);
+
+        // A page that fails its verification is not cached, so it is never found: every read of
+        // it reads the device and verifies again.
+        for reads in 2..4 {
+            assert_eq!(
+                cache
+                    .read_page_verified(refused, |_| Err(EngineError::new("REFUSED", "page")))
+                    .unwrap_err()
+                    .code,
+                "REFUSED"
+            );
+            assert_eq!(cache.cached_index(refused), None);
+            assert_eq!(cache.device().reads(), reads);
+        }
+
+        // While a candidate holds a reservation no page is found, whichever it is. The read that
+        // is left to do then refuses the reserved page, and returns the others as before.
+        cache.reserve_candidate_page(7, reserved, &active).unwrap();
+        for written in [false, true] {
+            if written {
+                cache
+                    .write_candidate_page(7, reserved, &[7; PAGE_SIZE])
+                    .unwrap();
+            }
+            for id in [cached, reserved, other] {
+                assert_eq!(cache.cached_index(id), None);
+            }
+            let error = cache.read_page(reserved).unwrap_err();
+            assert_eq!(error.code, "PAGE_CACHE_ERROR");
+            assert!(error.message.contains("reserved by candidate 7"));
+            assert_eq!(cache.read_page(cached).unwrap(), &[0; PAGE_SIZE]);
+        }
+        assert_eq!(cache.device().reads(), 3);
+        assert_eq!(cache.read_page(other).unwrap(), &[2; PAGE_SIZE]);
+        assert_eq!(cache.device().reads(), 4);
+
+        // Installed, the candidate's page is a committed page like the others.
+        cache.flush_candidate(7).unwrap();
+        cache
+            .install_candidate(7, &active, &bitmap_allocating(&active, &[reserved]))
+            .unwrap();
+        for (id, value) in [(cached, 0), (reserved, 7), (other, 2)] {
+            let index = cache.cached_index(id).unwrap();
+            assert_eq!(cache.cached_page(index), &[value; PAGE_SIZE]);
+        }
+        assert_eq!(cache.device().reads(), 4);
+
+        // A candidate that is abandoned leaves the committed pages to be found again, and its own
+        // page to be read from the device, where it never arrived.
+        cache.reserve_candidate_page(8, abandoned, &active).unwrap();
+        cache
+            .write_candidate_page(8, abandoned, &[8; PAGE_SIZE])
+            .unwrap();
+        assert_eq!(cache.cached_index(cached), None);
+        cache.invalidate_candidate(8);
+        assert!(cache.cached_index(cached).is_some());
+        assert_eq!(cache.cached_index(abandoned), None);
+        assert_eq!(cache.read_page(abandoned).unwrap(), &[4; PAGE_SIZE]);
+        assert_eq!(cache.device().reads(), 5);
+    }
+
+    #[test]
+    fn a_page_served_from_the_cache_is_kept_from_the_next_eviction() {
+        // Three pages fill the cache, and a fourth takes the first's entry, leaving the second
+        // and the third unreferenced. A fifth then takes the second's entry, unless the second
+        // has been read since, by the routine or as a cached page: then it takes the third's.
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Read {
+            None,
+            Routine,
+            Cached,
+        }
+        let id = |page: PageId| FIRST_DATA_PAGE_ID + page;
+        for read in [Read::None, Read::Routine, Read::Cached] {
+            let mut cache = counting_cache(3, 5);
+            for page in 0..4 {
+                assert_eq!(cache.read_page(id(page)).unwrap()[0], page as u8);
+            }
+            match read {
+                Read::None => {}
+                Read::Routine => assert_eq!(cache.read_page(id(1)).unwrap()[0], 1),
+                Read::Cached => {
+                    let index = cache.cached_index(id(1)).unwrap();
+                    assert_eq!(cache.cached_page(index)[0], 1);
+                }
+            }
+            assert_eq!(cache.read_page(id(4)).unwrap()[0], 4);
+            assert_eq!(cache.device().reads(), 5);
+            assert_eq!(
+                [1, 2].map(|page| cache.cached_index(id(page)).is_some()),
+                [read != Read::None, read == Read::None],
+                "{read:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lookup_past_the_entries_is_left_to_the_read_that_stops_on_it() {
+        let mut cache = counting_cache(2, 1);
+        cache.read_page(FIRST_DATA_PAGE_ID).unwrap();
+        // The lookup and the entries change together, so only a test parts them.
+        *cache
+            .lookup
+            .get_mut(&(Owner::Committed, FIRST_DATA_PAGE_ID))
+            .unwrap() = 1;
+        assert_eq!(cache.cached_index(FIRST_DATA_PAGE_ID), None);
+        let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = cache.read_page(FIRST_DATA_PAGE_ID);
+        }));
+        assert!(stopped.is_err());
+    }
+
+    #[test]
+    fn pages_that_displace_each_other_are_read_from_the_device_every_time() {
+        let mut cache = counting_cache(1, 2);
+        for round in 1..=3 {
+            for page in 0..2 {
+                let id = FIRST_DATA_PAGE_ID + page;
+                assert_eq!(cache.cached_index(id), None);
+                assert_eq!(cache.read_page(id).unwrap(), &[page as u8; PAGE_SIZE]);
+                assert!(cache.cached_index(id).is_some());
+            }
+            assert_eq!(cache.device().reads(), 2 * round);
+            assert_eq!(cache.len(), 1);
+        }
     }
 }

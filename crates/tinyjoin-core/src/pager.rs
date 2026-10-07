@@ -137,7 +137,38 @@ impl<D: PageDevice> Pager<D> {
     }
 
     /// Reads a data page as [`Self::read_page`] does, borrowing its payload from the page cache.
+    ///
+    /// A page the cache holds is reached with one call, the cache's lookup. A statement fetches
+    /// a page at each level of a tree to find a row, in code a baseline compiler made, which
+    /// inlines nothing: there the functions a read went through on its way to a cached page cost
+    /// several times the work they did. So what [`Self::read_page_checked`] needs to pass every
+    /// check, find the page in the cache and decode it is tested here in one place, and the page
+    /// is returned as that routine would return it. Any other read is left to that routine whole,
+    /// which makes each check and reports the first that fails. A page it has to load is then
+    /// looked up twice, which is little beside reading the page and verifying it.
     pub(crate) fn read_page_in_place(&mut self, id: PageId) -> Result<PageRef<'_>> {
+        if !self.recovery_required
+            && id >= FIRST_DATA_PAGE_ID
+            && self.active.allocation_bitmap.allocates(id)
+            && let Some(index) = self.cache.cached_index(id)
+        {
+            let page = PageRef::decode_whole(self.cache.cached_page(index));
+            if let Ok(page) = &page {
+                debug_assert_eq!(
+                    page.id, id,
+                    "cached pages keep the envelope they were verified with"
+                );
+            }
+            return page;
+        }
+        self.read_page_checked(id)
+    }
+
+    /// Reads a data page through each of a read's checks in turn, loading it from the device if
+    /// the cache does not hold it. It is kept out of [`Self::read_page_in_place`] so that the read
+    /// of a cached page, which never comes here, sets up no more than its own frame.
+    #[inline(never)]
+    fn read_page_checked(&mut self, id: PageId) -> Result<PageRef<'_>> {
         self.ensure_usable()?;
         ensure_data_page(id)?;
         if !self.active.allocation_bitmap.is_allocated(id)? {
@@ -147,6 +178,18 @@ impl<D: PageDevice> Pager<D> {
             .cache
             .read_page_verified(id, |bytes| verify_expected_page(id, bytes))?;
         decode_verified_page(id, bytes)
+    }
+
+    /// The checks a read makes before it asks the cache for the page, as they were written before
+    /// [`AllocationBitmap::allocates`]: the oracle that tests compare a refused read with.
+    #[cfg(test)]
+    fn read_checks_reference(&self, id: PageId) -> Result<()> {
+        self.ensure_usable()?;
+        ensure_data_page(id)?;
+        if !self.active.allocation_bitmap.is_allocated_reference(id)? {
+            return Err(page_not_allocated(id));
+        }
+        Ok(())
     }
 
     pub(crate) fn begin_write(&mut self) -> Result<PagerWriteTransaction<'_, D>> {
@@ -239,12 +282,19 @@ impl<D: PageDevice> PagerWriteTransaction<'_, D> {
 
     /// Whether this candidate allocated `id`.
     fn is_new(&self, id: PageId) -> bool {
-        self.next_bitmap.is_allocated(id).unwrap_or(false)
+        self.next_bitmap.allocates(id) && !self.pager.active.allocation_bitmap.allocates(id)
+    }
+
+    /// [`Self::is_new`] as it was written over [`AllocationBitmap::is_allocated`], whose error for
+    /// an ID past the limit it read as a page that is not new: the oracle it is compared with.
+    #[cfg(test)]
+    fn is_new_reference(&self, id: PageId) -> bool {
+        self.next_bitmap.is_allocated_reference(id).unwrap_or(false)
             && !self
                 .pager
                 .active
                 .allocation_bitmap
-                .is_allocated(id)
+                .is_allocated_reference(id)
                 .unwrap_or(true)
     }
 
@@ -760,13 +810,17 @@ fn verify_expected_page(id: PageId, bytes: &[u8; PAGE_SIZE]) -> Result<()> {
 }
 
 /// Decodes a cached data page, which was verified when it was loaded or encoded by this engine.
+/// The decoder's result is passed on as it stands: taken apart and put together again, it was
+/// copied both ways, in more code than the decoding.
 fn decode_verified_page(id: PageId, bytes: &[u8; PAGE_SIZE]) -> Result<PageRef<'_>> {
-    let page = PageRef::decode_verified(bytes)?;
-    debug_assert_eq!(
-        page.id, id,
-        "cached pages keep the envelope they were verified with"
-    );
-    Ok(page)
+    let page = PageRef::decode_verified(bytes);
+    if let Ok(page) = &page {
+        debug_assert_eq!(
+            page.id, id,
+            "cached pages keep the envelope they were verified with"
+        );
+    }
+    page
 }
 
 fn page_not_allocated(id: PageId) -> EngineError {
@@ -790,6 +844,7 @@ mod tests {
     use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
     use super::*;
+    use crate::cache::CountingDevice;
     use crate::page::{PAGE_MAGIC, SUPERBLOCK_MAGIC, first_page_of_bitmap_chunk};
     use crate::{BitmapSlot, MAX_PAGE_CACHE_BYTES, MemoryPageDevice, PageType};
 
@@ -1364,6 +1419,203 @@ mod tests {
         let mut reopened = Pager::open_or_create(device).unwrap();
         assert_eq!(reopened.catalog_root_page_id(), Some(new_root));
         assert_eq!(reopened.read_page(new_root).unwrap().payload, vec![2]);
+    }
+
+    /// What a read returned, in a form that two reads can be compared by.
+    fn outcome(page: Result<PageRef<'_>>) -> Result<(PageId, PageType, Vec<u8>)> {
+        page.map(|page| (page.id, page.page_type, page.payload.to_vec()))
+    }
+
+    #[test]
+    fn refused_reads_report_what_the_checks_report() {
+        let (device, root) = committed_fault_device();
+        // A page the device holds and no root allocates.
+        let orphan = root + 1;
+        let mut direct = device.clone();
+        direct
+            .write_page(orphan, &leaf(orphan, 9).encode().unwrap())
+            .unwrap();
+        // Metadata pages, the one allocated page, pages no root allocates, and IDs past the limit.
+        let ids = [
+            0,
+            FIRST_DATA_PAGE_ID - 1,
+            root,
+            orphan,
+            MAX_PAGE_COUNT - 1,
+            MAX_PAGE_COUNT,
+            u64::MAX,
+        ];
+        // The routine that makes each check in turn is the oracle, on a pager of its own, so that
+        // the reader meets the allocated page before its cache holds it and then in it. That
+        // routine is in turn held to the checks as they were first written, which refuse what it
+        // refuses and pass the one page it reads. For the third round the cache is made to hold
+        // every probed page the device holds, as no read leaves it: a page the checks refuse is
+        // refused wherever it is found.
+        let mut pager = Pager::open_or_create(device.clone()).unwrap();
+        let mut reference = Pager::open_or_create(device.clone()).unwrap();
+        for round in 0..3 {
+            if round == 2 {
+                for id in [0, FIRST_DATA_PAGE_ID - 1, orphan] {
+                    pager.cache.read_page(id).unwrap();
+                }
+            }
+            let codes = ids.map(|id| {
+                let expected = outcome(reference.read_page_checked(id));
+                assert_eq!(
+                    reference.read_checks_reference(id).err(),
+                    expected.as_ref().err().cloned(),
+                    "page {id}"
+                );
+                let cached = match round {
+                    0 => false,
+                    1 => id == root,
+                    _ => id <= orphan,
+                };
+                assert_eq!(pager.cache.cached_index(id).is_some(), cached, "page {id}");
+                assert_eq!(outcome(pager.read_page_in_place(id)), expected, "page {id}");
+                expected.map_or_else(|error| error.code, |_| String::from("read"))
+            });
+            assert_eq!(
+                codes,
+                [
+                    "PAGER_ERROR",
+                    "PAGER_ERROR",
+                    "read",
+                    "PAGE_NOT_ALLOCATED",
+                    "PAGE_NOT_ALLOCATED",
+                    "PAGER_ERROR",
+                    "PAGER_ERROR",
+                ]
+            );
+        }
+
+        // A pager whose publication had an unknown outcome refuses every read alike, among them
+        // the read of the page its cache holds.
+        let mut pager = reference;
+        pager.fail_install_once = true;
+        let (transaction, new_root) = prepare_replacement(&mut pager, root);
+        assert_eq!(
+            transaction
+                .commit(2, EMPTY_HASH, Some(new_root))
+                .unwrap_err()
+                .code,
+            "RECOVERY_REQUIRED"
+        );
+        assert!(pager.cache.cached_index(root).is_some());
+        for id in ids {
+            let expected = outcome(pager.read_page_checked(id));
+            assert_eq!(expected.as_ref().unwrap_err().code, "RECOVERY_REQUIRED");
+            assert_eq!(
+                pager.read_checks_reference(id).err(),
+                expected.as_ref().err().cloned(),
+                "page {id}"
+            );
+            assert_eq!(outcome(pager.read_page_in_place(id)), expected, "page {id}");
+        }
+        assert_eq!(
+            crate::Btree::get(&mut pager, root, 1, b"key")
+                .unwrap_err()
+                .code,
+            "RECOVERY_REQUIRED"
+        );
+    }
+
+    #[test]
+    fn a_cached_page_is_read_without_the_device_and_as_the_checked_read_reads_it() {
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let mut transaction = pager.begin_write().unwrap();
+        let pages = [(); 2].map(|_| transaction.allocate_page().unwrap());
+        for (value, page) in pages.iter().enumerate() {
+            transaction
+                .write_new_page(&leaf(*page, value as u8))
+                .unwrap();
+        }
+        transaction.commit(1, EMPTY_HASH, Some(pages[0])).unwrap();
+        let reads = |pager: &Pager<CountingDevice>| pager.device.0.borrow().reads();
+
+        // With room for both pages, each is read from the device once, however often it is read.
+        let device = CountingDevice::new(pager.into_device());
+        let mut pager = Pager::with_cache_capacity(device, 2 * PAGE_SIZE).unwrap();
+        let opened = reads(&pager);
+        for round in 0..3 {
+            for (value, page) in pages.iter().enumerate() {
+                let expected = Ok((*page, PageType::BtreeLeaf, vec![value as u8]));
+                assert_eq!(outcome(pager.read_page_in_place(*page)), expected);
+                assert_eq!(outcome(pager.read_page_checked(*page)), expected);
+                assert_eq!(
+                    reads(&pager) - opened,
+                    if round == 0 { value + 1 } else { 2 }
+                );
+            }
+        }
+
+        // While a candidate holds a reservation, a cached page is left to the checked read, which
+        // looks for its ID among the reservations, and is still read without the device.
+        let mut transaction = pager.begin_write().unwrap();
+        let reserved = transaction.allocate_page().unwrap();
+        assert_eq!(transaction.pager.cache.cached_index(pages[0]), None);
+        assert_eq!(
+            outcome(transaction.pager.read_page_in_place(pages[0])),
+            Ok((pages[0], PageType::BtreeLeaf, vec![0]))
+        );
+        assert_eq!(
+            transaction
+                .pager
+                .read_page_in_place(reserved)
+                .unwrap_err()
+                .code,
+            "PAGE_NOT_ALLOCATED"
+        );
+        transaction.abort();
+        assert!(pager.cache.cached_index(pages[0]).is_some());
+        assert_eq!(reads(&pager) - opened, 2);
+
+        // With room for one page, two pages read in turn displace each other, and every read is
+        // from the device.
+        let mut pager = Pager::with_cache_capacity(pager.into_device(), PAGE_SIZE).unwrap();
+        let opened = reads(&pager);
+        for round in 0..3 {
+            for (value, page) in pages.iter().enumerate() {
+                assert_eq!(
+                    outcome(pager.read_page_in_place(*page)),
+                    Ok((*page, PageType::BtreeLeaf, vec![value as u8]))
+                );
+                assert_eq!(reads(&pager) - opened, 2 * round + value + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn new_pages_are_those_only_the_candidate_allocates() {
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let mut transaction = pager.begin_write().unwrap();
+        let shared = [(); 3].map(|_| transaction.allocate_page().unwrap());
+        for page in shared {
+            transaction.write_new_page(&leaf(page, 1)).unwrap();
+        }
+        transaction.commit(1, EMPTY_HASH, Some(shared[0])).unwrap();
+
+        // A candidate that allocates three pages, frees a shared page and releases one of its own.
+        let mut transaction = pager.begin_write().unwrap();
+        let allocated = [(); 3].map(|_| transaction.allocate_page().unwrap());
+        transaction.free_shared_page(shared[1]).unwrap();
+        transaction.release_new_page(allocated[1]).unwrap();
+        // Every page up to those and a few past them, the last page within the limit, and IDs past
+        // it, among them some whose low bits name a page the candidate allocated.
+        let ids = (0..allocated[2] + 4).chain([
+            MAX_PAGE_COUNT - 1,
+            MAX_PAGE_COUNT,
+            MAX_PAGE_COUNT + allocated[0],
+            (1 << 32) + allocated[0],
+            (1 << 35) + allocated[0],
+            u64::MAX,
+        ]);
+        for id in ids {
+            let new = id == allocated[0] || id == allocated[2];
+            assert_eq!(transaction.is_new(id), new, "page {id}");
+            assert_eq!(transaction.is_new_reference(id), new, "page {id}");
+            assert_eq!(transaction.owns_page(id), new, "page {id}");
+        }
     }
 
     #[test]

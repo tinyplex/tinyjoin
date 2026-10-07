@@ -80,17 +80,30 @@ pub(crate) enum PageType {
     Overflow = 5,
 }
 
+impl PageType {
+    /// The type a page's type byte names, or `None` for a byte that names none. It is compiled
+    /// into [`PageRef::whole`], which reads the type of every cached page a statement fetches:
+    /// there a conversion that can build an error is a call, and this is a comparison.
+    #[inline(always)]
+    const fn from_byte(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Superblock),
+            2 => Some(Self::AllocationBitmap),
+            3 => Some(Self::BtreeInternal),
+            4 => Some(Self::BtreeLeaf),
+            5 => Some(Self::Overflow),
+            _ => None,
+        }
+    }
+}
+
 impl TryFrom<u8> for PageType {
     type Error = EngineError;
 
     fn try_from(value: u8) -> Result<Self> {
-        match value {
-            1 => Ok(Self::Superblock),
-            2 => Ok(Self::AllocationBitmap),
-            3 => Ok(Self::BtreeInternal),
-            4 => Ok(Self::BtreeLeaf),
-            5 => Ok(Self::Overflow),
-            _ => Err(invalid_page(storage_diagnostic!(
+        match Self::from_byte(value) {
+            Some(page_type) => Ok(page_type),
+            None => Err(invalid_page(storage_diagnostic!(
                 "Unknown page type {value}"
             ))),
         }
@@ -353,6 +366,37 @@ impl<'a> PageRef<'a> {
             page_type: PageType::try_from(bytes[20])?,
             payload: &bytes[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + payload_length],
         })
+    }
+
+    /// Reads a whole page as [`Self::decode_verified`] does, compiled into its caller.
+    ///
+    /// The pager decodes every cached page it hands out, and a baseline compiler inlines nothing:
+    /// there each helper that reads or checks a field costs more as a call than the field does.
+    /// So a page whose type and payload length are valid is [read in place](Self::whole), and
+    /// any other is handed to [`Self::decode_verified`], which makes the refusal, so that the two
+    /// report such a page alike.
+    #[inline(always)]
+    pub(crate) fn decode_whole(bytes: &'a [u8; PAGE_SIZE]) -> Result<Self> {
+        match Self::whole(bytes) {
+            Some(page) => Ok(page),
+            None => Self::decode_verified(bytes),
+        }
+    }
+
+    /// The page `bytes` hold, if its type and payload length are valid: every page that
+    /// [`Self::decode_verified`] accepts, and what it returns for it. The fields are read at
+    /// constant offsets of the array, since a copy out of a slice would be a call.
+    #[inline(always)]
+    fn whole(bytes: &'a [u8; PAGE_SIZE]) -> Option<Self> {
+        let payload_length = u32_at(bytes, 24) as usize;
+        match PageType::from_byte(bytes[20]) {
+            Some(page_type) if payload_length <= MAX_PAGE_PAYLOAD_SIZE => Some(Self {
+                id: u64::from(u32_at(bytes, 12)) | (u64::from(u32_at(bytes, 16)) << 32),
+                page_type,
+                payload: &bytes[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + payload_length],
+            }),
+            _ => None,
+        }
     }
 
     pub(crate) fn to_page(self) -> Page {
@@ -713,6 +757,30 @@ impl AllocationBitmap {
     }
 
     pub(crate) fn is_allocated(&self, id: PageId) -> Result<bool> {
+        validate_page_id(id)?;
+        Ok(self.allocates(id))
+    }
+
+    /// Whether this root allocates `id`, as [`Self::is_allocated`] reports it for an ID within
+    /// the limit. No root allocates an ID past the limit, which is tested before the ID is
+    /// narrowed to an index.
+    ///
+    /// It is compiled into its callers, which ask it of every page they read or write: the range
+    /// check that can build an error and the indexing that can panic were each a call there, for
+    /// the sake of one bit.
+    #[inline(always)]
+    pub(crate) fn allocates(&self, id: PageId) -> bool {
+        id < MAX_PAGE_COUNT
+            && self
+                .bits
+                .get((id / 8) as usize)
+                .is_some_and(|byte| byte & (1 << (id % 8)) != 0)
+    }
+
+    /// [`Self::is_allocated`] as it was written before [`Self::allocates`]: the oracle that tests
+    /// compare both with.
+    #[cfg(test)]
+    pub(crate) fn is_allocated_reference(&self, id: PageId) -> Result<bool> {
         validate_page_id(id)?;
         let byte = id as usize / 8;
         let bit = id as usize % 8;
@@ -1168,6 +1236,18 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
             .try_into()
             .expect("validated length"),
     )
+}
+
+/// Reads a little-endian number at a constant offset of a whole page byte by byte, which compiles
+/// into its caller as a load, where [`read_u32`]'s copy out of a slice is two calls.
+#[inline(always)]
+const fn u32_at(bytes: &[u8; PAGE_SIZE], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
 }
 
 fn invalid_page(message: impl Into<String>) -> EngineError {
@@ -1837,6 +1917,150 @@ mod tests {
         assert_eq!(
             bitmap.set_allocated(0, false).unwrap_err().code,
             "INVALID_PAGE"
+        );
+    }
+
+    #[test]
+    fn allocates_agrees_with_is_allocated() {
+        let mut random = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            random
+        };
+        // IDs past the limit, among them some whose low bits name a page within it, as an index
+        // narrowed to 32 bits before the limit was tested would read them.
+        let beyond = [
+            MAX_PAGE_COUNT,
+            MAX_PAGE_COUNT + 1,
+            MAX_PAGE_COUNT * 2 + 3,
+            1 << 32,
+            (1 << 35) + 40,
+            u64::MAX - 7,
+            u64::MAX,
+        ];
+        for case in 0..5 {
+            // No page, every page, then random pages.
+            let bits = (0..ALLOCATION_BITMAP_BYTES)
+                .map(|_| match case {
+                    0 => 0,
+                    1 => 0xff,
+                    _ => next() as u8,
+                })
+                .collect();
+            let bitmap = AllocationBitmap { bits, allocated: 0 };
+            for id in (0..MAX_PAGE_COUNT).chain(beyond) {
+                let expected = bitmap.is_allocated_reference(id);
+                assert_eq!(bitmap.is_allocated(id), expected, "page {id}");
+                assert_eq!(bitmap.allocates(id), expected.unwrap_or(false), "page {id}");
+            }
+            for id in beyond {
+                assert_eq!(bitmap.is_allocated(id).unwrap_err().code, "INVALID_PAGE");
+            }
+        }
+    }
+
+    /// [`PageType::try_from`] as it was written before [`PageType::from_byte`]: the oracle that
+    /// both are compared with.
+    fn page_type_reference(value: u8) -> Result<PageType> {
+        match value {
+            1 => Ok(PageType::Superblock),
+            2 => Ok(PageType::AllocationBitmap),
+            3 => Ok(PageType::BtreeInternal),
+            4 => Ok(PageType::BtreeLeaf),
+            5 => Ok(PageType::Overflow),
+            _ => Err(invalid_page(storage_diagnostic!(
+                "Unknown page type {value}"
+            ))),
+        }
+    }
+
+    const PAGE_TYPES: [PageType; 5] = [
+        PageType::Superblock,
+        PageType::AllocationBitmap,
+        PageType::BtreeInternal,
+        PageType::BtreeLeaf,
+        PageType::Overflow,
+    ];
+
+    #[test]
+    fn page_types_are_read_from_their_bytes_as_they_were() {
+        for value in 0..=u8::MAX {
+            let expected = page_type_reference(value);
+            assert_eq!(PageType::try_from(value), expected, "byte {value}");
+            assert_eq!(PageType::from_byte(value), expected.ok(), "byte {value}");
+        }
+        for page_type in PAGE_TYPES {
+            assert_eq!(PageType::from_byte(page_type as u8), Some(page_type));
+        }
+    }
+
+    #[test]
+    fn whole_pages_decode_as_slices_do() {
+        // Whether the slice's reader, which is the oracle, decodes the page. The whole page's
+        // reader must then return the same fields over the same bytes, having read them in place,
+        // and otherwise the same error, having read nothing in place.
+        let decodes = |bytes: &[u8; PAGE_SIZE], case: &str| {
+            let fields = |page: PageRef<'_>| (page.id, page.page_type, page.payload.as_ptr_range());
+            let slice = PageRef::decode_verified(bytes).map(fields);
+            assert_eq!(PageRef::decode_whole(bytes).map(fields), slice, "{case}");
+            assert_eq!(
+                PageRef::whole(bytes).map(fields),
+                slice.as_ref().ok().cloned(),
+                "{case}"
+            );
+            slice.is_ok()
+        };
+        let (mut decoded, mut refused) = (0, 0);
+        for page_type in PAGE_TYPES {
+            for payload_length in [0, 3, 1000, MAX_PAGE_PAYLOAD_SIZE] {
+                let payload = (0..payload_length).map(|index| index as u8).collect();
+                let page = Page::new(42, page_type, payload).unwrap();
+                // As the cache holds a page it loaded, and one a candidate wrote, whose checksum
+                // is still zero.
+                for (sealed, page) in [
+                    (true, page.encode().unwrap()),
+                    (false, page.encode_unsealed().unwrap()),
+                ] {
+                    let case = format!("{page_type:?} of {payload_length} bytes, sealed: {sealed}");
+                    assert!(decodes(&page, &case));
+                    for bit in 0..PAGE_HEADER_SIZE * 8 {
+                        let mut flipped = page;
+                        flipped[bit / 8] ^= 1 << (bit % 8);
+                        if decodes(&flipped, &format!("{case}, bit {bit}")) {
+                            decoded += 1;
+                        } else {
+                            refused += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(decoded > 0 && refused > 0);
+
+        // A page with neither a type nor a length that is valid is refused for its length, which
+        // the slice's reader checks first.
+        let mut page = Page::new(42, PageType::BtreeLeaf, vec![1, 2, 3])
+            .unwrap()
+            .encode()
+            .unwrap();
+        page[20] = 0;
+        page[24..28].copy_from_slice(&((MAX_PAGE_PAYLOAD_SIZE + 1) as u32).to_le_bytes());
+        assert!(!decodes(&page, "an unknown type and an oversized payload"));
+        assert!(
+            PageRef::decode_whole(&page)
+                .unwrap_err()
+                .message
+                .contains("payload length")
+        );
+        page[24..28].copy_from_slice(&3_u32.to_le_bytes());
+        assert!(!decodes(&page, "an unknown type"));
+        assert!(
+            PageRef::decode_whole(&page)
+                .unwrap_err()
+                .message
+                .contains("Unknown page type 0")
         );
     }
 

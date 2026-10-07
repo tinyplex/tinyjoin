@@ -91,6 +91,18 @@ was made again. Before V8 has optimized the code, an update, upsert or delete
 by key and an insert in a transaction each run 4% to 5% fewer instructions,
 with a third fewer calls in staging.
 
+### Reading pages
+
+A page the cache already holds is fetched with one call, the cache's lookup.
+A read went through seventeen: its checks that the pager is usable, that the
+page is a data page the active root allocates, and that it is not reserved,
+each a function of its own, and then the cache's readers and the decoding of
+the page's envelope. A read now tests all of that in one place, and one that
+does not pass there takes the old path, which reports what failed. A
+statement that finds a row fetches a page at each level of its tree, so
+before V8 has optimized the code an update, delete or select by key runs 2%
+fewer instructions, and a scan 3% fewer.
+
 ### Comparing memory
 
 The WebAssembly build compares memory eight bytes at a time, in place of the
