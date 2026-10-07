@@ -561,6 +561,27 @@ Found along the way, 6 and 7 October:
   0.8 KiB compressed, since the entry grew by four bytes on wasm32 and the
   shared leaf descent added an indirect call to every point lookup. The
   patch is kept in the session scratchpad as held-estimate-dropped.patch.
+- The slow single-insert commit samples, examined over eight publication runs
+  and two isolated ones by three readers and their skeptics: TinyJoin's file
+  does not grow at each commit (the freed pages are reused, so 20 of 1,000
+  commits append a page), Chromium's sync access handle adds no per-write
+  work, and the disturbance is not TinyJoin's alone. It is a bounded stretch
+  of slower flushes that follows a large teardown, mostly a PGlite profile of
+  more than a thousand files and a renderer near a gigabyte, and lands on
+  whichever sample's flush-dense window it overlaps: TinyJoin's 0.4 s window
+  of a thousand flushes fits inside it and reads as two to three times slower,
+  SQLite's and PGlite's longer windows as a few hundred milliseconds more,
+  and PGlite following PGlite was hit the same way in an isolated run. It
+  needs a busy machine: the two worst runs had Docker's VM and a 12 GB model
+  server resident, and the run discarded today had the media and photo
+  analysis daemons started again by launchd during it, and a Time Machine helper,
+  where the kept run half an hour later had them paused. The pre-sample flush
+  probe does move before slow samples (0.30-0.54 ms against 0.25-0.31) but
+  within its tolerance. Taken: the runner's profiles and probe files now live
+  in a `.noindex` directory, and the quiet-run script pauses again any daemon
+  launchd starts during a run. Left for a later run: a per-statement timeline inside the
+  workload, so a slow sample shows whether it was uniformly slow or stalled,
+  and a gate that reads the system's idle time rather than one thread's speed.
 - The slow `insert-autocommit` samples in the two runs discarded on 7
   October were the ones that followed the deletion of a PGlite profile. Within
   a round the engines ran in a fixed rotation of TinyJoin, SQLite, PGlite, so

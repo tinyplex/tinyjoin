@@ -1,7 +1,7 @@
 import {execFileSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {existsSync} from 'node:fs';
-import {mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
+import {mkdir, mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
 import {createServer} from 'node:http';
 import {arch, cpus, platform, release, tmpdir, totalmem} from 'node:os';
 import {extname, join, resolve, sep} from 'node:path';
@@ -65,6 +65,12 @@ if (options.help) {
   process.exit(0);
 }
 
+// Browser profiles and the probes' files live in a directory whose name ends in .noindex, which
+// Spotlight leaves alone: a sample's profile holds hundreds of files, PGlite's more than a
+// thousand, and indexing them as they come and go would be work the machine does during samples.
+const scratch = join(tmpdir(), 'tinyjoin-compare.noindex');
+await mkdir(scratch, {recursive: true});
+
 // Times the probes alone, once a second, with no build, servers, or browser: whether the machine
 // is quiet before a long run, and what each probe reads on it, which is what the flush gate's
 // tolerance is set from. The flush probe should read near what an engine's commit flush costs,
@@ -74,7 +80,7 @@ if (options.probe) {
   if (options.publish) throw new Error('--probe times the probes alone, and cannot be combined with --publish');
   const seconds = Number(options.probe);
   if (!(seconds >= 1)) throw new Error('--probe takes a number of seconds');
-  const probes = [createCpuProbe(), await createFlushProbe(tmpdir()), await createNodeFlushProbe(tmpdir())];
+  const probes = [createCpuProbe(), await createFlushProbe(scratch), await createNodeFlushProbe(scratch)];
   const [, flush, fsync] = probes;
   const quietest = probes.map(() => Infinity);
   const slowest = probes.map(() => 0);
@@ -274,7 +280,7 @@ async function measureDownload(fetched) {
 }
 
 async function sample(engine, id) {
-  const profile = await mkdtemp(join(tmpdir(), `tinyjoin-compare-${engine}-`));
+  const profile = await mkdtemp(join(scratch, `tinyjoin-compare-${engine}-`));
   try {
     if (id === 'cold-open') {
       return await session(engine, profile, async (page, fetched) => {
@@ -323,7 +329,7 @@ const save = async () => {
 // row have begun before it recovered, the runner stops waiting on it, reads it once before each
 // sample, and says so in the report.
 const cpu = await createSettler(createCpuProbe(), {tolerance: (ms) => ms * 1.05, stepSeconds: 5, maxSeconds: 60, counter: 'unrecoveredRounds'});
-const flushProbe = await createFlushProbe(tmpdir());
+const flushProbe = await createFlushProbe(scratch);
 const flush = await createSettler(flushProbe, {
   tolerance: (ms) => Math.max(ms * 1.5, ms + 0.1),
   floor: (baselineMs) => baselineMs / 1.5,
