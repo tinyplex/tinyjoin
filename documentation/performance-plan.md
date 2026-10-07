@@ -538,6 +538,14 @@ Found along the way, 6 and 7 October:
   whole leaves and writes 10 pages; committing one insert writes about four
   pages and flushes, and an OPFS flush costs 0.35-0.4 ms, which is nearly all
   of that workload's 431 µs per statement.
+- Carrying a held row's estimated bytes inside its `StoredEntry` (so the
+  script writer stops re-opening the record to charge it), with an existence
+  probe that copies no row, was built, reviewed and measured, then dropped:
+  the range delete gained 3-5% under baseline compilation and nothing
+  optimized, updates and upserts were flat to 3% slower, and the engine grew
+  0.8 KiB compressed, since the entry grew by four bytes on wasm32 and the
+  shared leaf descent added an indirect call to every point lookup. The
+  patch is kept in the session scratchpad as held-estimate-dropped.patch.
 - The slow `insert-autocommit` samples in the two runs discarded on 7
   October were the ones that followed the deletion of a PGlite profile. Within
   a round the engines ran in a fixed rotation of TinyJoin, SQLite, PGlite, so
