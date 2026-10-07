@@ -75,7 +75,15 @@ fn stage_with_full_validation(
         return Ok(());
     }
     let patch = transaction.patch(storage, changes, Vec::new())?;
-    let mut entries = transaction.entries.clone();
+    // The write set the patch leaves, as a map of each table's entries by key, which the
+    // transaction no longer keeps as one.
+    let mut entries: BTreeMap<String, BTreeMap<Vec<u8>, OverlayEntry>> = BTreeMap::new();
+    for (table, overlay) in transaction.tables.iter() {
+        let staged = entries.entry(table.clone()).or_default();
+        for (key, entry) in &overlay.rows {
+            staged.insert(key.clone(), entry.clone());
+        }
+    }
     for (table, patched) in &patch.entries {
         entries.entry(table.clone()).or_default().extend(
             patched
@@ -101,13 +109,9 @@ fn stage_with_full_validation(
                 .map(move |(key, entry)| (table.as_str(), key.as_slice(), entry))
         }),
     ))?;
-    for (table, patched) in patch.entries {
+    for ((table, patched), deletes) in patch.entries.into_iter().zip(patch.deletes) {
         transaction.touch(&table);
-        transaction
-            .entries
-            .entry(table)
-            .or_default()
-            .extend(patched);
+        transaction.install(table, patched, deletes);
     }
     Ok(())
 }
@@ -171,14 +175,27 @@ fn compare_stage(
         full.unique_prefixes
     );
     let (mut keys, mut bytes) = (0, 0);
-    for (table, entries) in &staged.entries {
-        for (key, entry) in entries {
+    for (table, overlay) in staged.tables.iter() {
+        for (key, entry) in &overlay.rows {
             keys += 1;
             bytes += decoded_retained_bytes(storage, table, key, entry);
         }
     }
     assert_eq!(totals.overlay_keys, keys);
     assert_eq!(totals.overlay_bytes, bytes);
+    // Each table's count of staged deletes is what its entries hold, in both transactions.
+    for transaction in [&*staged, &*reference] {
+        for (_, overlay) in transaction.tables.iter() {
+            assert_eq!(
+                overlay.deletes,
+                overlay
+                    .rows
+                    .iter()
+                    .filter(|(_, entry)| entry.row.next.is_none())
+                    .count()
+            );
+        }
+    }
     actual.err().map(|error| error.code)
 }
 
@@ -540,12 +557,14 @@ impl StorageReader for MapsOnly<'_> {
 /// What a transaction stages and keeps, to compare two transactions entry by entry.
 fn overlay_state(transaction: &PagedTransaction) -> String {
     let entries = transaction
-        .entries
+        .tables
         .iter()
-        .map(|(table, entries)| {
-            let entries = entries
+        .map(|(table, overlay)| {
+            let entries = overlay
+                .ordered()
                 .iter()
-                .map(|(key, entry)| {
+                .map(|&position| {
+                    let (key, entry) = &overlay.rows[position as usize];
                     (
                         key,
                         &entry.row.old,
@@ -556,7 +575,7 @@ fn overlay_state(transaction: &PagedTransaction) -> String {
                     )
                 })
                 .collect::<Vec<_>>();
-            (table, entries)
+            (table, overlay.deletes, entries)
         })
         .collect::<Vec<_>>();
     let totals = &transaction.totals;

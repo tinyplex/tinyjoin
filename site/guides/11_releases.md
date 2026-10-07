@@ -70,6 +70,17 @@ read the copy, and charges per statement what it charged per row. Engine-only,
 the `LIKE` delete takes a further 6% less time before optimization and 15%
 less after.
 
+### Staging rows
+
+A transaction keeps each table's staged rows in one vector, in the order they
+arrive, and finds a row by a hash of its encoded key rather than by searching
+a B-tree map. The rows are put in key order only when a scan or the commit
+needs them, by sorting the keys that arrived out of order and merging them in.
+Engine-only, 10,000 inserts in a transaction take 11% less time before V8 has
+optimized the code and 10% less after, 200-row inserts 16% and 15% less, and
+updates, upserts and deletes by key 3% to 5% less; the engine is 2.2 KiB
+smaller compressed.
+
 ### Comparing memory
 
 The WebAssembly build compares memory eight bytes at a time, in place of the

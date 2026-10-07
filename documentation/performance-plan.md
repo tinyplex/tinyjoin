@@ -481,6 +481,21 @@ Found along the way:
   optimized, the range delete 2% and 4%, for 0.4 KiB more compressed code.
   The one observable change: a corrupt text or JSON column in such a row
   fails the statement while planning rather than while applying.
+- A transaction's staged rows live in a `TableOverlay`: one vector of
+  entries per table in arrival order, a `KeyIndex` of open-addressed u32
+  slots from a multiplicative hash of the encoded key, the table's count of
+  staged deletes, and a key order built lazily: positions that arrive above
+  the last stay in order, and a scan or the commit sorts the tail that did
+  not and merges it in by binary search, copying positions rather than
+  cloning keys. The B-tree map's searches had been a quarter of a bulk
+  insert's time under baseline compilation. A first version re-sorted the
+  whole order with cloned keys at every scan, which slowed update-scan by 16%
+  under baseline compilation; the merge brought it 5% below where it was.
+  Engine-only, 10,000 inserts in a transaction take 11% less time under
+  baseline compilation and 10% less optimized, 200-row inserts 16% and 15%,
+  updates, upserts and deletes by key 3-5%, and the engine is 2.2 KiB smaller
+  compressed, the B-tree map's instantiation gone and the index build and
+  GROUP BY sharing one sort of borrowed keys.
 
 Found along the way, 6 and 7 October:
 

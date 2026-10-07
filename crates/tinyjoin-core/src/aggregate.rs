@@ -5,6 +5,7 @@ use std::hash::{Hash, Hasher};
 use serde_json::{Map, Number, Value};
 
 use crate::hash::{KeyHasher, KeyMap, KeySet};
+use crate::paged_script::sort_keyed;
 use crate::query::{
     Filter, ParseMode, Token, column_definition, is_distinct_keyword_at, is_reserved_keyword,
     parse_predicate_at, sort_rows_by, validate_predicate_columns, validate_predicate_types,
@@ -1132,18 +1133,27 @@ impl Groups {
     }
 
     fn into_states(self) -> Vec<GroupState> {
-        // Sorting (key, position) pairs shares its code with the sort that builds indexes.
-        let mut order = Vec::with_capacity(self.entries.len());
+        // The keys sort beside the positions of their states, through the sort that orders a new
+        // index's entries; the rows a query may read keep the groups far below what a position
+        // can hold.
+        let mut keys = Vec::with_capacity(self.entries.len());
         let mut states = Vec::with_capacity(self.entries.len());
-        for (position, group) in self.entries.into_iter().enumerate() {
-            order.push((group.key, position));
+        for group in self.entries {
+            keys.push(group.key);
             states.push(Some(group.state));
         }
-        order.sort_unstable();
-        order
-            .into_iter()
-            .filter_map(|(_, position)| states[position].take())
-            .collect()
+        let mut order = Vec::with_capacity(keys.len());
+        for (position, key) in keys.iter().enumerate() {
+            order.push((key.as_slice(), position as u32));
+        }
+        sort_keyed(&mut order);
+        let mut sorted = Vec::with_capacity(order.len());
+        for (_, position) in order {
+            if let Some(state) = states[position as usize].take() {
+                sorted.push(state);
+            }
+        }
+        sorted
     }
 }
 

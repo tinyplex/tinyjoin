@@ -113,21 +113,15 @@ impl<T> KeyedRows<T> {
         self.rows.push((key, row));
     }
 
-    /// Where each row is in key order.
-    fn order(&self) -> Vec<usize> {
+    /// Each row's key beside its position, in key order.
+    fn order(&self) -> Vec<KeyedPosition<'_>> {
         let mut order = Vec::with_capacity(self.rows.len());
-        if self.seen.is_none() {
-            order.extend(0..self.rows.len());
-            return order;
+        // A statement's work limit keeps its rows far below what a position can hold.
+        for (position, (key, _)) in self.rows.iter().enumerate() {
+            order.push((key.as_slice(), position as u32));
         }
-        let mut keys = Vec::with_capacity(self.rows.len());
-        for (index, (key, _)) in self.rows.iter().enumerate() {
-            keys.push((key.clone(), index));
-        }
-        // Keys are unique, so the pairs sort as their keys do.
-        keys.sort_unstable();
-        for (_, index) in keys {
-            order.push(index);
+        if self.seen.is_some() {
+            sort_keyed(&mut order);
         }
         order
     }
@@ -137,14 +131,21 @@ impl<T> KeyedRows<T> {
         if self.seen.is_none() {
             return self.rows;
         }
-        let order = self.order();
+        let mut positions = Vec::with_capacity(self.rows.len());
+        for (_, position) in self.order() {
+            positions.push(position);
+        }
         let mut rows = Vec::with_capacity(self.rows.len());
         for row in self.rows {
             rows.push(Some(row));
         }
         let mut sorted = Vec::with_capacity(rows.len());
-        for index in order {
-            sorted.push(rows[index].take().expect("each row is taken once"));
+        for position in positions {
+            sorted.push(
+                rows[position as usize]
+                    .take()
+                    .expect("each row is taken once"),
+            );
         }
         sorted
     }
@@ -154,9 +155,8 @@ impl KeyedRows<PlannedChange> {
     /// The changed rows in key order.
     fn changes(&self) -> Vec<(&[u8], &ChangedRow)> {
         let mut changes = Vec::with_capacity(self.rows.len());
-        for index in self.order() {
-            let (key, change) = &self.rows[index];
-            changes.push((key.as_slice(), &change.row));
+        for (key, position) in self.order() {
+            changes.push((key, &self.rows[position as usize].1.row));
         }
         changes
     }
@@ -167,6 +167,20 @@ impl KeyedRows<PlannedChange> {
 enum PlannedRow {
     Map(Row),
     Record(Vec<u8>),
+}
+
+/// A row's encoded key, borrowed from where the row is held, beside the row's position there.
+pub(crate) type KeyedPosition<'a> = (&'a [u8], u32);
+
+/// Sorts rows' keys, each beside its row's position, by key. Every sort of rows by their encoded
+/// keys that needs to know where the rows are passes through here, so that the engine compiles
+/// one: a script's planned rows, a transaction's staged rows, a new index's entries and a query's
+/// groups each pair a borrowed key with its row's position, rather than each compiling a sort
+/// over a comparison of its own rows, or copying its keys out to sort them. The pairs are plain
+/// values that the sort compares with one call to the comparison of byte slices, and keys of
+/// different rows never compare equal, so the positions beside them are never reached.
+pub(crate) fn sort_keyed(keyed: &mut [KeyedPosition<'_>]) {
+    keyed.sort_unstable();
 }
 
 /// The rows a write changes in one table, each with its encoded primary key, in key order.
@@ -1432,13 +1446,20 @@ impl IndexBuild<'_> {
         if entries.is_empty() {
             return Ok(());
         }
-        // Each entry ends with its row's primary key, so no two are equal, and the pairs sort as
-        // their entries do.
-        entries.sort_unstable();
+        // Each entry ends with its row's primary key, so no two are equal, and the entries are
+        // ordered by their keys beside their positions, which the chunk's byte bound keeps far
+        // below what a position can hold.
+        let mut order = Vec::with_capacity(entries.len());
+        for (position, (key, _)) in entries.iter().enumerate() {
+            order.push((key.as_slice(), position as u32));
+        }
+        sort_keyed(&mut order);
         if self.definition.unique {
             // Entries for one tuple sort together, so a repeated tuple has its neighbor's prefix.
-            for pair in entries.windows(2) {
-                if secondary_index_entry_matches_prefix(&pair[1].0, &pair[0].0[..pair[0].1]) {
+            for pair in order.windows(2) {
+                let ((first, position), (second, _)) = (pair[0], pair[1]);
+                let tuple = entries[position as usize].1;
+                if secondary_index_entry_matches_prefix(second, &first[..tuple]) {
                     return Err(unique_violation(&self.definition.name));
                 }
             }
@@ -1455,13 +1476,13 @@ impl IndexBuild<'_> {
                 }
             }
         }
-        let batch = entries
-            .iter()
-            .map(|(key, _)| BatchChange {
+        let mut batch = Vec::with_capacity(order.len());
+        for &(key, _) in &order {
+            batch.push(BatchChange {
                 key,
                 value: Some(&[]),
-            })
-            .collect::<Vec<_>>();
+            });
+        }
         let applied = Btree::apply(transaction, self.root_page_id, self.tree_id, &batch)?;
         if applied.inserted != entries.len() {
             return Err(storage_corrupt(format!(

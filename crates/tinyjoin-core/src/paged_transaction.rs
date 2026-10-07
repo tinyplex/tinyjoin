@@ -1,6 +1,7 @@
 use std::{
-    cell::Cell,
+    cell::{Cell, Ref, RefCell},
     collections::{BTreeMap, BTreeSet},
+    hash::Hasher,
     rc::Rc,
 };
 
@@ -10,10 +11,12 @@ use crate::{
     ChangedKeys, EngineError, IndexDefinition, MAX_CHANGED_KEYS_PER_TABLE, PageDevice,
     PagedStorage, Result, Row, RowChange, StorageReader, TableDefinition, TableKeys, TreeId,
     VisitControl, VisitOutcome,
+    hash::KeyHasher,
+    name_map::NameMap,
     paged_codec::{
         EMPTY_RECORD, IndexEntryLayout, PrimaryKey, RecordLayout, encode_primary_key, encode_row,
     },
-    paged_script::{ChangedRow, KeyedRows, TableChanges, held_row_bytes},
+    paged_script::{ChangedRow, KeyedRows, TableChanges, held_row_bytes, sort_keyed},
     paged_storage::{
         ChangeCost, ChangeRow, PagedIndex, PagedTable, PagedWriteUsage, batch_too_large,
     },
@@ -31,13 +34,10 @@ const OVERLAY_ENTRY_BYTES: usize = 128;
 #[derive(Clone)]
 pub(crate) struct PagedTransaction {
     base_revision: u64,
-    entries: BTreeMap<String, BTreeMap<Vec<u8>, OverlayEntry>>,
+    /// The entries staged for each table a statement has changed, in name order.
+    tables: NameMap<TableOverlay>,
     /// The tables a statement has changed, in name order.
     touched_tables: Vec<String>,
-    /// How many staged entries of each table delete their row. An insert of a key no row was read
-    /// for can replace a staged entry only in a table with one, so other tables' inserts skip the
-    /// search for one.
-    staged_deletes: Vec<(String, usize)>,
     totals: Totals,
 }
 
@@ -79,6 +79,245 @@ struct OverlayEntry {
     cost: Option<ChangeCost>,
 }
 
+/// The entries a transaction stages for one table.
+///
+/// The entries are one vector in arrival order, which an entry never leaves: a later change to
+/// its key replaces it in place, since a staged key stays staged for the transaction. A hash
+/// index finds a key's position, and a list of the positions in key order serves the walks that
+/// need the order: the commit's batches and reported keys, the committed rows a scan passes over
+/// and the staged rows it presents after them, and the row count, so that a corrupt table fails
+/// it at the same entry however its keys arrived. The list is the arrival order itself while
+/// every key arrives above the one before it, as the keys of ascending inserts and upserts do.
+/// Once a key arrives below the last, it and the keys after it form a tail behind the positions
+/// known to be in key order, and the next ordered walk sorts the tail and merges it in, at a
+/// cost that grows with the tail rather than with the table: a transaction that scans between
+/// its statements by scattered keys merges a few positions at each scan, rather than sorting
+/// every staged key again.
+///
+/// The memory this takes is one contiguous vector of entries, doubling as it grows, where a
+/// B-tree map held them in nodes of about a kilobyte that the allocator reuses: at the
+/// transaction's key limit the vector's last doubling briefly holds its old buffer beside its
+/// new one.
+#[derive(Clone, Default)]
+struct TableOverlay {
+    /// The staged keys and their entries, in arrival order.
+    rows: Vec<(Vec<u8>, OverlayEntry)>,
+    /// Where each key is in `rows`.
+    index: KeyIndex,
+    /// How many entries delete their row. An insert of a key no row was read for can replace a
+    /// staged entry only in a table with one, so other tables' inserts skip the search for one.
+    deletes: usize,
+    /// Each position in `rows` once: the first `sorted` of them in key order, and the rest, the
+    /// tail, in arrival order.
+    order: RefCell<Vec<u32>>,
+    /// How many leading positions of `order` are in key order. Fewer than the rows means a tail
+    /// has arrived since the order was last whole, which the next ordered walk merges in.
+    sorted: Cell<usize>,
+    /// How many tail positions the merges have searched the head for, so that a test can see
+    /// that a merge searches for its tail alone.
+    #[cfg(test)]
+    searches: Cell<usize>,
+}
+
+impl TableOverlay {
+    /// The entry staged for `key`, if one is.
+    fn get(&self, key: &[u8]) -> Option<&OverlayEntry> {
+        self.index
+            .find(&self.rows, key)
+            .ok()
+            .map(|position| &self.rows[position].1)
+    }
+
+    /// Installs a statement's entries, in key order, each replacing the entry of its key or
+    /// joining the rows, and counts the deletes the statement adds to the table, or takes away.
+    fn install(&mut self, entries: PatchEntries, deletes: isize) {
+        self.deletes = self.deletes.saturating_add_signed(deletes);
+        let order = self.order.get_mut();
+        let sorted = self.sorted.get_mut();
+        for (key, entry) in entries {
+            let slot = match self.index.find(&self.rows, &key) {
+                Ok(position) => {
+                    // The key keeps its position, and with it its place in the order; the key
+                    // the entry arrived with is dropped, as a map drops the key of a value it
+                    // replaces.
+                    self.rows[position].1 = entry;
+                    continue;
+                }
+                Err(slot) => slot,
+            };
+            let position = self.rows.len();
+            // A key above every key before it keeps a whole order whole; any other key begins
+            // the tail, or lengthens it.
+            if *sorted == position
+                && order
+                    .last()
+                    .is_none_or(|&last| self.rows[last as usize].0 < key)
+            {
+                *sorted += 1;
+            }
+            self.rows.push((key, entry));
+            self.index.insert(&self.rows, position, slot);
+            // The transaction's key limit keeps every position far below what a slot can hold.
+            order.push(position as u32);
+        }
+    }
+
+    /// Each row's position, in key order.
+    ///
+    /// A walk may hold the positions while it reads the table again through the same view, as a
+    /// visitor can, and that read shares them: a merge needs a tail, which only installing a key
+    /// makes, and that needs the transaction mutably, which no live reader of it allows. The test
+    /// for a tail reads a cell and a length, so no shared borrow is held into the merge.
+    fn ordered(&self) -> Ref<'_, [u32]> {
+        if self.sorted.get() < self.rows.len() {
+            self.merge_tail();
+        }
+        Ref::map(self.order.borrow(), Vec::as_slice)
+    }
+
+    /// Makes the order whole: sorts the tail by key, each position beside its borrowed key, then
+    /// merges it into the head, the positions before it, which are in key order already. Each
+    /// tail position is placed by a binary search of the head's keys after the place before it,
+    /// and the order is rebuilt in one pass of copies, so a merge compares a key at each step of
+    /// each tail position's search and copies a position for each row, where sorting every
+    /// position again would compare a key for each row many times over. A tail begins with a key
+    /// below the head's last, so a tail is never wholly above the head, and nothing looks for one
+    /// that could be appended as it is.
+    fn merge_tail(&self) {
+        let rows = &self.rows;
+        let key_of = |position: u32| rows[position as usize].0.as_slice();
+        let mut order = self.order.borrow_mut();
+        // The merged order keeps the room this one had, so that the next key to arrive does not
+        // copy it again.
+        let mut merged = Vec::with_capacity(order.capacity());
+        let (head, tail) = order.split_at(self.sorted.get());
+        let mut keyed = Vec::with_capacity(tail.len());
+        for &position in tail {
+            keyed.push((key_of(position), position));
+        }
+        sort_keyed(&mut keyed);
+        let mut copied = 0;
+        for (key, position) in keyed {
+            #[cfg(test)]
+            self.searches.set(self.searches.get() + 1);
+            let place = copied + head[copied..].partition_point(|&before| key_of(before) < key);
+            merged.extend_from_slice(&head[copied..place]);
+            merged.push(position);
+            copied = place;
+        }
+        merged.extend_from_slice(&head[copied..]);
+        *order = merged;
+        self.sorted.set(rows.len());
+    }
+}
+
+/// A slot of a [`KeyIndex`] holding no position.
+const EMPTY_SLOT: u32 = u32::MAX;
+
+/// Where a table's staged keys are among its rows, found by hashing the key: an open-addressing
+/// table of positions, probed linearly and kept at most half full. A staged key is never removed,
+/// so the table needs no tombstones, and it keeps no hash beside a position: growing it hashes
+/// the keys again from the rows, which costs a transaction a pass over its keys at each doubling.
+#[derive(Clone, Default)]
+struct KeyIndex {
+    /// A power of two of slots, or none, each a position in the rows or [`EMPTY_SLOT`].
+    slots: Vec<u32>,
+}
+
+impl KeyIndex {
+    /// The position of `key` in `rows`, or else the empty slot its probe ended at, where
+    /// [`Self::insert`] puts the key if it joins the rows next, as a binary search reports where
+    /// a key it misses would go. An index with no slots reports a slot it does not have, which
+    /// nothing reads: its first insert grows it.
+    fn find(
+        &self,
+        rows: &[(Vec<u8>, OverlayEntry)],
+        key: &[u8],
+    ) -> std::result::Result<usize, usize> {
+        if self.slots.is_empty() {
+            return Err(0);
+        }
+        let mask = self.slots.len() - 1;
+        let mut slot = self.home(key);
+        loop {
+            let position = self.slots[slot];
+            if position == EMPTY_SLOT {
+                return Err(slot);
+            }
+            if rows[position as usize].0.as_slice() == key {
+                return Ok(position as usize);
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    /// Adds the key at `position`, the last of `rows`, which [`Self::find`] missed, its probe
+    /// ending at `slot`. The key is not hashed or probed again: it takes that slot, which nothing
+    /// has filled since, unless the rows have reached half the slots, when growing places every
+    /// key of the rows, the new one among them, and nothing else is placed.
+    fn insert(&mut self, rows: &[(Vec<u8>, OverlayEntry)], position: usize, slot: usize) {
+        debug_assert_eq!(position + 1, rows.len());
+        if rows.len() * 2 > self.slots.len() {
+            self.grow(rows);
+        } else {
+            debug_assert_eq!(self.slots[slot], EMPTY_SLOT);
+            self.slots[slot] = position as u32;
+        }
+        debug_assert_eq!(self.find(rows, &rows[position].0), Ok(position));
+    }
+
+    /// Doubles the slots and places every key of `rows` in them. The slots are allocated afresh
+    /// rather than grown in place, since the old ones hold nothing worth a reallocation's copy.
+    fn grow(&mut self, rows: &[(Vec<u8>, OverlayEntry)]) {
+        self.slots = vec![EMPTY_SLOT; (self.slots.len() * 2).max(16)];
+        for (position, (key, _)) in rows.iter().enumerate() {
+            self.place(key, position);
+        }
+    }
+
+    /// Stores `position` in the first free slot from its key's home.
+    fn place(&mut self, key: &[u8], position: usize) {
+        let mask = self.slots.len() - 1;
+        let mut slot = self.home(key);
+        while self.slots[slot] != EMPTY_SLOT {
+            slot = (slot + 1) & mask;
+        }
+        self.slots[slot] = position as u32;
+    }
+
+    /// The slot `key` hashes to: as many of its hash's top bits as the slots take.
+    fn home(&self, key: &[u8]) -> usize {
+        (key_hash(key) >> (64 - self.slots.len().trailing_zeros())) as usize
+    }
+}
+
+/// The hash a [`KeyIndex`] takes a key's slot from: the key's length, then its bytes a word at a
+/// time, folded in with the multiply the engine's hash maps use. A word is read little-endian,
+/// which WebAssembly loads in one instruction where a big-endian read swaps its bytes one by one.
+/// A multiply carries a bit's variation only upward, and keys vary at either end of a word: an
+/// integer key varies in its last bytes, which that read puts highest; a float key in its first;
+/// a text key in the first bytes of its last word. The folded hash is therefore mixed once more,
+/// its high half into its low half and the whole upward again, before its top bits choose the
+/// slot.
+fn key_hash(key: &[u8]) -> u64 {
+    let mut hasher = KeyHasher::default();
+    hasher.write_usize(key.len());
+    let (words, rest) = key.as_chunks::<8>();
+    for word in words {
+        hasher.write_u64(u64::from_le_bytes(*word));
+    }
+    if !rest.is_empty() {
+        let mut word = 0;
+        for (index, byte) in rest.iter().enumerate() {
+            word |= u64::from(*byte) << (8 * index);
+        }
+        hasher.write_u64(word);
+    }
+    let folded = hasher.finish();
+    hasher.write_u64(folded >> 32);
+    hasher.finish()
+}
+
 /// The last of a statement's changes to one key, with the committed row the key holds.
 struct PatchChange {
     base: Option<HeldRow>,
@@ -102,14 +341,9 @@ enum PatchRow {
 /// A table's entries in a patch, in key order.
 type PatchEntries = Vec<(Vec<u8>, OverlayEntry)>;
 
-/// The table a patch's last change named: its name, its place in the patch, the entries the
-/// transaction already stages for it, and whether any of those delete their row.
-type LastTable<'a> = (
-    Rc<str>,
-    usize,
-    Option<&'a BTreeMap<Vec<u8>, OverlayEntry>>,
-    bool,
-);
+/// The table a patch's last change named: its name, its place in the patch, and the entries the
+/// transaction already stages for it.
+type LastTable<'a> = (Rc<str>, usize, Option<&'a TableOverlay>);
 
 /// A statement's overlay entries: each table it changes, with its entries in key order. A
 /// statement changes a table or two, and most change a row or two, so vectors hold them without
@@ -152,9 +386,8 @@ impl PagedTransaction {
     pub(crate) fn new(base_revision: u64) -> Self {
         Self {
             base_revision,
-            entries: BTreeMap::new(),
+            tables: NameMap::new(),
             touched_tables: Vec::new(),
-            staged_deletes: Vec::new(),
             totals: Totals::default(),
         }
     }
@@ -163,11 +396,22 @@ impl PagedTransaction {
         self.base_revision
     }
 
-    /// Whether any of `table`'s staged entries deletes its row.
-    fn has_staged_deletes(&self, table: &str) -> bool {
-        self.staged_deletes
-            .iter()
-            .any(|(name, count)| name == table && *count > 0)
+    /// The entries staged for `table`, if a statement has changed it.
+    fn table(&self, table: &str) -> Option<&TableOverlay> {
+        self.tables.get(table)
+    }
+
+    /// Installs a validated statement's entries for `table`, with how many more of the table's
+    /// entries delete their row once they are in place.
+    fn install(&mut self, table: String, entries: PatchEntries, deletes: isize) {
+        match self.tables.get_mut(&table) {
+            Some(overlay) => overlay.install(entries, deletes),
+            None => {
+                let mut overlay = TableOverlay::default();
+                overlay.install(entries, deletes);
+                self.tables.insert(table, overlay);
+            }
+        }
     }
 
     pub(crate) fn is_dirty(&self) -> bool {
@@ -181,8 +425,9 @@ impl PagedTransaction {
     pub(crate) fn fingerprint(&self) -> String {
         use std::fmt::Write;
         let mut text = String::new();
-        for (table, entries) in &self.entries {
-            for (key, entry) in entries {
+        for (table, overlay) in self.tables.iter() {
+            for &position in overlay.ordered().iter() {
+                let (key, entry) = &overlay.rows[position as usize];
                 writeln!(
                     text,
                     "{table} {key:?} old={:?} next={:?} changed={} retained={} cost={:?}",
@@ -190,6 +435,7 @@ impl PagedTransaction {
                 )
                 .unwrap();
             }
+            writeln!(text, "{table} deletes={}", overlay.deletes).unwrap();
         }
         writeln!(
             text,
@@ -226,26 +472,28 @@ impl PagedTransaction {
 
     #[cfg(test)]
     pub(crate) fn changes<D: PageDevice>(&self, storage: &PagedStorage<D>) -> Vec<RowChange> {
-        changes_from_entries(
-            storage,
-            self.entries.iter().flat_map(|(table, entries)| {
-                entries
-                    .iter()
-                    .map(move |(key, entry)| (table.as_str(), key.as_slice(), entry))
-            }),
-        )
+        let mut entries = Vec::new();
+        for (table, overlay) in self.tables.iter() {
+            for &position in overlay.ordered().iter() {
+                let (key, entry) = &overlay.rows[position as usize];
+                entries.push((table.as_str(), key.as_slice(), entry));
+            }
+        }
+        changes_from_entries(storage, entries.into_iter())
     }
 
     /// The rows this transaction changes, by table and encoded primary key, each with the committed
     /// row it replaces. A row changed back to its committed state is left out.
     pub(crate) fn changed_rows(&self) -> Vec<TableChanges<'_>> {
         let mut changed = Vec::new();
-        for (table, entries) in &self.entries {
-            let rows = entries
-                .iter()
-                .filter(|(_, entry)| entry.changed)
-                .map(|(key, entry)| (key.as_slice(), &entry.row))
-                .collect::<Vec<_>>();
+        for (table, overlay) in self.tables.iter() {
+            let mut rows = Vec::new();
+            for &position in overlay.ordered().iter() {
+                let (key, entry) = &overlay.rows[position as usize];
+                if entry.changed {
+                    rows.push((key.as_slice(), &entry.row));
+                }
+            }
             if !rows.is_empty() {
                 changed.push((table.as_str(), rows));
             }
@@ -261,8 +509,14 @@ impl PagedTransaction {
         storage: &PagedStorage<D>,
     ) -> Result<ChangedKeys> {
         let mut keys = ChangedKeys::default();
-        for (table, entries) in &self.entries {
-            let changed = || entries.iter().filter(|(_, entry)| entry.changed);
+        for (table, overlay) in self.tables.iter() {
+            let order = overlay.ordered();
+            let changed = || {
+                order
+                    .iter()
+                    .map(|&position| &overlay.rows[position as usize])
+                    .filter(|(_, entry)| entry.changed)
+            };
             // A table with a key more than it can report reports none, so none is decoded.
             if changed().nth(MAX_CHANGED_KEYS_PER_TABLE).is_some() {
                 continue;
@@ -307,18 +561,6 @@ impl PagedTransaction {
             .zip(patch.deletes)
             .zip(change.changed_rows)
         {
-            if deletes != 0 {
-                match self
-                    .staged_deletes
-                    .iter_mut()
-                    .find(|(name, _)| *name == table)
-                {
-                    Some((_, count)) => *count = count.saturating_add_signed(deletes),
-                    None => self
-                        .staged_deletes
-                        .push((table.clone(), deletes.max(0).unsigned_abs())),
-                }
-            }
             let count = changed_count(&self.totals.changed_tables, &table, changed_rows);
             match self
                 .totals
@@ -335,14 +577,7 @@ impl PagedTransaction {
                 None => {}
             }
             self.touch(&table);
-            match self.entries.get_mut(&table) {
-                Some(staged) => staged.extend(entries),
-                None => {
-                    let mut staged = BTreeMap::new();
-                    staged.extend(entries);
-                    self.entries.insert(table, staged);
-                }
-            }
+            self.install(table, entries, deletes);
         }
         for claim in change.released {
             if let Some(holder) = self.totals.claims.get_mut(&claim) {
@@ -407,18 +642,9 @@ impl PagedTransaction {
             };
             // A statement's only change needs nothing merged with it.
             if count == 1 {
-                let staged = self.entries.get(&*table);
-                let has_deletes = self.has_staged_deletes(&table);
-                let (change, replaces) = self.first_change(
-                    storage,
-                    staged,
-                    &table,
-                    &key,
-                    held,
-                    row,
-                    is_delete,
-                    has_deletes,
-                )?;
+                let staged = self.table(&table);
+                let (change, replaces) =
+                    self.first_change(storage, staged, &table, &key, held, row, is_delete)?;
                 let deletes = isize::from(is_delete) - isize::from(change.replaced_delete);
                 let paged = storage.table(&table)?;
                 let indexes = storage.table_indexes(&table);
@@ -429,10 +655,8 @@ impl PagedTransaction {
                     replaces,
                 });
             }
-            let (position, staged, has_deletes) = match &last {
-                Some((name, position, staged, has_deletes)) if *name == table => {
-                    (*position, *staged, *has_deletes)
-                }
+            let (position, staged) = match &last {
+                Some((name, position, staged)) if *name == table => (*position, *staged),
                 _ => {
                     let position = patched.partition_point(|(name, _)| name.as_str() < &*table);
                     if patched
@@ -441,10 +665,9 @@ impl PagedTransaction {
                     {
                         patched.insert(position, (table.to_string(), KeyedRows::default()));
                     }
-                    let staged = self.entries.get(&*table);
-                    let has_deletes = self.has_staged_deletes(&table);
-                    last = Some((table.clone(), position, staged, has_deletes));
-                    (position, staged, has_deletes)
+                    let staged = self.table(&table);
+                    last = Some((table.clone(), position, staged));
+                    (position, staged)
                 }
             };
             let entries = &mut patched[position].1;
@@ -461,16 +684,8 @@ impl PagedTransaction {
                     slot.row = row;
                 }
                 None => {
-                    let (change, replaced) = self.first_change(
-                        storage,
-                        staged,
-                        &table,
-                        &key,
-                        held,
-                        row,
-                        is_delete,
-                        has_deletes,
-                    )?;
+                    let (change, replaced) =
+                        self.first_change(storage, staged, &table, &key, held, row, is_delete)?;
                     replaces |= replaced;
                     entries.insert(key, change);
                 }
@@ -506,20 +721,20 @@ impl PagedTransaction {
     fn first_change<D: PageDevice>(
         &self,
         storage: &PagedStorage<D>,
-        staged: Option<&BTreeMap<Vec<u8>, OverlayEntry>>,
+        staged: Option<&TableOverlay>,
         table: &str,
         key: &[u8],
         held: PreviousRow,
         row: PatchRow,
         is_delete: bool,
-        has_deletes: bool,
     ) -> Result<(PatchChange, bool)> {
         // A key planning read no row for has no live staged entry, which planning would have
         // read, so only a table with staged deletes can hold an entry for it.
+        let has_deletes = staged.is_some_and(|overlay| overlay.deletes > 0);
         let staged = if !is_delete && !has_deletes && matches!(held, PreviousRow::Read(None)) {
             None
         } else {
-            staged.and_then(|entries| entries.get(key))
+            staged.and_then(|overlay| overlay.get(key))
         };
         let replaced_delete = staged.is_some_and(|entry| entry.row.next.is_none());
         let base = match (staged, held) {
@@ -560,8 +775,7 @@ impl PagedTransaction {
         if patch.replaces {
             for ((table, entries), changed) in patch.entries.iter().zip(&mut changed_rows) {
                 for (key, _) in entries {
-                    let Some(previous) =
-                        self.entries.get(table).and_then(|entries| entries.get(key))
+                    let Some(previous) = self.table(table).and_then(|overlay| overlay.get(key))
                     else {
                         continue;
                     };
@@ -601,7 +815,7 @@ impl PagedTransaction {
         let changes_row = |table: &str, key: &[u8]| {
             patch
                 .entry(table, key)
-                .or_else(|| self.entries.get(table).and_then(|entries| entries.get(key)))
+                .or_else(|| self.table(table).and_then(|overlay| overlay.get(key)))
                 .is_some_and(|entry| entry.cost.is_some())
         };
         for (table, entries) in &patch.entries {
@@ -679,10 +893,6 @@ impl PagedTransaction {
         } else {
             Err(write_conflict(self.base_revision, storage.revision()))
         }
-    }
-
-    fn table_entries(&self, table: &str) -> Option<&BTreeMap<Vec<u8>, OverlayEntry>> {
-        self.entries.get(table)
     }
 }
 
@@ -893,8 +1103,8 @@ impl<'a, D: PageDevice> PagedReadView<'a, D> {
         let encoded_key = key.encode(&paged.schema)?;
         if let Some(entry) = self
             .transaction
-            .and_then(|transaction| transaction.table_entries(table))
-            .and_then(|entries| entries.get(&encoded_key))
+            .and_then(|transaction| transaction.table(table))
+            .and_then(|overlay| overlay.get(&encoded_key))
         {
             return match &entry.row.next {
                 Some(record)
@@ -927,9 +1137,9 @@ impl<'a, D: PageDevice> PagedReadView<'a, D> {
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
         self.ensure_base_revision()?;
-        let Some(entries) = self
+        let Some(overlay) = self
             .transaction
-            .and_then(|transaction| transaction.table_entries(table))
+            .and_then(|transaction| transaction.table(table))
         else {
             return self.storage.visit_rows_where(
                 table,
@@ -945,7 +1155,8 @@ impl<'a, D: PageDevice> PagedReadView<'a, D> {
         // The committed rows that changed entries replace are passed over, and the entries' rows
         // visited after the rest. Both are in key order, so the scan finds each replaced row once.
         let mut replaced = Vec::new();
-        for (key, entry) in entries {
+        for &position in overlay.ordered().iter() {
+            let (key, entry) = &overlay.rows[position as usize];
             if entry.changed {
                 replaced.push(key.as_slice());
             }
@@ -964,7 +1175,11 @@ impl<'a, D: PageDevice> PagedReadView<'a, D> {
             return Ok(VisitOutcome::Stopped);
         }
         let paged = self.storage.table(table)?;
-        for (key, entry) in entries {
+        // The order is held while the visitor runs, which may read the table again through this
+        // view and share it: nothing can stage a key, and so give the order a tail, while a view
+        // of the transaction is alive.
+        for &position in overlay.ordered().iter() {
+            let (key, entry) = &overlay.rows[position as usize];
             self.charge_work(1)?;
             if !entry.changed {
                 continue;
@@ -1071,11 +1286,14 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
     fn table_row_count(&self, table: &str) -> Result<usize> {
         self.ensure_base_revision()?;
         let mut count = self.storage.table_row_count(table)?;
-        if let Some(entries) = self
+        if let Some(overlay) = self
             .transaction
-            .and_then(|transaction| transaction.table_entries(table))
+            .and_then(|transaction| transaction.table(table))
         {
-            for entry in entries.values() {
+            // In key order, so that a count the entries take below zero, which only a corrupt
+            // table can, fails at the same entry however the keys arrived.
+            for &position in overlay.ordered().iter() {
+                let (_, entry) = &overlay.rows[position as usize];
                 match (entry.row.old.is_some(), entry.row.next.is_some()) {
                     (false, true) => {
                         count = count.checked_add(1).ok_or_else(transaction_too_large)?;
@@ -1102,8 +1320,8 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
             let paged = self.storage.table(table)?;
             let encoded_key = encode_primary_key(&paged.schema, key)?;
             if let Some(entry) = transaction
-                .table_entries(table)
-                .and_then(|entries| entries.get(&encoded_key))
+                .table(table)
+                .and_then(|overlay| overlay.get(&encoded_key))
             {
                 return match &entry.row.next {
                     Some(record) => Ok(Some(paged.record(&encoded_key, record)?.to_row()?)),
@@ -1145,8 +1363,8 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
         self.charge_work(1)?;
         if let Some(entry) = self
             .transaction
-            .and_then(|transaction| transaction.table_entries(table))
-            .and_then(|entries| entries.get(key))
+            .and_then(|transaction| transaction.table(table))
+            .and_then(|overlay| overlay.get(key))
         {
             return Ok(entry.row.next.is_some());
         }
@@ -1477,7 +1695,7 @@ mod tests {
             "TRANSACTION_TOO_LARGE"
         );
         assert!(!transaction.is_dirty());
-        assert!(transaction.entries.is_empty());
+        assert_eq!(transaction.tables.len(), 0);
     }
 
     /// What an entry inserting one small row retains.
@@ -1530,5 +1748,482 @@ mod tests {
             "TRANSACTION_TOO_LARGE"
         );
         assert_eq!(work.get(), crate::sql_script::MAX_SQL_SCRIPT_OPERATIONS);
+    }
+
+    /// An entry of no consequence, for an index over keys alone.
+    fn blank_entry() -> OverlayEntry {
+        OverlayEntry {
+            row: ChangedRow {
+                old: None,
+                next: None,
+            },
+            changed: false,
+            retained: 0,
+            cost: None,
+        }
+    }
+
+    /// Indexes `present`, shuffled, checking at each doubling that each key took one slot; then
+    /// that every key is found at its position and none of `absent` is found. Returns how many
+    /// doublings the index grew through, and the longest run of probes a key took to be found.
+    fn check_key_index(mut present: Vec<Vec<u8>>, absent: &[Vec<u8>]) -> (usize, usize) {
+        assert_eq!(present.iter().collect::<BTreeSet<_>>().len(), present.len());
+        // Shuffled, so that the keys do not arrive in the order they vary in.
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        for index in (1..present.len()).rev() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            present.swap(index, (seed % (index as u64 + 1)) as usize);
+        }
+        let occupied = |index: &KeyIndex| {
+            index
+                .slots
+                .iter()
+                .filter(|slot| **slot != EMPTY_SLOT)
+                .count()
+        };
+        let mut rows = Vec::new();
+        let mut index = KeyIndex::default();
+        let mut doublings = 0;
+        for key in present {
+            let slots = index.slots.len();
+            let position = rows.len();
+            let slot = index.find(&rows, &key).unwrap_err();
+            rows.push((key, blank_entry()));
+            index.insert(&rows, position, slot);
+            if index.slots.len() != slots {
+                doublings += 1;
+                assert_eq!(occupied(&index), rows.len());
+            }
+        }
+        assert_eq!(occupied(&index), rows.len());
+        let mut longest = 0;
+        for (position, (key, _)) in rows.iter().enumerate() {
+            assert_eq!(index.find(&rows, key), Ok(position));
+            let mut slot = index.home(key);
+            let mut probes = 1;
+            while index.slots[slot] as usize != position {
+                slot = (slot + 1) & (index.slots.len() - 1);
+                probes += 1;
+            }
+            longest = longest.max(probes);
+        }
+        for key in absent {
+            assert!(index.find(&rows, key).is_err(), "{key:?} was found");
+        }
+        (doublings, longest)
+    }
+
+    #[test]
+    fn key_index_finds_every_key_and_no_other() {
+        // Keys of each shape a primary key takes, varying where its encoding puts the variation:
+        // an integer in its last bytes, a float in its first, text after a shared prefix or in
+        // fewer bytes than a word, a boolean in its one byte, and a composite key in the integer
+        // after its text.
+        let mut storage = PagedStorage::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let statements = [
+            "CREATE TABLE ints (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE floats (id FLOAT PRIMARY KEY)",
+            "CREATE TABLE texts (id TEXT PRIMARY KEY)",
+            "CREATE TABLE flags (id BOOLEAN PRIMARY KEY)",
+            "CREATE TABLE pairs (a TEXT, b INTEGER, PRIMARY KEY (a, b))",
+        ]
+        .into_iter()
+        .map(|sql| crate::statement::parse(sql, &[]))
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+        storage.execute_script(statements).unwrap();
+        let encode = |table: &str, key: Value| {
+            encode_primary_key(&storage.table(table).unwrap().schema, &row(key)).unwrap()
+        };
+        let mut ints = (Vec::new(), Vec::new());
+        let mut floats = (Vec::new(), Vec::new());
+        let mut texts = (Vec::new(), Vec::new());
+        let mut pairs = (Vec::new(), Vec::new());
+        for id in 1..=10_000_i64 {
+            ints.0.push(encode("ints", json!({"id": id})));
+            floats.0.push(encode("floats", json!({"id": id as f64})));
+            texts
+                .0
+                .push(encode("texts", json!({"id": format!("task-{id:06}")})));
+            pairs.0.push(encode(
+                "pairs",
+                json!({"a": format!("group-{}", id % 7), "b": id}),
+            ));
+        }
+        for id in 10_001..=10_100_i64 {
+            ints.1.push(encode("ints", json!({"id": id})));
+            floats
+                .1
+                .push(encode("floats", json!({"id": id as f64 - 0.5})));
+            texts
+                .1
+                .push(encode("texts", json!({"id": format!("task-{id:06}")})));
+            pairs.1.push(encode(
+                "pairs",
+                json!({"a": format!("group-{}", id % 7), "b": id}),
+            ));
+        }
+        ints.1.push(encode("ints", json!({"id": 0})));
+        ints.1.push(encode("ints", json!({"id": -1})));
+        texts.1.push(encode("texts", json!({"id": "task-00001"})));
+        texts.1.push(encode("texts", json!({"id": "task-0000010"})));
+        pairs
+            .1
+            .push(encode("pairs", json!({"a": "group-1", "b": 2})));
+        let mut short = (Vec::new(), Vec::new());
+        for flag in [true, false] {
+            short.0.push(encode("flags", json!({"id": flag})));
+        }
+        for first in 'a'..='z' {
+            short
+                .0
+                .push(encode("texts", json!({"id": first.to_string()})));
+            for second in 'a'..='z' {
+                short
+                    .0
+                    .push(encode("texts", json!({"id": format!("{first}{second}")})));
+            }
+            short.1.push(encode(
+                "texts",
+                json!({"id": first.to_ascii_uppercase().to_string()}),
+            ));
+        }
+        short.1.push(encode("texts", json!({"id": ""})));
+
+        let mut all = (Vec::new(), Vec::new());
+        for (name, (present, absent)) in [
+            ("ints", &ints),
+            ("floats", &floats),
+            ("texts", &texts),
+            ("pairs", &pairs),
+            ("short", &short),
+        ] {
+            let (doublings, longest) = check_key_index(present.clone(), absent);
+            assert!(longest < 32, "{name}: a run of {longest} probes");
+            assert!(
+                doublings >= 11 || name == "short",
+                "{name}: {doublings} doublings"
+            );
+            all.0.extend(present.iter().cloned());
+            all.1.extend(absent.iter().cloned());
+        }
+        let (doublings, longest) = check_key_index(all.0, &all.1);
+        assert!(longest < 32, "all shapes: a run of {longest} probes");
+        assert!(doublings >= 13, "all shapes: {doublings} doublings");
+    }
+
+    #[test]
+    fn ordered_walks_follow_key_order_however_keys_arrive() {
+        let storage = storage();
+        let paged = storage.table("items").unwrap();
+        let key = |id: i64| encode_primary_key(&paged.schema, &row(json!({"id": id}))).unwrap();
+        let item = |id: i64, name: &str| row(json!({"id": id, "name": name}));
+        let committed = BTreeMap::from([(key(1), item(1, "one")), (key(2), item(2, "two"))]);
+
+        // Checks every walk of the overlay against `oracle`, what the transaction stages for each
+        // key: a row, or none for a delete.
+        let check = |transaction: &PagedTransaction, oracle: &BTreeMap<Vec<u8>, Option<Row>>| {
+            let overlay = transaction.table("items").unwrap();
+            assert_eq!(overlay.rows.len(), oracle.len());
+            assert_eq!(overlay.order.borrow().len(), oracle.len());
+            assert_eq!(
+                overlay.deletes,
+                oracle.values().filter(|staged| staged.is_none()).count()
+            );
+            // The positions in key order name the oracle's keys in its order, and leave no tail.
+            assert_eq!(
+                overlay
+                    .ordered()
+                    .iter()
+                    .map(|&position| overlay.rows[position as usize].0.as_slice())
+                    .collect::<Vec<_>>(),
+                oracle.keys().map(Vec::as_slice).collect::<Vec<_>>()
+            );
+            assert_eq!(overlay.sorted.get(), overlay.rows.len());
+            // The keys whose staged row differs from the committed one, in key order.
+            let changed = oracle
+                .iter()
+                .filter(|(key, staged)| committed.get(*key) != staged.as_ref())
+                .collect::<Vec<_>>();
+            let changed_rows = transaction.changed_rows();
+            let rows = changed_rows
+                .iter()
+                .find(|(table, _)| *table == "items")
+                .map_or(&[][..], |(_, rows)| rows.as_slice());
+            assert_eq!(rows.len(), changed.len());
+            for ((key, change), (expected_key, expected)) in rows.iter().zip(&changed) {
+                assert_eq!(*key, expected_key.as_slice());
+                let next = change
+                    .next
+                    .as_ref()
+                    .map(|record| paged.record(key, record).unwrap().to_row().unwrap());
+                assert_eq!(next, **expected);
+            }
+            let keys = transaction.changed_keys(&storage).unwrap();
+            let values = keys
+                .get("items")
+                .map(|keys| keys.values.clone())
+                .unwrap_or_default();
+            assert_eq!(
+                values,
+                changed
+                    .iter()
+                    .map(|(key, _)| key_row(paged, key).unwrap()["id"].clone())
+                    .collect::<Vec<_>>()
+            );
+            // A scan presents the committed rows not replaced, then the staged rows, in key order.
+            let view = PagedReadView::new(&storage, Some(transaction));
+            let mut expected = Vec::new();
+            for (key, committed) in &committed {
+                if !changed.iter().any(|(changed, _)| *changed == key) {
+                    expected.push(committed.clone());
+                }
+            }
+            for (_, staged) in &changed {
+                if let Some(staged) = staged {
+                    expected.push(staged.clone());
+                }
+            }
+            assert_eq!(view.scan_table("items").unwrap(), expected);
+            let live = committed
+                .keys()
+                .chain(oracle.keys())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .filter(|key| oracle.get(*key).is_none_or(|staged| staged.is_some()))
+                .count();
+            assert_eq!(view.table_row_count("items").unwrap(), live);
+            for (key, staged) in oracle {
+                assert_eq!(
+                    view.holds_encoded_key("items", key).unwrap(),
+                    staged.is_some()
+                );
+                assert_eq!(
+                    view.lookup_primary_key("items", &key_row(paged, key).unwrap())
+                        .unwrap(),
+                    *staged
+                );
+            }
+            let fingerprint = transaction.fingerprint();
+            let lines = fingerprint
+                .lines()
+                .filter(|line| line.starts_with("items ["))
+                .collect::<Vec<_>>();
+            assert_eq!(lines.len(), oracle.len());
+            for (line, key) in lines.iter().zip(oracle.keys()) {
+                assert!(line.starts_with(&format!("items {key:?} old=")), "{line}");
+            }
+            assert!(
+                fingerprint
+                    .lines()
+                    .any(|line| line == format!("items deletes={}", overlay.deletes))
+            );
+        };
+
+        // Each statement's changes by key, a row to upsert or none to delete, with whether a tail
+        // is expected once they are staged; and the scans between them, which merge it in.
+        type Statement<'a> = (Vec<(i64, Option<&'a str>)>, bool);
+        let mut statements: Vec<Statement> = vec![
+            // Ascending keys, one and several per statement, keep the arrival order.
+            (vec![(100, Some("hundred"))], false),
+            (vec![(101, Some("hundred and one"))], false),
+            (
+                vec![(102, Some("a")), (103, Some("b")), (104, Some("c"))],
+                false,
+            ),
+            (vec![], false),
+            // Keys below the last, singly and together, with a scan between them.
+            (vec![(50, Some("fifty"))], true),
+            (vec![], false),
+            (vec![(49, Some("forty-nine"))], true),
+            (vec![(48, Some("forty-eight"))], true),
+            (vec![], false),
+            // A key above every other keeps the rebuilt order.
+            (vec![(200, Some("two hundred"))], false),
+            // Keys interleaving the staged ones, changing and deleting committed rows.
+            (
+                vec![
+                    (75, Some("seventy-five")),
+                    (10, Some("ten")),
+                    (1, Some("changed")),
+                    (2, None),
+                ],
+                true,
+            ),
+            (vec![], false),
+            // A replacement, a committed row put back, a staged row deleted, and its key reused:
+            // none of them adds a row or a position.
+            (vec![(100, Some("replaced"))], false),
+            (vec![(2, Some("two"))], false),
+            (vec![(50, None)], false),
+            (vec![(50, Some("fifty again"))], false),
+            (vec![], false),
+            (
+                vec![(60, Some("sixty")), (300, Some("three hundred"))],
+                true,
+            ),
+            (vec![], false),
+        ];
+        // A key above every other, then a key scattered below it before each scan, as the
+        // statements of a transaction that updates by spread keys and scans between them stage
+        // them: each scan merges a tail of one position.
+        statements.push((vec![(2000, Some("two thousand"))], false));
+        for index in 1..=40 {
+            statements.push((vec![(1000 + (index * 919) % 1000, Some("spread"))], true));
+            statements.push((vec![], false));
+        }
+        // A long run of ascending keys after a merge keeps the order whole, however many
+        // statements stage it, so a scan after it merges nothing.
+        statements.push(((3000..3050).map(|id| (id, Some("run"))).collect(), false));
+        statements.extend((3050..3100).map(|id| (vec![(id, Some("run"))], false)));
+        statements.push((vec![], false));
+        // A key below the run, staged in one statement with a second run, begins the tail, and
+        // the run lengthens it, since a statement's entries arrive in key order: the scan merges
+        // a tail of one key among the head's and a hundred above them, in one pass.
+        statements.push((
+            std::iter::once((500, Some("five hundred")))
+                .chain((3100..3200).map(|id| (id, Some("run"))))
+                .collect(),
+            true,
+        ));
+        statements.push((vec![], false));
+        // Checked after every statement, which merges the tail each time, and then only at the
+        // scans, so that several keys arrive out of order before a merge.
+        for check_every_statement in [true, false] {
+            let mut transaction = PagedTransaction::new(storage.revision());
+            let mut oracle = BTreeMap::new();
+            // How many keys joined the rows since the last walk: the most a merge can search for.
+            let mut appended = 0;
+            for (changes, expected_tail) in &statements {
+                if !changes.is_empty() {
+                    for (id, name) in changes {
+                        if oracle
+                            .insert(key(*id), name.map(|name| item(*id, name)))
+                            .is_none()
+                        {
+                            appended += 1;
+                        }
+                    }
+                    let staged = changes
+                        .iter()
+                        .map(|(id, name)| match name {
+                            Some(name) => RowChange::Upsert {
+                                table: "items".into(),
+                                row: item(*id, name),
+                            },
+                            None => RowChange::Delete {
+                                table: "items".into(),
+                                key: row(json!({"id": id})),
+                            },
+                        })
+                        .collect();
+                    transaction.stage(&storage, staged, Vec::new()).unwrap();
+                    let overlay = transaction.table("items").unwrap();
+                    assert_eq!(
+                        overlay.sorted.get() < overlay.rows.len(),
+                        *expected_tail,
+                        "{changes:?}"
+                    );
+                    assert_eq!(overlay.rows.len(), oracle.len());
+                    assert_eq!(overlay.order.borrow().len(), oracle.len());
+                    if !check_every_statement {
+                        continue;
+                    }
+                }
+                let overlay = transaction.table("items").unwrap();
+                let tail = overlay.rows.len() - overlay.sorted.get();
+                let searches = overlay.searches.get();
+                check(&transaction, &oracle);
+                // A merge searches the head once for each tail position, which the keys that
+                // joined since the last walk bound; a walk of a whole order searches nothing.
+                assert_eq!(overlay.searches.get() - searches, tail);
+                assert!(tail <= appended, "a tail of {tail} from {appended} keys");
+                appended = 0;
+            }
+        }
+    }
+
+    #[test]
+    fn tails_of_every_length_merge_in_at_every_place() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut random = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        let mut overlay = TableOverlay::default();
+        let mut oracle = BTreeSet::new();
+        // How many keys joined the rows since the last walk.
+        let mut appended = 0;
+        // Above every key staged so far.
+        let mut above = 1_000_000;
+        // How many walks found no tail, a tail wholly below the head, and a tail among it.
+        let (mut whole, mut below, mut among) = (0, 0, 0);
+        for statement in 0..1_000 {
+            // A statement's keys, in key order: a run above every key so far, as inserts stage,
+            // and first of all, so that the keys after it fall below the whole head; a few
+            // scattered ones, as a range update does; or one, as a statement by key does, any
+            // of which may be staged already. A run's keys are text of one length, above every
+            // scattered key, which is the digits of its number: keys of several lengths, which
+            // share prefixes and are prefixes of one another, merge in among each other.
+            let keys = match if statement == 0 { 0 } else { random(4) } {
+                0 => {
+                    let run = 1 + random(50);
+                    above += run;
+                    (above - run..above)
+                        .map(|id| format!("r{id:07}").into_bytes())
+                        .collect::<BTreeSet<_>>()
+                }
+                1 => (0..random(20))
+                    .map(|_| random(5_000).to_string().into_bytes())
+                    .collect(),
+                _ => BTreeSet::from([random(5_000).to_string().into_bytes()]),
+            };
+            appended += keys.iter().filter(|key| !oracle.contains(*key)).count();
+            oracle.extend(keys.iter().cloned());
+            overlay.install(
+                keys.into_iter().map(|key| (key, blank_entry())).collect(),
+                0,
+            );
+            assert_eq!(overlay.rows.len(), oracle.len());
+            if random(3) == 0 || statement == 999 {
+                let tail = overlay.rows.len() - overlay.sorted.get();
+                let key = |position: u32| overlay.rows[position as usize].0.as_slice();
+                let order = overlay.order.borrow();
+                let (head, tail_positions) = order.split_at(overlay.sorted.get());
+                if tail_positions.is_empty() {
+                    whole += 1;
+                } else if tail_positions
+                    .iter()
+                    .all(|&position| key(position) < key(head[0]))
+                {
+                    below += 1;
+                } else {
+                    among += 1;
+                }
+                // The walk merges the tail under its own borrow.
+                drop(order);
+                let searches = overlay.searches.get();
+                assert_eq!(
+                    overlay
+                        .ordered()
+                        .iter()
+                        .map(|&position| overlay.rows[position as usize].0.as_slice())
+                        .collect::<Vec<_>>(),
+                    oracle.iter().map(Vec::as_slice).collect::<Vec<_>>()
+                );
+                assert_eq!(overlay.sorted.get(), overlay.rows.len());
+                assert_eq!(overlay.searches.get() - searches, tail);
+                assert!(tail <= appended, "a tail of {tail} from {appended} keys");
+                appended = 0;
+            }
+        }
+        assert!(
+            whole > 0 && below > 0 && among > 0,
+            "{whole} whole, {below} below, {among} among"
+        );
     }
 }
