@@ -291,14 +291,15 @@ impl TreeReader<'_> {
             .transpose()
     }
 
-    /// Visits the row of the encoded primary key `key` in `table`, if it holds one.
-    pub(crate) fn visit_encoded_key(
+    /// Visits the row of the encoded primary key `key` in `table`, one of this reader's tables, if
+    /// it holds one. The caller has found the table, to encode the key with its schema or to look
+    /// for the key among a transaction's rows first, so it is not searched for by name again.
+    pub(crate) fn visit_entry(
         &self,
-        table: &str,
+        table: &PagedTable,
         key: &[u8],
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
-        let table = self.table(table)?;
         let Some(root) = table.root_page_id else {
             return Ok(VisitOutcome::Complete);
         };
@@ -318,8 +319,9 @@ impl TreeReader<'_> {
         key: PrimaryKey<'_>,
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
-        let key = key.encode(&self.table(table)?.schema)?;
-        self.visit_encoded_key(table, &key, visitor)
+        let table = self.table(table)?;
+        let key = key.encode(&table.schema)?;
+        self.visit_entry(table, &key, visitor)
     }
 
     pub(crate) fn visit_index(
@@ -972,13 +974,50 @@ impl<D: PageDevice> PagedStorage<D> {
         key: &[u8],
     ) -> Result<Option<StoredEntry>> {
         self.ensure_ready()?;
-        let table = self.table(table_name)?;
-        let Some(root) = table.root_page_id else {
+        self.committed_entry_in(self.table(table_name)?, key)
+    }
+
+    /// The committed row the encoded primary key `key` holds in `table`, one of this storage's
+    /// tables, as its stored entry: [`Self::committed_entry`] for a caller that has already found
+    /// the table.
+    pub(crate) fn committed_entry_of(
+        &self,
+        table: &PagedTable,
+        key: &[u8],
+    ) -> Result<Option<StoredEntry>> {
+        self.ensure_ready()?;
+        self.committed_entry_in(table, key)
+    }
+
+    /// The row `key` holds in `table`, if the table holds any. The test is compiled into its
+    /// callers, so that a probe of a table with no rows ends at it, as each of the inserts that
+    /// fill a new table in one transaction does.
+    #[inline(always)]
+    fn committed_entry_in(&self, table: &PagedTable, key: &[u8]) -> Result<Option<StoredEntry>> {
+        match table.root_page_id {
+            Some(root) => self.committed_entry_from(table, root, key),
+            None => Ok(None),
+        }
+    }
+
+    /// The row `key` holds in `table`, whose tree has the root `root`, copied out of its leaf
+    /// once, straight into the entry: the lookup puts the record after the key it was given,
+    /// which is the key the entry holds.
+    fn committed_entry_from(
+        &self,
+        table: &PagedTable,
+        root: PageId,
+        key: &[u8],
+    ) -> Result<Option<StoredEntry>> {
+        let Some(bytes) = Btree::get_entry(&mut self.pager.borrow_mut(), root, table.tree_id, key)?
+        else {
             return Ok(None);
         };
-        Btree::get(&mut self.pager.borrow_mut(), root, table.tree_id, key)?
-            .map(|value| Ok(table.record(key, &value)?.to_entry()))
-            .transpose()
+        let entry = StoredEntry::from_bytes(bytes, key.len());
+        // The record is opened as a visit of the row opens it, so that one no reader could open
+        // is refused here, as that visit refuses it, and not wherever the entry is read next.
+        table.record(key, entry.value())?;
+        Ok(Some(entry))
     }
 
     /// Visits the committed rows of `table` in key order, as [`StorageReader::visit_table`] does,
@@ -1018,14 +1057,16 @@ impl<D: PageDevice> PagedStorage<D> {
         }
     }
 
-    pub(crate) fn visit_encoded_key(
+    /// Visits the committed row of the encoded primary key `encoded_key` in `table`, one of this
+    /// storage's tables, if it holds one.
+    pub(crate) fn visit_entry(
         &self,
-        table: &str,
+        table: &PagedTable,
         encoded_key: &[u8],
         visitor: &mut dyn FnMut(&RowRef<'_>) -> Result<VisitControl>,
     ) -> Result<VisitOutcome> {
         self.ensure_ready()?;
-        self.reader().visit_encoded_key(table, encoded_key, visitor)
+        self.reader().visit_entry(table, encoded_key, visitor)
     }
 
     /// Validates one change of a transaction's write set, and measures what it adds to the write

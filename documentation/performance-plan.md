@@ -567,6 +567,24 @@ Found along the way:
   update-pk -2.0%, upsert -1.4%, delete-pk -1.9%, select-pk -2.3%,
   select-scan -3.4%, update-scan -2.1%, and about half as much once
   optimized; 15 bytes larger compressed.
+- The row a prepared UPDATE, DELETE or upsert by key changes is copied once,
+  found by the key the statement encoded. The statement read it through a
+  visit: the view encoded the key from its values, the lookup copied the
+  record out of its leaf, the visitor copied key and record again into the
+  entry the writer keeps, and the statement copied the key a third time for
+  its change. It now encodes the key once and asks the view for the held
+  row by it (`StorageReader::held_encoded_key`, which only a transaction's
+  view answers): a staged row is copied from the overlay, and a committed
+  one by `Btree::get_entry`, which writes the key and then the value into
+  one allocation of exactly their length, the entry itself. The read makes
+  the tests the visit made in their order (the transaction's revision, one
+  work charge, the table, the overlay, the record's header), and a test
+  keeps the old route as its oracle over generated rows, in leaves and in
+  overflow pages, staged and committed. Instructions under baseline
+  compilation, medians of nine interleaved pairs: upsert -2.9%, update-pk
+  -1.4%, delete-pk -0.9%, select-pk -0.5%, with 38, 62 and 23 fewer calls a
+  statement for an update, an upsert and a delete; 17 bytes larger
+  compressed.
 
 Found along the way, 6 and 7 October:
 

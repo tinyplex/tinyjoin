@@ -1436,6 +1436,372 @@ lines', true, '7')"#,
     }
 
     #[test]
+    fn point_statements_find_rows_by_keys_of_every_shape() {
+        use crate::{RowChange, row::HeldRow, statement::PreviousRow};
+        const SETUP: &[&str] = &[
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            "INSERT INTO items (id, name) VALUES (1, 'one'), (2, 'two'), (3, 'three')",
+            "CREATE TABLE notes (slug TEXT PRIMARY KEY, body TEXT NOT NULL)",
+            "INSERT INTO notes (slug, body) VALUES ('a', 'first'), ('b', 'second')",
+            "CREATE TABLE pairs (s TEXT, n INTEGER, v TEXT NOT NULL, PRIMARY KEY (s, n))",
+            "INSERT INTO pairs (s, n, v) VALUES ('x', 1, 'x1'), ('x', 2, 'x2'), ('y', 1, 'y1')",
+            "CREATE TABLE flags (lit BOOLEAN PRIMARY KEY, label TEXT NOT NULL)",
+            "INSERT INTO flags (lit, label) VALUES (true, 'lit')",
+            "CREATE TABLE ratios (r FLOAT PRIMARY KEY, label TEXT NOT NULL)",
+            "INSERT INTO ratios (r, label) VALUES (1.5, 'half'), (2, 'whole')",
+        ];
+        let open = || {
+            let mut engine = database_with(SETUP);
+            engine.begin_transaction().unwrap();
+            engine
+        };
+        // Each statement runs prepared in one engine and as SQL with the same parameters in the
+        // other, as in `point_statements_stage_what_their_statements_stage`, whose keys are all
+        // integers that a lookup finds. `point` says whether the statement's key is one the
+        // point planner looks up, which it must then plan from, and otherwise must not.
+        let (mut prepared, mut plain) = (open(), open());
+        let mut ids: Vec<(&str, PreparedStatementId)> = Vec::new();
+        // How many planned statements changed a row, and how many found none to change.
+        let (mut changed, mut unchanged) = (0, 0);
+        let mut run = |sql: &'static str, params: Vec<Value>, point: bool| {
+            let id = match ids.iter().find(|(prepared, _)| *prepared == sql) {
+                Some((_, id)) => *id,
+                None => {
+                    let id = prepared.prepare_sql(sql).unwrap();
+                    ids.push((sql, id));
+                    id
+                }
+            };
+            let shown = params
+                .iter()
+                .map(|value| match value {
+                    Value::String(text) if text.len() > 40 => format!("{} bytes", text.len()),
+                    value => value.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let planned = {
+                let view = prepared.read_view();
+                let planned = match prepared.prepared_statements.point(id, &params) {
+                    Ok(Some(template)) => {
+                        crate::statement::plan_point(&view, template, &params).unwrap_or(None)
+                    }
+                    Ok(None) | Err(_) => None,
+                };
+                // A planned change comes with what the planner read at its key, so that staging
+                // it reads nothing again: no row, or the stored row, whose entry begins with the
+                // key the change is planned under.
+                if let Some(planned) = &planned {
+                    assert_eq!(planned.changes.len(), planned.previous.len());
+                    for change in planned.changes.iter().zip(&planned.previous) {
+                        match change {
+                            (
+                                RowChange::Put { key, .. },
+                                PreviousRow::Read(Some(HeldRow::Stored(entry))),
+                            ) => assert_eq!(entry.key(), key, "{sql} [{shown}]"),
+                            (RowChange::Put { .. }, PreviousRow::Read(None))
+                            | (
+                                RowChange::Delete { .. },
+                                PreviousRow::Read(Some(HeldRow::Stored(_))),
+                            ) => {}
+                            other => panic!("{sql} [{shown}] planned {other:?}"),
+                        }
+                    }
+                }
+                planned.is_some()
+            };
+            assert_eq!(planned, point, "{sql} [{shown}]");
+            let fast = prepared.execute_prepared(id, &params);
+            let full = plain.execute_sql(sql, &params);
+            let describe = |result: &Result<ExecuteResult>| match result {
+                Ok(result) => format!(
+                    "ok {} {} {:?} {:?} {:?}",
+                    result.command, result.row_count, result.tables, result.keys, result.rows
+                ),
+                Err(error) => format!("err {} {}", error.code, error.message),
+            };
+            assert_eq!(describe(&fast), describe(&full), "{sql} [{shown}]");
+            assert_eq!(
+                prepared.transaction_fingerprint(),
+                plain.transaction_fingerprint(),
+                "{sql} [{shown}]"
+            );
+            if point {
+                match fast.unwrap().row_count {
+                    0 => unchanged += 1,
+                    _ => changed += 1,
+                }
+            }
+        };
+        // A key's statements: the row is updated, upserted, updated where the upsert staged it,
+        // deleted, deleted again where nothing is left, upserted over the staged delete, and
+        // updated once more.
+        const ORDER: [usize; 7] = [0, 2, 0, 1, 1, 2, 0];
+        let long = |length: usize| json!("k".repeat(length));
+
+        // An INTEGER key: values of other types, numbers that are not integers or not safe ones,
+        // and the largest and smallest safe integers.
+        let statements = [
+            "UPDATE items SET name = $2 WHERE id = $1",
+            "DELETE FROM items WHERE id = $1",
+            "INSERT INTO items (id, name) VALUES ($1, $2) \
+             ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+        ];
+        for (key, point) in [
+            (json!(null), false),
+            (json!(1.5), false),
+            (json!(1.0), false),
+            (json!("1"), false),
+            (json!(true), false),
+            (json!(9_007_199_254_740_992_u64), false),
+            (json!(9_007_199_254_740_991_u64), true),
+            (json!(-9_007_199_254_740_991_i64), true),
+            (json!(2), true),
+            (json!(77), true),
+            (json!(0), true),
+            (json!(-1), true),
+        ] {
+            for (step, statement) in ORDER.into_iter().enumerate() {
+                let mut params = vec![key.clone()];
+                if statement != 1 {
+                    params.push(json!(format!("item at step {step}")));
+                }
+                run(statements[statement], params, point);
+            }
+        }
+
+        // A TEXT key: empty, holding a zero byte, which its encoding escapes, and quotes; of
+        // 1,022 bytes, which with its terminator is exactly the longest key, and of more.
+        let statements = [
+            "UPDATE notes SET body = $2 WHERE slug = $1",
+            "DELETE FROM notes WHERE slug = $1",
+            "INSERT INTO notes (slug, body) VALUES ($1, $2) \
+             ON CONFLICT (slug) DO UPDATE SET body = EXCLUDED.body",
+        ];
+        for (key, point) in [
+            (json!("a"), true),
+            (json!("missing"), true),
+            (json!(""), true),
+            (json!("zero\u{0}byte"), true),
+            (json!("\u{0}"), true),
+            (json!("it's \"quoted\""), true),
+            (long(1_021), true),
+            (long(1_022), true),
+            (long(1_023), false),
+            (long(2_000), false),
+            (json!(null), false),
+            (json!(7), false),
+            (json!(true), false),
+        ] {
+            for (step, statement) in ORDER.into_iter().enumerate() {
+                let mut params = vec![key.clone()];
+                if statement != 1 {
+                    params.push(json!(format!("note at step {step}")));
+                }
+                run(statements[statement], params, point);
+            }
+        }
+
+        // A key of a TEXT and an INTEGER column, named by the predicate and by the conflict
+        // target in both orders. A first component of 1,014 bytes leaves exactly the room the
+        // second needs; one of 1,022 fills a key by itself, and one of 1,023 passes it.
+        let statements = [
+            [
+                "UPDATE pairs SET v = $3 WHERE s = $1 AND n = $2",
+                "DELETE FROM pairs WHERE s = $1 AND n = $2",
+                "INSERT INTO pairs (s, n, v) VALUES ($1, $2, $3) \
+                 ON CONFLICT (s, n) DO UPDATE SET v = EXCLUDED.v",
+            ],
+            [
+                "UPDATE pairs SET v = $3 WHERE n = $2 AND s = $1",
+                "DELETE FROM pairs WHERE n = $2 AND s = $1",
+                "INSERT INTO pairs (n, v, s) VALUES ($2, $3, $1) \
+                 ON CONFLICT (n, s) DO UPDATE SET v = EXCLUDED.v",
+            ],
+        ];
+        for (index, (s, n, point)) in [
+            (json!("x"), json!(1), true),
+            (json!("x"), json!(9), true),
+            (json!("y"), json!(1), true),
+            (json!(""), json!(0), true),
+            (json!("zero\u{0}"), json!(-3), true),
+            (long(1_014), json!(1), true),
+            (long(1_015), json!(1), false),
+            (long(1_020), json!(1), false),
+            (long(1_021), json!(1), false),
+            (long(1_022), json!(1), false),
+            (long(1_023), json!(1), false),
+            (json!("x"), json!(null), false),
+            (json!(null), json!(1), false),
+            (json!("x"), json!(1.5), false),
+            (json!("x"), json!("1"), false),
+            (json!(1), json!(1), false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (step, statement) in ORDER.into_iter().enumerate() {
+                let mut params = vec![s.clone(), n.clone()];
+                if statement != 1 {
+                    params.push(json!(format!("pair at step {step}")));
+                }
+                run(statements[(index + step) % 2][statement], params, point);
+            }
+            // A predicate that names one of the two columns is not a lookup by key.
+            run(
+                "UPDATE pairs SET v = $2 WHERE s = $1",
+                vec![s.clone(), json!("by half a key")],
+                false,
+            );
+            run(
+                "DELETE FROM pairs WHERE n = $1 AND v = $2",
+                vec![n, s],
+                false,
+            );
+        }
+
+        // A BOOLEAN key.
+        let statements = [
+            "UPDATE flags SET label = $2 WHERE lit = $1",
+            "DELETE FROM flags WHERE lit = $1",
+            "INSERT INTO flags (lit, label) VALUES ($1, $2) \
+             ON CONFLICT (lit) DO UPDATE SET label = EXCLUDED.label",
+        ];
+        for (key, point) in [
+            (json!(true), true),
+            (json!(false), true),
+            (json!(null), false),
+            (json!(1), false),
+            (json!("true"), false),
+        ] {
+            for (step, statement) in ORDER.into_iter().enumerate() {
+                let mut params = vec![key.clone()];
+                if statement != 1 {
+                    params.push(json!(format!("flag at step {step}")));
+                }
+                run(statements[statement], params, point);
+            }
+        }
+
+        // A FLOAT key is never one the point planner looks up: a float's key is the same for
+        // several spellings of its number, which the general planner reconciles.
+        let statements = [
+            "UPDATE ratios SET label = $2 WHERE r = $1",
+            "DELETE FROM ratios WHERE r = $1",
+            "INSERT INTO ratios (r, label) VALUES ($1, $2) \
+             ON CONFLICT (r) DO UPDATE SET label = EXCLUDED.label",
+        ];
+        for key in [
+            json!(1.5),
+            json!(2),
+            json!(2.0),
+            json!(0),
+            json!(-0.0),
+            json!(null),
+            json!("1.5"),
+        ] {
+            for (step, statement) in ORDER.into_iter().enumerate() {
+                let mut params = vec![key.clone()];
+                if statement != 1 {
+                    params.push(json!(format!("ratio at step {step}")));
+                }
+                run(statements[statement], params, false);
+            }
+        }
+
+        // The point planner looked up 22 keys, 5 of which held a row at the start. Five of a
+        // key's seven statements change a row whatever it held, the second delete finds none,
+        // and the first update finds one only where one was.
+        assert_eq!((changed, unchanged), (22 * 5 + 5, 22 + 17));
+        let fast = prepared.commit_transaction().unwrap();
+        let full = plain.commit_transaction().unwrap();
+        assert_eq!(format!("{fast:?}"), format!("{full:?}"));
+        assert_eq!(prepared.database_hash(), plain.database_hash());
+        // Both hold the rows the statements left. The row whose `id` was 1 is not among them:
+        // a delete by the float 1.0 is not a lookup the point planner makes, and the general
+        // planner, which both engines then ran, finds the row whose integer equals it.
+        for (table, rows) in [
+            ("items", 7),
+            ("notes", 9),
+            ("pairs", 7),
+            ("flags", 2),
+            ("ratios", 3),
+        ] {
+            let count = |engine: &mut PagedEngine<MemoryPageDevice>| {
+                objects(
+                    &engine
+                        .execute_sql(&format!("SELECT * FROM {table}"), &[])
+                        .unwrap(),
+                )
+                .len()
+            };
+            assert_eq!(count(&mut prepared), rows, "{table}");
+            assert_eq!(count(&mut plain), rows, "{table}");
+        }
+    }
+
+    #[test]
+    fn a_database_that_needs_recovery_holds_no_committed_row_for_a_point_statement() {
+        use crate::{paged_codec::PrimaryKey, row::HeldRow};
+        let device = DurableDevice::default();
+        let control = device.clone();
+        let mut engine = page_native_fixture(device).unwrap();
+        let update = engine
+            .prepare_sql("UPDATE accounts SET active = $1 WHERE id = $2")
+            .unwrap();
+        engine.begin_transaction().unwrap();
+        engine
+            .execute_sql(
+                "INSERT INTO accounts (id, email) VALUES (3, 'grace@example.com')",
+                &[],
+            )
+            .unwrap();
+        control.arm_after_flush(1);
+        assert_eq!(
+            engine.commit_transaction().unwrap_err().code,
+            "RECOVERY_REQUIRED"
+        );
+        // The transaction stays open over a database whose last commit may or may not have
+        // happened, and its view reads no committed row, by the route a point statement takes
+        // or by a visit of the key, though both still find the row the transaction staged.
+        assert!(engine.in_transaction());
+        let view = engine.read_view();
+        let schema = Rc::clone(&engine.storage.table("accounts").unwrap().schema);
+        for (id, staged) in [(1, false), (3, true), (9, false)] {
+            let value = json!(id);
+            let key = PrimaryKey::Values(&[&value]).encode(&schema).unwrap();
+            let held = view.held_encoded_key("accounts", &key);
+            let mut visited = None;
+            let visit = view.visit_primary_key_values("accounts", &schema, &[&value], &mut |row| {
+                visited = Some(row.hold()?);
+                Ok(crate::VisitControl::Stop)
+            });
+            if staged {
+                assert_eq!(visit.unwrap(), crate::VisitOutcome::Stopped);
+                let Some(HeldRow::Stored(visited)) = visited else {
+                    panic!("the staged row is visited as a stored entry");
+                };
+                let held = held.unwrap().unwrap();
+                assert_eq!((held.key(), held.value()), (visited.key(), visited.value()));
+                assert_eq!(held.key(), key);
+            } else {
+                let refusal = held.unwrap_err();
+                assert_eq!(refusal, visit.unwrap_err());
+                assert_eq!(refusal.code, "RECOVERY_REQUIRED");
+            }
+        }
+        for id in [1, 3, 9] {
+            assert_eq!(
+                engine
+                    .execute_prepared(update, &[json!(true), json!(id)])
+                    .unwrap_err()
+                    .code,
+                "RECOVERY_REQUIRED"
+            );
+        }
+    }
+
+    #[test]
     fn the_database_fingerprint_describes_the_rows_and_nothing_else() {
         // Two databases which hold the same rows must agree, however the rows got there. This is
         // the whole point of publishing the fingerprint: a comparison between two databases has to

@@ -12,7 +12,7 @@ use crate::expression::{
 };
 use crate::hash::{KeyMap, KeySet};
 use crate::paged_codec::{
-    EMPTY_RECORD, RecordLayout, StoredEntry, StoredRecord, encode_primary_key,
+    EMPTY_RECORD, PrimaryKey, RecordLayout, StoredRecord, encode_primary_key,
     encode_primary_key_values, encode_row_values, encode_updated_record,
 };
 use crate::query::{
@@ -893,31 +893,6 @@ fn point_key<'a>(
     Ok(primary_key_values_fit(&values).then_some(values))
 }
 
-/// What a table holds at a key: nothing, a stored row, or a row the reader does not store as a
-/// record, which only the general planner reads.
-enum PointRow {
-    None,
-    Stored(StoredEntry),
-    Other,
-}
-
-/// The row of `schema`'s table at the key `values`, as the reader sees it, held for the writer.
-fn point_row(
-    storage: &dyn StorageReader,
-    schema: &TableDefinition,
-    values: &[&Value],
-) -> Result<PointRow> {
-    let mut found = PointRow::None;
-    storage.visit_primary_key_values(&schema.name, schema, values, &mut |row| {
-        found = match row.hold()? {
-            HeldRow::Stored(entry) => PointRow::Stored(entry),
-            HeldRow::Map(_) | HeldRow::Measured(_) => PointRow::Other,
-        };
-        Ok(VisitControl::Stop)
-    })?;
-    Ok(found)
-}
-
 /// What a point statement that matched no row plans.
 fn point_unchanged(command: &'static str) -> PlannedDml {
     PlannedDml {
@@ -1044,10 +1019,11 @@ fn plan_point_update(
     let Some(bound) = point_assigned_bound(layout.json_overhead(), &schema, &assigned) else {
         return Ok(None);
     };
-    let entry = match point_row(storage, &schema, &key_values)? {
-        PointRow::None => return Ok(Some(point_unchanged("UPDATE"))),
-        PointRow::Stored(entry) => entry,
-        PointRow::Other => return Ok(None),
+    // The key is encoded once, for the lookup and then for the change. Its values are ones a
+    // lookup finds exactly and their encoding fits a key, so encoding them cannot fail.
+    let encoded_key = PrimaryKey::Values(&key_values).encode(&schema)?;
+    let Some(entry) = storage.held_encoded_key(table, &encoded_key)? else {
+        return Ok(Some(point_unchanged("UPDATE")));
     };
     let record = StoredRecord::new(&schema, &layout, entry.key(), entry.value())?;
     if !point_record_fits(&record, schema.columns.len(), bound) {
@@ -1059,7 +1035,7 @@ fn plan_point_update(
         table,
         RowChange::Put {
             table: Rc::clone(&table_name),
-            key: entry.key().to_vec(),
+            key: encoded_key,
             record: next,
         },
         PreviousRow::Read(Some(HeldRow::Stored(entry))),
@@ -1081,16 +1057,16 @@ fn plan_point_delete(
     let Some(key_values) = point_key(&schema, key, params)? else {
         return Ok(None);
     };
-    let entry = match point_row(storage, &schema, &key_values)? {
-        PointRow::None => return Ok(Some(point_unchanged("DELETE"))),
-        PointRow::Stored(entry) => entry,
-        PointRow::Other => return Ok(None),
+    // Encoded once, as an update's key is, for the lookup and for a removal by key.
+    let encoded_key = PrimaryKey::Values(&key_values).encode(&schema)?;
+    let Some(entry) = storage.held_encoded_key(table, &encoded_key)? else {
+        return Ok(Some(point_unchanged("DELETE")));
     };
     // A script's writer applies a delete by its encoded key; a transaction's by the key as a map.
     let change = if storage.plans_removals() {
         RowChange::Remove {
             table: Rc::clone(&table_name),
-            key: entry.key().to_vec(),
+            key: encoded_key,
         }
     } else {
         RowChange::Delete {
@@ -1298,30 +1274,25 @@ fn plan_point_insert(
         unreachable!("a lone row without a conflict clause was planned above")
     };
     let position_of = |name: &str| schema.columns.iter().position(|column| column.name == name);
-    let mut key_values = Vec::with_capacity(schema.primary_key.len());
     for column in &schema.primary_key {
         let value = row[position_of(column).expect("a key column is a column")];
         if !exact_primary_key_value(schema, column, value) {
             return Ok(None);
         }
-        key_values.push(value);
     }
-    let entry = match point_row(storage, schema, &key_values)? {
-        PointRow::Other => return Ok(None),
-        PointRow::None => {
-            let record = encode_row_values(schema, &layout, &row)?;
-            return Ok(Some(point_change(
-                "INSERT",
-                table,
-                RowChange::Put {
-                    table: Rc::clone(&table_name),
-                    key,
-                    record,
-                },
-                PreviousRow::Read(None),
-            )));
-        }
-        PointRow::Stored(entry) => entry,
+    // The row is looked up by the key encoded above, which is the key of its values.
+    let Some(entry) = storage.held_encoded_key(table, &key)? else {
+        let record = encode_row_values(schema, &layout, &row)?;
+        return Ok(Some(point_change(
+            "INSERT",
+            table,
+            RowChange::Put {
+                table: Rc::clone(&table_name),
+                key,
+                record,
+            },
+            PreviousRow::Read(None),
+        )));
     };
     // The stored row is rewritten with the assigned values, as a lone upsert rewrites it.
     let mut assigned: Vec<Option<&Value>> = vec![None; schema.columns.len()];
@@ -1361,7 +1332,7 @@ fn plan_point_insert(
         table,
         RowChange::Put {
             table: Rc::clone(&table_name),
-            key: entry.key().to_vec(),
+            key,
             record: next,
         },
         PreviousRow::Read(Some(HeldRow::Stored(entry))),

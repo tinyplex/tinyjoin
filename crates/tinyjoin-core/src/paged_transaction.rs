@@ -14,7 +14,8 @@ use crate::{
     hash::KeyHasher,
     name_map::NameMap,
     paged_codec::{
-        EMPTY_RECORD, IndexEntryLayout, PrimaryKey, RecordLayout, encode_primary_key, encode_row,
+        EMPTY_RECORD, IndexEntryLayout, PrimaryKey, RecordLayout, StoredEntry, encode_primary_key,
+        encode_row,
     },
     paged_script::{ChangedRow, KeyedRows, TableChanges, held_row_bytes, sort_keyed},
     paged_storage::{
@@ -1287,7 +1288,7 @@ impl<'a, D: PageDevice> PagedReadView<'a, D> {
                 _ => Ok(VisitOutcome::Complete),
             };
         }
-        self.storage.visit_encoded_key(table, &encoded_key, visitor)
+        self.storage.visit_entry(paged, &encoded_key, visitor)
     }
 
     /// Whether the committed table is exactly what this view sees, so that its key order and
@@ -1542,6 +1543,28 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
         Ok(self.storage.committed_entry(table, key)?.is_some())
     }
 
+    // What `visit_key` finds for a visitor that holds the row, by the same tests in the same
+    // order: a staged row is copied from the overlay, and a committed one out of its leaf, once.
+    fn held_encoded_key(&self, table: &str, key: &[u8]) -> Result<Option<StoredEntry>> {
+        self.ensure_base_revision()?;
+        self.charge_work(1)?;
+        let paged = self.storage.table(table)?;
+        if let Some(entry) = self
+            .transaction
+            .and_then(|transaction| transaction.table(table))
+            .and_then(|overlay| overlay.get(key))
+        {
+            return match &entry.row.next {
+                Some(record) => {
+                    paged.record(key, record)?;
+                    Ok(Some(StoredEntry::new(key, record)))
+                }
+                None => Ok(None),
+            };
+        }
+        self.storage.committed_entry_of(paged, key)
+    }
+
     fn index_definition(&self, name: &str) -> Option<IndexDefinition> {
         self.storage.index_definition(name)
     }
@@ -1756,6 +1779,316 @@ mod tests {
         );
         assert!(transaction.is_dirty());
         assert_eq!(transaction.changes(&storage).len(), 2);
+    }
+
+    /// The entry a visit of the row whose key has `values` holds, which is how a point statement
+    /// read the row it changes before the view answered [`StorageReader::held_encoded_key`]: the
+    /// oracle for it.
+    fn visited_entry(
+        view: &PagedReadView<'_, MemoryPageDevice>,
+        table: &str,
+        schema: &TableDefinition,
+        values: &[&Value],
+    ) -> Result<Option<StoredEntry>> {
+        let mut held = None;
+        view.visit_primary_key_values(table, schema, values, &mut |row| {
+            held = match row.hold()? {
+                HeldRow::Stored(entry) => Some(entry),
+                HeldRow::Map(_) | HeldRow::Measured(_) => {
+                    unreachable!("a view of stored records holds their entries")
+                }
+            };
+            Ok(VisitControl::Stop)
+        })?;
+        Ok(held)
+    }
+
+    /// An entry as its key and its record, or the refusal of one as its code and message, so that
+    /// two routes to it can be compared.
+    type HeldOutcome = std::result::Result<Option<(Vec<u8>, Vec<u8>)>, (String, String)>;
+
+    fn held_outcome(result: Result<Option<StoredEntry>>) -> HeldOutcome {
+        match result {
+            Ok(entry) => Ok(entry.map(|entry| (entry.key().to_vec(), entry.value().to_vec()))),
+            Err(error) => Err((error.code, error.message)),
+        }
+    }
+
+    #[test]
+    fn held_rows_are_the_rows_a_visit_holds() {
+        const IDS: i64 = 96;
+        let mut seed = 0x243f_6a88_85a3_08d3_u64;
+        let mut random = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        // `items` holds committed rows. `spare`, of the same shape, never holds one, so it has no
+        // root to look a key up from.
+        let mut storage = PagedStorage::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        storage
+            .execute_script(
+                ["items", "spare"]
+                    .into_iter()
+                    .map(|table| {
+                        crate::statement::parse(
+                            &format!(
+                                "CREATE TABLE {table} \
+                                 (id INTEGER PRIMARY KEY, name TEXT NOT NULL, note TEXT)"
+                            ),
+                            &[],
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        // A row whose note is absent, short, about as long as a leaf holds inline, or longer, so
+        // that some records are read from their leaves and others from overflow pages.
+        let generated = |id: i64, random: &mut dyn FnMut(u64) -> u64| {
+            let note = match random(5) {
+                0 => Value::Null,
+                1 | 2 => json!("n".repeat(random(40) as usize)),
+                3 => json!("b".repeat(980 + random(60) as usize)),
+                _ => json!("o".repeat(1_100 + random(1_500) as usize)),
+            };
+            row(json!({"id": id, "name": format!("item {id} {}", random(1_000)), "note": note}))
+        };
+        // About half of the keys are committed, over three commits.
+        let mut committed = BTreeMap::new();
+        for commit in 0..3 {
+            let mut statements = Vec::new();
+            for id in (0..IDS).filter(|id| id % 3 == commit) {
+                if random(2) == 0 {
+                    continue;
+                }
+                let stored = generated(id, &mut random);
+                statements.push(
+                    crate::statement::parse(
+                        "INSERT INTO items (id, name, note) VALUES ($1, $2, $3)",
+                        &[
+                            stored["id"].clone(),
+                            stored["name"].clone(),
+                            stored["note"].clone(),
+                        ],
+                    )
+                    .unwrap(),
+                );
+                committed.insert(id, stored);
+            }
+            storage.execute_script(statements).unwrap();
+        }
+        // A transaction inserts, updates and deletes rows of both tables, deletes rows it
+        // inserted, and inserts again rows it deleted, by keys in no order.
+        let mut transaction = PagedTransaction::new(storage.revision());
+        let mut staged: BTreeMap<(&str, i64), Option<Row>> = BTreeMap::new();
+        for step in 0..IDS {
+            let id = (step * 37 + 11) % IDS;
+            for table in ["items", "spare"] {
+                let (first, second) = match random(6) {
+                    0 | 1 => continue,
+                    2 => (Some(generated(id, &mut random)), None),
+                    3 => (None, None),
+                    4 => (Some(generated(id, &mut random)), Some(None)),
+                    _ => (None, Some(Some(generated(id, &mut random)))),
+                };
+                for next in [Some(first), second].into_iter().flatten() {
+                    let change = match &next {
+                        Some(next) => RowChange::Upsert {
+                            table: table.into(),
+                            row: next.clone(),
+                        },
+                        None => RowChange::Delete {
+                            table: table.into(),
+                            key: row(json!({"id": id})),
+                        },
+                    };
+                    transaction
+                        .stage(&storage, vec![change], Vec::new())
+                        .unwrap();
+                    staged.insert((table, id), next);
+                }
+            }
+        }
+
+        let work = Cell::new(0);
+        // How many keys each view found in each state: committed in a leaf and in overflow pages,
+        // staged in place of a committed row, staged where there was none, deleted, and absent.
+        let (mut inline, mut overflow, mut updated, mut inserted, mut deleted, mut absent) =
+            (0, 0, 0, 0, 0, 0);
+        for (overlay, budget) in [(false, false), (true, false), (true, true)] {
+            let transaction = overlay.then_some(&transaction);
+            let view = if budget {
+                PagedReadView::with_work_budget(&storage, transaction, &work)
+            } else {
+                PagedReadView::new(&storage, transaction)
+            };
+            for table in ["items", "spare"] {
+                let paged = storage.table(table).unwrap();
+                assert_eq!(paged.root_page_id.is_some(), table == "items");
+                // Every key that could hold a row, and keys beyond both ends of them.
+                for id in -2..IDS + 2 {
+                    let value = json!(id);
+                    let key = PrimaryKey::Values(&[&value]).encode(&paged.schema).unwrap();
+                    let charged = work.get();
+                    let held = held_outcome(view.held_encoded_key(table, &key));
+                    // Each route charges the read as one visit of a key.
+                    assert_eq!(work.get() - charged, usize::from(budget));
+                    let visited =
+                        held_outcome(visited_entry(&view, table, &paged.schema, &[&value]));
+                    assert_eq!(work.get() - charged, 2 * usize::from(budget));
+                    assert_eq!(held, visited, "{table} {id}");
+                    // The entry is the row the view sees there, whichever route found it.
+                    let base = committed.get(&id).filter(|_| table == "items");
+                    let change = staged.get(&(table, id)).filter(|_| overlay);
+                    let expected = match change {
+                        Some(next) => next.as_ref(),
+                        None => base,
+                    };
+                    let found = held.unwrap();
+                    assert_eq!(
+                        found.as_ref().map(|(key, record)| paged
+                            .record(key, record)
+                            .unwrap()
+                            .to_row()
+                            .unwrap()),
+                        expected.cloned(),
+                        "{table} {id}"
+                    );
+                    match (change, base, &found) {
+                        (None, Some(_), Some((_, record)))
+                            if record.len() > crate::btree::MAX_BTREE_INLINE_VALUE_BYTES =>
+                        {
+                            overflow += 1;
+                        }
+                        (None, Some(_), _) => inline += 1,
+                        (Some(Some(_)), Some(_), _) => updated += 1,
+                        (Some(Some(_)), None, _) => inserted += 1,
+                        (Some(None), ..) => deleted += 1,
+                        (None, None, _) => absent += 1,
+                    }
+                }
+            }
+        }
+        for count in [inline, overflow, updated, inserted, deleted, absent] {
+            assert!(count > 10, "{count} keys in one of the states");
+        }
+
+        // Each route refuses a read at the same test: the transaction's revision, then the work
+        // the statement may do, then the table.
+        let stale = PagedTransaction::new(storage.revision() + 1);
+        let spent = Cell::new(crate::sql_script::MAX_SQL_SCRIPT_OPERATIONS);
+        let schema = Rc::clone(&storage.table("items").unwrap().schema);
+        let value = json!(1);
+        let key = PrimaryKey::Values(&[&value]).encode(&schema).unwrap();
+        for (transaction, work, table, code) in [
+            (Some(&stale), Some(&spent), "missing", "WRITE_CONFLICT"),
+            (Some(&stale), None, "items", "WRITE_CONFLICT"),
+            (
+                Some(&transaction),
+                Some(&spent),
+                "missing",
+                "TRANSACTION_TOO_LARGE",
+            ),
+            (None, Some(&spent), "items", "TRANSACTION_TOO_LARGE"),
+            (Some(&transaction), None, "missing", "TABLE_NOT_FOUND"),
+            (None, None, "missing", "TABLE_NOT_FOUND"),
+        ] {
+            let view = match work {
+                Some(work) => PagedReadView::with_work_budget(&storage, transaction, work),
+                None => PagedReadView::new(&storage, transaction),
+            };
+            let held = held_outcome(view.held_encoded_key(table, &key));
+            let visited = held_outcome(visited_entry(&view, table, &schema, &[&value]));
+            assert_eq!(held, visited, "{table} {code}");
+            assert_eq!(held.unwrap_err().0, code, "{table}");
+            assert_eq!(spent.get(), crate::sql_script::MAX_SQL_SCRIPT_OPERATIONS);
+        }
+
+        // A staged record that no reader can open is refused by both routes with one error: its
+        // first header byte is given a flag no record has.
+        let ((_, id), _) = staged
+            .iter()
+            .find(|((table, _), next)| *table == "items" && next.is_some())
+            .unwrap();
+        let value = json!(id);
+        let key = PrimaryKey::Values(&[&value]).encode(&schema).unwrap();
+        let overlay = transaction.tables.get_mut("items").unwrap();
+        let (_, entry) = overlay
+            .rows
+            .iter_mut()
+            .find(|(staged, _)| *staged == key)
+            .unwrap();
+        entry.row.next.as_mut().unwrap()[0] |= 0x80;
+        let view = PagedReadView::new(&storage, Some(&transaction));
+        let held = held_outcome(view.held_encoded_key("items", &key));
+        assert_eq!(
+            held,
+            held_outcome(visited_entry(&view, "items", &schema, &[&value]))
+        );
+        assert_eq!(held.unwrap_err().0, "PAGED_STORAGE_VERSION_UNSUPPORTED");
+
+        // The same for a committed record, corrupted in its leaf, which is the table's root while
+        // the table is this small. The leaf is sealed again, so that only the record is wrong, and
+        // the root that preceded the active one is erased, so that opening does not take the
+        // change for an interrupted commit and go back to it.
+        let mut storage = PagedStorage::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        storage
+            .execute_script(
+                [
+                    "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, note TEXT)",
+                    "INSERT INTO items (id, name) VALUES (1, 'one'), (2, 'two'), (3, 'three')",
+                ]
+                .into_iter()
+                .map(|sql| crate::statement::parse(sql, &[]).unwrap())
+                .collect(),
+            )
+            .unwrap();
+        let schema = Rc::clone(&storage.table("items").unwrap().schema);
+        let leaf = storage.table("items").unwrap().root_page_id.unwrap();
+        let value = json!(2);
+        let key = PrimaryKey::Values(&[&value]).encode(&schema).unwrap();
+        let pager = crate::Pager::open_or_create(storage.into_device()).unwrap();
+        let inactive = pager.active_metadata().superblock.slot.inactive();
+        let mut device = pager.into_device();
+        device
+            .write_page(inactive.page_id(), &[0; crate::PAGE_SIZE])
+            .unwrap();
+        let mut page = [0; crate::PAGE_SIZE];
+        device.read_page(leaf, &mut page).unwrap();
+        // A leaf cell is its header of eight bytes, which begins with the length of its key, then
+        // the key, then the value, which here is the record.
+        let cell_key = page
+            .windows(key.len())
+            .position(|window| window == key)
+            .unwrap();
+        assert_eq!(page[cell_key - 8..cell_key - 6], [key.len() as u8, 0]);
+        page[cell_key + key.len()] |= 0x80;
+        crate::page::seal(&mut page);
+        device.write_page(leaf, &page).unwrap();
+        let storage = PagedStorage::open(device).unwrap();
+        let transaction = PagedTransaction::new(storage.revision());
+        for transaction in [None, Some(&transaction)] {
+            let view = PagedReadView::new(&storage, transaction);
+            let held = held_outcome(view.held_encoded_key("items", &key));
+            assert_eq!(
+                held,
+                held_outcome(visited_entry(&view, "items", &schema, &[&value]))
+            );
+            assert_eq!(held.unwrap_err().0, "PAGED_STORAGE_VERSION_UNSUPPORTED");
+            // The rows beside it are read as they were.
+            for id in [1, 3] {
+                let value = json!(id);
+                let key = PrimaryKey::Values(&[&value]).encode(&schema).unwrap();
+                let held = held_outcome(view.held_encoded_key("items", &key));
+                assert!(held.as_ref().is_ok_and(Option::is_some));
+                assert_eq!(
+                    held,
+                    held_outcome(visited_entry(&view, "items", &schema, &[&value]))
+                );
+            }
+        }
     }
 
     #[test]

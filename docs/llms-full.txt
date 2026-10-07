@@ -3225,6 +3225,12 @@ replace, which planning would have read. Engine-only, 10,000 inserts in a
 transaction take a quarter less time, updates by key a fifth less, upserts a
 third less, and 200-row inserts a third less.
 
+Such an `UPDATE`, `DELETE` or upsert then encodes its key once, and takes the
+row it changes as the entry the transaction keeps of it, copied out of its
+page once. The key had been encoded twice, or three times for an upsert, and
+the row copied twice. Before V8 has optimized the code, an upsert runs 3%
+fewer instructions, and an update or delete by key 1% fewer.
+
 ### Changing many rows
 
 The rows a statement changes share one name for their table, kept once per

@@ -150,6 +150,17 @@ impl Btree {
         get_from(pager, root_page_id, tree_id, key)
     }
 
+    /// Looks up one exact key in a committed root, as [`Self::get`] does, and returns the key
+    /// followed by its value: the entry whole, as a reader that keeps a row holds it.
+    pub(crate) fn get_entry<D: PageDevice>(
+        pager: &mut Pager<D>,
+        root_page_id: PageId,
+        tree_id: TreeId,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        get_prefixed_from(pager, root_page_id, tree_id, key, key)
+    }
+
     /// Inserts or replaces an inline value and returns the candidate root and its fingerprint.
     /// Commits write through [`Self::apply`]; tests build trees one change at a time with this and
     /// [`Self::delete`], and check batches against them.
@@ -547,16 +558,32 @@ impl<D: PageDevice> BtreeReadView for PagerWriteTransaction<'_, D> {
     }
 }
 
-/// Descends from `root_page_id` to the one leaf that can hold `key`, reading each node in place in
-/// the page cache.
-///
-/// Each step down must reach exactly the next lower level and a page's level is fixed, so a cycle
-/// is rejected without tracking visited pages.
+/// The value `key` holds in the tree at `root_page_id`, if it holds one: what
+/// [`get_prefixed_from`] returns with nothing to put in front of it. It is compiled into its
+/// callers, since it only passes their arguments on.
+#[inline(always)]
 pub(crate) fn get_from(
     reader: &mut dyn BtreeReadView,
     root_page_id: PageId,
     tree_id: TreeId,
     key: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    get_prefixed_from(reader, root_page_id, tree_id, key, &[])
+}
+
+/// Descends from `root_page_id` to the one leaf that can hold `key`, reading each node in place in
+/// the page cache, and returns `prefix` followed by the value the key holds, in one allocation of
+/// exactly their length. A caller that keeps an entry as its key and then its value passes the
+/// key as the prefix, so that the value is copied out of its page once, into the entry itself.
+///
+/// Each step down must reach exactly the next lower level and a page's level is fixed, so a cycle
+/// is rejected without tracking visited pages.
+pub(crate) fn get_prefixed_from(
+    reader: &mut dyn BtreeReadView,
+    root_page_id: PageId,
+    tree_id: TreeId,
+    key: &[u8],
+    prefix: &[u8],
 ) -> Result<Option<Vec<u8>>> {
     validate_tree_id(tree_id)?;
     validate_key(key)?;
@@ -580,18 +607,24 @@ pub(crate) fn get_from(
                 return Ok(None);
             };
             let descriptor = match node.leaf_cell(index)?.1 {
-                CellValue::Inline(value) => return Ok(Some(value.to_vec())),
+                CellValue::Inline(value) => return Ok(Some(prefixed(prefix, value))),
                 CellValue::Overflow(descriptor) => descriptor,
             };
             let leaf_generation = node.generation;
-            return read_overflow_chain(
+            let (value, _) = read_overflow_chain(
                 &mut |page_id| reader.read_btree_page(page_id),
                 tree_id,
                 generation,
                 leaf_generation,
                 &descriptor,
-            )
-            .map(|(value, _)| Some(value));
+            )?;
+            // A value read from its overflow pages is a vector already, which only a prefix has
+            // to be put in front of.
+            return Ok(Some(if prefix.is_empty() {
+                value
+            } else {
+                prefixed(prefix, &value)
+            }));
         }
         page_id = node.child(node.child_index_for(key)?)?;
         expected_level = Some(node.level - 1);
@@ -600,6 +633,19 @@ pub(crate) fn get_from(
     Err(invalid_btree(storage_diagnostic!(
         "Tree {tree_id} exceeds the maximum depth of {MAX_TREE_DEPTH}"
     )))
+}
+
+/// `prefix` followed by `value`, in one allocation of exactly their length. It is compiled into
+/// the lookup, which copies each value it finds in a leaf through it, once.
+#[inline(always)]
+fn prefixed(prefix: &[u8], value: &[u8]) -> Vec<u8> {
+    if prefix.is_empty() {
+        return value.to_vec();
+    }
+    let mut bytes = Vec::with_capacity(prefix.len() + value.len());
+    bytes.extend_from_slice(prefix);
+    bytes.extend_from_slice(value);
+    bytes
 }
 
 /// Opens a cursor moving forward from the first key at or after `bound`, or backward from the last
@@ -4686,6 +4732,104 @@ mod tests {
         assert_eq!(
             Btree::get(&mut reopened, root, TREE, b"maximum").unwrap(),
             Some(maximum)
+        );
+    }
+
+    #[test]
+    fn entries_are_keys_followed_by_values() {
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let mut root = create_tree(&mut pager);
+        // Values a leaf holds inline, from none to the most it holds, and values in one overflow
+        // page and in several, under keys from the empty one to the longest, among enough others
+        // for the tree to have internal levels.
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = vec![
+            (Vec::new(), b"under the empty key".to_vec()),
+            (b"empty".to_vec(), Vec::new()),
+            (b"short".to_vec(), b"value".to_vec()),
+            (b"inline".to_vec(), vec![11; MAX_BTREE_INLINE_VALUE_BYTES]),
+            (
+                b"overflow".to_vec(),
+                vec![12; MAX_BTREE_INLINE_VALUE_BYTES + 1],
+            ),
+            (
+                b"pages".to_vec(),
+                (0..3 * MAX_OVERFLOW_CHUNK_BYTES + 5)
+                    .map(|index| (index % 251) as u8)
+                    .collect(),
+            ),
+            (vec![b'z'; MAX_BTREE_KEY_BYTES], vec![13; 300]),
+            (vec![b'y'; MAX_BTREE_KEY_BYTES], vec![14; 2_000]),
+        ];
+        entries.extend((0..40).map(|number| (key(number), value(number))));
+        let entry_of = |prefix: &[u8], value: &[u8]| [prefix, value].concat();
+        {
+            let mut transaction = pager.begin_write().unwrap();
+            for (key, value) in &entries {
+                root = Btree::upsert(&mut transaction, root, TREE, key, value)
+                    .unwrap()
+                    .root_page_id;
+            }
+            // A candidate's pages are read as committed ones are.
+            for (key, value) in &entries {
+                assert_eq!(
+                    get_prefixed_from(&mut transaction, root, TREE, key, key).unwrap(),
+                    Some(entry_of(key, value))
+                );
+            }
+            transaction.commit(2, EMPTY_HASH, Some(root)).unwrap();
+        }
+        let root_node = Node::decode(
+            pager.read_page(root).unwrap(),
+            TREE,
+            pager.generation(),
+            false,
+        )
+        .unwrap();
+        assert!(root_node.level >= 1, "the keys must fill several leaves");
+
+        for (key, value) in &entries {
+            assert_eq!(
+                Btree::get(&mut pager, root, TREE, key).unwrap().as_ref(),
+                Some(value)
+            );
+            let entry = Btree::get_entry(&mut pager, root, TREE, key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(entry, entry_of(key, value));
+            // One allocation of exactly the entry's length, which boxing it does not copy again.
+            assert_eq!(entry.capacity(), entry.len());
+            // The prefix need not be the key, and without one the value comes back alone.
+            for prefix in [b"p".as_slice(), b"another prefix", b""] {
+                let prefixed = get_prefixed_from(&mut pager, root, TREE, key, prefix)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(prefixed, entry_of(prefix, value));
+                assert_eq!(prefixed.capacity(), prefixed.len());
+            }
+        }
+        // A key the tree does not hold has no entry, whatever would be put in front of it.
+        for absent in [
+            b"absent".to_vec(),
+            b"shor".to_vec(),
+            b"shorter".to_vec(),
+            key(40),
+            vec![b'z'; MAX_BTREE_KEY_BYTES - 1],
+        ] {
+            assert_eq!(Btree::get(&mut pager, root, TREE, &absent).unwrap(), None);
+            assert_eq!(
+                Btree::get_entry(&mut pager, root, TREE, &absent).unwrap(),
+                None
+            );
+        }
+        // The lookup's refusals do not depend on the prefix either.
+        let too_long = vec![0; MAX_BTREE_KEY_BYTES + 1];
+        assert_eq!(
+            Btree::get_entry(&mut pager, root, TREE, &too_long)
+                .unwrap_err()
+                .message,
+            Btree::get(&mut pager, root, TREE, &too_long)
+                .unwrap_err()
+                .message
         );
     }
 

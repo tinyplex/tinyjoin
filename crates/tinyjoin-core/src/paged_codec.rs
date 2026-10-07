@@ -1012,6 +1012,16 @@ impl StoredEntry {
         }
     }
 
+    /// An entry of `bytes`, which are an encoded primary key of `key_length` bytes and then its
+    /// record, as a lookup that copies a record out of its page once hands them over.
+    pub(crate) fn from_bytes(bytes: Vec<u8>, key_length: usize) -> Self {
+        debug_assert!(key_length <= bytes.len());
+        Self {
+            bytes: bytes.into_boxed_slice(),
+            key_length,
+        }
+    }
+
     /// The encoded primary key.
     pub(crate) fn key(&self) -> &[u8] {
         &self.bytes[..self.key_length]

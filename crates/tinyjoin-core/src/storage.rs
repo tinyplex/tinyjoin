@@ -7,7 +7,7 @@ use std::rc::Rc;
 use serde_json::Value;
 
 use crate::hash::KeySet;
-use crate::paged_codec::{EMPTY_RECORD, IndexEntryLayout, RecordLayout, StoredRecord};
+use crate::paged_codec::{EMPTY_RECORD, IndexEntryLayout, RecordLayout, StoredEntry, StoredRecord};
 use crate::query::Filter;
 use crate::row::{RowRef, ValueRef};
 use crate::{
@@ -235,6 +235,14 @@ pub(crate) trait StorageReader {
     /// Whether a row of `table` holds the encoded primary key `key`, from a reader with record
     /// layouts, charged as a primary-key visit.
     fn holds_encoded_key(&self, _table: &str, _key: &[u8]) -> Result<bool> {
+        Err(unplanned_record())
+    }
+    /// The row of `table` that holds the encoded primary key `key`, if one does, as the stored
+    /// entry a writer keeps of it, charged as a primary-key visit: what a visitor of the key's
+    /// values would hold of the row, without the key encoded again or the row copied twice. Only
+    /// a transaction's view answers, which is the reader a prepared point statement is planned
+    /// with; a script's candidate plans none.
+    fn held_encoded_key(&self, _table: &str, _key: &[u8]) -> Result<Option<StoredEntry>> {
         Err(unplanned_record())
     }
     fn index_definition(&self, name: &str) -> Option<IndexDefinition>;
