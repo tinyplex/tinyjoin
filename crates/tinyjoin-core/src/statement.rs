@@ -1057,8 +1057,9 @@ fn plan_point_delete(
     let Some(entry) = storage.held_encoded_key(table, &encoded_key)? else {
         return Ok(Some(point_unchanged("DELETE")));
     };
-    // A script's writer applies a delete by its encoded key; a transaction's by the key as a map.
-    let change = if storage.plans_removals() {
+    // A script's writer applies a delete by its encoded key, and a transaction stages one by
+    // it; any other writer takes the key as a map.
+    let change = if storage.stages_removals() || storage.plans_removals() {
         RowChange::Remove {
             table: Rc::clone(&table_name),
             key: encoded_key,

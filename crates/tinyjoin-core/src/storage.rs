@@ -232,6 +232,14 @@ pub(crate) trait StorageReader {
     fn plans_removals(&self) -> bool {
         false
     }
+    /// Whether a writer stages a delete of a stored row by its encoded key alone, as a
+    /// [`RowChange::Remove`], when it is a statement's planned delete of the row a primary key
+    /// names. A transaction's overlay does: it measures such a delete by its table's layout,
+    /// or by the map it decodes from the key. It is apart from [`Self::plans_removals`], which
+    /// also has the general planner hand over rows it only measured, which an overlay refuses.
+    fn stages_removals(&self) -> bool {
+        false
+    }
     /// Whether a row of `table` holds the encoded primary key `key`, from a reader with record
     /// layouts, charged as a primary-key visit.
     fn holds_encoded_key(&self, _table: &str, _key: &[u8]) -> Result<bool> {
@@ -1711,6 +1719,11 @@ pub(crate) struct RowWriteUsage {
 }
 
 impl RowWriteUsage {
+    /// The usage of a write set of `changes` changes whose rows retain `bytes`.
+    pub(crate) fn new(changes: usize, bytes: usize) -> Self {
+        Self { changes, bytes }
+    }
+
     /// This usage with `other`'s added, failing as [`preflight_row_write_set`] would once either
     /// total passes its limit.
     pub(crate) fn plus(self, other: Self) -> Result<Self> {
@@ -1826,19 +1839,15 @@ fn preflight_row_changes<'a>(
     Ok(batch_bytes)
 }
 
-/// [`preflight_row_write_set`] for one change to a table the caller resolved: an upsert of
-/// `input`, which planning normalized, or a delete of the key `input`. `input_bytes` is the input's
-/// [`estimated_row_bytes`].
-pub(crate) fn preflight_row_write(
-    table: &str,
-    schema: &TableDefinition,
-    (input, input_bytes): (&Row, usize),
-    is_delete: bool,
-    indexes: &[&IndexDefinition],
-    previous: RowWriteUsage,
-) -> Result<RowWriteUsage> {
-    let changes = previous
-        .changes
+/// [`preflight_row_write_set`] for one change to a table the caller resolved, before the
+/// change's bytes are charged: counts the change into a write set that has made `changes`,
+/// failing once the set holds more than it may, or if the table's name is longer than a catalog
+/// name may be. A writer that measures one change at a time makes these two checks here once,
+/// whatever the change is, and then charges its bytes with [`preflight_row_change`],
+/// [`preflight_record_change`] or [`charge_row_write`], as its kind is: one call each, where
+/// a function of its own for each kind would hold a copy of the two checks.
+pub(crate) fn preflight_change(table: &str, changes: usize) -> Result<usize> {
+    let changes = changes
         .checked_add(1)
         .ok_or_else(row_write_overflow_error)?;
     if changes > MAX_ROW_WRITE_CHANGES {
@@ -1848,47 +1857,12 @@ pub(crate) fn preflight_row_write(
     }
     validate_catalog_name_bound(table)
         .map_err(|error| EngineError::invalid_change(error.message))?;
-    Ok(RowWriteUsage {
-        changes,
-        bytes: preflight_row_change(
-            table,
-            schema,
-            (input, input_bytes),
-            is_delete,
-            indexes,
-            previous.bytes,
-        )?,
-    })
+    Ok(changes)
 }
 
-/// [`preflight_row_write`] for an upsert planned as its stored record, whose estimated bytes as
+/// [`preflight_row_change`] for an upsert planned as its stored record, whose estimated bytes as
 /// a map are `record_bytes`. Planning checked its values and size as it would a map's.
-pub(crate) fn preflight_record_write(
-    table: &str,
-    record: &StoredRecord<'_>,
-    record_bytes: usize,
-    indexes: &[&IndexDefinition],
-    previous: RowWriteUsage,
-) -> Result<RowWriteUsage> {
-    let changes = previous
-        .changes
-        .checked_add(1)
-        .ok_or_else(row_write_overflow_error)?;
-    if changes > MAX_ROW_WRITE_CHANGES {
-        return Err(row_write_limit_error(format!(
-            "A row write-set cannot contain more than {MAX_ROW_WRITE_CHANGES} changes"
-        )));
-    }
-    validate_catalog_name_bound(table)
-        .map_err(|error| EngineError::invalid_change(error.message))?;
-    Ok(RowWriteUsage {
-        changes,
-        bytes: preflight_record_change(table, record, record_bytes, indexes, previous.bytes)?,
-    })
-}
-
-/// [`preflight_row_change`] for an upsert planned as its stored record.
-fn preflight_record_change(
+pub(crate) fn preflight_record_change(
     table: &str,
     record: &StoredRecord<'_>,
     record_bytes: usize,
@@ -1972,7 +1946,10 @@ pub(crate) fn unplanned_record() -> EngineError {
     )
 }
 
-fn preflight_row_change(
+/// Checks one change to `table`, and adds it to a write set's bytes, `batch_bytes` so far,
+/// failing past their limit: an upsert of `input`, which planning normalized, or a delete of
+/// the key `input`. `input_bytes` is the input's [`estimated_row_bytes`].
+pub(crate) fn preflight_row_change(
     table: &str,
     schema: &TableDefinition,
     (input, input_bytes): (&Row, usize),
@@ -2001,8 +1978,14 @@ fn preflight_row_change(
 }
 
 /// Adds a change to `table` of a row of `input_bytes` to a write set's bytes, failing past their
-/// limit.
-fn charge_row_write(table: &str, input_bytes: usize, batch_bytes: usize) -> Result<usize> {
+/// limit. A delete adds no key to an index, so this is all that [`preflight_row_change`] does
+/// for one, and all there is to do for a delete planned by its encoded key, which is charged
+/// as the map of its key's columns a delete otherwise plans.
+pub(crate) fn charge_row_write(
+    table: &str,
+    input_bytes: usize,
+    batch_bytes: usize,
+) -> Result<usize> {
     let batch_bytes = checked_row_write_add(
         batch_bytes,
         checked_row_write_add(table.len(), checked_row_write_add(input_bytes, 64)?)?,

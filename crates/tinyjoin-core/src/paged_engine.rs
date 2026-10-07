@@ -3159,20 +3159,16 @@ lines', true, '7')"#,
                 };
                 // A planned change comes with what the planner read at its key, so that staging
                 // it reads nothing again: no row, or the stored row, whose entry begins with the
-                // key the change is planned under.
+                // key the change is planned under. A delete is planned by that key alone.
                 if let Some(planned) = &planned {
                     assert_eq!(planned.changes.len(), planned.previous.len());
                     for change in planned.changes.iter().zip(&planned.previous) {
                         match change {
                             (
-                                RowChange::Put { key, .. },
+                                RowChange::Put { key, .. } | RowChange::Remove { key, .. },
                                 PreviousRow::Read(Some(HeldRow::Stored(entry))),
                             ) => assert_eq!(entry.key(), key, "{sql} [{shown}]"),
-                            (RowChange::Put { .. }, PreviousRow::Read(None))
-                            | (
-                                RowChange::Delete { .. },
-                                PreviousRow::Read(Some(HeldRow::Stored(_))),
-                            ) => {}
+                            (RowChange::Put { .. }, PreviousRow::Read(None)) => {}
                             other => panic!("{sql} [{shown}] planned {other:?}"),
                         }
                     }

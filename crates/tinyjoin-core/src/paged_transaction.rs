@@ -24,7 +24,7 @@ use crate::{
     query::Filter,
     row::{HeldRow, RowRef},
     statement::PreviousRow,
-    storage::{KeyOrder, KeyRange, estimated_record_bytes, estimated_row_bytes, unplanned_record},
+    storage::{KeyOrder, KeyRange, estimated_record_bytes, estimated_row_bytes},
 };
 
 const MAX_TRANSACTION_KEYS: usize = 100_000;
@@ -351,6 +351,8 @@ enum PatchRow {
     Record(Vec<u8>),
     /// A delete, of the key as a map.
     Delete(Row),
+    /// A delete planned by its encoded key, which the change brings.
+    Remove,
 }
 
 /// A table's entries in a patch, in key order.
@@ -755,10 +757,9 @@ impl PagedTransaction {
                 RowChange::Put { table, key, record } => {
                     (table, PatchRow::Record(record), Some(key))
                 }
-                // A transaction's reader plans deletes as maps, which the overlay measures them by.
-                RowChange::Remove { .. } => return Err(unplanned_record()),
+                RowChange::Remove { table, key } => (table, PatchRow::Remove, Some(key)),
             };
-            let is_delete = matches!(row, PatchRow::Delete(_));
+            let is_delete = matches!(row, PatchRow::Delete(_) | PatchRow::Remove);
             // A stored row planning held is the row the change's key holds, so its entry's key is
             // the change's encoded key.
             let key = match (encoded, &held, &row) {
@@ -767,7 +768,9 @@ impl PagedTransaction {
                 (None, _, PatchRow::Map(row) | PatchRow::Delete(row)) => {
                     encode_primary_key(&storage.table(&table)?.schema, row)?
                 }
-                (None, _, PatchRow::Record(_)) => unreachable!("a record comes with its key"),
+                (None, _, PatchRow::Record(_) | PatchRow::Remove) => {
+                    unreachable!("a record or a removal comes with its key")
+                }
             };
             // A statement's only change needs nothing merged with it: its entry goes into the
             // kept vectors, under the change's own name for its table, and the searches made
@@ -839,8 +842,9 @@ impl PagedTransaction {
             let mut entries = Vec::with_capacity(changes.len());
             let mut deletes = 0isize;
             for (key, change) in changes {
-                deletes += isize::from(matches!(change.row, PatchRow::Delete(_)))
-                    - isize::from(change.replaced_delete);
+                deletes +=
+                    isize::from(matches!(change.row, PatchRow::Delete(_) | PatchRow::Remove))
+                        - isize::from(change.replaced_delete);
                 let entry = overlay_entry(storage, paged, &indexes, &key, change)?;
                 entries.push((key, entry));
             }
@@ -1081,12 +1085,23 @@ fn overlay_entry<D: PageDevice>(
     let PatchChange { base, row, .. } = change;
     let schema = &table.schema;
     let table_name = schema.name.as_str();
-    let is_delete = matches!(row, PatchRow::Delete(_));
+    let is_delete = matches!(row, PatchRow::Delete(_) | PatchRow::Remove);
     // A planned map is encoded here; a planned record already was, and is measured in place.
+    // A delete is measured as the map of its key's columns, which one planned by its encoded
+    // key comes without. Where no key column holds text, the table's layout knows what that
+    // map takes whatever the key, by the row estimate and by a batch's, so none is made, and
+    // the change is left with neither a map nor a record. Any other key is decoded to its map
+    // here, as planning decodes it for a delete it plans as one, and measured as that is.
+    let key_estimates = match row {
+        PatchRow::Remove => table.layout().key_estimates(),
+        _ => None,
+    };
     let (next, map) = match row {
         PatchRow::Map(row) => (Some(encode_row(schema, &row)?), Some(row)),
         PatchRow::Delete(key) => (None, Some(key)),
         PatchRow::Record(record) => (Some(record), None),
+        PatchRow::Remove if key_estimates.is_some() => (None, None),
+        PatchRow::Remove => (None, Some(table.layout().key_row(schema, key)?)),
     };
     // Records are canonical, so equal rows have equal records.
     let changed = match (&base, &next) {
@@ -1098,19 +1113,22 @@ fn overlay_entry<D: PageDevice>(
     let base_bytes = base
         .as_ref()
         .map_or(Ok(0), |base| held_row_bytes(table, base))?;
-    let row_bytes = match (&map, &next) {
-        (Some(row), _) => estimated_row_bytes(row)?,
-        (None, Some(record)) => estimated_record_bytes(&table.record(key, record)?)?,
-        (None, None) => unreachable!("a change without a map is a record"),
+    let row_bytes = match (&map, &next, key_estimates) {
+        (Some(row), ..) => estimated_row_bytes(row)?,
+        (None, Some(record), _) => estimated_record_bytes(&table.record(key, record)?)?,
+        // Only a delete measured by its table's layout has neither a map nor a record.
+        (None, None, Some((bytes, _))) => bytes,
+        (None, None, None) => unreachable!("a change without a map is a record"),
     };
     let next_bytes = if is_delete { 0 } else { row_bytes };
     let retained = retained_bytes(table_name, key, base_bytes, next_bytes)?;
     let cost = changed
         .then(|| {
-            let row = match (&map, &next) {
-                (Some(row), _) => ChangeRow::Map(row, row_bytes),
-                (None, Some(record)) => ChangeRow::Record(record, row_bytes),
-                (None, None) => unreachable!("a change without a map is a record"),
+            let row = match (&map, &next, key_estimates) {
+                (Some(row), ..) => ChangeRow::Map(row, row_bytes),
+                (None, Some(record), _) => ChangeRow::Record(record, row_bytes),
+                (None, None, Some((bytes, batch_bytes))) => ChangeRow::Key(bytes, batch_bytes),
+                (None, None, None) => unreachable!("a change without a map is a record"),
             };
             storage.change_cost_in(table, indexes, row, is_delete, key, base.as_ref())
         })
@@ -1528,6 +1546,10 @@ impl<D: PageDevice> StorageReader for PagedReadView<'_, D> {
             .table(table)
             .ok()
             .map(|table| Rc::clone(table.layout()))
+    }
+
+    fn stages_removals(&self) -> bool {
+        true
     }
 
     fn holds_encoded_key(&self, table: &str, key: &[u8]) -> Result<bool> {
@@ -2089,6 +2111,181 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn deletes_by_encoded_key_stage_as_deletes_of_the_key_as_a_map_do() {
+        let mut storage = storage();
+        storage
+            .execute_script(
+                [
+                    "CREATE TABLE named (name TEXT PRIMARY KEY, n INTEGER)",
+                    "INSERT INTO named VALUES ('one', 1), ('two', 2)",
+                ]
+                .into_iter()
+                .map(|sql| crate::statement::parse(sql, &[]).unwrap())
+                .collect(),
+            )
+            .unwrap();
+        let encoded = |table: &str, key: Value| {
+            encode_primary_key(&storage.table(table).unwrap().schema, &row(key)).unwrap()
+        };
+        let remove = |table: &str, key: Value| RowChange::Remove {
+            table: table.into(),
+            key: encoded(table, key),
+        };
+        let delete = |table: &str, key: Value| RowChange::Delete {
+            table: table.into(),
+            key: row(key),
+        };
+        let mut by_key = PagedTransaction::new(storage.revision());
+        let mut by_map = PagedTransaction::new(storage.revision());
+
+        // A statement of nothing but deletes by key counts each among its table's deletes: an
+        // integer key is measured by the table's layout, with no map.
+        assert!(
+            storage
+                .table("items")
+                .unwrap()
+                .layout()
+                .key_estimates()
+                .is_some()
+        );
+        by_key
+            .stage(
+                &storage,
+                vec![
+                    remove("items", json!({"id": 1})),
+                    remove("items", json!({"id": 2})),
+                ],
+                Vec::new(),
+            )
+            .unwrap();
+        by_map
+            .stage(
+                &storage,
+                vec![
+                    delete("items", json!({"id": 1})),
+                    delete("items", json!({"id": 2})),
+                ],
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(by_key.table("items").unwrap().deletes, 2);
+        assert_eq!(by_key.fingerprint(), by_map.fingerprint());
+        // So an insert of a deleted key, for which planning read no row, looks for the entry
+        // that deleted it and replaces it, as it does only in a table with staged deletes.
+        for transaction in [&mut by_key, &mut by_map] {
+            transaction
+                .stage(
+                    &storage,
+                    vec![RowChange::Upsert {
+                        table: "items".into(),
+                        row: row(json!({"id": 1, "name": "again"})),
+                    }],
+                    vec![PreviousRow::Read(None)],
+                )
+                .unwrap();
+        }
+        let overlay = by_key.table("items").unwrap();
+        assert_eq!((overlay.rows.len(), overlay.deletes), (2, 1));
+        assert_eq!(by_key.fingerprint(), by_map.fingerprint());
+
+        // A text key has no one measure, so it is decoded to its map, once, and measured as
+        // the map planning would have made: alone, which the transaction's kept vectors
+        // stage, and among other changes, with the row planning read or without it.
+        assert!(
+            storage
+                .table("named")
+                .unwrap()
+                .layout()
+                .key_estimates()
+                .is_none()
+        );
+        let held = || {
+            PreviousRow::Read(
+                storage
+                    .committed_entry("named", &encoded("named", json!({"name": "one"})))
+                    .unwrap()
+                    .map(HeldRow::Stored),
+            )
+        };
+        by_key
+            .stage(
+                &storage,
+                vec![remove("named", json!({"name": "one"}))],
+                vec![held()],
+            )
+            .unwrap();
+        by_map
+            .stage(
+                &storage,
+                vec![delete("named", json!({"name": "one"}))],
+                vec![held()],
+            )
+            .unwrap();
+        assert_eq!(by_key.fingerprint(), by_map.fingerprint());
+        by_key
+            .stage(
+                &storage,
+                vec![
+                    remove("named", json!({"name": "two"})),
+                    remove("named", json!({"name": "three"})),
+                    delete("items", json!({"id": 1})),
+                ],
+                Vec::new(),
+            )
+            .unwrap();
+        by_map
+            .stage(
+                &storage,
+                vec![
+                    delete("named", json!({"name": "two"})),
+                    delete("named", json!({"name": "three"})),
+                    delete("items", json!({"id": 1})),
+                ],
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(by_key.fingerprint(), by_map.fingerprint());
+        // The key no row holds is staged as a delete that changes nothing.
+        assert_eq!(by_key.table("named").unwrap().deletes, 3);
+        assert_eq!(by_key.changes(&storage).len(), 4);
+
+        let view = PagedReadView::new(&storage, Some(&by_key));
+        assert_eq!(view.table_row_count("named").unwrap(), 0);
+        assert_eq!(view.table_row_count("items").unwrap(), 0);
+        assert!(
+            !view
+                .holds_encoded_key("named", &encoded("named", json!({"name": "one"})))
+                .unwrap()
+        );
+        assert!(view.scan_table("named").unwrap().is_empty());
+
+        // A key that does not decode fails as it does when planning decodes it, and nothing
+        // of the statement is staged.
+        let before = by_key.fingerprint();
+        let error = by_key
+            .stage(
+                &storage,
+                vec![
+                    remove("items", json!({"id": 2})),
+                    RowChange::Remove {
+                        table: "named".into(),
+                        key: b"unterminated".to_vec(),
+                    },
+                ],
+                Vec::new(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            (error.code.as_str(), error.message.as_str()),
+            (
+                "PAGED_STORAGE_CORRUPT",
+                "A text key component is not terminated"
+            )
+        );
+        assert_eq!(by_key.fingerprint(), before);
     }
 
     #[test]

@@ -657,9 +657,10 @@ pub(crate) struct RecordLayout {
     estimate: Option<usize>,
     sized: Vec<usize>,
     /// The estimated bytes of the map of a primary key's columns, as
-    /// [`crate::storage::estimated_key_bytes`] finds them, when no key column holds text, whose
-    /// values take more than a scalar's 16.
-    key_estimate: Option<usize>,
+    /// [`crate::storage::estimated_key_bytes`] finds them, and then as a paged batch estimates
+    /// the same map, when no key column holds text, whose values take more than a scalar's by
+    /// their lengths, and neither estimate overflows.
+    key_estimates: Option<(usize, usize)>,
     /// The most JSON text a row takes apart from its values, as
     /// [`crate::storage::row_json_overhead`] finds it.
     json_overhead: usize,
@@ -940,12 +941,25 @@ impl RecordLayout {
             }
         }
         let mut key_estimate = Some(32usize);
+        // A paged batch estimates the same map at 64 bytes, and for each column 64 more, six
+        // for every byte of its name, and 32 for a number or 8 for a boolean. It is summed in
+        // 64 bits, which the names of a schema are far too short to overflow, and kept where
+        // the sum is a size. It is read only beside the row's estimate, which a key with text
+        // does not have, so text is not told apart here.
+        let mut key_batch_estimate = 64u64;
         for (name, data_type) in schema.primary_key.iter().zip(&key_types) {
             key_estimate = key_estimate
                 .filter(|_| !matches!(data_type, ColumnType::Text | ColumnType::Json))
                 .and_then(|bytes| bytes.checked_add(96))
                 .and_then(|bytes| bytes.checked_add(name.len().checked_mul(2)?));
+            let value = if *data_type == ColumnType::Boolean {
+                8
+            } else {
+                32
+            };
+            key_batch_estimate += 6 * name.len() as u64 + 64 + value;
         }
+        let key_estimates = key_estimate.zip(usize::try_from(key_batch_estimate).ok());
         Ok(Self {
             slots,
             key_types,
@@ -953,7 +967,7 @@ impl RecordLayout {
             stored,
             estimate,
             sized,
-            key_estimate,
+            key_estimates,
             json_overhead: crate::storage::row_json_overhead(schema)?,
         })
     }
@@ -968,7 +982,36 @@ impl RecordLayout {
     /// JSON, which is then what [`StoredRecord::key_estimate`] reports for every record of this
     /// layout, so a writer charging many of a table's keys reads it once.
     pub(crate) fn scalar_key_estimate(&self) -> Option<usize> {
-        self.key_estimate
+        self.key_estimates.map(|(bytes, _)| bytes)
+    }
+
+    /// The primary-key columns of `key`, the encoded primary key of a row of the table of
+    /// `schema`, whose layout this is, decoded from the key alone: no entry is opened for it.
+    pub(crate) fn key_row(&self, schema: &TableDefinition, key: &[u8]) -> Result<Row> {
+        let mut row = Row::new();
+        let mut offset = 0;
+        for (name, data_type) in schema.primary_key.iter().zip(&self.key_types) {
+            let end = component_end(key, offset, *data_type)?;
+            row.insert(
+                name.clone(),
+                decode_component(&key[offset..end], *data_type)?.into_value(),
+            );
+            offset = end;
+        }
+        if offset != key.len() {
+            return Err(storage_corrupt(
+                "A stored row key contains trailing bytes after its primary key",
+            ));
+        }
+        Ok(row)
+    }
+
+    /// What the map of a primary key's columns takes by the two estimates a transaction measures
+    /// a delete by, [`crate::storage::estimated_row_bytes`] and then a paged batch's, when no key
+    /// column holds text or JSON: every key of the table then takes the same, so a delete staged
+    /// by its encoded key is measured without the map.
+    pub(crate) fn key_estimates(&self) -> Option<(usize, usize)> {
+        self.key_estimates
     }
 }
 
@@ -1098,7 +1141,7 @@ impl<'a> StoredRecord<'a> {
 
     /// The estimated bytes of the map of the primary key's columns, when no key column holds text.
     pub(crate) fn key_estimate(&self) -> Option<usize> {
-        self.layout.key_estimate
+        self.layout.scalar_key_estimate()
     }
 
     /// The length of the entry, its key and its record.
@@ -1159,22 +1202,7 @@ impl<'a> StoredRecord<'a> {
 
     /// The primary-key columns, decoded from the key alone.
     pub(crate) fn key_row(&self) -> Result<Row> {
-        let mut row = Row::new();
-        let mut offset = 0;
-        for (name, data_type) in self.schema.primary_key.iter().zip(&self.layout.key_types) {
-            let end = component_end(self.key, offset, *data_type)?;
-            row.insert(
-                name.clone(),
-                decode_component(&self.key[offset..end], *data_type)?.into_value(),
-            );
-            offset = end;
-        }
-        if offset != self.key.len() {
-            return Err(storage_corrupt(
-                "A stored row key contains trailing bytes after its primary key",
-            ));
-        }
-        Ok(row)
+        self.layout.key_row(self.schema, self.key)
     }
 
     fn key_component(&self, position: usize) -> Result<ValueRef<'a>> {

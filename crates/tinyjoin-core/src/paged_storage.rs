@@ -37,8 +37,8 @@ use crate::{
     row::{HeldRow, RowRef, ValueRef, unkept_row},
     sql_script::charge_operations,
     storage::{
-        KeyOrder, KeyRange, RowWriteUsage, normalize_row, preflight_record_write,
-        preflight_row_write,
+        KeyOrder, KeyRange, RowWriteUsage, charge_row_write, normalize_row, preflight_change,
+        preflight_record_change, preflight_row_change,
     },
 };
 /// A callback for each key and value of a B-tree entry, which says whether to go on.
@@ -740,6 +740,10 @@ pub(crate) struct UniqueClaim {
 pub(crate) enum ChangeRow<'a> {
     Map(&'a Row, usize),
     Record(&'a [u8], usize),
+    /// A delete planned by its encoded key, which comes without the map of its key's columns
+    /// that a delete is measured as: with what that map takes by the same estimate, and then
+    /// by a paged batch's, as its table's layout found them once for every key.
+    Key(usize, usize),
 }
 
 /// What one change adds to a write set: its usage, and the unique-index values it claims.
@@ -1072,7 +1076,8 @@ impl<D: PageDevice> PagedStorage<D> {
     /// Validates one change of a transaction's write set, and measures what it adds to the write
     /// set's usage exactly as [`Self::validate_row_write_set`] does for each change: an upsert of
     /// `row`, which planning normalized, or where `is_delete`, a delete of the key `row`, with the
-    /// row's [`crate::storage::estimated_row_bytes`]. `key` is the row's encoded primary key, and
+    /// row's [`crate::storage::estimated_row_bytes`], or a delete planned by its encoded key,
+    /// with its key's estimates in place of a row. `key` is the row's encoded primary key, and
     /// `base` the committed row the change replaces. The catalog operations charged once per
     /// changed table are left to [`Self::write_set_usage`], and conflicts between claims to the
     /// caller.
@@ -1123,28 +1128,34 @@ impl<D: PageDevice> PagedStorage<D> {
             .collect::<Vec<_>>();
         let record = match row {
             ChangeRow::Record(value, _) => Some(table.record(key, value)?),
-            ChangeRow::Map(..) => None,
+            ChangeRow::Map(..) | ChangeRow::Key(..) => None,
         };
-        let row_write = match (row, &record) {
-            (ChangeRow::Map(row, bytes), _) => preflight_row_write(
+        // The change is counted, and its table's name checked, once, whatever kind it is, and
+        // its bytes are then charged as its kind is, with one call. The usage is the change's
+        // own, which the transaction adds to its total.
+        let changes = preflight_change(table_name, 0)?;
+        let write_bytes = match (row, &record) {
+            (ChangeRow::Map(row, bytes), _) => preflight_row_change(
                 table_name,
                 &table.schema,
                 (row, bytes),
                 is_delete,
                 &definitions,
-                RowWriteUsage::default(),
+                0,
             )?,
-            (ChangeRow::Record(_, bytes), Some(record)) => preflight_record_write(
-                table_name,
-                record,
-                bytes,
-                &definitions,
-                RowWriteUsage::default(),
-            )?,
+            (ChangeRow::Record(_, bytes), Some(record)) => {
+                preflight_record_change(table_name, record, bytes, &definitions, 0)?
+            }
+            (ChangeRow::Key(bytes, _), _) => {
+                debug_assert!(is_delete, "a key alone is a delete's");
+                charge_row_write(table_name, bytes, 0)?
+            }
             (ChangeRow::Record(..), None) => unreachable!("a record change opened its record"),
         };
+        let row_write = RowWriteUsage::new(changes, write_bytes);
         let row_bytes = match (row, &record) {
             (ChangeRow::Map(row, _), _) => estimated_row_bytes(row)?,
+            (ChangeRow::Key(_, bytes), _) => bytes,
             (_, Some(record)) => estimated_record_batch_bytes(record)?,
             (ChangeRow::Record(..), None) => unreachable!("a record change opened its record"),
         };
@@ -1180,7 +1191,8 @@ impl<D: PageDevice> PagedStorage<D> {
                         &index_column_positions(&table.schema, &index.definition)?,
                         record,
                     )?,
-                    (ChangeRow::Record(..), None) => {
+                    // A key alone is a delete's, which claims nothing and does not come here.
+                    (ChangeRow::Record(..) | ChangeRow::Key(..), None) => {
                         unreachable!("a record change opened its record")
                     }
                 };
@@ -2537,6 +2549,118 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn layouts_estimate_the_map_of_a_key_without_text_as_both_estimators_do() {
+        // A transaction measures a delete planned by its encoded key by what its table's layout
+        // says the map of the key's columns takes, without making the map. That must be what
+        // each estimator makes of the map, for every key of the table, which only a key without
+        // text allows: a key with text has no such estimates, and is measured by its map.
+        let mut storage = PagedStorage::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        for sql in [
+            "CREATE TABLE ints (id INTEGER PRIMARY KEY, v TEXT)",
+            "CREATE TABLE floats (a_rather_longer_key_column FLOAT PRIMARY KEY, v TEXT)",
+            "CREATE TABLE flags (f BOOLEAN PRIMARY KEY, v TEXT)",
+            "CREATE TABLE points (v TEXT, x INTEGER, on_grid BOOLEAN, y FLOAT, \
+             PRIMARY KEY (y, on_grid, x))",
+            "CREATE TABLE texts (id TEXT PRIMARY KEY, v TEXT)",
+            "CREATE TABLE pairs (a TEXT, b INTEGER, v TEXT, PRIMARY KEY (b, a))",
+        ] {
+            execute_sql(&mut storage, sql, &[]).unwrap();
+        }
+        let safe = 9_007_199_254_740_991_i64;
+        let tables = [
+            (
+                "ints",
+                true,
+                vec![json!({"id": 0}), json!({"id": -safe}), json!({"id": safe})],
+            ),
+            (
+                "floats",
+                true,
+                vec![
+                    json!({"a_rather_longer_key_column": 0.0}),
+                    json!({"a_rather_longer_key_column": -2.5}),
+                    json!({"a_rather_longer_key_column": 1e300}),
+                ],
+            ),
+            ("flags", true, vec![json!({"f": true}), json!({"f": false})]),
+            (
+                "points",
+                true,
+                vec![
+                    json!({"y": 0.5, "on_grid": true, "x": 1}),
+                    json!({"y": -1e-300, "on_grid": false, "x": -safe}),
+                ],
+            ),
+            (
+                "texts",
+                false,
+                vec![
+                    json!({"id": ""}),
+                    json!({"id": "a"}),
+                    json!({"id": "a\u{0}b"}),
+                    json!({"id": "é🦀"}),
+                ],
+            ),
+            (
+                "pairs",
+                false,
+                vec![json!({"b": 1, "a": ""}), json!({"b": 1, "a": "longer"})],
+            ),
+        ];
+        for (name, scalar, keys) in tables {
+            let table = storage.table(name).unwrap();
+            let layout = table.layout();
+            assert_eq!(layout.key_estimates().is_some(), scalar, "{name}");
+            assert_eq!(layout.scalar_key_estimate().is_some(), scalar, "{name}");
+            let mut estimates = BTreeSet::new();
+            for key in keys {
+                let key = row(key);
+                let encoded = encode_primary_key(&table.schema, &key).unwrap();
+                // The map a key decodes to is the map planning makes of a row's key columns.
+                let decoded = layout.key_row(&table.schema, &encoded).unwrap();
+                assert_eq!(decoded, key, "{name}");
+                assert_eq!(
+                    decoded,
+                    table
+                        .record(&encoded, crate::paged_codec::EMPTY_RECORD)
+                        .unwrap()
+                        .key_row()
+                        .unwrap()
+                );
+                // A key with a byte after its last column's is not one of the table's.
+                let mut longer = encoded.clone();
+                longer.push(0);
+                assert_eq!(
+                    layout.key_row(&table.schema, &longer).unwrap_err().message,
+                    "A stored row key contains trailing bytes after its primary key",
+                    "{name}"
+                );
+                let estimated = (
+                    crate::storage::estimated_row_bytes(&decoded).unwrap(),
+                    estimated_row_bytes(&decoded).unwrap(),
+                );
+                if scalar {
+                    assert_eq!(layout.key_estimates(), Some(estimated), "{name}");
+                    assert_eq!(layout.scalar_key_estimate(), Some(estimated.0), "{name}");
+                }
+                estimates.insert(estimated);
+            }
+            // A key with text takes what its text does, so no one estimate is every key's.
+            assert_eq!(estimates.len() == 1, scalar, "{name}: {estimates:?}");
+        }
+        // A map takes 32 bytes by the row estimate, and a scalar 96 and two for every byte of
+        // its name; by a batch's it takes 64, and a value 64, six for every byte of its name,
+        // and 32 if it is a number or 8 if it is a boolean.
+        let estimates = |name: &str| storage.table(name).unwrap().layout().key_estimates();
+        assert_eq!(estimates("ints"), Some((32 + 96 + 4, 64 + 64 + 12 + 32)));
+        assert_eq!(estimates("flags"), Some((32 + 96 + 2, 64 + 64 + 6 + 8)));
+        assert_eq!(
+            estimates("points"),
+            Some((32 + 3 * 96 + 2 * 9, 64 + 3 * 64 + 6 * 9 + 32 + 8 + 32))
+        );
     }
 
     #[test]

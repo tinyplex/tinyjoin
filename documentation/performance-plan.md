@@ -664,6 +664,27 @@ Found along the way:
   estimate had been 1%, from the comparisons alone: most of the saving is
   the readers' calls, which an earlier trial of word-wise comparison inside
   `memcmp` had left in place and so found nothing.
+- A prepared DELETE by key in a transaction is planned as a
+  `RowChange::Remove`, by its encoded key, and staged from it. The planner
+  had decoded the key into a map of its columns, which staging measured by
+  two estimators and dropped: 23 calls for the estimates, and 19 with two
+  frees for the drop. A reader now says whether its writer stages removals
+  (`stages_removals`, which a transaction's view answers; `plans_removals`
+  stays a script's, since it also has the general planner hand over rows it
+  only measured, which an overlay refuses). Staging takes a removal as
+  `PatchRow::Remove`. Where no key column holds text, the table's
+  `RecordLayout` holds what the key's map takes by the row estimate and by a
+  batch's, and the entry is costed as `ChangeRow::Key` with no map; a text
+  key is decoded to its map in staging and measured as it was. The write
+  preflight is divided into the count and name check every change makes and
+  the charge its kind makes. A test holds the layout's two numbers to the
+  estimators over integer, float, boolean and composite keys; a generated
+  test stages each delete as a map and by its key, alone and among other
+  changes, with cascades, and compares fingerprints and errors; and the
+  point-statement equivalence test now compares a prepared delete planned by
+  key with SQL planned as a map. Three faults put in on purpose each failed
+  three to five tests. Instructions under baseline compilation: delete-pk
+  -5.0%, the others within 0.3%; 169 bytes larger compressed.
 
 Found along the way, 6 and 7 October:
 

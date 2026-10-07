@@ -3238,6 +3238,12 @@ page once. The key had been encoded twice, or three times for an upsert, and
 the row copied twice. Before V8 has optimized the code, an upsert runs 3%
 fewer instructions, and an update or delete by key 1% fewer.
 
+Such a `DELETE` is then staged by its encoded key. It had been planned as a
+map of its key's columns, which was built for every delete only to be
+measured twice and dropped. Where no key column holds text, the table already
+knows what that map would measure, and none is made. Before V8 has optimized
+the code, a delete by key runs 5% fewer instructions.
+
 ### Changing many rows
 
 The rows a statement changes share one name for their table, kept once per
