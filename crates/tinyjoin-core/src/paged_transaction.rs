@@ -39,6 +39,12 @@ pub(crate) struct PagedTransaction {
     /// The tables a statement has changed, in name order.
     touched_tables: Vec<String>,
     totals: Totals,
+    /// The vectors the last statement's patch was built in, for the next statement's.
+    room: PatchRoom,
+    /// Whether a statement of one change is staged as one of several is, which a test sets to
+    /// compare the two ways.
+    #[cfg(test)]
+    general_only: bool,
 }
 
 /// What the overlay retains and what its write set costs, kept up to date statement by statement,
@@ -130,12 +136,20 @@ impl TableOverlay {
 
     /// Installs a statement's entries, in key order, each replacing the entry of its key or
     /// joining the rows, and counts the deletes the statement adds to the table, or takes away.
-    fn install(&mut self, entries: PatchEntries, deletes: isize) {
+    /// The entries are taken out of `entries`, which keeps its capacity. `found` is where
+    /// staging looked for the statement's only entry among the keys, when it did: nothing has
+    /// joined the rows since, so the key is not hashed and probed for a second time.
+    fn install(&mut self, entries: &mut PatchEntries, deletes: isize, mut found: Option<Probe>) {
+        debug_assert!(found.is_none() || entries.len() == 1);
         self.deletes = self.deletes.saturating_add_signed(deletes);
         let order = self.order.get_mut();
         let sorted = self.sorted.get_mut();
-        for (key, entry) in entries {
-            let slot = match self.index.find(&self.rows, &key) {
+        for (key, entry) in entries.drain(..) {
+            debug_assert!(found.is_none_or(|found| found == self.index.find(&self.rows, &key)));
+            let probe = found
+                .take()
+                .unwrap_or_else(|| self.index.find(&self.rows, &key));
+            let slot = match probe {
                 Ok(position) => {
                     // The key keeps its position, and with it its place in the order; the key
                     // the entry arrived with is dropped, as a map drops the key of a value it
@@ -341,30 +355,70 @@ enum PatchRow {
 /// A table's entries in a patch, in key order.
 type PatchEntries = Vec<(Vec<u8>, OverlayEntry)>;
 
+/// Where [`KeyIndex::find`] found a key among a table's staged rows, or else the empty slot its
+/// probe ended at, kept from the search a statement's only change makes to the install of its
+/// entry.
+type Probe = std::result::Result<usize, usize>;
+
 /// The table a patch's last change named: its name, its place in the patch, and the entries the
 /// transaction already stages for it.
 type LastTable<'a> = (Rc<str>, usize, Option<&'a TableOverlay>);
 
+/// One table's part of a statement's patch.
+struct PatchTable {
+    table: Rc<str>,
+    /// Where the transaction's overlay for the table is among its overlays, or where a new one
+    /// goes, as [`NameMap::position`] found it before any of the patch's tables was installed.
+    at: std::result::Result<usize, usize>,
+    /// The table's entries, in key order.
+    entries: PatchEntries,
+    /// How many more of the table's staged entries delete their row once the patch is installed.
+    deletes: isize,
+    /// How many changed rows the table gains, or loses, as a two's-complement change to its
+    /// count, which validation finds.
+    changed: usize,
+}
+
+impl PatchTable {
+    /// The entry the patch holds for `key`, if it holds one.
+    fn entry(&self, key: &[u8]) -> Option<&OverlayEntry> {
+        let index = self
+            .entries
+            .binary_search_by(|(entry, _)| entry.as_slice().cmp(key))
+            .ok()?;
+        Some(&self.entries[index].1)
+    }
+}
+
 /// A statement's overlay entries: each table it changes, with its entries in key order. A
 /// statement changes a table or two, and most change a row or two, so vectors hold them without
 /// the nodes a map would allocate.
-#[derive(Default)]
 struct OverlayPatch {
-    entries: Vec<(String, PatchEntries)>,
-    /// For each table in `entries`, how many more of its staged entries delete their row once the
-    /// patch is installed.
-    deletes: Vec<isize>,
+    /// The tables the statement changes, in name order.
+    tables: Vec<PatchTable>,
+    /// The entries vector the transaction kept from its last statement, unless a table of the
+    /// patch holds its entries in it.
+    spare: PatchEntries,
     /// Whether any entry replaces one the transaction staged before.
     replaces: bool,
+    /// Where the patch's only entry was looked for among its table's staged keys, when it was.
+    found: Option<Probe>,
 }
 
-impl OverlayPatch {
-    fn entry(&self, table: &str, key: &[u8]) -> Option<&OverlayEntry> {
-        let (_, entries) = self.entries.iter().find(|(name, _)| name == table)?;
-        let index = entries
-            .binary_search_by(|(entry, _)| entry.as_slice().cmp(key))
-            .ok()?;
-        Some(&entries[index].1)
+/// The emptied vectors of the last statement's patch, which the next statement's is built in, so
+/// that a statement of one change allocates neither. They hold nothing between statements, and
+/// a statement that fails frees them with its patch.
+#[derive(Default)]
+struct PatchRoom {
+    tables: Vec<PatchTable>,
+    entries: PatchEntries,
+}
+
+impl Clone for PatchRoom {
+    /// A copy of a transaction makes its own room with its first statement: the vectors are
+    /// empty, so there is nothing of them to copy but their capacity.
+    fn clone(&self) -> Self {
+        Self::default()
     }
 }
 
@@ -373,13 +427,11 @@ struct TotalsChange {
     overlay_keys: usize,
     overlay_bytes: usize,
     usage: PagedWriteUsage,
-    /// How many changed rows each of the patch's tables gains, or loses, in patch order, as a
-    /// two's-complement change to its count.
-    changed_rows: Vec<usize>,
-    /// The unique-index claims the patch gives up.
-    released: BTreeSet<(TreeId, Box<[u8]>)>,
-    /// The claims it makes, each with the primary key that makes it.
-    claimed: Claims,
+    /// The unique-index claims the patch gives up, if it gives any up: a patch of a table
+    /// without a unique index, as most are, builds no set of them.
+    released: Option<BTreeSet<(TreeId, Box<[u8]>)>>,
+    /// The claims it makes, each with the primary key that makes it, if it makes any.
+    claimed: Option<Claims>,
 }
 
 impl PagedTransaction {
@@ -389,7 +441,27 @@ impl PagedTransaction {
             tables: NameMap::new(),
             touched_tables: Vec::new(),
             totals: Totals::default(),
+            room: PatchRoom::default(),
+            #[cfg(test)]
+            general_only: false,
         }
+    }
+
+    /// Has every later statement of one change staged as a statement of several is.
+    #[cfg(test)]
+    fn set_general_only(&mut self) {
+        self.general_only = true;
+    }
+
+    /// Whether a statement of one change is staged as a statement of several is.
+    #[cfg(test)]
+    fn general_only(&self) -> bool {
+        self.general_only
+    }
+
+    #[cfg(not(test))]
+    fn general_only(&self) -> bool {
+        false
     }
 
     pub(crate) fn base_revision(&self) -> u64 {
@@ -401,16 +473,58 @@ impl PagedTransaction {
         self.tables.get(table)
     }
 
-    /// Installs a validated statement's entries for `table`, with how many more of the table's
-    /// entries delete their row once they are in place.
-    fn install(&mut self, table: String, entries: PatchEntries, deletes: isize) {
-        match self.tables.get_mut(&table) {
-            Some(overlay) => overlay.install(entries, deletes),
-            None => {
-                let mut overlay = TableOverlay::default();
-                overlay.install(entries, deletes);
-                self.tables.insert(table, overlay);
+    /// Installs a validated statement's patch, each table's entries in the overlay the patch
+    /// found for it or in a new one where it found none, and returns the patch's emptied vectors
+    /// for the next statement's.
+    fn install(&mut self, patch: OverlayPatch) -> PatchRoom {
+        let OverlayPatch {
+            mut tables,
+            mut spare,
+            mut found,
+            ..
+        } = patch;
+        // The tables are installed last name first. The patch's tables and the overlays are
+        // both in name order, so an overlay added for one table goes in at or after the place
+        // found for each table still to be installed, and leaves each of those places right.
+        while let Some(patched) = tables.pop() {
+            let PatchTable {
+                table,
+                at,
+                mut entries,
+                deletes,
+                ..
+            } = patched;
+            let overlay = match at {
+                Ok(at) => {
+                    debug_assert_eq!(
+                        self.tables.keys().nth(at).map(String::as_str),
+                        Some(&*table)
+                    );
+                    self.tables
+                        .at_mut(at)
+                        .expect("a patch's overlay stays where it was found")
+                }
+                Err(at) => {
+                    // A table is touched as its overlay is made, so the two lists name the
+                    // same tables.
+                    self.touch(&table);
+                    self.tables
+                        .insert_at(at, String::from(&*table), TableOverlay::default())
+                }
+            };
+            overlay.install(&mut entries, deletes, found.take());
+            // The transaction keeps one emptied vector, of no more capacity than a first push
+            // gives one, which is a few hundred bytes: a statement of thousands of rows does
+            // not leave its vector behind. The vector it takes the place of has no capacity, so
+            // forgetting it frees nothing less than dropping it would, without the calls a drop
+            // makes to find that out.
+            if spare.capacity() == 0 && entries.capacity() <= 4 {
+                std::mem::forget(std::mem::replace(&mut spare, entries));
             }
+        }
+        PatchRoom {
+            tables,
+            entries: spare,
         }
     }
 
@@ -550,42 +664,49 @@ impl PagedTransaction {
         if changes.is_empty() {
             return Ok(());
         }
-        let patch = self.patch(storage, changes, previous)?;
-        let change = self.validate_patch(storage, &patch)?;
+        // The patch is built in the vectors the last statement's left. A statement that fails
+        // returns with them taken, and frees them with its patch.
+        let room = std::mem::take(&mut self.room);
+        let mut patch = self.patch(storage, changes, previous, room)?;
+        let change = self.validate_patch(storage, &mut patch)?;
 
         // No fallible validation remains: a failed statement changes neither the staged rows nor
         // the totals.
-        for (((table, entries), deletes), changed_rows) in patch
-            .entries
-            .into_iter()
-            .zip(patch.deletes)
-            .zip(change.changed_rows)
-        {
-            let count = changed_count(&self.totals.changed_tables, &table, changed_rows);
+        for patched in &patch.tables {
+            let table = &*patched.table;
+            let count = changed_count(&self.totals.changed_tables, table, patched.changed);
             match self
                 .totals
                 .changed_tables
                 .iter_mut()
-                .find(|(name, _)| *name == table)
+                .find(|(name, _)| name == table)
             {
                 Some((_, counted)) => *counted = count,
                 None if count > 0 => {
                     let tables = &mut self.totals.changed_tables;
-                    let position = tables.partition_point(|(name, _)| *name < table);
-                    tables.insert(position, (table.clone(), count));
+                    let position = tables.partition_point(|(name, _)| name.as_str() < table);
+                    tables.insert(position, (table.to_owned(), count));
                 }
                 None => {}
             }
-            self.touch(&table);
-            self.install(table, entries, deletes);
         }
-        for claim in change.released {
-            if let Some(holder) = self.totals.claims.get_mut(&claim) {
-                *holder = None;
-                self.totals.released += 1;
+        let room = self.install(patch);
+        // The vectors left in the room's place when it was taken have no capacity, so they are
+        // forgotten as the emptied vector above is.
+        let taken = std::mem::replace(&mut self.room, room);
+        debug_assert!(taken.tables.capacity() == 0 && taken.entries.capacity() == 0);
+        std::mem::forget(taken);
+        if let Some(released) = change.released {
+            for claim in released {
+                if let Some(holder) = self.totals.claims.get_mut(&claim) {
+                    *holder = None;
+                    self.totals.released += 1;
+                }
             }
         }
-        self.totals.claims.extend(change.claimed);
+        if let Some(claimed) = change.claimed {
+            self.totals.claims.extend(claimed);
+        }
         if self.totals.released > 64 && self.totals.released > self.totals.claims.len() / 2 {
             for (slot, holder) in std::mem::take(&mut self.totals.claims) {
                 if holder.is_some() {
@@ -603,14 +724,21 @@ impl PagedTransaction {
     /// The overlay entries a statement's changes produce, each starting from the committed row the
     /// entry it replaces started from, or from the committed row itself. Planning read through
     /// this overlay, so a row it read for a key the overlay does not hold is the committed row.
+    /// The patch is built in the vectors of `room`.
     fn patch<D: PageDevice>(
         &self,
         storage: &PagedStorage<D>,
         changes: Vec<RowChange>,
         previous: Vec<PreviousRow>,
+        room: PatchRoom,
     ) -> Result<OverlayPatch> {
+        let PatchRoom {
+            mut tables,
+            entries: mut spare,
+        } = room;
+        debug_assert!(tables.is_empty() && spare.is_empty());
         // Each table's changes, in name order: a statement changes one.
-        let mut patched: Vec<(String, KeyedRows<PatchChange>)> = Vec::new();
+        let mut patched: Vec<(Rc<str>, KeyedRows<PatchChange>)> = Vec::new();
         let mut replaces = false;
         let count = changes.len();
         let mut previous = previous.into_iter();
@@ -640,30 +768,42 @@ impl PagedTransaction {
                 }
                 (None, _, PatchRow::Record(_)) => unreachable!("a record comes with its key"),
             };
-            // A statement's only change needs nothing merged with it.
-            if count == 1 {
-                let staged = self.table(&table);
-                let (change, replaces) =
+            // A statement's only change needs nothing merged with it: its entry goes into the
+            // kept vectors, under the change's own name for its table, and the searches made
+            // for its overlay and for its key are kept for installing it.
+            if count == 1 && !self.general_only() {
+                let at = self.tables.position(&table);
+                let staged = at.ok().and_then(|at| self.tables.at(at));
+                let (change, found) =
                     self.first_change(storage, staged, &table, &key, held, row, is_delete)?;
                 let deletes = isize::from(is_delete) - isize::from(change.replaced_delete);
                 let paged = storage.table(&table)?;
                 let indexes = storage.table_indexes(&table);
                 let entry = overlay_entry(storage, paged, &indexes, &key, change)?;
+                spare.push((key, entry));
+                tables.push(PatchTable {
+                    table,
+                    at,
+                    entries: spare,
+                    deletes,
+                    changed: 0,
+                });
                 return Ok(OverlayPatch {
-                    entries: vec![(table.to_string(), vec![(key, entry)])],
-                    deletes: vec![deletes],
-                    replaces,
+                    tables,
+                    spare: Vec::new(),
+                    replaces: matches!(found, Some(Ok(_))),
+                    found,
                 });
             }
             let (position, staged) = match &last {
                 Some((name, position, staged)) if *name == table => (*position, *staged),
                 _ => {
-                    let position = patched.partition_point(|(name, _)| name.as_str() < &*table);
+                    let position = patched.partition_point(|(name, _)| **name < *table);
                     if patched
                         .get(position)
-                        .is_none_or(|(name, _)| *name != *table)
+                        .is_none_or(|(name, _)| **name != *table)
                     {
-                        patched.insert(position, (table.to_string(), KeyedRows::default()));
+                        patched.insert(position, (Rc::clone(&table), KeyedRows::default()));
                     }
                     let staged = self.table(&table);
                     last = Some((table.clone(), position, staged));
@@ -684,17 +824,13 @@ impl PagedTransaction {
                     slot.row = row;
                 }
                 None => {
-                    let (change, replaced) =
+                    let (change, found) =
                         self.first_change(storage, staged, &table, &key, held, row, is_delete)?;
-                    replaces |= replaced;
+                    replaces |= matches!(found, Some(Ok(_)));
                     entries.insert(key, change);
                 }
             }
         }
-        let mut patch = OverlayPatch {
-            replaces,
-            ..OverlayPatch::default()
-        };
         for (table, changes) in patched {
             let paged = storage.table(&table)?;
             let indexes = storage.table_indexes(&table);
@@ -707,16 +843,28 @@ impl PagedTransaction {
                 let entry = overlay_entry(storage, paged, &indexes, &key, change)?;
                 entries.push((key, entry));
             }
-            patch.entries.push((table, entries));
-            patch.deletes.push(deletes);
+            let at = self.tables.position(&table);
+            tables.push(PatchTable {
+                table,
+                at,
+                entries,
+                deletes,
+                changed: 0,
+            });
         }
-        Ok(patch)
+        Ok(OverlayPatch {
+            tables,
+            spare,
+            replaces,
+            found: None,
+        })
     }
 
     /// A statement's first change to `key`, starting from the committed row of the entry it
     /// replaces, among those the transaction stages for the table, `staged`, or else the row
-    /// planning read, or else the row the key holds; and whether it replaces an entry the
-    /// transaction staged before.
+    /// planning read, or else the row the key holds; and where the key was looked for among the
+    /// staged keys, if it was: at the position of the entry the change replaces, or at the empty
+    /// slot a key the table does not stage would take.
     #[allow(clippy::too_many_arguments)]
     fn first_change<D: PageDevice>(
         &self,
@@ -727,17 +875,21 @@ impl PagedTransaction {
         held: PreviousRow,
         row: PatchRow,
         is_delete: bool,
-    ) -> Result<(PatchChange, bool)> {
+    ) -> Result<(PatchChange, Option<Probe>)> {
         // A key planning read no row for has no live staged entry, which planning would have
         // read, so only a table with staged deletes can hold an entry for it.
         let has_deletes = staged.is_some_and(|overlay| overlay.deletes > 0);
-        let staged = if !is_delete && !has_deletes && matches!(held, PreviousRow::Read(None)) {
-            None
-        } else {
-            staged.and_then(|overlay| overlay.get(key))
+        let unstaged = !is_delete && !has_deletes && matches!(held, PreviousRow::Read(None));
+        let (found, replaced) = match staged {
+            Some(overlay) if !unstaged => {
+                let found = overlay.index.find(&overlay.rows, key);
+                let replaced = found.ok().map(|position| &overlay.rows[position].1);
+                (Some(found), replaced)
+            }
+            _ => (None, None),
         };
-        let replaced_delete = staged.is_some_and(|entry| entry.row.next.is_none());
-        let base = match (staged, held) {
+        let replaced_delete = replaced.is_some_and(|entry| entry.row.next.is_none());
+        let base = match (replaced, held) {
             (Some(entry), _) => entry.row.old.clone(),
             (None, PreviousRow::Read(row)) => row,
             (None, PreviousRow::Unread) => {
@@ -750,7 +902,7 @@ impl PagedTransaction {
             upserted: !is_delete,
             replaced_delete,
         };
-        Ok((change, staged.is_some()))
+        Ok((change, found))
     }
 
     /// Measures a patch's entries and returns the totals with them in place of the entries they
@@ -760,66 +912,83 @@ impl PagedTransaction {
     /// A claimed value must not be held by another staged row, nor by a committed row unless the
     /// transaction changes that row, since a changed row holds only the values of its new row. A
     /// row the patch changes back to its committed state holds its committed values again.
+    ///
+    /// Each of the patch's tables is left with how many changed rows it gains or loses.
     fn validate_patch<D: PageDevice>(
         &self,
         storage: &PagedStorage<D>,
-        patch: &OverlayPatch,
+        patch: &mut OverlayPatch,
     ) -> Result<TotalsChange> {
         let mut overlay_keys = self.totals.overlay_keys;
         let mut overlay_bytes = self.totals.overlay_bytes;
         let mut usage = self.totals.usage;
-        let mut changed_rows = vec![0_usize; patch.entries.len()];
+        // The entries the transaction stages for a table of the patch, which the patch found
+        // where its overlay is, or found none.
+        let staged = |table: &PatchTable| table.at.ok().and_then(|at| self.tables.at(at));
         // Take each replaced entry's share out first, so that no total passes its limit only on
         // the way to a smaller final value. A patch of new keys, such as an insert's, has none.
-        let mut released = BTreeSet::new();
+        let mut released: Option<BTreeSet<(TreeId, Box<[u8]>)>> = None;
         if patch.replaces {
-            for ((table, entries), changed) in patch.entries.iter().zip(&mut changed_rows) {
-                for (key, _) in entries {
-                    let Some(previous) = self.table(table).and_then(|overlay| overlay.get(key))
-                    else {
+            for table in &mut patch.tables {
+                let Some(overlay) = staged(table) else {
+                    continue;
+                };
+                for (key, _) in &table.entries {
+                    let Some(previous) = overlay.get(key) else {
                         continue;
                     };
                     overlay_keys -= 1;
                     overlay_bytes -= previous.retained;
                     if let Some(cost) = &previous.cost {
                         usage = usage.minus(cost.usage);
-                        *changed = changed.wrapping_sub(1);
-                        released.extend(
-                            cost.claims
-                                .iter()
-                                .map(|claim| (claim.tree_id, claim.prefix.clone())),
-                        );
+                        table.changed = table.changed.wrapping_sub(1);
+                        if !cost.claims.is_empty() {
+                            released.get_or_insert_with(BTreeSet::new).extend(
+                                cost.claims
+                                    .iter()
+                                    .map(|claim| (claim.tree_id, claim.prefix.clone())),
+                            );
+                        }
                     }
                 }
             }
         }
-        for ((_, entries), changed) in patch.entries.iter().zip(&mut changed_rows) {
-            for (_, entry) in entries {
+        for table in &mut patch.tables {
+            for (_, entry) in &table.entries {
                 retain_entry(&mut overlay_keys, &mut overlay_bytes, entry.retained)?;
                 if let Some(cost) = &entry.cost {
                     usage = usage.plus(cost.usage)?;
-                    *changed = changed.wrapping_add(1);
+                    table.changed = table.changed.wrapping_add(1);
                 }
             }
         }
 
-        let mut claimed = Claims::new();
-        let holder = |claimed: &Claims, slot: &(TreeId, Box<[u8]>)| -> Option<Vec<u8>> {
-            claimed.get(slot).cloned().flatten().or_else(|| {
-                (!released.contains(slot))
-                    .then(|| self.totals.claims.get(slot).cloned().flatten())
-                    .flatten()
-            })
+        // The claims the patch makes, in a map made when it makes its first: most patches make
+        // none, and give none up. A map or set that was not made is read as an empty one.
+        let mut claimed: Option<Claims> = None;
+        let holder = |claimed: &Option<Claims>, slot: &(TreeId, Box<[u8]>)| -> Option<Vec<u8>> {
+            claimed
+                .as_ref()
+                .and_then(|claimed| claimed.get(slot))
+                .cloned()
+                .flatten()
+                .or_else(|| {
+                    released
+                        .as_ref()
+                        .is_none_or(|released| !released.contains(slot))
+                        .then(|| self.totals.claims.get(slot).cloned().flatten())
+                        .flatten()
+                })
         };
         // Whether the transaction changes a row, once the patch is in place.
-        let changes_row = |table: &str, key: &[u8]| {
-            patch
-                .entry(table, key)
-                .or_else(|| self.table(table).and_then(|overlay| overlay.get(key)))
+        let changes_row = |table: &PatchTable, key: &[u8]| {
+            table
+                .entry(key)
+                .or_else(|| staged(table).and_then(|overlay| overlay.get(key)))
                 .is_some_and(|entry| entry.cost.is_some())
         };
-        for (table, entries) in &patch.entries {
-            for (key, entry) in entries {
+        for table in &patch.tables {
+            for (key, entry) in &table.entries {
                 let Some(cost) = &entry.cost else {
                     continue;
                 };
@@ -833,19 +1002,21 @@ impl PagedTransaction {
                     {
                         return Err(storage.unique_violation_in(claim.tree_id));
                     }
-                    claimed.insert(slot, Some(key.clone()));
+                    claimed
+                        .get_or_insert_with(Claims::new)
+                        .insert(slot, Some(key.clone()));
                 }
             }
         }
-        for (table, entries) in &patch.entries {
-            for (key, entry) in entries {
+        for table in &patch.tables {
+            for (key, entry) in &table.entries {
                 if entry.cost.is_some() {
                     continue;
                 }
                 let Some(base) = &entry.row.old else {
                     continue;
                 };
-                for (tree_id, prefix) in storage.unique_values(table, base)? {
+                for (tree_id, prefix) in storage.unique_values(&table.table, base)? {
                     let slot = (tree_id, prefix.into_boxed_slice());
                     if holder(&claimed, &slot).is_some_and(|holder| holder != *key) {
                         return Err(storage.unique_violation_in(tree_id));
@@ -858,21 +1029,22 @@ impl PagedTransaction {
         let mut operations = 0_usize;
         for (table, count) in &self.totals.changed_tables {
             let changed = patch
-                .entries
+                .tables
                 .iter()
-                .zip(&changed_rows)
-                .find(|((name, _), _)| name == table)
-                .map_or(0, |(_, changed)| *changed);
+                .find(|patched| *patched.table == **table)
+                .map_or(0, |patched| patched.changed);
             if count.wrapping_add(changed) > 0 {
                 operations = operations
                     .checked_add(storage.catalog_operations(table))
                     .ok_or_else(batch_too_large)?;
             }
         }
-        for ((table, _), changed) in patch.entries.iter().zip(&changed_rows) {
-            if table_count(&self.totals.changed_tables, table).is_none() && *changed as isize > 0 {
+        for table in &patch.tables {
+            if table_count(&self.totals.changed_tables, &table.table).is_none()
+                && table.changed as isize > 0
+            {
                 operations = operations
-                    .checked_add(storage.catalog_operations(table))
+                    .checked_add(storage.catalog_operations(&table.table))
                     .ok_or_else(batch_too_large)?;
             }
         }
@@ -881,7 +1053,6 @@ impl PagedTransaction {
             overlay_keys,
             overlay_bytes,
             usage,
-            changed_rows,
             released,
             claimed,
         })
@@ -1698,6 +1869,264 @@ mod tests {
         assert_eq!(transaction.tables.len(), 0);
     }
 
+    #[test]
+    fn a_failed_statement_frees_the_kept_vectors_and_changes_nothing_else() {
+        // Rows that retain far more than they hold, so that few of them bring a transaction to
+        // its byte limit and writing its fingerprint out stays quick: a JSON array is estimated
+        // by its elements, however short they are.
+        let doc = Value::Array(vec![json!(0); 10_000]);
+        let mut statements = vec![
+            crate::statement::parse("CREATE TABLE docs (id INTEGER PRIMARY KEY, doc JSON)", &[])
+                .unwrap(),
+        ];
+        for id in 1..=9 {
+            statements.push(
+                crate::statement::parse(
+                    "INSERT INTO docs (id, doc) VALUES ($1, $2)",
+                    &[json!(id), doc.clone()],
+                )
+                .unwrap(),
+            );
+        }
+        let mut storage = PagedStorage::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        storage.execute_script(statements).unwrap();
+        let put = |table: &str, id: i64, doc: &Value| {
+            vec![RowChange::Upsert {
+                table: table.into(),
+                row: row(json!({"id": id, "doc": doc})),
+            }]
+        };
+        let kept = |transaction: &PagedTransaction| {
+            let room = &transaction.room;
+            assert!(room.tables.is_empty() && room.entries.is_empty());
+            (room.tables.capacity(), room.entries.capacity())
+        };
+
+        // The twin stages every statement that succeeds, and never sees one that fails.
+        let mut staged = PagedTransaction::new(storage.revision());
+        let mut twin = PagedTransaction::new(storage.revision());
+        // A row put back as it is retains its committed row and its staged one, and costs the
+        // write set nothing, so it is the overlay's own byte limit that these reach: eight fit
+        // under it, within one more of it.
+        for id in 1..=8 {
+            for transaction in [&mut staged, &mut twin] {
+                transaction
+                    .stage(&storage, put("docs", id, &doc), Vec::new())
+                    .unwrap();
+            }
+        }
+        let retained = staged.totals.overlay_bytes;
+        assert!(
+            retained < MAX_TRANSACTION_BYTES && retained + retained / 8 > MAX_TRANSACTION_BYTES
+        );
+        let (tables, entries) = kept(&staged);
+        assert!(tables > 0 && entries > 0);
+
+        // The ninth passes the limit once its patch is whole, in validation.
+        let before = staged.fingerprint();
+        let error = staged
+            .stage(&storage, put("docs", 9, &doc), Vec::new())
+            .unwrap_err();
+        assert_eq!(
+            (error.code.as_str(), error.message),
+            (
+                "TRANSACTION_TOO_LARGE",
+                format!("A transaction cannot retain more than {MAX_TRANSACTION_BYTES} bytes")
+            )
+        );
+        assert_eq!(staged.fingerprint(), before);
+        assert_eq!(kept(&staged), (0, 0));
+
+        // A small statement then stages as it does in the twin, in vectors of its own, which
+        // the transaction keeps again.
+        for transaction in [&mut staged, &mut twin] {
+            transaction
+                .stage(&storage, put("docs", 10, &Value::Null), Vec::new())
+                .unwrap();
+        }
+        assert_eq!(staged.fingerprint(), twin.fingerprint());
+        let (tables, entries) = kept(&staged);
+        assert!(tables > 0 && entries > 0);
+
+        // A statement that fails before its patch is whole frees the vectors too.
+        let before = staged.fingerprint();
+        assert_eq!(
+            staged
+                .stage(&storage, put("missing", 1, &Value::Null), Vec::new())
+                .unwrap_err()
+                .code,
+            "TABLE_NOT_FOUND"
+        );
+        assert_eq!(staged.fingerprint(), before);
+        assert_eq!(kept(&staged), (0, 0));
+        for transaction in [&mut staged, &mut twin] {
+            transaction
+                .stage(&storage, put("docs", 11, &json!([1])), Vec::new())
+                .unwrap();
+        }
+        assert_eq!(staged.fingerprint(), twin.fingerprint());
+
+        // A copy of a transaction, as a script's savepoint takes, starts without kept vectors
+        // and leaves the transaction its own.
+        let (tables, entries) = kept(&staged);
+        assert!(tables > 0 && entries > 0);
+        let copy = staged.clone();
+        assert_eq!(kept(&copy), (0, 0));
+        assert_eq!(kept(&staged), (tables, entries));
+        assert_eq!(copy.fingerprint(), staged.fingerprint());
+    }
+
+    #[test]
+    fn a_statement_of_many_rows_leaves_no_large_vector_with_the_transaction() {
+        let storage = storage();
+        let rows = |ids: std::ops::Range<i64>| {
+            ids.map(|id| RowChange::Upsert {
+                table: "items".into(),
+                row: row(json!({"id": id, "name": format!("item-{id}")})),
+            })
+            .collect::<Vec<_>>()
+        };
+        // How many entries the vector the transaction keeps has room for, which is outside
+        // every budget, so it must stay small.
+        let kept = |transaction: &PagedTransaction| {
+            let room = &transaction.room;
+            assert!(room.tables.is_empty() && room.entries.is_empty());
+            room.entries.capacity()
+        };
+
+        // A statement of many rows builds its entries in a vector of their number, which is
+        // freed once they are installed: a transaction that had kept none keeps none.
+        let mut transaction = PagedTransaction::new(storage.revision());
+        transaction
+            .stage(&storage, rows(10..1_010), Vec::new())
+            .unwrap();
+        assert_eq!(kept(&transaction), 0);
+        // A statement of one row leaves the vector its entry was pushed into, which a later
+        // statement of many rows neither builds its entries in nor replaces with its own.
+        transaction
+            .stage(&storage, rows(2_000..2_001), Vec::new())
+            .unwrap();
+        let small = kept(&transaction);
+        assert!((1..=4).contains(&small));
+        transaction
+            .stage(&storage, rows(3_000..4_000), Vec::new())
+            .unwrap();
+        assert_eq!(kept(&transaction), small);
+        assert_eq!(transaction.totals.overlay_keys, 2_001);
+
+        // A statement of a few rows leaves its vector where the transaction had kept none,
+        // since it is no larger than the one a single row leaves.
+        let mut transaction = PagedTransaction::new(storage.revision());
+        transaction
+            .stage(&storage, rows(10..13), Vec::new())
+            .unwrap();
+        assert!((3..=4).contains(&kept(&transaction)));
+    }
+
+    #[test]
+    fn a_statement_of_several_tables_installs_each_where_its_overlay_is() {
+        // Four tables, each with a unique index and a committed row under a key no other table
+        // holds, so that entries read from another table's overlay would not be found there.
+        const TABLES: [&str; 4] = ["a", "b", "c", "d"];
+        let held = |index: usize| 10 * (index as i64 + 1);
+        let mut statements = Vec::new();
+        for (index, table) in TABLES.iter().enumerate() {
+            for sql in [
+                format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"),
+                format!("CREATE UNIQUE INDEX {table}_name ON {table} (name)"),
+                format!(
+                    "INSERT INTO {table} VALUES ({}, '{table} held')",
+                    held(index)
+                ),
+            ] {
+                statements.push(crate::statement::parse(&sql, &[]).unwrap());
+            }
+        }
+        let mut storage = PagedStorage::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+        storage.execute_script(statements).unwrap();
+        let put = |index: usize, id: i64, name: &str| RowChange::Upsert {
+            table: TABLES[index].into(),
+            row: row(json!({"id": id, "name": format!("{} {name}", TABLES[index])})),
+        };
+        let chosen = |set: u32| (0..TABLES.len()).filter(move |index| set & (1 << index) != 0);
+
+        // Every set of tables the transaction stages before the statement, every set the
+        // statement changes, and a statement that only adds rows or also replaces staged ones.
+        for before in 0..16 {
+            for patched in 1..16 {
+                for replaces in [false, true] {
+                    // Each table staged before has its committed row renamed, which gives up
+                    // the name it held. The statement gives that name to a new row, which the
+                    // table's overlay allows only if the entry renaming the committed row is
+                    // read from it; and it renames the committed row again, or for a table not
+                    // staged before, for the first time.
+                    let changes = |index: usize| {
+                        let name = if before & (1 << index) != 0 {
+                            "held"
+                        } else {
+                            "new"
+                        };
+                        let mut changes = vec![put(index, 1, name)];
+                        if replaces {
+                            changes.push(put(index, held(index), "moved again"));
+                        }
+                        changes
+                    };
+                    let mut transaction = PagedTransaction::new(storage.revision());
+                    for index in chosen(before) {
+                        transaction
+                            .stage(&storage, vec![put(index, held(index), "moved")], Vec::new())
+                            .unwrap();
+                    }
+                    transaction
+                        .stage(
+                            &storage,
+                            chosen(patched).flat_map(changes).collect(),
+                            Vec::new(),
+                        )
+                        .unwrap();
+
+                    // The twin stages the same rows a change at a time, last table first.
+                    let mut twin = PagedTransaction::new(storage.revision());
+                    for index in chosen(before).rev() {
+                        twin.stage(&storage, vec![put(index, held(index), "moved")], Vec::new())
+                            .unwrap();
+                    }
+                    for index in chosen(patched).rev() {
+                        for change in changes(index) {
+                            twin.stage(&storage, vec![change], Vec::new()).unwrap();
+                        }
+                    }
+                    assert_eq!(
+                        transaction.fingerprint(),
+                        twin.fingerprint(),
+                        "{before:04b} {patched:04b} {replaces}"
+                    );
+                    // Each overlay holds the rows of its own table, which name it.
+                    assert_eq!(
+                        transaction.tables.keys().collect::<Vec<_>>(),
+                        chosen(before | patched)
+                            .map(|index| TABLES[index])
+                            .collect::<Vec<_>>()
+                    );
+                    assert_eq!(
+                        transaction.touched_tables(),
+                        transaction.tables.keys().cloned().collect::<Vec<_>>()
+                    );
+                    for (table, overlay) in transaction.tables.iter() {
+                        let paged = storage.table(table).unwrap();
+                        for (key, entry) in &overlay.rows {
+                            let record = entry.row.next.as_ref().unwrap();
+                            let staged = paged.record(key, record).unwrap().to_row().unwrap();
+                            let name = staged["name"].as_str().unwrap();
+                            assert!(name.starts_with(table.as_str()), "{table}: {name}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// What an entry inserting one small row retains.
     fn entry_bytes() -> usize {
         let next_bytes = estimated_row_bytes(&row(json!({"id": 1, "name": "one"}))).unwrap();
@@ -2185,8 +2614,9 @@ mod tests {
             appended += keys.iter().filter(|key| !oracle.contains(*key)).count();
             oracle.extend(keys.iter().cloned());
             overlay.install(
-                keys.into_iter().map(|key| (key, blank_entry())).collect(),
+                &mut keys.into_iter().map(|key| (key, blank_entry())).collect(),
                 0,
+                None,
             );
             assert_eq!(overlay.rows.len(), oracle.len());
             if random(3) == 0 || statement == 999 {

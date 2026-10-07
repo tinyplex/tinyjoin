@@ -38,6 +38,34 @@ impl<V> NameMap<V> {
             .map(|at| &mut self.values[at])
     }
 
+    /// Where `name` is among the names, or where it would go, for a caller that searches for a
+    /// name once and then reads its value with [`Self::at`], or adds it with
+    /// [`Self::insert_at`], without searching again. It only hands the search its arguments,
+    /// so it is inlined: as a function of its own it was a second call for each statement a
+    /// transaction stages.
+    #[inline(always)]
+    pub(crate) fn position(&self, name: &str) -> Result<usize, usize> {
+        search(&self.names, name)
+    }
+
+    /// The value at `position`, where [`Self::position`] found its name.
+    pub(crate) fn at(&self, position: usize) -> Option<&V> {
+        self.values.get(position)
+    }
+
+    pub(crate) fn at_mut(&mut self, position: usize) -> Option<&mut V> {
+        self.values.get_mut(position)
+    }
+
+    /// Adds `name` with `value` at `position`, where [`Self::position`] said a name the map
+    /// lacks would go, and returns the value in its place.
+    pub(crate) fn insert_at(&mut self, position: usize, name: String, value: V) -> &mut V {
+        debug_assert!(position == 0 || self.names[position - 1] < name);
+        debug_assert!(self.names.get(position).is_none_or(|next| name < *next));
+        self.names.insert(position, name);
+        self.values.insert_mut(position, value)
+    }
+
     pub(crate) fn contains_key(&self, name: &str) -> bool {
         search(&self.names, name).is_ok()
     }
@@ -137,5 +165,43 @@ mod tests {
         );
         assert_eq!(map.keys().collect::<Vec<_>>(), ["a", "b", "d"]);
         assert_eq!(map.into_iter().map(|(_, value)| value).sum::<i32>(), 34);
+    }
+
+    #[test]
+    fn reads_and_fills_the_place_a_search_found() {
+        let mut map = [("b", 2), ("d", 4)]
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect::<NameMap<_>>();
+        // A name the map holds is found where its value is, which is read and written there.
+        assert_eq!(map.position("b"), Ok(0));
+        assert_eq!(map.position("d"), Ok(1));
+        assert_eq!(map.at(1), Some(&4));
+        *map.at_mut(0).unwrap() = 20;
+        assert_eq!(map.get("b"), Some(&20));
+        assert_eq!(map.at(2), None);
+        assert_eq!(map.at_mut(2), None);
+        // A name it lacks is reported where it would go: before every name, between two, and
+        // after them all. Each is added there, and found there afterwards.
+        for (name, value, position) in [("a", 1, 0), ("c", 3, 2), ("e", 5, 4)] {
+            assert_eq!(map.position(name), Err(position));
+            let added = map.insert_at(position, name.to_owned(), value);
+            assert_eq!(*added, value);
+            *added *= 10;
+            assert_eq!(map.position(name), Ok(position));
+            assert_eq!(map.at(position), Some(&(value * 10)));
+        }
+        assert_eq!(
+            map.iter()
+                .map(|(name, value)| (name.as_str(), *value))
+                .collect::<Vec<_>>(),
+            [("a", 10), ("b", 20), ("c", 30), ("d", 4), ("e", 50)]
+        );
+        // An empty map reports the first place for any name, and takes its first name there.
+        let mut empty = NameMap::new();
+        assert_eq!(empty.position("a"), Err(0));
+        assert_eq!(empty.at(0), None::<&i32>);
+        empty.insert_at(0, "a".to_owned(), 1);
+        assert_eq!(empty.get("a"), Some(&1));
     }
 }

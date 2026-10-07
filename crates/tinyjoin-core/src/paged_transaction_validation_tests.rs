@@ -15,6 +15,9 @@ fn storage() -> PagedStorage<MemoryPageDevice> {
                   CREATE UNIQUE INDEX items_group_email ON items (group_id, email);\
                   CREATE TABLE other (id FLOAT PRIMARY KEY, email TEXT, group_id INTEGER, payload TEXT);\
                   CREATE UNIQUE INDEX other_email ON other (email);\
+                  CREATE TABLE listed (id FLOAT PRIMARY KEY, email TEXT, group_id INTEGER, payload TEXT);\
+                  CREATE INDEX listed_group ON listed (group_id);\
+                  CREATE TABLE plain (id FLOAT PRIMARY KEY, email TEXT, group_id INTEGER, payload TEXT);\
                   INSERT INTO items VALUES (0, 'base', 0, 'committed');";
     let statements = crate::sql_script::split(script)
         .unwrap()
@@ -74,7 +77,7 @@ fn stage_with_full_validation(
     if changes.is_empty() {
         return Ok(());
     }
-    let patch = transaction.patch(storage, changes, Vec::new())?;
+    let patch = transaction.patch(storage, changes, Vec::new(), PatchRoom::default())?;
     // The write set the patch leaves, as a map of each table's entries by key, which the
     // transaction no longer keeps as one.
     let mut entries: BTreeMap<String, BTreeMap<Vec<u8>, OverlayEntry>> = BTreeMap::new();
@@ -84,12 +87,16 @@ fn stage_with_full_validation(
             staged.insert(key.clone(), entry.clone());
         }
     }
-    for (table, patched) in &patch.entries {
-        entries.entry(table.clone()).or_default().extend(
-            patched
-                .iter()
-                .map(|(key, entry)| (key.clone(), entry.clone())),
-        );
+    for patched in &patch.tables {
+        entries
+            .entry(patched.table.to_string())
+            .or_default()
+            .extend(
+                patched
+                    .entries
+                    .iter()
+                    .map(|(key, entry)| (key.clone(), entry.clone())),
+            );
     }
     let (mut keys, mut bytes) = (0, 0);
     for (table, entries) in &entries {
@@ -109,22 +116,58 @@ fn stage_with_full_validation(
                 .map(move |(key, entry)| (table.as_str(), key.as_slice(), entry))
         }),
     ))?;
-    for ((table, patched), deletes) in patch.entries.into_iter().zip(patch.deletes) {
-        transaction.touch(&table);
-        transaction.install(table, patched, deletes);
-    }
+    transaction.install(patch);
     Ok(())
 }
 
+/// A transaction that stages a statement of one change as it stages a statement of several, for
+/// comparing the two ways statement by statement.
+fn general_transaction(storage: &PagedStorage<MemoryPageDevice>) -> PagedTransaction {
+    let mut transaction = PagedTransaction::new(storage.revision());
+    transaction.set_general_only();
+    transaction
+}
+
+/// Stages a statement in `staged`, and compares what that leaves with what validating the whole
+/// write set finds, in `reference`, and with what staging the statement as one of several changes
+/// leaves, in `general`.
 fn compare_stage(
     storage: &PagedStorage<MemoryPageDevice>,
     staged: &mut PagedTransaction,
     reference: &mut PagedTransaction,
+    general: &mut PagedTransaction,
     changes: Vec<RowChange>,
 ) -> Option<String> {
     let before = staged.changes(storage);
     let touched = staged.touched_tables();
+    let fingerprint = staged.fingerprint();
+    let count = changes.len();
     let actual = staged.stage(storage, changes.clone(), Vec::new());
+    // A statement's only change is staged in the vectors the transaction keeps, with the searches
+    // made for its overlay and its key kept for installing it. Staged as one of several changes
+    // it fails the same way, or leaves the same entries, totals, claims and tables.
+    let generally = general.stage(storage, changes.clone(), Vec::new());
+    let failure = |result: &Result<()>| {
+        result
+            .as_ref()
+            .err()
+            .map(|error| (error.code.clone(), error.message.clone()))
+    };
+    assert_eq!(failure(&actual), failure(&generally));
+    let after = staged.fingerprint();
+    assert_eq!(after, general.fingerprint());
+    // The kept vectors hold nothing between statements. A statement that fails frees them, and
+    // one that succeeds leaves them for the next: the patch's tables, and the entries of a
+    // statement of one change.
+    let room = &staged.room;
+    assert!(room.tables.is_empty() && room.entries.is_empty());
+    if actual.is_err() {
+        assert_eq!(after, fingerprint);
+        assert_eq!((room.tables.capacity(), room.entries.capacity()), (0, 0));
+    } else {
+        assert!(room.tables.capacity() > 0);
+        assert!(count > 1 || room.entries.capacity() > 0);
+    }
     let expected = stage_with_full_validation(storage, reference, changes);
     assert_eq!(
         actual.as_ref().err().map(|error| &error.code),
@@ -132,7 +175,7 @@ fn compare_stage(
     );
     assert_eq!(staged.changes(storage), reference.changes(storage));
     assert_eq!(staged.touched_tables(), reference.touched_tables());
-    for table in ["items", "other"] {
+    for table in ["items", "other", "listed", "plain"] {
         assert_eq!(
             PagedReadView::new(storage, Some(staged))
                 .scan_table(table)
@@ -204,6 +247,7 @@ fn staged_totals_match_full_validation_for_unique_and_mixed_statements() {
     let mut storage = storage();
     let mut fast = PagedTransaction::new(storage.revision());
     let mut fallback = PagedTransaction::new(storage.revision());
+    let mut general = general_transaction(&storage);
     let appends = [
         vec![upsert("items", json!(1), json!("one"), "")],
         vec![
@@ -215,7 +259,7 @@ fn staged_totals_match_full_validation_for_unique_and_mixed_statements() {
     ];
     for patch in appends {
         assert_eq!(
-            compare_stage(&storage, &mut fast, &mut fallback, patch),
+            compare_stage(&storage, &mut fast, &mut fallback, &mut general, patch),
             None
         );
     }
@@ -234,7 +278,7 @@ fn staged_totals_match_full_validation_for_unique_and_mixed_statements() {
         vec![upsert("items", json!(1), json!("base"), "")],
     ] {
         assert_eq!(
-            compare_stage(&storage, &mut fast, &mut fallback, patch).as_deref(),
+            compare_stage(&storage, &mut fast, &mut fallback, &mut general, patch).as_deref(),
             Some("CONSTRAINT_VIOLATION")
         );
     }
@@ -243,6 +287,7 @@ fn staged_totals_match_full_validation_for_unique_and_mixed_statements() {
             &storage,
             &mut fast,
             &mut fallback,
+            &mut general,
             vec![upsert("items", json!(4), json!("four"), "")]
         ),
         None
@@ -254,6 +299,7 @@ fn staged_totals_match_full_validation_for_unique_and_mixed_statements() {
             &storage,
             &mut fast,
             &mut fallback,
+            &mut general,
             vec![delete(0), upsert("items", json!(5), json!("base"), "")]
         ),
         None
@@ -267,7 +313,7 @@ fn staged_totals_match_full_validation_for_unique_and_mixed_statements() {
         vec![delete(9)],
     ] {
         assert_eq!(
-            compare_stage(&storage, &mut fast, &mut fallback, patch),
+            compare_stage(&storage, &mut fast, &mut fallback, &mut general, patch),
             None
         );
     }
@@ -285,6 +331,7 @@ fn budget_failures_match_full_validation_and_do_not_consume_capacity() {
     let storage = storage();
     let mut fast = PagedTransaction::new(storage.revision());
     let mut fallback = PagedTransaction::new(storage.revision());
+    let mut general = general_transaction(&storage);
     let large = "x".repeat(500_000);
     let mut failed_id = None;
     for id in 1..20 {
@@ -292,6 +339,7 @@ fn budget_failures_match_full_validation_and_do_not_consume_capacity() {
             &storage,
             &mut fast,
             &mut fallback,
+            &mut general,
             vec![upsert(
                 "items",
                 json!(id),
@@ -313,6 +361,7 @@ fn budget_failures_match_full_validation_and_do_not_consume_capacity() {
             &storage,
             &mut fast,
             &mut fallback,
+            &mut general,
             vec![upsert(
                 "items",
                 json!(id),
@@ -327,6 +376,7 @@ fn budget_failures_match_full_validation_and_do_not_consume_capacity() {
             &storage,
             &mut fast,
             &mut fallback,
+            &mut general,
             vec![upsert(
                 "items",
                 json!(id + 1),
@@ -385,9 +435,131 @@ fn transaction_script_savepoints_restore_staged_rows_and_claims() {
     );
 }
 
+/// A script inside a transaction stages in a copy of it, which starts without the vectors the
+/// transaction keeps from statement to statement. A script that fails leaves the transaction as
+/// it was, and one that succeeds leaves what its statements would have staged one by one, with
+/// or without a unique index to hold claims for.
+#[test]
+fn transaction_script_savepoints_restore_what_single_statements_staged() {
+    for unique in [false, true] {
+        let open = || {
+            let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+            engine
+                .exec_sql(
+                    "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL);\
+                     INSERT INTO notes VALUES (1, 'one'), (2, 'two');",
+                )
+                .unwrap();
+            if unique {
+                engine
+                    .exec_sql("CREATE UNIQUE INDEX notes_body ON notes (body)")
+                    .unwrap();
+            }
+            engine.begin_transaction().unwrap();
+            engine
+        };
+        // The twin runs every statement that takes effect, and never the script that fails.
+        let (mut engine, mut twin) = (open(), open());
+        let both = |engine: &mut PagedEngine<MemoryPageDevice>,
+                    twin: &mut PagedEngine<MemoryPageDevice>,
+                    sql: &str| {
+            for engine in [&mut *engine, &mut *twin] {
+                engine.execute_sql(sql, &[]).unwrap();
+            }
+            assert_eq!(
+                engine.transaction_fingerprint(),
+                twin.transaction_fingerprint(),
+                "{sql}"
+            );
+        };
+        both(
+            &mut engine,
+            &mut twin,
+            "INSERT INTO notes VALUES (3, 'three')",
+        );
+        both(
+            &mut engine,
+            &mut twin,
+            "UPDATE notes SET body = 'first' WHERE id = 1",
+        );
+
+        // The script stages a row under the value the update gave up, replaces a staged row,
+        // and then fails: on a value a staged row holds where there is a unique index, and
+        // otherwise on a key the table holds.
+        let before = engine.transaction_fingerprint();
+        assert_eq!(
+            engine
+                .exec_sql(
+                    "INSERT INTO notes VALUES (4, 'one');\
+                     UPDATE notes SET body = 'third' WHERE id = 3;\
+                     INSERT INTO notes VALUES (5, 'first');\
+                     INSERT INTO notes VALUES (2, 'again');"
+                )
+                .unwrap_err()
+                .code,
+            "CONSTRAINT_VIOLATION"
+        );
+        assert_eq!(engine.transaction_fingerprint(), before);
+        // The value and the key the script staged are free again, and the row it replaced is
+        // replaced as if for the first time.
+        both(
+            &mut engine,
+            &mut twin,
+            "INSERT INTO notes VALUES (4, 'one')",
+        );
+        both(
+            &mut engine,
+            &mut twin,
+            "UPDATE notes SET body = 'tres' WHERE id = 3",
+        );
+        both(&mut engine, &mut twin, "DELETE FROM notes WHERE id = 2");
+
+        // A script that succeeds stages what its statements do one by one.
+        let script = [
+            "INSERT INTO notes VALUES (6, 'six')",
+            "UPDATE notes SET body = 'four' WHERE id = 4",
+            "DELETE FROM notes WHERE id = 1",
+        ];
+        engine.exec_sql(&script.join("; ")).unwrap();
+        for sql in script {
+            twin.execute_sql(sql, &[]).unwrap();
+        }
+        assert_eq!(
+            engine.transaction_fingerprint(),
+            twin.transaction_fingerprint()
+        );
+        both(
+            &mut engine,
+            &mut twin,
+            "INSERT INTO notes VALUES (7, 'one')",
+        );
+
+        let committed = engine.commit_transaction().unwrap();
+        assert_eq!(
+            format!("{committed:?}"),
+            format!("{:?}", twin.commit_transaction().unwrap())
+        );
+        assert_eq!(engine.database_hash(), twin.database_hash());
+        engine.check().unwrap();
+        assert_eq!(
+            engine
+                .query_sql("SELECT id, body FROM notes ORDER BY id", &[])
+                .unwrap()
+                .rows,
+            vec![
+                row(json!({"id": 3, "body": "tres"})),
+                row(json!({"id": 4, "body": "four"})),
+                row(json!({"id": 6, "body": "six"})),
+                row(json!({"id": 7, "body": "one"})),
+            ]
+        );
+    }
+}
+
 /// Generated sequences of inserts, updates, deletes and reverts over two unique indexes, including
 /// swaps of unique values and rows changed back to their committed state, stage exactly as
-/// validating the whole write set does.
+/// validating the whole write set does; and so do the same sequences over a table with an index
+/// that is not unique, and over one with none, whose rows claim nothing.
 #[test]
 fn generated_mixed_statements_stage_as_full_validation_does() {
     struct Random(u64);
@@ -402,12 +574,14 @@ fn generated_mixed_statements_stage_as_full_validation_does() {
     }
     let mut storage = storage();
     let mut engine = PagedEngine::open(storage.into_device()).unwrap();
-    engine
-        .exec_sql(
-            "INSERT INTO items VALUES (1, 'a', 1, 'p'), (2, 'b', 1, 'p'), (3, 'c', 2, 'p'), \
-             (4, NULL, 2, 'p'), (5, 'e', NULL, 'p')",
-        )
-        .unwrap();
+    for table in ["items", "listed", "plain"] {
+        engine
+            .exec_sql(&format!(
+                "INSERT INTO {table} VALUES (1, 'a', 1, 'p'), (2, 'b', 1, 'p'), (3, 'c', 2, 'p'), \
+                 (4, NULL, 2, 'p'), (5, 'e', NULL, 'p')"
+            ))
+            .unwrap();
+    }
     storage = PagedStorage::open(engine.into_device()).unwrap();
     let emails = [
         json!("a"),
@@ -418,37 +592,50 @@ fn generated_mixed_statements_stage_as_full_validation_does() {
         Value::Null,
     ];
     let mut random = Random(0x5e7);
-    let mut failures = 0;
-    for _ in 0..200 {
-        let mut staged = PagedTransaction::new(storage.revision());
-        let mut reference = PagedTransaction::new(storage.revision());
-        for _ in 0..12 {
-            let changes = (0..1 + random.below(3))
-                .map(|_| {
-                    let id = 1 + random.below(7) as i64;
-                    if random.below(4) == 0 {
-                        delete(id)
-                    } else {
-                        let email = emails[random.below(emails.len())].clone();
-                        let group = [json!(1), json!(2), Value::Null][random.below(3)].clone();
-                        RowChange::Upsert {
-                            table: "items".into(),
-                            row: row(json!({
-                                "id": crate::storage::float_value(&json!(id)),
-                                "email": email,
-                                "group_id": group,
-                                "payload": "p",
-                            })),
+    for (table, transactions) in [("items", 200), ("listed", 60), ("plain", 60)] {
+        let mut failures = 0;
+        for _ in 0..transactions {
+            let mut staged = PagedTransaction::new(storage.revision());
+            let mut reference = PagedTransaction::new(storage.revision());
+            let mut general = general_transaction(&storage);
+            for _ in 0..12 {
+                let changes = (0..1 + random.below(3))
+                    .map(|_| {
+                        let id = 1 + random.below(7) as i64;
+                        if random.below(4) == 0 {
+                            RowChange::Delete {
+                                table: table.into(),
+                                key: row(json!({"id": id})),
+                            }
+                        } else {
+                            let email = emails[random.below(emails.len())].clone();
+                            let group = [json!(1), json!(2), Value::Null][random.below(3)].clone();
+                            RowChange::Upsert {
+                                table: table.into(),
+                                row: row(json!({
+                                    "id": crate::storage::float_value(&json!(id)),
+                                    "email": email,
+                                    "group_id": group,
+                                    "payload": "p",
+                                })),
+                            }
                         }
-                    }
-                })
-                .collect::<Vec<_>>();
-            if compare_stage(&storage, &mut staged, &mut reference, changes).is_some() {
-                failures += 1;
+                    })
+                    .collect::<Vec<_>>();
+                if compare_stage(&storage, &mut staged, &mut reference, &mut general, changes)
+                    .is_some()
+                {
+                    failures += 1;
+                }
             }
         }
+        // A statement that writes one key twice fails in any table, and the unique indexes
+        // refuse more.
+        assert!(
+            failures > 20,
+            "only {failures} statements on {table} failed"
+        );
     }
-    assert!(failures > 20, "only {failures} statements failed");
 }
 
 /// Plans as a reader without record layouts does: every inserted or updated row as a map. It

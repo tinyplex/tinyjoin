@@ -3257,6 +3257,16 @@ optimized the code and 10% less after, 200-row inserts 16% and 15% less, and
 updates, upserts and deletes by key 3% to 5% less; the engine is 2.2 KiB
 smaller compressed.
 
+A statement that changes one row, as nearly every statement in a transaction
+does, builds its entry in two vectors that the transaction keeps from one
+statement to the next, where it built four vectors, a copy of its table's
+name, and two sets of unique-index claims that almost always stayed empty.
+The search for its table's staged rows and the probe for its key, each made
+to read the row it replaces, are kept for installing its entry, where each
+was made again. Before V8 has optimized the code, an update, upsert or delete
+by key and an insert in a transaction each run 4% to 5% fewer instructions,
+with a third fewer calls in staging.
+
 ### Comparing memory
 
 The WebAssembly build compares memory eight bytes at a time, in place of the

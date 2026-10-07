@@ -538,6 +538,21 @@ Found along the way:
   (3.50), and insert-autocommit, whose statements commit and so cross as
   before, 364.9 to 359.9. The package is 3.4 KiB larger compressed: 1.2 in
   the client, 1.3 in the Worker and 0.8 in the engine.
+- A statement of one change is staged without the bookkeeping a statement of
+  many needs. Its patch is one vector of one struct per table, built in two
+  vectors the transaction keeps between statements, the entries vector only
+  while it is no larger than a first push makes one, so that a statement of
+  thousands of rows leaves nothing behind; the claims a patch gives up and
+  makes are sets made only when there is one to hold; and the place
+  `NameMap::position` found for the table's overlay and the probe
+  `KeyIndex::find` made for the key are carried to the install rather than
+  repeated. A test stages the same changes both ways and compares the
+  transactions, and 79,000 generated statements gave the same results and
+  pages before and after. Instructions under baseline compilation: update-pk
+  -3.9%, upsert -4.6%, delete-pk -4.4%, insert-transaction -5.2%,
+  insert-indexed -4.7%, with staging's calls a third fewer (an update's 299
+  to 205, its allocations there 5 to none); whole stack, cold, -1.6% to
+  -3.7% by median; 33 bytes smaller compressed.
 
 Found along the way, 6 and 7 October:
 
