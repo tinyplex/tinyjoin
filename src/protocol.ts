@@ -11,12 +11,13 @@ import {
   isRecord,
   isString,
   isUndefined,
+  MAX_CHANGED_KEYS_PER_TABLE,
   MAX_U32,
   objHasOwn,
   objValues,
 } from './common.js';
 
-export const PROTOCOL_VERSION = 11 as const;
+export const PROTOCOL_VERSION = 12 as const;
 
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue =
@@ -132,9 +133,10 @@ export interface ApplyOutcome {
  * with each row's values in field order: an object keyed by field name, or an
  * array when the request asked for `rowMode: 'array'`.
  *
- * A result that changed nothing durable crosses from the Worker as
- * {@link SqlResultText}, which the Worker does not parse; one that committed
- * crosses as this object, which the Worker read to publish its changes.
+ * A result that published nothing, and has a shape a
+ * {@link StatementResponse} can hold, crosses from the Worker as that flat
+ * array instead; one that committed crosses as this object, which the Worker
+ * read to publish its changes.
  */
 export interface SqlResult {
   command: string;
@@ -144,12 +146,6 @@ export interface SqlResult {
   keys: ChangedKeys;
   data: string;
 }
-
-/**
- * A {@link SqlResult} as JSON text: its header, which is the result without
- * its `data`, and then its `data`.
- */
-export type SqlResultText = [header: string, data: string];
 
 /** The fields and rows a {@link SqlResult} carries as JSON text. */
 export interface SqlData {
@@ -205,7 +201,12 @@ export interface RpcMethods {
   };
   commitTransaction: {
     request: {transactionId: string};
-    response: ApplyOutcome;
+    /**
+     * The revision the commit published. The tables and keys it changed reach
+     * subscribers in the change event that follows, so the response does not
+     * carry them a second time.
+     */
+    response: {revision: number};
   };
   rollbackTransaction: {
     request: {transactionId: string};
@@ -259,6 +260,86 @@ export type WorkerEvent = {
   event: 'tablesChanged' | 'resync';
   payload: ApplyOutcome;
 };
+
+/** The operation a {@link StatementRequest} asks for: a statement's SQL text. */
+export const STATEMENT_SQL = 1;
+/** The operation a {@link StatementRequest} asks for: a prepared statement. */
+export const STATEMENT_PREPARED = 4;
+/** Where a {@link StatementRequest}'s parameters begin. */
+export const STATEMENT_PARAMS = 6;
+
+/**
+ * A statement sent as one flat array, rather than as a {@link WorkerRequest}:
+ * its `executeSql` or `executePrepared` request with every value in a fixed
+ * place and no names. A structured clone copies an array of scalars in about
+ * half the time it copies the request object, and both ends read it by index.
+ *
+ * The slots are the protocol version, the request's id, the operation
+ * ({@link STATEMENT_SQL} or {@link STATEMENT_PREPARED}), the SQL text or the
+ * prepared statement's id, the transaction's id or `0` outside one, `1` for
+ * array rows or `0` for object rows, and then the statement's parameters,
+ * from {@link STATEMENT_PARAMS} on.
+ */
+export type StatementRequest = [
+  v: typeof PROTOCOL_VERSION,
+  id: number,
+  operation: typeof STATEMENT_SQL | typeof STATEMENT_PREPARED,
+  target: string | number,
+  transaction: string | 0,
+  arrayRows: 0 | 1,
+  ...params: JsonValue[],
+];
+
+/**
+ * The commands a {@link StatementResponse} names by number: each is at its
+ * number's place.
+ */
+export const STATEMENT_COMMANDS = ['INSERT', 'UPDATE', 'DELETE', 'SELECT'] as const;
+/** The number of `SELECT` in {@link STATEMENT_COMMANDS}. */
+export const STATEMENT_SELECT = 3;
+
+/**
+ * The response to a statement whose result published nothing, as one flat
+ * array rather than a {@link WorkerResponse} holding a {@link SqlResult}:
+ * every statement inside a transaction, every read, and a write outside a
+ * transaction that changed no row. Nothing in it is JSON text for either
+ * thread to write or parse, apart from a read's rows.
+ *
+ * The first five slots are the protocol version, the request's id, the
+ * command's number in {@link STATEMENT_COMMANDS}, the revision, and the row
+ * count. What follows depends on the command. A `SELECT` has one more slot,
+ * its fields and rows as the JSON text {@link SqlResult.data} holds. A write
+ * that changed no table has none. A write that changed a table has the
+ * table's name, and, when the table's changed keys are reported, the number of
+ * columns in its primary key, those columns' names, and then each changed
+ * key's values in that order, one key after another.
+ *
+ * A result of any other shape, such as one with `RETURNING` rows, or one that
+ * changed several tables, crosses as a {@link SqlResult} in a
+ * {@link WorkerResponse}, as a result that committed does.
+ */
+export type StatementResponse = [
+  v: typeof PROTOCOL_VERSION,
+  id: number,
+  command: number,
+  revision: number,
+  rowCount: number,
+  ...rest: JsonPrimitive[],
+];
+
+/**
+ * A {@link StatementResponse} before it is posted, as the engine's bridge
+ * returns it: its first two slots, the version and the request's id, are
+ * filled by whoever posts it.
+ */
+export type StatementResult = [
+  v: number,
+  id: number,
+  command: number,
+  revision: number,
+  rowCount: number,
+  ...rest: JsonPrimitive[],
+];
 
 const MAX_ARRAY_ITEMS = 1_000_000;
 const MAX_TRANSACTION_ID_LENGTH = 128;
@@ -353,6 +434,180 @@ export const isWorkerRequest = (value: unknown): value is WorkerRequest => {
   }
 };
 
+/**
+ * Whether `value` is a statement request: an array, with each of its fixed
+ * slots as {@link StatementRequest} gives it, and parameters that
+ * {@link isWorkerRequest} would accept as a statement's.
+ */
+export const isStatementRequest = (value: unknown): value is StatementRequest => {
+  if (!arrayIsArray(value) || value.length < STATEMENT_PARAMS) {
+    return false;
+  }
+  const length = value.length;
+  const operation: unknown = value[2];
+  const target: unknown = value[3];
+  const transaction: unknown = value[4];
+  const arrayRows: unknown = value[5];
+  if (
+    value[0] !== PROTOCOL_VERSION ||
+    !isRequestId(value[1]) ||
+    !(operation === STATEMENT_PREPARED
+      ? isPreparedStatementId(target)
+      : operation === STATEMENT_SQL && typeof target === 'string') ||
+    !(transaction === 0 || isTransactionId(transaction)) ||
+    !(arrayRows === 0 || arrayRows === 1) ||
+    length - STATEMENT_PARAMS > MAX_ARRAY_ITEMS
+  ) {
+    return false;
+  }
+  // Nearly every parameter is a scalar, which is checked where it stands. A
+  // hole reads as undefined, which no scalar is, and so falls to the full
+  // check, which refuses it.
+  for (let index = STATEMENT_PARAMS; index < length; index++) {
+    const item: unknown = value[index];
+    if (typeof item === 'number') {
+      if (!Number.isFinite(item)) {
+        return false;
+      }
+    } else if (
+      !(item === null || typeof item === 'boolean' || typeof item === 'string')
+    ) {
+      const validation = createJsonValidation();
+      for (let rest = STATEMENT_PARAMS; rest < length; rest++) {
+        if (!objHasOwn(value, rest) || !validation.isJson(value[rest])) {
+          return false;
+        }
+      }
+      return true;
+    }
+  }
+  return true;
+};
+
+/**
+ * The most primary-key columns a {@link StatementResponse} may list, which is
+ * more than a table may declare.
+ */
+const MAX_KEY_COLUMNS = 255;
+
+const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
+
+/**
+ * Whether an array a Worker posted is a statement response, in everything the
+ * Worker itself wrote: its fixed slots, and the shape its command gives the
+ * rest. A `SELECT`'s rows are JSON text the engine wrote and the Worker passed
+ * on unread, which {@link isSqlDataText} checks apart, so that text the page
+ * cannot read fails its own statement rather than the Worker.
+ *
+ * Without `deep`, as for the Worker TinyJoin ships, the changed keys' columns
+ * and values are left unread, as a result's header check leaves them. With
+ * `deep`, as for a Worker an application supplied, every one of them is
+ * checked, and no more keys may be listed than a table reports.
+ *
+ * The page runs this for every statement, mostly before its code has been
+ * optimized, where each helper is a call that costs more than the check it
+ * makes. So the id and the counts are tested here with comparisons, which say
+ * what isRequestId(), isCount() and isCountWithin() say: a number that is an
+ * integer, within the safe range, and at least the least it may be.
+ */
+export const isStatementResponse = (
+  value: readonly unknown[],
+  deep: boolean,
+): value is StatementResponse => {
+  const length = value.length;
+  const id: unknown = value[1];
+  const command: unknown = value[2];
+  const revision: unknown = value[3];
+  const rowCount: unknown = value[4];
+  if (
+    length < 5 ||
+    value[0] !== PROTOCOL_VERSION ||
+    !(
+      typeof id === 'number' &&
+      id >= 1 &&
+      id <= MAX_SAFE_INTEGER &&
+      id % 1 === 0
+    ) ||
+    !(
+      typeof revision === 'number' &&
+      revision >= 0 &&
+      revision <= MAX_SAFE_INTEGER &&
+      revision % 1 === 0
+    ) ||
+    !(
+      typeof rowCount === 'number' &&
+      rowCount >= 0 &&
+      rowCount <= MAX_SAFE_INTEGER &&
+      rowCount % 1 === 0
+    )
+  ) {
+    return false;
+  }
+  if (command === STATEMENT_SELECT) {
+    return length === 6 && typeof value[5] === 'string';
+  }
+  if (command !== 0 && command !== 1 && command !== 2) {
+    return false;
+  }
+  if (length === 5) {
+    return true;
+  }
+  if (typeof value[5] !== 'string') {
+    return false;
+  }
+  if (length === 6) {
+    return true;
+  }
+  const width: unknown = value[6];
+  if (
+    !(
+      typeof width === 'number' &&
+      width >= 1 &&
+      width <= MAX_KEY_COLUMNS &&
+      width % 1 === 0
+    )
+  ) {
+    return false;
+  }
+  const values = length - 7 - width;
+  if (values < 0 || values % width !== 0) {
+    return false;
+  }
+  if (!deep) {
+    return true;
+  }
+  if (values / width > MAX_CHANGED_KEYS_PER_TABLE) {
+    return false;
+  }
+  for (let index = 7; index < length; index++) {
+    const item: unknown = value[index];
+    if (!objHasOwn(value, index)) {
+      return false;
+    }
+    if (index < 7 + width) {
+      if (typeof item !== 'string') {
+        return false;
+      }
+    } else if (typeof item === 'number') {
+      if (!Number.isFinite(item)) {
+        return false;
+      }
+    } else if (
+      !(item === null || typeof item === 'boolean' || typeof item === 'string')
+    ) {
+      return false;
+    }
+  }
+  return true;
+};
+
+/**
+ * Whether `text` is a result's fields and rows as JSON, parsed and walked in
+ * full, as the full check of a {@link SqlResult} walks its `data`.
+ */
+export const isSqlDataText = (text: string): boolean =>
+  isSqlData(parseSqlData(text), createJsonValidation());
+
 export const isRpcResult = <Method extends RpcMethod>(
   method: Method,
   value: unknown,
@@ -404,7 +659,11 @@ const isResult = (
     case 'close':
       return isUndefined(value);
     case 'commitTransaction':
-      return isApplyOutcome(value);
+      return (
+        isRecord(value) &&
+        hasExactKeys(value, ['revision']) &&
+        isCount(value.revision)
+      );
     case 'schema':
       return isSchema(value);
     case 'setSchema':
@@ -614,7 +873,11 @@ const isSchema = (value: unknown): value is Schema => {
   );
 };
 
-const isApplyOutcome = (value: unknown): value is ApplyOutcome =>
+/**
+ * Whether `value` is the outcome of a commit, as an event carries one and as
+ * the engine reports one: its revision, and the tables and keys it changed.
+ */
+export const isApplyOutcome = (value: unknown): value is ApplyOutcome =>
   isRecord(value) &&
   hasExactKeys(value, ['revision', 'tables', 'keys']) &&
   isCount(value.revision) &&
@@ -671,25 +934,6 @@ export const parseSqlData = (text: string): unknown => {
   } catch {
     return undefined;
   }
-};
-
-/** Whether a statement's result crossed as {@link SqlResultText}. */
-export const isSqlResultText = (value: unknown): value is SqlResultText =>
-  arrayIsArray(value) &&
-  value.length === 2 &&
-  isString(value[0]) &&
-  isString(value[1]);
-
-/**
- * Reads a statement's result sent as {@link SqlResultText}: its header is
- * parsed, and its data attached, for the result's checks to judge.
- */
-export const readSqlResult = (value: SqlResultText): unknown => {
-  const header = parseSqlData(value[0]);
-  if (isRecord(header)) {
-    header.data = value[1];
-  }
-  return header;
 };
 
 const isSqlData = (

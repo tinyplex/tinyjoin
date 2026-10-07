@@ -13,7 +13,8 @@ export const decodeRequest = (
   bytes: Uint8Array,
 ): unknown => {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const decoder = new TextDecoder('utf-8', {fatal: true});
+  // A byte order mark is a character of a string like any other.
+  const decoder = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true});
   let at = 0;
   const u8 = (): number => view.getUint8(at++);
   const u32 = (): number => {

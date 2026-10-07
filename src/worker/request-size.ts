@@ -1,3 +1,5 @@
+import {STATEMENT_PARAMS, type StatementRequest} from '../protocol.js';
+
 /**
  * Estimates retained JSON-like request data without serializing or expanding it.
  * Container identity is charged once; each property/array slot and string value
@@ -78,6 +80,49 @@ export const requestBytes = (value: unknown, limit: number): number => {
 };
 
 /**
+ * What {@link checkedRequestBytes} charges the request that a statement
+ * request stands for, computed from the array as it arrived, so that the
+ * request's object need not be built to be measured, nor walked.
+ *
+ * Everything but the parameters has a fixed charge: the request object with
+ * its four keys, its two numbers and its method's name; the parameters object
+ * with its `params` key; `sql` and the text or `statementId` and its number;
+ * `transactionId` and the id inside a transaction; and `rowMode` and `array`
+ * for array rows. The parameters are then charged as their array would be. A
+ * parameter that is not a scalar sends them all through the walk, which
+ * charges a container that several of them share once, as it would there.
+ */
+export const statementBytes = (
+  request: StatementRequest,
+  limit: number,
+): number => {
+  const length = request.length;
+  const target = request[3];
+  const transaction = request[4];
+  const fixed =
+    (typeof target === 'string' ? 324 + target.length * 2 : 342) +
+    (transaction === 0 ? 0 : 66 + transaction.length * 2) +
+    (request[5] === 1 ? 64 : 0);
+  let bytes = fixed + 32 + (length - STATEMENT_PARAMS) * 8;
+  for (let index = STATEMENT_PARAMS; index < length; index++) {
+    const value = request[index];
+    if (typeof value === 'string') bytes += 16 + value.length * 2;
+    else if (
+      value === null ||
+      typeof value === 'boolean' ||
+      typeof value === 'number'
+    )
+      bytes += 8;
+    else
+      return fixed > limit
+        ? limit + 1
+        : fixed +
+            checkedRequestBytes(request.slice(STATEMENT_PARAMS), limit - fixed);
+  }
+  return bytes > limit ? limit + 1 : bytes;
+};
+
+/**
  * {@link requestBytes} for a value a protocol check has already accepted: plain
  * data from a structured clone or a literal, whose containers are plain objects
  * and dense arrays. It charges exactly what {@link requestBytes} charges, but
@@ -86,60 +131,6 @@ export const requestBytes = (value: unknown, limit: number): number => {
  * container's own properties are exactly its enumerable ones, which
  * Object.keys lists far faster than a for-in loop visits them.
  */
-/**
- * {@link checkedRequestBytes} for a statement request whose parameters are a
- * few scalars, as nearly every statement's are: charged exactly as the walk
- * would charge them, without the walk. Any other request is walked.
- */
-export const statementRequestBytes = (
-  request: {method: string; params: unknown},
-  limit: number,
-): number => {
-  const params = request.params as Record<string, unknown> | undefined;
-  const values = params?.params;
-  if (
-    (request.method === 'executePrepared' || request.method === 'executeSql') &&
-    params !== undefined &&
-    Array.isArray(values) &&
-    values.length <= 4096
-  ) {
-    // The request object with its keys `v`, `id`, `method` and `params`, the
-    // numbers and the method's name; then the parameters object with its keys,
-    // each scalar value, and the array of parameters.
-    let bytes = 222 + request.method.length * 2;
-    for (const key of Object.keys(params)) {
-      const value = params[key];
-      bytes += 24 + key.length * 2;
-      if (key === 'params') {
-        bytes += 32;
-        continue;
-      }
-      if (typeof value === 'string') bytes += 16 + value.length * 2;
-      else if (
-        value === undefined ||
-        value === null ||
-        typeof value === 'boolean' ||
-        typeof value === 'number'
-      )
-        bytes += 8;
-      else return checkedRequestBytes(request, limit);
-    }
-    bytes += values.length * 8;
-    for (const value of values) {
-      if (typeof value === 'string') bytes += 16 + value.length * 2;
-      else if (
-        value === null ||
-        typeof value === 'boolean' ||
-        typeof value === 'number'
-      )
-        bytes += 8;
-      else return checkedRequestBytes(request, limit);
-    }
-    return bytes > limit ? limit + 1 : bytes;
-  }
-  return checkedRequestBytes(request, limit);
-};
-
 export const checkedRequestBytes = (value: unknown, limit: number): number => {
   if (
     !Number.isSafeInteger(limit) ||

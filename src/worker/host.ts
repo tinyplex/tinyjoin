@@ -1,4 +1,5 @@
 import {
+  arrayIsArray,
   asCodedError,
   finishChangedKeys,
   isRecord,
@@ -11,11 +12,16 @@ import {
 import {ClientError} from '../client/error.js';
 import {
   PROTOCOL_VERSION,
-  isSqlResultText,
+  STATEMENT_PARAMS,
+  STATEMENT_PREPARED,
+  isStatementRequest,
   isWorkerRequest,
   type ApplyOutcome,
   type SerializedError,
-  type SqlResultText,
+  type SqlResult,
+  type StatementRequest,
+  type StatementResponse,
+  type StatementResult,
   type StorageOptions,
   type WorkerEvent,
   type WorkerRequest,
@@ -29,7 +35,9 @@ import {
 import {createOpfsWasmEngine} from './opfs-loader.js';
 
 export interface WorkerScope {
-  postMessage(message: WorkerResponse | WorkerEvent): void;
+  postMessage(
+    message: WorkerResponse | StatementResponse | WorkerEvent,
+  ): void;
   addEventListener(
     type: 'message',
     listener: (event: MessageEvent<unknown>) => void,
@@ -65,8 +73,52 @@ export interface WorkerController {
    * been.
    */
   requestNow(request: WorkerRequest): Served | undefined;
+  /**
+   * Serves a statement request at once, as requestNow() serves the request it
+   * stands for, but reading its parameters where they arrived, and with
+   * nothing built to carry the outcome: it returns the result, or throws what
+   * the engine or one of this host's own checks threw, which serializeError()
+   * turns into the error a response would carry. `undefined` means it cannot
+   * be served before earlier requests, and has not been.
+   *
+   * `target` and `transactionId` stand in for the request's own. A database
+   * owner serves each client's statement under the names the engine and this
+   * host gave its prepared statement and its transaction.
+   */
+  statementNow(
+    request: StatementRequest,
+    target: string | number,
+    transactionId: string | undefined,
+  ): SqlResult | StatementResult | undefined;
   close(): Promise<void>;
 }
+
+/**
+ * The request a statement request stands for, with exactly the keys a client
+ * gives it: `transactionId` only inside a transaction, and `rowMode` only for
+ * array rows. A statement that cannot be served at once takes its turn as
+ * this request, so that everything a waiting request meets finds it as it
+ * always was.
+ */
+export const statementRequest = (request: StatementRequest): WorkerRequest => {
+  const prepared = request[2] === STATEMENT_PREPARED;
+  const values = request.slice(STATEMENT_PARAMS);
+  const params: Record<string, unknown> = prepared
+    ? {statementId: request[3], params: values}
+    : {sql: request[3], params: values};
+  if (request[4] !== 0) {
+    params.transactionId = request[4];
+  }
+  if (request[5] === 1) {
+    params.rowMode = 'array';
+  }
+  return {
+    v: PROTOCOL_VERSION,
+    id: request[1],
+    method: prepared ? 'executePrepared' : 'executeSql',
+    params,
+  } as WorkerRequest;
+};
 
 const TRANSACTION_ACTIVE = 'TRANSACTION_ACTIVE';
 const ALREADY_ACTIVE = 'A TinyJoin transaction is already active';
@@ -105,7 +157,7 @@ export const startWorker = (
     return finishChangedKeys(merged);
   };
 
-  const respondWith = (message: WorkerResponse): void =>
+  const respondWith = (message: WorkerResponse | StatementResponse): void =>
     scope.postMessage(message);
 
   const emitInvalidation = (outcome: ApplyOutcome): void => {
@@ -142,12 +194,12 @@ export const startWorker = (
 
   // Publishes an outcome only outside a transaction: staged changes become
   // visible when the transaction commits, not as each statement runs. A result
-  // still in text published nothing, so it has nothing to announce.
+  // that is a flat array published nothing, so it has nothing to announce.
   const emitUnlessInTransaction = (
-    outcome: ApplyOutcome | SqlResultText,
+    outcome: ApplyOutcome | StatementResult,
   ): void => {
     if (
-      !isSqlResultText(outcome) &&
+      !arrayIsArray(outcome) &&
       isUndefined(activeTransactionId) &&
       outcome.tables.length > 0
     ) {
@@ -251,7 +303,8 @@ export const startWorker = (
           const outcome = engine.commitTransaction();
           emitInvalidation(outcome);
           clearTransaction(request.params.transactionId);
-          return outcome;
+          // The change event carries the tables and keys to every subscriber.
+          return {revision: outcome.revision};
         } catch (error) {
           let cleanedUp = false;
           try {
@@ -297,6 +350,53 @@ export const startWorker = (
         return outcome.revision !== revision;
       }
     }
+  };
+
+  // Serves a statement request at once, or returns `undefined`, having done
+  // nothing, when it cannot be served before earlier requests. It runs the
+  // statement as handleRequest() runs the request it stands for, but with the
+  // parameters read where they arrived, after the request's fixed slots.
+  // Every statement of a transaction comes this way while its JavaScript is
+  // still cold, so the checks that a helper would make are made in place.
+  const statementNow = (
+    request: StatementRequest,
+    target: string | number,
+    transactionId: string | undefined,
+  ): SqlResult | StatementResult | undefined => {
+    const engine = openEngine;
+    if (queuedRequests !== 0 || engine === undefined) {
+      return undefined;
+    }
+    // Either the active transaction is named, or none is named and none is
+    // active: the two are then one value. Any difference is an error, which
+    // the check itself tells apart and throws.
+    if (transactionId !== activeTransactionId) {
+      assertTransactionId(transactionId);
+    }
+    const rowMode = request[5] === 1 ? 'array' : undefined;
+    const result =
+      request[2] === STATEMENT_PREPARED
+        ? engine.executePrepared(
+            target as number,
+            request,
+            rowMode,
+            STATEMENT_PARAMS,
+          )
+        : engine.executeSql(
+            target as string,
+            request,
+            rowMode,
+            STATEMENT_PARAMS,
+          );
+    // As emitUnlessInTransaction() has it: a flat array published nothing.
+    if (
+      !arrayIsArray(result) &&
+      activeTransactionId === undefined &&
+      result.tables.length > 0
+    ) {
+      emitInvalidation(result);
+    }
+    return result;
   };
 
   const engineForRequest = (
@@ -420,19 +520,32 @@ export const startWorker = (
       );
   };
 
-  // Posts a request's response. A close, or an init that failed, then closes
-  // the Worker.
+  // Posts a request's response. A statement's result that is a flat array is
+  // its own response, once the two slots left for it are filled; a script's
+  // results are an array too, but of results, and go in a response as any
+  // other result does. A close, or an init that failed, then closes the
+  // Worker.
   const respond =
     (request: WorkerRequest) =>
     (ok: boolean, value: unknown): void => {
       if (ok) {
         try {
-          respondWith({
-            v: PROTOCOL_VERSION,
-            id: request.id,
-            ok: true,
-            result: value,
-          });
+          if (
+            arrayIsArray(value) &&
+            (request.method === 'executeSql' ||
+              request.method === 'executePrepared')
+          ) {
+            value[0] = PROTOCOL_VERSION;
+            value[1] = request.id;
+            respondWith(value as StatementResponse);
+          } else {
+            respondWith({
+              v: PROTOCOL_VERSION,
+              id: request.id,
+              ok: true,
+              result: value,
+            });
+          }
         } catch (error) {
           ok = false;
           value = error;
@@ -452,13 +565,53 @@ export const startWorker = (
     };
 
   const onMessage = (event: MessageEvent<unknown>): void => {
-    if (!isWorkerRequest(event.data)) {
+    const data = event.data;
+    if (isStatementRequest(data)) {
+      const id = data[1];
+      // With nothing ahead of it, it is served here, and answered as respond()
+      // would answer it: a result that cannot be posted fails its statement.
+      try {
+        const result = statementNow(
+          data,
+          data[3],
+          data[4] === 0 ? undefined : data[4],
+        );
+        if (result !== undefined) {
+          if (arrayIsArray(result)) {
+            result[0] = PROTOCOL_VERSION;
+            result[1] = id;
+            scope.postMessage(result as StatementResponse);
+          } else {
+            scope.postMessage({v: PROTOCOL_VERSION, id, ok: true, result});
+          }
+          return;
+        }
+      } catch (error) {
+        respondWith({
+          v: PROTOCOL_VERSION,
+          id,
+          ok: false,
+          error: serializeError(error),
+        });
+        return;
+      }
+      // Behind earlier requests it waits its turn, as the request it stands
+      // for.
+      const request = statementRequest(data);
+      schedule(request, respond(request));
+      return;
+    }
+    if (!isWorkerRequest(data)) {
+      // An array that is not a statement request has its id, when it has one,
+      // where a statement request does.
+      const id: unknown = arrayIsArray(data)
+        ? data[1]
+        : isRecord(data)
+          ? data.id
+          : 0;
       respondWith({
         v: PROTOCOL_VERSION,
-        id:
-          isRecord(event.data) && isSafeInteger(event.data.id)
-            ? event.data.id
-            : 0,
+        id: isSafeInteger(id) ? id : 0,
         ok: false,
         error: {
           code: 'PROTOCOL_MISMATCH',
@@ -467,7 +620,7 @@ export const startWorker = (
       });
       return;
     }
-    schedule(event.data, respond(event.data));
+    schedule(data, respond(data));
   };
 
   scope.addEventListener('message', onMessage);
@@ -489,6 +642,8 @@ export const startWorker = (
         return {ok: false, error: new ClientError(serializeError(error))};
       }
     },
+
+    statementNow,
 
     close: async (): Promise<void> => {
       try {
@@ -513,7 +668,8 @@ const sameStorage = (left: StorageOptions, right: StorageOptions): boolean =>
   (left.kind === 'memory' ||
     (right.kind === 'opfs' && left.name === right.name));
 
-const serializeError = (error: unknown): SerializedError =>
+/** The error a response carries for whatever a request threw. */
+export const serializeError = (error: unknown): SerializedError =>
   asCodedError(error) ?? {
     code: OPERATION_FAILED,
     message: error instanceof Error ? error.message : String(error),

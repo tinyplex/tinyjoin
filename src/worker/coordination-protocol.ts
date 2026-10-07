@@ -1,6 +1,7 @@
 import {
   PROTOCOL_VERSION,
   type SerializedError,
+  type StatementResponse,
   type WorkerEvent,
   type WorkerRequest,
   type WorkerResponse,
@@ -44,7 +45,15 @@ export type GroupMessage =
   | {kind: 'event'; epoch: string; event: WorkerEvent}
   | {kind: 'failed'; epoch: string; error: SerializedError};
 
-export type RoutedResponse = {epoch: string; response: WorkerResponse};
+/**
+ * An owner's answer to another tab's request: the message that tab's Worker
+ * posts to its page as it stands, which for a statement whose result published
+ * nothing is the flat array of a {@link StatementResponse}.
+ */
+export type RoutedResponse = {
+  epoch: string;
+  response: WorkerResponse | StatementResponse;
+};
 
 export const coordinationError = (
   code: string,

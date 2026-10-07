@@ -10,6 +10,8 @@ declare module '*tinyjoin_wasm.js' {
       operation: number,
       request: Uint8Array,
     ): unknown;
+    memory(): WebAssembly.Memory;
+    resultHeader(): number;
     free(): void;
   }
 }

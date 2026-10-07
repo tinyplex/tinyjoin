@@ -7,15 +7,20 @@ import {describe, expect, it} from 'vitest';
 import {transformSync} from 'esbuild';
 
 import {
+  PROTOCOL_VERSION,
+  STATEMENT_COMMANDS,
+  STATEMENT_SELECT,
   isRpcResult,
-  isSqlResultText,
-  readSqlResult,
+  isSqlDataText,
+  isStatementResponse,
+  type ChangedKeys,
+  type JsonPrimitive,
   type JsonValue,
   type Row,
   type RowMode,
   type SqlData,
   type SqlResult,
-  type SqlResultText,
+  type StatementResult,
 } from '../../src/protocol.js';
 import type {WorkerEngine} from '../../src/worker/engine.js';
 import type {PageDevice} from '../../src/worker/page-device.js';
@@ -26,9 +31,14 @@ import {
   type RawStructuredWasmEngine,
   type RawStructuredWasmEngineConstructor,
 } from '../../src/worker/wasm-bridge.js';
+import {encodeExecSql, encodeStatement} from '../../src/worker/wasm-preflight.js';
 import {decodeRequest} from '../helpers/wasm-request.js';
+import {
+  decodeStatementHeader,
+  statementResult,
+} from '../helpers/wasm-response.js';
 
-const BRIDGE_VERSION = 5;
+const BRIDGE_VERSION = 6;
 const artifactDirectory =
   process.env.TINYJOIN_PAGED_WASM_DIR ?? resolve('dist/wasm');
 const artifactModule = `${artifactDirectory}/tinyjoin_wasm.js`;
@@ -44,13 +54,28 @@ type StructuredCall = {
   operation: number;
   payload: unknown;
   response: unknown;
+  /** The header the call left in the engine's memory, if it left one. */
+  header: Uint8Array | undefined;
 };
 
 class RecordingStructuredEngine implements RawStructuredWasmEngine {
   readonly calls: StructuredCall[] = [];
   freeCalls = 0;
+  readonly wasmMemory: WebAssembly.Memory;
+  readonly headerAt: number;
 
-  constructor(readonly raw: RawStructuredWasmEngine) {}
+  constructor(readonly raw: RawStructuredWasmEngine) {
+    this.wasmMemory = raw.memory!() as WebAssembly.Memory;
+    this.headerAt = raw.resultHeader!();
+  }
+
+  memory(): WebAssembly.Memory {
+    return this.wasmMemory;
+  }
+
+  resultHeader(): number {
+    return this.headerAt;
+  }
 
   callStructured(
     bridgeVersion: number,
@@ -64,7 +89,14 @@ class RecordingStructuredEngine implements RawStructuredWasmEngine {
       operation,
       request,
     );
-    this.calls.push({bridgeVersion, operation, payload, response});
+    // So is the header, which the next call clears: its first byte says
+    // whether there is one, and its fifth and sixth how long it is.
+    const bytes = new Uint8Array(this.wasmMemory.buffer);
+    const at = this.headerAt;
+    const header = bytes[at]
+      ? bytes.slice(at, at + (bytes[at + 4]! | (bytes[at + 5]! << 8)))
+      : undefined;
+    this.calls.push({bridgeVersion, operation, payload, response, header});
     return response;
   }
 
@@ -117,14 +149,70 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
   it('runs every warm-up statement against the real engine', async () => {
     const wasm = await loadStructuredModule();
     const {engine} = createRecordingEngine(wasm, new MemoryPageDevice());
+    // What each prepared statement was answered with, by its SQL.
+    const statements = new Map<number, string>();
+    const results = new Map<string, DecodedResult[]>();
+    const recorded = {
+      ...engine,
+      prepareSql: (sql: string) => {
+        const id = engine.prepareSql(sql);
+        statements.set(id, sql);
+        results.set(sql, []);
+        return id;
+      },
+      executePrepared: (id: number, params: readonly JsonValue[], rowMode?: RowMode) => {
+        const result = engine.executePrepared(id, params, rowMode);
+        results.get(statements.get(id)!)!.push(result);
+        return result;
+      },
+    };
     try {
       // Each result gets the full check, so a statement the engine rejects fails here.
-      warmUp(engine as unknown as WorkerEngine);
+      warmUp(recorded as unknown as WorkerEngine);
       expect(engine.inTransaction()).toBe(false);
       expect(engine.executeSql('SELECT count(*) AS n FROM w', []).rows).toEqual([{n: 404}]);
     } finally {
       engine.close();
     }
+
+    // The statements on `v` are there to take the path of a write by key, on
+    // a table that lets it be taken, so they must find rows to write: an
+    // update that matched nothing, or an upsert that only ever inserted,
+    // would leave the rewriting of a row for a database's first statements
+    // to compile. Nearly every update finds its row, and one in each pass
+    // finds none.
+    const updates = results.get('UPDATE v SET n = $1 WHERE id = $2')!;
+    expect(updates.map((result) => result.command)).toEqual(Array(25).fill('UPDATE'));
+    expect(updates.filter((result) => result.rowCount === 1)).toHaveLength(23);
+    expect(updates.filter((result) => result.rowCount === 0)).toHaveLength(2);
+    for (const update of updates) {
+      expect(update.tables).toEqual(update.rowCount ? ['v'] : []);
+      expect(update.keys.v ?? []).toHaveLength(update.rowCount);
+    }
+    // Every row of `v` was reported by the statement that inserted it, so an
+    // upsert that reports a key already reported rewrote that row, and one
+    // that reports a new key inserted it. The warm-up does both.
+    const known = new Set(
+      results
+        .get('INSERT INTO v (id, wid, n) VALUES ($1, $2, $3)')!
+        .flatMap((result) => result.keys.v!.map((key) => key.id)),
+    );
+    expect(known.size).toBe(305);
+    let rewritten = 0;
+    let inserted = 0;
+    for (const upsert of results.get(
+      'INSERT INTO v (id, wid, n) VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n',
+    )!) {
+      expect(upsert).toMatchObject({command: 'INSERT', rowCount: 1, tables: ['v']});
+      const [key] = upsert.keys.v!;
+      if (known.has(key!.id)) {
+        rewritten += 1;
+      } else {
+        inserted += 1;
+        known.add(key!.id);
+      }
+    }
+    expect([rewritten, inserted]).toEqual([11, 14]);
   });
 
   it('executes the documented join boundaries against the real engine', async () => {
@@ -603,6 +691,528 @@ runIfArtifactExists('structured TypeScript/Rust bridge contract', () => {
     }
   });
 
+  it('answers a statement that published nothing as its response, which says what its JSON would', async () => {
+    const wasm = await loadStructuredModule();
+    const schema = `
+      CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, c TEXT NOT NULL);
+      CREATE TABLE pairs (owner TEXT, n FLOAT, flag BOOLEAN, body TEXT, PRIMARY KEY (owner, n, flag));
+      CREATE TABLE "__proto__" ("__proto__" TEXT PRIMARY KEY, v INTEGER);
+      CREATE TABLE parents (id INTEGER PRIMARY KEY);
+      CREATE TABLE children (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents (id) ON DELETE CASCADE);
+      CREATE INDEX children_parent ON children (parent);
+      CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT);
+      CREATE TABLE many (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);
+      CREATE TABLE named (id TEXT PRIMARY KEY, v INTEGER NOT NULL);
+      INSERT INTO t VALUES (1, 10, 'one'), (2, 20, 'two'), (3, 30, 'three');
+      INSERT INTO parents VALUES (1), (2);
+      INSERT INTO children VALUES (10, 1), (11, 1), (12, 2);
+    `;
+    const name = (id: number) => `a rather long name of a key ${String(id).padStart(6, '0')}`;
+    // The same database three times over: for statements as text, for the same
+    // statements prepared, and for the same statements as scripts, whose
+    // results are always JSON.
+    const open = () => {
+      const opened = createRecordingEngine(wasm, new MemoryPageDevice());
+      opened.engine.execSql(schema);
+      opened.engine.beginTransaction();
+      const many = opened.engine.prepareSql('INSERT INTO many VALUES ($1, 0)');
+      const named = opened.engine.prepareSql('INSERT INTO named VALUES ($1, 0)');
+      for (let id = 1; id <= 1200; id++) {
+        opened.bridged.executePrepared(many, [id]);
+        if (id <= 1000) opened.bridged.executePrepared(named, [name(id)]);
+      }
+      opened.engine.commitTransaction();
+      return opened;
+    };
+    const direct = open();
+    const prepared = open();
+    const scripted = open();
+    const long = 'k'.repeat(100);
+    const revision = direct.engine.revision();
+    // Each statement, and the response it is answered with, or `undefined`
+    // for one whose result has not the shape of a response.
+    const flat = (command: number, rowCount: number, ...rest: JsonPrimitive[]) => [
+      0,
+      0,
+      command,
+      revision,
+      rowCount,
+      ...rest,
+    ];
+    const statements = (
+      rowMode: RowMode,
+    ): [sql: string, response: JsonPrimitive[] | undefined][] => [
+      [`INSERT INTO t VALUES (4, 40, 'four')`, flat(0, 1, 't', 1, 'id', 4)],
+      [`INSERT INTO t VALUES (5, 50, 'five'), (6, 60, 'six')`, flat(0, 2, 't', 1, 'id', 5, 6)],
+      [`UPDATE t SET c = 'x' WHERE id = 1`, flat(1, 1, 't', 1, 'id', 1)],
+      [`UPDATE t SET c = 'x' WHERE id = 99`, flat(1, 0)],
+      [`DELETE FROM t WHERE id = 2`, flat(2, 1, 't', 1, 'id', 2)],
+      [`DELETE FROM t WHERE id = 98`, flat(2, 0)],
+      [
+        `INSERT INTO t VALUES (3, 31, 'again') ON CONFLICT (id) DO UPDATE SET c = EXCLUDED.c`,
+        flat(0, 1, 't', 1, 'id', 3),
+      ],
+      [
+        `INSERT INTO t VALUES (7, 70, 'seven') ON CONFLICT (id) DO UPDATE SET c = EXCLUDED.c`,
+        flat(0, 1, 't', 1, 'id', 7),
+      ],
+      [`INSERT INTO t VALUES (3, 1, 'dup') ON CONFLICT (id) DO NOTHING`, flat(0, 0)],
+      [`UPDATE t SET a = a + 1`, flat(1, 6, 't', 1, 'id', 1, 3, 4, 5, 6, 7)],
+      // A key of several columns and kinds, in key order.
+      [
+        `INSERT INTO pairs VALUES ('é', 1.5, true, 'b'), ('plain', -2.25, false, 'c'), ('z', 2.0, true, 'd')`,
+        flat(0, 3, 'pairs', 3, 'owner', 'n', 'flag', 'plain', -2.25, false, 'z', 2, true, 'é', 1.5, true),
+      ],
+      [`UPDATE pairs SET body = 'z' WHERE owner = 'é'`, flat(1, 1, 'pairs', 3, 'owner', 'n', 'flag', 'é', 1.5, true)],
+      [`DELETE FROM pairs WHERE n < 2`, flat(2, 2, 'pairs', 3, 'owner', 'n', 'flag', 'plain', -2.25, false, 'é', 1.5, true)],
+      // Names that are properties of every object.
+      [
+        `INSERT INTO "__proto__" VALUES ('__proto__', 1), ('constructor', 2)`,
+        flat(0, 2, '__proto__', 1, '__proto__', '__proto__', 'constructor'),
+      ],
+      // Text keys that are empty, long, not ASCII, and marked with a byte order.
+      [
+        `INSERT INTO notes VALUES ('\ufeffbom', 'x'), ('${long}', 'long'), ('é😀', 'emoji'), ('', 'empty'), ('abc', 'short')`,
+        flat(0, 5, 'notes', 1, 'id', '', 'abc', long, 'é😀', '\ufeffbom'),
+      ],
+      [`UPDATE notes SET body = 'again' WHERE id >= 'é'`, flat(1, 2, 'notes', 1, 'id', 'é😀', '\ufeffbom')],
+      // As many keys as a table reports, and one more, which reports none.
+      [
+        `UPDATE many SET v = v + 1 WHERE id <= 1000`,
+        flat(1, 1000, 'many', 1, 'id', ...Array.from({length: 1000}, (_, id) => id + 1)),
+      ],
+      [`UPDATE many SET v = v + 1 WHERE id <= 1001`, flat(1, 1001, 'many')],
+      [`DELETE FROM many`, flat(2, 1200, 'many')],
+      // Keys that fit a header, and as many as a table reports that do not.
+      [
+        `UPDATE named SET v = v + 1 WHERE id < '${name(430)}'`,
+        flat(1, 429, 'named', 1, 'id', ...Array.from({length: 429}, (_, id) => name(id + 1))),
+      ],
+      [`UPDATE named SET v = v + 1`, undefined],
+      // Rows returned, with or without any to return.
+      [`UPDATE t SET a = a + 1 WHERE id = 1 RETURNING id, a`, undefined],
+      [`DELETE FROM t WHERE id = 97 RETURNING id`, undefined],
+      // Two tables changed, as a cascade changes them.
+      [`DELETE FROM parents WHERE id = 1`, undefined],
+      [`DELETE FROM parents WHERE id = 2`, undefined],
+      [`DELETE FROM parents WHERE id = 3`, flat(2, 0)],
+      // Reads.
+      [`SELECT * FROM t ORDER BY id`, flat(3, 6, expect.any(String) as unknown as string)],
+      [`SELECT id FROM t WHERE id = 99`, flat(3, 0, '{"fields":[{"name":"id","dataTypeID":20}],"rows":[]}')],
+      [`SELECT count(*) AS n, max(c) AS c FROM t`, flat(3, 1, expect.any(String) as unknown as string)],
+      [
+        `SELECT "__proto__" FROM "__proto__" ORDER BY "__proto__"`,
+        flat(
+          3,
+          2,
+          `{"fields":[{"name":"__proto__","dataTypeID":25}],"rows":${
+            rowMode === 'array'
+              ? '[["__proto__"],["constructor"]]'
+              : '[{"__proto__":"__proto__"},{"__proto__":"constructor"}]'
+          }}`,
+        ),
+      ],
+    ];
+    // Statements are prepared before a transaction begins, as a client prepares them.
+    const ids = statements('object').map(([sql]) => prepared.engine.prepareSql(sql));
+    // Each kind of row in a transaction of its own, rolled back for the next.
+    for (const rowMode of ['object', 'array'] as const) {
+      for (const {engine} of [direct, prepared, scripted]) {
+        engine.beginTransaction();
+      }
+      for (const [at, [sql, response]] of statements(rowMode).entries()) {
+        const sent = direct.bridged.executeSql(sql, [], rowMode);
+        const result = direct.checked(sent);
+        expect(Array.isArray(sent), sql).toBe(response !== undefined);
+        if (response) {
+          expect(sent, sql).toEqual(response);
+        }
+        // Prepared, the statement is answered alike.
+        expect(prepared.bridged.executePrepared(ids[at]!, [], rowMode), sql).toEqual(sent);
+        // And what either says is what the JSON of the same statement says,
+        // key for key and in the same order.
+        const scripts = scripted.engine.execSql(sql, rowMode);
+        expect(scripts, sql).toHaveLength(1);
+        expect(sameResult(result, scripts[0]!), sql).toBe(true);
+      }
+      // Nothing was published by any of it.
+      for (const {engine} of [direct, prepared, scripted]) {
+        expect(engine.revision()).toBe(revision);
+        engine.rollbackTransaction();
+      }
+    }
+    for (const {engine} of [direct, prepared, scripted]) {
+      engine.close();
+    }
+  });
+
+  it('answers in JSON what published, and outside a transaction what changed nothing as its response', async () => {
+    const wasm = await loadStructuredModule();
+    const {engine, bridged, recording} = createRecordingEngine(wasm, new MemoryPageDevice());
+    try {
+      engine.execSql(`CREATE TABLE t (id INTEGER PRIMARY KEY, c TEXT NOT NULL); INSERT INTO t VALUES (1, 'one')`);
+      const revision = engine.revision();
+      const update = engine.prepareSql('UPDATE t SET c = $1 WHERE id = $2');
+      const insert = engine.prepareSql('INSERT INTO t VALUES ($1, $2) ON CONFLICT (id) DO NOTHING');
+      const remove = engine.prepareSql('DELETE FROM t WHERE id = $1');
+      const select = engine.prepareSql('SELECT c FROM t WHERE id = $1');
+      const duplicate = engine.prepareSql('INSERT INTO t VALUES ($1, $2)');
+
+      // A read, and a write that changed nothing, published nothing.
+      expect(bridged.executePrepared(select, [1])).toEqual([
+        0, 0, 3, revision, 1, '{"fields":[{"name":"c","dataTypeID":25}],"rows":[{"c":"one"}]}',
+      ]);
+      expect(bridged.executePrepared(select, [1], 'array')).toEqual([
+        0, 0, 3, revision, 1, '{"fields":[{"name":"c","dataTypeID":25}],"rows":[["one"]]}',
+      ]);
+      expect(bridged.executePrepared(update, ['x', 99])).toEqual([0, 0, 1, revision, 0]);
+      expect(bridged.executePrepared(insert, [1, 'dup'])).toEqual([0, 0, 0, revision, 0]);
+      expect(bridged.executePrepared(remove, [99])).toEqual([0, 0, 2, revision, 0]);
+      expect(bridged.executeSql('DELETE FROM t WHERE id = $1', [99])).toEqual([0, 0, 2, revision, 0]);
+      expect(engine.revision()).toBe(revision);
+
+      // A write that changed a row published it, and is read to be announced.
+      expect(bridged.executePrepared(update, ['x', 1])).toEqual({
+        command: 'UPDATE',
+        revision: revision + 1,
+        rowCount: 1,
+        tables: ['t'],
+        keys: {t: [{id: 1}]},
+        data: '{"fields":[],"rows":[]}',
+      });
+      expectDisposition(recording, WASM_OPERATION.executePrepared, 'durable');
+      expect(lastCall(recording, WASM_OPERATION.executePrepared).header).toBeUndefined();
+      expect(bridged.executeSql('INSERT INTO t VALUES ($1, $2)', [2, 'two'])).toMatchObject({
+        command: 'INSERT',
+        revision: revision + 2,
+        keys: {t: [{id: 2}]},
+      });
+      // Any other command is answered in JSON, though it changed nothing.
+      expect(bridged.executeSql('CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY)', [])).toEqual({
+        command: 'CREATE TABLE',
+        revision: revision + 2,
+        rowCount: 0,
+        tables: [],
+        keys: {},
+        data: '{"fields":[],"rows":[]}',
+      });
+      expectDisposition(recording, WASM_OPERATION.executeSql, 'safe');
+
+      // Inside a transaction every statement is a response, the same writes among them.
+      engine.beginTransaction();
+      expect(bridged.executePrepared(update, ['y', 1])).toEqual([0, 0, 1, revision + 2, 1, 't', 1, 'id', 1]);
+      expect(bridged.executePrepared(insert, [3, 'three'])).toEqual([0, 0, 0, revision + 2, 1, 't', 1, 'id', 3]);
+      expect(bridged.executePrepared(remove, [2])).toEqual([0, 0, 2, revision + 2, 1, 't', 1, 'id', 2]);
+      expect(bridged.executePrepared(select, [1])).toEqual([
+        0, 0, 3, revision + 2, 1, '{"fields":[{"name":"c","dataTypeID":25}],"rows":[{"c":"y"}]}',
+      ]);
+      // A statement request's parameters are read where they stand in it.
+      const request: JsonValue[] = [PROTOCOL_VERSION, 9, 4, update, 'tx-1', 0, 'z', 3];
+      expect(bridged.executePrepared(update, request, undefined, 6)).toEqual([0, 0, 1, revision + 2, 1, 't', 1, 'id', 3]);
+      expectRequest(recording, WASM_OPERATION.executePrepared).toEqual({statementId: update, params: ['z', 3]});
+      expect(bridged.executeSql('SELECT c FROM t WHERE id = $1', request.slice(0, 7).concat(3), 'array', 7)).toEqual([
+        0, 0, 3, revision + 2, 1, '{"fields":[{"name":"c","dataTypeID":25}],"rows":[["z"]]}',
+      ]);
+
+      // A header never outlives its call: a failure after one is the failure,
+      // a result in JSON after one is that result, and no other operation
+      // leaves or reads one.
+      expect(
+        captureError(() => bridged.executePrepared(duplicate, [1, 'dup'])),
+      ).toMatchObject({code: 'CONSTRAINT_VIOLATION'});
+      expectFailureDisposition(recording, WASM_OPERATION.executePrepared);
+      expect(bridged.executePrepared(select, [1])).toHaveLength(6);
+      expect(bridged.executeSql('UPDATE t SET c = c WHERE id = 1 RETURNING c', [])).toMatchObject({
+        command: 'UPDATE',
+        data: '{"fields":[{"name":"c","dataTypeID":25}],"rows":[{"c":"y"}]}',
+      });
+      expect(engine.inTransaction()).toBe(true);
+      expect(engine.revision()).toBe(revision + 2);
+      expect(engine.commitTransaction()).toEqual({
+        revision: revision + 3,
+        tables: ['t'],
+        keys: {t: [{id: 1}, {id: 2}, {id: 3}]},
+      });
+      for (const call of recording.calls) {
+        const statement =
+          call.operation === WASM_OPERATION.executeSql ||
+          call.operation === WASM_OPERATION.executePrepared;
+        expect(call.header === undefined || statement).toBe(true);
+        // `true`, and text that is not an envelope, only ever stand beside a header.
+        if (call.header === undefined) {
+          expect(call.response).toEqual(expect.stringMatching(/^\[6,[01],[01],/));
+        }
+      }
+    } finally {
+      engine.close();
+    }
+  });
+
+  it('refuses a request by its version, then by whether the engine is open, and only then by what it holds', async () => {
+    const wasm = await loadStructuredModule();
+    const raw = new wasm.WasmEngine(new MemoryPageDevice());
+    const refusal = (bridgeVersion: number, operation: number, request: number[]) => {
+      const response = raw.callStructured(bridgeVersion, operation, Uint8Array.from(request));
+      const [version, status, disposition, payload] = JSON.parse(response as string) as [
+        number,
+        number,
+        number,
+        {code: string},
+      ];
+      expect([version, status, disposition]).toEqual([BRIDGE_VERSION, 1, 0]);
+      return payload.code;
+    };
+    // A statement that is not one, a request with bytes after it, and an
+    // operation there is none of.
+    const malformed: [operation: number, request: number[]][] = [
+      [WASM_OPERATION.executeSql, [2]],
+      [WASM_OPERATION.executePrepared, [0, 1, 0, 0, 0]],
+      [WASM_OPERATION.begin, [0]],
+      [WASM_OPERATION.revision, [1, 2, 3]],
+      [99, []],
+    ];
+    try {
+      for (const [operation, request] of malformed) {
+        expect(refusal(BRIDGE_VERSION, operation, request)).toBe('INVALID_BRIDGE_VALUE');
+      }
+      // An engine of another version refuses whatever it is asked, closing included.
+      expect(refusal(BRIDGE_VERSION - 1, WASM_OPERATION.revision, [])).toBe('INVALID_BRIDGE_VALUE');
+      expect(refusal(BRIDGE_VERSION + 1, WASM_OPERATION.close, [])).toBe('INVALID_BRIDGE_VALUE');
+      expect(JSON.parse(raw.callStructured(BRIDGE_VERSION, WASM_OPERATION.revision, new Uint8Array(0)) as string)).toEqual([
+        BRIDGE_VERSION, 0, 0, 0,
+      ]);
+
+      // Closed, it says so to every request, whatever the request holds,
+      expect(raw.callStructured(BRIDGE_VERSION, WASM_OPERATION.close, new Uint8Array(0))).toBe(
+        `[${BRIDGE_VERSION},0,0,null]`,
+      );
+      for (const [operation, request] of [
+        ...malformed,
+        [WASM_OPERATION.revision, []],
+        [WASM_OPERATION.executePrepared, [0, 1, 0, 0, 0, 0, 0, 0, 0]],
+      ] as [number, number[]][]) {
+        expect(refusal(BRIDGE_VERSION, operation, request)).toBe('ENGINE_CLOSED');
+      }
+      // but still tells a request of another version that it is one,
+      expect(refusal(BRIDGE_VERSION + 1, WASM_OPERATION.revision, [])).toBe('INVALID_BRIDGE_VALUE');
+      // and may be closed again.
+      expect(raw.callStructured(BRIDGE_VERSION, WASM_OPERATION.close, new Uint8Array(0))).toBe(
+        `[${BRIDGE_VERSION},0,0,null]`,
+      );
+    } finally {
+      raw.free?.();
+    }
+  });
+
+  it('runs nothing after a fatal storage failure, and says why until it is closed', async () => {
+    const wasm = await loadStructuredModule();
+    class FailingDevice extends MemoryPageDevice {
+      failing = false;
+
+      override flush(): void {
+        if (this.failing) {
+          throw new Error('device flush failed');
+        }
+      }
+    }
+    const device = new FailingDevice();
+    const raw = new wasm.WasmEngine(device);
+    const respond = (operation: number, request: Uint8Array = new Uint8Array(0)) =>
+      JSON.parse((raw.callStructured(BRIDGE_VERSION, operation, request) as string).split('\n')[0]!) as [
+        number,
+        number,
+        number,
+        {code?: string; retryable?: boolean} | null,
+      ];
+    try {
+      expect(
+        respond(WASM_OPERATION.execSql, encodeExecSql('CREATE TABLE a (id INTEGER PRIMARY KEY)', false)).slice(0, 3),
+      ).toEqual([BRIDGE_VERSION, 0, 1]);
+      // A write whose pages reached the device, but not its flush, may or
+      // may not have been published: the engine says so, and closes itself.
+      device.failing = true;
+      const insert = encodeStatement(false, 'INSERT INTO a VALUES ($1)', [1], false).slice();
+      expect(respond(WASM_OPERATION.executeSql, insert)).toEqual([
+        BRIDGE_VERSION,
+        1,
+        0,
+        expect.objectContaining({code: 'RECOVERY_REQUIRED'}),
+      ]);
+      device.failing = false;
+      expect(device.closed).toBe(1);
+      // Every request after it is refused for that, whatever it holds.
+      for (const [operation, request] of [
+        [WASM_OPERATION.revision, []],
+        [WASM_OPERATION.executeSql, [...insert]],
+        [WASM_OPERATION.executeSql, [2]],
+        [99, []],
+      ] as [number, number[]][]) {
+        expect(respond(operation, Uint8Array.from(request))).toEqual([
+          BRIDGE_VERSION,
+          1,
+          0,
+          {
+            code: 'STORAGE_ENGINE_POISONED',
+            message: 'The TinyJoin engine cannot be used after an uncertain result',
+            retryable: false,
+          },
+        ]);
+      }
+      // Closed, it is an engine that is closed, as any other is.
+      expect(respond(WASM_OPERATION.close)).toEqual([BRIDGE_VERSION, 0, 0, null]);
+      expect(respond(WASM_OPERATION.revision)).toEqual([
+        BRIDGE_VERSION,
+        1,
+        0,
+        {code: 'ENGINE_CLOSED', message: 'The TinyJoin engine is closed'},
+      ]);
+      expect(device.closed).toBe(1);
+    } finally {
+      raw.free?.();
+    }
+  });
+
+  it('answers every statement in JSON to whatever does not ask where its header is', async () => {
+    const wasm = await loadStructuredModule();
+    // The engine wrapped by something that passes on its calls and nothing
+    // else, as a tool that times or traces them may be written. The bridge
+    // finds no memory to read a header in, so it never asks where one would
+    // be, and the engine, not having been asked, writes none.
+    const responses: unknown[] = [];
+    class CallsOnly implements RawStructuredWasmEngine {
+      readonly raw: RawStructuredWasmEngine;
+
+      constructor(device: PageDevice) {
+        this.raw = new wasm.WasmEngine(device);
+      }
+
+      callStructured(bridgeVersion: number, operation: number, request: Uint8Array): unknown {
+        const response = this.raw.callStructured(bridgeVersion, operation, request);
+        responses.push(response);
+        return response;
+      }
+
+      free(): void {
+        this.raw.free?.();
+      }
+    }
+    const wrapped = createStructuredWasmEngine(CallsOnly, new MemoryPageDevice());
+    // The same statements on an engine that is read as the Worker reads it.
+    const {engine: read, bridged} = createRecordingEngine(wasm, new MemoryPageDevice());
+    try {
+      const schema = `CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT NOT NULL);
+        INSERT INTO notes VALUES ('one', 'first')`;
+      wrapped.execSql(schema);
+      read.execSql(schema);
+      // Each is run four times over, so each can be: as text and prepared,
+      // for rows of either kind.
+      const statements: [sql: string, params: JsonValue[]][] = [
+        ['SELECT * FROM notes ORDER BY id', []],
+        ['UPDATE notes SET body = $1 WHERE id = $2', ['x', 'none']],
+        ['DELETE FROM notes WHERE id = $1', ['none']],
+        ['INSERT INTO notes VALUES ($1, $2) ON CONFLICT (id) DO NOTHING', ['two', 'second']],
+        ['UPDATE notes SET body = $1 WHERE id = $2', ['changed', 'one']],
+        ['INSERT INTO notes VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body', ['one', 'again']],
+        ['SELECT body FROM notes WHERE id = $1', ['one']],
+        ['DELETE FROM notes WHERE id = $1', ['two']],
+        ['UPDATE notes SET body = body', []],
+        // Rows returned, which no header holds for either engine.
+        ['UPDATE notes SET body = body WHERE id = $1 RETURNING id, body', ['one']],
+      ];
+      const ids = statements.map(([sql]) => [wrapped.prepareSql(sql), read.prepareSql(sql)] as const);
+      // Once outside a transaction, where a write that changes a row
+      // publishes it, and once inside one, where nothing is published and
+      // every one of these results has the shape of a statement's response.
+      for (const inTransaction of [false, true]) {
+        if (inTransaction) {
+          wrapped.beginTransaction();
+          read.beginTransaction();
+        }
+        let headed = 0;
+        for (const [at, [sql, params]] of statements.entries()) {
+          for (const rowMode of ['object', 'array'] as const) {
+            const [wrappedId, readId] = ids[at]!;
+            for (const [inJson, inHeader] of [
+              [wrapped.executeSql(sql, params, rowMode), bridged.executeSql(sql, params, rowMode)],
+              [wrapped.executePrepared(wrappedId, params, rowMode), bridged.executePrepared(readId, params, rowMode)],
+            ] as const) {
+              // Never the array that is read from a header,
+              expect(Array.isArray(inJson), sql).toBe(false);
+              headed += Array.isArray(inHeader) ? 1 : 0;
+              // and always what the header, where there is one, says.
+              expect(sameResult(decode(inJson), decode(inHeader)), sql).toBe(true);
+            }
+          }
+        }
+        // The engine that was asked answers with a header all that
+        // published nothing but the one that returned rows: in a
+        // transaction every other statement, and outside one the reads and
+        // the writes that changed nothing.
+        if (inTransaction) {
+          expect(headed).toBe((statements.length - 1) * 4);
+        } else {
+          expect(headed).toBeGreaterThanOrEqual(16);
+          expect(headed).toBeLessThan((statements.length - 1) * 4);
+        }
+        if (inTransaction) {
+          expect(wrapped.commitTransaction()).toEqual(read.commitTransaction());
+        }
+      }
+      // Every response was the text of an envelope: never `true`, and never a
+      // read's rows alone.
+      expect(responses.length).toBeGreaterThan(80);
+      for (const response of responses) {
+        expect(response).toEqual(expect.stringMatching(/^\[6,[01],[01],/));
+      }
+    } finally {
+      wrapped.close();
+      read.close();
+    }
+  });
+
+  it('reads headers from the memory as it grows', async () => {
+    const wasm = await loadStructuredModule(true);
+    const {engine, bridged, recording} = createRecordingEngine(wasm, new MemoryPageDevice());
+    try {
+      engine.execSql('CREATE TABLE t (id INTEGER PRIMARY KEY, c TEXT NOT NULL)');
+      const insert = engine.prepareSql('INSERT INTO t VALUES ($1, $2)');
+      const select = engine.prepareSql('SELECT id FROM t WHERE id = $1');
+      const revision = engine.revision();
+      const inserted = (id: number) => [0, 0, 0, revision, 1, 't', 1, 'id', id];
+      const selected = (id: number) => [
+        0, 0, 3, revision, 1, `{"fields":[{"name":"id","dataTypeID":20}],"rows":[{"id":${id}}]}`,
+      ];
+      engine.beginTransaction();
+      // Growing the memory leaves the buffer the bridge was reading detached,
+      // whoever grows it: here the test, between two calls.
+      for (let id = 1; id <= 3; id++) {
+        expect(bridged.executePrepared(insert, [id, 'grown'])).toEqual(inserted(id));
+        const buffer = recording.wasmMemory.buffer;
+        recording.wasmMemory.grow(1);
+        expect(buffer.byteLength).toBe(0);
+        expect(bridged.executePrepared(select, [id])).toEqual(selected(id));
+      }
+      // And here the engine, inside the call that writes the header, once the
+      // rows a transaction stages have taken what memory there was.
+      const text = 'x'.repeat(1000);
+      let buffer = recording.wasmMemory.buffer;
+      let grown = 0;
+      for (let id = 4; grown < 2 && id < 15_000; id++) {
+        expect(bridged.executePrepared(insert, [id, text])).toEqual(inserted(id));
+        if (recording.wasmMemory.buffer !== buffer) {
+          expect(buffer.byteLength).toBe(0);
+          buffer = recording.wasmMemory.buffer;
+          grown += 1;
+          expect(bridged.executePrepared(select, [id])).toEqual(selected(id));
+        }
+      }
+      expect(grown).toBe(2);
+      engine.rollbackTransaction();
+    } finally {
+      engine.close();
+    }
+  });
+
   it('round-trips every SQL-first operation against the real WASM artifact', async () => {
     const wasm = await loadStructuredModule();
     const device = new MemoryPageDevice();
@@ -802,29 +1412,97 @@ async function createDocumentedBackupFixture() {
   return {engine, db, backupNotes, restoreNotes};
 }
 
-async function loadStructuredModule(): Promise<StructuredModule> {
+// Every test shares one instance of the module, and so one memory, unless it
+// asks for an instance of its own, whose memory is as small as a new one is.
+async function loadStructuredModule(own = false): Promise<StructuredModule> {
   const wasm = (await import(
-    /* @vite-ignore */ pathToFileURL(artifactModule).href
+    /* @vite-ignore */ `${pathToFileURL(artifactModule).href}${own ? `?own=${ownModules++}` : ''}`
   )) as StructuredModule;
   await wasm.default({module_or_path: readFileSync(artifactWasm)});
   return wasm;
 }
 
+let ownModules = 0;
+
 type DecodedResult = Omit<SqlResult, 'data'> & SqlData & {rows: Row[]};
 
 // Every result the real engine writes gets the full check that a custom
 // Worker's results get on the page, and then its rows are parsed as the page
-// parses them.
-// A result arrives as the page reads it: as text, when it published nothing.
-function decode(sent: SqlResult | SqlResultText): DecodedResult {
-  const result = isSqlResultText(sent) ? readSqlResult(sent) : sent;
-  expect(isRpcResult('executeSql', result)).toBe(true);
-  const {data, ...header} = result as SqlResult;
-  return {...header, ...(JSON.parse(data) as SqlData)} as DecodedResult;
+// parses them. A result that published nothing arrives as the array its
+// response is, where it has the shape of one, and is read as the page reads
+// that: into the result its JSON would have been.
+function decode(sent: SqlResult | StatementResult): DecodedResult {
+  if (!Array.isArray(sent)) {
+    expect(isRpcResult('executeSql', sent)).toBe(true);
+    const {data, ...header} = sent;
+    return {...header, ...(JSON.parse(data) as SqlData)} as DecodedResult;
+  }
+  // Its first two slots are left for whoever posts it.
+  expect(sent.slice(0, 2)).toEqual([0, 0]);
+  expect(isStatementResponse([PROTOCOL_VERSION, 1, ...sent.slice(2)], true)).toBe(true);
+  const command = sent[2];
+  const header = {
+    command: STATEMENT_COMMANDS[command]!,
+    revision: sent[3],
+    rowCount: sent[4],
+  };
+  if (command === STATEMENT_SELECT) {
+    const data = sent[5] as string;
+    expect(isSqlDataText(data)).toBe(true);
+    return {...header, tables: [], keys: {}, ...(JSON.parse(data) as SqlData)} as DecodedResult;
+  }
+  const tables: string[] = [];
+  const keys: ChangedKeys = {};
+  if (sent.length > 5) {
+    tables.push(sent[5] as string);
+  }
+  if (sent.length > 6) {
+    const width = sent[6] as number;
+    const rows: Row[] = [];
+    for (let at = 7 + width; at < sent.length; at += width) {
+      const row: Row = {};
+      for (let column = 0; column < width; column++) {
+        // Defined rather than assigned, so that a `__proto__` column stays data.
+        define(row, sent[7 + column] as string, sent[at + column]!);
+      }
+      rows.push(row);
+    }
+    define(keys, tables[0]!, rows);
+  }
+  return {...header, tables, keys, fields: [], rows: []};
+}
+
+function define(target: object, key: string, value: unknown): void {
+  Object.defineProperty(target, key, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
 }
 
 function withoutRows({fields: _fields, rows: _rows, ...header}: DecodedResult) {
   return header;
+}
+
+// Whether two results say the same, to the order of every key's columns and
+// the sign of every zero, which a deep comparison alone leaves out.
+function sameResult(left: DecodedResult, right: DecodedResult): boolean {
+  expect(left).toEqual(right);
+  const text = (result: DecodedResult) =>
+    JSON.stringify(result, (_key, value: unknown) =>
+      Object.is(value, -0) ? '-0' : value,
+    );
+  expect(text(left)).toBe(text(right));
+  expect(Object.keys(left.keys)).toEqual(Object.keys(right.keys));
+  for (const table of Object.keys(left.keys)) {
+    expect(Object.hasOwn(right.keys, table)).toBe(true);
+    for (const [at, key] of left.keys[table]!.entries()) {
+      expect(Object.getPrototypeOf(key)).toBe(Object.prototype);
+      expect(Object.keys(key)).toEqual(Object.keys(right.keys[table]![at]!));
+    }
+  }
+  return true;
 }
 
 function createRecordingEngine(
@@ -842,19 +1520,44 @@ function createRecordingEngine(
   if (!recording) {
     throw new Error('The structured WASM recording engine was not created');
   }
+  const recorded = recording;
+  // A statement's result, with what the engine itself wrote held against what
+  // the bridge made of it.
+  const checked = (result: SqlResult | StatementResult) => {
+    const call = recorded.calls.at(-1)!;
+    if (Array.isArray(result)) {
+      // The header's bytes, read by a reader of the test's own, are the array.
+      const header = decodeStatementHeader(call.header!);
+      expect(result).toEqual(
+        statementResult(
+          header,
+          header.command === 'SELECT' ? (call.response as string) : undefined,
+        ),
+      );
+      expect(call.response).toBe(header.command === 'SELECT' ? result[5] : true);
+    } else {
+      expect(call.header).toBeUndefined();
+    }
+    return decode(result);
+  };
   const engine = {
     ...bridged,
-    executeSql: (sql: string, params: JsonValue[], rowMode?: RowMode) =>
-      decode(bridged.executeSql(sql, params, rowMode)),
+    executeSql: (
+      sql: string,
+      params: readonly JsonValue[],
+      rowMode?: RowMode,
+      from?: number,
+    ) => checked(bridged.executeSql(sql, params, rowMode, from)),
     executePrepared: (
       statementId: number,
-      params: JsonValue[],
+      params: readonly JsonValue[],
       rowMode?: RowMode,
-    ) => decode(bridged.executePrepared(statementId, params, rowMode)),
+      from?: number,
+    ) => checked(bridged.executePrepared(statementId, params, rowMode, from)),
     execSql: (sql: string, rowMode?: RowMode) =>
       bridged.execSql(sql, rowMode).map(decode),
   };
-  return {engine, recording};
+  return {engine, recording, bridged, checked};
 }
 
 function lastCall(
@@ -879,8 +1582,35 @@ function expectRequest(
   return expect(lastCall(engine, operation).payload);
 }
 
-// A response is JSON text, whose first line holds its envelope.
+// A response is JSON text, whose first line holds its envelope, unless the
+// call left a header, which stands for the envelope of a success that
+// published nothing and for the header of its result.
 function responseEnvelope(call: StructuredCall): unknown[] {
+  if (call.header) {
+    const header = decodeStatementHeader(call.header);
+    const keys: ChangedKeys = {};
+    if (header.columns) {
+      define(
+        keys,
+        header.table!,
+        header.keys!.map((values) =>
+          Object.fromEntries(header.columns!.map((column, at) => [column, values[at]!])),
+        ),
+      );
+    }
+    return [
+      BRIDGE_VERSION,
+      0,
+      0,
+      {
+        command: header.command,
+        revision: header.revision,
+        rowCount: header.rowCount,
+        tables: header.table === undefined ? [] : [header.table],
+        keys,
+      },
+    ];
+  }
   expect(typeof call.response).toBe('string');
   return JSON.parse((call.response as string).split('\n')[0]!) as unknown[];
 }

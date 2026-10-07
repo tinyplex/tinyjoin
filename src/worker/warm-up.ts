@@ -52,6 +52,14 @@ export const warmUp = (engine: WorkerEngine): void => {
     'INSERT INTO w (id, a, b, c, d, e) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO UPDATE SET c = EXCLUDED.c',
   );
   const remove = engine.prepareSql('DELETE FROM w WHERE id = $1');
+  // An update of a row named by its key is planned from the statement's template, and the row
+  // rewritten in place, unless the table has a JSON column, as `w` has: the two above are
+  // planned as any statement is. These two change rows of `v`, which has none, and so take the
+  // path that such a statement takes on most tables.
+  const updateByKey = engine.prepareSql('UPDATE v SET n = $1 WHERE id = $2');
+  const upsertByKey = engine.prepareSql(
+    'INSERT INTO v (id, wid, n) VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n',
+  );
   let next = 1;
   // The second pass runs each loop just long enough to have it optimized. A longer one finished
   // later, while a database's first statements were running, and left those statements slower.
@@ -77,6 +85,13 @@ export const warmUp = (engine: WorkerEngine): void => {
       engine.executePrepared(update, [`updated ${i}`, {pass, i}, i]);
       engine.executePrepared(upsert, row(next - i));
       if (i % 4 === 0) engine.executePrepared(remove, [i]);
+      // That path is compiled by its first statement of each kind, so a few of each are enough:
+      // none of it is a loop for more of them to have optimized.
+      if (i <= 20) {
+        engine.executePrepared(updateByKey, [i, next - i]);
+        // A row that is there, which is rewritten, or one that is not, which is inserted.
+        engine.executePrepared(upsertByKey, [i % 2 ? next - i : next + i, i, pass]);
+      }
     }
     engine.commitTransaction();
     engine.executeSql('UPDATE w SET d = $1 WHERE b >= $2 AND b < $3', [true, 100, 300]);

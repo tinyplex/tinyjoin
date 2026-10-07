@@ -4,24 +4,36 @@ import type {
   RowMode,
   Schema,
   SqlResult,
-  SqlResultText,
+  StatementResult,
   StorageOptions,
 } from '../protocol.js';
 import {createMemoryPageDevice, type PageDevice} from './page-device.js';
 import {createStructuredWasmEngine} from './wasm-bridge.js';
 
 export interface WorkerEngine {
+  /**
+   * Executes one statement. A result that published nothing comes back as a
+   * {@link StatementResult}, the flat array its response is, where it has the
+   * shape of one; any other result comes back as a {@link SqlResult}.
+   *
+   * `from` is where the statement's parameters begin in `params`, so that a
+   * statement request's parameters are read where they arrived, after its
+   * fixed slots, rather than copied out first.
+   */
   executeSql(
     sql: string,
-    params: JsonValue[],
+    params: readonly JsonValue[],
     rowMode?: RowMode,
-  ): SqlResult | SqlResultText;
+    from?: number,
+  ): SqlResult | StatementResult;
   prepareSql(sql: string): number;
+  /** Executes a prepared statement, as {@link WorkerEngine.executeSql} executes one. */
   executePrepared(
     statementId: number,
-    params: JsonValue[],
+    params: readonly JsonValue[],
     rowMode?: RowMode,
-  ): SqlResult | SqlResultText;
+    from?: number,
+  ): SqlResult | StatementResult;
   closePrepared(statementId: number): void;
   execSql(sql: string, rowMode?: RowMode): SqlResult[];
   beginTransaction(): void;

@@ -511,6 +511,33 @@ Found along the way:
   updates, upserts and deletes by key 3-5%, and the engine is 2.2 KiB smaller
   compressed, the B-tree map's instantiation gone and the index build and
   GROUP BY sharing one sort of borrowed keys.
+- A statement and its result cross between the page and the Worker as flat
+  arrays, as protocol version 12 and bridge version 6. The request is
+  `[version, id, operation, target, transaction, arrayRows, ...parameters]`.
+  The response to a statement that published nothing, a read or a statement
+  inside a transaction, is `[version, id, command, revision, rowCount]`
+  followed by a read's rows as JSON text, or by the one table a write changed
+  with its key columns and each changed key's values. The engine writes that
+  result as numbers into a buffer it owns, which the Worker reads in place
+  through the module's memory, where it wrote a JSON header that the Worker
+  decoded and the page parsed; a result of any other shape (`RETURNING` rows,
+  several tables, a commit) still crosses as a `SqlResult` in a response
+  object. The page counts a transaction's statements in flight through a hook
+  its connection calls, rather than keeping each promise in a set, and a
+  prepared statement's in a second, with a reaction on each to remove it; the
+  coordinator and the host serve a flat statement at once when nothing is
+  queued, and build the request object it stands for only when it must wait.
+  Whole stack in Node with real structured clones, cold as a benchmark sample
+  is, medians of nine interleaved pairs: update-pk -35%, upsert -37%,
+  delete-pk -36%, insert-transaction -33%, insert-indexed -32%, select-pk
+  -27%. In Chromium, twelve samples of each build interleaved, with SQLite in
+  the same runs (its medians in brackets): update-pk 30.45 to 24.45 ms
+  (24.0), upsert 29.50 to 22.85 (22.4), delete-pk 29.95 to 23.80 (21.5),
+  insert-transaction 247.2 to 199.9 (199.1), insert-indexed 259.1 to 206.7
+  (212.1), select-pk 27.65 to 22.05 (29.7), select-indexed 3.65 to 2.90
+  (3.50), and insert-autocommit, whose statements commit and so cross as
+  before, 364.9 to 359.9. The package is 3.4 KiB larger compressed: 1.2 in
+  the client, 1.3 in the Worker and 0.8 in the engine.
 
 Found along the way, 6 and 7 October:
 
@@ -625,6 +652,36 @@ Found along the way, 6 and 7 October:
   not reproduce what a PGlite profile's deletion did to the sample after it;
   the readings the runner keeps beside each sample will show whether the
   probe sees it.
+
+Found along the way, 8 October:
+
+- Half of what a point statement cost beside SQLite was JavaScript and the
+  shape of its messages, not the engine. Every benchmark sample is a fresh
+  page, so its 1,000 timed statements run the page's and the Worker's
+  JavaScript in V8's interpreter and baseline tiers, which inline nothing:
+  each small helper (`isRecord`, `isUndefined`, `objHasOwn`) is a call, and
+  the client's 0.9 µs a statement once optimized was 3.7 µs there. A
+  structured clone costs by the shape of what it copies. Timed in Node, the
+  request object took 1.17 µs to clone and a flat array of the same values
+  0.52; the response object 0.82 and a flat array 0.58, where a compact array
+  nested inside the old envelope took 1.10, more than the object it would
+  have replaced. JavaScript and clones together were 7-8 µs of a statement,
+  nearly as much as the engine.
+- V8 spends a WebAssembly function's tier-up budget in proportion to the size
+  of its baseline code, so the engine's largest functions are optimized
+  before a benchmark's timed phase begins, by the warm-up Worker's statements
+  and the workload's own setup, while its small ones stay in baseline code
+  throughout. A change that removes work from a statement keeps its value in
+  the browser; one that only folds small functions into a large one mostly
+  does not. Each engine step is therefore measured twice: as instructions
+  under baseline compilation alone, and as whole-stack time under V8's own
+  tiering.
+- Instructions retired (`/usr/bin/time -l`), for a process that runs a
+  workload a fixed number of times less a process that only sets it up,
+  repeat to 0.2-0.4% on a machine whose timings of the same builds vary by
+  several percent. Under baseline compilation an update by key retires about
+  173,000 instructions, a call between two WebAssembly functions costs about
+  48 of them, and an allocation with its free about 800.
 
 Remaining, in order of expected value:
 

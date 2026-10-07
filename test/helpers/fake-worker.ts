@@ -103,6 +103,16 @@ export class FakeWorker implements WorkerLike {
     }
   }
 
+  /**
+   * Delivers an event of the test's own making, such as one that counts how
+   * often its data is read.
+   */
+  emitEvent(event: {readonly data: unknown}): void {
+    for (const listener of this.#messageListeners) {
+      listener(event as MessageEvent<unknown>);
+    }
+  }
+
   emitMessageError(): void {
     const event = {data: undefined} as MessageEvent<unknown>;
     for (const listener of this.#messageErrorListeners) {

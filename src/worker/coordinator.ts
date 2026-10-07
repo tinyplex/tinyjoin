@@ -1,10 +1,12 @@
-import {asCodedError, isRecord} from '../common.js';
+import {arrayIsArray, asCodedError, isRecord} from '../common.js';
 import {
   PROTOCOL_VERSION,
+  isStatementRequest,
   isWorkerEvent,
   isWorkerRequest,
   isWorkerResponse,
   type SerializedError,
+  type StatementResponse,
   type StorageOptions,
   type WorkerRequest,
   type WorkerResponse,
@@ -24,16 +26,20 @@ import {
   type GroupMessage,
   type RoutedRequest,
 } from './coordination-protocol.js';
-import {startWorker, type WorkerScope} from './host.js';
+import {startWorker, statementRequest, type WorkerScope} from './host.js';
 import {createLocalRpc, type LocalRpc} from './local-rpc.js';
-import {statementRequestBytes} from './request-size.js';
+import {checkedRequestBytes, statementBytes} from './request-size.js';
 import {warmUp} from './warm-up.js';
 
 type Pending = {request: WorkerRequest; bytes: number; epoch?: string};
 
-/** Memory clients keep their private host; persistent clients join one owner. */
-export const startCoordinatedWorker = (): void => {
-  const scope = globalThis as unknown as WorkerScope;
+/**
+ * Memory clients keep their private host; persistent clients join one owner.
+ * The scope is the Worker's own, unless a test stands in for several Workers.
+ */
+export const startCoordinatedWorker = (
+  scope = globalThis as unknown as WorkerScope,
+): void => {
   const firstMessage = (event: MessageEvent<unknown>): void => {
     scope.removeEventListener('message', firstMessage);
     if (isRecord(event.data) && event.data.tinyjoin === 'warmup') {
@@ -183,11 +189,23 @@ const startCoordinator = (
       )
       .finally(() => scope.close());
   };
-  const post = (message: WorkerResponse): void => scope.postMessage(message);
-  const response = (message: WorkerResponse): void => {
-    const entry = pending.get(message.id);
+  const post = (message: WorkerResponse | StatementResponse): void =>
+    scope.postMessage(message);
+  const response = (message: WorkerResponse | StatementResponse): void => {
+    // A statement's flat response holds its request's id in its second slot.
+    // It confirms nothing that the bookkeeping below follows, so it is passed
+    // on as it stands, whatever request it names: the page refuses one that
+    // answers anything but a statement, as it refuses any answer it cannot
+    // read.
+    const flat = arrayIsArray(message);
+    const id = flat ? message[1] : message.id;
+    const entry = pending.get(id);
     if (!entry) return;
-    removePending(message.id);
+    removePending(id);
+    if (flat) {
+      scope.postMessage(message);
+      return;
+    }
     if (message.ok) {
       if (entry.request.method === 'init') initialized = true;
       if (
@@ -328,9 +346,51 @@ const startCoordinator = (
       failPending(terminalError);
     }
   };
+  const queueFull = (id: number): void =>
+    fail(
+      id,
+      coordinationError(
+        'RESOURCE_LIMIT',
+        'The TinyJoin client request queue is full',
+      ),
+    );
+  // Holds a request until its response arrives, and sends it to the owner.
+  const enqueue = (request: WorkerRequest, bytes: number): void => {
+    const entry = {request, bytes};
+    pending.set(request.id, entry);
+    pendingBytes += bytes;
+    dispatch(entry);
+  };
   const receive = (event: MessageEvent<unknown>): void => {
     if (closed) return;
-    if (isRecord(event.data) && event.data.tinyjoin === 'resync') {
+    const data = event.data;
+    // A statement sent as a flat array meets what its request would meet, in
+    // the same order: the terminal error, the bounds, and then service at once
+    // by this Worker's own owner when nothing waits ahead of it. Only when it
+    // must wait is the request it stands for built, to take its turn exactly
+    // as that request always has.
+    if (isStatementRequest(data)) {
+      if (terminalError) {
+        fail(data[1], terminalError);
+        return;
+      }
+      // A statement has no allowance to exceed the bounds by, as a commit or
+      // a close has, so the sum alone also refuses one that is too large by
+      // itself, with nothing waiting.
+      const bytes = statementBytes(data, MAX_QUEUED_BYTES);
+      const waiting = pending.size;
+      if (
+        waiting >= MAX_PENDING_REQUESTS ||
+        pendingBytes + bytes > MAX_QUEUED_BYTES
+      ) {
+        queueFull(data[1]);
+        return;
+      }
+      if (waiting === 0 && owner?.serveStatement(data, post)) return;
+      enqueue(statementRequest(data), bytes);
+      return;
+    }
+    if (isRecord(data) && data.tinyjoin === 'resync') {
       refreshRequested = true;
       if (owner && leader) {
         resync(localRevision);
@@ -338,13 +398,17 @@ const startCoordinator = (
       } else group.postMessage({kind: 'discover'});
       return;
     }
-    if (!isWorkerRequest(event.data)) {
+    if (!isWorkerRequest(data)) {
+      // An array that is not a statement request has its id, when it has one,
+      // where a statement request does.
+      const id: unknown = arrayIsArray(data)
+        ? data[1]
+        : isRecord(data)
+          ? data.id
+          : 0;
       scope.postMessage({
         v: PROTOCOL_VERSION,
-        id:
-          isRecord(event.data) && typeof event.data.id === 'number'
-            ? event.data.id
-            : 0,
+        id: typeof id === 'number' ? id : 0,
         ok: false,
         error: coordinationError(
           'PROTOCOL_MISMATCH',
@@ -353,7 +417,7 @@ const startCoordinator = (
       });
       return;
     }
-    const request = event.data;
+    const request = data;
     if (request.method === 'close' && (terminalError || !leader?.ready)) {
       finishClose({
         v: PROTOCOL_VERSION,
@@ -400,39 +464,38 @@ const startCoordinator = (
       request.method === 'commitTransaction' ||
       request.method === 'rollbackTransaction';
     // The request was checked above, as plain data from a structured clone.
-    const bytes = statementRequestBytes(request, MAX_QUEUED_BYTES);
+    const bytes = checkedRequestBytes(request, MAX_QUEUED_BYTES);
     if (
       bytes > MAX_QUEUED_BYTES ||
       pending.size >= MAX_PENDING_REQUESTS + (cleanup ? 8 : 0) ||
       pendingBytes + bytes > MAX_QUEUED_BYTES + (cleanup ? 8192 : 0)
     ) {
-      fail(
-        request.id,
-        coordinationError(
-          'RESOURCE_LIMIT',
-          'The TinyJoin client request queue is full',
-        ),
-      );
+      queueFull(request.id);
       return;
     }
-    // A statement with nothing waiting ahead of it, which this Worker's own
-    // database owner can serve at once, is served here, without the
-    // bookkeeping that a request waiting its turn needs.
+    // A script, or a statement sent as a request, with nothing waiting ahead
+    // of it, which this Worker's own database owner can serve at once, is
+    // served here, without the bookkeeping that a request waiting its turn
+    // needs.
     if (pending.size === 0 && owner?.serveLocal(request, post)) return;
-    const entry = {request, bytes};
-    pending.set(request.id, entry);
-    pendingBytes += bytes;
-    dispatch(entry);
+    enqueue(request, bytes);
   };
   scope.addEventListener('message', receive);
   group.onmessage = (event: MessageEvent<unknown>) => onGroup(event.data);
+  // The owner answers a statement whose result published nothing with the
+  // flat array that the page reads. Like a response object, it is taken here
+  // by its envelope alone: this protocol's version in its first slot, and in
+  // its second the id of a request that waits, which response() looks for.
+  // What follows is the page's to check, as a response's result is, so that
+  // an answer the page cannot read ends its connection there, where it can be
+  // seen, rather than leave the request waiting here for ever.
   inbox.onmessage = (event: MessageEvent<unknown>) => {
-    if (
-      isRecord(event.data) &&
-      event.data.epoch === leader?.epoch &&
-      isWorkerResponse(event.data.response)
-    )
-      response(event.data.response);
+    const data = event.data;
+    if (!isRecord(data) || data.epoch !== leader?.epoch) return;
+    const answer: unknown = data.response;
+    if (arrayIsArray(answer)) {
+      if (answer[0] === PROTOCOL_VERSION) response(answer as StatementResponse);
+    } else if (isWorkerResponse(answer)) response(answer);
   };
   receive({data: init} as MessageEvent<unknown>);
 
@@ -495,8 +558,8 @@ const startCoordinator = (
                 await tenure;
                 return;
               }
-              // A statement result still in text published nothing, so it
-              // holds no newer revision, and its two strings are passed over.
+              // A statement's flat result published nothing, and so never
+              // comes here: an array is a script's results, each noted.
               const noteResult = (result: unknown): void => {
                 for (const value of Array.isArray(result) ? result : [result]) {
                   if (isRecord(value) && typeof value.revision === 'number')

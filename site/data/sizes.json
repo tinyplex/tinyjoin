@@ -1,22 +1,22 @@
 {
   "wasm": {
-    "raw": 807052,
-    "gzip": 336087,
-    "gzipLabel": "328 KiB"
+    "raw": 806858,
+    "gzip": 336932,
+    "gzipLabel": "329 KiB"
   },
   "client": {
-    "raw": 17128,
-    "gzip": 6745,
-    "gzipLabel": "7 KiB"
+    "raw": 20015,
+    "gzip": 8018,
+    "gzipLabel": "8 KiB"
   },
   "worker": {
-    "raw": 43421,
-    "gzip": 16167,
-    "gzipLabel": "16 KiB"
+    "raw": 46614,
+    "gzip": 17525,
+    "gzipLabel": "17 KiB"
   },
   "total": {
-    "raw": 867601,
-    "gzip": 358999,
-    "gzipLabel": "351 KiB"
+    "raw": 873487,
+    "gzip": 362475,
+    "gzipLabel": "354 KiB"
   }
 }

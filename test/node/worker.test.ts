@@ -72,6 +72,28 @@ describe('Node Worker adapter', () => {
     expect(worker.terminate).toHaveBeenCalledOnce();
   });
 
+  it("carries a statement's flat request and its flat response as they are", () => {
+    const adapter = createNodeWorker();
+    const worker = latestWorker();
+    const received: unknown[] = [];
+    adapter.addEventListener('message', (event) => {
+      received.push(event.data);
+    });
+
+    // A statement crosses as one array each way. The adapter reads neither:
+    // the thread is posted the request itself, and the page's listener is
+    // handed the response the thread posted.
+    const request = [PROTOCOL_VERSION, 7, 4, 3, 0, 0, 'updated', 1];
+    adapter.postMessage(request);
+    expect(worker.postMessage).toHaveBeenCalledOnce();
+    expect(worker.postMessage.mock.calls[0]![0]).toBe(request);
+    const response = [PROTOCOL_VERSION, 7, 1, 0, 1, 'posts', 1, 'id', 1];
+    worker.emit('message', response);
+    expect(received).toHaveLength(1);
+    expect(received[0]).toBe(response);
+    adapter.terminate?.();
+  });
+
   it('removes browser-style message and error listeners', () => {
     const adapter = createNodeWorker();
     const worker = latestWorker();

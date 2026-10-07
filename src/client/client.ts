@@ -13,8 +13,12 @@ import {
 } from '../common.js';
 import {createDefaultWorker, createUrlWorker} from '../default-worker.js';
 import {
-  parseSqlData,
+  STATEMENT_COMMANDS,
+  STATEMENT_PREPARED,
+  STATEMENT_SELECT,
+  STATEMENT_SQL,
   type ApplyOutcome,
+  type ChangedKeys,
   type JsonValue,
   type QueryOptions,
   type ResultField,
@@ -23,11 +27,16 @@ import {
   type Schema,
   type SetSchemaOptions,
   type SqlResult,
+  type StatementResponse,
   type StorageOptions,
-  type RpcMethods,
 } from '../protocol.js';
 import {clientError} from './error.js';
-import {createWorkerRpc, type ResultValidation, type WorkerRpc} from './rpc.js';
+import {
+  createWorkerRpc,
+  invalidResult,
+  type PageRpc,
+  type ResultValidation,
+} from './rpc.js';
 
 export interface WorkerLike {
   postMessage(message: unknown): void;
@@ -133,16 +142,11 @@ export interface Client {
 type PreparedStatementState = {
   readonly owner: object;
   readonly statementId: number;
-  readonly inFlight: Set<Promise<unknown>>;
-  readonly assertDirectOperationAllowed: () => void;
   readonly assertClientOpen: () => void;
-  readonly executeDirect: (
-    params: JsonValue[],
-    options?: QueryOptions,
-  ) => Promise<Results<unknown>>;
-  readonly closeRemote: () => Promise<void>;
-  readonly trackClose: (close: Promise<void>) => void;
-  readonly unregister: () => void;
+  // The executions sent and not yet settled, in a transaction or not, and what
+  // lets a close() that waits for them go on once there are none.
+  inFlight: number;
+  idle: (() => void) | undefined;
   closed: boolean;
   clientClosed: boolean;
   closePromise?: Promise<void>;
@@ -271,24 +275,85 @@ const createClient = (options: ClientOptions): Client => {
     }
   };
 
-  // Reads a statement's result as its response arrives.
+  // Reads a statement's result as its response arrives, when it came as a
+  // result object.
   const readResults = <RowType>(result: SqlResult): Results<RowType> => {
     noteRevision(result.revision);
     return toResults<RowType>(result);
   };
 
-  const executePrepared = <RowType>(
-    statementId: number,
-    params: JsonValue[],
-    options?: QueryOptions,
-  ): Promise<Results<RowType>> =>
-    direct(() =>
-      rpc.request(
-        'executePrepared',
-        preparedParams(statementId, params, undefined, options),
-        readResults<RowType>,
-      ),
-    );
+  // Reads a statement's result as its response arrives, when it came flat. The
+  // Results are, in every property, value and property order, what toResults()
+  // makes of the result object that the response stands for. This is one
+  // function, with the revision noted in it, because it runs for nearly every
+  // statement, where a call costs more than the work it would tidy away.
+  const readStatement = <RowType>(
+    response: StatementResponse,
+  ): Results<RowType> => {
+    const command = response[2];
+    const seen = response[3];
+    const rowCount = response[4];
+    if (seen > revision) {
+      revision = seen;
+    }
+    if (command === STATEMENT_SELECT) {
+      const data = readData(response[5] as string);
+      return {
+        rows: data.rows as RowType[],
+        fields: data.fields as ResultField[],
+        affectedRows: 0,
+        command: STATEMENT_COMMANDS[STATEMENT_SELECT],
+        rowCount,
+        revision: seen,
+        tables: [],
+        keys: {},
+      };
+    }
+    // A write's response names the one table it changed, if any, and then, if
+    // that table's keys are reported, their columns and each key's values. A
+    // table or a column may have a name that every object inherits, such as
+    // `__proto__` or `constructor`. Assigning to one of those may set the
+    // prototype, or call a setter, or throw, as it does on a page that has
+    // frozen Object.prototype. A computed key in a literal defines the
+    // property whatever its name, as parsing JSON does. Any other name is
+    // assigned, which costs less.
+    const length = response.length;
+    const tables = length > 5 ? [response[5] as string] : [];
+    let keys: ChangedKeys = {};
+    if (length > 6) {
+      const table = response[5] as string;
+      const width = response[6] as number;
+      const changed: Row[] = [];
+      for (let at = 7 + width; at < length; at += width) {
+        let row: Row = {};
+        for (let column = 0; column < width; column++) {
+          const name = response[7 + column] as string;
+          const value = response[at + column] as JsonValue;
+          if (name in row) {
+            row = {...row, [name]: value};
+          } else {
+            row[name] = value;
+          }
+        }
+        changed.push(row);
+      }
+      if (table in keys) {
+        keys = {[table]: changed};
+      } else {
+        keys[table] = changed;
+      }
+    }
+    return {
+      rows: [],
+      fields: [],
+      affectedRows: rowCount,
+      command: STATEMENT_COMMANDS[command] as string,
+      rowCount,
+      revision: seen,
+      tables,
+      keys,
+    };
+  };
 
   const trackPreparedClose = (close: Promise<void>): void => {
     const previous = preparedCloseTail;
@@ -335,6 +400,7 @@ const createClient = (options: ClientOptions): Client => {
       transactionId,
       preparedOwner,
       noteRevision,
+      readStatement,
       readResults,
     );
     let shouldRollback = true;
@@ -424,15 +490,38 @@ const createClient = (options: ClientOptions): Client => {
       sql: string,
       params: JsonValue[] = [],
       options?: QueryOptions,
-    ): Promise<Results<RowType>> =>
-      direct(() => {
-        assertQueryOptions(options);
-        return rpc.request(
-          'executeSql',
-          {sql, params, ...rowModeParam(options)},
+    ): Promise<Results<RowType>> => {
+      // A ready database that no transaction owns takes the statement at once.
+      // In any other state the general path waits or refuses. A statement
+      // that waited is then sent without another look, as any request that
+      // waited is: what began meanwhile is the Worker's to answer for.
+      if (!ready || transactionActive || closing) {
+        return direct(() =>
+          rpc.execute(
+            STATEMENT_SQL,
+            sql,
+            0,
+            options !== undefined && asksForArrayRows(options),
+            params,
+            readStatement<RowType>,
+            readResults<RowType>,
+          ),
+        );
+      }
+      try {
+        return rpc.execute(
+          STATEMENT_SQL,
+          sql,
+          0,
+          options !== undefined && asksForArrayRows(options),
+          params,
+          readStatement<RowType>,
           readResults<RowType>,
         );
-      }),
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    },
 
     sql: <RowType = Row>(
       strings: TemplateStringsArray,
@@ -450,23 +539,90 @@ const createClient = (options: ClientOptions): Client => {
       const state: PreparedStatementState = {
         owner: preparedOwner,
         statementId,
-        inFlight: new Set(),
-        assertDirectOperationAllowed: assertNoActiveTransaction,
         assertClientOpen: assertOpen,
-        executeDirect: (params, options) =>
-          executePrepared<unknown>(statementId, params, options),
-        closeRemote: async () => {
-          if (!closing && !closed) {
-            await rpc.request('closePrepared', {statementId});
-          }
-        },
-        trackClose: trackPreparedClose,
-        unregister: () => preparedStatements.delete(state),
+        inFlight: 0,
+        idle: undefined,
         closed: false,
         clientClosed: false,
       };
+      const closeRemote = async (): Promise<void> => {
+        if (!closing && !closed) {
+          await rpc.request('closePrepared', {statementId});
+        }
+      };
+      const statement: PreparedStatement<RowType> = objFreeze({
+        execute: (
+          params: JsonValue[] = [],
+          options?: QueryOptions,
+        ): Promise<Results<RowType>> => {
+          try {
+            if (state.closed) {
+              assertPreparedStatementOpen(state);
+            }
+            // The statement exists, so the database became ready, and it is
+            // not closed, so its client is open. Only an active transaction can
+            // still forbid a direct execution, which the full check reports.
+            if (transactionActive) {
+              assertNoActiveTransaction();
+            }
+            let arrayRows = false;
+            if (options !== undefined) {
+              arrayRows = asksForArrayRows(options);
+              // Reading the options ran the caller's code, in an accessor or
+              // a proxy, which may have closed the client since the checks
+              // above.
+              assertNoActiveTransaction();
+            }
+            state.inFlight++;
+            return rpc.execute(
+              STATEMENT_PREPARED,
+              statementId,
+              0,
+              arrayRows,
+              params,
+              readStatement<RowType>,
+              readResults<RowType>,
+              executionSettled,
+              state,
+            );
+          } catch (error) {
+            return Promise.reject(error);
+          }
+        },
+
+        close: (): Promise<void> => {
+          if (state.closed) {
+            return state.closePromise ?? Promise.resolve();
+          }
+          try {
+            assertNoActiveTransaction();
+          } catch (error) {
+            return Promise.reject(error);
+          }
+          state.closed = true;
+          state.closePromise = (async () => {
+            // The statement's executions in flight settle first, whatever
+            // their outcome. No more can begin now that it is closed.
+            await (state.inFlight > 0
+              ? new Promise<void>((resolve) => {
+                  state.idle = resolve;
+                })
+              : undefined);
+            if (!state.clientClosed) {
+              await closeRemote();
+            }
+          })().finally(() => preparedStatements.delete(state));
+          trackPreparedClose(state.closePromise);
+          return state.closePromise;
+        },
+
+        get closed(): boolean {
+          return state.closed;
+        },
+      });
       preparedStatements.add(state);
-      return createPreparedStatement<RowType>(state);
+      preparedStatementStates.set(statement, state);
+      return statement;
     },
 
     /** Executes one or more SQL statements without parameters. */
@@ -544,70 +700,30 @@ const createClient = (options: ClientOptions): Client => {
   return objFreeze(Object.setPrototypeOf(client, Client.prototype) as Client);
 };
 
-const createPreparedStatement = <RowType>(
-  state: PreparedStatementState,
-): PreparedStatement<RowType> => {
-  const statement = objFreeze({
-    execute: (
-      params: JsonValue[] = [],
-      options?: QueryOptions,
-    ): Promise<Results<RowType>> => {
-      try {
-        state.assertClientOpen();
-        assertPreparedStatementOpen(state);
-        state.assertDirectOperationAllowed();
-        assertQueryOptions(options);
-        return trackPreparedExecution(
-          state,
-          state.executeDirect(params, options) as Promise<Results<RowType>>,
-        );
-      } catch (error) {
-        return Promise.reject(error);
-      }
-    },
-
-    close: (): Promise<void> => {
-      if (state.closed) {
-        return state.closePromise ?? Promise.resolve();
-      }
-      try {
-        state.assertDirectOperationAllowed();
-      } catch (error) {
-        return Promise.reject(error);
-      }
-      state.closed = true;
-      const pending = [...state.inFlight];
-      state.closePromise = (async () => {
-        await Promise.allSettled(pending);
-        if (!state.clientClosed) {
-          await state.closeRemote();
-        }
-      })().finally(state.unregister);
-      state.trackClose(state.closePromise);
-      return state.closePromise;
-    },
-
-    get closed(): boolean {
-      return state.closed;
-    },
-  });
-  preparedStatementStates.set(statement, state);
-  return statement;
-};
-
 /**
  * Builds the transaction handed to a callback, plus the three controls its
  * client needs. Keeping those off the transaction object means a callback
  * cannot seal or settle the transaction it is running inside.
  */
 const createTransactionSession = (
-  rpc: WorkerRpc,
+  rpc: PageRpc,
   transactionId: string,
   preparedOwner: object,
   noteRevision: (revision: number) => void,
+  readStatement: <RowType>(response: StatementResponse) => Results<RowType>,
   readResults: <RowType>(result: SqlResult) => Results<RowType>,
 ): TransactionSession => {
+  // The scripts and the rollback in flight.
   const pending = new Set<Promise<unknown>>();
+  // The statements in flight. They are counted as they are sent and as their
+  // responses arrive, rather than held in the set above, so that a statement
+  // costs no reaction on its promise.
+  let inFlight = 0;
+  // What settle() waits on while statements are in flight.
+  let landing: {resolve(): void; reject(error: unknown): void} | undefined;
+  // The failures of the statements that failed within the last turn of the
+  // microtask queue, oldest first.
+  const failures: unknown[] = [];
   let open = true;
   let closing = false;
   let rolledBack = false;
@@ -629,21 +745,45 @@ const createTransactionSession = (
     );
   };
 
-  // Tracks a statement until it settles, and a prepared statement's execution
-  // with it, in one reaction rather than one for each.
-  const track = <Result>(
-    promise: Promise<Result>,
-    statement?: PreparedStatementState,
-  ): Promise<Result> => {
+  // Tracks a script until it settles.
+  const track = <Result>(promise: Promise<Result>): Promise<Result> => {
     assertOpen();
     pending.add(promise);
-    statement?.inFlight.add(promise);
-    const settled = (): void => {
-      pending.delete(promise);
-      statement?.inFlight.delete(promise);
-    };
-    void promise.then(settled, settled);
+    forget(promise);
     return promise;
+  };
+
+  // Counts a statement as settled, and a prepared statement's execution with
+  // it. A failure reaches a settle() that is waiting at once. One that arrives
+  // before settle() begins is kept for one turn of the microtask queue, and
+  // fails a settle() that begins within it: a Worker that answers within the
+  // queue, as a stand-in on the page may, can fail a statement after its
+  // callback has returned and before the transaction has looked at what is in
+  // flight. After that turn the failure is its caller's alone to handle, as
+  // one that the callback awaited and caught is.
+  const statementSettled = (
+    failed: boolean,
+    error: unknown,
+    statement: PreparedStatementState | undefined,
+  ): void => {
+    inFlight--;
+    if (
+      statement !== undefined &&
+      --statement.inFlight === 0 &&
+      statement.idle !== undefined
+    ) {
+      queueMicrotask(statement.idle);
+    }
+    if (landing !== undefined) {
+      if (failed) {
+        landing.reject(error);
+      } else if (inFlight === 0) {
+        landing.resolve();
+      }
+    } else if (failed) {
+      failures.push(error);
+      queueMicrotask(() => failures.shift());
+    }
   };
 
   const transaction: Transaction = objFreeze({
@@ -652,14 +792,20 @@ const createTransactionSession = (
       params: JsonValue[] = [],
       options?: QueryOptions,
     ): Promise<Results<RowType>> => {
-      assertOpen();
-      assertQueryOptions(options);
-      return track(
-        rpc.request(
-          'executeSql',
-          {sql, params, transactionId, ...rowModeParam(options)},
-          readResults<RowType>,
-        ),
+      if (!open || closing) {
+        assertOpen();
+      }
+      const arrayRows = options !== undefined && asksForArrayRows(options);
+      inFlight++;
+      return rpc.execute(
+        STATEMENT_SQL,
+        sql,
+        transactionId,
+        arrayRows,
+        params,
+        readStatement<RowType>,
+        readResults<RowType>,
+        statementSettled,
       );
     },
 
@@ -691,23 +837,38 @@ const createTransactionSession = (
       params: JsonValue[] = [],
       options?: QueryOptions,
     ): Promise<Results<RowType>> => {
-      assertOpen();
-      const state = preparedStatementState(statement);
+      if (!open || closing) {
+        assertOpen();
+      }
+      // A value that is no statement, an object or not, has no state.
+      const state = preparedStatementStates.get(statement);
+      if (state === undefined) {
+        throw clientError(
+          'INVALID_PREPARED_STATEMENT',
+          'The value is not a TinyJoin prepared statement',
+        );
+      }
       if (state.owner !== preparedOwner) {
         throw clientError(
           'PREPARED_STATEMENT_CLIENT_MISMATCH',
           'The prepared statement belongs to a different TinyJoin client',
         );
       }
-      state.assertClientOpen();
-      assertPreparedStatementOpen(state);
-      assertQueryOptions(options);
-      return track(
-        rpc.request(
-          'executePrepared',
-          preparedParams(state.statementId, params, transactionId, options),
-          readResults<RowType>,
-        ),
+      if (state.closed) {
+        assertPreparedStatementOpen(state);
+      }
+      const arrayRows = options !== undefined && asksForArrayRows(options);
+      inFlight++;
+      state.inFlight++;
+      return rpc.execute(
+        STATEMENT_PREPARED,
+        state.statementId,
+        transactionId,
+        arrayRows,
+        params,
+        readStatement<RowType>,
+        readResults<RowType>,
+        statementSettled,
         state,
       );
     },
@@ -740,9 +901,20 @@ const createTransactionSession = (
       open = false;
     },
 
+    // Waits until nothing the transaction sent is in flight. If any of it
+    // fails meanwhile, this fails with it at once, so that the transaction
+    // rolls back rather than commits around a statement nobody awaited.
     settle: async (): Promise<void> => {
-      while (pending.size > 0) {
-        await Promise.all([...pending]);
+      if (failures.length > 0) {
+        throw failures[0];
+      }
+      while (inFlight > 0 || pending.size > 0) {
+        const landed =
+          inFlight > 0 &&
+          new Promise<void>((resolve, reject) => {
+            landing = {resolve, reject};
+          });
+        await Promise.all([...pending, landed]);
       }
       await rollbackPromise;
     },
@@ -820,20 +992,13 @@ const createWorker = (
   ];
 };
 
-const preparedStatementState = (value: unknown): PreparedStatementState => {
-  const state = isRecord(value)
-    ? preparedStatementStates.get(value)
-    : undefined;
-  if (isUndefined(state)) {
-    throw clientError(
-      'INVALID_PREPARED_STATEMENT',
-      'The value is not a TinyJoin prepared statement',
-    );
-  }
-  return state;
-};
-
+// Refuses a statement that may not run: with its client's error if the client
+// has closed, and otherwise with its own if it has. A client that closes seals
+// every statement it still has, so a statement that is not closed has an open
+// client, and one test of `closed` clears a statement of both before this is
+// called.
 const assertPreparedStatementOpen = (state: PreparedStatementState): void => {
+  state.assertClientOpen();
   if (state.closed) {
     throw clientError(
       'PREPARED_STATEMENT_CLOSED',
@@ -842,16 +1007,16 @@ const assertPreparedStatementOpen = (state: PreparedStatementState): void => {
   }
 };
 
-const trackPreparedExecution = <Result>(
+// Counts a prepared statement's execution as settled, whatever its outcome,
+// and lets a close() that was waiting for the last of them go on.
+const executionSettled = (
+  _failed: boolean,
+  _error: unknown,
   state: PreparedStatementState,
-  operation: Promise<Result>,
-): Promise<Result> => {
-  state.inFlight.add(operation);
-  void operation.then(
-    () => state.inFlight.delete(operation),
-    () => state.inFlight.delete(operation),
-  );
-  return operation;
+): void => {
+  if (--state.inFlight === 0 && state.idle !== undefined) {
+    queueMicrotask(state.idle);
+  }
 };
 
 const assertClientOptions = (options: ClientOptions): void => {
@@ -908,41 +1073,45 @@ const rowModeParam = (
   options: QueryOptions | undefined,
 ): {rowMode?: 'array'} => (options?.rowMode === 'array' ? {rowMode: 'array'} : {});
 
-// The parameters of a prepared statement's execution: its array rows only when
-// asked for, so that the usual request is built without spreading anything.
-const preparedParams = (
-  statementId: number,
-  params: JsonValue[],
-  transactionId: string | undefined,
-  options: QueryOptions | undefined,
-): RpcMethods['executePrepared']['request'] => {
-  if (isUndefined(transactionId)) {
-    return options?.rowMode === 'array'
-      ? {statementId, params, rowMode: 'array'}
-      : {statementId, params};
-  }
-  return options?.rowMode === 'array'
-    ? {statementId, params, transactionId, rowMode: 'array'}
-    : {statementId, params, transactionId};
+// Checks the options a statement was given, and says whether they ask for
+// array rows. A statement given none, as nearly all are, does not call this.
+const asksForArrayRows = (options: QueryOptions): boolean => {
+  assertQueryOptions(options);
+  return options.rowMode === 'array';
 };
 
 // The rows of a statement that returns none, such as an INSERT's.
 const NO_ROWS = '{"fields":[],"rows":[]}';
 
-// A result's rows arrive as JSON text, parsed here only once they are used.
-const toResults = <RowType>(result: SqlResult): Results<RowType> => {
-  const data =
-    result.data === NO_ROWS ? {fields: [], rows: []} : parseSqlData(result.data);
+// A result's fields and rows arrive as JSON text, parsed here only once they
+// are used: an object holding an array of each. An array holds neither, so it
+// needs no test of its own. Every read comes through here, so the text is
+// parsed and its shape tested in place.
+const readData = (text: string): {fields: unknown[]; rows: unknown[]} => {
+  let data: {fields?: unknown; rows?: unknown} | null | undefined;
+  if (text === NO_ROWS) {
+    data = {fields: [], rows: []};
+  } else {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      // Text that is not JSON has no fields or rows either.
+    }
+  }
   if (
-    !isRecord(data) ||
+    typeof data !== 'object' ||
+    data === null ||
     !arrayIsArray(data.fields) ||
     !arrayIsArray(data.rows)
   ) {
-    throw clientError(
-      'PROTOCOL_MISMATCH',
-      'The TinyJoin worker returned an invalid result for the requested operation',
-    );
+    throw invalidResult();
   }
+  return data as {fields: unknown[]; rows: unknown[]};
+};
+
+// The public result of a statement, from the result object it came as.
+const toResults = <RowType>(result: SqlResult): Results<RowType> => {
+  const data = readData(result.data);
   const command = result.command;
   const affectedRows = changesRows(command) ? result.rowCount : 0;
   return countsRows(command)

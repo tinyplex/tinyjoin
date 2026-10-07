@@ -1,9 +1,13 @@
-import {asCodedError} from '../common.js';
-import type {WorkerRpc} from '../client/rpc.js';
+import {arrayIsArray, asCodedError} from '../common.js';
 import type {LocalRpc} from './local-rpc.js';
 import {
   PROTOCOL_VERSION,
+  STATEMENT_PREPARED,
   type SerializedError,
+  type SqlResult,
+  type StatementRequest,
+  type StatementResponse,
+  type StatementResult,
   type WorkerRequest,
   type WorkerResponse,
 } from '../protocol.js';
@@ -23,14 +27,15 @@ type Connection = {
   prepared: Map<number, number>;
 };
 type Queued = {message: RoutedRequest; bytes: number};
-type Post = (response: WorkerResponse) => void;
+type Post = (response: WorkerResponse | StatementResponse) => void;
 
 /** Schedules complete transaction callbacks, not just individual RPC messages. */
 export const createDatabaseBroker = (
-  rpc: WorkerRpc & Partial<Pick<LocalRpc, 'requestNow'>>,
+  rpc: Pick<LocalRpc, 'request'> &
+    Partial<Pick<LocalRpc, 'requestNow' | 'statementNow'>>,
   epoch: string,
   localClient: string,
-  localResponse: (response: WorkerResponse) => void,
+  localResponse: Post,
   revision: () => number,
   noteResult: (result: unknown) => void,
   onFailure: (error: SerializedError) => void,
@@ -45,7 +50,10 @@ export const createDatabaseBroker = (
   // it by, which also names this owner's epoch.
   let transaction: {client: string; token: string; id: string} | undefined;
 
-  const reply = (client: string, response: WorkerResponse): void => {
+  const reply = (
+    client: string,
+    response: WorkerResponse | StatementResponse,
+  ): void => {
     if (client === localClient) localResponse(response);
     else connections.get(client)?.channel.postMessage({epoch, response});
   };
@@ -187,21 +195,16 @@ export const createDatabaseBroker = (
     }
   };
 
-  // Posts a request's outcome, retiring this owner when an error left the
+  // Posts a request's failure, retiring this owner when the error left the
   // engine beyond use.
-  const settle = (post: Post, id: number, ok: boolean, value: unknown): void => {
-    if (ok) {
-      noteResult(value);
-      post({v: PROTOCOL_VERSION, id, ok, result: value});
-      return;
-    }
+  const settleFailure = (post: Post, id: number, value: unknown): void => {
     const error =
       asCodedError(value) ??
       coordinationError(
         'WORKER_OPERATION_FAILED',
         value instanceof Error ? value.message : String(value),
       );
-    post({v: PROTOCOL_VERSION, id, ok, error});
+    post({v: PROTOCOL_VERSION, id, ok: false, error});
     if (
       [
         'RECOVERY_REQUIRED',
@@ -210,6 +213,44 @@ export const createDatabaseBroker = (
       ].includes(error.code)
     )
       onFailure(error);
+  };
+
+  // Posts a statement's result. One that is a flat array published nothing: it
+  // holds no newer revision to note, and is its own response once the two
+  // slots left for it are filled. Any other is noted, and goes in a response.
+  const settleStatement = (
+    post: Post,
+    id: number,
+    result: SqlResult | StatementResult,
+  ): void => {
+    if (arrayIsArray(result)) {
+      result[0] = PROTOCOL_VERSION;
+      result[1] = id;
+      post(result as StatementResponse);
+    } else {
+      noteResult(result);
+      post({v: PROTOCOL_VERSION, id, ok: true, result});
+    }
+  };
+
+  // Posts a request's outcome. A script's results are an array too, but of
+  // results, so only a statement's array is taken for a flat result.
+  const settle = (
+    post: Post,
+    request: WorkerRequest,
+    ok: boolean,
+    value: unknown,
+  ): void => {
+    if (!ok) settleFailure(post, request.id, value);
+    else if (
+      request.method === 'executeSql' ||
+      request.method === 'executePrepared'
+    )
+      settleStatement(post, request.id, value as SqlResult | StatementResult);
+    else {
+      noteResult(value);
+      post({v: PROTOCOL_VERSION, id: request.id, ok, result: value});
+    }
   };
 
   // The host's parameters for a client's statement that can be served at once,
@@ -255,7 +296,7 @@ export const createDatabaseBroker = (
     const params = immediateParams(client, request);
     const served = params && rpc.requestNow!(request.method, params as never);
     if (!served) return false;
-    settle(post, request.id, served.ok, served.ok ? served.value : served.error);
+    settle(post, request, served.ok, served.ok ? served.value : served.error);
     return true;
   };
 
@@ -287,9 +328,9 @@ export const createDatabaseBroker = (
         }
         const post: Post = (response) => reply(message.client, response);
         try {
-          settle(post, message.request.id, true, await handle(message));
+          settle(post, message.request, true, await handle(message));
         } catch (error) {
-          settle(post, message.request.id, false, error);
+          settle(post, message.request, false, error);
         }
       }
     } catch {
@@ -404,6 +445,52 @@ export const createDatabaseBroker = (
      */
     serveLocal: (request: WorkerRequest, post: Post): boolean =>
       !closed && serveNow(localClient, request, post),
+    /**
+     * Serves a statement request of the local client at once, if it can be,
+     * as serveLocal() would serve the request it stands for, and posts its
+     * response with `post`. Reports whether it did; if not, nothing happened,
+     * and the statement takes its turn as that request. The conditions are
+     * those of immediateParams(), read from the array: nothing waits, the
+     * active transaction is this client's and the one named, and the engine
+     * holds the prepared statement.
+     */
+    serveStatement: (request: StatementRequest, post: Post): boolean => {
+      if (
+        closed ||
+        !rpc.statementNow ||
+        busy ||
+        queue.length > 0 ||
+        abandoned.size > 0
+      )
+        return false;
+      const named = request[4];
+      let token: string | undefined;
+      if (transaction !== undefined) {
+        if (transaction.client !== localClient) return false;
+        if (named !== 0) {
+          if (named !== transaction.id) return false;
+          token = transaction.token;
+        }
+      } else if (named !== 0) return false;
+      let target = request[3];
+      if (request[2] === STATEMENT_PREPARED) {
+        const statementId = connections
+          .get(localClient)
+          ?.prepared.get(target as number);
+        if (statementId === undefined) return false;
+        target = statementId;
+      }
+      let result: SqlResult | StatementResult | undefined;
+      try {
+        result = rpc.statementNow(request, target, token);
+      } catch (error) {
+        settleFailure(post, request[1], error);
+        return true;
+      }
+      if (result === undefined) return false;
+      settleStatement(post, request[1], result);
+      return true;
+    },
     close: (): void => {
       closed = true;
       for (const connection of connections.values()) {

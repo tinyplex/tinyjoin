@@ -3276,15 +3276,53 @@ in one pass; and a response's keys are counted rather than walked where each
 is checked by name. Warm in Chromium, an update by key in a transaction spends
 about 2 µs less in the Worker's JavaScript and 1 µs less in the page's.
 
+A statement and its result now cross between the page and the Worker as flat
+arrays. A statement's request is one array: its text or its prepared
+statement, its transaction, and then its parameters themselves. The response
+to a statement that published nothing, which is every statement in a
+transaction and every read, is one array too: the command, the revision and
+the row count, followed by a read's rows as text, or by the table a write
+changed and its changed keys. Each was an object holding objects, whose every
+key and value a message's structured clone writes on one thread and reads on
+the other, and a write's result was JSON text that the engine wrote, the
+Worker decoded and the page parsed. The engine now writes such a result as
+numbers into a small buffer that the Worker reads in place. A result of any
+other shape, such as one with `RETURNING` rows, one that changed several
+tables, or one that committed, crosses as it did.
+
+The page does less for each statement as well. It counts a transaction's
+statements in flight, where it kept each one's promise in a set, and a
+prepared statement's in a second, with a reaction on each to remove it, and
+it checks a response with plain comparisons. That matters most in a page's
+first few thousand statements, which is what every benchmark sample times:
+V8 has not yet optimized the client there, and each small helper function is
+a call. In Chromium, sample for sample against the build before, 1,000
+updates by key in a transaction fell from 30.5 ms to 24.5, upserts from 29.5
+to 22.9, deletes by key from 30.0 to 23.8, and selects by key from 27.7 to
+22.1; 10,000 inserts in a transaction fell from 247 ms to 200, and into an
+indexed table from 259 to 207.
+
+A statement's parameters are read from their array one by one, so an array
+that could not be copied whole, such as a reactive proxy of an array of plain
+values, is now sent, where it failed with `WORKER_POST_FAILED`.
+
 ### Download size
 
-The compressed download is now 351 KiB, up from 339 KiB in
-v0.5.0, for the record tests, the point planner, and the word-wise
-comparison.
+The compressed download is now 354 KiB, up from 339 KiB in
+v0.5.0, for the record tests, the point planner, the word-wise comparison,
+and the flat statement messages.
 
 ### Upgrading from v0.5.0
 
-Nothing is required: the API and the storage format are unchanged.
+Nothing is required of an application that installs the package whole: the
+API and the storage format are unchanged.
+
+**The Worker protocol version moves from 11 to 12.** Client and Worker ship
+together and are upgraded together by a normal install, so this affects only a
+deployment that pins or caches a Worker file independently of the client
+bundle. A mismatched pair fails cleanly with `PROTOCOL_MISMATCH`, and tabs
+running different releases fail with `DATABASE_VERSION_MISMATCH`, rather than
+misreading each other's results.
 
 ## v0.5.0
 

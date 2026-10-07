@@ -7,10 +7,20 @@ import {
   type WorkerEvent,
   type WorkerRequest,
 } from '../protocol.js';
-import {startWorker, type Served} from './host.js';
+import {ClientError} from '../client/error.js';
+import {
+  serializeError,
+  startWorker,
+  type Served,
+  type WorkerController,
+} from './host.js';
 
-/** A connection to an engine host in the same Worker. */
-export interface LocalRpc extends WorkerRpc {
+/**
+ * A connection to an engine host in the same Worker. It takes only what its
+ * users need of a connection to a Worker: requests, events and disposal.
+ */
+export interface LocalRpc
+  extends Pick<WorkerRpc, 'request' | 'onEvent' | 'dispose'> {
   /**
    * Serves a request at once, as the host's requestNow() does, or returns
    * `undefined`, having done nothing, when it must wait its turn.
@@ -19,6 +29,13 @@ export interface LocalRpc extends WorkerRpc {
     method: Method,
     params: RpcMethods[Method]['request'],
   ): Served | undefined;
+  /**
+   * Serves a statement request at once, as the host's statementNow() does: it
+   * returns the result, or throws the error a response would carry, as
+   * requestNow() returns it, or returns `undefined`, having done nothing, when
+   * the statement must wait its turn.
+   */
+  statementNow: WorkerController['statementNow'];
 }
 
 /**
@@ -55,6 +72,16 @@ export const createLocalRpc = (): LocalRpc => {
     },
     requestNow: (method, params) =>
       disposed ? undefined : host.requestNow(envelope(method, params)),
+    statementNow: (request, target, transactionId) => {
+      if (disposed) {
+        return undefined;
+      }
+      try {
+        return host.statementNow(request, target, transactionId);
+      } catch (error) {
+        throw new ClientError(serializeError(error));
+      }
+    },
     onEvent: (listener) => {
       listeners.add(listener);
     },

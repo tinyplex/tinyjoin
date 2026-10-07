@@ -1,4 +1,3 @@
-import {isSqlResultText} from '../../../src/protocol.js';
 import type {PageDevice} from '../../../src/worker/page-device.js';
 import {
   createStructuredWasmEngine,
@@ -170,11 +169,12 @@ async function run(): Promise<{
     committedRevision,
     pageCount,
     reopenedRevision,
-    // A read published nothing, so its result passes on as text.
+    // A read published nothing, so its result is the response it is posted
+    // as, whose last slot holds its fields and rows as text.
     rows: (
-      JSON.parse(isSqlResultText(result) ? result[1] : result.data) as {
-        rows: unknown[];
-      }
+      JSON.parse(
+        Array.isArray(result) ? (result[5] as string) : result.data,
+      ) as {rows: unknown[]}
     ).rows,
   };
 }
