@@ -3292,6 +3292,12 @@ statement that finds a row fetches a page at each level of its tree, so
 before V8 has optimized the code an update, delete or select by key runs 2%
 fewer instructions, and a scan 3% fewer.
 
+A lookup then searches each of those pages in one loop, which reads the keys
+it probes in place and decides a key of eight bytes, as an `INTEGER`'s is, by
+comparing two words. Each probe had gone through a reader and a comparison of
+byte slices, four calls in all. Before V8 has optimized the code, an update,
+upsert, delete or select by key runs a further 5% to 6% fewer instructions.
+
 ### Writing pages
 
 A commit stores each cell's header fields and its slot with no call, tests a

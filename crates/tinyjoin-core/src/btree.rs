@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, cmp::Ordering};
 
 use crate::{
     CandidateId, EngineError, FIRST_DATA_PAGE_ID, MAX_PAGE_COUNT, MAX_PAGE_PAYLOAD_SIZE, Page,
@@ -594,31 +594,39 @@ pub(crate) fn get_prefixed_from(
         )?;
         validate_expected_level(page_id, node.level, expected_level)?;
         validate_child_generation(page_id, node.generation, parent_generation)?;
+        let Some((index, found)) = node.search(key) else {
+            return Err(node.search_error(key));
+        };
         if node.leaf {
-            let Some(index) = node.find(key)? else {
+            if !found {
                 return Ok(None);
+            }
+            let value = match node.inline_leaf_cell(index) {
+                Some((_, value)) => value,
+                None => match node.leaf_cell(index)?.1 {
+                    CellValue::Inline(value) => value,
+                    CellValue::Overflow(descriptor) => {
+                        let leaf_generation = node.generation;
+                        let (value, _) = read_overflow_chain(
+                            &mut |page_id| reader.read_btree_page(page_id),
+                            tree_id,
+                            generation,
+                            leaf_generation,
+                            &descriptor,
+                        )?;
+                        // A value read from its overflow pages is a vector already, which only a
+                        // prefix has to be put in front of.
+                        return Ok(Some(if prefix.is_empty() {
+                            value
+                        } else {
+                            prefixed(prefix, &value)
+                        }));
+                    }
+                },
             };
-            let descriptor = match node.leaf_cell(index)?.1 {
-                CellValue::Inline(value) => return Ok(Some(prefixed(prefix, value))),
-                CellValue::Overflow(descriptor) => descriptor,
-            };
-            let leaf_generation = node.generation;
-            let (value, _) = read_overflow_chain(
-                &mut |page_id| reader.read_btree_page(page_id),
-                tree_id,
-                generation,
-                leaf_generation,
-                &descriptor,
-            )?;
-            // A value read from its overflow pages is a vector already, which only a prefix has
-            // to be put in front of.
-            return Ok(Some(if prefix.is_empty() {
-                value
-            } else {
-                prefixed(prefix, &value)
-            }));
+            return Ok(Some(prefixed(prefix, value)));
         }
-        page_id = node.child(node.child_index_for(key)?)?;
+        page_id = node.child(index)?;
         expected_level = Some(node.level - 1);
         parent_generation = Some(node.generation);
     }
@@ -1315,10 +1323,68 @@ impl<'a> NodeView<'a> {
         self.partition(low, |index| Ok(self.leaf_key(index)? < key))
     }
 
-    /// The leaf entry whose key is exactly `key`.
+    /// The leaf entry whose key is exactly `key`, as a lookup found it before
+    /// [`Self::search`], which tests hold to it.
+    #[cfg(test)]
     fn find(&self, key: &[u8]) -> Result<Option<usize>> {
         let index = self.lower_bound(key)?;
         Ok((index < self.item_count && self.leaf_key(index)? == key).then_some(index))
+    }
+
+    /// Where `key` falls among the node's keys, and whether the key there is `key` itself: in a
+    /// leaf the first entry at or after it, as [`Self::lower_bound`] finds, and in an internal
+    /// node the child to follow, as [`Self::child_index_for`] finds. One loop reads each key it
+    /// probes in place, where those call a reader for each. `None` when a probed cell does not
+    /// lie within the page, which the readers then report as they always have.
+    #[inline(always)]
+    fn search(&self, key: &[u8]) -> Option<(usize, bool)> {
+        let page: &[u8; MAX_PAGE_PAYLOAD_SIZE] = (&*self.bytes).try_into().ok()?;
+        let slots = page[NODE_HEADER_SIZE..].as_chunks::<SLOT_SIZE>().0;
+        let header = if self.leaf {
+            LEAF_CELL_HEADER_SIZE
+        } else {
+            INTERNAL_CELL_HEADER_SIZE
+        };
+        // A leaf's search passes the keys below `key`, and an internal node's those at or below.
+        let passed = if self.leaf {
+            Ordering::Less
+        } else {
+            Ordering::Equal
+        };
+        let (mut low, mut high) = (0, self.item_count);
+        let mut found = false;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let offset = usize::from(u16::from_le_bytes(*slots.get(middle)?));
+            if offset < self.free_end {
+                return None;
+            }
+            let length = page.get(offset..offset + 2)?;
+            let start = offset + header;
+            let end = start + usize::from(u16::from_le_bytes([length[0], length[1]]));
+            let order = key_order(page.get(start..end)?, key);
+            if order <= passed {
+                low = middle + 1;
+            } else {
+                high = middle;
+                found = order == Ordering::Equal;
+            }
+        }
+        Some((low, found))
+    }
+
+    /// The error the readers [`Self::search`] stands in for report of the cell it refused. They
+    /// probe the cells it probed, in its order, and so stop at the same one.
+    #[cold]
+    #[inline(never)]
+    fn search_error(&self, key: &[u8]) -> EngineError {
+        let searched = if self.leaf {
+            self.lower_bound(key)
+        } else {
+            self.child_index_for(key)
+        };
+        debug_assert!(searched.is_err());
+        searched.err().unwrap_or_else(|| invalid_btree(""))
     }
 
     /// The number of leading entries for which `before` holds, by binary search over sorted cells,
@@ -3751,6 +3817,27 @@ fn validate_child_generation(
     Ok(())
 }
 
+/// The order of a cell's key and the key searched for, as the slices order, decided without a
+/// call when their first eight bytes decide it. The lowest byte in which two little-endian words
+/// differ is the first byte in which the keys do.
+#[inline(always)]
+fn key_order(cell: &[u8], key: &[u8]) -> Ordering {
+    if let (Some(cell_start), Some(key_start)) = (cell.first_chunk::<8>(), key.first_chunk::<8>()) {
+        let (a, b) = (
+            u64::from_le_bytes(*cell_start),
+            u64::from_le_bytes(*key_start),
+        );
+        if a != b {
+            let shift = (a ^ b).trailing_zeros() & 56;
+            return ((a >> shift) as u8).cmp(&((b >> shift) as u8));
+        }
+        if cell.len() == 8 && key.len() == 8 {
+            return Ordering::Equal;
+        }
+    }
+    cell.cmp(key)
+}
+
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {
     u16_at(bytes, offset)
 }
@@ -5753,6 +5840,204 @@ mod tests {
             assert_eq!(bytes, expected, "four bytes at {offset}");
             assert_eq!(read_u32(&bytes, offset), 0x1234_5678);
         }
+    }
+
+    /// A sequence of numbers that is the same in every run, for tests that generate keys.
+    fn numbers(seed: u64) -> impl FnMut() -> u64 {
+        let mut state = seed;
+        move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        }
+    }
+
+    /// Keys of up to twenty bytes over five values, so that many share their first eight bytes,
+    /// differ within them at every place, or are prefixes of one another.
+    fn generated_keys(count: usize, seed: u64) -> Vec<Vec<u8>> {
+        let mut next = numbers(seed);
+        let mut keys = vec![Vec::new()];
+        for _ in 0..count {
+            let length = (next() % 21) as usize;
+            keys.push(
+                (0..length)
+                    .map(|_| [0x00, 0x01, 0x7f, 0x80, 0xff][(next() % 5) as usize])
+                    .collect(),
+            );
+        }
+        keys
+    }
+
+    #[test]
+    fn key_order_orders_keys_as_slices_do() {
+        let keys = generated_keys(500, 0x9e37_79b9_7f4a_7c15);
+        for left in &keys {
+            for right in &keys {
+                assert_eq!(
+                    key_order(left, right),
+                    left.as_slice().cmp(right),
+                    "{left:?} {right:?}"
+                );
+            }
+        }
+        // Keys of exactly eight bytes, as an integer's are, in each order and equal.
+        for (left, right) in [(1_u64, 2_u64), (2, 1), (7, 7), (255, 256), (u64::MAX, 0)] {
+            let (left, right) = (left.to_be_bytes(), right.to_be_bytes());
+            assert_eq!(key_order(&left, &right), left.cmp(&right));
+        }
+    }
+
+    /// A leaf of `keys` and an internal node whose separators they are, as views of their pages,
+    /// after `spoil` has changed what it will of each payload.
+    fn searched_nodes(
+        keys: &[Vec<u8>],
+        spoil: impl Fn(&mut Vec<u8>, bool),
+    ) -> [NodeView<'static>; 2] {
+        let leaf = Node::leaf(
+            TREE,
+            2,
+            keys.iter()
+                .map(|key| LeafEntry {
+                    key: key.clone(),
+                    value: LeafValue::Inline(b"v".to_vec()),
+                })
+                .collect(),
+        );
+        let internal = Node::internal(
+            TREE,
+            2,
+            1,
+            FIRST_DATA_PAGE_ID + 1,
+            EMPTY_HASH,
+            keys.iter()
+                .enumerate()
+                .map(|(index, key)| InternalEntry {
+                    key: key.clone(),
+                    right_child: FIRST_DATA_PAGE_ID + 2 + index as PageId,
+                    child_hash: EMPTY_HASH,
+                })
+                .collect(),
+        );
+        [(leaf, true), (internal, false)].map(|(node, is_leaf)| {
+            let (mut page, _) = node.encode(FIRST_DATA_PAGE_ID).unwrap();
+            spoil(&mut page.payload, is_leaf);
+            NodeView::from_payload(
+                page.id,
+                page.page_type,
+                Cow::Owned(page.payload),
+                TREE,
+                2,
+                false,
+            )
+            .unwrap()
+        })
+    }
+
+    /// Holds a view's one-loop search to the readers it stands in for, for `key`: the same place
+    /// and the same finding, or no answer exactly where they refuse a cell, with their error.
+    fn assert_searched_as_read(view: &NodeView<'_>, key: &[u8]) {
+        let read = if view.leaf {
+            view.lower_bound(key).and_then(|index| {
+                let found = index < view.len() && view.leaf_key(index)? == key;
+                Ok((index, found))
+            })
+        } else {
+            view.child_index_for(key).map(|index| (index, false))
+        };
+        match (view.search(key), read) {
+            (Some((index, found)), Ok(read)) => {
+                assert_eq!((index, view.leaf && found), read, "{key:?}");
+                if view.leaf {
+                    assert_eq!(view.find(key).unwrap(), found.then_some(index), "{key:?}");
+                }
+            }
+            (None, Err(error)) => assert_eq!(view.search_error(key), error, "{key:?}"),
+            (searched, read) => panic!("{key:?}: searched {searched:?}, read {read:?}"),
+        }
+    }
+
+    #[test]
+    fn a_node_is_searched_as_its_readers_search_it() {
+        let probes = generated_keys(400, 0x2545_f491_4f6c_dd1d);
+        for (count, seed) in [(0, 1), (1, 2), (2, 3), (7, 4), (60, 5), (90, 6)] {
+            let mut keys = generated_keys(count, seed);
+            if count == 0 {
+                keys.clear();
+            }
+            keys.sort();
+            keys.dedup();
+            for view in &searched_nodes(&keys, |_, _| {}) {
+                for key in keys.iter().chain(&probes) {
+                    assert_searched_as_read(view, key);
+                }
+            }
+            // A page whose checksum holds may still have its cells out of order. The search and
+            // the readers probe the same cells of it, and so end at the same place.
+            if keys.len() > 3 {
+                let exchange = |payload: &mut Vec<u8>, _: bool| {
+                    let (first, last) = (NODE_HEADER_SIZE, NODE_HEADER_SIZE + 3 * SLOT_SIZE);
+                    for byte in 0..SLOT_SIZE {
+                        payload.swap(first + byte, last + byte);
+                    }
+                };
+                for view in &searched_nodes(&keys, exchange) {
+                    for key in keys.iter().chain(&probes) {
+                        assert_searched_as_read(view, key);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_node_search_refuses_the_cell_its_readers_refuse() {
+        let probes = generated_keys(200, 0x1234_5678_9abc_def1);
+        let mut keys = generated_keys(40, 7);
+        keys.sort();
+        keys.dedup();
+        let count = keys.len();
+        // A slot that points below the cells, into the free space, whose zero bytes would read
+        // as a cell with an empty key, or a byte short of the first cell; one that points at
+        // the page's last byte, or past its end; and a cell whose key is longer than the page
+        // has room for.
+        type Spoil = fn(&mut Vec<u8>, usize, bool);
+        let spoils: [Spoil; 5] = [
+            |payload, slot, _| {
+                let free_end = read_u16(payload, 28);
+                payload[slot..slot + SLOT_SIZE].copy_from_slice(&(free_end - 64).to_le_bytes());
+            },
+            |payload, slot, _| {
+                let free_end = read_u16(payload, 28);
+                payload[slot..slot + SLOT_SIZE].copy_from_slice(&(free_end - 1).to_le_bytes());
+            },
+            |payload, slot, _| {
+                let last = (MAX_PAGE_PAYLOAD_SIZE - 1) as u16;
+                payload[slot..slot + SLOT_SIZE].copy_from_slice(&last.to_le_bytes());
+            },
+            |payload, slot, _| {
+                payload[slot..slot + SLOT_SIZE].copy_from_slice(&u16::MAX.to_le_bytes());
+            },
+            |payload, slot, _| {
+                let cell = usize::from(read_u16(payload, slot));
+                payload[cell..cell + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+            },
+        ];
+        let mut refused = 0;
+        for spoil in spoils {
+            for index in [0, 1, count / 2, count - 2, count - 1] {
+                let slot = NODE_HEADER_SIZE + index * SLOT_SIZE;
+                let views = searched_nodes(&keys, |payload, is_leaf| spoil(payload, slot, is_leaf));
+                for view in &views {
+                    for key in keys.iter().chain(&probes) {
+                        refused += usize::from(view.search(key).is_none());
+                        assert_searched_as_read(view, key);
+                    }
+                }
+            }
+        }
+        // The cells were spoiled where searches pass, so many searches met one.
+        assert!(refused > 1_000, "{refused}");
     }
 
     #[test]

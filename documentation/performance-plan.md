@@ -647,6 +647,23 @@ Found along the way:
   is 1.42 KiB smaller compressed; instructions under baseline compilation:
   delete-range -2.3%, insert-indexed -0.2%, create-index +0.3% (its batch's
   push is now a function shared with these two batches).
+- A lookup searches a node in one loop. `NodeView::search` probes the cells
+  the readers' binary search probed, reading each slot and key in place from
+  the page as an array of its size, and orders a cell's key and the key
+  searched for by `key_order`: when both have eight bytes their first words
+  are compared, the lowest byte in which two little-endian words differ being
+  the first in which the keys do, and any other pair goes to the slice
+  comparison. It answers for a leaf and for an internal node. Where a probed
+  cell lies outside the page it gives no answer, and the readers it stands in
+  for are run for their error, so a corrupt node fails as it did. Tests hold
+  it to `lower_bound`, `find` and `child_index_for` on sorted and disordered
+  nodes, and on nodes with a slot or a key length spoiled, and hold
+  `key_order` to the slice order; four faults put in on purpose each failed
+  one. Instructions under baseline compilation: delete-pk -5.1%, update-pk
+  -4.6%, upsert -5.7%, select-pk -5.8%; 0.3 KiB larger compressed. The
+  estimate had been 1%, from the comparisons alone: most of the saving is
+  the readers' calls, which an earlier trial of word-wise comparison inside
+  `memcmp` had left in place and so found nothing.
 
 Found along the way, 6 and 7 October:
 
