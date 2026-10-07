@@ -1513,6 +1513,8 @@ lines', true, '7')"#,
          ON CONFLICT (id) DO UPDATE SET qty = EXCLUDED.qty, note = $4";
     const ITEM_UPSERT_CROSSED: &str = "INSERT INTO items (id, name, note) VALUES ($1, $2, $3) \
          ON CONFLICT (id) DO UPDATE SET qty = EXCLUDED.name, name = EXCLUDED.note";
+    const ITEM_UPSERT_NAMED: &str = "INSERT INTO items (id, name) VALUES ($1, $2) \
+         ON CONFLICT (id) DO UPDATE SET note = EXCLUDED.name";
     const ITEM_SELECT: &str = "SELECT id, qty, note FROM items WHERE id = $1";
     const ITEM_LITERAL_NOTE: &str = "UPDATE items SET note = 'lit' WHERE id = 902";
     const ITEM_LITERAL_KEY: &str = "UPDATE items SET qty = $2 WHERE id = 902";
@@ -1830,9 +1832,9 @@ lines', true, '7')"#,
                     Fails("INVALID_QUERY")
                 },
             ),
-            // The first inserts from its template; the second finds that row, which is left to
-            // the general planner.
-            on_items(UPSERT_KEY, json!([n(72), s("seventy-two")]), Point),
+            // A clause that assigns a key column is the general planner's to plan, for a new
+            // row and then for the row that leaves.
+            on_items(UPSERT_KEY, json!([n(72), s("seventy-two")]), Full),
             on_items(UPSERT_KEY, json!([n(72), s("seventy-two again")]), Full),
             on_items(ITEM_DELETE, json!([n(72)]), Point),
             on_items(
@@ -1913,13 +1915,16 @@ lines', true, '7')"#,
     }
 
     /// Statements on `items` that are refused, most of them with two faults, where the order
-    /// in which a planner looks decides which of the two it reports.
+    /// in which a planner looks decides which of the two it reports. The last have a `SET` list
+    /// that only the general planner refuses, which a template's planner has to leave to it
+    /// whether or not the statement finds a row.
     fn refused_cases(round: PointRound) -> Vec<PointCase> {
         let (n, s) = round.rows();
         const REORDERED: &str = "INSERT INTO items (qty, name, id) VALUES ($1, $2, $3)";
         const UPDATE_TWO: &str = "UPDATE items SET qty = $1, name = $2 WHERE id = $3";
+        const DEFAULT_NAME: &str = "UPDATE items SET name = DEFAULT, qty = $1 WHERE id = $2";
         let (mistyped, violated) = (Fails("TYPE_MISMATCH"), Fails("CONSTRAINT_VIOLATION"));
-        vec![
+        let mut cases = vec![
             // A listed row's values are checked in the order of the table's columns, so a
             // null name is found before a mistyped quantity listed ahead of it.
             on_items(REORDERED, json!([5, s("reordered"), n(69)]), Point),
@@ -1934,6 +1939,10 @@ lines', true, '7')"#,
                 json!([1, 2, n(69)]),
                 Fails("INVALID_QUERY"),
             ),
+            // A `DEFAULT` is checked at its place among them: the null that is all `name` has
+            // for one is refused ahead of a mistyped quantity, and where no row is found.
+            on_items(DEFAULT_NAME, json!(["many", n(69)]), violated),
+            on_items(DEFAULT_NAME, json!([7, n(99)]), violated),
             // Of two listed rows, the first's key is found taken before the second's value
             // is found mistyped.
             on_items(
@@ -1969,7 +1978,57 @@ lines', true, '7')"#,
                 json!([n(63), s("crossed again"), "noted"]),
                 mistyped,
             ),
-        ]
+            // An upsert whose clause is in order, for a new row and then for that row. The
+            // table a later round creates has no `note`, and there the clause is refused.
+            on_items(ITEM_UPSERT_NAMED, json!([n(57), s("fifty-seven")]), Point),
+            on_items(
+                ITEM_UPSERT_NAMED,
+                json!([n(57), s("fifty-seven again")]),
+                Point,
+            ),
+        ];
+        // A `SET` list the general planner refuses: a column assigned twice, once or both
+        // times as `DEFAULT`; a column the table does not have, assigned or taken from the
+        // proposed row; and each of these ahead of a mistyped constant, which is the fault a
+        // planner that checked a clause's constants first would report. Each runs for a row
+        // that is there and for one that is not, because a planner that looked at the list
+        // only once it had a row to rewrite would insert the second, and one that found no
+        // row to update would report that it had changed none.
+        const DEFAULT_AND_VALUE: &str = "UPDATE items SET qty = DEFAULT, qty = $1 WHERE id = $2";
+        const DEFAULT_TWICE: &str = "UPDATE items SET qty = DEFAULT, qty = DEFAULT WHERE id = $1";
+        let upsert = |set: &str, params: Value, expected: Expected| {
+            let sql = format!(
+                "INSERT INTO items (id, name) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET {set}"
+            );
+            on_items(&sql, params, expected)
+        };
+        let (twice, unknown) = (Fails("INVALID_QUERY"), Fails("COLUMN_NOT_FOUND"));
+        for id in [n(69), n(56)] {
+            let name = s("refused");
+            cases.extend([
+                on_items(DEFAULT_AND_VALUE, json!([7, id]), twice),
+                on_items(DEFAULT_TWICE, json!([id]), twice),
+                upsert("nope = EXCLUDED.name", json!([id, name]), unknown),
+                upsert("name = EXCLUDED.nope", json!([id, name]), unknown),
+                upsert(
+                    "name = EXCLUDED.name, name = EXCLUDED.name",
+                    json!([id, name]),
+                    twice,
+                ),
+                upsert(
+                    "name = EXCLUDED.name, name = $3",
+                    json!([id, name, 7]),
+                    twice,
+                ),
+                upsert(
+                    "nope = EXCLUDED.name, qty = $3",
+                    json!([id, name, "many"]),
+                    unknown,
+                ),
+                upsert("qty = $3, qty = $4", json!([id, name, 1, "many"]), twice),
+            ]);
+        }
+        cases
     }
 
     /// Statements on `items` of shapes that have no point template, which only the general
@@ -2125,6 +2184,14 @@ lines', true, '7')"#,
             on_items(ITEM_UPSERT_QTY, json!([n(2), s("deux"), "a couple"]), Point),
             on_items(ITEM_UPSERT_QTY, json!([n(8), s("eight"), "eight"]), Point),
             on_items(ITEM_UPSERT_NAME, json!([n(8), s("eighth")]), Point),
+            // A clause that assigns `note`, for a new row and for a stored one: until the table
+            // has that column the clause is refused, and no row is inserted first.
+            on_items(
+                ITEM_UPSERT_NAMED,
+                json!([n(57), s("fifty-seven")]),
+                noted(Point),
+            ),
+            on_items(ITEM_UPSERT_NAMED, json!([n(8), s("eight")]), noted(Point)),
             on_items(ITEM_SELECT, json!([n(1)]), noted(Full)),
             on_items(ITEM_DELETE, json!([n(1)]), Point),
             // The row whose key two statements spell out, which the new table holds only once

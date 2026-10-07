@@ -195,6 +195,55 @@ fn do_update_rewrites_the_conflicting_row_from_excluded_values() {
                 "INSERT INTO kv (id, v) VALUES (50, 'a') ON CONFLICT (id) DO UPDATE SET n = 'bad'",
                 "TYPE_MISMATCH",
             ),
+            // So is a SET list that assigns a column the table does not have, takes one the
+            // proposed row does not have, or assigns a column twice, next to the first or not.
+            (
+                "INSERT INTO kv (id, v) VALUES (50, 'a') ON CONFLICT (id) DO UPDATE SET missing = EXCLUDED.v",
+                "COLUMN_NOT_FOUND",
+            ),
+            (
+                "INSERT INTO kv (id, v) VALUES (50, 'a') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.missing",
+                "COLUMN_NOT_FOUND",
+            ),
+            (
+                "INSERT INTO kv (id, v) VALUES (50, 'a') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v, v = EXCLUDED.v",
+                "INVALID_QUERY",
+            ),
+            (
+                "INSERT INTO kv (id, v) VALUES (50, 'a') ON CONFLICT (id) DO UPDATE SET n = 1, v = EXCLUDED.v, n = EXCLUDED.n",
+                "INVALID_QUERY",
+            ),
+            (
+                "INSERT INTO kv (id, v) VALUES (1, 'a') ON CONFLICT (id) DO UPDATE SET missing = EXCLUDED.v",
+                "COLUMN_NOT_FOUND",
+            ),
+            // The faults of a SET list are found in the order of the list, so one of those is
+            // reported ahead of a type error after it, and a type error ahead of one after it,
+            // whether or not a row conflicts.
+            (
+                "INSERT INTO kv (id, v) VALUES (50, 'a') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v, v = 5",
+                "INVALID_QUERY",
+            ),
+            (
+                "INSERT INTO kv (id, v) VALUES (1, 'a') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v, v = 5",
+                "INVALID_QUERY",
+            ),
+            (
+                "INSERT INTO kv (id, v) VALUES (50, 'a') ON CONFLICT (id) DO UPDATE SET missing = EXCLUDED.v, n = 'bad'",
+                "COLUMN_NOT_FOUND",
+            ),
+            (
+                "INSERT INTO kv (id, v) VALUES (1, 'a') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.missing, n = 'bad'",
+                "COLUMN_NOT_FOUND",
+            ),
+            (
+                "INSERT INTO kv (id, v) VALUES (50, 'a') ON CONFLICT (id) DO UPDATE SET n = 'bad', missing = EXCLUDED.v",
+                "TYPE_MISMATCH",
+            ),
+            (
+                "INSERT INTO kv (id, v) VALUES (1, 'a') ON CONFLICT (id) DO UPDATE SET n = 'bad', n = 2",
+                "TYPE_MISMATCH",
+            ),
         ] {
             let revision = engine.revision();
             assert_eq!(

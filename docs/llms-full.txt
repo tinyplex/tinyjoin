@@ -3221,7 +3221,9 @@ parameters: its key is encoded from them, the row looked up once, and the
 change built as the record a commit writes, rather than binding the
 statement's syntax tree and planning it as any statement is. A test stages
 the same statements both ways and checks that the transactions, the results,
-and the committed databases agree. Staging then looks a statement's table up
+and the committed databases agree, and that a statement one way refuses is
+refused the other way with the same error. Staging then looks a statement's
+table up
 once rather than for every row, a listed row's values are resolved to literals
 or parameter positions once, when the statement is prepared, rather than for
 every row of every execution, and an insert into a table none of whose staged

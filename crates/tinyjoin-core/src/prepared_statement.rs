@@ -907,6 +907,65 @@ mod tests {
     }
 
     #[test]
+    fn a_column_assigned_twice_is_refused_when_either_assignment_is_its_default() {
+        let mut engine = engine();
+        engine
+            .execute_sql(
+                "INSERT INTO tasks (id, title, done) VALUES (1, 'one', true)",
+                &[],
+            )
+            .unwrap();
+        let stored = "SELECT * FROM tasks ORDER BY id";
+        let before = engine.query_sql(stored, &[]).unwrap();
+        for (sql, values) in [
+            (
+                "UPDATE tasks SET done = DEFAULT, done = $1 WHERE id = $2",
+                vec![json!(true)],
+            ),
+            (
+                "UPDATE tasks SET done = $1, done = DEFAULT WHERE id = $2",
+                vec![json!(true)],
+            ),
+            (
+                "UPDATE tasks SET done = DEFAULT, done = DEFAULT WHERE id = $1",
+                vec![],
+            ),
+            (
+                "UPDATE tasks SET done = DEFAULT, title = $1, done = DEFAULT WHERE id = $2",
+                vec![json!("two")],
+            ),
+        ] {
+            let statement = engine.prepare_sql(sql).unwrap();
+            // Inside a transaction a prepared UPDATE by key is planned from its template, for a
+            // row that is there and for one that is not.
+            for transaction in [false, true] {
+                if transaction {
+                    engine.begin_transaction().unwrap();
+                }
+                for id in [1, 2] {
+                    let params = [values.clone(), vec![json!(id)]].concat();
+                    let error = engine.execute_prepared(statement, &params).unwrap_err();
+                    assert_eq!(error.code, "INVALID_QUERY", "{sql}");
+                    assert_eq!(
+                        error.message, "Column `done` is named more than once",
+                        "{sql}"
+                    );
+                    assert_eq!(
+                        engine.execute_sql(sql, &params).unwrap_err(),
+                        error,
+                        "{sql}"
+                    );
+                    assert_eq!(engine.query_sql(stored, &[]).unwrap(), before, "{sql}");
+                }
+                if transaction {
+                    engine.rollback_transaction().unwrap();
+                }
+            }
+            engine.close_prepared(statement).unwrap();
+        }
+    }
+
+    #[test]
     fn ddl_is_rejected_and_schema_changes_are_revalidated_on_execute() {
         let mut engine = engine();
         for sql in [

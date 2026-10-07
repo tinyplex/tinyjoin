@@ -977,7 +977,6 @@ fn plan_point_update(
         return Ok(None);
     };
     // Each assignment's value, checked in assignment order, as the general planner checks them.
-    let mut defaults = Vec::new();
     let mut assigned: Vec<Option<&Value>> = vec![None; schema.columns.len()];
     for (column, value) in assignments {
         let Some(position) = schema
@@ -990,19 +989,15 @@ fn plan_point_update(
         if schema.primary_key.contains(column) || assigned[position].is_some() {
             return Ok(None);
         }
-        match value {
-            Some(value) => assigned[position] = Some(point_value(value, params)?),
-            None => defaults.push((
-                position,
-                schema.columns[position]
-                    .default
-                    .clone()
-                    .unwrap_or(Value::Null),
-            )),
-        }
-    }
-    for (position, value) in &defaults {
-        assigned[*position] = Some(value);
+        // A `DEFAULT` takes its column's place as a value does, so that the test above finds a
+        // column assigned twice however it is assigned, which the general planner refuses.
+        assigned[position] = Some(match value {
+            Some(value) => point_value(value, params)?,
+            None => schema.columns[position]
+                .default
+                .as_ref()
+                .unwrap_or(&Value::Null),
+        });
     }
     for (column, _) in assignments {
         let position = schema
@@ -1233,6 +1228,25 @@ fn plan_point_insert(
                     .all(|column| target.contains(column))
             {
                 return Ok(None);
+            }
+            // The general planner looks at the whole clause before any row, and refuses one
+            // that assigns a column the table does not have or a column it has already
+            // assigned, or that takes a column the proposed row does not have. Such a clause
+            // is left to it here, before a constant or a row can be found at fault in its
+            // place, and so is one that assigns a key column, which it plans as a map. A
+            // column assigned from itself, as `SET c = EXCLUDED.c` assigns one, has been
+            // found by then, and is not looked for a second time.
+            let named = |name: &String| schema.columns.iter().any(|column| column.name == *name);
+            for (index, (column, value)) in assignments.iter().enumerate() {
+                if !named(column)
+                    || schema.primary_key.contains(column)
+                    || assignments[..index]
+                        .iter()
+                        .any(|(earlier, _)| earlier == column)
+                    || matches!(value, PointAssigned::Excluded(source) if source != column && !named(source))
+                {
+                    return Ok(None);
+                }
             }
             // A constant the clause assigns is checked before any row, whether or not one
             // conflicts, as the general planner checks it.

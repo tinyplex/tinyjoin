@@ -785,6 +785,25 @@ Found along the way, 8 October:
   does not. Each engine step is therefore measured twice: as instructions
   under baseline compilation alone, and as whole-stack time under V8's own
   tiering.
+- The point planner, new since v0.5.0 and so never released, did not answer
+  as full planning does for three kinds of invalid statement, found by
+  probing more than fifty shapes through the real bridge. A prepared `UPDATE`
+  by key with `SET qty = DEFAULT, qty = $1`, or two `DEFAULT`s for one
+  column, wrote the default where full planning refuses a column named
+  twice, because a `DEFAULT` took its column's place only after the test for
+  a repeated column. A prepared upsert whose clause assigned a column the
+  table does not have, took one from `EXCLUDED` that it does not have, or
+  assigned a column twice, inserted its row when no row conflicted, because
+  the clause was read only once there was a row to rewrite. And such a
+  clause with a mistyped constant reported the constant where full planning
+  reports the clause. Both planners now leave such a statement to full
+  planning before a constant or a row is looked at: a `DEFAULT` is stored as
+  a value is, and an upsert's clause is checked whole, by name, at each
+  execution. The equivalence test runs one statement of each kind for a row
+  that is there and for one that is not, and failed on each before the
+  change. An upsert by key runs 1.2% more instructions under baseline
+  compilation for the clause's check, which memoizing it against the
+  table's schema would remove; an update by key runs no more.
 - Instructions retired (`/usr/bin/time -l`), for a process that runs a
   workload a fixed number of times less a process that only sets it up,
   repeat to 0.2-0.4% on a machine whose timings of the same builds vary by
