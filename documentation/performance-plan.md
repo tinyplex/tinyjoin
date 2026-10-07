@@ -176,6 +176,21 @@ stayed at 1.30 to 1.35, inserts into an indexed table at 1.23, the `LIKE`
 delete at 1.17 times PGlite's time and the range delete at 1.10. The
 compressed download is 353 KiB.
 
+The `66805a22` run, published on 7 October after the day's work on bulk DML
+and the overlay, the first with the flush gate (which waited 110 s in all,
+read 0.24-0.98 ms a flush, and left no sample unrecovered) and the balanced
+engine order: TinyJoin was the fastest engine in 14 of the 20 workloads and
+second in the rest, never the slowest, at most 1.34 times the faster engine.
+The `LIKE` delete fell from 1.17 times PGlite's time to 0.95 and the range
+delete from 1.10 to 0.98, 200-row inserts from 0.94 times SQLite's to 0.87,
+inserts into an indexed table from 1.23 to 1.19, range `UPDATE`s from 0.82
+to 0.78 and upserts from 1.31 to 1.26; updates and deletes by key stayed at
+1.2 to 1.35 and inserts in a transaction at 1.23. A run an hour earlier on
+the same commit was discarded: five of TinyJoin's nine single-insert commit
+samples took two to three times as long while the flush probe read a quiet
+disk before each of them, so the gate cannot see that condition, which the
+next bullets investigate. The compressed download is 351 KiB.
+
 Done:
 
 - Phase 0, the native benchmark.

@@ -10,11 +10,12 @@ TinyJoin's engine is young. It is the smallest download and the quickest to
 open or reopen a database, and it reads every row, reads rows by key, scans,
 runs `LIKE` scans, groups, joins, updates rows by range, builds indexes,
 inserts 200 rows at a time, and commits single inserts more quickly than
-either alternative, and runs indexed range aggregates as quickly as SQLite.
-With OPFS storage, it is the fastest of the three in 13 of the 20 workloads,
-and second in the other seven, taking at most 1.4 times as long as the faster
-engine: it is never the slowest. Closing the remaining gaps is ongoing work,
-and the suite is designed to be rerun after every optimization.
+either alternative, deletes rows by pattern or by range as quickly as PGlite,
+and runs indexed range aggregates nearly as quickly as SQLite. With OPFS
+storage, it is the fastest of the three in 14 of the 20 workloads, and second
+in the other six, taking at most 1.4 times as long as the faster engine: it is
+never the slowest. Closing the remaining gaps is ongoing work, and the suite
+is designed to be rerun after every optimization.
 
 {{benchmarks.environment}}
 
