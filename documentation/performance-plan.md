@@ -191,6 +191,32 @@ samples took two to three times as long while the flush probe read a quiet
 disk before each of them, so the gate cannot see that condition, which the
 next bullets investigate. The compressed download is 351 KiB.
 
+The `8df67174` run, published on 8 October after the flat statement messages
+and the day's engine steps: TinyJoin was the fastest engine in 18 of the 20
+workloads and second in the other two, at most 1.07 times the faster engine.
+Updates by key fell from 1.20 times SQLite's time to 0.93, upserts from 1.26
+to 0.99, deletes by key from 1.34 to 1.02, inserts in a transaction from 1.23
+to 0.97, inserts into an indexed table from 1.19 to 0.96, selects by key from
+0.91 to 0.74, and indexed range aggregates from 1.06 to 0.80. The `LIKE`
+delete read 1.07 times PGlite's time, 4.3 ms against 4.0 where the run before
+read 4.1 against 4.3, and the range delete 1.00; interleaved, the two builds'
+`LIKE` deletes read 4.20 and 4.25 ms, and the range delete 6.10 and 5.65.
+Opening a new database read 57.5 ms against 53.9, and 51.7 at v0.5.0:
+interleaved, the two builds read 53.5 and 55.3, so about 2 ms of it is this
+work, which the larger client and Worker cost before their first statement,
+and the rest is the run. A run fifty minutes earlier on the same commit was
+discarded. Six of TinyJoin's nine single-insert commit samples took two to
+three times as long, each of them the sample after a PGlite sample or the
+workload's first, with the flush probe reading a quiet disk before every one,
+and SQLite's samples after PGlite's were 0.1 to 0.9 s slower too; that run
+waited on its gates 355 times where this one waited 130, and a run of PGlite
+and TinyJoin alone between the two showed no slow sample. The nine rounds put
+TinyJoin after PGlite five times and SQLite four, so when the disturbance is
+there TinyJoin's median is a disturbed sample and SQLite's is not: a run of
+twelve rounds through every arrangement twice would put each after PGlite six
+times, and neither median would be spared. The compressed download is 353
+KiB.
+
 Done:
 
 - Phase 0, the native benchmark.
@@ -768,7 +794,21 @@ Found along the way, 8 October:
 
 Remaining, in order of expected value:
 
-1. Per-statement cost of writes. Measured warm in Chromium, a prepared point
+1. Per-statement cost of writes. As of the `8df67174` run a statement in a
+   transaction costs about 22 µs, within 7% of SQLite's either way: an update
+   by key 0.93 times its time, an upsert 0.99, an insert 0.97, and a delete
+   by key 1.02, the one still behind. Interleaved in Chromium, the flat
+   messages took 19% to 23% off each and the day's engine steps a further 4%
+   to 8% off updates, upserts and deletes by key and 2% off inserts, so work
+   in the engine still shows in the browser. The steps designed and reviewed
+   on 7 October and not yet built are, for lookups, a node searched in one
+   loop that reads its keys in place; for staging, a delete staged from its
+   encoded key; for commits, a page built once in the page the cache keeps,
+   and a touched leaf rewritten by runs of the cells it keeps; and for
+   planning, a template's arguments and positions resolved when it is
+   prepared, and a one-change plan staged and reported without vectors.
+   What follows is the history of this item. Measured warm in Chromium, a
+   prepared point
    read costs 26 µs against SQLite's 24, but an insert in a transaction costs
    about 28 µs against 16, and an update about 34 against 17, before their
    commits. A round trip between the page and a Worker costs about 12 µs by
