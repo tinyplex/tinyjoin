@@ -1794,10 +1794,10 @@ impl Node {
         for (index, cell) in cells.iter().enumerate() {
             free_end -= cell.len();
             payload[free_end..free_end + cell.len()].copy_from_slice(cell);
-            put(
+            put_u16(
                 &mut payload,
                 NODE_HEADER_SIZE + index * SLOT_SIZE,
-                (free_end as u16).to_le_bytes(),
+                free_end as u16,
             );
         }
         payload[28..30].copy_from_slice(&(free_end as u16).to_le_bytes());
@@ -2157,10 +2157,19 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
                     cells.push(LeafCell::Kept(index - 1));
                     continue;
                 }
-                match change.value {
-                    Some(_) => delta = combine(delta, cell_hash(change.key, &held)),
-                    None => removed.push(index - 1),
-                }
+                // The held cell's key is the change's, so a replaced entry takes one hash of it
+                // for the fingerprint of the value it held and of the one it takes.
+                let replacement = match change.value {
+                    Some(value) => {
+                        let seed = key_hash(change.key);
+                        delta = combine(delta, value_hash(seed, &held));
+                        Some((value, seed))
+                    }
+                    None => {
+                        removed.push(index - 1);
+                        None
+                    }
+                };
                 if let CellValue::Overflow(descriptor) = held {
                     release_leaf_value(
                         self.transaction,
@@ -2171,10 +2180,10 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
                     )?;
                 }
                 changed = true;
-                match change.value {
-                    Some(value) => {
+                match replacement {
+                    Some((value, seed)) => {
                         let value = self.new_value(change.key, value)?;
-                        delta = combine(delta, cell_hash(change.key, &value));
+                        delta = combine(delta, value_hash(seed, &value));
                         cells.push(LeafCell::New {
                             key: change.key,
                             value,
@@ -2340,13 +2349,24 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
         Ok(Some(pieces))
     }
 
-    /// The cell value for an upserted value, stored in overflow pages when it is large.
+    /// The cell value for an upserted value, stored in overflow pages when it is large. Nearly
+    /// every value is small, so the test of its size is compiled into each place that makes a
+    /// cell, and storing a large one is kept out of line: as one function, each small value paid
+    /// for a call that set up everything a chain of overflow pages needs.
+    #[inline(always)]
     fn new_value<'a>(&mut self, key: &[u8], value: &'a [u8]) -> Result<CellValue<'a>> {
         if value.len() <= MAX_BTREE_INLINE_VALUE_BYTES
             && key.len() + value.len() <= MAX_BTREE_INLINE_ENTRY_BYTES
         {
             return Ok(CellValue::Inline(value));
         }
+        self.overflow_value(value)
+    }
+
+    /// Stores a value too large for a leaf cell in overflow pages.
+    #[cold]
+    #[inline(never)]
+    fn overflow_value<'a>(&mut self, value: &'a [u8]) -> Result<CellValue<'a>> {
         store_overflow_value(self.transaction, self.tree_id, self.generation, value)
             .map(CellValue::Overflow)
     }
@@ -2415,10 +2435,10 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
                 if slot == 0 {
                     first_key = key.to_vec();
                 }
-                put(
+                put_u16(
                     &mut payload,
                     NODE_HEADER_SIZE + slot * SLOT_SIZE,
-                    (free_end as u16).to_le_bytes(),
+                    free_end as u16,
                 );
             }
             start += count;
@@ -3311,8 +3331,23 @@ fn leaf_entry_hash(entry: &LeafEntry) -> u64 {
 /// The XXH64 of the key, which covers its length, seeds the XXH64 of the value, so bytes cannot
 /// move between the two without changing the result. An overflow value's length and checksum are
 /// hashed from the complement of that seed, so they never pass for an inline value of those bytes.
+///
+/// The two hashes are two functions, [`key_hash`] and [`value_hash`], because replacing an
+/// entry's value takes two fingerprints of one key, the held value's and the new one's. This is
+/// their composition, compiled into its callers so that it adds no call of its own to theirs.
+#[inline(always)]
 fn cell_hash(key: &[u8], value: &CellValue<'_>) -> u64 {
-    let key_hash = xxh64(key, 0);
+    value_hash(key_hash(key), value)
+}
+
+/// The hash of an entry's key, which seeds the hash of its value.
+#[inline(always)]
+fn key_hash(key: &[u8]) -> u64 {
+    xxh64(key, 0)
+}
+
+/// An entry's fingerprint from the hash of its key and the value its cell holds.
+fn value_hash(key_hash: u64, value: &CellValue<'_>) -> u64 {
     match value {
         CellValue::Inline(value) => xxh64(value, key_hash),
         CellValue::Overflow(descriptor) => {
@@ -3330,14 +3365,18 @@ fn write_leaf_cell(destination: &mut [u8], key: &[u8], value: &CellValue<'_>) {
         CellValue::Inline(_) => INLINE_CELL_FLAGS,
         CellValue::Overflow(_) => OVERFLOW_CELL_FLAGS,
     };
-    put(destination, 0, (key.len() as u16).to_le_bytes());
-    put(destination, 2, flags.to_le_bytes());
-    put(destination, 4, (value.encoded_len() as u32).to_le_bytes());
+    // The last field first, so that its bounds test is the only one the header's eight bytes take.
+    put_u32(destination, 4, value.encoded_len() as u32);
+    put_u16(destination, 2, flags);
+    put_u16(destination, 0, key.len() as u16);
     let key_end = LEAF_CELL_HEADER_SIZE + key.len();
     destination[LEAF_CELL_HEADER_SIZE..key_end].copy_from_slice(key);
     match value {
         CellValue::Inline(value) => {
-            destination[key_end..key_end + value.len()].copy_from_slice(value);
+            // Every index entry's value is empty, and a copy of no bytes still costs its calls.
+            if !value.is_empty() {
+                destination[key_end..key_end + value.len()].copy_from_slice(value);
+            }
         }
         CellValue::Overflow(descriptor) => {
             destination[key_end..key_end + 8]
@@ -3555,15 +3594,25 @@ fn validate_tree_id(tree_id: TreeId) -> Result<()> {
     }
 }
 
+/// Refuses a key longer than a cell may hold. Every key of a batch and of a lookup passes this
+/// test, so it is compiled into its callers, and the error is built out of line.
+#[inline(always)]
 fn validate_key(key: &[u8]) -> Result<()> {
     if key.len() > MAX_BTREE_KEY_BYTES {
-        Err(limit_error(format!(
-            "B-tree key is {} bytes, exceeding {MAX_BTREE_KEY_BYTES}",
-            key.len()
-        )))
+        key_limit_exceeded(key.len())
     } else {
         Ok(())
     }
+}
+
+/// The refusal of [`validate_key`], as the result its callers test: were it a bare error, each of
+/// them would hold the code that wraps it.
+#[cold]
+#[inline(never)]
+fn key_limit_exceeded(length: usize) -> Result<()> {
+    Err(limit_error(format!(
+        "B-tree key is {length} bytes, exceeding {MAX_BTREE_KEY_BYTES}"
+    )))
 }
 
 fn validate_value(value: &[u8]) -> Result<()> {
@@ -3734,10 +3783,32 @@ fn u32_at(bytes: &[u8], offset: usize) -> u32 {
 }
 
 /// Writes `value` at `offset` as one store of its size, where copying it from a slice would call
-/// `memcpy` for a few bytes, once for each cell a page is written with.
+/// `memcpy` for a few bytes. Taking the slice and making an array of it are still two calls. An
+/// internal node pays them for each child reference a batch patches into it; a cell's fields and
+/// its slot, which every row written would pay for, are stored by [`put_u16`] and [`put_u32`].
 #[inline(always)]
 fn put<const N: usize>(bytes: &mut [u8], offset: usize, value: [u8; N]) {
     *<&mut [u8; N]>::try_from(&mut bytes[offset..offset + N]).expect("bounded write") = value;
+}
+
+/// Writes a little-endian number byte by byte, compiled into its caller with no slice taken, as
+/// [`u16_at`] reads one. A leaf is written with a slot and three header fields for each of its
+/// cells, so a call for each would be several for every row a commit writes. The last byte is
+/// stored first: where the offset is a constant, its bounds test is then the only one made.
+#[inline(always)]
+fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    let value = value.to_le_bytes();
+    bytes[offset + 1] = value[1];
+    bytes[offset] = value[0];
+}
+
+#[inline(always)]
+fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    let value = value.to_le_bytes();
+    bytes[offset + 3] = value[3];
+    bytes[offset + 2] = value[2];
+    bytes[offset + 1] = value[1];
+    bytes[offset] = value[0];
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
@@ -4379,6 +4450,53 @@ mod tests {
     }
 
     #[test]
+    fn entry_fingerprints_are_the_values_stored_in_released_databases() {
+        // The fingerprints that every released database records, for each child of an internal
+        // node and for each tree, combine these numbers. So however an entry's fingerprint is
+        // computed, each must stay the number it is here. The literals come from outside the
+        // engine: a second XXH64, checked against the algorithm's published vectors. Each is also
+        // taken the way a replaced entry takes it, from one hash of its key.
+        let descriptor = OverflowDescriptor {
+            first_page_id: FIRST_DATA_PAGE_ID,
+            generation: 1,
+            total_length: 5_000,
+            checksum: 0x1234_5678,
+        };
+        let mut summary = [0; 8];
+        summary[..4].copy_from_slice(&5_000_u32.to_le_bytes());
+        summary[4..].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+        let seed = xxh64(b"key", 0);
+        assert_eq!(seed, 0x4477_6256_2de1_4334);
+        assert_eq!(key_hash(b"key"), seed);
+
+        let inline = cell_hash(b"key", &CellValue::Inline(b"value"));
+        assert_eq!(inline, 0x7b57_2dc2_312a_e10d);
+        assert_eq!(inline, xxh64(b"value", seed));
+        assert_eq!(inline, value_hash(seed, &CellValue::Inline(b"value")));
+
+        let empty = cell_hash(b"key", &CellValue::Inline(b""));
+        assert_eq!(empty, 0x2d5a_85ce_20c0_e388);
+        assert_eq!(empty, xxh64(b"", seed));
+        assert_eq!(empty, value_hash(seed, &CellValue::Inline(b"")));
+
+        let overflow = cell_hash(b"key", &CellValue::Overflow(descriptor.clone()));
+        assert_eq!(overflow, 0x27de_bccb_e91d_723e);
+        assert_eq!(overflow, xxh64(&summary, !seed));
+        assert_eq!(overflow, value_hash(seed, &CellValue::Overflow(descriptor)));
+
+        // A key and a value long enough for the hash to take them in stripes.
+        let long_key = (0..40).collect::<Vec<u8>>();
+        let long_value = (0..100).map(|index| 255 - index).collect::<Vec<u8>>();
+        let long = cell_hash(&long_key, &CellValue::Inline(&long_value));
+        assert_eq!(long, 0x3563_e867_c1dc_c826);
+        assert_eq!(long, xxh64(&long_value, xxh64(&long_key, 0)));
+        assert_eq!(
+            long,
+            value_hash(key_hash(&long_key), &CellValue::Inline(&long_value))
+        );
+    }
+
+    #[test]
     fn overflow_values_are_fingerprinted_from_their_descriptors() {
         // An overflow value is summarized by its length and checksum, so a fingerprint never has
         // to walk a chain of pages. The summary must still follow the content.
@@ -4879,6 +4997,151 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_stores_values_inline_or_in_overflow_pages_as_single_changes_do() {
+        /// How a cell stores its value: `None` inline, or the length and checksum that its
+        /// overflow descriptor records.
+        type Form = Option<(u32, u32)>;
+
+        /// Every entry beneath a page, in key order, with how its cell stores its value.
+        fn stored(pager: &mut Pager<MemoryPageDevice>, page_id: PageId) -> Vec<(Vec<u8>, Form)> {
+            let node = Node::decode(
+                pager.read_page(page_id).unwrap(),
+                TREE,
+                pager.generation(),
+                false,
+            )
+            .unwrap();
+            match node.kind {
+                NodeKind::Leaf(entries) => entries
+                    .into_iter()
+                    .map(|entry| {
+                        let overflow = match entry.value {
+                            LeafValue::Inline(_) => None,
+                            LeafValue::Overflow(descriptor) => {
+                                Some((descriptor.total_length, descriptor.checksum))
+                            }
+                        };
+                        (entry.key, overflow)
+                    })
+                    .collect(),
+                NodeKind::Internal(internal) => {
+                    let mut cells = stored(pager, internal.leftmost_child);
+                    for entry in internal.entries {
+                        cells.extend(stored(pager, entry.right_child));
+                    }
+                    cells
+                }
+            }
+        }
+
+        // A value alone may take 1,024 bytes of a cell, and a key and value together 1,536: on
+        // each side of both limits, in key order.
+        let long_key = |byte: u8| vec![byte; MAX_BTREE_KEY_BYTES];
+        let entries = [
+            (b"k1".to_vec(), vec![1; MAX_BTREE_INLINE_VALUE_BYTES]),
+            (b"k2".to_vec(), vec![2; MAX_BTREE_INLINE_VALUE_BYTES + 1]),
+            (
+                long_key(b'l'),
+                vec![3; MAX_BTREE_INLINE_ENTRY_BYTES - MAX_BTREE_KEY_BYTES],
+            ),
+            (
+                long_key(b'm'),
+                vec![4; MAX_BTREE_INLINE_ENTRY_BYTES - MAX_BTREE_KEY_BYTES + 1],
+            ),
+        ];
+        fn batch_of(entries: &[(Vec<u8>, Vec<u8>)]) -> Vec<BatchChange<'_>> {
+            entries
+                .iter()
+                .map(|(key, value)| BatchChange {
+                    key,
+                    value: Some(value),
+                })
+                .collect()
+        }
+        // The batch writer makes a cell in three places: for a tree with no root, for a key its
+        // leaf holds, and for a key its leaf lacks. `held` is what the leaf holds beforehand.
+        let replaced = entries
+            .iter()
+            .map(|(key, _)| (key.clone(), b"held".to_vec()))
+            .collect::<Vec<_>>();
+        let beside = vec![(b"a".to_vec(), b"beside".to_vec())];
+        for (case, held) in [None, Some(replaced), Some(beside)].into_iter().enumerate() {
+            let mut batched = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+            let mut batched_root = None;
+            let mut single = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+            let mut single_root = create_tree(&mut single);
+            if let Some(held) = &held {
+                let mut transaction = batched.begin_write().unwrap();
+                batched_root = Btree::apply(&mut transaction, None, TREE, &batch_of(held))
+                    .unwrap()
+                    .root_page_id;
+                transaction.commit(2, EMPTY_HASH, batched_root).unwrap();
+                let mut transaction = single.begin_write().unwrap();
+                for (key, value) in held {
+                    single_root = Btree::upsert(&mut transaction, single_root, TREE, key, value)
+                        .unwrap()
+                        .root_page_id;
+                }
+                transaction
+                    .commit(2, EMPTY_HASH, Some(single_root))
+                    .unwrap();
+            }
+
+            let mut transaction = batched.begin_write().unwrap();
+            let applied =
+                Btree::apply(&mut transaction, batched_root, TREE, &batch_of(&entries)).unwrap();
+            let batched_root = applied.root_page_id.expect("the tree holds entries");
+            transaction
+                .commit(3, EMPTY_HASH, Some(batched_root))
+                .unwrap();
+            assert_eq!(
+                applied.inserted,
+                if case == 1 { 0 } else { entries.len() },
+                "case {case}"
+            );
+
+            let mut transaction = single.begin_write().unwrap();
+            let mut single_hash = EMPTY_HASH;
+            for (key, value) in &entries {
+                let upserted =
+                    Btree::upsert(&mut transaction, single_root, TREE, key, value).unwrap();
+                single_root = upserted.root_page_id;
+                single_hash = upserted.hash;
+            }
+            transaction
+                .commit(3, EMPTY_HASH, Some(single_root))
+                .unwrap();
+
+            let cells = stored(&mut batched, batched_root);
+            let forms = entries
+                .iter()
+                .map(|(key, _)| {
+                    let (_, overflow) = cells
+                        .iter()
+                        .find(|(stored_key, _)| stored_key == key)
+                        .expect("the tree holds every entry of the batch");
+                    overflow.is_some()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(forms, [false, true, false, true], "case {case}");
+            assert_eq!(cells, stored(&mut single, single_root), "case {case}");
+            assert_eq!(applied.hash, Some(single_hash), "case {case}");
+            assert_eq!(
+                verified_subtree_hash(&mut batched, batched_root),
+                single_hash,
+                "case {case}"
+            );
+            for (key, value) in &entries {
+                assert_eq!(
+                    Btree::get(&mut batched, batched_root, TREE, key).unwrap(),
+                    Some(value.clone()),
+                    "case {case}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn overflow_replacements_reclaim_shared_and_candidate_chains() {
         let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
         let mut root = create_tree(&mut pager);
@@ -5339,8 +5602,51 @@ mod tests {
             .code,
             "BTREE_LIMIT"
         );
+        let long_key = vec![0; MAX_BTREE_KEY_BYTES + 1];
+        let error = Btree::apply(
+            &mut transaction,
+            Some(root),
+            TREE,
+            &[BatchChange {
+                key: &long_key,
+                value: Some(b"v"),
+            }],
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "BTREE_LIMIT");
+        assert_eq!(error.message, "B-tree key is 1025 bytes, exceeding 1024");
         transaction.abort();
         assert_eq!(pager.physical_page_count(), page_count);
+        // A lookup refuses the key as a write does, and the longest key allowed is merely absent.
+        let error = Btree::get(&mut pager, root, TREE, &long_key).unwrap_err();
+        assert_eq!(error.code, "BTREE_LIMIT");
+        assert_eq!(error.message, "B-tree key is 1025 bytes, exceeding 1024");
+        assert_eq!(
+            Btree::get(&mut pager, root, TREE, &long_key[1..]).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn put_stores_little_endian_bytes() {
+        // Each store against the bytes `to_le_bytes` gives, at the start of a buffer, at an odd
+        // offset and at the last offset that holds the number, leaving every other byte alone.
+        for offset in [0, 5, 14] {
+            let mut bytes = [0xaa; 16];
+            put_u16(&mut bytes, offset, 0x1234);
+            let mut expected = [0xaa; 16];
+            expected[offset..offset + 2].copy_from_slice(&0x1234_u16.to_le_bytes());
+            assert_eq!(bytes, expected, "two bytes at {offset}");
+            assert_eq!(read_u16(&bytes, offset), 0x1234);
+        }
+        for offset in [0, 5, 12] {
+            let mut bytes = [0xaa; 16];
+            put_u32(&mut bytes, offset, 0x1234_5678);
+            let mut expected = [0xaa; 16];
+            expected[offset..offset + 4].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+            assert_eq!(bytes, expected, "four bytes at {offset}");
+            assert_eq!(read_u32(&bytes, offset), 0x1234_5678);
+        }
     }
 
     #[test]

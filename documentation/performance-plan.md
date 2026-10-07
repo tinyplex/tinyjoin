@@ -585,6 +585,28 @@ Found along the way:
   -1.4%, delete-pk -0.9%, select-pk -0.5%, with 38, 62 and 23 fewer calls a
   statement for an update, an upsert and a delete; 17 bytes larger
   compressed.
+- The batch writer makes no call for a cell's fields. A leaf cell's three
+  header fields and its slot are stored by `put_u16` and `put_u32`, indexed
+  byte stores compiled into their callers, last byte and last field first so
+  that one bounds test covers the header, where `put` took a slice and made
+  an array of it, two calls a field. `new_value` keeps its two length tests
+  and is compiled into the three places that make a cell, with the storing
+  of a large value cold and out of line; a replaced entry hashes its key
+  once for the fingerprint of the value it held and of the one it takes;
+  `write_leaf_cell` copies an inline value only when it has bytes, which no
+  index entry's has; and `validate_key` is compiled into its callers with
+  its refusal built out of line. Page bytes, fingerprints, errors and the
+  order of allocation are unchanged: thirteen workloads made the same device
+  writes byte for byte before and after, and a test pins entry fingerprints
+  to values computed outside the engine. Calls in the commit of 10,000
+  inserts: 550,151 to 459,315, and with an index 1,778,495 to 1,576,920.
+  Instructions under baseline compilation: insert-indexed -1.4%,
+  insert-transaction -0.8%, update-pk -0.8%, upsert -0.7%, delete-pk -0.5%;
+  commit time there 3.87 to 3.08 ms for the inserts and 11.29 to 10.25 with
+  an index. Giving the cell vector of a tree with no root its capacity at
+  once showed nothing when reverted alone, and was left out. The compressed
+  engine is 168 bytes larger on this base, with 31 fewer bytes before
+  compression.
 
 Found along the way, 6 and 7 October:
 

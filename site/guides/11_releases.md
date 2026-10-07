@@ -109,6 +109,16 @@ statement that finds a row fetches a page at each level of its tree, so
 before V8 has optimized the code an update, delete or select by key runs 2%
 fewer instructions, and a scan 3% fewer.
 
+### Writing pages
+
+A commit stores each cell's header fields and its slot with no call, tests a
+value's size where the cell is made, leaving the storing of a large value in
+overflow pages out of line, and hashes a replaced entry's key once for the
+fingerprints of the value it held and of the one it takes. Before V8 has
+optimized the code, the commit of 10,000 inserted rows makes a sixth fewer
+calls and takes a fifth less time, and a tenth less when the table has an
+index.
+
 ### Comparing memory
 
 The WebAssembly build compares memory eight bytes at a time, in place of the
