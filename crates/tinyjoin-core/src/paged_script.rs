@@ -176,9 +176,12 @@ pub(crate) type KeyedPosition<'a> = (&'a [u8], u32);
 /// keys that needs to know where the rows are passes through here, so that the engine compiles
 /// one: a script's planned rows, a transaction's staged rows, a new index's entries and a query's
 /// groups each pair a borrowed key with its row's position, rather than each compiling a sort
-/// over a comparison of its own rows, or copying its keys out to sort them. The pairs are plain
-/// values that the sort compares with one call to the comparison of byte slices, and keys of
-/// different rows never compare equal, so the positions beside them are never reached.
+/// over a comparison of its own rows, or copying its keys out to sort them. A write's batches
+/// for an index and for the catalog are ordered here as well, the entries an index loses and
+/// gains and the catalog's records each beside its position, and then built in that order: a
+/// batch sorted as its changes would be a second sort to compile. The pairs are plain values
+/// that the sort compares with one call to the comparison of byte slices, and keys of different
+/// rows never compare equal, so the positions beside them are never reached.
 pub(crate) fn sort_keyed(keyed: &mut [KeyedPosition<'_>]) {
     keyed.sort_unstable();
 }
@@ -1157,26 +1160,43 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                         .then_some(middle..keys.len()),
                         None => None,
                     };
-                    let span =
-                        |range: &Option<Range<usize>>| range.clone().map(|range| &keys[range]);
-                    if span(&old_key) == span(&next_key) {
+                    // A row with no entry before or after, or with the same entry, leaves the
+                    // index as it is. The two are compared only when both are there, so a row
+                    // that is inserted or deleted, which has one, costs no comparison.
+                    let unchanged = match (&old_key, &next_key) {
+                        (None, None) => true,
+                        (Some(old), Some(next)) => keys[old.clone()] == keys[next.clone()],
+                        _ => false,
+                    };
+                    if unchanged {
                         keys.truncate(start);
                         continue;
                     }
-                    entries.extend(old_key.map(|range| (range, false)));
-                    entries.extend(next_key.map(|range| (range, true)));
+                    if let Some(range) = old_key {
+                        entries.push((range, false));
+                    }
+                    if let Some(range) = next_key {
+                        entries.push((range, true));
+                    }
                 }
                 if entries.is_empty() {
                     continue;
                 }
-                let mut batch = entries
-                    .iter()
-                    .map(|(range, insert)| BatchChange {
-                        key: &keys[range.clone()],
-                        value: insert.then_some(&[][..]),
-                    })
-                    .collect::<Vec<_>>();
-                BatchChange::sort(&mut batch);
+                // The entries are ordered by their keys beside their positions, which the limits
+                // on a transaction's keys and a script's work keep far below what a position can
+                // hold, and the batch is built from that order.
+                let mut order = Vec::with_capacity(entries.len());
+                for (position, (range, _)) in entries.iter().enumerate() {
+                    order.push((&keys[range.clone()], position as u32));
+                }
+                sort_keyed(&mut order);
+                let mut batch = Vec::with_capacity(order.len());
+                for &(key, position) in &order {
+                    batch.push(BatchChange {
+                        key,
+                        value: entries[position as usize].1.then_some(&[][..]),
+                    });
+                }
                 let inserted = entries.iter().filter(|(_, insert)| *insert).count();
                 let removed = entries.len() - inserted;
                 let applied =
@@ -1345,14 +1365,21 @@ impl<D: PageDevice> PagedScriptCandidate<'_, D> {
                 changes.push((key, Some(value)));
             }
         }
-        let mut batch = changes
-            .iter()
-            .map(|(key, value)| BatchChange {
+        // A record's key is the header's, or names one table or one index, so no two are equal.
+        // The records are ordered as an index's entries are, by their keys beside their
+        // positions, which the catalog's limits keep far below what a position can hold.
+        let mut order = Vec::with_capacity(changes.len());
+        for (position, (key, _)) in changes.iter().enumerate() {
+            order.push((key.as_slice(), position as u32));
+        }
+        sort_keyed(&mut order);
+        let mut batch = Vec::with_capacity(order.len());
+        for &(key, position) in &order {
+            batch.push(BatchChange {
                 key,
-                value: value.as_deref(),
-            })
-            .collect::<Vec<_>>();
-        BatchChange::sort(&mut batch);
+                value: changes[position as usize].1.as_deref(),
+            });
+        }
         let applied = Btree::apply(
             &mut self.transaction.borrow_mut(),
             self.catalog_root,

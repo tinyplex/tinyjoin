@@ -91,14 +91,6 @@ pub(crate) struct BatchChange<'a> {
     pub(crate) value: Option<&'a [u8]>,
 }
 
-impl BatchChange<'_> {
-    /// Sorts a batch of changes to distinct keys into the order [`Btree::apply`] takes. Batches
-    /// share this sort, so its code is built once.
-    pub(crate) fn sort(batch: &mut [Self]) {
-        batch.sort_unstable_by(|left, right| left.key.cmp(right.key));
-    }
-}
-
 /// The outcome of one [`Btree::apply`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BtreeBatch {
@@ -5625,6 +5617,120 @@ mod tests {
             Btree::get(&mut pager, root, TREE, &long_key[1..]).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn a_batch_out_of_order_is_refused_before_anything_is_written() {
+        type Change<'a> = (&'a [u8], Option<&'a [u8]>);
+        fn batch_of<'a>(changes: &[Change<'a>]) -> Vec<BatchChange<'a>> {
+            changes
+                .iter()
+                .map(|&(key, value)| BatchChange { key, value })
+                .collect()
+        }
+        // Every batch begins with a value long enough for overflow pages, which a batch
+        // allocates as it reaches the value: a refusal that came after the batch had begun would
+        // leave those pages allocated.
+        let long = vec![b'o'; MAX_OVERFLOW_CHUNK_BYTES * 3];
+        let held: [Change<'_>; 2] = [(b"c", Some(b"held")), (b"e", Some(b"held"))];
+        let ordered: [Change<'_>; 4] = [
+            (b"a", Some(&long)),
+            (b"c", None),
+            (b"d", Some(b"new")),
+            (b"f", Some(b"")),
+        ];
+        // A key removed and then added, which is what sorting would leave of a batch that held
+        // one key twice; two keys exchanged; and the last key twice, behind changes in order.
+        let unordered: [[Change<'_>; 4]; 3] = [
+            [
+                (b"a", Some(&long)),
+                (b"c", None),
+                (b"c", Some(b"")),
+                (b"f", Some(b"")),
+            ],
+            [
+                (b"a", Some(&long)),
+                (b"d", Some(b"new")),
+                (b"c", None),
+                (b"f", Some(b"")),
+            ],
+            [
+                (b"a", Some(&long)),
+                (b"c", None),
+                (b"f", Some(b"")),
+                (b"f", Some(b"")),
+            ],
+        ];
+        for with_root in [false, true] {
+            // Two pagers hold the same tree, or none. One is offered every unordered batch before
+            // the ordered one and must end as the other does, which was offered only that.
+            let open = || {
+                let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+                let mut root = None;
+                if with_root {
+                    let mut transaction = pager.begin_write().unwrap();
+                    root = Btree::apply(&mut transaction, None, TREE, &batch_of(&held))
+                        .unwrap()
+                        .root_page_id;
+                    transaction.commit(1, EMPTY_HASH, root).unwrap();
+                }
+                (pager, root)
+            };
+            let (mut refusing, root) = open();
+            let (mut plain, plain_root) = open();
+            assert_eq!(root.is_some(), with_root);
+            assert_eq!(root, plain_root);
+
+            // A candidate takes its first page at or below the end of the file, so the pages up
+            // to there show whether a refused batch allocated any.
+            let end = refusing.physical_page_count();
+            let mut transaction = refusing.begin_write().unwrap();
+            for (case, batch) in unordered.iter().enumerate() {
+                let context = format!("root {with_root}, batch {case}");
+                let error =
+                    Btree::apply(&mut transaction, root, TREE, &batch_of(batch)).unwrap_err();
+                assert_eq!(error.code, "INVALID_PAGED_ARGUMENT", "{context}");
+                assert_eq!(
+                    error.message, "A B-tree batch must be sorted by strictly increasing key",
+                    "{context}"
+                );
+                assert!((0..=end).all(|id| !transaction.owns_page(id)), "{context}");
+                // The batch is refused as an argument, so the transaction is not marked failed.
+                transaction.generation().expect(&context);
+            }
+            let applied = Btree::apply(&mut transaction, root, TREE, &batch_of(&ordered)).unwrap();
+            transaction
+                .commit(2, EMPTY_HASH, applied.root_page_id)
+                .unwrap();
+
+            let mut transaction = plain.begin_write().unwrap();
+            let expected =
+                Btree::apply(&mut transaction, plain_root, TREE, &batch_of(&ordered)).unwrap();
+            transaction
+                .commit(2, EMPTY_HASH, expected.root_page_id)
+                .unwrap();
+
+            assert_eq!(applied, expected, "root {with_root}");
+            assert_eq!(applied.inserted, 3, "root {with_root}");
+            assert_eq!(applied.removed, usize::from(with_root), "root {with_root}");
+            let root = applied.root_page_id.expect("the tree holds entries");
+            assert_eq!(
+                Btree::get(&mut refusing, root, TREE, b"a").unwrap(),
+                Some(long.clone())
+            );
+            let (refusing, plain) = (refusing.into_device(), plain.into_device());
+            assert_eq!(
+                refusing.page_count(),
+                plain.page_count(),
+                "root {with_root}"
+            );
+            for id in 0..plain.page_count() {
+                assert!(
+                    refusing.page(id).unwrap() == plain.page(id).unwrap(),
+                    "root {with_root}, page {id}"
+                );
+            }
+        }
     }
 
     #[test]

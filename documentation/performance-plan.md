@@ -607,6 +607,20 @@ Found along the way:
   once showed nothing when reverted alone, and was left out. The compressed
   engine is 168 bytes larger on this base, with 31 fewer bytes before
   compression.
+- A write's batch for an index, and the catalog's, are ordered through
+  `sort_keyed`, as (key, position) pairs, and built from that order, as an
+  index build's batch already was; `BatchChange::sort`, a second
+  instantiation of the standard sort, is gone, with 14 functions of the
+  dump. Both sorts order distinct keys by the same comparison of bytes, and
+  `Btree::apply` refuses a batch that is not strictly increasing before it
+  reads or writes anything, a guard that had no test and now has one. In the
+  same edit `apply_row_changes` keeps an index's entries without closures:
+  a row's old and new entries are compared only when both are there, and
+  each one present is pushed, ten calls fewer for a row inserted or deleted.
+  Nineteen workloads make the same device writes byte for byte. The package
+  is 1.42 KiB smaller compressed; instructions under baseline compilation:
+  delete-range -2.3%, insert-indexed -0.2%, create-index +0.3% (its batch's
+  push is now a function shared with these two batches).
 
 Found along the way, 6 and 7 October:
 

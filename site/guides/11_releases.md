@@ -119,6 +119,13 @@ optimized the code, the commit of 10,000 inserted rows makes a sixth fewer
 calls and takes a fifth less time, and a tenth less when the table has an
 index.
 
+A write's batch of entries for an index, and its records for the catalog,
+are put in order by the one sort the engine already compiles for keys beside
+their positions, where the two shared a second, and a row's old and new
+index entries are compared only when it has both. The engine is 1.4 KiB
+smaller compressed, and deleting 8,000 rows by an indexed range runs 2%
+fewer instructions before optimization.
+
 ### Comparing memory
 
 The WebAssembly build compares memory eight bytes at a time, in place of the
