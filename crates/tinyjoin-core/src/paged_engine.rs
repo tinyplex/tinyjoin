@@ -22,6 +22,24 @@ pub struct PagedEngine<D: PageDevice> {
     transaction: Option<PagedTransaction>,
     prepared_statements: PreparedStatementRegistry,
     value_rows: bool,
+    /// How the last prepared statement to run was planned, or `None` if it failed before that
+    /// was settled.
+    #[cfg(test)]
+    last_path: Cell<Option<StatementPath>>,
+}
+
+/// How a prepared statement was planned, which the engine records in test builds only, for the
+/// test that holds each point statement to the path it is meant to take.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatementPath {
+    /// From its point template, on a table no foreign key involves.
+    PointPlain,
+    /// From its point template, on a table a foreign key involves, whose rows are then checked.
+    PointEnforced,
+    /// Bound and planned in full: the statement has no point template, ran outside a
+    /// transaction, or was declined by its template's planner.
+    General,
 }
 
 impl<D: PageDevice> PagedEngine<D> {
@@ -32,6 +50,8 @@ impl<D: PageDevice> PagedEngine<D> {
             transaction: None,
             prepared_statements: PreparedStatementRegistry::default(),
             value_rows: false,
+            #[cfg(test)]
+            last_path: Cell::new(None),
         })
     }
 
@@ -106,11 +126,15 @@ impl<D: PageDevice> PagedEngine<D> {
         params: &[Value],
         array_rows: bool,
     ) -> Result<ExecuteResult> {
+        #[cfg(test)]
+        self.last_path.set(None);
         if self.transaction.is_some()
             && let Some(result) = self.execute_point(id, params)?
         {
             return Ok(result);
         }
+        #[cfg(test)]
+        self.last_path.set(Some(StatementPath::General));
         let mut statement = self.prepared_statements.bind(id, params)?;
         if array_rows {
             statement.position_outputs()?;
@@ -141,6 +165,14 @@ impl<D: PageDevice> PagedEngine<D> {
             let Some(mut planned) = crate::statement::plan_point(&view, template, params)? else {
                 return Ok(None);
             };
+            #[cfg(test)]
+            self.last_path.set(Some(
+                if crate::foreign_key::involves(&view, point_table(template)) {
+                    StatementPath::PointEnforced
+                } else {
+                    StatementPath::PointPlain
+                },
+            ));
             // Foreign keys are checked as the statement ends, with the rows their actions change.
             crate::foreign_key::enforce(&view, &mut planned)?;
             let keys = crate::statement::changed_keys(&view, &planned.changes, &planned.previous)?;
@@ -462,6 +494,17 @@ impl<D: PageDevice> PagedEngine<D> {
     }
 }
 
+/// The table a point template's statement names.
+#[cfg(test)]
+fn point_table(template: &crate::statement::PointTemplate) -> &str {
+    use crate::statement::PointTemplate;
+    match template {
+        PointTemplate::Insert { table, .. }
+        | PointTemplate::Update { table, .. }
+        | PointTemplate::Delete { table, .. } => table,
+    }
+}
+
 fn execute_query_result(result: QueryResult) -> Result<ExecuteResult> {
     Ok(ExecuteResult {
         command: "SELECT",
@@ -724,210 +767,1769 @@ lines', true, '7')"#,
         }
     }
 
-    #[test]
-    fn point_statements_stage_what_their_statements_stage() {
-        const SETUP: &[&str] = &[
-            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, \
-             qty INTEGER NOT NULL DEFAULT 1, note TEXT, price FLOAT)",
-            "CREATE UNIQUE INDEX items_name ON items (name)",
-            "CREATE INDEX items_qty ON items (qty)",
-            "CREATE TABLE tags (id INTEGER PRIMARY KEY, \
-             item INTEGER NOT NULL REFERENCES items (id) ON DELETE CASCADE, tag TEXT NOT NULL)",
-            "INSERT INTO items (id, name, qty, note, price) VALUES \
-             (1, 'one', 1, NULL, 1.5), (2, 'two', 2, 'second', NULL), (3, 'three', 3, NULL, NULL)",
-            "INSERT INTO tags (id, item, tag) VALUES (10, 1, 'a'), (11, 3, 'b')",
-        ];
-        // Each statement runs prepared in one engine, which plans it from its point template, and
-        // as SQL with the same parameters in another, which plans it in full. Several fail, in
-        // both; several are not point statements at all.
-        let statements: Vec<(&str, Vec<Value>)> = vec![
-            (
-                "INSERT INTO items (id, name, qty, note, price) VALUES ($1, $2, $3, $4, $5)",
-                vec![json!(4), json!("four"), json!(4), json!(null), json!(4.0)],
-            ),
-            (
-                "INSERT INTO items (id, name) VALUES ($1, $2)",
-                vec![json!(5), json!("five")],
-            ),
-            (
-                "INSERT INTO items (id, name) VALUES ($1, $2)",
-                vec![json!(5), json!("again")],
-            ),
-            (
-                "INSERT INTO items (id, name) VALUES ($1, $2)",
-                vec![json!(6), json!("one")],
-            ),
-            (
-                "INSERT INTO items (id, name, qty) VALUES ($1, $2, $3)",
-                vec![json!(7), json!("seven"), json!("many")],
-            ),
-            (
-                "INSERT INTO items VALUES ($1, $2, $3, $4, $5)",
-                vec![
-                    json!(9),
-                    json!("nine"),
-                    json!(9),
-                    json!("ninth"),
-                    json!(9.5),
-                ],
-            ),
-            (
-                "INSERT INTO items (id, name, qty) VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9)",
-                vec![
-                    json!(30),
-                    json!("thirty"),
-                    json!(3),
-                    json!(31),
-                    json!("thirty-one"),
-                    json!(1),
-                    json!(29),
-                    json!("twenty-nine"),
-                    json!(2),
-                ],
-            ),
-            (
-                "INSERT INTO items (id, name) VALUES ($1, $2), ($3, $4)",
-                vec![json!(40), json!("forty"), json!(40), json!("forty again")],
-            ),
-            (
-                "INSERT INTO items (id, name) VALUES ($1, $2), ($3, $4)",
-                vec![
-                    json!(41),
-                    json!("forty-one"),
-                    json!(30),
-                    json!("thirty again"),
-                ],
-            ),
-            (
-                "INSERT INTO items (id, name, qty) VALUES ($1, $2, $3), ($4, $5, $6)",
-                vec![
-                    json!(42),
-                    json!("forty-two"),
-                    json!(1),
-                    json!(43),
-                    json!("forty-three"),
-                    json!("lots"),
-                ],
-            ),
-            (
-                "INSERT INTO items (id, name) VALUES ($1, $2), ($3, $4)",
-                vec![json!(44), json!("one"), json!(45), json!("forty-five")],
-            ),
-            (
-                "UPDATE items SET note = $1 WHERE id = $2",
-                vec![json!("noted"), json!(2)],
-            ),
-            (
-                "UPDATE items SET note = $1 WHERE id = $2",
-                vec![json!("missing"), json!(99)],
-            ),
-            (
-                "UPDATE items SET qty = DEFAULT, note = $1 WHERE $2 = id",
-                vec![json!(null), json!(3)],
-            ),
-            (
-                "UPDATE items SET name = $1 WHERE id = $2",
-                vec![json!(null), json!(1)],
-            ),
-            (
-                "UPDATE items SET name = $1 WHERE id = $2",
-                vec![json!("two"), json!(1)],
-            ),
-            (
-                "UPDATE items SET price = $1 WHERE id = $2",
-                vec![json!(2), json!(2)],
-            ),
-            (
-                "UPDATE items SET id = $1 WHERE id = $2",
-                vec![json!(20), json!(2)],
-            ),
-            (
-                "UPDATE items SET qty = $1 WHERE id = $2",
-                vec![json!(3.5), json!(1)],
-            ),
-            ("DELETE FROM items WHERE id = $1", vec![json!(5)]),
-            ("DELETE FROM items WHERE id = $1", vec![json!(5)]),
-            ("DELETE FROM items WHERE id = $1", vec![json!(3)]),
-            (
-                "INSERT INTO items (id, name, qty) VALUES ($1, $2, $3) \
-                 ON CONFLICT (id) DO UPDATE SET qty = EXCLUDED.qty, note = $4",
-                vec![json!(1), json!("uno"), json!(10), json!("upserted")],
-            ),
-            (
-                "INSERT INTO items (id, name, qty) VALUES ($1, $2, $3) \
-                 ON CONFLICT (id) DO UPDATE SET qty = EXCLUDED.qty",
-                vec![json!(8), json!("eight"), json!(8)],
-            ),
-            (
-                "INSERT INTO items (id, name) VALUES ($1, $2) \
-                 ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
-                vec![json!(8), json!("two")],
-            ),
-            (
-                "INSERT INTO items (id, name) VALUES ($1, $2) \
-                 ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
-                vec![json!(8), json!("eighth")],
-            ),
-            (
-                "INSERT INTO tags (id, item, tag) VALUES ($1, $2, $3)",
-                vec![json!(12), json!(2), json!("c")],
-            ),
-            (
-                "INSERT INTO tags (id, item, tag) VALUES ($1, $2, $3)",
-                vec![json!(13), json!(99), json!("d")],
-            ),
-            (
-                "UPDATE items SET note = $1 WHERE id = $2 AND name = $3",
-                vec![json!("x"), json!(1), json!("uno")],
-            ),
-            (
-                "SELECT id, qty, note FROM items WHERE id = $1",
-                vec![json!(1)],
-            ),
-            ("DELETE FROM items WHERE id = $1", vec![json!(1)]),
-        ];
-        let open = || {
-            let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
-            for sql in SETUP {
-                engine.execute_sql(sql, &[]).unwrap();
+    /// What the equivalence test expects of one execution in its prepared engine: that it is
+    /// planned from the statement's point template and changes a row, or is planned from it and
+    /// finds no row to change; that it is bound and planned in full; or that it is refused with
+    /// an error of this code. `Unprepared` is a statement both engines run as SQL, which has
+    /// only to succeed.
+    #[derive(Clone, Copy, Debug)]
+    enum Expected {
+        Point,
+        Unchanged,
+        Full,
+        Fails(&'static str),
+        Unprepared,
+    }
+    use Expected::{Fails, Full, Point, Unchanged, Unprepared};
+
+    /// One execution in the equivalence test: the table its statement names, the statement, its
+    /// parameters, and how it should end.
+    struct PointCase {
+        table: &'static str,
+        sql: String,
+        params: Vec<Value>,
+        expected: Expected,
+    }
+
+    /// A case on `table`, with its parameters as a JSON array.
+    fn case_on(table: &'static str, sql: &str, params: Value, expected: Expected) -> PointCase {
+        let Value::Array(params) = params else {
+            unreachable!("a case's parameters are written as an array")
+        };
+        PointCase {
+            table,
+            sql: sql.to_owned(),
+            params,
+            expected,
+        }
+    }
+
+    fn on_items(sql: &str, params: Value, expected: Expected) -> PointCase {
+        case_on("items", sql, params, expected)
+    }
+
+    /// The catalog a round of the equivalence test runs against, where it decides what a
+    /// statement does or how it is planned.
+    #[derive(Clone, Copy, Debug)]
+    struct PointRound {
+        number: usize,
+        /// Whether the setup gave its tables indexes, of which `items_name` makes each name
+        /// unique in the `items` it was created on.
+        indexed: bool,
+        /// Whether `items` and the tables of [`WIDENED`] have the column a round adds.
+        widened: bool,
+        /// Whether there is a table `tags`, and whether its `item` references `items`.
+        tags: bool,
+        references: bool,
+        /// Whether `aa_children` references `items`, cascading deletes and updates.
+        cascades: bool,
+        /// Whether `zz_holds` references `items`, with no action.
+        holds: bool,
+        /// Whether `label_children` references `labels`.
+        labelled: bool,
+        /// Whether `items` is the table a round creates in place of the one it drops, and
+        /// whether a round has since renamed that table's `label` as `note`.
+        recreated: bool,
+        renamed: bool,
+    }
+
+    impl PointRound {
+        /// Whether a foreign key involves `table`, which the test knows from the catalog changes
+        /// it made, not from the engine.
+        fn involves(&self, table: &str) -> bool {
+            match table {
+                "items" => (self.tags && self.references) || self.cascades || self.holds,
+                "tags" => self.tags && self.references,
+                "labels" => self.labelled,
+                _ => false,
             }
-            engine.begin_transaction().unwrap();
-            engine
-        };
-        let (mut prepared, mut plain) = (open(), open());
-        let describe = |result: &Result<ExecuteResult>| match result {
-            Ok(result) => format!(
-                "ok {} {} {:?} {:?} {:?}",
-                result.command, result.row_count, result.tables, result.keys, result.rows
-            ),
-            Err(error) => format!("err {} {}", error.code, error.message),
-        };
-        for (sql, params) in &statements {
-            let id = prepared.prepare_sql(sql).unwrap();
-            let fast = prepared.execute_prepared(id, params);
-            let full = plain.execute_sql(sql, params);
-            assert_eq!(describe(&fast), describe(&full), "{sql}");
+        }
+
+        /// The id and the name the round gives a row of `items` or `tags` that its lists number
+        /// and name, so that no two rounds write the same row or, where names are unique, the
+        /// same name.
+        fn rows(self) -> (impl Fn(i64) -> i64, impl Fn(&str) -> String) {
+            let number = self.number;
+            (
+                move |id| 1000 * number as i64 + id,
+                move |name| format!("{name} {number}"),
+            )
+        }
+
+        /// A case on `tags`, which fails once a round has dropped the table.
+        fn on_tags(&self, sql: &str, params: Value, expected: Expected) -> PointCase {
+            let expected = if self.tags {
+                expected
+            } else {
+                Fails("TABLE_NOT_FOUND")
+            };
+            case_on("tags", sql, params, expected)
+        }
+    }
+
+    /// Two engines over the same database. One runs each statement prepared, which inside a
+    /// transaction plans it from its point template where it has one; the other runs it as SQL
+    /// with the same parameters, which plans it in full.
+    struct PointPair {
+        prepared: PagedEngine<MemoryPageDevice>,
+        plain: PagedEngine<MemoryPageDevice>,
+        /// Each distinct statement the prepared engine has run, prepared once and kept through
+        /// every commit and catalog change.
+        ids: Vec<(String, PreparedStatementId)>,
+        round: PointRound,
+        /// The setup, for a failure's message.
+        setup: String,
+    }
+
+    impl PointPair {
+        fn open(setup: String, script: &str, round: PointRound) -> Self {
+            let open = || {
+                let mut engine = PagedEngine::open(MemoryPageDevice::new(0).unwrap()).unwrap();
+                engine.exec_sql(script).unwrap();
+                engine
+            };
+            Self {
+                prepared: open(),
+                plain: open(),
+                ids: Vec::new(),
+                round,
+                setup,
+            }
+        }
+
+        /// The pair with each engine closed and opened again over what it stored, which
+        /// forgets every statement the prepared one had prepared.
+        fn reopened(self) -> Self {
+            let reopen = |engine: PagedEngine<MemoryPageDevice>| {
+                PagedEngine::open(engine.into_device()).unwrap()
+            };
+            Self {
+                prepared: reopen(self.prepared),
+                plain: reopen(self.plain),
+                ids: Vec::new(),
+                ..self
+            }
+        }
+
+        /// Runs a script in both engines, outside a transaction.
+        fn exec(&mut self, script: &str) {
+            for engine in [&mut self.prepared, &mut self.plain] {
+                if let Err(error) = engine.exec_sql(script) {
+                    panic!("{} {script}: {error:?}", self.setup);
+                }
+            }
+        }
+
+        /// Runs `cases` in one transaction of each engine. The two must then publish the same
+        /// changes and hold the same rows.
+        fn transact(&mut self, cases: &[PointCase]) {
+            self.prepared.begin_transaction().unwrap();
+            self.plain.begin_transaction().unwrap();
+            for case in cases {
+                self.run(case);
+            }
+            let context = format!("{} round {}", self.setup, self.round.number);
             assert_eq!(
-                prepared.transaction_fingerprint(),
-                plain.transaction_fingerprint(),
-                "{sql}"
+                self.prepared.commit_transaction().unwrap(),
+                self.plain.commit_transaction().unwrap(),
+                "{context}"
+            );
+            assert_eq!(
+                self.prepared.database_hash(),
+                self.plain.database_hash(),
+                "{context}"
             );
         }
-        let fast = prepared.commit_transaction().unwrap();
-        let full = plain.commit_transaction().unwrap();
-        assert_eq!(format!("{fast:?}"), format!("{full:?}"));
-        assert_eq!(prepared.database_hash(), plain.database_hash());
-        // Rows 4, 8, 9, 20, 29, 30, and 31 remain: 2 moved to 20, 3 and 5 were deleted, 1 last of
-        // all, and every later listed insert failed as a whole.
-        assert_eq!(
-            objects(
-                &prepared
-                    .execute_sql("SELECT * FROM items ORDER BY id", &[])
-                    .unwrap()
+
+        /// Runs one execution in both engines, which must return the same result or error and
+        /// then hold the same staged state, and holds the prepared engine to the outcome and
+        /// the path the case expects, so that a statement that quietly stops being planned from
+        /// its template fails here.
+        fn run(&mut self, case: &PointCase) {
+            let PointCase {
+                table,
+                sql,
+                params,
+                expected,
+            } = case;
+            let fast = if let Unprepared = expected {
+                self.prepared.execute_sql(sql, params)
+            } else {
+                let id = match self.ids.iter().find(|(text, _)| text == sql) {
+                    Some((_, id)) => *id,
+                    None => {
+                        let id = self.prepared.prepare_sql(sql).unwrap();
+                        self.ids.push((sql.clone(), id));
+                        // No statement is ever closed, and the registry holds 128 at most.
+                        assert!(self.ids.len() < 128, "{sql}");
+                        id
+                    }
+                };
+                self.prepared.execute_prepared(id, params)
+            };
+            let full = self.plain.execute_sql(sql, params);
+            // Written only for a failure, and without the bulk of a large parameter.
+            let context = || {
+                let mut shown = format!("{params:?}");
+                if shown.len() > 400 {
+                    shown = format!("{} parameters of {} bytes", params.len(), shown.len());
+                }
+                format!("{} round {}: {sql} {shown}", self.setup, self.round.number)
+            };
+            assert_eq!(fast, full, "{}", context());
+            assert_eq!(
+                self.prepared.transaction_fingerprint(),
+                self.plain.transaction_fingerprint(),
+                "{}",
+                context()
+            );
+            let path = self.prepared.last_path.get();
+            match (expected, &fast) {
+                (Fails(code), Err(error)) => assert_eq!(error.code, *code, "{}", context()),
+                (Unprepared, Ok(_)) => {}
+                // Only a transaction plans a statement from its template.
+                (Point | Unchanged, Ok(result)) if self.prepared.in_transaction() => {
+                    let planned = if self.round.involves(table) {
+                        StatementPath::PointEnforced
+                    } else {
+                        StatementPath::PointPlain
+                    };
+                    assert_eq!(path, Some(planned), "{}", context());
+                    // A statement that stopped finding its row would still agree with the
+                    // other engine's, and would no longer compare what it is here to compare.
+                    let unchanged = matches!(expected, Unchanged);
+                    assert_eq!(result.row_count == 0, unchanged, "{}", context());
+                }
+                (Full, Ok(_)) => assert_eq!(path, Some(StatementPath::General), "{}", context()),
+                _ => panic!("{}: expected {expected:?}, not {fast:?}", context()),
+            }
+        }
+    }
+
+    /// A column of a [`ShapedTable`]: its name, its SQL type, and the rest of its definition.
+    struct ShapedColumn {
+        name: String,
+        kind: &'static str,
+        rest: &'static str,
+    }
+
+    /// A table the equivalence test writes statements for from its columns, so that every key
+    /// shape and width runs the same shapes of statement: its columns in schema order, and its
+    /// primary key's columns in key order, which need not be the schema's.
+    struct ShapedTable {
+        name: &'static str,
+        columns: Vec<ShapedColumn>,
+        key: Vec<&'static str>,
+        /// Whether the table runs every shape of statement, or only those that name one row by
+        /// its whole key: an insert of it, an update, a delete and an upsert.
+        every_shape: bool,
+    }
+
+    /// The shaped tables a round widens with `ALTER TABLE ... ADD COLUMN`.
+    const WIDENED: [&str; 2] = ["pairs", "wide17"];
+
+    impl ShapedTable {
+        fn new(
+            name: &'static str,
+            columns: &[(&str, &'static str, &'static str)],
+            key: &[&'static str],
+            every_shape: bool,
+        ) -> Self {
+            Self {
+                name,
+                columns: columns
+                    .iter()
+                    .map(|(name, kind, rest)| ShapedColumn {
+                        name: (*name).to_owned(),
+                        kind,
+                        rest,
+                    })
+                    .collect(),
+                key: key.to_vec(),
+                every_shape,
+            }
+        }
+
+        /// A table of `count` columns keyed by its first, the others taking each type in turn
+        /// and being in turn nullable with no default, nullable with one, and required with
+        /// one, so that every type has a default of each kind.
+        fn wide(name: &'static str, count: usize) -> Self {
+            let mut table = Self::new(name, &[("id", "INTEGER", "")], &["id"], true);
+            for n in 1..count {
+                table.columns.push(ShapedColumn {
+                    name: format!("c{n}"),
+                    kind: ["INTEGER", "TEXT", "BOOLEAN", "FLOAT"][n % 4],
+                    rest: match (n % 3, n % 4) {
+                        (0, _) => "",
+                        (1, 0) => "DEFAULT 40",
+                        (1, 1) => "DEFAULT 'one'",
+                        (1, 2) => "DEFAULT true",
+                        (1, _) => "DEFAULT 2.5",
+                        (_, 0) => "NOT NULL DEFAULT -4",
+                        (_, 1) => "NOT NULL DEFAULT ''",
+                        (_, 2) => "NOT NULL DEFAULT false",
+                        (_, _) => "NOT NULL DEFAULT 3",
+                    },
+                });
+            }
+            table
+        }
+
+        fn create(&self) -> String {
+            let columns = self
+                .columns
+                .iter()
+                .map(|column| format!("{} {} {}", column.name, column.kind, column.rest))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "CREATE TABLE {} ({columns}, PRIMARY KEY ({}))",
+                self.name,
+                self.key.join(", ")
             )
-            .len(),
-            7
-        );
+        }
+
+        fn is_key(&self, column: &ShapedColumn) -> bool {
+            self.key.contains(&column.name.as_str())
+        }
+
+        /// Every column, in schema order.
+        fn all(&self) -> Vec<&ShapedColumn> {
+            self.columns.iter().collect()
+        }
+
+        /// The key's columns, in key order.
+        fn keys(&self) -> Vec<&ShapedColumn> {
+            let column = |name| self.columns.iter().find(|column| column.name == name);
+            self.key.iter().map(|name| column(*name).unwrap()).collect()
+        }
+
+        /// The columns outside the key, in schema order.
+        fn rest(&self) -> Vec<&ShapedColumn> {
+            self.columns
+                .iter()
+                .filter(|column| !self.is_key(column))
+                .collect()
+        }
+
+        fn names(columns: &[&ShapedColumn]) -> String {
+            let names = columns.iter().map(|column| column.name.as_str());
+            names.collect::<Vec<_>>().join(", ")
+        }
+
+        /// `count` parameter markers, numbered from `from`.
+        fn markers(from: usize, count: usize) -> String {
+            let markers = (from..from + count).map(|number| format!("${number}"));
+            markers.collect::<Vec<_>>().join(", ")
+        }
+
+        /// Each of `columns` set equal to a parameter, numbered from `from`.
+        fn equalities(columns: &[&ShapedColumn], from: usize) -> String {
+            let equalities = columns
+                .iter()
+                .enumerate()
+                .map(|(index, column)| format!("{} = ${}", column.name, from + index));
+            equalities.collect::<Vec<_>>().join(" AND ")
+        }
+
+        /// A value for `column` in row `row`: the same for a key column whenever the row is,
+        /// and for any other column a different one for each `version`.
+        fn value(&self, column: &ShapedColumn, row: i64, version: i64) -> Value {
+            let name = &column.name;
+            match (column.kind, self.is_key(column)) {
+                ("INTEGER", true) => json!(row),
+                ("TEXT", true) => json!(format!("{name} {row}")),
+                ("BOOLEAN", true) => json!(row % 2 != 0),
+                // A FLOAT key is written as an integer in every other row, and read as a float.
+                ("FLOAT", true) if row % 2 != 0 => json!(row),
+                ("FLOAT", true) => json!(row as f64 + 0.5),
+                ("INTEGER", false) => json!(row * 100 + version),
+                ("TEXT", false) => json!(format!("{name} {row}.{version}")),
+                ("BOOLEAN", false) => json!((row + version) % 2 == 0),
+                ("FLOAT", false) => json!((row * 4 + version) as f64 / 4.0),
+                _ => unreachable!("a shaped column has one of four types"),
+            }
+        }
+
+        fn values(&self, columns: &[&ShapedColumn], row: i64, version: i64) -> Vec<Value> {
+            let value = |column: &&ShapedColumn| self.value(column, row, version);
+            columns.iter().map(value).collect()
+        }
+
+        /// The key of row `row`, in key order.
+        fn key_of(&self, row: i64) -> Vec<Value> {
+            self.values(&self.keys(), row, 0)
+        }
+
+        /// How a statement that finds a row by its key is planned, where a row has the key and
+        /// where none has: from its template only where a lookup finds the key exactly, which it
+        /// cannot for a FLOAT.
+        fn keyed(&self) -> (Expected, Expected) {
+            if self.keys().iter().any(|column| column.kind == "FLOAT") {
+                (Full, Full)
+            } else {
+                (Point, Unchanged)
+            }
+        }
+
+        fn case(&self, sql: String, params: Vec<Value>, expected: Expected) -> PointCase {
+            case_on(self.name, &sql, Value::Array(params), expected)
+        }
+
+        /// `INSERT` of row `row`, listing every column in schema order.
+        fn insert_all(&self, row: i64, version: i64, expected: Expected) -> PointCase {
+            let all = self.all();
+            let (names, markers) = (Self::names(&all), Self::markers(1, all.len()));
+            self.case(
+                format!("INSERT INTO {} ({names}) VALUES ({markers})", self.name),
+                self.values(&all, row, version),
+                expected,
+            )
+        }
+
+        /// `INSERT` of row `row` with its values in schema order, listing no column.
+        fn insert_bare(&self, row: i64, version: i64, expected: Expected) -> PointCase {
+            let all = self.all();
+            let markers = Self::markers(1, all.len());
+            self.case(
+                format!("INSERT INTO {} VALUES ({markers})", self.name),
+                self.values(&all, row, version),
+                expected,
+            )
+        }
+
+        /// `INSERT` of the key of row `row` and one other column, the rest taking their
+        /// defaults.
+        fn insert_key(&self, row: i64, version: i64) -> PointCase {
+            let columns = [self.keys(), vec![self.rest()[0]]].concat();
+            let (names, markers) = (Self::names(&columns), Self::markers(1, columns.len()));
+            self.case(
+                format!("INSERT INTO {} ({names}) VALUES ({markers})", self.name),
+                self.values(&columns, row, version),
+                Point,
+            )
+        }
+
+        /// `INSERT` of two rows, listing every column, last first.
+        fn insert_rows(&self, first: i64, second: i64, expected: Expected) -> PointCase {
+            let columns = self.columns.iter().rev().collect::<Vec<_>>();
+            let count = columns.len();
+            self.case(
+                format!(
+                    "INSERT INTO {} ({}) VALUES ({}), ({})",
+                    self.name,
+                    Self::names(&columns),
+                    Self::markers(1, count),
+                    Self::markers(count + 1, count)
+                ),
+                [
+                    self.values(&columns, first, 0),
+                    self.values(&columns, second, 0),
+                ]
+                .concat(),
+                expected,
+            )
+        }
+
+        /// `UPDATE` of one column of the row at `key`, the predicate naming the key's columns in
+        /// key order and taking the first parameters, so that the statement's markers do not
+        /// come in the order of their numbers.
+        fn update_one(&self, key: Vec<Value>, value: Value, expected: Expected) -> PointCase {
+            let keys = self.keys();
+            self.case(
+                format!(
+                    "UPDATE {} SET {} = ${} WHERE {}",
+                    self.name,
+                    self.rest()[0].name,
+                    keys.len() + 1,
+                    Self::equalities(&keys, 1)
+                ),
+                [key, vec![value]].concat(),
+                expected,
+            )
+        }
+
+        /// `UPDATE` of every column outside the key of row `row`, last first and every third to
+        /// its default, the predicate naming the key's columns last first.
+        fn update_all(&self, row: i64, version: i64, expected: Expected) -> PointCase {
+            let (mut assignments, mut params) = (Vec::new(), Vec::new());
+            for (index, column) in self.rest().into_iter().rev().enumerate() {
+                if index % 3 == 1 {
+                    assignments.push(format!("{} = DEFAULT", column.name));
+                } else {
+                    params.push(self.value(column, row, version));
+                    assignments.push(format!("{} = ${}", column.name, params.len()));
+                }
+            }
+            let key = self.keys().into_iter().rev().collect::<Vec<_>>();
+            let sql = format!(
+                "UPDATE {} SET {} WHERE {}",
+                self.name,
+                assignments.join(", "),
+                Self::equalities(&key, params.len() + 1)
+            );
+            params.extend(self.values(&key, row, 0));
+            self.case(sql, params, expected)
+        }
+
+        /// `DELETE` of the row at `key`.
+        fn delete(&self, key: Vec<Value>, expected: Expected) -> PointCase {
+            let equalities = Self::equalities(&self.keys(), 1);
+            self.case(
+                format!("DELETE FROM {} WHERE {equalities}", self.name),
+                key,
+                expected,
+            )
+        }
+
+        /// `INSERT` of a key and one other column, which a row at that key takes instead, the
+        /// conflict target naming the key's columns last first.
+        fn upsert_one(&self, key: Vec<Value>, value: Value, expected: Expected) -> PointCase {
+            let columns = [self.keys(), vec![self.rest()[0]]].concat();
+            let target = self.keys().into_iter().rev().collect::<Vec<_>>();
+            self.case(
+                format!(
+                    "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) \
+                     DO UPDATE SET {column} = EXCLUDED.{column}",
+                    self.name,
+                    Self::names(&columns),
+                    Self::markers(1, columns.len()),
+                    Self::names(&target),
+                    column = self.rest()[0].name
+                ),
+                [key, vec![value]].concat(),
+                expected,
+            )
+        }
+
+        /// `INSERT` of row `row`, which a row at its key takes instead: every column outside
+        /// the key from the proposed row, last first, but the first of them, which takes a
+        /// constant.
+        fn upsert_all(&self, row: i64, version: i64) -> PointCase {
+            let (all, rest) = (self.all(), self.rest());
+            let assignments = rest.iter().rev().map(|column| {
+                if column.name == rest[0].name {
+                    format!("{} = ${}", column.name, all.len() + 1)
+                } else {
+                    format!("{name} = EXCLUDED.{name}", name = column.name)
+                }
+            });
+            let mut params = self.values(&all, row, version);
+            params.push(self.value(rest[0], row, version + 1));
+            self.case(
+                format!(
+                    "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO UPDATE SET {}",
+                    self.name,
+                    Self::names(&all),
+                    Self::markers(1, all.len()),
+                    Self::names(&self.keys()),
+                    assignments.collect::<Vec<_>>().join(", ")
+                ),
+                params,
+                self.keyed().0,
+            )
+        }
+
+        /// The table's statements for a round: rows the round inserts, changes, deletes and
+        /// inserts again, which are staged rows by then, and the rows the round before it
+        /// left, which are stored ones.
+        fn cases(&self, round: PointRound) -> Vec<PointCase> {
+            let (keyed, absent) = self.keyed();
+            let duplicate = Fails("CONSTRAINT_VIOLATION");
+            // The round's rows are numbered from `base`, and those of the round before it from
+            // `before`.
+            let base = 10 * round.number as i64;
+            let before = base - 10;
+            let key = |row: i64| self.key_of(row);
+            let other = |row: i64, version: i64| self.value(self.rest()[0], row, version);
+            // A round's first two rows are new to it, except in a table keyed by a BOOLEAN,
+            // whose two values every round writes: there the round before left the first of
+            // them, and only the opening round left the second as well.
+            let boolean = self.keys()[0].kind == "BOOLEAN";
+            let left = |held: bool| if boolean && held { keyed } else { absent };
+            let mut cases = vec![
+                self.delete(key(base + 1), left(round.number > 0)),
+                self.delete(key(base + 2), left(round.number == 1)),
+                self.update_one(key(base + 2), other(base + 2, 1), absent),
+                self.insert_all(base + 1, 0, Point),
+                self.insert_all(base + 1, 1, duplicate),
+                self.update_one(key(base + 1), other(base + 1, 2), keyed),
+                self.upsert_one(key(base + 2), other(base + 2, 3), keyed),
+                self.upsert_one(key(base + 2), other(base + 2, 4), keyed),
+                self.delete(key(base + 1), keyed),
+                self.upsert_one(key(base + 1), other(base + 1, 5), keyed),
+            ];
+            if round.number > 0 {
+                cases.extend([
+                    self.update_one(key(before + 1), other(before + 1, 6), keyed),
+                    self.upsert_one(key(before + 1), other(before + 1, 7), keyed),
+                    self.insert_all(before + 1, 8, duplicate),
+                    self.delete(key(before + 2), keyed),
+                ]);
+            }
+            if !self.every_shape {
+                return cases;
+            }
+            // A row without a column list has a value too few once the table has another
+            // column, and the row it would have put back is then not there to update.
+            let (bare, restored) = if round.widened && WIDENED.contains(&self.name) {
+                (Fails("INVALID_QUERY"), absent)
+            } else {
+                (Point, keyed)
+            };
+            cases.extend([
+                self.insert_rows(base + 3, base + 4, Point),
+                self.insert_rows(base + 4, base + 3, duplicate),
+                self.insert_key(base + 5, 0),
+                self.update_all(base + 3, 1, keyed),
+                self.upsert_all(base + 4, 2),
+                self.upsert_all(base + 6, 3),
+                self.delete(key(base + 5), keyed),
+                self.insert_bare(base + 5, 4, bare),
+                self.update_all(base + 5, 5, restored),
+            ]);
+            if round.number > 0 {
+                cases.extend([
+                    self.update_all(before + 3, 6, keyed),
+                    self.upsert_all(before + 4, 7),
+                    self.insert_rows(base + 7, before + 3, duplicate),
+                    self.delete(key(before + 6), keyed),
+                ]);
+            }
+            cases
+        }
+
+        /// Statements on rows at `keys`, each a key that fits a stored key or one that does
+        /// not, which assign `values`.
+        fn sized_key_cases(
+            &self,
+            keys: Vec<(Vec<Value>, bool)>,
+            values: [Value; 2],
+        ) -> Vec<PointCase> {
+            let [first, second] = values;
+            let mut cases = Vec::new();
+            for (key, fits) in keys {
+                if fits {
+                    cases.extend([
+                        self.upsert_one(key.clone(), first.clone(), Point),
+                        self.update_one(key.clone(), second.clone(), Point),
+                        self.upsert_one(key.clone(), first.clone(), Point),
+                        self.delete(key.clone(), Point),
+                        self.upsert_one(key, second.clone(), Point),
+                    ]);
+                } else {
+                    // No row has a key too long to store, so the general planner finds none,
+                    // and refuses to write one.
+                    cases.extend([
+                        self.update_one(key.clone(), first.clone(), Full),
+                        self.delete(key.clone(), Full),
+                        self.upsert_one(key, second.clone(), Fails("INVALID_CHANGE")),
+                    ]);
+                }
+            }
+            cases
+        }
+    }
+
+    /// The tables of the equivalence test with other shapes of key than `items` has, and two
+    /// of many columns, whose defaults are of every type and kind.
+    fn shaped_tables() -> Vec<ShapedTable> {
+        vec![
+            ShapedTable::new(
+                "pairs",
+                &[
+                    ("v", "TEXT", ""),
+                    ("b", "TEXT", ""),
+                    ("n", "INTEGER", "NOT NULL DEFAULT 5"),
+                    ("a", "INTEGER", ""),
+                    ("f", "FLOAT", "DEFAULT 0.5"),
+                ],
+                &["a", "b"],
+                true,
+            ),
+            ShapedTable::new(
+                "spans",
+                &[
+                    ("s", "TEXT", ""),
+                    ("live", "BOOLEAN", "NOT NULL DEFAULT true"),
+                    ("n", "INTEGER", ""),
+                    ("v", "TEXT", "DEFAULT 'none'"),
+                ],
+                &["s", "n"],
+                false,
+            ),
+            ShapedTable::new(
+                "labels",
+                &[
+                    ("code", "TEXT", ""),
+                    ("v", "TEXT", ""),
+                    ("n", "INTEGER", "NOT NULL DEFAULT 5"),
+                ],
+                &["code"],
+                true,
+            ),
+            ShapedTable::new(
+                "flags",
+                &[("v", "TEXT", ""), ("flag", "BOOLEAN", "")],
+                &["flag"],
+                false,
+            ),
+            ShapedTable::new(
+                "ratios",
+                &[("ratio", "FLOAT", ""), ("v", "TEXT", "")],
+                &["ratio"],
+                false,
+            ),
+            ShapedTable::wide("wide17", 17),
+            ShapedTable::wide("wide40", 40),
+        ]
+    }
+
+    // The statements on `items` and `tags` that several lists of the equivalence test run. The
+    // prepared engine prepares each once, however many lists and rounds run it.
+    const ITEM_INSERT: &str =
+        "INSERT INTO items (id, name, qty, note, price) VALUES ($1, $2, $3, $4, $5)";
+    const ITEM_INSERT_NAME: &str = "INSERT INTO items (id, name) VALUES ($1, $2)";
+    const ITEM_INSERT_QTY: &str = "INSERT INTO items (id, name, qty) VALUES ($1, $2, $3)";
+    const ITEM_INSERT_BARE: &str = "INSERT INTO items VALUES ($1, $2, $3, $4, $5)";
+    const ITEM_INSERT_DEFAULT: &str = "INSERT INTO items (id, name, qty) VALUES ($1, $2, DEFAULT)";
+    const ITEM_INSERT_TWO: &str = "INSERT INTO items (id, name) VALUES ($1, $2), ($3, $4)";
+    const ITEM_INSERT_TWO_QTY: &str =
+        "INSERT INTO items (id, name, qty) VALUES ($1, $2, $3), ($4, $5, $6)";
+    const ITEM_INSERT_THREE: &str =
+        "INSERT INTO items (id, name, qty) VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9)";
+    const ITEM_NOTE: &str = "UPDATE items SET note = $1 WHERE id = $2";
+    const ITEM_NAME: &str = "UPDATE items SET name = $1 WHERE id = $2";
+    const ITEM_QTY: &str = "UPDATE items SET qty = $1 WHERE id = $2";
+    const ITEM_PRICE: &str = "UPDATE items SET price = $1 WHERE id = $2";
+    const ITEM_ID: &str = "UPDATE items SET id = $1 WHERE id = $2";
+    const ITEM_DEFAULT: &str = "UPDATE items SET qty = DEFAULT, note = $1 WHERE $2 = id";
+    const ITEM_DELETE: &str = "DELETE FROM items WHERE id = $1";
+    const ITEM_UPSERT_QTY: &str = "INSERT INTO items (id, name, qty) VALUES ($1, $2, $3) \
+         ON CONFLICT (id) DO UPDATE SET qty = EXCLUDED.qty";
+    const ITEM_UPSERT_NAME: &str = "INSERT INTO items (id, name) VALUES ($1, $2) \
+         ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name";
+    const ITEM_UPSERT_NOTE: &str = "INSERT INTO items (id, name, qty) VALUES ($1, $2, $3) \
+         ON CONFLICT (id) DO UPDATE SET qty = EXCLUDED.qty, note = $4";
+    const ITEM_UPSERT_CROSSED: &str = "INSERT INTO items (id, name, note) VALUES ($1, $2, $3) \
+         ON CONFLICT (id) DO UPDATE SET qty = EXCLUDED.name, name = EXCLUDED.note";
+    const ITEM_SELECT: &str = "SELECT id, qty, note FROM items WHERE id = $1";
+    const ITEM_LITERAL_NOTE: &str = "UPDATE items SET note = 'lit' WHERE id = 902";
+    const ITEM_LITERAL_KEY: &str = "UPDATE items SET qty = $2 WHERE id = 902";
+    const ITEM_LITERAL_INSERT: &str = "INSERT INTO items (id, name, qty) VALUES (903, $1, 7)";
+    const TAG_INSERT: &str = "INSERT INTO tags (id, item, tag) VALUES ($1, $2, $3)";
+    const TAG_ITEM: &str = "UPDATE tags SET item = $1 WHERE id = $2";
+    const TAG_DELETE: &str = "DELETE FROM tags WHERE id = $1";
+
+    /// The rows each round finds in `items` and `tags`, which it writes outside a transaction,
+    /// where a prepared statement is bound and planned in full.
+    fn seed_cases(round: PointRound) -> Vec<PointCase> {
+        let (n, s) = round.rows();
+        let mut cases = vec![
+            on_items(ITEM_INSERT, json!([n(1), s("one"), 1, null, 1.5]), Full),
+            on_items(
+                ITEM_INSERT,
+                json!([n(2), s("two"), 2, "second", null]),
+                Full,
+            ),
+            on_items(ITEM_INSERT, json!([n(3), s("three"), 3, null, null]), Full),
+            // Rows that other tables reference, in the rounds that have those tables.
+            on_items(
+                ITEM_INSERT,
+                json!([n(51), s("cascading"), 5, null, null]),
+                Full,
+            ),
+            on_items(
+                ITEM_INSERT,
+                json!([n(52), s("followed"), 5, null, null]),
+                Full,
+            ),
+            on_items(ITEM_INSERT, json!([n(53), s("held"), 5, null, null]), Full),
+            on_items(
+                ITEM_INSERT,
+                json!([n(54), s("held in place"), 5, null, null]),
+                Full,
+            ),
+            on_items(
+                ITEM_INSERT,
+                json!([n(55), s("tagged"), 5, null, null]),
+                Full,
+            ),
+            // A row a round deletes and inserts again as it was, and one only a range finds.
+            on_items(ITEM_INSERT, json!([n(84), s("same"), 4, "kept", 2.5]), Full),
+            on_items(
+                ITEM_INSERT,
+                json!([n(85), s("lowest"), -9, null, null]),
+                Full,
+            ),
+        ];
+        if round.tags {
+            cases.extend([
+                case_on("tags", TAG_INSERT, json!([n(10), n(1), "a"]), Full),
+                case_on("tags", TAG_INSERT, json!([n(11), n(3), "b"]), Full),
+                case_on("tags", TAG_INSERT, json!([n(16), n(55), "c"]), Full),
+            ]);
+        }
+        cases
+    }
+
+    /// The statements this test has always run, on the rows a round seeds, with a few more
+    /// among them and statements on `tags` around them. Several fail, in both engines; several
+    /// are not point statements at all.
+    fn item_cases(round: PointRound) -> Vec<PointCase> {
+        let (n, s) = round.rows();
+        // A name another row holds is refused only where `items_name` makes names unique.
+        let unique = if round.indexed {
+            Fails("CONSTRAINT_VIOLATION")
+        } else {
+            Point
+        };
+        // A tag of an item that does not exist is refused only where `tags.item` references
+        // `items`.
+        let dangling = if round.references {
+            Fails("CONSTRAINT_VIOLATION")
+        } else {
+            Point
+        };
+        // A row without a column list has a value too few once the table has another column.
+        let bare = if round.widened {
+            Fails("INVALID_QUERY")
+        } else {
+            Point
+        };
+        // A tag is gone with the item it referenced only where `tags.item` references `items`.
+        let cascaded = if round.references { Unchanged } else { Point };
+        vec![
+            // A tag of a seeded item, moved to another, and to one that does not exist.
+            round.on_tags(TAG_INSERT, json!([n(14), n(2), "e"]), Point),
+            round.on_tags(TAG_ITEM, json!([n(1), n(14)]), Point),
+            round.on_tags(TAG_ITEM, json!([n(98), n(14)]), dangling),
+            round.on_tags(TAG_DELETE, json!([n(15)]), Unchanged),
+            on_items(ITEM_INSERT, json!([n(4), s("four"), 4, null, 4.0]), Point),
+            on_items(ITEM_INSERT_NAME, json!([n(5), s("five")]), Point),
+            on_items(
+                ITEM_INSERT_NAME,
+                json!([n(5), s("again")]),
+                Fails("CONSTRAINT_VIOLATION"),
+            ),
+            // That was the key of a staged row, and this is a stored row's.
+            on_items(
+                ITEM_INSERT_NAME,
+                json!([n(2), s("stored")]),
+                Fails("CONSTRAINT_VIOLATION"),
+            ),
+            on_items(ITEM_INSERT_NAME, json!([n(6), s("one")]), unique),
+            on_items(
+                ITEM_INSERT_QTY,
+                json!([n(7), s("seven"), "many"]),
+                Fails("TYPE_MISMATCH"),
+            ),
+            on_items(
+                ITEM_INSERT_BARE,
+                json!([n(9), s("nine"), 9, "ninth", 9.5]),
+                bare,
+            ),
+            on_items(
+                ITEM_INSERT_THREE,
+                json!([
+                    n(30),
+                    s("thirty"),
+                    3,
+                    n(31),
+                    s("thirty-one"),
+                    1,
+                    n(29),
+                    s("twenty-nine"),
+                    2
+                ]),
+                Point,
+            ),
+            on_items(
+                ITEM_INSERT_TWO,
+                json!([n(40), s("forty"), n(40), s("forty again")]),
+                Fails("CONSTRAINT_VIOLATION"),
+            ),
+            // A third row with the key of the first, past a second whose key sorts before
+            // theirs; then a second row with the key of a staged row, and of a stored one.
+            on_items(
+                ITEM_INSERT_THREE,
+                json!([
+                    n(48),
+                    s("forty-eight"),
+                    1,
+                    n(47),
+                    s("forty-seven"),
+                    1,
+                    n(48),
+                    s("forty-eight again"),
+                    1
+                ]),
+                Fails("CONSTRAINT_VIOLATION"),
+            ),
+            on_items(
+                ITEM_INSERT_TWO,
+                json!([n(41), s("forty-one"), n(30), s("thirty again")]),
+                Fails("CONSTRAINT_VIOLATION"),
+            ),
+            on_items(
+                ITEM_INSERT_TWO,
+                json!([n(46), s("forty-six"), n(3), s("stored")]),
+                Fails("CONSTRAINT_VIOLATION"),
+            ),
+            on_items(
+                ITEM_INSERT_TWO_QTY,
+                json!([n(42), s("forty-two"), 1, n(43), s("forty-three"), "lots"]),
+                Fails("TYPE_MISMATCH"),
+            ),
+            on_items(
+                ITEM_INSERT_TWO,
+                json!([n(44), s("one"), n(45), s("forty-five")]),
+                unique,
+            ),
+            on_items(ITEM_NOTE, json!(["noted", n(2)]), Point),
+            on_items(ITEM_NOTE, json!(["missing", n(99)]), Unchanged),
+            on_items(ITEM_DEFAULT, json!([null, n(3)]), Point),
+            on_items(
+                ITEM_NAME,
+                json!([null, n(1)]),
+                Fails("CONSTRAINT_VIOLATION"),
+            ),
+            on_items(ITEM_NAME, json!([s("two"), n(1)]), unique),
+            on_items(ITEM_PRICE, json!([2, n(2)]), Point),
+            on_items(ITEM_ID, json!([n(20), n(2)]), Full),
+            on_items(ITEM_QTY, json!([3.5, n(1)]), Fails("TYPE_MISMATCH")),
+            on_items(ITEM_DELETE, json!([n(5)]), Point),
+            on_items(ITEM_DELETE, json!([n(5)]), Unchanged),
+            // With the tag that references it, where `tags.item` references `items`.
+            on_items(ITEM_DELETE, json!([n(3)]), Point),
+            on_items(
+                ITEM_UPSERT_NOTE,
+                json!([n(1), s("uno"), 10, "upserted"]),
+                Point,
+            ),
+            on_items(ITEM_UPSERT_QTY, json!([n(8), s("eight"), 8]), Point),
+            on_items(ITEM_UPSERT_NAME, json!([n(8), s("two")]), unique),
+            on_items(ITEM_UPSERT_NAME, json!([n(8), s("eighth")]), Point),
+            round.on_tags(TAG_INSERT, json!([n(12), n(2), "c"]), dangling),
+            round.on_tags(TAG_INSERT, json!([n(13), n(99), "d"]), dangling),
+            on_items(
+                "UPDATE items SET note = $1 WHERE id = $2 AND name = $3",
+                json!(["x", n(1), s("uno")]),
+                Full,
+            ),
+            on_items(ITEM_SELECT, json!([n(1)]), Full),
+            // One of the two tags that reference an item by now, then the item, and then the
+            // other tag.
+            round.on_tags(TAG_DELETE, json!([n(14)]), Point),
+            on_items(ITEM_DELETE, json!([n(1)]), Point),
+            round.on_tags(TAG_DELETE, json!([n(10)]), cascaded),
+        ]
+    }
+
+    /// Statements on `items` whose arguments are literals, and statements whose keys a lookup
+    /// does not find exactly.
+    fn key_cases(round: PointRound) -> Vec<PointCase> {
+        let (n, s) = round.rows();
+        // Literal and mixed arguments, on rows whose keys the statements spell out, which
+        // every round therefore shares. One statement has no use for its first parameter.
+        let mut cases = vec![
+            on_items(
+                "INSERT INTO items (id, name) VALUES (902, 'standing') \
+                 ON CONFLICT (id) DO UPDATE SET note = 'kept'",
+                json!([]),
+                Point,
+            ),
+            on_items(ITEM_LITERAL_NOTE, json!([]), Point),
+            on_items(ITEM_LITERAL_KEY, json!(["unused", round.number]), Point),
+            on_items(ITEM_LITERAL_INSERT, json!([s("passing")]), Point),
+            on_items("DELETE FROM items WHERE id = 903", json!([]), Point),
+            // A listed row's `DEFAULT`, alone, and then among literals and a parameter that
+            // another row takes as well.
+            on_items(ITEM_INSERT_DEFAULT, json!([n(66), s("defaulted")]), Point),
+            on_items(
+                "INSERT INTO items (id, name, qty, note, price) \
+                 VALUES ($1, $2, DEFAULT, 'listed', DEFAULT), ($3, $4, 6, $2, 1.5)",
+                json!([n(67), s("listed"), n(68), s("listed too")]),
+                Point,
+            ),
+            on_items(ITEM_INSERT_NAME, json!([n(70), s("keyed")]), Point),
+        ];
+        // Each key, how an upsert of it ends, and how an UPDATE and a DELETE that name it do,
+        // which find the row wherever the upsert put one. The general planner compares a key
+        // that is not an integer a lookup finds exactly, or refuses it.
+        let mistyped = Fails("TYPE_MISMATCH");
+        for (key, found, upserted) in [
+            (json!(null), Full, Fails("CONSTRAINT_VIOLATION")),
+            (json!(1.5), Full, mistyped),
+            (json!("1"), mistyped, mistyped),
+            (json!(true), mistyped, mistyped),
+            (json!(9_007_199_254_740_992_u64), Full, mistyped),
+            (json!(-9_007_199_254_740_992_i64), Full, mistyped),
+            (json!(9_007_199_254_740_991_u64), Point, Point),
+            (json!(-9_007_199_254_740_991_i64), Point, Point),
+            // The key of the row inserted above, spelled as a float, which the general planner
+            // finds.
+            (json!(n(70) as f64), Full, mistyped),
+        ] {
+            cases.extend([
+                on_items(ITEM_UPSERT_QTY, json!([key, s("keyed again"), 1]), upserted),
+                on_items(ITEM_NOTE, json!(["keyed", key]), found),
+                on_items(ITEM_DELETE, json!([key]), found),
+            ]);
+        }
+        cases
+    }
+
+    /// Statements on `items` of shapes a template's planner declines or refuses, statements on
+    /// rows other tables reference, and deletes by key among deletes of a range.
+    fn declined_cases(round: PointRound) -> Vec<PointCase> {
+        let (n, s) = round.rows();
+        // An upsert that assigns the key its own value, and one that assigns a constant of the
+        // wrong type ahead of a column the table does not have.
+        const UPSERT_KEY: &str = "INSERT INTO items (id, name) VALUES ($1, $2) \
+             ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id, name = EXCLUDED.name";
+        const UPSERT_UNKNOWN: &str = "INSERT INTO items (id, name, qty) VALUES ($1, $2, $3) \
+             ON CONFLICT (id) DO UPDATE SET qty = $4, nope = EXCLUDED.name";
+        // The general planner plans a delete of a range, and both engines run it as SQL.
+        const RANGE: &str = "DELETE FROM items WHERE qty < $1";
+        // A row another table references with no action can neither go nor move.
+        let held = |otherwise: Expected| {
+            if round.holds {
+                Fails("CONSTRAINT_VIOLATION")
+            } else {
+                otherwise
+            }
+        };
+        // Nor can a row move that a tag references, where `tags.item` references `items`: that
+        // key has an action for a delete alone.
+        let tagged = if round.tags && round.references {
+            Fails("CONSTRAINT_VIOLATION")
+        } else {
+            Full
+        };
+        vec![
+            on_items(ITEM_INSERT_NAME, json!([n(74), s("shaped")]), Point),
+            on_items(
+                "UPDATE items SET nope = $1 WHERE id = $2",
+                json!(["x", n(74)]),
+                Fails("COLUMN_NOT_FOUND"),
+            ),
+            on_items(
+                "UPDATE items SET note = $1 WHERE name = $2",
+                json!(["by name", s("shaped")]),
+                Full,
+            ),
+            // A conflict target that is not the key needs the unique index on it.
+            on_items(
+                "INSERT INTO items (id, name, qty) VALUES ($1, $2, $3) \
+                 ON CONFLICT (name) DO UPDATE SET qty = EXCLUDED.qty",
+                json!([n(71), s("shaped"), 40]),
+                if round.indexed {
+                    Full
+                } else {
+                    Fails("INVALID_QUERY")
+                },
+            ),
+            // The first inserts from its template; the second finds that row, which is left to
+            // the general planner.
+            on_items(UPSERT_KEY, json!([n(72), s("seventy-two")]), Point),
+            on_items(UPSERT_KEY, json!([n(72), s("seventy-two again")]), Full),
+            on_items(ITEM_DELETE, json!([n(72)]), Point),
+            on_items(
+                "INSERT INTO items (id, name) VALUES ($1, $2, $3)",
+                json!([n(73), s("too many"), 1]),
+                Fails("INVALID_QUERY"),
+            ),
+            on_items(
+                "INSERT INTO items (id, name, qty) VALUES ($1, $2) \
+                 ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+                json!([n(73), s("too few")]),
+                Fails("INVALID_QUERY"),
+            ),
+            on_items(
+                "INSERT INTO items (id, id, name) VALUES ($1, $2, $3)",
+                json!([n(73), n(75), s("twice")]),
+                Fails("INVALID_QUERY"),
+            ),
+            on_items(
+                "INSERT INTO items (id, nope) VALUES ($1, $2)",
+                json!([n(73), s("unknown")]),
+                Fails("COLUMN_NOT_FOUND"),
+            ),
+            // For a new row, and for a stored one.
+            on_items(
+                UPSERT_UNKNOWN,
+                json!([n(73), s("mistyped"), 1, "text"]),
+                Fails("TYPE_MISMATCH"),
+            ),
+            on_items(
+                UPSERT_UNKNOWN,
+                json!([n(74), s("mistyped"), 1, "text"]),
+                Fails("TYPE_MISMATCH"),
+            ),
+            on_items(
+                "INSERT INTO items DEFAULT VALUES",
+                json!([]),
+                Fails("CONSTRAINT_VIOLATION"),
+            ),
+            // Rows other tables reference, in the rounds that have those tables: two whose
+            // references go or move with them, and three whose references hold them.
+            on_items(ITEM_DELETE, json!([n(51)]), Point),
+            on_items(ITEM_ID, json!([n(62), n(52)]), Full),
+            on_items(ITEM_DELETE, json!([n(53)]), held(Point)),
+            on_items(ITEM_ID, json!([n(64), n(54)]), held(Full)),
+            on_items(ITEM_ID, json!([n(65), n(55)]), tagged),
+            // Deletes by key among deletes of a range, which find a stored row and staged
+            // ones, and no row that a delete by key has taken.
+            on_items(
+                ITEM_INSERT_THREE,
+                json!([
+                    n(80),
+                    s("low"),
+                    -1,
+                    n(81),
+                    s("lower"),
+                    -2,
+                    n(82),
+                    s("lower still"),
+                    -3
+                ]),
+                Point,
+            ),
+            on_items(ITEM_INSERT_QTY, json!([n(83), s("low too"), -1]), Point),
+            on_items(RANGE, json!([-2]), Unprepared),
+            on_items(ITEM_DELETE, json!([n(80)]), Point),
+            on_items(RANGE, json!([-1]), Unprepared),
+            on_items(ITEM_DELETE, json!([n(81)]), Unchanged),
+            on_items(RANGE, json!([0]), Unprepared),
+            // A row deleted and inserted again as it was.
+            on_items(ITEM_DELETE, json!([n(84)]), Point),
+            on_items(
+                ITEM_INSERT,
+                json!([n(84), s("same"), 4, "kept", 2.5]),
+                Point,
+            ),
+        ]
+    }
+
+    /// Statements on `items` that are refused, most of them with two faults, where the order
+    /// in which a planner looks decides which of the two it reports.
+    fn refused_cases(round: PointRound) -> Vec<PointCase> {
+        let (n, s) = round.rows();
+        const REORDERED: &str = "INSERT INTO items (qty, name, id) VALUES ($1, $2, $3)";
+        const UPDATE_TWO: &str = "UPDATE items SET qty = $1, name = $2 WHERE id = $3";
+        let (mistyped, violated) = (Fails("TYPE_MISMATCH"), Fails("CONSTRAINT_VIOLATION"));
+        vec![
+            // A listed row's values are checked in the order of the table's columns, so a
+            // null name is found before a mistyped quantity listed ahead of it.
+            on_items(REORDERED, json!([5, s("reordered"), n(69)]), Point),
+            on_items(REORDERED, json!(["many", null, n(60)]), violated),
+            // An UPDATE's values are checked in the order it assigns them, before the row is
+            // looked for, and a column it assigns twice is the general planner's to refuse.
+            on_items(UPDATE_TWO, json!(["many", null, n(69)]), mistyped),
+            on_items(UPDATE_TWO, json!([6, s("reordered twice"), n(69)]), Point),
+            on_items(ITEM_QTY, json!([3.5, n(99)]), mistyped),
+            on_items(
+                "UPDATE items SET qty = $1, qty = $2 WHERE id = $3",
+                json!([1, 2, n(69)]),
+                Fails("INVALID_QUERY"),
+            ),
+            // Of two listed rows, the first's key is found taken before the second's value
+            // is found mistyped.
+            on_items(
+                ITEM_INSERT_TWO_QTY,
+                json!([n(69), s("taken"), 1, n(61), s("mistyped"), "lots"]),
+                violated,
+            ),
+            // A key that is null, and one that is a float.
+            on_items(ITEM_INSERT_NAME, json!([null, s("keyless")]), violated),
+            on_items(
+                ITEM_INSERT_NAME,
+                json!([n(61) as f64, s("float")]),
+                mistyped,
+            ),
+            // An upsert's constant is checked before the row it proposes, whose values are
+            // checked in the order of the table's columns.
+            on_items(ITEM_UPSERT_NOTE, json!([n(69), s("x"), "bad", 5]), mistyped),
+            on_items(ITEM_UPSERT_QTY, json!([n(60), null, "many"]), violated),
+            // What an upsert takes from the row it proposes is checked in the order of the
+            // table's columns, and only where a row is there to take it.
+            on_items(
+                ITEM_UPSERT_CROSSED,
+                json!([n(63), s("crossed"), null]),
+                Point,
+            ),
+            on_items(
+                ITEM_UPSERT_CROSSED,
+                json!([n(63), s("crossed again"), null]),
+                violated,
+            ),
+            on_items(
+                ITEM_UPSERT_CROSSED,
+                json!([n(63), s("crossed again"), "noted"]),
+                mistyped,
+            ),
+        ]
+    }
+
+    /// Statements on `items` of shapes that have no point template, which only the general
+    /// planner plans, among statements that have one, on the same rows.
+    fn general_cases(round: PointRound) -> Vec<PointCase> {
+        let (n, s) = round.rows();
+        const UPSERT_SUM: &str = "INSERT INTO items (id, name, qty) VALUES ($1, $2, $3) \
+             ON CONFLICT (id) DO UPDATE SET qty = items.qty + EXCLUDED.qty";
+        const UPSERT_NOTHING: &str =
+            "INSERT INTO items (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING";
+        vec![
+            on_items(
+                "INSERT INTO items (id, name) VALUES ($1, $2) RETURNING *",
+                json!([n(77), s("returned")]),
+                Full,
+            ),
+            on_items(ITEM_NOTE, json!(["templated", n(77)]), Point),
+            on_items(
+                "UPDATE items SET note = $1 WHERE id = $2 RETURNING id, note",
+                json!(["returned", n(77)]),
+                Full,
+            ),
+            on_items(
+                "UPDATE items SET qty = qty + $1 WHERE id = $2",
+                json!([5, n(77)]),
+                Full,
+            ),
+            // A stored row and a new one, for each clause.
+            on_items(UPSERT_SUM, json!([n(77), s("summed"), 10]), Full),
+            on_items(UPSERT_SUM, json!([n(78), s("summed"), 10]), Full),
+            on_items(UPSERT_NOTHING, json!([n(78), s("ignored")]), Full),
+            on_items(UPSERT_NOTHING, json!([n(79), s("new")]), Full),
+            on_items(
+                "UPDATE items SET note = $1 WHERE id >= $2",
+                json!(["ranged", n(78)]),
+                Full,
+            ),
+            on_items(ITEM_QTY, json!([1, n(78)]), Point),
+            on_items(
+                "DELETE FROM items WHERE id = $1 RETURNING name",
+                json!([n(77)]),
+                Full,
+            ),
+            on_items(ITEM_DELETE, json!([n(79)]), Point),
+        ]
+    }
+
+    /// Statements on large rows, as transactions of their own, because the staged state of a
+    /// large row is slow to compare: a row a template's planner can bound; two such rows,
+    /// which take one parameter between them and are more than it plans in one statement; and
+    /// a row too large for it to bound, which the general planner measures.
+    fn large_cases(round: PointRound) -> [Vec<PointCase>; 3] {
+        let (n, s) = round.rows();
+        let large = "x".repeat(180_000);
+        let bounded = |letter: &str| letter.repeat(90_000);
+        [
+            vec![
+                on_items(
+                    ITEM_INSERT,
+                    json!([n(91), s("bounded"), 1, bounded("y"), null]),
+                    Point,
+                ),
+                on_items(ITEM_NOTE, json!(["small", n(91)]), Point),
+                on_items(ITEM_DELETE, json!([n(91)]), Point),
+            ],
+            vec![on_items(
+                "INSERT INTO items (id, name, note) VALUES ($1, $2, $3), ($4, $5, $3)",
+                json!([
+                    n(92),
+                    s("bounded too"),
+                    bounded("z"),
+                    n(93),
+                    s("bounded as well")
+                ]),
+                Full,
+            )],
+            vec![
+                on_items(
+                    ITEM_INSERT,
+                    json!([n(90), s("large"), 1, large, null]),
+                    Full,
+                ),
+                // The row as it is stored is too large, and then the value assigned to it is.
+                on_items(ITEM_NOTE, json!(["small", n(90)]), Full),
+                on_items(ITEM_NOTE, json!([large, n(90)]), Full),
+                on_items(ITEM_UPSERT_QTY, json!([n(90), s("large again"), 2]), Full),
+                on_items(ITEM_DELETE, json!([n(90)]), Point),
+                // And a row an upsert proposes is, where no row is there for it to rewrite.
+                on_items(
+                    ITEM_UPSERT_CROSSED,
+                    json!([n(94), s("large too"), large]),
+                    Full,
+                ),
+            ],
+        ]
+    }
+
+    /// The statements of a round on the `items` a round created in place of the table every
+    /// statement was prepared against, with its columns in another order, `qty` of another type
+    /// and `note` under another name, until a round gives it that name again.
+    fn recreated_cases(round: PointRound) -> Vec<PointCase> {
+        let (n, s) = round.rows();
+        let mistyped = Fails("TYPE_MISMATCH");
+        // How a statement that names `note` ends once the table has a column of that name.
+        let noted = |otherwise: Expected| {
+            if round.renamed {
+                otherwise
+            } else {
+                Fails("COLUMN_NOT_FOUND")
+            }
+        };
+        vec![
+            on_items(ITEM_INSERT_NAME, json!([n(1), s("one")]), Point),
+            on_items(ITEM_INSERT_QTY, json!([n(2), s("two"), 2]), mistyped),
+            on_items(ITEM_INSERT_QTY, json!([n(2), s("two"), "a pair"]), Point),
+            // Values in the old order of the columns, and in the new.
+            on_items(
+                ITEM_INSERT_BARE,
+                json!([n(9), s("nine"), 9, "ninth", 9.5]),
+                mistyped,
+            ),
+            on_items(
+                ITEM_INSERT_BARE,
+                json!([s("nine"), n(9), 9.5, "nine", "ninth"]),
+                Point,
+            ),
+            on_items(
+                ITEM_INSERT,
+                json!([n(4), s("four"), "4", null, 4.0]),
+                noted(Point),
+            ),
+            on_items(
+                ITEM_INSERT_THREE,
+                json!([
+                    n(30),
+                    s("thirty"),
+                    "three",
+                    n(31),
+                    s("thirty-one"),
+                    null,
+                    n(29),
+                    s("twenty-nine"),
+                    "two"
+                ]),
+                Point,
+            ),
+            on_items(ITEM_NOTE, json!(["noted", n(2)]), noted(Point)),
+            on_items(ITEM_DEFAULT, json!([null, n(2)]), noted(Point)),
+            on_items(ITEM_NAME, json!([s("uno"), n(1)]), Point),
+            on_items(ITEM_QTY, json!([3, n(1)]), mistyped),
+            on_items(ITEM_QTY, json!(["three", n(1)]), Point),
+            on_items(ITEM_PRICE, json!([2, n(2)]), Point),
+            on_items(ITEM_UPSERT_QTY, json!([n(2), s("deux"), "a couple"]), Point),
+            on_items(ITEM_UPSERT_QTY, json!([n(8), s("eight"), "eight"]), Point),
+            on_items(ITEM_UPSERT_NAME, json!([n(8), s("eighth")]), Point),
+            on_items(ITEM_SELECT, json!([n(1)]), noted(Full)),
+            on_items(ITEM_DELETE, json!([n(1)]), Point),
+            // The row whose key two statements spell out, which the new table holds only once
+            // a round has put it there.
+            on_items(ITEM_LITERAL_NOTE, json!([]), noted(Point)),
+            on_items(ITEM_UPSERT_NAME, json!([902, s("standing")]), Point),
+            on_items(ITEM_LITERAL_KEY, json!(["unused", "none"]), Point),
+            on_items(ITEM_LITERAL_INSERT, json!([s("passing")]), mistyped),
+            // The new `qty` has no default.
+            on_items(ITEM_INSERT_DEFAULT, json!([n(66), s("defaulted")]), Point),
+            // Statements on `tags`, which find no table until a round creates one again.
+            round.on_tags(TAG_INSERT, json!([n(14), n(2), "e"]), Point),
+            round.on_tags(TAG_ITEM, json!([n(8), n(14)]), Point),
+            round.on_tags(TAG_DELETE, json!([n(14)]), Point),
+        ]
+    }
+
+    /// Statements on a table with JSON columns, which a template's planner plans only while
+    /// every JSON value the row would hold is a scalar, whose text it can bound.
+    fn doc_cases(round: PointRound) -> Vec<PointCase> {
+        const INSERT: &str = "INSERT INTO docs (id, body, meta, title) VALUES ($1, $2, $3, $4)";
+        const UPDATE: &str = "UPDATE docs SET body = $1, meta = $2, rank = $3 WHERE id = $4";
+        const UPSERT: &str = "INSERT INTO docs (id, body, meta) VALUES ($1, $2, $3) \
+             ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body";
+        let n = |id: i64| 10 * round.number as i64 + id;
+        let doc =
+            |sql: &str, params: Value, expected: Expected| case_on("docs", sql, params, expected);
+        vec![
+            doc(INSERT, json!([n(1), 5, "plain", "first"]), Point),
+            doc(INSERT, json!([n(2), {"a": [1]}, null, "second"]), Full),
+            // The default of `meta` is an object.
+            doc(
+                "INSERT INTO docs (id, body) VALUES ($1, $2)",
+                json!([n(3), "scalar"]),
+                Full,
+            ),
+            // The row keeps its JSON columns, whose text only reading them bounds.
+            doc(
+                "UPDATE docs SET title = $1 WHERE id = $2",
+                json!(["renamed", n(1)]),
+                Full,
+            ),
+            doc(UPDATE, json!([7, null, "high", n(1)]), Point),
+            doc(UPDATE, json!([{"b": 2}, 1, 2, n(1)]), Full),
+            // A new row, and then that row, which keeps two of its JSON columns.
+            doc(UPSERT, json!([n(4), 1, 2]), Point),
+            doc(UPSERT, json!([n(4), 3, 4]), Full),
+            doc("DELETE FROM docs WHERE id = $1", json!([n(2)]), Point),
+        ]
+    }
+
+    /// `INSERT ... DEFAULT VALUES`, into a table whose key has a default, once the row the
+    /// round before left is gone.
+    fn single_cases(round: PointRound) -> Vec<PointCase> {
+        const DEFAULTS: &str = "INSERT INTO singles DEFAULT VALUES";
+        vec![
+            case_on(
+                "singles",
+                "DELETE FROM singles WHERE id = $1",
+                json!([1]),
+                if round.number == 0 { Unchanged } else { Point },
+            ),
+            case_on("singles", DEFAULTS, json!([]), Point),
+            case_on(
+                "singles",
+                DEFAULTS,
+                json!([]),
+                Fails("CONSTRAINT_VIOLATION"),
+            ),
+        ]
+    }
+
+    /// The statements of a round, as the transactions that run them. Each holds the statements
+    /// of a table or two, a statement of each in turn, so that it stages a row and then finds
+    /// it staged, and so that consecutive statements are seldom of one table. A round runs
+    /// several, because every statement is compared by all that its transaction has staged.
+    fn round_transactions(tables: &[ShapedTable], round: PointRound) -> Vec<Vec<PointCase>> {
+        let table = |name: &str| tables.iter().find(|table| table.name == name).unwrap();
+        let shaped = |name: &str| table(name).cases(round);
+        let alternate = |first: Vec<PointCase>, second: Vec<PointCase>| {
+            let (mut first, mut second) = (first.into_iter(), second.into_iter());
+            let mut cases = Vec::new();
+            loop {
+                let before = cases.len();
+                cases.extend(first.next());
+                cases.extend(second.next());
+                if cases.len() == before {
+                    return cases;
+                }
+            }
+        };
+        // A text of `length` bytes that only this round writes.
+        let text = |length: usize| {
+            let mut text = format!("{length} bytes in round {} ", round.number);
+            text.push_str(&"k".repeat(length - text.len()));
+            text
+        };
+        // A text key takes its bytes, one more for each zero byte, and two to end it, of the
+        // 1,024 a stored key has.
+        let label_keys = [
+            (
+                format!("zero \0, 'quotes\" and né 漢 {}", round.number),
+                true,
+            ),
+            (text(1_022), true),
+            (text(1_023), false),
+            (format!("\0{}", text(1_020)), true),
+            (format!("\0{}", text(1_021)), false),
+        ]
+        .map(|(key, fits)| (vec![json!(key)], fits));
+        // An integer takes eight more, after a text or before one, so every one of these
+        // texts but the shortest passes the limit with it, and the longest does so alone.
+        let span_keys = [1_014, 1_015, 1_020, 1_021, 1_022, 1_023].map(|length| {
+            (
+                vec![json!(text(length)), json!(round.number)],
+                length == 1_014,
+            )
+        });
+        let pair_keys = [1_014, 1_015].map(|length| {
+            (
+                vec![json!(round.number), json!(text(length))],
+                length == 1_014,
+            )
+        });
+        let values = || [json!("first"), json!("second")];
+        let mut sized_cases = table("labels").sized_key_cases(label_keys.into(), values());
+        // A listed row with a key too long to store, and one with a mistyped value as well,
+        // which is found first.
+        const LABEL_INSERT: &str = "INSERT INTO labels (code, v, n) VALUES ($1, $2, $3)";
+        sized_cases.extend([
+            case_on(
+                "labels",
+                LABEL_INSERT,
+                json!([text(1_023), "v", 1]),
+                Fails("INVALID_CHANGE"),
+            ),
+            case_on(
+                "labels",
+                LABEL_INSERT,
+                json!([text(1_023), "v", "many"]),
+                Fails("TYPE_MISMATCH"),
+            ),
+        ]);
+        // Where `pairs` has an index, a key that long leaves no room in the index's entries.
+        if !round.indexed {
+            sized_cases.extend(table("pairs").sized_key_cases(pair_keys.into(), values()));
+        }
+        let spans = table("spans");
+        let mut span_cases = spans.sized_key_cases(span_keys.into(), [json!(true), json!(false)]);
+        // A row found by a predicate that names the key's columns last first, and then half of
+        // a key, which finds the rows of this round that hold it.
+        let base = 10 * round.number as i64;
+        let (s, n) = (format!("s {}", base + 7), base + 7);
+        span_cases.extend([
+            spans.upsert_one(spans.key_of(base + 7), json!(true), Point),
+            case_on(
+                "spans",
+                "UPDATE spans SET v = $1 WHERE n = $2 AND s = $3",
+                json!(["last first", n, s]),
+                Point,
+            ),
+            case_on(
+                "spans",
+                "DELETE FROM spans WHERE n = $1 AND s = $2",
+                json!([n, s]),
+                Point,
+            ),
+            case_on(
+                "spans",
+                "UPDATE spans SET v = $1 WHERE s = $2",
+                json!(["half a key", format!("s {}", base + 1)]),
+                Full,
+            ),
+            case_on(
+                "spans",
+                "DELETE FROM spans WHERE s = $1",
+                json!(["no such row"]),
+                Full,
+            ),
+        ]);
+        let [items, keys, declined, others] = if round.recreated {
+            [recreated_cases(round), Vec::new(), Vec::new(), Vec::new()]
+        } else {
+            let mut others = refused_cases(round);
+            others.extend(general_cases(round));
+            [
+                item_cases(round),
+                key_cases(round),
+                declined_cases(round),
+                others,
+            ]
+        };
+        let mut transactions = vec![
+            alternate(items, doc_cases(round)),
+            alternate(keys, shaped("flags")),
+            alternate(declined, shaped("ratios")),
+            alternate(shaped("pairs"), shaped("spans")),
+            alternate(shaped("wide17"), others),
+            alternate(shaped("wide40"), shaped("labels")),
+            alternate(sized_cases, single_cases(round)),
+            span_cases,
+        ];
+        // Only the first round has the large rows.
+        if round.number == 0 {
+            transactions.extend(large_cases(round));
+        }
+        transactions
+    }
+
+    #[test]
+    fn point_statements_stage_what_their_statements_stage() {
+        let tables = shaped_tables();
+        // Today's tables with their foreign key and indexes, then without the foreign key, then
+        // without the indexes either, which is the shape of table the benchmarks write.
+        for (references, indexes) in [(true, true), (false, true), (false, false)] {
+            let mut script = vec![
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, \
+                 qty INTEGER NOT NULL DEFAULT 1, note TEXT, price FLOAT)"
+                    .to_owned(),
+                format!(
+                    "CREATE TABLE tags (id INTEGER PRIMARY KEY, item INTEGER NOT NULL{}, \
+                     tag TEXT NOT NULL)",
+                    if references {
+                        " REFERENCES items (id) ON DELETE CASCADE"
+                    } else {
+                        ""
+                    }
+                ),
+                "CREATE TABLE docs (id INTEGER PRIMARY KEY, body JSON, \
+                 meta JSON DEFAULT '{\"kind\": \"none\"}'::jsonb, rank JSON DEFAULT '3'::jsonb, \
+                 title TEXT DEFAULT 'untitled')"
+                    .to_owned(),
+                "CREATE TABLE singles (id INTEGER PRIMARY KEY DEFAULT 1, v TEXT DEFAULT 'x')"
+                    .to_owned(),
+            ];
+            script.extend(tables.iter().map(ShapedTable::create));
+            if indexes {
+                script.extend(
+                    [
+                        "CREATE UNIQUE INDEX items_name ON items (name)",
+                        "CREATE INDEX items_qty ON items (qty)",
+                        "CREATE INDEX pairs_v ON pairs (v)",
+                        "CREATE INDEX wide17_c1 ON wide17 (c1)",
+                        "CREATE INDEX wide40_c1 ON wide40 (c1)",
+                    ]
+                    .map(str::to_owned),
+                );
+            }
+            let mut round = PointRound {
+                number: 0,
+                indexed: indexes,
+                widened: false,
+                tags: true,
+                references,
+                cascades: false,
+                holds: false,
+                labelled: false,
+                recreated: false,
+                renamed: false,
+            };
+            let mut pair = PointPair::open(
+                format!("references={references} indexes={indexes}"),
+                &script.join(";"),
+                round,
+            );
+            for number in 0..9 {
+                round.number = number;
+                // Between rounds the catalog changes, outside a transaction, and the prepared
+                // engine keeps every statement it has prepared.
+                match number {
+                    // Indexes come, which leaves each table's schema as it was.
+                    1 => pair.exec(
+                        "CREATE INDEX items_names ON items (name, qty);\
+                         CREATE INDEX flags_v ON flags (v)",
+                    ),
+                    // They go, tables gain a column, and a column takes another default.
+                    2 => {
+                        pair.exec(
+                            "DROP INDEX items_names;\
+                             DROP INDEX flags_v;\
+                             ALTER TABLE items ADD COLUMN origin TEXT DEFAULT 'added';\
+                             ALTER TABLE pairs ADD COLUMN extra INTEGER NOT NULL DEFAULT 7;\
+                             ALTER TABLE wide17 ADD COLUMN c17 TEXT;\
+                             ALTER TABLE items ALTER COLUMN qty SET DEFAULT 4",
+                        );
+                        round.widened = true;
+                    }
+                    // New tables reference tables that statements prepared long before
+                    // change: first with actions that follow a referenced row, from either
+                    // side of those tables in the catalog's order.
+                    3 => {
+                        pair.exec(
+                            "CREATE TABLE aa_children (id INTEGER PRIMARY KEY, item INTEGER \
+                             REFERENCES items (id) ON DELETE CASCADE ON UPDATE CASCADE);\
+                             CREATE TABLE label_children (id INTEGER PRIMARY KEY, code TEXT \
+                             REFERENCES labels (code) ON DELETE CASCADE)",
+                        );
+                        round.cascades = true;
+                        round.labelled = true;
+                    }
+                    // Then with none, which holds a referenced row where it is.
+                    4 => {
+                        pair.exec(
+                            "CREATE TABLE zz_holds (id INTEGER PRIMARY KEY, \
+                             item INTEGER REFERENCES items (id))",
+                        );
+                        round.holds = true;
+                    }
+                    // And an existing table gains the key it was set up without, once it has
+                    // no row the key would refuse.
+                    5 if !references => {
+                        pair.exec(
+                            "DELETE FROM tags;\
+                             ALTER TABLE tags ADD CONSTRAINT tags_item FOREIGN KEY (item) \
+                             REFERENCES items (id) ON DELETE CASCADE",
+                        );
+                        round.references = true;
+                    }
+                    // Every referencing table goes, and with them every foreign key. Nothing
+                    // replaces `tags` for two rounds, in which its statements find no table.
+                    6 => {
+                        pair.exec(
+                            "DROP TABLE aa_children;\
+                             DROP TABLE label_children;\
+                             DROP TABLE zz_holds;\
+                             DROP TABLE tags",
+                        );
+                        round.cascades = false;
+                        round.labelled = false;
+                        round.holds = false;
+                        round.tags = false;
+                        round.references = false;
+                    }
+                    // A table of the same name replaces `items`, with its columns in another
+                    // order, one of another type and one renamed.
+                    7 => {
+                        pair.exec(
+                            "DROP TABLE items;\
+                             CREATE TABLE items (name TEXT NOT NULL, id INTEGER PRIMARY KEY, \
+                             price FLOAT, qty TEXT, label TEXT)",
+                        );
+                        round.recreated = true;
+                    }
+                    // The renamed column takes its old name, in the table as it stands, and
+                    // there is a table `tags` again, so that statements refused for a round or
+                    // two find their column and their table.
+                    8 => {
+                        pair.exec(
+                            "ALTER TABLE items RENAME COLUMN label TO note;\
+                             CREATE TABLE tags (id INTEGER PRIMARY KEY, item INTEGER NOT NULL, \
+                             tag TEXT NOT NULL)",
+                        );
+                        round.renamed = true;
+                        round.tags = true;
+                    }
+                    _ => {}
+                }
+                pair.round = round;
+                if !round.recreated {
+                    for case in seed_cases(round) {
+                        pair.run(&case);
+                    }
+                }
+                // The rows of the referencing tables, which only the actions of their keys
+                // change afterwards.
+                let (n, _) = round.rows();
+                if round.cascades {
+                    pair.exec(&format!(
+                        "INSERT INTO aa_children (id, item) VALUES ({0}, {0}), ({1}, {1})",
+                        n(51),
+                        n(52)
+                    ));
+                }
+                if round.holds {
+                    pair.exec(&format!(
+                        "INSERT INTO zz_holds (id, item) VALUES ({0}, {0}), ({1}, {1})",
+                        n(53),
+                        n(54)
+                    ));
+                }
+                if round.labelled {
+                    // The rows of `labels` that the round before left, one of which this round
+                    // deletes.
+                    let before = 10 * number as i64 - 10;
+                    pair.exec(&format!(
+                        "INSERT INTO label_children (id, code) VALUES \
+                         ({}, 'code {}'), ({}, 'code {}')",
+                        n(1),
+                        before + 1,
+                        n(2),
+                        before + 2
+                    ));
+                }
+                // The first transactions find each database as opening it leaves it, with
+                // whatever foreign key it was set up with and nothing committed to it since.
+                if number == 0 {
+                    pair = pair.reopened();
+                }
+                for cases in round_transactions(&tables, round) {
+                    pair.transact(&cases);
+                }
+            }
+            pair.prepared.check().unwrap();
+            pair.plain.check().unwrap();
+        }
     }
 
     /// The statements that create a table of entries whose notes name their rows' numbers in
