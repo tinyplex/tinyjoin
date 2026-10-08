@@ -67,7 +67,9 @@ type Measure = {
   missing: string[];
   titles: string[];
 };
-type Chart = {unit: 'ms' | 'bytes'; measures: Measure[]};
+// A chart says how to read its bars in a caption, unless the page it is on
+// has `explained` that beside it.
+type Chart = {unit: 'ms' | 'bytes'; measures: Measure[]; explained?: true};
 
 const PLACEHOLDER = /\{\{benchmarks\.([a-z-]+)\}\}/g;
 const KIB = 1024;
@@ -240,7 +242,8 @@ const chartHtml = (report: Report, chart: Chart): string => {
         'Brackets span the fastest to the slowest run.'
       : 'Bytes fetched to open a database, smallest first.';
   return (
-    `<figure class="chart"><figcaption>${note}</figcaption>` +
+    '<figure class="chart">' +
+    (chart.explained ? '' : `<figcaption>${note}</figcaption>`) +
     `<dl>${measures.join('')}</dl></figure>`
   );
 };
@@ -391,10 +394,10 @@ const epithet = (report: Report): string =>
     ? 'The smallest, fastest'
     : 'A tiny, fast';
 
-// The heading of the homepage's first section.
+// The heading of the homepage's benchmark section.
 const heading = (report: Report): string =>
   isSmallest(report) && sweeps(report)
-    ? `Smaller and faster than ${OTHERS}`
+    ? `Faster than ${OTHERS}`
     : `Measured against ${OTHERS}`;
 
 // The claim under the homepage's headline, up to the words that link to the
@@ -403,7 +406,7 @@ const heading = (report: Report): string =>
 const claim = (report: Report): string => {
   const total = report.results.length;
   const speed = sweeps(report)
-    ? `faster than both in all ${total} workloads`
+    ? `faster than both`
     : `the fastest of the three in ${placingCounts(report)[0][0]} of the ` +
       `${total} workloads`;
   return isSmallest(report)
@@ -411,8 +414,8 @@ const claim = (report: Report): string => {
     : `Beside ${OTHERS}, ${speed}`;
 };
 
-// The count of TinyJoin's wins, for the homepage's first section, whose heading
-// has already said how it compares.
+// The count of TinyJoin's wins, for the homepage's benchmark section, whose
+// heading has already said how it compares.
 const tally = (report: Report): string => {
   const total = report.results.length;
   return sweeps(report)
@@ -680,11 +683,7 @@ export type Benchmarks = {
 const HIGHLIGHTS: [id: string, label: string][] = [
   ['cold-open', 'Open a new database'],
   ['select-all', 'Read 10,000 rows'],
-  ['select-pk', '1,000 reads by key'],
   ['update-pk', '1,000 updates by key'],
-  ['insert-transaction', '10,000 inserts'],
-  ['insert-autocommit', '1,000 commits'],
-  ['join', '100 joins'],
 ];
 
 const highlightsChart = (report: Report): Chart => ({
@@ -693,6 +692,7 @@ const highlightsChart = (report: Report): Chart => ({
     ...timeChart(report, [id]).measures[0],
     label,
   })),
+  explained: true,
 });
 
 const createBenchmarks = (report: Report): Benchmarks => {

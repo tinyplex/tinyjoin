@@ -5,9 +5,9 @@
     {{benchmarks.epithet}} <em>relational database</em> for your web app.
   </h2>
   <p>
-    {{benchmarks.claim}} of
-    <a href="/guides/benchmarks/">our benchmarks</a>. PostgreSQL-shaped SQL,
-    running locally and away from the main thread.
+    {{benchmarks.claim}}. Written in Rust, 
+    supporting PostgreSQL-shaped SQL, and running locally, away from the 
+    browser's main UI thread.
   </p>
 </section>
 
@@ -19,24 +19,14 @@
 
 ---
 
-> ## {{benchmarks.heading}}
->
-> Each engine runs the same SQL in a browser Worker, with its database on OPFS.
-> {{benchmarks.tally}}, from opening a database to reading, writing, joining,
-> and committing. The Benchmarks guide has every result, and how to run them
-> yourself.
->
-> And all of TinyJoin is {{sizes.total.gzip}} to download, gzipped, where
-> SQLite is {{benchmarks.sqlite-download}} and PGlite
-> {{benchmarks.pglite-download}}.
 
-{{benchmarks.highlights}}
-
-> ## Small enough to not worry about
+> ## Small enough not to notice
 >
-> Of that download, only {{sizes.client.gzip}} is the client that runs on the
-> UI thread. The rest is the Worker host and the Rust WASM engine, which do
-> their work away from it.
+> TinyJoin is only {{sizes.total.gzip}} to download, compressed, smaller than
+> SQLite ({{benchmarks.sqlite-download}}) and way smaller than PGlite
+> ({{benchmarks.pglite-download}}).
+> 
+> Of that, only {{sizes.client.gzip}} runs on the UI thread!
 
 | Component      |                     gzip |
 | -------------- | -----------------------: |
@@ -44,6 +34,18 @@
 | Worker JS      |    {{sizes.worker.gzip}} |
 | Engine WASM    |      {{sizes.wasm.gzip}} |
 | **Everything** | **{{sizes.total.gzip}}** |
+
+> ## {{benchmarks.heading}}
+>
+> We test each engine running the same SQL in a browser Worker, with its
+> database on OPFS. {{benchmarks.tally}}, from opening a database to reading,
+> writing, joining, and committing.
+> 
+> These charts show the median of 9 runs, fastest first. Brackets span the
+> fastest to the slowest run. The Benchmarks guide has every result in detail,
+> and how to run them yourself. 
+
+{{benchmarks.highlights}}
 
 > ## Your first _TinyJoin_ app
 >
@@ -65,10 +67,10 @@
 📦 Creating your project...
 ```
 
-> ## Start small
+> ## Or add it to an existing app
 >
-> Install TinyJoin. There are no runtime dependencies, no servers to run, no
-> accounts to create, and no native toolchains
+> Installing TinyJoin is simple. There are no runtime dependencies, no servers
+> to run, no accounts to create, and no native toolchains.
 
 ```sh
 npm install tinyjoin
@@ -228,8 +230,8 @@ await db.close();
 > ## Local by design
 >
 > TinyJoin keeps your database in the browser. Your app reads and writes data
-> locally, without waiting for a database server. Keep data in memory or save
-> it across reloads with OPFS; tabs opening the same persistent database share
+> locally, without waiting for a database server. Keep data in memory or save it
+> across reloads with OPFS; tabs opening the same persistent database share
 > access automatically.
 >
 > Your app can keep working when the network drops. Apps created with the

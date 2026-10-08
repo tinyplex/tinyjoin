@@ -55,6 +55,11 @@
     margin: 0;
   }
 
+  // A chart with no caption starts at its first measure, not a gap above it.
+  dl:first-child {
+    margin-top: -@groupGap;
+  }
+
   // Labels sit right-aligned against the baseline, level with the first of
   // their bars.
   dt {
