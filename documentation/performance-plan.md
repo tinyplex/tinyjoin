@@ -217,6 +217,22 @@ twelve rounds through every arrangement twice would put each after PGlite six
 times, and neither median would be spared. The compressed download is 353
 KiB.
 
+The `db42f881` run, published on 8 October as v0.6.0, after the node search,
+the delete staged by its key, the leaf rewrite by runs and the answer before
+the merge of changed keys: TinyJoin was the fastest engine in all 20
+workloads. Deletes by key fell from 1.02 times SQLite's time to 0.96, updates
+by key from 0.93 to 0.91, upserts from 0.99 to 0.91, selects by key from 0.74
+to 0.71, the `LIKE` delete from 1.07 times PGlite's time to 0.85, and single
+inserts that each commit from 0.91 to 0.87. Its two narrowest leads are no
+more than a run's spread: inserts in a transaction read 196.8 ms against
+SQLite's 199.2, and the range delete 5.9 ms against PGlite's 6.0. The machine
+was the warmest of the day's runs, its CPU probe 18.6 ms at the start and 24.9
+at its slowest, with 590 s spent cooling and two rounds begun at 1.1 times
+the reference; the flush gate never waited, and all nine single-insert
+commit samples but one were quick. Reading all rows read 6.9 ms against 6.5,
+and opening a new database 55.8 against 57.5: neither moved with this work
+when the builds were interleaved. The compressed download is 354 KiB.
+
 Done:
 
 - Phase 0, the native benchmark.
@@ -901,19 +917,23 @@ Found along the way, 8 October:
 
 Remaining, in order of expected value:
 
-1. Per-statement cost of writes. As of the `8df67174` run a statement in a
-   transaction costs about 22 µs, within 7% of SQLite's either way: an update
-   by key 0.93 times its time, an upsert 0.99, an insert 0.97, and a delete
-   by key 1.02, the one still behind. Interleaved in Chromium, the flat
-   messages took 19% to 23% off each and the day's engine steps a further 4%
-   to 8% off updates, upserts and deletes by key and 2% off inserts, so work
-   in the engine still shows in the browser. The steps designed and reviewed
-   on 7 October and not yet built are, for lookups, a node searched in one
-   loop that reads its keys in place; for staging, a delete staged from its
-   encoded key; for commits, a page built once in the page the cache keeps,
-   and a touched leaf rewritten by runs of the cells it keeps; and for
+1. Per-statement cost of writes. As of the `db42f881` run a statement in a
+   transaction costs 20 to 22 µs and is ahead of SQLite's in each of the five
+   workloads: an update by key at 0.91 times its time, an upsert 0.91, a
+   delete by key 0.96, an insert 0.99, and 0.96 with an index. Interleaved in
+   Chromium, the flat messages took 19% to 23% off each, and the engine steps
+   of 8 October a further 5% to 12% off updates, upserts and deletes by key
+   and 2% off inserts, so work in the engine still shows in the browser. An
+   insert's lead is the narrowest. Under baseline compilation a delete by key
+   now makes about 540 calls, twelve of them allocations and eight of them
+   searches for its table by name, with as many for an update or an insert:
+   the steps designed and reviewed on 7 October and not yet built are, for
    planning, a template's arguments and positions resolved when it is
-   prepared, and a one-change plan staged and reported without vectors.
+   prepared, parameters read into a vector the engine keeps, a one-change
+   plan staged and reported without vectors, and one table handle a
+   statement; for staging, the estimates of the row a change replaces taken
+   from its table's layout; and for commits, a page built once in the page
+   the cache keeps.
    What follows is the history of this item. Measured warm in Chromium, a
    prepared point
    read costs 26 µs against SQLite's 24, but an insert in a transaction costs

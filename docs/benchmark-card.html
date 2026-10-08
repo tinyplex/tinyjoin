@@ -219,22 +219,22 @@
       <header class="brand">
         <img src="/favicon.svg" alt="" />
         <span class="wordmark">TinyJoin</span>
-        <span class="pill">v0.5.0 benchmarks</span>
+        <span class="pill">v0.6.0 benchmarks</span>
       </header>
-      <h1>Fastest in 18 of 20 workloads.<br /><em>Never the slowest.</em></h1>
+      <h1>Fastest in all 20 workloads.<br /><em>Never the slowest.</em></h1>
       <p class="sub">
         Against SQLite 3.53.4 and PGlite 0.5.8, each in a browser Worker on OPFS.
       </p>
-      <div class="tiles"><figure class="tile"><figcaption>Download, gzip</figcaption><p><b>1.3×</b> smaller than SQLite</p><dl><dt class="tinyjoin">TinyJoin</dt><dd class="tinyjoin"><span class="bar" style="--x:0.0616"></span>353 KiB</dd><dt class="sqlite">SQLite</dt><dd class="sqlite"><span class="bar" style="--x:0.0798"></span>457 KiB</dd><dt class="pglite">PGlite</dt><dd class="pglite"><span class="bar" style="--x:1.0000"></span>5.6 MiB</dd></dl></figure><figure class="tile"><figcaption>First open</figcaption><p><b>1.5×</b> faster than SQLite</p><dl><dt class="tinyjoin">TinyJoin</dt><dd class="tinyjoin"><span class="bar" style="--x:0.0512"></span>57.5 ms</dd><dt class="sqlite">SQLite</dt><dd class="sqlite"><span class="bar" style="--x:0.0761"></span>85.5 ms</dd><dt class="pglite">PGlite</dt><dd class="pglite"><span class="bar" style="--x:1.0000"></span>1.12 s</dd></dl></figure><figure class="tile"><figcaption>Read 10,000 rows</figcaption><p><b>6.9×</b> faster than PGlite</p><dl><dt class="tinyjoin">TinyJoin</dt><dd class="tinyjoin"><span class="bar" style="--x:0.1438"></span>6.50 ms</dd><dt class="pglite">PGlite</dt><dd class="pglite"><span class="bar" style="--x:0.9934"></span>44.9 ms</dd><dt class="sqlite">SQLite</dt><dd class="sqlite"><span class="bar" style="--x:1.0000"></span>45.2 ms</dd></dl></figure></div>
+      <div class="tiles"><figure class="tile"><figcaption>Download, gzip</figcaption><p><b>1.3×</b> smaller than SQLite</p><dl><dt class="tinyjoin">TinyJoin</dt><dd class="tinyjoin"><span class="bar" style="--x:0.0618"></span>354 KiB</dd><dt class="sqlite">SQLite</dt><dd class="sqlite"><span class="bar" style="--x:0.0798"></span>457 KiB</dd><dt class="pglite">PGlite</dt><dd class="pglite"><span class="bar" style="--x:1.0000"></span>5.6 MiB</dd></dl></figure><figure class="tile"><figcaption>First open</figcaption><p><b>1.5×</b> faster than SQLite</p><dl><dt class="tinyjoin">TinyJoin</dt><dd class="tinyjoin"><span class="bar" style="--x:0.0499"></span>55.8 ms</dd><dt class="sqlite">SQLite</dt><dd class="sqlite"><span class="bar" style="--x:0.0744"></span>83.2 ms</dd><dt class="pglite">PGlite</dt><dd class="pglite"><span class="bar" style="--x:1.0000"></span>1.12 s</dd></dl></figure><figure class="tile"><figcaption>Read 10,000 rows</figcaption><p><b>6.5×</b> faster than PGlite</p><dl><dt class="tinyjoin">TinyJoin</dt><dd class="tinyjoin"><span class="bar" style="--x:0.1523"></span>6.90 ms</dd><dt class="pglite">PGlite</dt><dd class="pglite"><span class="bar" style="--x:0.9868"></span>44.7 ms</dd><dt class="sqlite">SQLite</dt><dd class="sqlite"><span class="bar" style="--x:1.0000"></span>45.3 ms</dd></dl></figure></div>
       <div class="wins">
         <span>Also fastest at</span>
         <ul>
-          <li>LIKE scans <b>2.0×</b></li><li>Range scans <b>1.8×</b></li><li>Reopen <b>1.7×</b></li><li>GROUP BY <b>1.4×</b></li><li>Point reads <b>1.3×</b></li><li>Range updates <b>1.3×</b></li>
+          <li>LIKE scans <b>2.1×</b></li><li>Range scans <b>1.8×</b></li><li>Reopen <b>1.7×</b></li><li>Point reads <b>1.4×</b></li><li>GROUP BY <b>1.4×</b></li><li>Range updates <b>1.3×</b></li>
         </ul>
       </div>
       <footer>
         <code>npm i tinyjoin</code>
-        <span class="method">Same SQL on every engine · Median of 9 runs · Chromium 153 · Apple M2 · 2026-10-07</span>
+        <span class="method">Same SQL on every engine · Median of 9 runs · Chromium 153 · Apple M2 · 2026-10-08</span>
         <span>tinyjoin.org/guides/benchmarks</span>
       </footer>
     </div>

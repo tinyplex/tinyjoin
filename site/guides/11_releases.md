@@ -5,19 +5,18 @@ compatibility boundaries. Every entry states what upgrading to it requires, so
 check the entries between the version in use and the target before upgrading.
 A release that needs no action says so explicitly.
 
-## v0.6.0 (unreleased)
+## v0.6.0
 
 This release makes TinyJoin faster across the
 [comparative benchmarks](/guides/benchmarks/), with no change to the API or to
 the storage format. With OPFS storage, TinyJoin is the fastest of the three
-engines in 18 of the 20 timed workloads, up from 11, and second in the other
-two, never the slowest, taking at most 1.1 times as long as the faster engine
-where it is second, down from 1.5. Range aggregates take half the time they
-did, `LIKE` scans and a transaction's range `UPDATE`s two-fifths less,
-updates, upserts and deletes by key a third less, 10,000 inserts in a
-transaction a quarter less, with or without an index on the table, 200-row
-inserts nearly a quarter less, selects by key and the 8,000-row range delete
-a fifth less, and the `LIKE` delete a seventh less.
+engines in all 20 timed workloads, up from 11, where it took up to 1.5 times
+as long as the faster engine. Range aggregates take half the time they did,
+upserts, `LIKE` scans, a transaction's range `UPDATE`s, and deletes by key
+about two-fifths less, updates by key over a third less, the `LIKE` delete
+three-tenths less, 10,000 inserts in a transaction, with or without an index
+on the table, and 200-row inserts over a quarter less, selects by key a
+little under a quarter less, and the 8,000-row range delete a fifth less.
 
 ### Scanning rows
 
@@ -40,11 +39,10 @@ primary key, and an `UPDATE` or `DELETE` of the row a primary-key equality
 names, run inside a transaction, is planned straight from its template and
 parameters: its key is encoded from them, the row looked up once, and the
 change built as the record a commit writes, rather than binding the
-statement's syntax tree and planning it as any statement is. A test stages
-the same statements both ways and checks that the transactions, the results,
-and the committed databases agree, and that a statement one way refuses is
-refused the other way with the same error. Staging then looks a statement's
-table up
+statement's syntax tree and planning it as any statement is. A test stages the
+same statements both ways and checks that the transactions, the results, and
+the committed databases agree, and that a statement one way refuses is refused
+the other way with the same error. Staging then looks a statement's table up
 once rather than for every row, a listed row's values are resolved to literals
 or parameter positions once, when the statement is prepared, rather than for
 every row of every execution, and an insert into a table none of whose staged
@@ -149,11 +147,11 @@ bytes as words, and copies each run of cells it keeps as one piece, moving
 their slots as far as the bytes moved. Before V8 has optimized the code, the
 commit of 1,000 updates or deletes by key takes over a third less time, a
 statement that commits by itself, as each single insert does, runs 14% fewer
-instructions, and the `LIKE` delete 23% fewer. The check is also wider than
-it was: every cell of a leaf a commit
-reaches is tested for its packing and its order, so a damaged leaf that still
-passes its checksum fails that commit, whether or not the commit would have
-changed it, rather than being written back.
+instructions, and the `LIKE` delete 23% fewer. The check is also wider than it
+was: every cell of a leaf a commit reaches is tested for its packing and its
+order, so a damaged leaf that still passes its checksum fails that commit,
+whether or not the commit would have changed it, rather than being written
+back.
 
 ### Comparing memory
 
@@ -211,9 +209,9 @@ values, is now sent, where it failed with `WORKER_POST_FAILED`.
 
 ### Download size
 
-The compressed download is now {{sizes.total.gzip}}, up from 339 KiB in
-v0.5.0, for the record tests, the point planner, the word-wise comparison,
-and the flat statement messages.
+The compressed download is now 354 KiB, up from 339 KiB in v0.5.0, for the
+record tests, the point planner, the word-wise comparison, the flat statement
+messages, and the rewriting of leaves by runs.
 
 ### Upgrading from v0.5.0
 

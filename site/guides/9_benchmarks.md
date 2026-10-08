@@ -9,13 +9,13 @@ These numbers are published to track progress, not to win an argument.
 TinyJoin's engine is young. It is the smallest download and the quickest to
 open or reopen a database, and it reads every row, reads rows by key or
 through an index, scans, runs `LIKE` scans, groups, joins, inserts rows one at
-a time or 200 at a time, updates rows by key or by range, upserts, builds
-indexes, and commits single inserts more quickly than either alternative, and
-deletes rows by range as quickly as PGlite. With OPFS storage, it is the
-fastest of the three in 18 of the 20 workloads, and second in the other two,
-deleting rows by key and by pattern, where it takes at most 1.1 times as long
-as the faster engine: it is never the slowest. Closing the remaining gaps is
-ongoing work, and the suite is designed to be rerun after every optimization.
+a time or 200 at a time, updates rows by key or by range, upserts, deletes
+rows by key, by pattern or by range, builds indexes, and commits single
+inserts more quickly than either alternative. With OPFS storage, it is the
+fastest of the three in all 20 workloads. Two of those leads are of 1% or 2%,
+over SQLite at inserts in a transaction and over PGlite at the range delete,
+and another run could reverse them. The suite is designed to be rerun after
+every optimization.
 
 {{benchmarks.environment}}
 
@@ -81,47 +81,48 @@ fifth run in one page, against 27 and 29 the first time. See [custom Workers](/g
 
 In the results above, TinyJoin is the smallest download and the quickest to
 create a new database, where PGlite initializes a new PostgreSQL cluster, and
-to reopen one. It reads all 10,000 rows in order seven times as fast as either
-engine, reads rows by key in a quarter less time than SQLite, runs indexed
-range aggregates in a fifth less, runs `LIKE` scans, `GROUP BY`, and joins
-faster than either, inserts, updates, and upserts rows faster than either,
-builds indexes and commits single inserts faster than either, and deletes rows
-in bulk faster than SQLite. Across the 20 timed workloads, it places like
-this, where engines that tie share a place:
+to reopen one. It reads all 10,000 rows in order six times as fast as either
+engine, reads rows by key in three-tenths less time than SQLite, runs indexed
+range aggregates in a sixth less, runs `LIKE` scans, `GROUP BY`, and joins
+faster than either, inserts, updates, upserts, and deletes rows faster than
+either, and builds indexes and commits single inserts faster than either.
+Across the 20 timed workloads, it places like this, where engines that tie
+share a place:
 
 {{benchmarks.placings}}
 
-Where it comes second, it takes at most 1.1 times as long as the faster
-engine.
+Its narrowest leads are 1% over SQLite at 10,000 inserts in a transaction,
+and 2% over PGlite at the range delete.
 
-- **Single statements** cost about 22 microseconds each. About 12
+- **Single statements** cost about 20 to 22 microseconds each. About 12
   microseconds of every round trip is the message between the page and the
   Worker, which every engine pays. A statement and its result cross as flat
   arrays, which cost the least to copy from one thread to the other, and a
-  write's result is never text to parse. A point read by primary key takes a
-  quarter less time than SQLite's, an update by primary key about 7% less, an
-  upsert about as long, and a delete by primary key about 2% more. The
-  benchmark's 1,000 statements run JavaScript and WebAssembly that V8 has
-  mostly not yet optimized, which runs TinyJoin's many small functions almost
-  twice as slowly as optimized code, where SQLite's few large functions are
-  optimized almost at once.
+  write's result is never text to parse. A point read by primary key takes
+  three-tenths less time than SQLite's, an update or upsert by primary key
+  about 9% less, and a delete by primary key about 4% less. The benchmark's
+  1,000 statements run JavaScript and WebAssembly that V8 has mostly not yet
+  optimized, which runs TinyJoin's many small functions almost twice as
+  slowly as optimized code, where SQLite's few large functions are optimized
+  almost at once.
 - **Scans** take about three-fifths of SQLite's time. A predicate's simple
   terms are tested against each leaf's rows in one pass over the leaf's bytes,
   and only the rows they accept are decoded. A range `UPDATE` inside a
   transaction also passes over the rows the transaction has already changed,
   finding them leaf by leaf, and takes about four-fifths of SQLite's time.
-- **Inserts** one at a time in a transaction take 3% to 4% less time than
-  SQLite's, with or without an index on the table, and 200 at a time about a
-  fifth less.
-- **Bulk deletes** take as long as PGlite's by range, and about 7% longer by
-  pattern. PGlite, like PostgreSQL, only marks deleted rows and leaves
-  reclaiming their space to a later vacuum. TinyJoin removes each row and its
-  index entries at once, and rewrites every page they occupied, and still
-  takes about half of SQLite's time at both.
+- **Inserts** one at a time in a transaction take 1% less time than
+  SQLite's, 4% less with an index on the table, and 200 at a time a fifth
+  less.
+- **Bulk deletes** take about a seventh less time than PGlite's by pattern,
+  and about as long by range. PGlite, like PostgreSQL, only marks deleted
+  rows and leaves reclaiming their space to a later vacuum. TinyJoin removes
+  each row and its index entries at once, and rewrites every page they
+  occupied, copying the rows a page keeps in runs, and takes under
+  three-fifths of SQLite's time at both.
 - **Committing each insert alone** is dominated by the storage flush, one per
   commit, and writes only the pages the insert changed and the superblock. It
-  takes about a tenth less time than PGlite's commits, and about a quarter as
-  long as SQLite's. Its time is mostly the flushes, so it varies most of any
+  takes about an eighth less time than PGlite's commits, and about a quarter
+  as long as SQLite's. Its time is mostly the flushes, so it varies most of any
   workload with the state of the disk, which is why the runner waits for a
   flush to run at its usual latency before each sample.
 - **Reopening** reads the database's catalog rather than every row, so a
