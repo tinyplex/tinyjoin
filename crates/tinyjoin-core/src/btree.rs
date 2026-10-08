@@ -1,4 +1,4 @@
-use std::{borrow::Cow, cmp::Ordering};
+use std::{borrow::Cow, cmp::Ordering, ops::Range};
 
 use crate::{
     CandidateId, EngineError, FIRST_DATA_PAGE_ID, MAX_PAGE_COUNT, MAX_PAGE_PAYLOAD_SIZE, Page,
@@ -41,6 +41,8 @@ const NODE_FORMAT_VERSION: u16 = 2;
 const NODE_FLAGS: u8 = 0;
 const NODE_HEADER_SIZE: usize = 48;
 const SLOT_SIZE: usize = 2;
+/// The bytes of a node's payload that its slots and cells share.
+const NODE_CAPACITY: usize = MAX_PAGE_PAYLOAD_SIZE - NODE_HEADER_SIZE;
 const LEAF_CELL_HEADER_SIZE: usize = 8;
 const OVERFLOW_DESCRIPTOR_SIZE: usize = 24;
 const INTERNAL_CELL_HEADER_SIZE: usize = 20;
@@ -283,6 +285,37 @@ impl Btree {
         tree_id: TreeId,
         changes: &[BatchChange<'_>],
     ) -> Result<BtreeBatch> {
+        Self::apply_as(
+            transaction,
+            root_page_id,
+            tree_id,
+            changes,
+            #[cfg(test)]
+            false,
+        )
+    }
+
+    /// Applies a batch as [`Self::apply`] does, but rewrites each leaf cell by cell, as
+    /// [`Self::apply`] did before it kept cells in runs. A test applies one batch both ways and
+    /// compares what they report and every page they leave.
+    #[cfg(test)]
+    pub(crate) fn apply_by_cell<D: PageDevice>(
+        transaction: &mut PagerWriteTransaction<'_, D>,
+        root_page_id: Option<PageId>,
+        tree_id: TreeId,
+        changes: &[BatchChange<'_>],
+    ) -> Result<BtreeBatch> {
+        Self::apply_as(transaction, root_page_id, tree_id, changes, true)
+    }
+
+    /// [`Self::apply`], which a test can make rewrite leaves cell by cell.
+    fn apply_as<D: PageDevice>(
+        transaction: &mut PagerWriteTransaction<'_, D>,
+        root_page_id: Option<PageId>,
+        tree_id: TreeId,
+        changes: &[BatchChange<'_>],
+        #[cfg(test)] by_cell: bool,
+    ) -> Result<BtreeBatch> {
         validate_tree_id(tree_id)?;
         if changes.is_empty() {
             return Ok(BtreeBatch {
@@ -312,6 +345,8 @@ impl Btree {
                 visited: PageSet::default(),
                 inserted: 0,
                 removed: 0,
+                #[cfg(test)]
+                by_cell,
             };
             batch.generation = batch.transaction.generation()?;
             let (pieces, level) = match root_page_id {
@@ -1027,10 +1062,11 @@ impl CellValue<'_> {
 
 /// A reading of one B-tree page that decodes only the cells a reader visits.
 ///
-/// Pages are verified as they enter the page cache, and nodes are fully validated when written
-/// and when a database is opened, so a view checks the node header and the bounds of each cell
-/// it reads. Writers, and open-time validation through [`Btree::validating_cursor`], still decode
-/// with every check in [`Node::decode`]. A view owns a copy of its page's payload, which a cursor
+/// Pages are verified as they enter the page cache, so a view checks the node header and the
+/// cells it reads. A batch checks every cell of each leaf it reaches, for its bounds, its flags
+/// or overflow descriptor, its packing and its order, before it writes the leaf again from the
+/// bytes it keeps. `check()` and the catalog load decode with every check in [`Node::decode`],
+/// through [`Btree::validating_cursor`]. A view owns a copy of its page's payload, which a cursor
 /// keeps between steps, or borrows it from the page cache for one lookup.
 #[derive(Debug)]
 pub(crate) struct NodeView<'a> {
@@ -1166,7 +1202,9 @@ impl<'a> NodeView<'a> {
         self.item_count
     }
 
-    /// The bytes of the leaf cell at `index`, header, key and value.
+    /// The bytes of the leaf cell at `index`, header, key and value, which the rewrite of a leaf
+    /// cell by cell copies. A rewrite by runs takes a cell's bounds from [`Self::kept`].
+    #[cfg(test)]
     fn leaf_cell_bytes(&self, index: usize) -> Result<&[u8]> {
         let bytes = &*self.bytes;
         let offset = self.cell_offset(index)?;
@@ -1274,6 +1312,67 @@ impl<'a> NodeView<'a> {
             return None;
         }
         Some((&bytes[header_end..key_end], &bytes[key_end..value_end]))
+    }
+
+    /// The offset slot `index` holds, which no check has yet placed in the cell area. `index` must
+    /// be below [`Self::len`].
+    #[inline(always)]
+    fn slot(&self, index: usize) -> usize {
+        u16_at(&self.bytes, NODE_HEADER_SIZE + index * SLOT_SIZE) as usize
+    }
+
+    /// The key of leaf cell `index`, which must be below [`Self::len`], and the offsets its cell
+    /// starts and ends at. A well-formed cell with an inline value, by exactly the tests of
+    /// [`Self::inline_leaf_cell`], is read here, compiled into the merge that reads every cell
+    /// of a leaf a batch reaches; [`Self::kept_other`] reads any other. `bytes` is this view's
+    /// payload, which that merge takes once for the leaf: taken from the view here, it was a call
+    /// for each cell.
+    #[inline(always)]
+    fn kept<'b>(&'b self, bytes: &'b [u8], index: usize) -> Result<(&'b [u8], usize, usize)> {
+        let offset = u16_at(bytes, NODE_HEADER_SIZE + index * SLOT_SIZE) as usize;
+        let header_end = offset + LEAF_CELL_HEADER_SIZE;
+        if offset >= self.free_end
+            && header_end <= bytes.len()
+            && u16_at(bytes, offset + 2) == INLINE_CELL_FLAGS
+        {
+            let key_end = header_end + u16_at(bytes, offset) as usize;
+            let value_end = key_end + u32_at(bytes, offset + 4) as usize;
+            if value_end <= bytes.len() && value_end >= key_end {
+                return Ok((&bytes[header_end..key_end], offset, value_end));
+            }
+        }
+        self.kept_other(index, offset)
+    }
+
+    /// What [`Self::kept`] returns for a cell that is not a well-formed one with an inline value:
+    /// the same of a cell whose value is in overflow pages, or what [`Self::leaf_cell`] reports
+    /// is wrong with it. `start` is the offset the cell's slot holds, which reading the cell
+    /// places in the cell area.
+    #[cold]
+    #[inline(never)]
+    fn kept_other(&self, index: usize, start: usize) -> Result<(&[u8], usize, usize)> {
+        let (key, value) = self.leaf_cell(index)?;
+        let end = start + LEAF_CELL_HEADER_SIZE + key.len() + value.encoded_len();
+        Ok((key, start, end))
+    }
+
+    /// Where the cells of `run`, which is not empty, lie in the leaf `source`, which packs its
+    /// cells downward in slot order: from where the last of them starts to where the first ends,
+    /// which is where the cell before it starts, or the end of the payload. Returns the leaf with
+    /// the two offsets. A batch into an empty tree has no leaf to keep cells from, and keeps none.
+    fn span<'s>(source: Option<&'s Self>, run: &Range<usize>) -> Result<(&'s Self, usize, usize)> {
+        let Some(leaf) = source else {
+            return Err(invalid_btree("A kept B-tree cell has no source page"));
+        };
+        let low = leaf.slot(run.end - 1);
+        let high = match run.start {
+            0 => leaf.bytes.len(),
+            start => leaf.slot(start - 1),
+        };
+        if low < leaf.free_end || high < low || high > leaf.bytes.len() {
+            return Err(leaf.cell_error(run.end - 1));
+        }
+        Ok((leaf, low, high))
     }
 
     /// The key of leaf cell `index`, reading only the key: binary searches read many keys and
@@ -2101,13 +2200,108 @@ struct BatchWriter<'t, 'p, D: PageDevice> {
     visited: PageSet,
     inserted: usize,
     removed: usize,
+    /// Whether leaves are rewritten cell by cell, as they were before they were rewritten by
+    /// runs of kept cells, for a test to compare the two.
+    #[cfg(test)]
+    by_cell: bool,
 }
 
-/// One entry of a leaf the batch writer writes: a cell kept, byte for byte, from the page it
-/// rewrites, or a new one.
+/// One entry of a leaf the batch writer writes: a run of consecutive cells kept, byte for byte,
+/// from the leaf it rewrites, which is never empty, or a new cell.
 enum LeafCell<'a> {
+    Kept(Range<usize>),
+    New { key: &'a [u8], value: CellValue<'a> },
+}
+
+/// One entry of a leaf as the batch writer listed them before it kept cells in runs: one cell
+/// kept from the leaf it rewrites, or a new one.
+#[cfg(test)]
+enum CellByCell<'a> {
     Kept(usize),
     New { key: &'a [u8], value: CellValue<'a> },
+}
+
+/// A walk over the cells of a leaf that a batch merges its changes into, in slot order.
+///
+/// The walk passes every cell of the leaf once, and checks each as it does: that the cell is well
+/// formed, which reading it shows; that it ends where the cell before it starts, or with the
+/// payload when it is the first; and that its key is above the key before it. Every writer packs a
+/// leaf's cells that way, downward from the end of the payload in key order, so the cells between
+/// two slots are the bytes between two offsets, and a run of kept cells can be copied as one. A
+/// leaf laid out otherwise is refused here, before any of it is written, and before the batch
+/// knows whether it changes the leaf: a batch that would leave such a leaf as it was fails too.
+struct LeafWalk<'n> {
+    node: &'n NodeView<'n>,
+    /// The leaf's payload, taken from the view once: [`NodeView::kept`] says why.
+    bytes: &'n [u8],
+    page_id: PageId,
+    /// The next cell to pass.
+    index: usize,
+    /// The key of the cell passed last, which the next cell's key must be above.
+    previous: Option<&'n [u8]>,
+    /// Where the next cell must end: where the cell passed last starts, or the end of the payload.
+    floor: usize,
+}
+
+impl LeafWalk<'_> {
+    /// Passes the cells whose keys are below `bound`, or every cell left when there is none.
+    /// Returns whether it stopped on the cell that holds `bound`: that cell has been passed, and
+    /// [`Self::index`] is still its index, for the caller to step over once it has read the
+    /// value. A cell above `bound` is not passed, and the next call reads it again.
+    ///
+    /// Compiled into the merge, so that reading and checking a cell is no call: this runs for
+    /// every cell of every leaf a commit reaches.
+    #[inline(always)]
+    fn pass(&mut self, bound: Option<&[u8]>) -> Result<bool> {
+        let node = self.node;
+        // A cell that cannot be read, and one that no writer lays out so, leave by one way out:
+        // the merge this is compiled into then hands on one error, where it copied each of three.
+        let error = 'refused: {
+            while self.index < node.len() {
+                let (key, start, end) = match node.kept(self.bytes, self.index) {
+                    Ok(cell) => cell,
+                    Err(error) => break 'refused error,
+                };
+                let order = match bound {
+                    Some(bound) => key.cmp(bound),
+                    None => Ordering::Less,
+                };
+                if order == Ordering::Greater {
+                    break;
+                }
+                let ordered = match self.previous {
+                    Some(previous) => key.cmp(previous) == Ordering::Greater,
+                    None => true,
+                };
+                if end != self.floor {
+                    break 'refused unpacked_cell(self.page_id, self.index);
+                }
+                if !ordered {
+                    break 'refused unordered_leaf(self.page_id);
+                }
+                self.previous = Some(key);
+                self.floor = start;
+                if order == Ordering::Equal {
+                    return Ok(true);
+                }
+                self.index += 1;
+            }
+            return Ok(false);
+        };
+        Err(error)
+    }
+}
+
+/// Adds the cells of `run`, when it has any, to the cells a leaf will hold, as part of the run
+/// before them when they follow it in the leaf.
+fn keep(cells: &mut Vec<LeafCell<'_>>, run: Range<usize>) {
+    if run.is_empty() {
+        return;
+    }
+    match cells.last_mut() {
+        Some(LeafCell::Kept(last)) if last.end == run.start => last.end = run.end,
+        _ => cells.push(LeafCell::Kept(run)),
+    }
 }
 
 impl<D: PageDevice> BatchWriter<'_, '_, D> {
@@ -2158,9 +2352,9 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
         Ok(pieces.map(|pieces| (pieces, level)))
     }
 
-    /// Merges changes into a leaf without decoding its cells: kept cells are copied as they are,
-    /// and the leaf's fingerprint, when its parent gave it, changes by exactly the entries that
-    /// were removed, replaced and added.
+    /// Merges changes into a leaf without decoding its cells: the cells it keeps are copied as
+    /// they are, in runs, and the leaf's fingerprint, when its parent gave it, changes by exactly
+    /// the entries that were removed, replaced and added.
     fn apply_leaf(
         &mut self,
         page_id: PageId,
@@ -2169,50 +2363,49 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
         hash: Option<u64>,
         changes: &[BatchChange<'_>],
     ) -> Result<Option<Vec<Piece>>> {
+        #[cfg(test)]
+        if self.by_cell {
+            return self.apply_leaf_by_cell(page_id, owned, node, hash, changes);
+        }
         let count = node.len();
         let appends = (count == 0 || changes[0].key > node.leaf_key(count - 1)?)
             && changes.iter().all(|change| change.value.is_some());
-        let mut cells = Vec::with_capacity(count + changes.len());
+        // The most segments a merge leaves: a cell for each change, and a run of kept cells before
+        // each change and after the last, which are no more runs than the leaf has cells.
+        let mut cells = Vec::with_capacity(changes.len() + count.min(changes.len() + 1));
         let mut delta = EMPTY_HASH;
         // The cells removed outright, whose fingerprints matter only if the leaf keeps others: a
         // leaf that empties is released, and its parent drops the fingerprint it records for it.
         let mut removed = Vec::new();
         let mut changed = false;
-        let mut index = 0;
-        let mut previous: Option<&[u8]> = None;
-        let mut kept_until = |index: &mut usize, bound: Option<&[u8]>, cells: &mut Vec<_>| {
-            while *index < count {
-                let key = node.leaf_key(*index)?;
-                if bound.is_some_and(|bound| key >= bound) {
-                    break;
-                }
-                if previous.is_some_and(|previous| previous >= key) {
-                    return Err(invalid_btree(storage_diagnostic!(
-                        "B-tree leaf {page_id} keys are not strictly increasing"
-                    )));
-                }
-                previous = Some(key);
-                cells.push(LeafCell::Kept(*index));
-                *index += 1;
-            }
-            Ok(())
+        let bytes = &*node.bytes;
+        let mut walk = LeafWalk {
+            node,
+            bytes,
+            page_id,
+            index: 0,
+            previous: None,
+            floor: bytes.len(),
         };
-        for change in changes {
-            kept_until(&mut index, Some(change.key), &mut cells)?;
-            let held = match index < count {
-                true => {
-                    let (key, value) = node.leaf_cell(index)?;
-                    (key == change.key).then_some(value)
-                }
-                false => None,
+        let mut changes = changes.iter();
+        // The walk is compiled in here once, for each change and for the cells behind the last.
+        loop {
+            let change = changes.next();
+            let start = walk.index;
+            let held = walk.pass(change.map(|change| change.key))?;
+            keep(&mut cells, start..walk.index);
+            let Some(change) = change else {
+                break;
             };
-            if let Some(held) = held {
-                index += 1;
+            if held {
+                let index = walk.index;
+                walk.index += 1;
+                let (_, held) = node.leaf_cell(index)?;
                 // An upsert of the value an entry already holds inline changes nothing.
                 if let (CellValue::Inline(held), Some(value)) = (&held, change.value)
                     && *held == value
                 {
-                    cells.push(LeafCell::Kept(index - 1));
+                    keep(&mut cells, index..index + 1);
                     continue;
                 }
                 // The held cell's key is the change's, so a replaced entry takes one hash of it
@@ -2224,7 +2417,7 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
                         Some((value, seed))
                     }
                     None => {
-                        removed.push(index - 1);
+                        removed.push(index);
                         None
                     }
                 };
@@ -2260,6 +2453,138 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
                 });
             }
         }
+        if !changed {
+            return Ok(None);
+        }
+        if cells.is_empty() {
+            release_node_page(self.transaction, page_id, owned)?;
+            return Ok(Some(Vec::new()));
+        }
+        for index in removed {
+            let (key, value) = node.leaf_cell(index)?;
+            delta = combine(delta, cell_hash(key, &value));
+        }
+        let first_key = match &cells[0] {
+            LeafCell::Kept(run) => node.leaf_key(run.start)?,
+            LeafCell::New { key, .. } => key,
+        };
+        let first_changed = count == 0 || first_key != node.leaf_key(0)?;
+        let mut pieces = self.write_leaf_cells(
+            Some((page_id, owned)),
+            Some(node),
+            &cells,
+            appends,
+            hash.map(|hash| combine(hash, delta)),
+        )?;
+        if !first_changed {
+            pieces[0].first_key = None;
+        }
+        Ok(Some(pieces))
+    }
+
+    /// Merges changes into a leaf as [`Self::apply_leaf`] did before it kept cells in runs: it
+    /// lists every kept cell, compares each with the kept cell before it, and leaves a kept
+    /// cell's value and flags to [`Self::write_leaf_cells_by_cell`]. Tests compare the two.
+    #[cfg(test)]
+    fn apply_leaf_by_cell(
+        &mut self,
+        page_id: PageId,
+        owned: bool,
+        node: &NodeView<'_>,
+        hash: Option<u64>,
+        changes: &[BatchChange<'_>],
+    ) -> Result<Option<Vec<Piece>>> {
+        let count = node.len();
+        let appends = (count == 0 || changes[0].key > node.leaf_key(count - 1)?)
+            && changes.iter().all(|change| change.value.is_some());
+        let mut cells = Vec::with_capacity(count + changes.len());
+        let mut delta = EMPTY_HASH;
+        // The cells removed outright, whose fingerprints matter only if the leaf keeps others: a
+        // leaf that empties is released, and its parent drops the fingerprint it records for it.
+        let mut removed = Vec::new();
+        let mut changed = false;
+        let mut index = 0;
+        let mut previous: Option<&[u8]> = None;
+        let mut kept_until = |index: &mut usize, bound: Option<&[u8]>, cells: &mut Vec<_>| {
+            while *index < count {
+                let key = node.leaf_key(*index)?;
+                if bound.is_some_and(|bound| key >= bound) {
+                    break;
+                }
+                if previous.is_some_and(|previous| previous >= key) {
+                    return Err(invalid_btree(storage_diagnostic!(
+                        "B-tree leaf {page_id} keys are not strictly increasing"
+                    )));
+                }
+                previous = Some(key);
+                cells.push(CellByCell::Kept(*index));
+                *index += 1;
+            }
+            Ok(())
+        };
+        for change in changes {
+            kept_until(&mut index, Some(change.key), &mut cells)?;
+            let held = match index < count {
+                true => {
+                    let (key, value) = node.leaf_cell(index)?;
+                    (key == change.key).then_some(value)
+                }
+                false => None,
+            };
+            if let Some(held) = held {
+                index += 1;
+                // An upsert of the value an entry already holds inline changes nothing.
+                if let (CellValue::Inline(held), Some(value)) = (&held, change.value)
+                    && *held == value
+                {
+                    cells.push(CellByCell::Kept(index - 1));
+                    continue;
+                }
+                // The held cell's key is the change's, so a replaced entry takes one hash of it
+                // for the fingerprint of the value it held and of the one it takes.
+                let replacement = match change.value {
+                    Some(value) => {
+                        let seed = key_hash(change.key);
+                        delta = combine(delta, value_hash(seed, &held));
+                        Some((value, seed))
+                    }
+                    None => {
+                        removed.push(index - 1);
+                        None
+                    }
+                };
+                if let CellValue::Overflow(descriptor) = held {
+                    release_leaf_value(
+                        self.transaction,
+                        self.tree_id,
+                        self.generation,
+                        node.generation,
+                        &LeafValue::Overflow(descriptor),
+                    )?;
+                }
+                changed = true;
+                match replacement {
+                    Some((value, seed)) => {
+                        let value = self.new_value(change.key, value)?;
+                        delta = combine(delta, value_hash(seed, &value));
+                        cells.push(CellByCell::New {
+                            key: change.key,
+                            value,
+                        });
+                    }
+                    None => self.removed += 1,
+                }
+            } else if let Some(value) = change.value {
+                changed = true;
+                self.inserted += 1;
+                let value = self.new_value(change.key, value)?;
+                delta = combine(delta, cell_hash(change.key, &value));
+                cells.push(CellByCell::New {
+                    key: change.key,
+                    value,
+                });
+            }
+        }
         kept_until(&mut index, None, &mut cells)?;
         if !changed {
             return Ok(None);
@@ -2273,11 +2598,11 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
             delta = combine(delta, cell_hash(key, &value));
         }
         let first_key = match &cells[0] {
-            LeafCell::Kept(index) => node.leaf_key(*index)?,
-            LeafCell::New { key, .. } => key,
+            CellByCell::Kept(index) => node.leaf_key(*index)?,
+            CellByCell::New { key, .. } => key,
         };
         let first_changed = count == 0 || first_key != node.leaf_key(0)?;
-        let mut pieces = self.write_leaf_cells(
+        let mut pieces = self.write_leaf_cells_by_cell(
             Some((page_id, owned)),
             Some(node),
             &cells,
@@ -2430,14 +2755,190 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
     }
 
     /// Writes leaf cells into as many pages as they need, the first in place of `replacing`, and
-    /// reports each page with its first key. Kept cells are copied from `source`. When the cells
-    /// fit one page and `hash` is given, it is that page's fingerprint; otherwise each page's is
-    /// computed from its entries.
+    /// reports each page with its first key. A run of kept cells is copied from `source` as the
+    /// bytes it lies in, which are what its cells copied one at a time would be: the merge that
+    /// kept the run found each of its cells ending where the cell before it starts. When the
+    /// cells fit one page and `hash` is given, it is that page's fingerprint; otherwise each
+    /// page's is computed from its entries.
     fn write_leaf_cells(
         &mut self,
         replacing: Option<(PageId, bool)>,
         source: Option<&NodeView<'_>>,
         cells: &[LeafCell<'_>],
+        fill: bool,
+        hash: Option<u64>,
+    ) -> Result<Vec<Piece>> {
+        #[cfg(test)]
+        if self.by_cell {
+            // Only a batch into an empty tree comes here to be written cell by cell.
+            let cells = cells
+                .iter()
+                .map(|cell| match cell {
+                    LeafCell::Kept(_) => unreachable!("a batch into an empty tree keeps no cell"),
+                    LeafCell::New { key, value } => CellByCell::New {
+                        key,
+                        value: match value {
+                            CellValue::Inline(value) => CellValue::Inline(value),
+                            CellValue::Overflow(descriptor) => {
+                                CellValue::Overflow(descriptor.clone())
+                            }
+                        },
+                    },
+                })
+                .collect::<Vec<_>>();
+            return self.write_leaf_cells_by_cell(replacing, source, &cells, fill, hash);
+        }
+        // The cells' sizes, slots included. A first pass sums them a segment at a time, and stops
+        // once they pass what a page holds: nearly every leaf is written back as one page, and
+        // takes no more than that. Only for a leaf that divides does a second pass size each
+        // cell, for `divide`.
+        let mut sizes = Vec::new();
+        let mut each = false;
+        let (mut count, mut size);
+        loop {
+            (count, size) = (0, 0);
+            for cell in cells {
+                match cell {
+                    LeafCell::Kept(run) => {
+                        let step = if each { 1 } else { run.len() };
+                        let mut start = run.start;
+                        while start < run.end {
+                            let (_, low, high) = NodeView::span(source, &(start..start + step))?;
+                            let bytes = high - low + step * SLOT_SIZE;
+                            if each {
+                                sizes.push(bytes);
+                            }
+                            (count, size, start) = (count + step, size + bytes, start + step);
+                        }
+                    }
+                    LeafCell::New { key, value } => {
+                        let bytes =
+                            SLOT_SIZE + LEAF_CELL_HEADER_SIZE + key.len() + value.encoded_len();
+                        if each {
+                            sizes.push(bytes);
+                        }
+                        (count, size) = (count + 1, size + bytes);
+                    }
+                }
+                if !each && size > NODE_CAPACITY {
+                    break;
+                }
+            }
+            if each || size <= NODE_CAPACITY {
+                break;
+            }
+            each = true;
+        }
+        let (single, divided);
+        let divisions: &[usize] = if each {
+            divided = divide(&sizes, fill)?;
+            &divided
+        } else {
+            single = [count];
+            &single
+        };
+        let known = hash.filter(|_| divisions.len() == 1);
+        let mut pieces = Vec::with_capacity(divisions.len());
+        // The next cell to write is in segment `next`, and when that is a run of which earlier
+        // pages took cells, it is the one after the `taken` they took.
+        let (mut next, mut taken) = (0, 0);
+        for (index, &count) in divisions.iter().enumerate() {
+            let mut payload = vec![0; MAX_PAGE_PAYLOAD_SIZE];
+            let mut free_end = MAX_PAGE_PAYLOAD_SIZE;
+            let mut hash = EMPTY_HASH;
+            let mut first_key = Vec::new();
+            let mut slot = 0;
+            while slot < count {
+                // The key of the cell written, which the page reports when it is its first.
+                let first = slot == 0;
+                let key = match &cells[next] {
+                    LeafCell::Kept(run) => {
+                        // As many of the run's remaining cells as the page still takes.
+                        let start = run.start + taken;
+                        let end = run.end.min(start + count - slot);
+                        let (source, low, high) = NodeView::span(source, &(start..end))?;
+                        let bytes = &*source.bytes;
+                        free_end -= high - low;
+                        payload[free_end..free_end + high - low].copy_from_slice(&bytes[low..high]);
+                        // The cells keep their places in the bytes, so each slot moves as far as
+                        // the bytes did.
+                        for cell in start..end {
+                            let offset =
+                                u16_at(bytes, NODE_HEADER_SIZE + cell * SLOT_SIZE) as usize;
+                            if offset < low || offset >= high {
+                                return Err(source.cell_error(cell));
+                            }
+                            put_u16(
+                                &mut payload,
+                                NODE_HEADER_SIZE + (slot + cell - start) * SLOT_SIZE,
+                                (offset - low + free_end) as u16,
+                            );
+                            if known.is_none() {
+                                let (key, value) = source.leaf_cell(cell)?;
+                                hash = combine(hash, cell_hash(key, &value));
+                            }
+                        }
+                        let key = match first {
+                            true => source.leaf_key(start)?,
+                            false => &[],
+                        };
+                        slot += end - start;
+                        if end == run.end {
+                            (next, taken) = (next + 1, 0);
+                        } else {
+                            taken = end - run.start;
+                        }
+                        key
+                    }
+                    LeafCell::New { key, value } => {
+                        free_end -= LEAF_CELL_HEADER_SIZE + key.len() + value.encoded_len();
+                        write_leaf_cell(&mut payload[free_end..], key, value);
+                        if known.is_none() {
+                            hash = combine(hash, cell_hash(key, value));
+                        }
+                        put_u16(
+                            &mut payload,
+                            NODE_HEADER_SIZE + slot * SLOT_SIZE,
+                            free_end as u16,
+                        );
+                        slot += 1;
+                        next += 1;
+                        key
+                    }
+                };
+                if first {
+                    first_key = key.to_vec();
+                }
+            }
+            write_node_header(
+                &mut payload,
+                self.tree_id,
+                self.generation,
+                0,
+                count,
+                free_end,
+                (NO_PAGE_ID, EMPTY_HASH),
+            );
+            let page_id = self.page_for(index, replacing)?;
+            self.write_payload(page_id, PageType::BtreeLeaf, payload)?;
+            pieces.push(Piece {
+                first_key: Some(first_key),
+                page_id,
+                hash: known.unwrap_or(hash),
+            });
+        }
+        self.release_replaced(replacing)?;
+        Ok(pieces)
+    }
+
+    /// Writes leaf cells as [`Self::write_leaf_cells`] did before it copied kept cells in runs:
+    /// it sizes, copies and reads again each kept cell of `source`, one at a time.
+    #[cfg(test)]
+    fn write_leaf_cells_by_cell(
+        &mut self,
+        replacing: Option<(PageId, bool)>,
+        source: Option<&NodeView<'_>>,
+        cells: &[CellByCell<'_>],
         fill: bool,
         hash: Option<u64>,
     ) -> Result<Vec<Piece>> {
@@ -2451,8 +2952,8 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
             sizes.push(
                 SLOT_SIZE
                     + match cell {
-                        LeafCell::Kept(index) => kept(*index)?.len(),
-                        LeafCell::New { key, value } => {
+                        CellByCell::Kept(index) => kept(*index)?.len(),
+                        CellByCell::New { key, value } => {
                             LEAF_CELL_HEADER_SIZE + key.len() + value.encoded_len()
                         }
                     },
@@ -2469,7 +2970,7 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
             let mut first_key = Vec::new();
             for (slot, cell) in cells[start..start + count].iter().enumerate() {
                 let key = match cell {
-                    LeafCell::Kept(index) => {
+                    CellByCell::Kept(index) => {
                         let bytes = kept(*index)?;
                         free_end -= bytes.len();
                         payload[free_end..free_end + bytes.len()].copy_from_slice(bytes);
@@ -2481,7 +2982,7 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
                         }
                         key
                     }
-                    LeafCell::New { key, value } => {
+                    CellByCell::New { key, value } => {
                         free_end -= LEAF_CELL_HEADER_SIZE + key.len() + value.encoded_len();
                         write_leaf_cell(&mut payload[free_end..], key, value);
                         if known.is_none() {
@@ -2639,18 +3140,17 @@ impl<D: PageDevice> BatchWriter<'_, '_, D> {
 /// page takes. Cells that fit one page stay together. Otherwise `fill` packs each page before
 /// starting the next, and without it cells are spread evenly over the fewest pages that hold them.
 fn divide(sizes: &[usize], fill: bool) -> Result<Vec<usize>> {
-    const CAPACITY: usize = MAX_PAGE_PAYLOAD_SIZE - NODE_HEADER_SIZE;
-    if sizes.iter().any(|size| *size > CAPACITY) {
+    if sizes.iter().any(|size| *size > NODE_CAPACITY) {
         return Err(limit_error("A single B-tree cell cannot fit in a page"));
     }
     let total = sizes.iter().sum::<usize>();
-    if total <= CAPACITY {
+    if total <= NODE_CAPACITY {
         return Ok(vec![sizes.len()]);
     }
-    let mut pages = total.div_ceil(CAPACITY);
+    let mut pages = total.div_ceil(NODE_CAPACITY);
     loop {
         let target = if fill {
-            CAPACITY
+            NODE_CAPACITY
         } else {
             total.div_ceil(pages)
         };
@@ -2666,7 +3166,7 @@ fn divide(sizes: &[usize], fill: bool) -> Result<Vec<usize>> {
         }
         counts.push(count);
         // Every page but the last stays at or under the target; the last takes the rest.
-        if size <= CAPACITY {
+        if size <= NODE_CAPACITY {
             return Ok(counts);
         }
         pages += 1;
@@ -3564,11 +4064,29 @@ fn validate_packed_cell(
     free_end: usize,
 ) -> Result<()> {
     if offset < free_end || cell_end != expected_cell_end {
-        return Err(invalid_btree(storage_diagnostic!(
-            "B-tree page {page_id} cell {index} is overlapping, out of order, or not tightly packed"
-        )));
+        return Err(unpacked_cell(page_id, index));
     }
     Ok(())
+}
+
+/// The error for a cell that does not end where the cell before it starts, or with the payload
+/// when it is the first. Decoding a node and rewriting a leaf both test every cell for it, so it
+/// is built out of line.
+#[cold]
+#[inline(never)]
+fn unpacked_cell(page_id: PageId, index: usize) -> EngineError {
+    invalid_btree(storage_diagnostic!(
+        "B-tree page {page_id} cell {index} is overlapping, out of order, or not tightly packed"
+    ))
+}
+
+/// The error for a leaf a batch reaches whose keys do not increase from each cell to the next.
+#[cold]
+#[inline(never)]
+fn unordered_leaf(page_id: PageId) -> EngineError {
+    invalid_btree(storage_diagnostic!(
+        "B-tree leaf {page_id} keys are not strictly increasing"
+    ))
 }
 
 fn validate_cell_floor(page_id: PageId, actual: usize, expected: usize) -> Result<()> {
@@ -4170,59 +4688,70 @@ mod tests {
         entries
     }
 
+    /// The same numbers on every run.
+    struct Random(u64);
+
+    impl Random {
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % bound as u64) as usize
+        }
+    }
+
+    /// A change to one key: the value it takes, or `None` to delete it.
+    type OwnedChange = (Vec<u8>, Option<Vec<u8>>);
+
+    /// A batch for the `round`th commit of a tree: upserts and deletes in key order, of keys
+    /// `key_bytes` long, which decides how many entries share a page, with values that are
+    /// inline, empty or long enough for overflow pages.
+    fn random_changes(random: &mut Random, key_bytes: usize, round: usize) -> Vec<OwnedChange> {
+        let key = |number: usize| {
+            let mut key = vec![b'k'; key_bytes];
+            key[..4].copy_from_slice(&(number as u32).to_be_bytes());
+            key
+        };
+        let value = |random: &mut Random| match random.below(10) {
+            0 => vec![b'o'; 3_000 + random.below(9_000)],
+            1 => Vec::new(),
+            _ => vec![random.below(256) as u8; random.below(200)],
+        };
+        let count = [1, 7, 60, 400][random.below(4)];
+        let mut numbers = (0..count)
+            .map(|_| random.below(if round == 0 { 400 } else { 600 }))
+            .collect::<Vec<_>>();
+        numbers.sort_unstable();
+        numbers.dedup();
+        numbers
+            .iter()
+            .map(|number| (key(*number), (random.below(4) != 0).then(|| value(random))))
+            .collect()
+    }
+
+    fn as_batch(changes: &[OwnedChange]) -> Vec<BatchChange<'_>> {
+        changes
+            .iter()
+            .map(|(key, value)| BatchChange {
+                key,
+                value: value.as_deref(),
+            })
+            .collect()
+    }
+
     #[test]
     fn batches_agree_with_single_changes_and_leak_no_pages() {
-        struct Random(u64);
-        impl Random {
-            fn below(&mut self, bound: usize) -> usize {
-                self.0 ^= self.0 << 13;
-                self.0 ^= self.0 >> 7;
-                self.0 ^= self.0 << 17;
-                (self.0 % bound as u64) as usize
-            }
-        }
         let mut random = Random(0x0ba7c4);
         for case in 0..60 {
-            // Key sizes decide how many entries share a page, and some values overflow.
             let key_bytes = [4, 24, 300, 900][case % 4];
-            let key = |number: usize| {
-                let mut key = vec![b'k'; key_bytes];
-                key[..4].copy_from_slice(&(number as u32).to_be_bytes());
-                key
-            };
-            let value = |random: &mut Random| match random.below(10) {
-                0 => vec![b'o'; 3_000 + random.below(9_000)],
-                1 => Vec::new(),
-                _ => vec![random.below(256) as u8; random.below(200)],
-            };
             let mut batched = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
             let mut single = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
             let (mut batched_root, mut single_root) = (None, None);
             let (mut batched_hash, mut single_hash) = (EMPTY_HASH, EMPTY_HASH);
             let mut model = BTreeMap::new();
             for round in 0..4 {
-                let count = [1, 7, 60, 400][random.below(4)];
-                let mut numbers = (0..count)
-                    .map(|_| random.below(if round == 0 { 400 } else { 600 }))
-                    .collect::<Vec<_>>();
-                numbers.sort_unstable();
-                numbers.dedup();
-                let changes = numbers
-                    .iter()
-                    .map(|number| {
-                        (
-                            key(*number),
-                            (random.below(4) != 0).then(|| value(&mut random)),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let batch = changes
-                    .iter()
-                    .map(|(key, value)| BatchChange {
-                        key,
-                        value: value.as_deref(),
-                    })
-                    .collect::<Vec<_>>();
+                let changes = random_changes(&mut random, key_bytes, round);
+                let batch = as_batch(&changes);
 
                 let revision = round as u64 + 2;
                 let mut transaction = batched.begin_write().unwrap();
@@ -4306,6 +4835,506 @@ mod tests {
                 0
             );
         }
+    }
+
+    /// Two pagers that hold one tree and are kept in step: a batch rewrites the leaves of the
+    /// first by runs of kept cells, as [`Btree::apply`] does, and those of the second cell by
+    /// cell, as [`Btree::apply_by_cell`] does.
+    struct Rewrites {
+        by_runs: Option<Pager<MemoryPageDevice>>,
+        by_cell: Option<Pager<MemoryPageDevice>>,
+        root: Option<PageId>,
+        revision: u64,
+    }
+
+    impl Rewrites {
+        /// Two pagers with the tree that `changes` build, each applied by [`Btree::upsert`] or
+        /// [`Btree::delete`], which encode every leaf they touch as releases before v0.4.0 did.
+        fn of_single_changes(changes: &[OwnedChange]) -> Self {
+            let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+            let mut root = None;
+            let mut transaction = pager.begin_write().unwrap();
+            for (key, value) in changes {
+                match (value, root) {
+                    (Some(value), held) => {
+                        let held = held.unwrap_or_else(|| {
+                            Btree::create(&mut transaction, TREE).expect("an empty tree")
+                        });
+                        let upserted = Btree::upsert(&mut transaction, held, TREE, key, value);
+                        root = Some(upserted.unwrap().root_page_id);
+                    }
+                    (None, Some(held)) => {
+                        let deleted = Btree::delete(&mut transaction, held, TREE, key);
+                        root = deleted.unwrap().root_page_id;
+                    }
+                    (None, None) => {}
+                }
+            }
+            transaction.commit(1, EMPTY_HASH, root).unwrap();
+            let device = pager.into_device();
+            Self {
+                by_runs: Some(Pager::open_or_create(device.clone()).unwrap()),
+                by_cell: Some(Pager::open_or_create(device).unwrap()),
+                root,
+                revision: 1,
+            }
+        }
+
+        /// Applies `changes` to both trees and commits them, and asserts that the two rewrites
+        /// report the same, leave every page of their devices the same, and wrote their pages in
+        /// the same order. Returns what they reported.
+        fn apply(&mut self, changes: &[OwnedChange], context: &str) -> BtreeBatch {
+            let batch = as_batch(changes);
+            self.revision += 1;
+            let mut applied = Vec::new();
+            for (pager, by_cell) in [(&mut self.by_runs, false), (&mut self.by_cell, true)] {
+                let pager = pager
+                    .as_mut()
+                    .expect("both pagers are open between batches");
+                let mut transaction = pager.begin_write().unwrap();
+                let result = match by_cell {
+                    false => Btree::apply(&mut transaction, self.root, TREE, &batch),
+                    true => Btree::apply_by_cell(&mut transaction, self.root, TREE, &batch),
+                };
+                let result = result.unwrap_or_else(|error| panic!("{context}: {error:?}"));
+                transaction
+                    .commit(self.revision, EMPTY_HASH, result.root_page_id)
+                    .unwrap();
+                applied.push(result);
+            }
+            assert_eq!(applied[0], applied[1], "{context}");
+            self.root = applied[0].root_page_id;
+
+            // The devices show every page, so the pagers give them up and open them again.
+            let by_runs = self.by_runs.take().unwrap().into_device();
+            let by_cell = self.by_cell.take().unwrap().into_device();
+            assert_eq!(by_runs.page_count(), by_cell.page_count(), "{context}");
+            for id in 0..by_runs.page_count() {
+                assert!(
+                    by_runs.page(id).unwrap() == by_cell.page(id).unwrap(),
+                    "{context}: page {id} differs"
+                );
+            }
+            assert_eq!(by_runs.writes(), by_cell.writes(), "{context}");
+            let mut by_runs = Pager::open_or_create(by_runs).unwrap();
+            // Every node of the tree still decodes with every check.
+            all_entries(&mut by_runs, self.root);
+            self.by_runs = Some(by_runs);
+            self.by_cell = Some(Pager::open_or_create(by_cell).unwrap());
+            applied[0]
+        }
+    }
+
+    /// Builds the tree of `held` both ways a tree is built, by one batch and by single changes,
+    /// and applies `batches` to each, by runs and by cell. Returns what each batch reported, for
+    /// the tree one batch built and then for the tree single changes built.
+    fn compare_rewrites(
+        name: &str,
+        held: &[OwnedChange],
+        batches: &[Vec<OwnedChange>],
+    ) -> Vec<BtreeBatch> {
+        let mut reported = Vec::new();
+        for singly in [false, true] {
+            let built = if singly { "single changes" } else { "a batch" };
+            let mut rewrites = Rewrites::of_single_changes(if singly { held } else { &[] });
+            if !singly {
+                rewrites.apply(held, &format!("{name}: the tree built by {built}"));
+            }
+            for (index, batch) in batches.iter().enumerate() {
+                let context = format!("{name}: batch {index} on a tree built by {built}");
+                reported.push(rewrites.apply(batch, &context));
+            }
+        }
+        reported
+    }
+
+    #[test]
+    fn leaves_rewritten_by_runs_match_leaves_rewritten_by_cell() {
+        // The property test's batches: keys of four lengths, values inline, empty and in overflow
+        // pages, upserts and deletes. The first batch builds the tree and the rest change it.
+        let mut random = Random(0x0ba7c4);
+        for case in 0..60 {
+            let key_bytes = [4, 24, 300, 900][case % 4];
+            let batches = (0..4)
+                .map(|round| random_changes(&mut random, key_bytes, round))
+                .collect::<Vec<_>>();
+            compare_rewrites(&format!("case {case}"), &batches[0], &batches[1..]);
+        }
+
+        // A tree of several leaves, with room between its keys. Every seventh value is in
+        // overflow pages and every eleventh is empty, so every leaf keeps cells of each kind.
+        let key = |number: u32| {
+            let mut key = vec![b'k'; 24];
+            key[..4].copy_from_slice(&number.to_be_bytes());
+            key
+        };
+        let inline = |number: u32| vec![number as u8; 40 + number as usize % 30];
+        let value = |number: u32| match number {
+            number if number % 7 == 0 => vec![number as u8; 5_000 + number as usize],
+            number if number % 11 == 0 => Vec::new(),
+            number => inline(number),
+        };
+        let numbers = || (1..=300).map(|number| number * 100);
+        let held = numbers()
+            .map(|number| (key(number), Some(value(number / 100))))
+            .collect::<Vec<_>>();
+        // Whichever way the tree was built, a batch changes the same entries.
+        let compare = |name: &str, batch: Vec<OwnedChange>| {
+            let reported = compare_rewrites(name, &held, &[batch]);
+            let entries = |batch: &BtreeBatch| (batch.hash, batch.inserted, batch.removed);
+            assert_eq!(entries(&reported[0]), entries(&reported[1]), "{name}");
+            reported[0]
+        };
+
+        compare(
+            "every cell replaced",
+            numbers()
+                .map(|number| (key(number), Some(inline(number / 100 + 1))))
+                .collect(),
+        );
+        compare(
+            "every other cell replaced or removed",
+            numbers()
+                .step_by(2)
+                .map(|number| (key(number), (number % 400 != 100).then(|| inline(number))))
+                .collect(),
+        );
+        compare("one cell replaced", vec![(key(15_000), Some(inline(1)))]);
+        compare("one cell removed", vec![(key(15_000), None)]);
+        // The leftmost leaf takes a first key, and loses the one it had: its parents are rewritten.
+        compare("a key below the first", vec![(key(50), Some(inline(2)))]);
+        compare("the first key removed", vec![(key(100), None)]);
+        // Enough below the first key to divide the leftmost leaf within the run of cells it
+        // keeps, so that its second page starts with a kept cell.
+        compare(
+            "keys below the first",
+            (1..=25)
+                .map(|number| (key(number), Some(inline(number))))
+                .collect(),
+        );
+        // Enough appends to divide the rightmost leaf, which keeps cells with overflow values.
+        compare(
+            "appends past the last key",
+            (1..=120)
+                .map(|number| (key(30_000 + number), Some(inline(number))))
+                .collect(),
+        );
+        // Enough between two cells to divide their leaf within the runs it keeps.
+        compare(
+            "upserts between two cells",
+            (1..=60)
+                .map(|number| (key(15_000 + number), Some(inline(number))))
+                .collect(),
+        );
+        // More than a leaf holds, so that at least one leaf loses every cell and is released.
+        let emptied = compare(
+            "every cell of a leaf removed",
+            (100..=200)
+                .map(|number| (key(number * 100), None))
+                .collect(),
+        );
+        assert_eq!(emptied.removed, 101);
+        let emptied = compare(
+            "every cell of the tree removed",
+            numbers().map(|number| (key(number), None)).collect(),
+        );
+        assert_eq!((emptied.root_page_id, emptied.removed), (None, 300));
+        // Deletes of keys the tree lacks stop on cells they leave, between upserts that add.
+        compare(
+            "keys the tree lacks",
+            vec![
+                (key(150), None),
+                (key(250), Some(inline(3))),
+                (key(15_050), None),
+                (key(99_999), None),
+            ],
+        );
+        // An upsert of the inline value an entry holds changes nothing, so a batch of them
+        // reports no fingerprint and leaves the tree's pages as they were.
+        let unchanged = numbers()
+            .filter(|number| number / 100 % 7 != 0)
+            .map(|number| (key(number), Some(value(number / 100))))
+            .collect::<Vec<_>>();
+        let reported = compare("the values the entries hold", unchanged.clone());
+        assert_eq!(
+            (reported.hash, reported.inserted, reported.removed),
+            (None, 0, 0)
+        );
+        // With one entry changed among them, the kept cells around it join into runs.
+        let mut nearly = unchanged;
+        nearly[100].1 = Some(inline(4));
+        assert!(
+            compare("all but one value the entries hold", nearly)
+                .hash
+                .is_some()
+        );
+
+        // A leaf that is the root: its fingerprint is computed from its cells, kept ones too, and
+        // the tree has no root once a batch removes them all.
+        let reported = compare_rewrites(
+            "a root leaf",
+            &held[..5],
+            &[
+                vec![(key(250), Some(inline(5))), (key(300), Some(inline(6)))],
+                [100, 200, 250, 300, 400, 500]
+                    .map(|number| (key(number), None))
+                    .to_vec(),
+            ],
+        );
+        for batches in reported.chunks(2) {
+            assert_eq!((batches[0].inserted, batches[0].removed), (1, 0));
+            assert_eq!((batches[1].root_page_id, batches[1].removed), (None, 6));
+        }
+        // A root leaf with keys added below its first and above its last, enough for three pages:
+        // the run of cells it keeps starts on the first page and ends on the third.
+        let reported = compare_rewrites(
+            "a root leaf divided in three",
+            &held[..40],
+            &[(1..=25)
+                .chain(30_001..=30_030)
+                .map(|number| (key(number), Some(inline(number))))
+                .collect()],
+        );
+        assert_eq!(reported[0].inserted, 55);
+        // A batch into an empty tree fills each page before it starts the next.
+        compare_rewrites("an empty tree", &[], std::slice::from_ref(&held));
+        compare_rewrites(
+            "an empty tree and a batch of deletes",
+            &[],
+            &[vec![(key(1), None)]],
+        );
+    }
+
+    #[test]
+    fn kept_cells_join_the_run_they_follow() {
+        let mut cells = Vec::new();
+        keep(&mut cells, 0..2);
+        // No cell is no run, and cells that follow a run extend it.
+        keep(&mut cells, 2..2);
+        keep(&mut cells, 2..5);
+        // A run starts behind a new cell, and behind a cell that was not kept.
+        cells.push(LeafCell::New {
+            key: b"key",
+            value: CellValue::Inline(b"value"),
+        });
+        keep(&mut cells, 5..6);
+        keep(&mut cells, 7..9);
+        keep(&mut cells, 9..10);
+        let runs = cells.iter().map(|cell| match cell {
+            LeafCell::Kept(run) => Some(run.clone()),
+            LeafCell::New { .. } => None,
+        });
+        assert_eq!(
+            runs.collect::<Vec<_>>(),
+            [Some(0..5), None, Some(5..6), Some(7..10)]
+        );
+    }
+
+    /// The offset of cell `index` of the leaf in `payload`.
+    fn cell_at(payload: &[u8], index: usize) -> usize {
+        read_u16(payload, NODE_HEADER_SIZE + index * SLOT_SIZE) as usize
+    }
+
+    /// The key of the one entry in the leaf beside the leaf [`damaged_leaf`] damages.
+    const SIBLING: u8 = 200;
+
+    /// A device whose tree is a root over two leaves, and the root's page. The first leaf holds
+    /// each of `keys`, which are below [`SIBLING`], as a one-byte key with a value of four bytes,
+    /// and `damage` is done to its payload: it passes its page checksum, and no release writes
+    /// it. Its parent records a fingerprint for it, so a batch that rewrites it by runs has no
+    /// cause to read its kept cells again, as it reads those of a leaf that is the root.
+    fn damaged_leaf(keys: &[u8], damage: impl FnOnce(&mut [u8])) -> (MemoryPageDevice, PageId) {
+        let mut pager = Pager::open_or_create(MemoryPageDevice::new(0).unwrap()).unwrap();
+        let mut transaction = pager.begin_write().unwrap();
+        let generation = transaction.generation().unwrap();
+        let leaf_of = |keys: &[u8]| {
+            let entries = keys.iter().map(|key| LeafEntry {
+                key: vec![*key],
+                value: LeafValue::Inline(vec![*key; 4]),
+            });
+            Node::leaf(TREE, generation, entries.collect())
+        };
+        let [leaf, sibling, root] = [(); 3].map(|()| transaction.allocate_page().unwrap());
+        let (mut page, hash) = leaf_of(keys).encode(leaf).unwrap();
+        damage(&mut page.payload);
+        transaction.write_new_page(&page).unwrap();
+        let sibling_hash = write_node(&mut transaction, sibling, &leaf_of(&[SIBLING])).unwrap();
+        let above = InternalEntry {
+            key: vec![SIBLING],
+            right_child: sibling,
+            child_hash: sibling_hash,
+        };
+        let node = Node::internal(TREE, generation, 1, leaf, hash, vec![above]);
+        write_node(&mut transaction, root, &node).unwrap();
+        transaction.commit(1, EMPTY_HASH, Some(root)).unwrap();
+        (pager.into_device(), root)
+    }
+
+    /// Exchanges the keys of cells `left` and `right` of a leaf [`damaged_leaf`] encoded.
+    fn exchange_keys(payload: &mut [u8], left: usize, right: usize) {
+        let (left, right) = (cell_at(payload, left), cell_at(payload, right));
+        payload.swap(left + LEAF_CELL_HEADER_SIZE, right + LEAF_CELL_HEADER_SIZE);
+    }
+
+    /// Exchanges the places of cells 2 and 3 of a leaf [`damaged_leaf`] encoded, which are as
+    /// long as each other, and their slots: the keys stay in order, and the cells no longer lie
+    /// in the order of their slots.
+    fn unpack(payload: &mut [u8]) {
+        let (left, right) = (cell_at(payload, 2), cell_at(payload, 3));
+        for byte in 0..left - right {
+            payload.swap(left + byte, right + byte);
+        }
+        let slots = NODE_HEADER_SIZE + 2 * SLOT_SIZE;
+        payload.swap(slots, slots + SLOT_SIZE);
+        payload.swap(slots + 1, slots + SLOT_SIZE + 1);
+    }
+
+    /// What a batch of `changes` to the first leaf of `device` comes to when it rewrites the leaf
+    /// by runs of kept cells, and when it rewrites it cell by cell: what the batch reported with
+    /// the keys the leaf then holds, or the code of the error.
+    fn rewritten(
+        (device, root): &(MemoryPageDevice, PageId),
+        changes: &[(u8, Option<&[u8]>)],
+    ) -> [std::result::Result<(BtreeBatch, Vec<u8>), String>; 2] {
+        let changes = changes
+            .iter()
+            .map(|(key, value)| (vec![*key], value.map(<[u8]>::to_vec)))
+            .collect::<Vec<_>>();
+        [false, true].map(|by_cell| {
+            let mut pager = Pager::open_or_create(device.clone()).unwrap();
+            let mut transaction = pager.begin_write().unwrap();
+            let batch = as_batch(&changes);
+            let applied = match by_cell {
+                false => Btree::apply(&mut transaction, Some(*root), TREE, &batch),
+                true => Btree::apply_by_cell(&mut transaction, Some(*root), TREE, &batch),
+            };
+            let applied = match applied {
+                Ok(applied) => applied,
+                Err(error) => {
+                    transaction.abort();
+                    return Err(error.code);
+                }
+            };
+            transaction
+                .commit(2, EMPTY_HASH, applied.root_page_id)
+                .unwrap();
+            // A batch that left the leaf as it was left its damage, which a cursor would refuse.
+            // One that wrote the leaf must have left a leaf that decodes with every check.
+            let mut keys = Vec::new();
+            if applied.hash.is_some() {
+                let root = applied.root_page_id.expect("the sibling keeps its entry");
+                let mut read = || {
+                    let mut cursor = Btree::validating_cursor(&mut pager, root, TREE)?;
+                    while let Some((key, _)) = cursor.next(&mut pager)? {
+                        keys.push(key[0]);
+                    }
+                    Ok(())
+                };
+                if let Err::<(), EngineError>(error) = read() {
+                    return Err(format!("wrote a leaf that reads as {}", error.code));
+                }
+                assert_eq!(keys.pop(), Some(SIBLING));
+            }
+            Ok((applied, keys))
+        })
+    }
+
+    #[test]
+    fn a_leaf_rewrite_refuses_what_a_cell_by_cell_rewrite_refuses() {
+        let keys = [1, 2, 3, 4, 5, 6, 7, 8];
+        let refused = |code: &str| [Err(code.to_string()), Err(code.to_string())];
+        // Each batch changes the leaf without its damage, by runs and by cell alike.
+        let sound = damaged_leaf(&keys, |_| {});
+        for changes in [
+            [(9, Some(&b"new"[..]))],
+            [(1, Some(b"new"))],
+            [(3, Some(b"new"))],
+        ] {
+            let [by_runs, by_cell] = rewritten(&sound, &changes);
+            assert_eq!(by_runs, by_cell);
+            assert!(by_runs.unwrap().0.hash.is_some());
+        }
+
+        // Two kept keys exchanged: the leaf holds 1, 2, 4, 3, 5, 6, 7, 8.
+        let exchanged = damaged_leaf(&keys, |payload| exchange_keys(payload, 2, 3));
+        assert_eq!(
+            rewritten(&exchanged, &[(9, Some(b"new"))]),
+            refused("INVALID_BTREE_PAGE")
+        );
+        // An upsert of 3 stops on 4, which is not it, and adds a second 3 before it.
+        assert_eq!(
+            rewritten(&exchanged, &[(3, Some(b"new"))]),
+            refused("INVALID_BTREE_PAGE")
+        );
+        // A kept cell with flags no release writes.
+        let flagged = damaged_leaf(&keys, |payload| {
+            let cell = cell_at(payload, 4);
+            payload[cell + 2] = 2;
+        });
+        assert_eq!(
+            rewritten(&flagged, &[(1, Some(b"new"))]),
+            refused("UNSUPPORTED_BTREE_PAGE")
+        );
+        // A kept cell whose value would end past the page.
+        let long = damaged_leaf(&keys, |payload| {
+            let cell = cell_at(payload, 4);
+            payload[cell + 4..cell + 8].copy_from_slice(&5_000_u32.to_le_bytes());
+        });
+        assert_eq!(
+            rewritten(&long, &[(1, Some(b"new"))]),
+            refused("INVALID_BTREE_PAGE")
+        );
+        // A kept cell whose slot points below the cells, into the slots.
+        let astray = damaged_leaf(&keys, |payload| {
+            let slot = NODE_HEADER_SIZE + 4 * SLOT_SIZE;
+            payload[slot..slot + SLOT_SIZE].copy_from_slice(&50_u16.to_le_bytes());
+        });
+        assert_eq!(
+            rewritten(&astray, &[(1, Some(b"new"))]),
+            refused("INVALID_BTREE_PAGE")
+        );
+    }
+
+    #[test]
+    fn a_leaf_rewrite_refuses_more_than_a_cell_by_cell_rewrite() {
+        let refused = |code: &str| Err(code.to_string());
+        let keys = [1, 2, 3, 4, 5, 6, 7, 8];
+        // Cells out of the order of their slots, with their keys in order. Cell by cell they are
+        // copied in slot order, which packs them; a run would be copied as it lies.
+        let unpacked = damaged_leaf(&keys, unpack);
+        let [by_runs, by_cell] = rewritten(&unpacked, &[(1, Some(b"new"))]);
+        assert_eq!(by_runs, refused("INVALID_BTREE_PAGE"));
+        assert_eq!(by_cell.unwrap().1, keys);
+
+        // The leaf holds 0, 1, 4, 2, and the batch removes the 4 that is out of order. Cell by
+        // cell, a removed cell is compared with neither neighbour, and the leaf comes out sound.
+        let exchanged = damaged_leaf(&[0, 1, 2, 4], |payload| exchange_keys(payload, 2, 3));
+        let [by_runs, by_cell] = rewritten(&exchanged, &[(2, None), (4, None)]);
+        assert_eq!(by_runs, refused("INVALID_BTREE_PAGE"));
+        let (applied, held) = by_cell.unwrap();
+        assert_eq!((applied.removed, held), (1, vec![0, 1, 2]));
+
+        // By runs, a batch checks every cell of a leaf it reaches before it knows whether it
+        // changes the leaf. Cell by cell, a batch that leaves the leaf as it was reads only the
+        // keys it passes and the cells its changes stop on, and so reports no change: for cells
+        // out of the order of their slots; for a key out of order whose own value an upsert
+        // repeats; and for a cell with flags no release writes, which it does not stop on.
+        let unchanged = |by_cell: std::result::Result<(BtreeBatch, Vec<u8>), String>| {
+            assert_eq!(by_cell.unwrap().0.hash, None);
+        };
+        let [by_runs, by_cell] = rewritten(&unpacked, &[(9, None)]);
+        assert_eq!(by_runs, refused("INVALID_BTREE_PAGE"));
+        unchanged(by_cell);
+        let [by_runs, by_cell] = rewritten(&exchanged, &[(4, Some(&[2; 4]))]);
+        assert_eq!(by_runs, refused("INVALID_BTREE_PAGE"));
+        unchanged(by_cell);
+        let flagged = damaged_leaf(&keys, |payload| {
+            let cell = cell_at(payload, 4);
+            payload[cell + 2] = 2;
+        });
+        let [by_runs, by_cell] = rewritten(&flagged, &[(9, None)]);
+        assert_eq!(by_runs, refused("UNSUPPORTED_BTREE_PAGE"));
+        unchanged(by_cell);
     }
 
     #[test]

@@ -142,6 +142,18 @@ index entries are compared only when it has both. The engine is 1.4 KiB
 smaller compressed, and deleting 8,000 rows by an indexed range runs 2%
 fewer instructions before optimization.
 
+A commit that changes some of a leaf's rows then copies the rest in runs. It
+had sized, copied and read again each cell it kept, one at a time. It now
+checks each cell once, as it merges the changes in, and copies each run of
+cells it keeps as one piece, moving their slots as far as the bytes moved.
+Before V8 has optimized the code, the commit of 1,000 updates or deletes by
+key takes three-tenths less time, a statement that commits by itself, as each
+single insert does, runs 12% fewer instructions, and the `LIKE` delete 18%
+fewer. The check is also wider than it was: every cell of a leaf a commit
+reaches is tested for its packing and its order, so a damaged leaf that still
+passes its checksum fails that commit, whether or not the commit would have
+changed it, rather than being written back.
+
 ### Comparing memory
 
 The WebAssembly build compares memory eight bytes at a time, in place of the

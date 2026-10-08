@@ -685,6 +685,34 @@ Found along the way:
   key with SQL planned as a map. Three faults put in on purpose each failed
   three to five tests. Instructions under baseline compilation: delete-pk
   -5.0%, the others within 0.3%; 169 bytes larger compressed.
+- A touched leaf is rewritten by runs of the cells it keeps. `LeafCell::Kept`
+  holds a range of consecutive cells, and the merge of a batch into a leaf is
+  a walk that passes every cell once and checks it as it does: that it reads
+  as a cell, that it ends where the cell before it starts, and that its key
+  is above the key before it. Every writer packs a leaf that way, so the
+  cells between two slots are the bytes between two offsets, and
+  `write_leaf_cells` copies a run with one slice copy and moves each of its
+  slots by as far as the bytes moved; it sums the cells' sizes a segment at
+  a time and sizes each cell only for a leaf that divides. The routines as
+  they were stay under `#[cfg(test)]`, and a test applies each batch both
+  ways to two pagers and compares what they report, every page and the order
+  of device writes, over the property test's cases and eighteen named ones,
+  on trees the batch writer built and on trees built a change at a time.
+  Thirteen workloads make the same device writes byte for byte. Instructions
+  under baseline compilation: delete-pk -14.7%, update-pk -12.8%,
+  insert-autocommit -12.0%, delete-like -18.4%, delete-range -3.7%,
+  update-scan -2.0%, the inserts and upsert unchanged; about half as much
+  once optimized. The commit of 1,000 updates by key takes 1.75 ms where it
+  took 2.50, and of 1,000 deletes 1.72 for 2.48. What changes is for leaves
+  that pass their checksum and that no release writes: one not packed in
+  slot order, or with a pair out of order that includes a cell the batch
+  names, fails the batch that reaches it with `INVALID_BTREE_PAGE`, where the
+  first was repacked and the second was never compared; a batch with two
+  reasons to fail may report the other; and since the walk checks before the
+  merge knows whether the leaf changes, a batch that would leave such a leaf
+  as it was fails too, where it reported no change. 0.76 KiB larger
+  compressed, over the 0.4 the step was allowed: the plan had counted on the
+  page image of its D2, which is not built.
 
 Found along the way, 6 and 7 October:
 
