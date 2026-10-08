@@ -69,22 +69,25 @@ fn word(bytes: &[u8], offset: usize) -> u64 {
 
 /// `memcmp` and `bcmp`, which the compiler calls to compare and to test slices for equality,
 /// provided here in place of the builtins' byte loops. Only the WebAssembly build defines them:
-/// a native test binary has its platform's.
+/// a native test binary has its platform's. Each is declared as the standard library declares
+/// it, over pointers to `c_void`, which the compiler checks a definition of its name against.
 #[cfg(target_arch = "wasm32")]
 mod overrides {
+    use std::ffi::c_void;
+
     /// # Safety
     /// `left` and `right` must each point to `length` readable bytes.
     #[unsafe(no_mangle)]
     pub(crate) unsafe extern "C" fn memcmp(
-        left: *const u8,
-        right: *const u8,
+        left: *const c_void,
+        right: *const c_void,
         length: usize,
     ) -> i32 {
         // SAFETY: the caller promises both pointers address `length` readable bytes.
         let (left, right) = unsafe {
             (
-                std::slice::from_raw_parts(left, length),
-                std::slice::from_raw_parts(right, length),
+                std::slice::from_raw_parts(left.cast::<u8>(), length),
+                std::slice::from_raw_parts(right.cast::<u8>(), length),
             )
         };
         super::compare(left, right) as i32
@@ -93,12 +96,16 @@ mod overrides {
     /// # Safety
     /// `left` and `right` must each point to `length` readable bytes.
     #[unsafe(no_mangle)]
-    pub(crate) unsafe extern "C" fn bcmp(left: *const u8, right: *const u8, length: usize) -> i32 {
+    pub(crate) unsafe extern "C" fn bcmp(
+        left: *const c_void,
+        right: *const c_void,
+        length: usize,
+    ) -> i32 {
         // SAFETY: the caller promises both pointers address `length` readable bytes.
         let (left, right) = unsafe {
             (
-                std::slice::from_raw_parts(left, length),
-                std::slice::from_raw_parts(right, length),
+                std::slice::from_raw_parts(left.cast::<u8>(), length),
+                std::slice::from_raw_parts(right.cast::<u8>(), length),
             )
         };
         i32::from(super::differ(left, right))
