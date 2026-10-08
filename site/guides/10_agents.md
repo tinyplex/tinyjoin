@@ -88,8 +88,9 @@ and has no OPFS, filesystem persistence, or remote synchronization. See the
 - Consult the
   [SQL compatibility contract](https://tinyjoin.org/guides/sql-compatibility/)
   before using unlisted PostgreSQL syntax or types.
-- Joins run left to right as bounded nested loops, without reordering or
-  index-based join lookup. Check actual workload size against the join limits.
+- Joins run in the order written, without reordering. Each joined table's
+  rows are found by primary key, through an index, or in a hash table. Check
+  actual workload size against the join limits.
 
 Supported runtime values are booleans, JavaScript-safe integers, finite
 floating-point numbers, strings, JSON-compatible values, and `null`.

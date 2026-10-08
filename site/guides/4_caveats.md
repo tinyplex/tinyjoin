@@ -35,8 +35,8 @@ The omissions most likely to matter are:
   lists of queries that do not aggregate, and no casts, `CASE`, or scalar
   functions.
 - No regular expressions, full-text search, `ANY`/`ALL`, or JSON path
-  operators. `LIKE` and `ILIKE` scan rather than use an index, and `ILIKE`
-  folds only ASCII letters.
+  operators. `LIKE` reads an index only for a pattern that begins with literal
+  characters, and `ILIKE` always scans, folding only ASCII letters.
 - No `INSERT ... SELECT`, `MERGE`, or `UPDATE ... FROM`.
 - No sequences, `SERIAL`, or generated identity. Generate text identifiers in
   the client.
@@ -149,12 +149,15 @@ Keep transactions short and request only the data your UI needs. Measure
 populated startup and larger batches with your application's data and target
 devices.
 
-The [transaction guide](/guides/transactions-and-changes/#inserting-many-rows)
-explains batching and validation costs. The
-[workload report](https://github.com/tinyplex/tinyjoin/tree/main/benchmarks)
-records detailed measurements, runtime hashes, and reproduction commands for
-mixed transactions, populated startup, and result materialization. Those
-measurements cover one desktop and Chromium version.
+The [benchmarks guide](/guides/benchmarks/) compares TinyJoin with SQLite and
+PGlite, one workload at a time, and says how each was measured. The
+[transaction guide](/guides/transactions-and-changes/#inserting-many-rows)
+explains batching and validation costs, and the repository's
+[workload measurements](https://github.com/tinyplex/tinyjoin/tree/main/benchmarks)
+record TinyJoin's own diagnostics, with runtime hashes and reproduction
+commands, for mixed transactions, populated startup, and result
+materialization. All of these measurements cover one desktop and Chromium
+version.
 
 ## If TinyJoin is not the right fit
 

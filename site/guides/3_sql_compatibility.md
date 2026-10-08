@@ -49,7 +49,9 @@ query(sql, params?, options?) executes one read or write statement with
 optional JSON-compatible `$1` parameters. exec(sql, options?) executes one or
 more statements without parameters as one implicit transaction and returns one
 result per statement. Both use `{rows, fields, affectedRows?, command?,
-rowCount?}` results; TinyJoin adds `revision` and `tables`. `fields` contains
+rowCount?}` results; TinyJoin adds `revision`, `tables`, and `keys`, the
+[changed keys](/guides/transactions-and-changes/#refreshing-individual-rows)
+of a write. `fields` contains
 ordered `{name, dataTypeID}` entries, including for empty typed results. Each
 object row lists its keys in that field order, and `rowMode: "array"` returns
 its values in that order. The `sql` tagged template
@@ -230,6 +232,10 @@ plain column, so `WHERE updated > created` and `WHERE price * quantity > $1`
 compare values worked out from the row. `IN`, `BETWEEN`, `LIKE`, and `IS NULL`
 take a plain column and literal or parameter values, and only `IN` takes a
 subquery. A join's `ON` clause still holds only column equalities.
+
+A predicate is one of the forms above, so a boolean column or literal is not
+one by itself. Write `WHERE done = true` or `WHERE done = false` rather than
+`WHERE done` or `WHERE NOT done`.
 
 ### Subqueries
 
@@ -792,9 +798,10 @@ After `RECOVERY_REQUIRED`, `STORAGE_COMMIT_OUTCOME_UNKNOWN`, or
 reconcile stored state before replaying a write. The `retryable` flag is not a
 safe-replay guarantee. See [storage recovery](/guides/storage-and-lifecycle/#recovering-after-an-uncertain-write).
 
-Requests are serialized through one Worker. OPFS persistence permits one open
-Worker for a database name; it is an exclusive writer rather than a
-PostgreSQL-style set of concurrent sessions. There is no MVCC session model,
+Requests are serialized through one database-owning Worker. Clients that open
+the same OPFS name, in any tab, share that owner rather than opening the
+database again, so it is an exclusive writer rather than a PostgreSQL-style
+set of concurrent sessions. There is no MVCC session model,
 isolation-level selection, user-controlled savepoints, lock manager, or
 deadlock detection. Different OPFS names are independent databases and do not
 synchronize with one another.
