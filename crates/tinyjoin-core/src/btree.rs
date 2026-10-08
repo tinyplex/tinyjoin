@@ -2263,14 +2263,14 @@ impl LeafWalk<'_> {
                     Err(error) => break 'refused error,
                 };
                 let order = match bound {
-                    Some(bound) => key.cmp(bound),
+                    Some(bound) => key_order(key, bound),
                     None => Ordering::Less,
                 };
                 if order == Ordering::Greater {
                     break;
                 }
                 let ordered = match self.previous {
-                    Some(previous) => key.cmp(previous) == Ordering::Greater,
+                    Some(previous) => key_order(key, previous) == Ordering::Greater,
                     None => true,
                 };
                 if end != self.floor {
@@ -4335,9 +4335,12 @@ fn validate_child_generation(
     Ok(())
 }
 
-/// The order of a cell's key and the key searched for, as the slices order, decided without a
-/// call when their first eight bytes decide it. The lowest byte in which two little-endian words
-/// differ is the first byte in which the keys do.
+/// The order of a cell's key and another key, as the slices order, decided without a call when
+/// their first eight bytes decide it: when they differ there, or are those eight bytes and no
+/// more, as the key of an integer is. The lowest byte in which two little-endian words differ
+/// is the first byte in which the keys do. A lookup's search of a node compares each key it
+/// probes through this, and the walk of a leaf a batch rewrites compares every cell's twice,
+/// where a comparison of slices is a call that makes two more.
 #[inline(always)]
 fn key_order(cell: &[u8], key: &[u8]) -> Ordering {
     if let (Some(cell_start), Some(key_start)) = (cell.first_chunk::<8>(), key.first_chunk::<8>()) {

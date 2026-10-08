@@ -713,6 +713,16 @@ Found along the way:
   as it was fails too, where it reported no change. 0.76 KiB larger
   compressed, over the 0.4 the step was allowed: the plan had counted on the
   page image of its D2, which is not built.
+- The walk of a leaf compares keys through `key_order`, the comparison a
+  lookup's search uses, which decides keys of eight bytes as words with no
+  call: the walk compares nearly every cell's key twice, with the change it
+  is looking for and with the key before it, 18,808 comparisons in the commit
+  of 1,000 updates, each of which was a call that made two more. Instructions
+  under baseline compilation: delete-pk -3.8%, update-pk -3.2%, the commit of
+  1,000 updates by key 1.58 ms for 1.75, of 1,000 deletes 1.57 for 1.72;
+  0.1 KiB larger compressed. With the rewrite by runs, against the commit as
+  it was: delete-pk -15.5%, update-pk -14.1%, insert-autocommit -14.2%,
+  delete-like -23.2%, delete-range -6.7%, update-scan -2.4%.
 
 Found along the way, 6 and 7 October:
 
