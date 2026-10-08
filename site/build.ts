@@ -198,6 +198,13 @@ export const build = async (
   for (const [pattern, replacement] of benchmarks.chartReplacers) {
     docs.addReplacer(pattern, replacement);
   }
+  // The release a declaration arrived in stays in its comment, where the
+  // declarations and the full reference carry it, but is not a section of its
+  // page, where it drew more attention than it merits.
+  docs.addReplacer(
+    /<section class="s\d"><h\d>Since<\/h\d><p>v[\d.]+<\/p><\/section>/g,
+    '',
+  );
 
   await docs.generateNodes({
     group: getSorter(GROUPS),
