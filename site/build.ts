@@ -9,7 +9,7 @@ import type {Benchmarks} from './benchmarks.ts';
 import {getBenchmarks} from './benchmarks.ts';
 import {MainInner} from './ui/MainInner.tsx';
 import {MarkdownPage} from './ui/MarkdownPage.tsx';
-import {Page} from './ui/Page.tsx';
+import {DESCRIPTION, Page} from './ui/Page.tsx';
 
 const GROUPS = ['Classes', 'Interfaces', 'Functions', '*', 'Type aliases'];
 const CATEGORIES = [
@@ -140,12 +140,29 @@ const hideInheritedErrorMembers = (reflection: any): void => {
   );
 };
 
+// The package's description is the site's, whose first words follow the
+// published benchmarks. A literal in package.json cannot follow them, so the
+// build says when the two have parted, rather than publish one that claims
+// more than was measured.
+const assertPackageDescription = (): void => {
+  const {description} = JSON.parse(
+    readFileSync(resolve(repositoryRoot, 'package.json'), 'utf8'),
+  );
+  if (description !== DESCRIPTION) {
+    throw new Error(
+      `package.json describes TinyJoin as "${description}", ` +
+        `and the site as "${DESCRIPTION}"`,
+    );
+  }
+};
+
 export const build = async (
   outDir = 'docs',
   typesDir = 'dist/@types',
   publicMarkdownDir = repositoryRoot,
   packageDir = resolve(typesDir, '..'),
 ): Promise<void> => {
+  assertPackageDescription();
   const benchmarks = getBenchmarks();
   const docs = createDocs('https://tinyjoin.org', outDir)
     .addJsFile('site/js/site.ts')

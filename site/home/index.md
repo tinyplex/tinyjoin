@@ -2,10 +2,12 @@
 
 <section id="hero">
   <h2>
-    A tiny, worker-first <em>relational database</em> for browser apps.
+    {{benchmarks.epithet}} <em>relational database</em> for your web app.
   </h2>
   <p>
-    PostgreSQL-shaped SQL, running locally and away from the main thread.
+    {{benchmarks.claim}} of
+    <a href="/guides/benchmarks/">our benchmarks</a>. PostgreSQL-shaped SQL,
+    running locally and away from the main thread.
   </p>
 </section>
 
@@ -17,14 +19,24 @@
 
 ---
 
+> ## {{benchmarks.heading}}
+>
+> Each engine runs the same SQL in a browser Worker, with its database on OPFS.
+> {{benchmarks.tally}}, from opening a database to reading, writing, joining,
+> and committing. The Benchmarks guide has every result, and how to run them
+> yourself.
+>
+> And all of TinyJoin is {{sizes.total.gzip}} to download, gzipped, where
+> SQLite is {{benchmarks.sqlite-download}} and PGlite
+> {{benchmarks.pglite-download}}.
+
+{{benchmarks.highlights}}
+
 > ## Small enough to not worry about
 >
-> The whole database - the main-thread client, the Worker host, and the Rust
-> WASM engine - is {{sizes.total.gzip}} gzipped, and only {{sizes.client.gzip}}
-> of that ever runs on the UI thread.
-> 
-> And it's quite fast! Check our Benchmarks guide for empirical comparisons with
-> other client databases.
+> Of that download, only {{sizes.client.gzip}} is the client that runs on the
+> UI thread. The rest is the Worker host and the Rust WASM engine, which do
+> their work away from it.
 
 | Component      |                     gzip |
 | -------------- | -----------------------: |

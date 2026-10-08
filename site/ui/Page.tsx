@@ -1,4 +1,5 @@
 import {useBaseUrl, usePageNode, useRootNode} from 'tinydocs';
+import {getBenchmarks} from '../benchmarks.ts';
 import {Footer} from './Footer.tsx';
 import {Header} from './Header.tsx';
 import {Home} from './Home.tsx';
@@ -6,8 +7,12 @@ import {MainInner} from './MainInner.tsx';
 
 const GTM_ID = 'G-40B96SPQX2';
 
-const DESCRIPTION =
-  'A tiny, worker-first relational database for browser apps.';
+// The site's description is the homepage's headline, whose first words are
+// only as strong as the published benchmarks support. package.json carries the
+// same sentence, which the build holds it to.
+export const DESCRIPTION = getBenchmarks().renderText(
+  '{{benchmarks.epithet}} relational database for your web app.',
+);
 
 // For now, only the benchmarks guide has a share image of its own: the
 // benchmark card, which npm run build:card captures from its results.

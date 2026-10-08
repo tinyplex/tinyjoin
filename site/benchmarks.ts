@@ -375,8 +375,75 @@ const probes = (report: Report): string => {
   return sentences.join(' ');
 };
 
+// The homepage's claims are written here rather than in its Markdown, so that
+// they are only ever as strong as the published run supports: the
+// superlatives stand while TinyJoin's download is the smallest of the three
+// and it is the fastest engine in every workload, and a later run that shows
+// otherwise leaves the page with plainer words and the count it measured.
+const OTHERS = `${ENGINES[1][1]} and ${ENGINES[2][1]}`;
+
+const sweeps = (report: Report): boolean =>
+  placingCounts(report)[0][0] == report.results.length;
+
+// The words the homepage's headline begins with.
+const epithet = (report: Report): string =>
+  isSmallest(report) && sweeps(report)
+    ? 'The smallest, fastest'
+    : 'A tiny, fast';
+
+// The heading of the homepage's first section.
+const heading = (report: Report): string =>
+  isSmallest(report) && sweeps(report)
+    ? `Smaller and faster than ${OTHERS}`
+    : `Measured against ${OTHERS}`;
+
+// The claim under the homepage's headline, up to the words that link to the
+// guide: how TinyJoin's download and its placings compare with the other two
+// engines' in the published run.
+const claim = (report: Report): string => {
+  const total = report.results.length;
+  const speed = sweeps(report)
+    ? `faster than both in all ${total} workloads`
+    : `the fastest of the three in ${placingCounts(report)[0][0]} of the ` +
+      `${total} workloads`;
+  return isSmallest(report)
+    ? `Smaller than ${OTHERS}, and ${speed}`
+    : `Beside ${OTHERS}, ${speed}`;
+};
+
+// The count of TinyJoin's wins, for the homepage's first section, whose heading
+// has already said how it compares.
+const tally = (report: Report): string => {
+  const total = report.results.length;
+  return sweeps(report)
+    ? `TinyJoin is the fastest in all ${total} of the workloads we measure`
+    : `TinyJoin is the fastest in ${placingCounts(report)[0][0]} of the ` +
+        `${total} workloads we measure`;
+};
+
+// An engine's compressed download, as the homepage compares them.
+const downloadOf = (report: Report, engine: string): string => {
+  const gzip = report.download[engine]?.gzip;
+  if (gzip == null) {
+    throw new Error(`No published download size for ${engine}`);
+  }
+  return formatBytes(gzip);
+};
+
 const renderText = (report: Report, name: string): string => {
   switch (name) {
+    case 'epithet':
+      return epithet(report);
+    case 'heading':
+      return heading(report);
+    case 'claim':
+      return claim(report);
+    case 'tally':
+      return tally(report);
+    case 'sqlite-download':
+      return downloadOf(report, 'sqlite');
+    case 'pglite-download':
+      return downloadOf(report, 'pglite');
     case 'versions':
       return versions(report);
     case 'workloads':
@@ -454,6 +521,10 @@ const compare = (
     other: ENGINES[other][1],
   };
 };
+
+// Whether TinyJoin's compressed download is the smallest of the three.
+const isSmallest = (report: Report): boolean =>
+  compare(report, downloadMeasure(report, ['gzip', 'Download (gzip)'])).leads;
 
 // A tile: its title, how TinyJoin compares with the nearest other engine, and
 // a bar per engine, fastest first, on a scale on which the slowest reaches the
@@ -543,17 +614,13 @@ const cardWins = (report: Report): string => {
 const cardHeadline = (report: Report): string => {
   const [fastest, second, slowest] = placingCounts(report)[0];
   const total = report.results.length;
-  const smallest = compare(
-    report,
-    downloadMeasure(report, ['gzip', 'Download (gzip)']),
-  ).leads;
   return (
     (fastest == total
       ? `Fastest in all ${total} workloads.`
       : `Fastest in ${fastest} of ${total} workloads.`) +
     '<br /><em>' +
     (fastest == total
-      ? smallest
+      ? isSmallest(report)
         ? 'And of course the tiniest.'
         : 'Second to none.'
       : slowest == 0
@@ -608,10 +675,33 @@ export type Benchmarks = {
   renderCard: (template: string, release: string) => string;
 };
 
+// The workloads the homepage draws side by side, one of each kind of work, each
+// under a label short enough to sit beside its bars in half the page's width.
+const HIGHLIGHTS: [id: string, label: string][] = [
+  ['cold-open', 'Open a new database'],
+  ['select-all', 'Read 10,000 rows'],
+  ['select-pk', '1,000 reads by key'],
+  ['update-pk', '1,000 updates by key'],
+  ['insert-transaction', '10,000 inserts'],
+  ['insert-autocommit', '1,000 commits'],
+  ['join', '100 joins'],
+];
+
+const highlightsChart = (report: Report): Chart => ({
+  unit: 'ms',
+  measures: HIGHLIGHTS.map(([id, label]) => ({
+    ...timeChart(report, [id]).measures[0],
+    label,
+  })),
+});
+
 const createBenchmarks = (report: Report): Benchmarks => {
-  // The report's charts: its download sizes, and one for each workload group,
-  // named by the group.
-  const charts = new Map<string, Chart>([['download', downloadChart(report)]]);
+  // The report's charts: its download sizes, the homepage's highlights, and
+  // one for each workload group, named by the group.
+  const charts = new Map<string, Chart>([
+    ['download', downloadChart(report)],
+    ['highlights', highlightsChart(report)],
+  ]);
   for (const group of new Set(
     report.results.map(({group}) => group.toLowerCase()),
   )) {

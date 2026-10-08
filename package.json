@@ -83,7 +83,7 @@
     "url": "https://github.com/tinyplex/tinyjoin/issues"
   },
   "license": "MIT",
-  "description": "A tiny, worker-first relational database for browser apps.",
+  "description": "The smallest, fastest relational database for your web app.",
   "keywords": [
     "postgresql",
     "database",
