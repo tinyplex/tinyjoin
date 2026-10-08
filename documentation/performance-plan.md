@@ -723,6 +723,18 @@ Found along the way:
   0.1 KiB larger compressed. With the rewrite by runs, against the commit as
   it was: delete-pk -15.5%, update-pk -14.1%, insert-autocommit -14.2%,
   delete-like -23.2%, delete-range -6.7%, update-scan -2.4%.
+- The host answers a mutation before it merges its changed keys. Its
+  `emitInvalidation` merged an outcome's keys into the pending event at once,
+  one `JSON.stringify` and two set operations a key, before the request's
+  response was posted; the outcomes are now kept, and merged in the task
+  that posts the event. That takes 0.24 ms off the acknowledgement of a
+  commit that changed 1,000 rows, which is what update-pk, delete-pk and
+  upsert each commit: 1,000 is also the most keys a table reports. The
+  whole-stack harness does not show it. Delivering messages in microtasks,
+  it never runs a timer between a workload's setup and its timed phase, so
+  the pending event still held the setup's table as changed too widely to
+  list, and the merge returned at once; with `--tasks` the merge reads
+  0.24 ms there too.
 
 Found along the way, 6 and 7 October:
 

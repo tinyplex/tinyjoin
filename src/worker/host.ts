@@ -139,7 +139,12 @@ export const startWorker = (
   let closed = false;
   let pendingRevision = 0;
   const pendingTables = new Set<string>();
-  const pendingKeys: PendingChangedKeys = new Map();
+  // The outcomes the next event announces. Their changed keys are merged only
+  // as that event is made, a task after the outcome's own request is answered:
+  // merging reads every key, a thousand of them for a table that changed that
+  // many rows, which the caller whose commit changed them would otherwise wait
+  // for before its acknowledgement.
+  const pendingOutcomes: ApplyOutcome[] = [];
   let invalidationScheduled = false;
   let activeTransactionId: string | undefined;
   let nextTransactionId = 1;
@@ -165,7 +170,11 @@ export const startWorker = (
     for (const table of outcome.tables) {
       pendingTables.add(table);
     }
-    mergeChangedKeys(pendingKeys, outcome.tables, outcome.keys);
+    // An outcome that changed no table has nothing to merge, and may come
+    // when no event is due to take it away.
+    if (outcome.tables.length > 0) {
+      pendingOutcomes.push(outcome);
+    }
     if (invalidationScheduled || pendingTables.size === 0) {
       return;
     }
@@ -177,6 +186,10 @@ export const startWorker = (
       if (closed || pendingTables.size === 0) {
         return;
       }
+      const pendingKeys: PendingChangedKeys = new Map();
+      for (const {tables, keys} of pendingOutcomes) {
+        mergeChangedKeys(pendingKeys, tables, keys);
+      }
       const event: WorkerEvent = {
         v: PROTOCOL_VERSION,
         event: 'tablesChanged',
@@ -187,7 +200,7 @@ export const startWorker = (
         },
       };
       pendingTables.clear();
-      pendingKeys.clear();
+      pendingOutcomes.length = 0;
       scope.postMessage(event);
     }, 0);
   };

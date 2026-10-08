@@ -3379,6 +3379,11 @@ to 22.9, deletes by key from 30.0 to 23.8, and selects by key from 27.7 to
 22.1; 10,000 inserts in a transaction fell from 247 ms to 200, and into an
 indexed table from 259 to 207.
 
+The Worker also answers a statement or a commit before it merges the keys
+that were changed into the change event that follows, where it merged them
+first. A commit that changed 1,000 rows is acknowledged about a quarter of a
+millisecond sooner.
+
 A statement's parameters are read from their array one by one, so an array
 that could not be copied whole, such as a reactive proxy of an array of plain
 values, is now sent, where it failed with `WORKER_POST_FAILED`.

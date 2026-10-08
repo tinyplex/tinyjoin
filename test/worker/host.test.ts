@@ -438,6 +438,82 @@ describe('startWorker', () => {
     ]);
   });
 
+  it('answers a mutation before it reads the keys its event will list', async () => {
+    const scope = new FakeScope();
+    const engine = mockEngine();
+    // What happened, in order: a key read, which merging does to tell it from
+    // the keys before it, and a message posted.
+    const log: string[] = [];
+    const key = (id: number) => ({
+      get id() {
+        log.push(`read ${id}`);
+        return id;
+      },
+    });
+    // Two statements that list the keys they changed, one key in both, and of
+    // which the second also changed a table too widely to list its keys.
+    const outcomes = [
+      {tables: ['posts'], keys: {posts: [key(1), key(2)]}},
+      {tables: ['posts', 'users'], keys: {posts: [key(2), key(3)]}},
+    ];
+    let revision = 0;
+    engine.executeSql = vi.fn(() => ({
+      command: 'UPDATE',
+      rowCount: 2,
+      data: sqlData([], []),
+      ...outcomes[revision]!,
+      revision: ++revision,
+    }));
+    startWorker({scope, durableEngineFactory: async () => engine});
+
+    scope.send({
+      v: PROTOCOL_VERSION,
+      id: 1,
+      method: 'init',
+      params: {storage: {kind: 'memory'}},
+    } satisfies WorkerRequest);
+    await waitForPosted(scope, 1);
+    scope.posted.length = 0;
+    const post = scope.postMessage.bind(scope);
+    scope.postMessage = (message) => {
+      log.push(
+        'event' in message
+          ? 'event'
+          : `answer ${Array.isArray(message) ? message[1] : message.id}`,
+      );
+      post(message);
+    };
+
+    for (const id of [2, 3]) {
+      scope.send({
+        v: PROTOCOL_VERSION,
+        id,
+        method: 'executeSql',
+        params: {sql: 'UPDATE posts SET id = id', params: []},
+      } satisfies WorkerRequest);
+    }
+    await waitForPosted(scope, 3);
+
+    // Both were answered before a key was read, and the keys were merged, each
+    // once, as the event was made.
+    expect(log.slice(0, 2)).toEqual(['answer 2', 'answer 3']);
+    expect(log.at(-1)).toBe('event');
+    expect(log.filter((entry) => entry.startsWith('read')).length).toBe(4);
+    const event = scope.posted.find(
+      (message): message is WorkerEvent => 'event' in message,
+    )!;
+    log.length = 0;
+    expect(JSON.parse(JSON.stringify(event))).toEqual({
+      v: PROTOCOL_VERSION,
+      event: 'tablesChanged',
+      payload: {
+        revision: 2,
+        tables: ['posts', 'users'],
+        keys: {posts: [{id: 1}, {id: 2}, {id: 3}]},
+      },
+    });
+  });
+
   it('invalidates writable SQL immediately but a transaction only when it commits', async () => {
     const scope = new FakeScope();
     const engine = mockEngine();
