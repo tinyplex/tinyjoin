@@ -536,17 +536,29 @@ const cardWins = (report: Report): string => {
     .join('');
 };
 
+// The card's headline: how many workloads TinyJoin is the fastest in, and under
+// it the next thing worth saying. Where it is the fastest in all of them, a
+// line about its other placings would only repeat the first, so the second is
+// about its size instead, when its download is also the smallest of the three.
 const cardHeadline = (report: Report): string => {
   const [fastest, second, slowest] = placingCounts(report)[0];
   const total = report.results.length;
+  const smallest = compare(
+    report,
+    downloadMeasure(report, ['gzip', 'Download (gzip)']),
+  ).leads;
   return (
     (fastest == total
       ? `Fastest in all ${total} workloads.`
       : `Fastest in ${fastest} of ${total} workloads.`) +
     '<br /><em>' +
-    (slowest == 0
-      ? 'Never the slowest.'
-      : `Second in ${second}, and the slowest in ${slowest}.`) +
+    (fastest == total
+      ? smallest
+        ? 'And of course the tiniest.'
+        : 'Second to none.'
+      : slowest == 0
+        ? 'Never the slowest.'
+        : `Second in ${second}, and the slowest in ${slowest}.`) +
     '</em>'
   );
 };
