@@ -504,60 +504,211 @@
 {
   /**
    * The postMessage method sends a request to the Worker.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   * import type {WorkerLike} from 'tinyjoin';
+   *
+   * // The application's worker.ts calls startWorker() from tinyjoin/worker.
+   * const worker: WorkerLike = new Worker(
+   *   new URL('./worker.ts', import.meta.url),
+   *   {type: 'module'},
+   * );
+   *
+   * // Count the requests the Client posts to its Worker.
+   * let requests = 0;
+   * const post = worker.postMessage.bind(worker);
+   * worker.postMessage = (message) => {
+   *   requests++;
+   *   post(message);
+   * };
+   *
+   * const db = await create({worker});
+   * console.log(requests > 0);
+   * // -> true
+   * await db.close();
+   * ```
    * @category Worker
    * @since v0.0.5
    */
   /// WorkerLike.postMessage
 
   /**
-   * This addEventListener overload listens for Worker messages.
+   * The overload of this method for the `message` event type listens for Worker
+   * messages.
    * @param type The `message` event type.
    * @param listener The callback receiving messages from the Worker.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   * import type {WorkerLike} from 'tinyjoin';
+   *
+   * const worker: WorkerLike = new Worker(
+   *   new URL('./worker.ts', import.meta.url),
+   *   {type: 'module'},
+   * );
+   *
+   * // Count the messages the Worker sends, beside the Client's own listener.
+   * let messages = 0;
+   * worker.addEventListener('message', () => {
+   *   messages++;
+   * });
+   *
+   * const db = await create({worker});
+   * console.log(messages > 0);
+   * // -> true
+   * await db.close();
+   * ```
    * @category Worker
    * @since v0.0.5
    */
   /// WorkerLike.addEventListener.message
 
   /**
-   * This addEventListener overload listens for message decoding failures.
+   * The overload of this method for the `messageerror` event type listens for
+   * message decoding failures.
    * @param type The `messageerror` event type.
    * @param listener The callback receiving message decoding failures.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   * import type {WorkerLike} from 'tinyjoin';
+   *
+   * const worker: WorkerLike = new Worker(
+   *   new URL('./worker.ts', import.meta.url),
+   *   {type: 'module'},
+   * );
+   *
+   * // Report a message from the Worker that the page could not decode.
+   * worker.addEventListener('messageerror', () => {
+   *   console.error('A message from the Worker could not be decoded.');
+   * });
+   *
+   * const db = await create({worker});
+   * await db.close();
+   * ```
    * @category Worker
    * @since v0.0.5
    */
   /// WorkerLike.addEventListener.messageerror
 
   /**
-   * This addEventListener overload listens for Worker runtime failures.
+   * The overload of this method for the `error` event type listens for Worker
+   * runtime failures.
    * @param type The `error` event type.
    * @param listener The callback receiving Worker runtime failures.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   * import type {WorkerLike} from 'tinyjoin';
+   *
+   * const worker: WorkerLike = new Worker(
+   *   new URL('./worker.ts', import.meta.url),
+   *   {type: 'module'},
+   * );
+   *
+   * // Report an error the Worker did not catch, such as a script that failed
+   * // to load.
+   * worker.addEventListener('error', (event) => {
+   *   console.error('The TinyJoin Worker failed:', event.message);
+   * });
+   *
+   * const db = await create({worker});
+   * await db.close();
+   * ```
    * @category Worker
    * @since v0.0.5
    */
   /// WorkerLike.addEventListener.error
 
   /**
-   * This removeEventListener overload removes a message listener.
+   * The overload of this method for the `message` event type removes a message
+   * listener.
    * @param type The `message` event type.
    * @param listener The same callback passed to addEventListener.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   * import type {WorkerLike} from 'tinyjoin';
+   *
+   * const worker: WorkerLike = new Worker(
+   *   new URL('./worker.ts', import.meta.url),
+   *   {type: 'module'},
+   * );
+   *
+   * let messages = 0;
+   * const countMessage = (): void => {
+   *   messages++;
+   * };
+   * worker.addEventListener('message', countMessage);
+   *
+   * const db = await create({worker});
+   * // Count only the messages it took to open the database.
+   * worker.removeEventListener('message', countMessage);
+   * console.log(messages > 0);
+   * // -> true
+   * await db.close();
+   * ```
    * @category Worker
    * @since v0.0.5
    */
   /// WorkerLike.removeEventListener.message
 
   /**
-   * This removeEventListener overload removes a message-error listener.
+   * The overload of this method for the `messageerror` event type removes a
+   * message-error listener.
    * @param type The `messageerror` event type.
    * @param listener The same callback passed to addEventListener.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   * import type {WorkerLike} from 'tinyjoin';
+   *
+   * const worker: WorkerLike = new Worker(
+   *   new URL('./worker.ts', import.meta.url),
+   *   {type: 'module'},
+   * );
+   *
+   * const reportUndecoded = (): void => {
+   *   console.error('A message from the Worker could not be decoded.');
+   * };
+   * worker.addEventListener('messageerror', reportUndecoded);
+   *
+   * const db = await create({worker});
+   * await db.close();
+   * // The Worker has stopped, so there is nothing left to report.
+   * worker.removeEventListener('messageerror', reportUndecoded);
+   * ```
    * @category Worker
    * @since v0.0.5
    */
   /// WorkerLike.removeEventListener.messageerror
 
   /**
-   * This removeEventListener overload removes a Worker error listener.
+   * The overload of this method for the `error` event type removes a Worker
+   * error listener.
    * @param type The `error` event type.
    * @param listener The same callback passed to addEventListener.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   * import type {WorkerLike} from 'tinyjoin';
+   *
+   * const worker: WorkerLike = new Worker(
+   *   new URL('./worker.ts', import.meta.url),
+   *   {type: 'module'},
+   * );
+   *
+   * const reportFailure = (): void => {
+   *   console.error('The TinyJoin Worker failed.');
+   * };
+   * worker.addEventListener('error', reportFailure);
+   *
+   * const db = await create({worker});
+   * await db.close();
+   * // The Worker has stopped, so there is nothing left to report.
+   * worker.removeEventListener('error', reportFailure);
+   * ```
    * @category Worker
    * @since v0.0.5
    */
@@ -689,6 +840,26 @@
    * @param params JSON-compatible values for `$1`, `$2`, and so on.
    * @param options Result-shape options.
    * @returns A Promise resolving to the statement results.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   *
+   * const db = await create();
+   * await db.exec(`
+   *   CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL)
+   * `);
+   * const insert = await db.prepare(
+   *   'INSERT INTO tasks (id, title) VALUES ($1, $2)',
+   * );
+   * await insert.execute(['a', 'Write docs']);
+   * await insert.execute(['b', 'Ship release']);
+   *
+   * const {rows} = await db.query('SELECT title FROM tasks ORDER BY id');
+   * console.log(rows);
+   * // -> [{title: 'Write docs'}, {title: 'Ship release'}]
+   * await insert.close();
+   * await db.close();
+   * ```
    * @category SQL
    * @since v0.0.5
    */
@@ -697,6 +868,22 @@
   /**
    * The close method seals the handle and releases its Worker resources after
    * already-started executions settle.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   *
+   * const db = await create();
+   * await db.exec(`
+   *   CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL)
+   * `);
+   * const select = await db.prepare('SELECT * FROM tasks WHERE id = $1');
+   * await select.execute(['a']);
+   *
+   * await select.close();
+   * console.log(select.closed);
+   * // -> true
+   * await db.close();
+   * ```
    * @category Lifecycle
    * @since v0.0.5
    */
@@ -728,6 +915,28 @@
   /**
    * The query method runs one parameterized statement against staged data.
    * @returns A Promise resolving to the statement results.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   *
+   * const db = await create();
+   * await db.exec(`
+   *   CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL)
+   * `);
+   * await db.transaction(async (tx) => {
+   *   await tx.query('INSERT INTO tasks (id, title) VALUES ($1, $2)', [
+   *     'a',
+   *     'Write docs',
+   *   ]);
+   *   // A read inside the transaction sees the rows it has staged.
+   *   const {rows} = await tx.query('SELECT title FROM tasks WHERE id = $1', [
+   *     'a',
+   *   ]);
+   *   console.log(rows);
+   *   // -> [{title: 'Write docs'}]
+   * });
+   * await db.close();
+   * ```
    * @category Transactions
    * @since v0.0.5
    */
@@ -736,6 +945,29 @@
   /**
    * The sql method is a parameterizing tagged-template form of query.
    * @returns A Promise resolving to the statement results.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   *
+   * const db = await create();
+   * await db.exec(`
+   *   CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL)
+   * `);
+   * const tasks = [
+   *   {id: 'a', title: 'Write docs'},
+   *   {id: 'b', title: 'Ship release'},
+   * ];
+   * await db.transaction(async (tx) => {
+   *   for (const {id, title} of tasks) {
+   *     await tx.sql`INSERT INTO tasks (id, title) VALUES (${id}, ${title})`;
+   *   }
+   * });
+   *
+   * const {rows} = await db.query('SELECT id FROM tasks ORDER BY id');
+   * console.log(rows);
+   * // -> [{id: 'a'}, {id: 'b'}]
+   * await db.close();
+   * ```
    * @category Transactions
    * @since v0.0.5
    */
@@ -744,6 +976,25 @@
   /**
    * The exec method runs a parameter-free DML and read script as one savepoint.
    * @returns A Promise resolving to one result per statement, in script order.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   *
+   * const db = await create();
+   * await db.exec(`
+   *   CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL)
+   * `);
+   * await db.transaction(async (tx) => {
+   *   const results = await tx.exec(`
+   *     INSERT INTO tasks (id, title) VALUES ('a', 'Write docs');
+   *     INSERT INTO tasks (id, title) VALUES ('b', 'Ship release');
+   *     SELECT id FROM tasks ORDER BY id;
+   *   `);
+   *   console.log(results[2].rows);
+   *   // -> [{id: 'a'}, {id: 'b'}]
+   * });
+   * await db.close();
+   * ```
    * @category Transactions
    * @since v0.0.5
    */
@@ -752,6 +1003,29 @@
   /**
    * The execute method runs a prepared statement owned by the same Client.
    * @returns A Promise resolving to the statement results.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   *
+   * const db = await create();
+   * await db.exec(`
+   *   CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL)
+   * `);
+   * // Prepare the statement before the transaction, and run it inside.
+   * const insert = await db.prepare(
+   *   'INSERT INTO tasks (id, title) VALUES ($1, $2)',
+   * );
+   * await db.transaction(async (tx) => {
+   *   await tx.execute(insert, ['a', 'Write docs']);
+   *   await tx.execute(insert, ['b', 'Ship release']);
+   * });
+   *
+   * const {rows} = await db.query('SELECT id FROM tasks ORDER BY id');
+   * console.log(rows);
+   * // -> [{id: 'a'}, {id: 'b'}]
+   * await insert.close();
+   * await db.close();
+   * ```
    * @category Transactions
    * @since v0.0.5
    */
@@ -759,6 +1033,29 @@
 
   /**
    * The rollback method explicitly discards the staged transaction.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   *
+   * const db = await create();
+   * await db.exec(`
+   *   CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL)
+   * `);
+   * await db.transaction(async (tx) => {
+   *   await tx.query('INSERT INTO tasks (id, title) VALUES ($1, $2)', [
+   *     'a',
+   *     'Write docs',
+   *   ]);
+   *   await tx.rollback();
+   *   console.log(tx.closed);
+   *   // -> true
+   * });
+   *
+   * const {rows} = await db.query('SELECT * FROM tasks');
+   * console.log(rows);
+   * // -> []
+   * await db.close();
+   * ```
    * @category Transactions
    * @since v0.0.5
    */
@@ -785,9 +1082,24 @@
 /// Client
 {
   /**
-   * The constructor begins opening a Client immediately.
+   * The constructor begins opening a Client immediately, and returns before the
+   * Client is ready.
    *
-   * Prefer create unless code specifically needs the waitReady lifecycle.
+   * Prefer the create function, which constructs a Client and resolves once it
+   * is ready, unless code specifically needs the waitReady lifecycle.
+   * @example
+   * ```ts
+   * import {Client} from 'tinyjoin';
+   *
+   * const db = new Client({dataDir: 'opfs://my-app-v1'});
+   * console.log(db.ready);
+   * // -> false
+   *
+   * await db.waitReady;
+   * console.log(db.ready);
+   * // -> true
+   * await db.close();
+   * ```
    * @category Lifecycle
    * @since v0.0.5
    */
@@ -829,6 +1141,48 @@
    * @param params JSON-compatible values for `$1`, `$2`, and so on.
    * @param options Result-shape options.
    * @returns A Promise resolving to the statement results.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   *
+   * const db = await create();
+   * await db.query(
+   *   'CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL)',
+   * );
+   * const inserted = await db.query(
+   *   'INSERT INTO tasks (id, title) VALUES ($1, $2)',
+   *   ['a', 'Write docs'],
+   * );
+   * console.log(inserted.affectedRows);
+   * // -> 1
+   *
+   * const {rows} = await db.query<{id: string; title: string}>(
+   *   'SELECT * FROM tasks WHERE id = $1',
+   *   ['a'],
+   * );
+   * console.log(rows);
+   * // -> [{id: 'a', title: 'Write docs'}]
+   * await db.close();
+   * ```
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   *
+   * const db = await create();
+   * await db.exec(`
+   *   CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL);
+   *   INSERT INTO tasks (id, title) VALUES ('a', 'Write docs');
+   * `);
+   * // Rows come back as arrays, in the order of the fields, on request.
+   * const {fields, rows} = await db.query('SELECT id, title FROM tasks', [], {
+   *   rowMode: 'array',
+   * });
+   * console.log(fields.map(({name}) => name));
+   * // -> ['id', 'title']
+   * console.log(rows);
+   * // -> [['a', 'Write docs']]
+   * await db.close();
+   * ```
    * @category SQL
    * @essential Using a database
    * @since v0.0.5
@@ -841,6 +1195,26 @@
    * Interpolated values become `$n` parameters. It does not interpolate raw
    * identifiers or SQL fragments.
    * @returns A Promise resolving to the statement results.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   *
+   * const db = await create();
+   * await db.sql`
+   *   CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL)
+   * `;
+   *
+   * const id = 'a';
+   * const title = 'Write docs';
+   * await db.sql`INSERT INTO tasks (id, title) VALUES (${id}, ${title})`;
+   *
+   * const {rows} = await db.sql<{title: string}>`
+   *   SELECT title FROM tasks WHERE id = ${id}
+   * `;
+   * console.log(rows);
+   * // -> [{title: 'Write docs'}]
+   * await db.close();
+   * ```
    * @category SQL
    * @essential Using a database
    * @since v0.0.5
@@ -851,6 +1225,28 @@
    * The prepare method parses and retains one reusable read or row-mutation
    * statement in the Worker.
    * @returns A Promise resolving to a reusable PreparedStatement handle.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   *
+   * const db = await create();
+   * await db.exec(`
+   *   CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL);
+   *   INSERT INTO tasks (id, title) VALUES ('a', 'Write docs');
+   *   INSERT INTO tasks (id, title) VALUES ('b', 'Ship release');
+   * `);
+   * const titleOf = await db.prepare<{title: string}>(
+   *   'SELECT title FROM tasks WHERE id = $1',
+   * );
+   * for (const id of ['a', 'b']) {
+   *   const {rows} = await titleOf.execute([id]);
+   *   console.log(rows[0].title);
+   * }
+   * // -> 'Write docs'
+   * // -> 'Ship release'
+   * await titleOf.close();
+   * await db.close();
+   * ```
    * @category SQL
    * @since v0.0.5
    */
@@ -860,6 +1256,22 @@
    * The exec method runs one or more parameter-free statements as one implicit
    * transaction.
    * @returns A Promise resolving to one result per statement, in script order.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   *
+   * const db = await create();
+   * const results = await db.exec(`
+   *   CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL);
+   *   INSERT INTO tasks (id, title) VALUES ('a', 'Write docs');
+   *   SELECT * FROM tasks;
+   * `);
+   * console.log(results.length);
+   * // -> 3
+   * console.log(results[2].rows);
+   * // -> [{id: 'a', title: 'Write docs'}]
+   * await db.close();
+   * ```
    * @category SQL
    * @essential Using a database
    * @since v0.0.5
@@ -885,6 +1297,36 @@
    * before replaying a failed write.
    * @returns A Promise resolving to the callback's result after the transaction
    * commits or explicitly rolls back.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   *
+   * const db = await create();
+   * await db.exec(`
+   *   CREATE TABLE accounts (id TEXT PRIMARY KEY, balance INTEGER NOT NULL);
+   *   INSERT INTO accounts (id, balance) VALUES ('a', 100);
+   *   INSERT INTO accounts (id, balance) VALUES ('b', 0);
+   * `);
+   * // Both updates commit together, or neither does.
+   * const moved = await db.transaction(async (tx) => {
+   *   await tx.query(
+   *     'UPDATE accounts SET balance = balance - $1 WHERE id = $2',
+   *     [30, 'a'],
+   *   );
+   *   await tx.query(
+   *     'UPDATE accounts SET balance = balance + $1 WHERE id = $2',
+   *     [30, 'b'],
+   *   );
+   *   return 30;
+   * });
+   * console.log(moved);
+   * // -> 30
+   *
+   * const {rows} = await db.query('SELECT * FROM accounts ORDER BY id');
+   * console.log(rows);
+   * // -> [{id: 'a', balance: 70}, {id: 'b', balance: 30}]
+   * await db.close();
+   * ```
    * @category Transactions
    * @essential Using a database
    * @since v0.0.5
@@ -897,6 +1339,28 @@
    * tab. After handover or page restoration, reset events notify every
    * subscriber to re-query even though tables is empty.
    * @returns A function that removes this subscription when called.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   *
+   * const db = await create();
+   * await db.exec(`
+   *   CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL)
+   * `);
+   * const unsubscribe = db.subscribe({tables: ['tasks']}, async ({tables}) => {
+   *   // The event names the tables that changed. Query again for their rows.
+   *   const {rows} = await db.query('SELECT * FROM tasks ORDER BY id');
+   *   console.log(tables, rows);
+   *   // -> ['tasks'] [{id: 'a', title: 'Write docs'}]
+   *   unsubscribe();
+   *   await db.close();
+   * });
+   *
+   * await db.query('INSERT INTO tasks (id, title) VALUES ($1, $2)', [
+   *   'a',
+   *   'Write docs',
+   * ]);
+   * ```
    * @category Subscriptions
    * @since v0.0.5
    */
@@ -906,6 +1370,25 @@
    * The getRevision method returns the newest database revision observed by
    * this Client.
    * @returns The newest database revision observed by this Client.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   *
+   * const db = await create();
+   * await db.exec(`
+   *   CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL)
+   * `);
+   * const before = db.getRevision();
+   * const {revision} = await db.query(
+   *   'INSERT INTO tasks (id, title) VALUES ($1, $2)',
+   *   ['a', 'Write docs'],
+   * );
+   * console.log(revision > before);
+   * // -> true
+   * console.log(db.getRevision() == revision);
+   * // -> true
+   * await db.close();
+   * ```
    * @category Subscriptions
    * @since v0.0.5
    */
@@ -1006,6 +1489,25 @@
    * @returns A Promise that resolves when the database is sound, or rejects
    * with a ClientError whose code names the first problem found, such as
    * `STORAGE_CORRUPT`.
+   * @example
+   * ```ts
+   * import {ClientError, create} from 'tinyjoin';
+   *
+   * const db = await create('opfs://my-app-v1');
+   * try {
+   *   await db.check();
+   *   console.log('Every row and index entry is sound.');
+   * } catch (error) {
+   *   if (!(error instanceof ClientError)) {
+   *     throw error;
+   *   }
+   *   // Nothing repairs a database that fails its check, so the application
+   *   // restores its own backup into a new OPFS name.
+   *   console.error(error.code);
+   * } finally {
+   *   await db.close();
+   * }
+   * ```
    * @category Lifecycle
    * @since v0.4.0
    */
@@ -1019,6 +1521,22 @@
    * A closed Client cannot resume; create a new one and recreate its prepared
    * statements and subscriptions. Closing is not a cancellation or rollback
    * guarantee for a write already in flight.
+   * @example
+   * ```ts
+   * import {create} from 'tinyjoin';
+   *
+   * const db = await create('opfs://my-app-v1');
+   * try {
+   *   await db.exec(`
+   *     CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY)
+   *   `);
+   * } finally {
+   *   // Releases the Worker and its hold on the storage, whatever happened.
+   *   await db.close();
+   * }
+   * console.log(db.closed);
+   * // -> true
+   * ```
    * @category Lifecycle
    * @since v0.0.5
    */
@@ -1028,8 +1546,14 @@
 /**
  * The create function opens a TinyJoin database in a dedicated Worker.
  *
- * This overload creates an ephemeral in-memory database using the packaged
- * Worker. Its data is lost when the Client closes or the page reloads.
+ * It constructs a Client and resolves once that Client is ready, so a database
+ * that cannot be opened rejects here. The Client
+ * [constructor](/api/tinyjoin/classes/lifecycle/client/constructors/lifecycle/constructor/)
+ * returns before then, for code that needs the waitReady lifecycle.
+ *
+ * The overload of this function with _no_ arguments creates an ephemeral
+ * in-memory database using the packaged Worker. Its data is lost when the
+ * Client closes or the page reloads.
  * @returns A Promise resolving to a Client whose Worker and database are ready.
  * @example
  * ```ts
@@ -1052,7 +1576,8 @@
 /// create
 
 /**
- * This create overload opens a database with ClientOptions.
+ * The overload of this function with _one_ argument, an options object, opens
+ * the database that its ClientOptions describe.
  *
  * Use the options object to select storage or provide a custom Worker.
  * Omitting its dataDir property selects an ephemeral in-memory database.
@@ -1072,7 +1597,8 @@
 /// create.options
 
 /**
- * This create overload opens a database at the supplied storage URL.
+ * The overload of this function with a storage URL as its _first_ argument,
+ * and optionally options as its second, opens a database at that URL.
  *
  * Use a stable `opfs://name` to persist data in the same browser, or
  * `memory://` for an ephemeral database. When providing the second argument,
@@ -1111,6 +1637,20 @@
 {
   /**
    * The constructor creates an Error from its serialized Worker envelope.
+   * @example
+   * ```ts
+   * import {ClientError} from 'tinyjoin';
+   *
+   * const error = new ClientError({
+   *   code: 'INVALID_ARGUMENT',
+   *   message: 'A task needs a title.',
+   *   details: {column: 'title'},
+   * });
+   * console.log(error instanceof Error);
+   * // -> true
+   * console.log(error.code, error.details, error.retryable);
+   * // -> 'INVALID_ARGUMENT' {column: 'title'} false
+   * ```
    * @category Error
    * @since v0.0.5
    */

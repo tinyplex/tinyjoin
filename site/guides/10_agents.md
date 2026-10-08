@@ -189,7 +189,8 @@ in `crates/tinyjoin-core`, and its WASM bridge lives in
 Public declarations are authored under `src/@types/`. Documentation comments
 in each matching `docs.js` file are merged into the declarations during the
 build. Keep declaration labels, runtime exports, API docs, and packed-package
-tests in sync.
+tests in sync. Give every function, constructor, and method an `@example`;
+the build refuses one without.
 
 Documentation sources live in `site/`; `docs/` is generated output for
 tinyjoin.org. `README.md` and `releases.md` are generated from the homepage and

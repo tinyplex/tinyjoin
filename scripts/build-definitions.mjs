@@ -4,6 +4,11 @@ import {dirname, resolve} from 'node:path';
 const TYPES_DOC_CODE_BLOCKS =
   /\/\/\/\s*(\S*)(.*?)(?=(\s*\/\/\/)|(\n\n)|(\n$))/gs;
 const TYPES_DOC_BLOCKS = /(\/\*\*.*?\*\/)\s*\/\/\/\s*(\S*)/gs;
+// How the declaration of a function, a constructor, or a method begins. Each
+// of those is something an application calls, so its documentation shows a
+// call.
+const TYPES_DOC_CALLABLE =
+  /^\s*(?:export\s+function\b|constructor\(|[\w$]+\??(?:<[^(]*>)?\()/;
 
 const modules = ['', 'worker', 'vite', 'node', 'drizzle', 'kysely'];
 
@@ -21,6 +26,7 @@ export async function buildDefinitions(root, dist) {
       );
       const docs = await readFile(resolve(sourceDirectory, 'docs.js'), 'utf8');
       const blocks = new Map();
+      const unexampled = [];
 
       for (const [, block, label] of docs.matchAll(TYPES_DOC_BLOCKS)) {
         if (labels.has(label)) {
@@ -49,9 +55,20 @@ export async function buildDefinitions(root, dist) {
             );
           }
           blocks.delete(label);
+          if (TYPES_DOC_CALLABLE.test(code) && !block.includes('@example')) {
+            unexampled.push(label);
+          }
           return `${block}${code}`;
         },
       );
+
+      if (unexampled.length > 0) {
+        throw new Error(
+          `Public functions and methods without an @example in ${
+            module || 'tinyjoin'
+          }: ${unexampled.join(', ')}`,
+        );
+      }
 
       if (blocks.size > 0) {
         throw new Error(
