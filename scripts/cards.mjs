@@ -1,10 +1,11 @@
-// Captures the benchmark card that the docs build publishes as
-// docs/benchmark-card.html as a 1600x900 PNG, serving it and its fonts and
-// logo from the committed docs. The image is written to
-// site/extras/benchmark-card.png, which the docs build publishes beside the
-// card, and which the benchmarks guide shares as its Open Graph image.
+// Captures each card that the docs build publishes, docs/benchmark-card.html
+// and docs/site-card.html, as a 1600x900 PNG, serving it and its fonts and
+// logo from the committed docs. Each image is written beside the others in
+// site/extras, which the docs build publishes beside the cards. The benchmarks
+// guide shares the benchmark card as its Open Graph image, and every other
+// page shares the site card.
 //
-// The image is stamped with a hash of the card it was captured from, so that
+// Each image is stamped with a hash of the card it was captured from, so that
 // the docs check can tell when a newly built card needs capturing again. The
 // check imports the stamp from here, so Playwright is only loaded to capture.
 import {createHash} from 'node:crypto';
@@ -15,12 +16,12 @@ import {crc32} from 'node:zlib';
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const docs = resolve(root, 'docs');
-const output = resolve(root, 'site/extras/benchmark-card.png');
 const origin = 'http://tinyjoin.test';
 
-export const benchmarkCardStamp = (html) =>
-  'benchmark-card.html SHA-256 ' +
-  createHash('sha256').update(html).digest('hex');
+export const CARDS = ['benchmark-card', 'site-card'];
+
+export const cardStamp = (card, html) =>
+  `${card}.html SHA-256 ` + createHash('sha256').update(html).digest('hex');
 
 // A PNG with a comment in a tEXt chunk, inserted before the chunk that ends it.
 const withComment = (png, comment) => {
@@ -33,9 +34,8 @@ const withComment = (png, comment) => {
   return Buffer.concat([png.subarray(0, -12), chunk, png.subarray(-12)]);
 };
 
-const captureBenchmarkCard = async () => {
+const captureCards = async () => {
   const {chromium} = await import('@playwright/test');
-  const html = await readFile(resolve(docs, 'benchmark-card.html'), 'utf8');
   let browser;
   try {
     browser = await chromium.launch({headless: true});
@@ -45,18 +45,22 @@ const captureBenchmarkCard = async () => {
         path: resolve(docs, '.' + new URL(route.request().url()).pathname),
       }),
     );
-    await page.goto(`${origin}/benchmark-card.html`);
-    await page.evaluate(() => document.fonts.ready);
-    await writeFile(
-      output,
-      withComment(await page.screenshot(), benchmarkCardStamp(html)),
-    );
-    console.log(`Wrote the benchmark card to ${output}`);
+    for (const card of CARDS) {
+      const html = await readFile(resolve(docs, `${card}.html`), 'utf8');
+      const output = resolve(root, `site/extras/${card}.png`);
+      await page.goto(`${origin}/${card}.html`);
+      await page.evaluate(() => document.fonts.ready);
+      await writeFile(
+        output,
+        withComment(await page.screenshot(), cardStamp(card, html)),
+      );
+      console.log(`Wrote the ${card.replace('-', ' ')} to ${output}`);
+    }
   } finally {
     await browser?.close();
   }
 };
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  await captureBenchmarkCard();
+  await captureCards();
 }

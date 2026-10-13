@@ -43,6 +43,11 @@ The image is written to `site/extras/benchmark-card.png` and published as
 with a hash of the card it was captured from, and the docs check fails when a
 rebuilt card no longer matches it.
 
+The same command captures the site card, `site/site-card.html`, which shows
+the homepage's hero and is every other page's Open Graph image. Its claims
+follow the published results as the homepage's do, so it too can need
+capturing after a run is published.
+
 The method, the results, and their limits are written up in
 [the benchmarks guide](https://tinyjoin.org/guides/benchmarks/), whose source
 is `site/guides/9_benchmarks.md`.

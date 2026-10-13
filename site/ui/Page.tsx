@@ -14,11 +14,13 @@ export const DESCRIPTION = getBenchmarks().renderText(
   '{{benchmarks.epithet}} relational database for your web app.',
 );
 
-// For now, only the benchmarks guide has a share image of its own: the
-// benchmark card, which npm run build:card captures from its results.
+// Every page shares one of the 1600x900 images that npm run build:card
+// captures. The benchmarks guide has one of its own, the benchmark card, from
+// its results. Every other page shares the site card, from the homepage's hero.
 const BENCHMARKS_URL = '/guides/benchmarks/';
 const BENCHMARKS_IMAGE_ALT =
   "A summary of TinyJoin's benchmark results against SQLite and PGlite";
+const SITE_IMAGE_ALT = `TinyJoin: ${DESCRIPTION}`;
 
 export const Page = () => {
   const node = usePageNode();
@@ -37,6 +39,10 @@ export const Page = () => {
 
   const title = isHome ? 'TinyJoin' : `${node.name} | TinyJoin`;
   const canonical = `${baseUrl}${node.url}`;
+  const [image, imageAlt] =
+    node.url === BENCHMARKS_URL
+      ? ['benchmark-card', BENCHMARKS_IMAGE_ALT]
+      : ['site-card', SITE_IMAGE_ALT];
 
   return (
     <html lang="en">
@@ -65,18 +71,11 @@ export const Page = () => {
         <meta property="og:title" content={title} />
         <meta property="og:description" content={DESCRIPTION} />
         <meta property="og:url" content={canonical} />
-        {node.url === BENCHMARKS_URL ? (
-          <>
-            <meta
-              property="og:image"
-              content={`${baseUrl}/benchmark-card.png`}
-            />
-            <meta property="og:image:width" content="1600" />
-            <meta property="og:image:height" content="900" />
-            <meta property="og:image:alt" content={BENCHMARKS_IMAGE_ALT} />
-            <meta name="twitter:card" content="summary_large_image" />
-          </>
-        ) : null}
+        <meta property="og:image" content={`${baseUrl}/${image}.png`} />
+        <meta property="og:image:width" content="1600" />
+        <meta property="og:image:height" content="900" />
+        <meta property="og:image:alt" content={imageAlt} />
+        <meta name="twitter:card" content="summary_large_image" />
         <link rel="canonical" href={canonical} />
         <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
         <link rel="stylesheet" href="/css/index.css" />

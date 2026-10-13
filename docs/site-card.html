@@ -1,0 +1,160 @@
+<!doctype html>
+<!--
+  The site card shows the homepage's hero in one 1600x900 image to share, in
+  the benchmark card's style. The docs build publishes it as /site-card.html,
+  with the hero section of site/home/index.md in place of the placeholder
+  below, so that the card says what the homepage says.
+
+  npm run build:card captures the published page as site/extras/site-card.png,
+  which the docs build publishes beside it, and which every page but the
+  benchmarks guide shares as its Open Graph image.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="robots" content="noindex" />
+    <title>TinyJoin site card</title>
+    <style>
+      @font-face {
+        font-family: Inter;
+        src: url(/fonts/inter.woff2);
+      }
+      @font-face {
+        font-family: Inconsolata;
+        src: url(/fonts/inconsolata.woff2);
+      }
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        width: 1600px;
+        height: 900px;
+        background: #111;
+        color: #eee;
+        font-family: Inter;
+        overflow: hidden;
+        position: relative;
+      }
+      .glow {
+        position: absolute;
+        inset: 0;
+        background:
+          radial-gradient(900px 600px at 85% 8%, #7c3aed40, transparent 70%),
+          radial-gradient(700px 500px at 5% 105%, #7c3aed22, transparent 70%);
+      }
+      .wrap {
+        position: absolute;
+        inset: 0;
+        padding: 64px 88px 60px;
+        display: flex;
+        flex-direction: column;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 22px;
+      }
+      .brand img {
+        width: 76px;
+        height: 76px;
+      }
+      .wordmark {
+        font-size: 68px;
+        font-weight: 800;
+        letter-spacing: -1.5px;
+      }
+      main {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        gap: 72px;
+      }
+      /* The homepage's large logo, over its glow, and as far to the left as
+         the brand's logo, with the margin the image has around its strokes. */
+      .logo {
+        flex: none;
+        width: 400px;
+        height: 400px;
+        margin-left: -20px;
+        position: relative;
+      }
+      .logo::before {
+        content: '';
+        position: absolute;
+        inset: -8%;
+        border-radius: 50%;
+        background: #7c3aed;
+        filter: blur(72px);
+      }
+      .logo img {
+        position: relative;
+        width: 100%;
+        height: 100%;
+      }
+      /* Positioned, to be drawn over the glow. */
+      #hero {
+        position: relative;
+      }
+      #hero h2 {
+        font-size: 88px;
+        font-weight: 800;
+        letter-spacing: -2.5px;
+        line-height: 1.1;
+      }
+      #hero h2 em {
+        font-style: normal;
+        color: #a78bfa;
+      }
+      #hero p {
+        margin-top: 28px;
+        font-size: 30px;
+        line-height: 1.45;
+        color: #bbb;
+        text-wrap: balance;
+      }
+      footer {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-size: 24px;
+        color: #888;
+      }
+      footer code {
+        font-family: Inconsolata;
+        font-size: 30px;
+        color: #eee;
+        background: #222;
+        padding: 4px 16px;
+        border-radius: 10px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="glow"></div>
+    <div class="wrap">
+      <header class="brand">
+        <img src="/favicon.svg" alt="" />
+        <span class="wordmark">TinyJoin</span>
+      </header>
+      <main>
+        <div class="logo"><img src="/favicon.svg" alt="" /></div>
+        <section id="hero">
+  <h2>
+    The smallest, fastest <em>relational database</em> for your web app.
+  </h2>
+  <p>
+    Smaller than SQLite and PGlite, and faster than both. Written in Rust, 
+    supporting PostgreSQL-shaped SQL, and running locally, away from the 
+    browser's main UI thread.
+  </p>
+</section>
+      </main>
+      <footer>
+        <code>npm i tinyjoin</code>
+        <span>tinyjoin.org</span>
+      </footer>
+    </div>
+  </body>
+</html>

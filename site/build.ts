@@ -65,7 +65,7 @@ const getSizeReplacers = (): [RegExp, string][] => {
 };
 
 // The benchmark card, labeled with the newest release, is a page to capture
-// as an image and share. scripts/render-benchmark-card.mjs captures it.
+// as an image and share. scripts/cards.mjs captures it.
 const getBenchmarkCard = (benchmarks: Benchmarks): string => {
   const release = /^## (v\d+\.\d+\.\d+)$/m.exec(
     readFileSync('site/guides/11_releases.md', 'utf8'),
@@ -76,6 +76,21 @@ const getBenchmarkCard = (benchmarks: Benchmarks): string => {
   return benchmarks.renderCard(
     readFileSync('site/benchmark-card.html', 'utf8'),
     release,
+  );
+};
+
+// The site card is the homepage's hero, in the homepage's own words, as
+// another page for scripts/cards.mjs to capture.
+const getSiteCard = (benchmarks: Benchmarks): string => {
+  const hero = /<section id="hero">.*?<\/section>/s.exec(
+    readFileSync('site/home/index.md', 'utf8'),
+  )?.[0];
+  if (hero == null) {
+    throw new Error('No hero section in site/home/index.md');
+  }
+  return readFileSync('site/site-card.html', 'utf8').replace(
+    '{{card.hero}}',
+    () => benchmarks.renderText(hero),
   );
 };
 
@@ -170,6 +185,7 @@ export const build = async (
     .addDir('site/fonts', 'fonts')
     .addDir('site/extras')
     .addStringFile(getBenchmarkCard(benchmarks), 'benchmark-card.html')
+    .addStringFile(getSiteCard(benchmarks), 'site-card.html')
     .addReflectionTransform(hideInheritedErrorMembers)
     .addNodeTransform(collapseEmptyGroups)
     .addNodeTransform((node) => {
